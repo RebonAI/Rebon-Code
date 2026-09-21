@@ -1,9 +1,24 @@
-# rebon
-
-An agent CLI for coding and more — a terminal harness that drives an LLM through
-a real agent loop with tools, sessions, permissions, and a full TUI.
-
-> 中文版：[docs/README.zh-CN.md](docs/README.zh-CN.md)
+<table>
+  <tr>
+    <td width="150" align="center" valign="middle">
+      <img src="assets/app-icon/icon.png" width="128" alt="Rebon">
+    </td>
+    <td valign="middle">
+      <h1>rebon</h1>
+      <p>
+        An agent CLI for coding and more — a terminal harness that drives an
+        LLM through a real agent loop with tools, sessions, permissions, and a
+        full TUI.
+      </p>
+      <p>
+        <a href="https://www.npmjs.com/package/@rebon/cli"><img src="https://img.shields.io/npm/v/@rebon/cli?label=%40rebon%2Fcli" alt="npm"></a>
+        <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue" alt="FSL-1.1-ALv2"></a>
+        ·
+        <a href="docs/README.zh-CN.md">中文</a>
+      </p>
+    </td>
+  </tr>
+</table>
 
 ## What is in this repository
 

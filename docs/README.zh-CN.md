@@ -1,9 +1,25 @@
-# rebon
+<table>
+  <tr>
+    <td width="150" align="center" valign="middle">
+      <img src="../assets/app-icon/icon.png" width="128" alt="Rebon">
+    </td>
+    <td valign="middle">
+      <h1>rebon</h1>
+      <p>
+        面向编码及更多场景的 agent CLI —— 一个终端 harness，通过真正的 agent
+        循环驱动大模型，带工具、会话、权限和完整 TUI。
+      </p>
+      <p>
+        <a href="https://www.npmjs.com/package/@rebon/cli"><img src="https://img.shields.io/npm/v/@rebon/cli?label=%40rebon%2Fcli" alt="npm"></a>
+        <a href="../LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue" alt="FSL-1.1-ALv2"></a>
+        ·
+        <a href="../README.md">English</a>
+      </p>
+    </td>
+  </tr>
+</table>
 
-面向编码及更多场景的 agent CLI —— 一个终端 harness，通过真正的 agent 循环驱动
-大模型，带工具、会话、权限和完整 TUI。
-
-> 英文版：[README.md](../README.md)。两份文档描述同一套东西；有出入时以英文版为准。
+> 两份文档描述同一套东西；有出入时以英文版为准。
 
 ## 这个仓库里有什么
 

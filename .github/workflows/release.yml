@@ -56,13 +56,13 @@ jobs:
     # The long pole, and nothing was bounding it.
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Cache the cargo registry
         # The registry only. `target/` is not cached on purpose: a build of
         # this workspace produces far more than the 10 GB a repository gets,
         # so caching it would evict itself every run and buy nothing. What
         # this does buy is not re-fetching 619 crates on every job.
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -75,7 +75,7 @@ jobs:
         # rebon-node-runtime pins. Asking the runner's preinstalled Node made
         # the gate fail on whatever the image last upgraded to, so the
         # workflow provisions the pinned one.
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24.19.0
       - name: Verify scripts
@@ -216,13 +216,13 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Cache the cargo registry
         # The registry only. `target/` is not cached on purpose: a build of
         # this workspace produces far more than the 10 GB a repository gets,
         # so caching it would evict itself every run and buy nothing. What
         # this does buy is not re-fetching 619 crates on every job.
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -271,13 +271,13 @@ jobs:
         runner: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Cache the cargo registry
         # The registry only. `target/` is not cached on purpose: a build of
         # this workspace produces far more than the 10 GB a repository gets,
         # so caching it would evict itself every run and buy nothing. What
         # this does buy is not re-fetching 619 crates on every job.
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -317,13 +317,13 @@ jobs:
           - target: x86_64-apple-darwin
             cpu: x64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Cache the cargo registry
         # The registry only. `target/` is not cached on purpose: a build of
         # this workspace produces far more than the 10 GB a repository gets,
         # so caching it would evict itself every run and buy nothing. What
         # this does buy is not re-fetching 619 crates on every job.
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -335,7 +335,7 @@ jobs:
         # Trusted publishing needs npm >= 11.5.1; a runner's bundled npm is
         # older and fails with a plain authentication error that does not name
         # the version.
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: npm install -g npm@latest
@@ -382,13 +382,13 @@ jobs:
           - target: aarch64-unknown-linux-musl
             cpu: arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Cache the cargo registry
         # The registry only. `target/` is not cached on purpose: a build of
         # this workspace produces far more than the 10 GB a repository gets,
         # so caching it would evict itself every run and buy nothing. What
         # this does buy is not re-fetching 619 crates on every job.
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -400,7 +400,7 @@ jobs:
         # Trusted publishing needs npm >= 11.5.1; a runner's bundled npm is
         # older and fails with a plain authentication error that does not name
         # the version.
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: npm install -g npm@latest
@@ -451,13 +451,13 @@ jobs:
     # As above, and Windows runners are slower.
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Cache the cargo registry
         # The registry only. `target/` is not cached on purpose: a build of
         # this workspace produces far more than the 10 GB a repository gets,
         # so caching it would evict itself every run and buy nothing. What
         # this does buy is not re-fetching 619 crates on every job.
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -469,7 +469,7 @@ jobs:
         # Trusted publishing needs npm >= 11.5.1; a runner's bundled npm is
         # older and fails with a plain authentication error that does not name
         # the version.
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: npm install -g npm@latest
@@ -511,13 +511,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Cache the cargo registry
         # The registry only. `target/` is not cached on purpose: a build of
         # this workspace produces far more than the 10 GB a repository gets,
         # so caching it would evict itself every run and buy nothing. What
         # this does buy is not re-fetching 619 crates on every job.
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -529,7 +529,7 @@ jobs:
         # Trusted publishing needs npm >= 11.5.1; a runner's bundled npm is
         # older and fails with a plain authentication error that does not name
         # the version.
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: npm install -g npm@latest
