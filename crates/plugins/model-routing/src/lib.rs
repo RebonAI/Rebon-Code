@@ -15,6 +15,9 @@ use rebon_kernel_seats::kernel_config_seats::{PluginSettings, SETTINGS_SERVICE};
 use rebon_types::{ModelProfileMap, ReasoningEffort};
 use serde::Deserialize;
 
+mod settings_row;
+pub use settings_row::ROUTER_MODEL_OPTION;
+
 pub const PLUGIN_ID: &str = "model-routing";
 // 分类只需要两个短字段，限制响应大小以免预检消耗主任务的资源。
 const OUTPUT_LIMIT: usize = 4096;
@@ -180,12 +183,14 @@ impl Plugin for ModelRoutingPlugin {
         PluginMeta::new(PLUGIN_ID)
             .provides(&[MODEL_ROUTING_SERVICE])
             .inject(&[SETTINGS_SERVICE])
+            .optional_inject(&[rebon_config_seat::CONFIG_SEAT_SERVICE])
             .settings(vec![SettingKey::new("routerModel", SettingType::String)])
     }
     fn apply(&self, ctx: &Context) -> Result<(), KernelError> {
         ctx.provide::<ModelRoutingService>(Arc::new(Router {
             settings: PluginSettings::new(ctx, PLUGIN_ID),
-        }))
+        }))?;
+        settings_row::register(ctx)
     }
 }
 fn make(_: &PluginHost) -> Result<Box<dyn Plugin>, KernelError> {

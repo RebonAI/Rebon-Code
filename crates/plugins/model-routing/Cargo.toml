@@ -14,6 +14,7 @@ rebon-api.workspace = true
 rebon-config.workspace = true
 rebon-core.workspace = true
 rebon-kernel.workspace = true
+rebon-config-seat.workspace = true
 rebon-kernel-seats.workspace = true
 rebon-provider.workspace = true
 rebon-types.workspace = true
