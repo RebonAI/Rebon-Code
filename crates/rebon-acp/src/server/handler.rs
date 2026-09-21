@@ -997,6 +997,15 @@ impl DefaultHandler {
 
         let current = self.config_options_snapshot();
         if !has_config_option_value(&current, config_id, value) {
+            // Said out loud rather than returning the unchanged list. A value
+            // this list does not offer is a client sending something no
+            // surface can have shown it; silence here reads to the caller as
+            // a setting that refuses to change for no reason.
+            tracing::warn!(
+                config_id,
+                value,
+                "no settings row offers this value; nothing applied"
+            );
             return self.config_options_for_session(session_id);
         }
 

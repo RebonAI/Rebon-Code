@@ -1109,14 +1109,14 @@ mod tests {
         assert_eq!(permission_option_value(&persisted), "auto");
     }
 
-    async fn serve_config_option_value(value: &str) -> Vec<u8> {
+    async fn serve_config_option_value(config_id: &str, value: &str) -> Vec<u8> {
         let handler = DefaultHandler::default()
             .with_config_option_applier(acp_config_option_applier(Default::default()));
 
         let (mut client_in, server_in) = tokio::io::duplex(4096);
         let (server_out, client_out) = tokio::io::duplex(4096);
         let input = format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":1,\"clientCapabilities\":{{}}}}}}\n{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/set_config_option\",\"params\":{{\"sessionId\":\"sess-missing\",\"configId\":\"sub_agents\",\"value\":\"{value}\"}}}}\n"
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":1,\"clientCapabilities\":{{}}}}}}\n{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/set_config_option\",\"params\":{{\"sessionId\":\"sess-missing\",\"configId\":\"{config_id}\",\"value\":\"{value}\"}}}}\n"
         );
         client_in.write_all(input.as_bytes()).await.unwrap();
         drop(client_in);
@@ -1131,28 +1131,31 @@ mod tests {
         out
     }
 
+    /// `session/set_config_option` reaches the applier and the applier
+    /// persists, over the real wire.
+    ///
+    /// The option is one the handler still owns. Everything backed by the
+    /// config file is registered on the `config-options` seat by whoever owns
+    /// the setting, and applying one of those is that registrar's business —
+    /// `plugins/agents` proves its own row flips the sub-agent switch. What
+    /// this test is for is the path between them: request in, applier run.
     #[tokio::test]
-    async fn acp_session_set_config_option_sub_agents_updates_runtime_switch() {
+    async fn acp_session_set_config_option_reaches_the_applier() {
         let tmp = TempDir::new().unwrap();
         let _guard = AcpGlobalStateGuard::with_config_dir(tmp.path());
 
-        rebon_tool::set_sub_agents_enabled(true);
-        let out = serve_config_option_value("off").await;
-
-        let lines = ndjson_lines(&out);
-        assert_eq!(lines.len(), 2);
-        let response: rebon_proto::JsonRpcResponse = serde_json::from_slice(lines[1]).unwrap();
-        assert!(response.error.is_none());
-        assert!(!rebon_tool::sub_agents_enabled());
-        assert!(!crate::rebon_config::saved_sub_agents_enabled());
-
-        let out = serve_config_option_value("on").await;
-        let lines = ndjson_lines(&out);
-        assert_eq!(lines.len(), 2);
-        let response: rebon_proto::JsonRpcResponse = serde_json::from_slice(lines[1]).unwrap();
-        assert!(response.error.is_none());
-        assert!(rebon_tool::sub_agents_enabled());
-        assert!(crate::rebon_config::saved_sub_agents_enabled());
+        for mode in ["acceptEdits", "default"] {
+            let out = serve_config_option_value("permissions", mode).await;
+            let lines = ndjson_lines(&out);
+            assert_eq!(lines.len(), 2);
+            let response: rebon_proto::JsonRpcResponse =
+                serde_json::from_slice(lines[1]).unwrap();
+            assert!(response.error.is_none());
+            assert_eq!(
+                crate::rebon_config::saved_default_permission_mode_wire().as_deref(),
+                Some(mode)
+            );
+        }
     }
 
     /// A refusing `PreToolUse` hook, written for whichever shell the test

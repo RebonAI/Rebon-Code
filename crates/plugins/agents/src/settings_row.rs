@@ -141,6 +141,29 @@ mod tests {
         register(ctx).expect("registers");
     }
 
+    /// Applying does both halves: the process-global atomic so the next turn
+    /// filters the tool without a restart, and the config file so the choice
+    /// survives one. Doing only the first is a setting that forgets itself;
+    /// only the second is one that needs a restart to mean anything.
+    #[test]
+    fn applying_flips_the_runtime_switch_and_persists_it() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("agents-settings-row");
+
+        rebon_tool::set_sub_agents_enabled(true);
+        SubAgentsOption.apply(None, "off").expect("applies");
+        assert!(!rebon_tool::sub_agents_enabled(), "the running turn sees it");
+        assert!(
+            !rebon_config::saved_sub_agents_enabled(),
+            "and so does the next process"
+        );
+        assert_eq!(SubAgentsOption.current(None), "off");
+
+        SubAgentsOption.apply(None, "on").expect("applies");
+        assert!(rebon_tool::sub_agents_enabled());
+        assert!(rebon_config::saved_sub_agents_enabled());
+        assert_eq!(SubAgentsOption.current(None), "on");
+    }
+
     #[test]
     fn a_value_that_is_neither_on_nor_off_is_refused() {
         let err = SubAgentsOption
