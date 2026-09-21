@@ -1,6 +1,6 @@
 {
   "name": "rebon",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Rebon agent CLI for coding and more. Installs @rebon/cli.",
   "license": "FSL-1.1-ALv2",
   "homepage": "https://github.com/RebonAI/Rebon-Releases",
@@ -9,7 +9,7 @@
     "rebon": "bin/rebon.js"
   },
   "dependencies": {
-    "@rebon/cli": "^1.3.0"
+    "@rebon/cli": "^1.4.0"
   },
   "files": [
     "bin",
