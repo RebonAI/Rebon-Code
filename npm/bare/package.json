@@ -3,8 +3,18 @@
   "version": "1.4.0",
   "description": "Rebon agent CLI for coding and more. Installs @rebon/cli.",
   "license": "FSL-1.1-ALv2",
-  "homepage": "https://github.com/RebonAI/Rebon-Releases",
-  "keywords": ["rebon", "cli", "agent", "coding-agent", "ai"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RebonAI/Rebon-Code.git"
+  },
+  "homepage": "https://reboncode.ai",
+  "keywords": [
+    "rebon",
+    "cli",
+    "agent",
+    "coding-agent",
+    "ai"
+  ],
   "bin": {
     "rebon": "bin/rebon.js"
   },

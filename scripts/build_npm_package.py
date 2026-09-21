@@ -28,6 +28,11 @@ README_MD = REPO_ROOT / "README.md"
 THIRD_PARTY_NOTICES = REPO_ROOT / "THIRD_PARTY_NOTICES.txt"
 LICENSE_FILE = REPO_ROOT / "LICENSE"
 DEFAULT_DESCRIPTION = "Agent cli for coding and more."
+# npm verifies the provenance statement trusted publishing signs against
+# package.json: a repository.url that does not normalise to the repository
+# the workflow ran in is a 422, and so is a missing one, which reads as "".
+REPOSITORY_URL = "git+https://github.com/RebonAI/Rebon-Code.git"
+HOMEPAGE_URL = "https://reboncode.ai"
 DEFAULT_OUT_DIR = REPO_ROOT / "dist" / "npm"
 DEFAULT_BIN_NAME = "rebon"
 BOA_HELPER_NAME = "rebon-boa-helper"
@@ -427,6 +432,8 @@ def write_platform_package_json(
         "version": version,
         "description": DEFAULT_DESCRIPTION,
         "license": license_expression,
+        "repository": {"type": "git", "url": REPOSITORY_URL},
+        "homepage": HOMEPAGE_URL,
         "engines": {"node": ">=20"},
         "bin": {DEFAULT_BIN_NAME: bin_target},
         "files": files,
@@ -451,6 +458,8 @@ def write_wrapper_package_json(
         "version": version,
         "description": DEFAULT_DESCRIPTION,
         "license": license_expression,
+        "repository": {"type": "git", "url": REPOSITORY_URL},
+        "homepage": HOMEPAGE_URL,
         "engines": {"node": ">=20"},
         "bin": {DEFAULT_BIN_NAME: "bin/rebon.js"},
         "files": ["bin", "README.md", "LICENSE"],
