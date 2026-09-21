@@ -191,6 +191,10 @@ npm install -g @rebon/cli@latest
   Kitty all work). The legacy `cmd.exe` and `conhost` are not supported.
 - **Logs** — check `$REBON_LOG_DIR/rebon.log` (TUI) or stderr (`--acp`).
 
+## Friends
+
+[Linux.Do](https://linux.do) — A new ideal community
+
 ## License
 
 Licensed under the [Functional Source License, Version 1.1, ALv2 Future

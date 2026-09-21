@@ -177,6 +177,10 @@ npm install -g @rebon/cli@latest
   iTerm2、Alacritty、WezTerm、Kitty 都可以）。旧的 `cmd.exe` 和 `conhost` 不支持。
 - **日志** —— 看 `$REBON_LOG_DIR/rebon.log`（TUI）或 stderr（`--acp`）。
 
+## Friends
+
+[Linux.Do](https://linux.do) — A new ideal community
+
 ## 许可
 
 采用 [Functional Source License, Version 1.1, ALv2 Future License](../LICENSE)
