@@ -2,7 +2,7 @@
   "name": "rebon",
   "version": "1.4.0",
   "description": "Rebon agent CLI for coding and more. Installs @rebon/cli.",
-  "license": "FSL-1.1-ALv2",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/RebonAI/Rebon-Code.git"
@@ -24,7 +24,8 @@
   "files": [
     "bin",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ],
   "engines": {
     "node": ">=20"

@@ -11,7 +11,7 @@
       </p>
       <p>
         <a href="https://www.npmjs.com/package/@rebon/cli"><img src="https://img.shields.io/npm/v/@rebon/cli?label=%40rebon%2Fcli" alt="npm"></a>
-        <a href="../LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue" alt="FSL-1.1-ALv2"></a>
+        <a href="../LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0"></a>
         ·
         <a href="../README.md">English</a>
       </p>
@@ -181,15 +181,8 @@ npm install -g @rebon/cli@latest
 
 ## 许可
 
-采用 [Functional Source License, Version 1.1, ALv2 Future License](../LICENSE)
-（`FSL-1.1-ALv2`）。
+采用 [Apache License 2.0](../LICENSE)。
 
-除「Competing Use」外的任何用途都可以 —— Competing Use 指把本软件做成替代 Rebon 的
-商业产品或服务。内部使用、非商业的教育与研究、以及围绕它提供的专业服务，都在允许
-范围内。
-
-每个版本在其发布满两年之日起，额外可按 Apache License 2.0 使用。
-
-这是 source-available 许可，不是 OSI 认可的开源许可。
+再分发时需随附许可证和 [NOTICE](../NOTICE) 里的署名声明，改动过的文件需标注已被修改。
 
 第三方组件及其许可证列在 [THIRD_PARTY_NOTICES.txt](../THIRD_PARTY_NOTICES.txt)。

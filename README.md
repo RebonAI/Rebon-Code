@@ -12,7 +12,7 @@
       </p>
       <p>
         <a href="https://www.npmjs.com/package/@rebon/cli"><img src="https://img.shields.io/npm/v/@rebon/cli?label=%40rebon%2Fcli" alt="npm"></a>
-        <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue" alt="FSL-1.1-ALv2"></a>
+        <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="Apache-2.0"></a>
         ·
         <a href="docs/README.zh-CN.md">中文</a>
       </p>
@@ -194,17 +194,10 @@ npm install -g @rebon/cli@latest
 
 ## License
 
-Licensed under the [Functional Source License, Version 1.1, ALv2 Future
-License](LICENSE) (`FSL-1.1-ALv2`).
+Licensed under the [Apache License, Version 2.0](LICENSE).
 
-Use it for anything except a Competing Use — a commercial product or service
-that substitutes for Rebon. Internal use, non-commercial education and
-research, and professional services around it are all permitted.
-
-Each version additionally becomes available under the Apache License,
-Version 2.0 on the second anniversary of its release.
-
-This is a source-available licence, not an OSI-approved open-source one.
+Redistributions must carry the licence and the attribution notice in
+[NOTICE](NOTICE), and modified files must say that they were changed.
 
 Third-party components and their licenses are listed in
 [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).

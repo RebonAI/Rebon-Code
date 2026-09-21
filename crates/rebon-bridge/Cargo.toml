@@ -2,7 +2,7 @@
 name = "rebon-bridge"
 version = "0.0.2"
 edition = "2021"
-license = "UNLICENSED"
+license = "Apache-2.0"
 rust-version = "1.80"
 publish = false
 description = "Remote-control bridge primitives and runtime wiring for Rebon sessions. Includes pure-logic protocol helpers with no I/O or rebon-* dependencies, plus async client/runtime traits for session control, permission responses, active handles, and security-sensitive session-id compatibility markers."

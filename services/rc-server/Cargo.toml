@@ -4,7 +4,7 @@
 name = "rebon-rc-server"
 version = "0.1.0"
 edition = "2021"
-license = "FSL-1.1-ALv2"
+license = "Apache-2.0"
 rust-version = "1.80"
 publish = false
 description = "Rebon Remote Control service — accounts, environments, work queue, leases and the session stream."

@@ -27,6 +27,7 @@ CARGO_TOML = REPO_ROOT / "Cargo.toml"
 README_MD = REPO_ROOT / "README.md"
 THIRD_PARTY_NOTICES = REPO_ROOT / "THIRD_PARTY_NOTICES.txt"
 LICENSE_FILE = REPO_ROOT / "LICENSE"
+NOTICE_FILE = REPO_ROOT / "NOTICE"
 DEFAULT_DESCRIPTION = "Agent cli for coding and more."
 # npm verifies the provenance statement trusted publishing signs against
 # package.json: a repository.url that does not normalise to the repository
@@ -422,7 +423,14 @@ def write_platform_package_json(
     bin_name: str,
 ) -> None:
     bin_target = f"bin/{bin_name}"
-    files = ["bin", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.txt", "scripts"]
+    files = [
+        "bin",
+        "README.md",
+        "LICENSE",
+        "NOTICE",
+        "THIRD_PARTY_NOTICES.txt",
+        "scripts",
+    ]
     scripts = {"postinstall": f"node scripts/{WINDOWS_POSTINSTALL_NAME}"}
     if npm_os == "win32":
         bin_target = f"bin/{WINDOWS_LAUNCHER_NAME}"
@@ -462,7 +470,7 @@ def write_wrapper_package_json(
         "homepage": HOMEPAGE_URL,
         "engines": {"node": ">=20"},
         "bin": {DEFAULT_BIN_NAME: "bin/rebon.js"},
-        "files": ["bin", "README.md", "LICENSE"],
+        "files": ["bin", "README.md", "LICENSE", "NOTICE"],
         "optionalDependencies": optional_dependencies,
     }
     (package_dir / "package.json").write_text(
@@ -479,11 +487,12 @@ def copy_third_party_notices(package_dir: Path) -> None:
     shutil.copy2(THIRD_PARTY_NOTICES, package_dir / THIRD_PARTY_NOTICES.name)
 
 
-# The licence's Redistribution clause requires a copy of or a link to the
-# terms with every copy, so it travels in the tarball rather than only in the
+# Apache-2.0 section 4 requires every redistribution to carry both the licence
+# and the NOTICE text, so the two travel in the tarball rather than only in the
 # repository.
 def copy_license(package_dir: Path) -> None:
     shutil.copy2(LICENSE_FILE, package_dir / "LICENSE")
+    shutil.copy2(NOTICE_FILE, package_dir / "NOTICE")
 
 
 def copy_binary(
