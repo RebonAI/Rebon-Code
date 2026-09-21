@@ -1,0 +1,18 @@
+[package]
+name = "rebon-plugin-node-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The `node-host` feature plugin: the Node plugin plane as one kernel plugin, and every external package on it as an `External` row in the same registry the built-ins live in."
+
+[dependencies]
+# Deliberately the only dependency. Starting a Node host process, speaking the
+# plugin protocol and registering what a package reports belong where the
+# engine is; this crate owns *when* that happens and *what* is loaded, which
+# needs nothing but the kernel. Adding an engine dependency here is what would
+# stop it being a plugin at all — see `PlaneHost` in `src/lib.rs`.
+rebon-kernel.workspace = true
+
+tracing.workspace = true

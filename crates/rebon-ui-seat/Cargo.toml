@@ -1,0 +1,17 @@
+[package]
+name = "rebon-ui-seat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The kernel's `ui-registry` seat: where every dialog a surface can open is registered, as a factory that builds its `DialogModel`. Registration is a kernel effect (dispose the context, the dialog is gone). Depends only on rebon-kernel and rebon-dialog — no terminal, no renderer."
+
+[dependencies]
+rebon-kernel.workspace = true
+rebon-dialog.workspace = true
+
+# The inputs a plugin's panel is opened with cross a crate boundary as
+# JSON, so both halves name one shape instead of a delimiter scheme.
+serde.workspace = true
+serde_json.workspace = true

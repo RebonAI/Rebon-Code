@@ -1,0 +1,17 @@
+[package]
+name = "rebon-design-system"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Pure-logic design-system helpers for the terminal UI: theme palettes with a get_theme() resolver, raw-color prefix parsing, status icons, progress-bar layout math, shortcut hints, and small state reducers (tabs, fuzzy picker, loading, ratchet). No IO and no rebon-* dependencies; rendering, fuzzy matching, and colorization are injected by the caller."
+
+[dependencies]
+
+# No runtime deps. This crate is intentionally pure-logic — every UI
+# concern (terminal rendering, fuzzy-match library, settings store
+# reads, keybinding subsystem) is delegated to the caller via plain
+# owned strings, structs, enums, or callback seams.
+[dev-dependencies]
+# Test matrix is hand-rolled — no extra deps.

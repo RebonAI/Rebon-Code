@@ -1,0 +1,45 @@
+[package]
+name = "rebon-plugin-onboarding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The `onboarding` feature plugin: the first-run setup wizard and the Codex OAuth login. Step dispatch, PKCE, the authorize URL, the loopback callback listener and its paste fallback, token exchange, credential persistence, error classification, the wizard's state machine, the import of Claude Code / Codex skills, agents and commands, and the `/onboarding` command."
+
+[dependencies]
+# The command seat `/onboarding` registers on, and the spec type it hands over.
+rebon-command-seat.workspace = true
+rebon-kernel.workspace = true
+
+# Where the wizard's answers land: providers, themes, credentials, and the
+# `hasCompletedOnboarding` flag. This crate never re-decides where the config
+# home is.
+rebon-config.workspace = true
+# The theme names the theme step offers.
+rebon-design-system.workspace = true
+# The theme picker's pure row model, shared with `/theme`.
+rebon-picker.workspace = true
+# Home-directory resolution, so the import step scans the same `~` the rest
+# of the process resolves.
+rebon-session.workspace = true
+
+# PKCE / OAuth crypto. Hand-rolling SHA-256 + base64url would be a security
+# regression, so these two stay even though the rest of the flow is hand-built.
+base64 = { workspace = true }
+sha2 = { workspace = true }
+
+anyhow = { workspace = true }
+getrandom = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+webbrowser = { workspace = true }
+
+[dev-dependencies]
+# The OAuth half writes credential files; the rest of the matrix is
+# hand-rolled so the security-critical decisions stay auditable byte-for-byte.
+tempfile = "3"
+# `TestConfigHome` — the repo's one guard for a test that reads the config
+# home, taken so two tests cannot see each other's `REBON_CONFIG_DIR`.
+rebon-tool = { workspace = true, features = ["test-support"] }

@@ -1,0 +1,248 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/plugins/agents",
+    "crates/plugins/browser",
+    "crates/plugins/cron",
+    "crates/plugins/escalation",
+    "crates/plugins/lsp-mcp",
+    "crates/plugins/model-prompt",
+    "crates/plugins/model-routing",
+    "crates/plugins/node-host",
+    "crates/plugins/onboarding",
+    "crates/plugins/plan-mode",
+    "crates/plugins/profile",
+    "crates/plugins/remote",
+    "crates/plugins/sandbox",
+    "crates/plugins/sandbox-win",
+    "crates/plugins/structured-output",
+    "crates/plugins/tasks",
+    "crates/plugins/updater",
+    "crates/plugins/web",
+    "crates/plugins/workflow",
+    "crates/rebon-acp",
+    "crates/rebon-acp-client",
+    "crates/rebon-agent-core",
+    "crates/rebon-api",
+    "crates/rebon-boa-runner",
+    "crates/rebon-bridge",
+    "crates/rebon-cli",
+    "crates/rebon-code-runner",
+    "crates/rebon-command-seat",
+    "crates/rebon-config-seat",
+    "crates/rebon-config",
+    "crates/rebon-core",
+    "crates/rebon-custom-select",
+    "crates/rebon-design-system",
+    "crates/rebon-dialog",
+    "crates/rebon-harness",
+    "crates/rebon-hooks",
+    "crates/rebon-i18n-gen",
+    "crates/rebon-instructions",
+    "crates/rebon-kernel",
+    "crates/rebon-math",
+    "crates/rebon-message-tui",
+    "crates/rebon-node-runtime",
+    "crates/rebon-permissions",
+    "crates/rebon-picker",
+    "crates/rebon-plugin-package",
+    "crates/rebon-plugin-protocol",
+    "crates/rebon-plugin-supervisor",
+    "crates/rebon-proto",
+    "crates/rebon-render",
+    "crates/rebon-session",
+    "crates/rebon-session-host",
+    "crates/rebon-session-runtime",
+    "crates/rebon-session-state",
+    "crates/rebon-shell",
+    "crates/rebon-shell-policy",
+    "crates/rebon-slash-commands",
+    "crates/rebon-spinner",
+    "crates/rebon-tool",
+    "crates/rebon-tools-core",
+    "crates/rebon-tui",
+    "crates/rebon-types",
+    "crates/rebon-ui-seat",
+    "crates/rebon-width",
+    "crates/rebon-mcp-channel",
+    "crates/rebon-schema-gen",
+    "crates/plugins/monitor",
+    "crates/plugins/notebook",
+    "crates/plugins/memory",
+    "crates/plugins/computer-use",
+    "crates/plugins/skill",
+    "crates/plugins/image-gen",
+    "crates/plugins/mcp",
+    "crates/rebon-kernel-seats",
+    "crates/rebon-provider",
+    "crates/rebon-rc-runner",
+    "crates/rebon-plugin-host",
+]
+
+# `rebon-rc-runner` dev-depends on the server by path, and cargo pulls a
+# member's path dependencies into the workspace. `services/rc-server` is its own
+# workspace, so it has to stay out of this one.
+exclude = ["services/rc-server"]
+
+[workspace.package]
+version = "1.3.0"
+edition = "2021"
+license = "FSL-1.1-ALv2"
+rust-version = "1.80"
+publish = false
+
+[workspace.dependencies]
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+regex = "1"
+boa_engine = "0.19.1"
+boa_gc = "0.19.1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+socket2 = "0.6"
+async-trait = "0.1"
+
+# HTTP / streaming / WebSocket
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "system-proxy", "gzip", "brotli", "deflate", "zstd"] }
+url = "2"
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# OAuth / PKCE crypto
+sha2 = "0.10"
+base64 = "0.22"
+getrandom = "0.2"
+webbrowser = "1"
+
+# Unicode terminal text layout
+unicode-width = "0.1"
+unicode-segmentation = "1"
+pulldown-cmark = { version = "0.12", default-features = false }
+
+# Offline terminal math rendering
+ratex-parser = "=0.1.13"
+ratex-layout = "=0.1.13"
+ratex-types = "=0.1.13"
+ratex-svg = { version = "=0.1.13", default-features = false }
+ratex-katex-fonts = "=0.1.13"
+resvg = { version = "=0.45.1", default-features = false, features = ["text"] }
+
+# Terminal image protocols plus the portable Unicode half-block fallback.
+ratatui-image = { version = "=3.0.0", default-features = false, features = ["crossterm"] }
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+
+# Date/time
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# Filesystem change notification
+notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
+
+# Advisory cross-process file locks
+fs2 = "0.4"
+
+# Internal crates
+rebon-tools-core = { path = "crates/rebon-tools-core" }
+rebon-types = { path = "crates/rebon-types" }
+rebon-width = { path = "crates/rebon-width" }
+rebon-math = { path = "crates/rebon-math" }
+rebon-kernel = { path = "crates/rebon-kernel" }
+rebon-plugin-protocol = { path = "crates/rebon-plugin-protocol" }
+rebon-acp = { path = "crates/rebon-acp" }
+rebon-acp-client = { path = "crates/rebon-acp-client" }
+rebon-proto = { path = "crates/rebon-proto" }
+rebon-agent-core = { path = "crates/rebon-agent-core" }
+rebon-session = { path = "crates/rebon-session" }
+rebon-session-state = { path = "crates/rebon-session-state" }
+rebon-session-host = { path = "crates/rebon-session-host" }
+rebon-session-runtime = { path = "crates/rebon-session-runtime" }
+rebon-mcp-channel = { path = "crates/rebon-mcp-channel" }
+rebon-config = { path = "crates/rebon-config" }
+rebon-harness = { path = "crates/rebon-harness" }
+rebon-tool = { path = "crates/rebon-tool" }
+rebon-shell-policy = { path = "crates/rebon-shell-policy" }
+rebon-core = { path = "crates/rebon-core" }
+rebon-tui = { path = "crates/rebon-tui" }
+rebon-hooks = { path = "crates/rebon-hooks" }
+rebon-instructions = { path = "crates/rebon-instructions" }
+rebon-render = { path = "crates/rebon-render" }
+rebon-slash-commands = { path = "crates/rebon-slash-commands" }
+rebon-command-seat = { path = "crates/rebon-command-seat" }
+rebon-config-seat = { path = "crates/rebon-config-seat" }
+rebon-ui-seat = { path = "crates/rebon-ui-seat" }
+rebon-plugin-cron = { path = "crates/plugins/cron" }
+rebon-plugin-web = { path = "crates/plugins/web" }
+rebon-plugin-monitor = { path = "crates/plugins/monitor" }
+rebon-plugin-memory = { path = "crates/plugins/memory" }
+rebon-plugin-notebook = { path = "crates/plugins/notebook" }
+rebon-plugin-structured-output = { path = "crates/plugins/structured-output" }
+rebon-plugin-profile = { path = "crates/plugins/profile" }
+rebon-plugin-computer-use = { path = "crates/plugins/computer-use" }
+rebon-plugin-image-gen = { path = "crates/plugins/image-gen" }
+rebon-plugin-skill = { path = "crates/plugins/skill" }
+rebon-plugin-escalation = { path = "crates/plugins/escalation" }
+rebon-plugin-mcp = { path = "crates/plugins/mcp" }
+rebon-plugin-tasks = { path = "crates/plugins/tasks" }
+rebon-plugin-plan-mode = { path = "crates/plugins/plan-mode" }
+rebon-plugin-agents = { path = "crates/plugins/agents" }
+rebon-plugin-workflow = { path = "crates/plugins/workflow" }
+rebon-plugin-node-host = { path = "crates/plugins/node-host" }
+rebon-plugin-model-prompt = { path = "crates/plugins/model-prompt" }
+rebon-plugin-model-routing = { path = "crates/plugins/model-routing" }
+rebon-plugin-updater = { path = "crates/plugins/updater" }
+rebon-plugin-remote = { path = "crates/plugins/remote" }
+rebon-plugin-onboarding = { path = "crates/plugins/onboarding" }
+rebon-plugin-sandbox = { path = "crates/plugins/sandbox" }
+rebon-plugin-lsp-mcp = { path = "crates/plugins/lsp-mcp" }
+rebon-plugin-browser = { path = "crates/plugins/browser" }
+rebon-dialog = { path = "crates/rebon-dialog" }
+rebon-picker = { path = "crates/rebon-picker" }
+rebon-design-system = { path = "crates/rebon-design-system" }
+rebon-customselect = { path = "crates/rebon-custom-select" }
+rebon-spinner = { path = "crates/rebon-spinner" }
+rebon-shell = { path = "crates/rebon-shell" }
+rebon-message-tui = { path = "crates/rebon-message-tui" }
+rebon-permissions = { path = "crates/rebon-permissions" }
+rebon-bridge = { path = "crates/rebon-bridge" }
+rebon-api = { path = "crates/rebon-api" }
+rebon-kernel-seats = { path = "crates/rebon-kernel-seats" }
+rebon-provider = { path = "crates/rebon-provider" }
+rebon-plugin-host = { path = "crates/rebon-plugin-host" }
+rebon-rc-runner = { path = "crates/rebon-rc-runner" }
+rebon-plugin-package = { path = "crates/rebon-plugin-package" }
+rebon-node-runtime = { path = "crates/rebon-node-runtime" }
+rebon-plugin-supervisor = { path = "crates/rebon-plugin-supervisor" }
+rebon-boa-runner = { path = "crates/rebon-boa-runner" }
+rebon-code-runner = { path = "crates/rebon-code-runner" }
+rebon-i18n-gen = { path = "crates/rebon-i18n-gen" }
+sandbox-win = { path = "crates/plugins/sandbox-win" }
+
+# Tactical fork of ratatui 0.29.0 with two local extensions:
+# `Terminal::set_viewport_height` (the API from upstream PR #1964, not yet
+# released) and cell-level hyperlink metadata emitted by the Crossterm backend.
+# The inline TUI runner uses the viewport method to grow/shrink the inline
+# viewport during streaming so live content isn't cropped from the top; cell
+# metadata keeps OSC-8 bytes out of symbol width and buffer diff calculations.
+# Drop this patch and remove `vendor/ratatui-0.29.0-rebon/` once upstream
+# ships equivalent APIs in a tagged release.
+[patch.crates-io]
+ratatui = { path = "vendor/ratatui-0.29.0-rebon" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 0
+strip = "symbols"

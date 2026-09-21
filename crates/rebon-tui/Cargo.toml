@@ -1,0 +1,77 @@
+[package]
+name = "rebon-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Ratatui-based transcript, message, and prompt-input rendering for rebon. Provides terminal UI rendering helpers and compatibility-focused buffer tests."
+
+[dependencies]
+rebon-types.workspace = true
+
+# Dialog: the surface-agnostic `DialogModel` / `ViewSpec` seam. This
+# crate owns the ratatui painter for those specs (`dialog_view`), so
+# each dialog describes its list once and every terminal surface draws
+# it the same way. rebon-dialog itself stays dependency-free.
+rebon-dialog.workspace = true
+
+# Design-system: theme palette, status icons, progress bar math.
+# The TUI derives its `RenderTheme` from the design-system palette
+# so colors stay consistent across terminal rendering surfaces.
+rebon-design-system.workspace = true
+
+# The ratatui-free render projection: markdown fast-path detection
+# (`has_markdown_syntax`) and table rendering, the framework-agnostic
+# Edit/Write diff algorithm (line-level LCS + file-context hunks), and
+# the structured-diff pipeline (gutter width, markers -> RenderedLine).
+# Shared with the GPUI app, which is why none of it names a terminal
+# framework.
+rebon-render.workspace = true
+
+
+# Message: the ratatui half of the message stack — the widget subtree,
+# the markdown renderer and the per-projection formatters. The local
+# message.rs owns the serde wire types; a conversion bridge connects them
+# to the projection types in rebon-render.
+rebon-message-tui.workspace = true
+
+# Shell: output formatting (JSON pretty-print, linkification, time display).
+rebon-shell.workspace = true
+
+# Url: `render::file_url` turns a path into the `file://` URL that
+# `rebon_shell::create_hyperlink` wraps in an OSC-8 escape. Percent
+# encoding is the whole reason a real URL type is here rather than a
+# format! — a path with a space has to survive the terminal.
+url.workspace = true
+
+# Spinner: reduced-motion breathing-dot helper for in-progress tool gutters.
+rebon-spinner.workspace = true
+
+# Tools-core: ToolId, PermissionBehavior, ValidationOutcome types.
+rebon-tools-core.workspace = true
+
+# Ratatui is the terminal rendering engine. We intentionally depend on a
+# recent stable line so buffer/golden tests have access to the `TestBackend`
+# helper.
+ratatui = { version = "0.29", default-features = false, features = ["unstable-rendered-line-info"] }
+ratatui-image = { workspace = true }
+image = { workspace = true }
+
+# Grapheme / display-width aware measurement. Needed so wrap_height
+# matches terminal column width (CJK = 2, combining = 0, emoji = 2)
+# instead of ASCII char-count. Pinned independently of ratatui's
+# transitive dep so a ratatui bump can't silently regress our wrap.
+rebon-width = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-linebreak = "0.1"
+
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Snapshot testing is currently done by comparing raw buffer contents to
+# hand-authored golden strings — no extra deps required. Adding `insta`
+# later is cheap; keep this minimal.

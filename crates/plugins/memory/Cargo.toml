@@ -1,0 +1,33 @@
+[package]
+name = "rebon-plugin-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The `memory` feature plugin, and everything durable memory is: the SaveMemory tool on the kernel's tool seat, the auto-MEMORY.md section on its prompt seat, the nested_memory attachment on its attachment seat, the update notification on its turn-hook seat, the /memory browser, and the store all of them read and write."
+
+[dependencies]
+rebon-api.workspace = true
+# The command seat `/memory` registers on, and the spec type it hands over.
+rebon-command-seat.workspace = true
+rebon-kernel.workspace = true
+rebon-core.workspace = true
+rebon-tool.workspace = true
+rebon-tools-core.workspace = true
+rebon-types.workspace = true
+rebon-instructions.workspace = true
+rebon-session.workspace = true
+# The `settings.json` chain the `autoMemoryEnabled` switch is read through:
+# which files, in which order, and which one is the user layer in cowork mode.
+rebon-config.workspace = true
+rebon-dialog.workspace = true
+rebon-ui-seat.workspace = true
+
+async-trait.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+rebon-session-state.workspace = true
+tempfile = "3"
+tokio.workspace = true

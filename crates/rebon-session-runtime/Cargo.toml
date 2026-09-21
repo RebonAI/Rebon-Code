@@ -1,0 +1,73 @@
+[package]
+name = "rebon-session-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The session as every surface drives it: engine half, runtime, and the slash commands that act on it."
+
+[dependencies]
+# The layer below: job state, store, protocol, owner/lease, the thin client.
+# This crate is the host half that sits on top of it (the two cannot be
+# one crate because the host needs the store and the store must not need the
+# host).
+rebon-session-host.workspace = true
+
+rebon-acp.workspace = true
+rebon-acp-client.workspace = true
+rebon-agent-core.workspace = true
+rebon-api.workspace = true
+rebon-config.workspace = true
+rebon-dialog.workspace = true
+rebon-core.workspace = true
+rebon-harness.workspace = true
+rebon-hooks.workspace = true
+rebon-kernel-seats.workspace = true
+rebon-permissions.workspace = true
+rebon-picker.workspace = true
+rebon-plugin-host.workspace = true
+rebon-plugin-mcp.workspace = true
+rebon-plugin-memory.workspace = true
+rebon-plugin-profile.workspace = true
+rebon-plugin-skill.workspace = true
+rebon-plugin-tasks.workspace = true
+rebon-plugin-updater.workspace = true
+rebon-proto.workspace = true
+socket2.workspace = true
+rebon-provider.workspace = true
+# The transcript row model and the width helper. Neither draws: `rebon-tui`
+# only re-exports them (see `rebon-tui/src/message.rs`), and naming the source
+# is what keeps this crate off the terminal's dependency edge.
+rebon-render.workspace = true
+rebon-width.workspace = true
+rebon-session.workspace = true
+rebon-slash-commands.workspace = true
+rebon-tool.workspace = true
+rebon-tools-core.workspace = true
+rebon-types.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+flate2 = "1"
+fs2.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[features]
+# Exposes the fixtures and test-only helpers that `rebon-cli` needs for the
+# command tests that stayed with the terminal (they build an `AppState`, so
+# they cannot live here). Off by default; nothing in a release build reaches it.
+test-support = []
+
+[dev-dependencies]
+tempfile = "3"
+# One reaper test names the node sidecar to prove it is not reaped.
+rebon-node-runtime.workspace = true
+# Tests only: one `/context` test drives the terminal's reducer to check that
+# what the command reports matches what a screen would show. Nothing in the
+# library half names this crate.

@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "note": "What rebon declares on behalf of the packages it ships. Every plugin on the plane loads against a manifest — the ceiling on what it may register and reach — and a third-party package declares its own under `capabilities.kernelPlugins` in its `rebon-plugin.json`. These packages are vendored into rebon's payload, so rebon is the one that has to say what they do. `root` names which package the `entry` is relative to. It defaults to `package`, which in this table means the vendored JS tree an entry belongs to; `payload` says the same thing explicitly, and `runtime` names the composition runtime itself. `invokableTools: \"$rebon/tools\"` expands to every tool this build exposes to the plane — the honest declaration for a plugin that runs whatever tool a model picks.",
+  "packages": {
+    "cordis": { "entry": "vendor/cordis/index.js" },
+    "@deepseek-ai/cordis-plugin-timer": { "entry": "vendor/dsh/timer.js" },
+    "@deepseek-ai/cordis-plugin-logger-console": { "entry": "vendor/dsh/logger-console.js" },
+
+    "@deepseek-ai/dsh-llm-deepseek": {
+      "entry": "vendor/dsh/llm-deepseek.js",
+      "llmProviders": ["deepseek-official"],
+      "seats": ["credentials"]
+    },
+    "@deepseek-ai/dsh-tool-todo": {
+      "entry": "vendor/dsh/tool-todo.js",
+      "tools": ["todo_write"],
+      "publishedTopics": ["compose:session/append"]
+    },
+    "@deepseek-ai/dsh-tool-web": {
+      "entry": "vendor/dsh/tool-web.js",
+      "tools": ["web_search", "web_fetch"],
+      "invokableTools": ["WebSearch", "WebFetch"],
+      "publishedTopics": ["compose:session/append"]
+    },
+    "@deepseek-ai/dsh-web-search-exa": {
+      "entry": "vendor/dsh/web-search-exa.js",
+      "services": ["web:search:exa"],
+      "seats": ["credentials"]
+    },
+
+    "@deepseek-ai/dsh-session": { "entry": "vendor/dsh/session.js" },
+    "@deepseek-ai/dsh-agent": { "entry": "vendor/dsh/agent.js" },
+    "@deepseek-ai/dsh-system-prompt": { "entry": "vendor/dsh/system-prompt.js" },
+    "@deepseek-ai/dsh-agent-loop": {
+      "entry": "vendor/dsh/agent-loop.js",
+      "invokableTools": "$rebon/tools",
+      "seats": ["credentials"]
+    },
+
+    "rebon-loop-assembly": {
+      "root": "runtime",
+      "entry": "src/loop-assembly.mjs",
+      "services": ["loop:control"],
+      "publishedTopics": ["loop:event", "loop:agent-error", "loop:agent-created"],
+      "seats": ["logger"]
+    }
+  }
+}

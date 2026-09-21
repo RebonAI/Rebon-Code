@@ -1,0 +1,171 @@
+[package]
+name = "rebon-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "`rebon` binary — interactive TUI, ACP server, and the `rebon <command>` subcommands."
+default-run = "rebon"
+
+[[bin]]
+name = "rebon"
+path = "src/main.rs"
+
+[[bin]]
+name = "rebon-boa-helper"
+path = "src/bin/rebon-boa-helper.rs"
+
+[dependencies]
+rebon-acp.workspace = true
+rebon-acp-client.workspace = true
+rebon-agent-core.workspace = true
+rebon-proto.workspace = true
+rebon-session.workspace = true
+rebon-session-host.workspace = true
+rebon-session-runtime.workspace = true
+# `rebon mcp serve`: the background jobs as an MCP server.
+rebon-mcp-channel.workspace = true
+# `rebon rc`: the Remote Control runner.
+rebon-rc-runner.workspace = true
+rebon-slash-commands.workspace = true
+rebon-command-seat.workspace = true
+rebon-config.workspace = true
+rebon-types.workspace = true
+rebon-api.workspace = true
+rebon-plugin-profile.workspace = true
+rebon-plugin-tasks.workspace = true
+rebon-core.workspace = true
+rebon-harness.workspace = true
+# The three crates the harness was split into. The cli names them
+# directly rather than through a harness re-export, so a path says which
+# layer it reaches.
+rebon-kernel-seats.workspace = true
+rebon-provider.workspace = true
+rebon-plugin-host.workspace = true
+rebon-node-runtime.workspace = true
+rebon-permissions.workspace = true
+rebon-plugin-remote.workspace = true
+rebon-tool.workspace = true
+
+# Local TUI composition: `rebon-tui` owns both halves — the
+# renderer (transcript, streaming overlay, prompt input surface) and
+# the pure state machines that drive it, as its `promptinput`, `input`,
+# `layout` and `status` modules. The `tui` module composes them here —
+# one-way dep flow, no translation layer: crossterm events →
+# rebon_tui::promptinput plans → AppState → rebon-tui draw calls.
+rebon-tui.workspace = true
+rebon-spinner.workspace = true
+
+# Pure-logic UI crates that stayed out of `rebon-tui` because someone
+# other than this binary's terminal half depends on them: `rebon-dialog`
+# is the surface-agnostic DialogModel layer (five plugins, the kernel
+# seats and the GPUI app), `rebon-customselect` is a dependency of
+# `rebon-dialog`, `rebon-picker` of the onboarding plugin, and
+# `rebon-spinner` above is called straight from the app. Merging any of
+# them would hand ratatui to that consumer.
+rebon-design-system.workspace = true
+rebon-dialog.workspace = true
+rebon-ui-seat.workspace = true
+rebon-customselect.workspace = true
+rebon-picker.workspace = true
+rebon-shell.workspace = true
+
+# Further pure-logic UI crates — each wired with concrete usage
+# into the TUI composition layer (runner, dispatch, update, wiring).
+rebon-tools-core.workspace = true
+rebon-render.workspace = true
+rebon-plugin-updater.workspace = true
+rebon-hooks.workspace = true
+rebon-boa-runner.workspace = true
+rebon-plugin-mcp.workspace = true
+# The only owner of skills: the loader the session runs at startup, the
+# registry the front end reads for `/`-commands and `/skills`, and the tool.
+rebon-plugin-skill.workspace = true
+rebon-plugin-memory.workspace = true
+rebon-plugin-agents.workspace = true
+rebon-plugin-onboarding.workspace = true
+rebon-bridge.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+fs2.workspace = true
+ignore = "0.4"
+
+# Reqwest is needed directly by the rebon_config OAuth-refresh
+# helper — it POSTs to auth.openai.com/oauth/token when the cached
+# access token is within the 5-minute expiry buffer. The same
+# dependency already flows in transitively via rebon-api, so this
+# is an explicit re-declaration rather than a new workspace entry.
+reqwest.workspace = true
+# Gzip for plugin package tarballs. Already in the tree via reqwest's
+# transparent decompression; the plugin reader uses it directly.
+flate2 = "1"
+webbrowser.workspace = true
+# `rebon serve`: the browser side of the ACP server rides a WebSocket.
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+
+# Local TUI dependencies. Pinned to the same `ratatui 0.29` line used
+# by `rebon-tui` (the rendering crate) so we share the same backend /
+# buffer types without version skew. `default-features = false` +
+# explicit `crossterm` matches `rebon-tui`'s opt-in shape and also
+# gives us access to `ratatui::crossterm::*` as a single source of
+# truth for the crossterm API (events, keycodes, terminal control).
+# `scrolling-regions` deliberately disabled: that ratatui code path uses
+# DECSTBM scroll-region escapes (CSI r + scroll-within-region). Windows
+# Terminal and conhost honor the geometry but DON'T push content out the
+# top of the region into terminal scrollback — rows scrolled past the
+# region just disappear. The default (no-scrolling-regions) path uses
+# `scroll_up` which writes real newlines at the bottom of screen, and
+# every terminal pushes those into scrollback. Required for inline-mode
+# `insert_before` to actually deposit committed transcript rows into
+# scrollback on Windows.
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+rebon-width.workspace = true
+unicode-segmentation.workspace = true
+
+# Clipboard image paste (Alt+V). `arboard` reads OS clipboards on
+# Windows/macOS/X11/Wayland and returns RGBA pixel data when a bitmap
+# is present; `png` re-encodes that buffer into a PNG blob which we
+# then base64-encode and hand to `plan_image_paste` alongside the
+# `[Image #N]` chip. Base64 is already a workspace dep (used by the
+# onboarding PKCE flow).
+arboard = { version = "3", features = ["image-data"] }
+png = "0.17"
+base64.workspace = true
+
+# Windows console input, read in batches. A non-bracketed paste arrives
+# as two `INPUT_RECORD`s per character and crossterm reads exactly one
+# record per `ReadConsoleInputW` call, so a few hundred pasted lines cost
+# tens of thousands of console round trips (~60us each, measured) and the
+# prompt visibly stalls for a second or more. `runner::console_input_batch`
+# peeks the queue once and consumes the whole pasted run in a single call.
+# Both crates are already in the tree via `crossterm`'s Windows backend;
+# `winapi` is the same 0.3 line `crossterm_winapi`'s `INPUT_RECORD`
+# conversion is written against, so the record types line up.
+[target.'cfg(windows)'.dependencies]
+crossterm_winapi = "0.9"
+winapi = { version = "0.3", features = ["consoleapi", "wincon", "winuser"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[dev-dependencies]
+rebon-tool = { workspace = true, features = ["test-support"] }
+rebon-session-runtime = { workspace = true, features = ["test-support"] }
+# The shared `TaskSnapshot` builder for the Agent View row tests.
+rebon-plugin-tasks = { workspace = true, features = ["test-support"] }
+futures-util.workspace = true
+# Temporary directories and files for the binary's tests: fake
+# $REBON_CONFIG_DIR homes (the rebon_config unit tests among them),
+# throwaway projects roots and cwds, and scratch install layouts.
+tempfile = "3"

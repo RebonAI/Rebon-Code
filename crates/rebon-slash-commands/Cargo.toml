@@ -1,0 +1,12 @@
+[package]
+name = "rebon-slash-commands"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Slash-command catalog readers, parser, and side-effect-free text formatters shared by front ends. The live catalog is served by the command seat, with built-in data as the pre-boot fallback; runtime sampling and command dispatch belong to consumers. Framework-free; depends only on rebon-types and tracing."
+
+[dependencies]
+rebon-types.workspace = true
+tracing.workspace = true

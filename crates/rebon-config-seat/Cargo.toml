@@ -1,0 +1,12 @@
+[package]
+name = "rebon-config-seat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The kernel's `config-options` seat: where every row of the settings panel's Config tab is registered, by whoever owns the thing it configures, with a provider that reads the value now and applies a change. Registration is a kernel effect (dispose the context, the row is gone). Depends only on rebon-kernel and rebon-types."
+
+[dependencies]
+rebon-kernel.workspace = true
+rebon-types.workspace = true

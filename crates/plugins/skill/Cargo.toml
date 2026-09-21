@@ -1,0 +1,35 @@
+[package]
+name = "rebon-plugin-skill"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The `skill` feature plugin, and the only owner of skills: the pure-logic skill model (frontmatter, naming, discovery, bundled definitions), the loader that reads SKILL.md files off disk, the SkillRegistry the session carries in its ToolContext, the Skill tool, the skill_listing attachment, the progressive-discovery turn subscriber, and the /skills selector."
+
+[dependencies]
+rebon-api.workspace = true
+# The command seat `/skills` registers on, and the spec type it hands over.
+rebon-command-seat.workspace = true
+rebon-kernel.workspace = true
+rebon-core.workspace = true
+rebon-session.workspace = true
+rebon-session-state.workspace = true
+rebon-tool.workspace = true
+rebon-tools-core.workspace = true
+rebon-agent-core.workspace = true
+rebon-dialog.workspace = true
+rebon-ui-seat.workspace = true
+
+serde_json.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The regressions that moved here from the engine drive real turns.
+rebon-types.workspace = true
+tempfile = "3"
+# `start_paused` (instant backoff sleeps) needs tokio's test-util.
+tokio = { workspace = true, features = ["full", "test-util"] }

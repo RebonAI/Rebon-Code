@@ -1,0 +1,30 @@
+[package]
+name = "rebon-plugin-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The `web` feature plugin: WebFetch and WebSearch, plus the local Brave/DuckDuckGo/Bing search fallback they run when the provider has no server-side web search."
+
+[dependencies]
+rebon-kernel.workspace = true
+rebon-core.workspace = true
+rebon-tool.workspace = true
+rebon-tools-core.workspace = true
+# WebFetch reuses `web_fetch_hostname` so the `domain:` permission rule
+# convention keeps one owner.
+rebon-permissions.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+# SERP and article HTML parsing; `encoding_rs` decodes non-UTF-8 pages.
+scraper = { version = "0.23", default-features = false }
+ego-tree = "0.10"
+encoding_rs = "0.8"

@@ -1,0 +1,21 @@
+[package]
+name = "rebon-plugin-cron"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The `cron` feature plugin: CronCreate / CronList / CronDelete on the kernel's tool seat. Scheduling arithmetic and storage stay in rebon-tool's `cron` module, which the engine's scheduler also reads."
+
+[dependencies]
+rebon-kernel.workspace = true
+rebon-core.workspace = true
+rebon-tool.workspace = true
+rebon-tools-core.workspace = true
+
+async-trait.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio.workspace = true

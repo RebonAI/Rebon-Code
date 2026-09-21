@@ -1,0 +1,8 @@
+# TLS termination for the Rebon relay. Caddy provisions and renews the
+# certificate automatically, forwards WebSocket upgrades and the Authorization
+# header untouched, and appends the client IP to X-Forwarded-For (which the
+# relay trusts via REBON_RELAY_TRUST_FORWARDED_FOR). Request logging stays off
+# so no authorization values or query strings are ever written to logs.
+{$RELAY_DOMAIN} {
+	reverse_proxy relay:8080
+}

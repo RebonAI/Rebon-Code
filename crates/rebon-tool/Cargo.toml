@@ -1,0 +1,92 @@
+[package]
+name = "rebon-tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Tool trait and per-tool implementations for the rebon harness."
+
+[dependencies]
+# The model-facing half of `Tool::project_result_for_model`: a tool that
+# builds its own `ToolResultContent` speaks the same wire type the engine
+# hands the provider. Already in this crate's graph through
+# `rebon-agent-core`, so the edge costs nothing but says what it means.
+rebon-api.workspace = true
+# Leaf crate (no rebon-* deps of its own); WebFetch reuses its
+# `web_fetch_hostname` so the `domain:` rule convention has one owner.
+rebon-permissions.workspace = true
+rebon-types.workspace = true
+rebon-tools-core.workspace = true
+rebon-shell-policy.workspace = true
+# Config-home resolution and the atomic file write every sidecar goes through.
+rebon-session.workspace = true
+rebon-agent-core.workspace = true
+# Already in this crate's graph through `rebon-agent-core`. The direct edge is
+# for `command_sandbox`: the `session-sandbox` seat is a `rebon_kernel::Service`
+# definition, and a seat has to be declared where its consumers are — this
+# crate's `Bash` and `PowerShell` — not where the plugin that fills it is.
+rebon-kernel.workspace = true
+
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+url.workspace = true
+futures-util.workspace = true
+tokio-tungstenite.workspace = true
+# Local web search fallback parses DuckDuckGo/Bing SERP HTML when the
+# provider has no server-side web_search capability. WebFetch reuses
+# scraper for readable-text extraction and encoding_rs (already in the
+# tree via reqwest) for non-UTF-8 pages.
+scraper = { version = "0.23", default-features = false }
+# Same tree crate scraper 0.23 uses internally; WebFetch walks raw
+# nodes for text extraction.
+ego-tree = "0.10"
+encoding_rs = "0.8"
+globset = "0.4"
+# `ignore` is the same crate ripgrep uses. Gives grep/glob `.gitignore` +
+# `.ignore` respect and `max_filesize` so searches don't drown in
+# `node_modules`/`target`/minified bundles the way a raw `walkdir` did.
+ignore = "0.4"
+regex.workspace = true
+base64.workspace = true
+sha2.workspace = true
+image = { version = "0.24.9", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+
+# Cron scheduling uses local-tz date math (match TS behavior) and 8-hex-char
+# random task IDs.
+chrono.workspace = true
+fs2.workspace = true
+getrandom.workspace = true
+# Only for `test-support`; see the feature below.
+tempfile = { version = "3", optional = true }
+
+[features]
+# Exposes `tasks::test_support::TestConfigHome` and
+# `todo_write::clear_all_todos` to other crates' tests. The task, team and
+# queue tools moved into `rebon-plugin-tasks` but their stores stayed here,
+# so the fixture that points those stores at a temp config home has to cross
+# the crate boundary with them. Off by default; nothing in a release build
+# reaches it.
+test-support = ["dep:tempfile"]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3"

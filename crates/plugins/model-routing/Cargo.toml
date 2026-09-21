@@ -1,0 +1,26 @@
+[package]
+name = "rebon-plugin-model-routing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Experimental opt-in first-prompt model and effort routing"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+rebon-api.workspace = true
+rebon-config.workspace = true
+rebon-core.workspace = true
+rebon-kernel.workspace = true
+rebon-kernel-seats.workspace = true
+rebon-provider.workspace = true
+rebon-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+rebon-tool = { workspace = true, features = ["test-support"] }
+tempfile = "3"
+tokio.workspace = true

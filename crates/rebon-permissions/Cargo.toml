@@ -1,0 +1,34 @@
+[package]
+name = "rebon-permissions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Pure decision logic for the permissions system: request routing, dialog chrome projection, permission-rule explanation/logging strings, file/session suggestion generation, shell option builders, and feedback reducers."
+
+[dependencies]
+# Otherwise dependency-free. UI rendering, IDE-diff hooks, app-state
+# mutations, filesystem realpath probes, and tool-specific side effects are
+# modeled as owned data contracts and caller-provided inputs, never Cargo deps.
+#
+# `url` is one exception: a host-scoped permission rule is only sound if the
+# host it authorizes is the host the request actually contacts, and reqwest
+# resolves that host with this crate. A second, hand-rolled parser here is a
+# bypass waiting to happen, so both sides share this one.
+url = { workspace = true }
+
+# `rebon-tools-core` is the second: the behavior this crate decides on
+# (allow / deny / ask) is the same value the tool pipeline acts on, and a
+# second copy of that enum here is exactly the divergence a permission bug
+# hides in.
+rebon-tools-core = { workspace = true }
+
+# `rebon-shell-policy` is the third, and the same argument: a permission rule
+# matches the words a shell would run, so the split into words has to be the
+# one the rest of the tree uses. A second tokeniser here is a second set of
+# quoting rules, and the gap between them is a bypass.
+rebon-shell-policy = { workspace = true }
+
+[dev-dependencies]
+# Hand-rolled tests only; no test framework.

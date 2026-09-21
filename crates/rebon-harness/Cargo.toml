@@ -1,0 +1,78 @@
+[package]
+name = "rebon-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "In-process rebon agent session assembly: resolves a provider (rebon-config), builds the ModelClient middleware stack, and constructs an EngineQueryExecutor-backed session. Shared by rebon-cli (TUI/ACP) and the GPUI app via build_headless_session."
+
+[dependencies]
+rebon-kernel.workspace = true
+# The three crates split out of this one. The harness names all three
+# because assembly is what it does; none of them names the harness back.
+rebon-kernel-seats.workspace = true
+rebon-provider.workspace = true
+rebon-plugin-host.workspace = true
+# Feature plugins. The dependency runs
+# one way only: the harness lists them, a plugin never reaches back here.
+rebon-plugin-cron.workspace = true
+rebon-plugin-web.workspace = true
+rebon-plugin-monitor.workspace = true
+rebon-plugin-memory.workspace = true
+rebon-plugin-notebook.workspace = true
+rebon-plugin-structured-output.workspace = true
+rebon-plugin-profile.workspace = true
+rebon-plugin-computer-use.workspace = true
+rebon-plugin-image-gen.workspace = true
+rebon-plugin-skill.workspace = true
+rebon-plugin-escalation.workspace = true
+rebon-plugin-mcp.workspace = true
+rebon-plugin-tasks.workspace = true
+rebon-plugin-plan-mode.workspace = true
+rebon-plugin-agents.workspace = true
+rebon-plugin-workflow.workspace = true
+rebon-plugin-model-prompt.workspace = true
+rebon-plugin-model-routing.workspace = true
+rebon-plugin-updater.workspace = true
+rebon-plugin-remote.workspace = true
+rebon-plugin-onboarding.workspace = true
+rebon-plugin-sandbox.workspace = true
+# TurnJournal / TranscriptJournal for the kernel loop backend (all builds:
+# the V8-free sidecar path shares the same backend and translator).
+rebon-acp-client.workspace = true
+# MCP server entries used by agent assembly. `tests/acp_engine_e2e.rs`
+# also builds a raw JSON-RPC response to answer reverse-RPC permissions.
+rebon-proto.workspace = true
+rebon-config.workspace = true
+rebon-api.workspace = true
+rebon-core.workspace = true
+rebon-tool.workspace = true
+rebon-tools-core.workspace = true
+rebon-acp.workspace = true
+rebon-agent-core.workspace = true
+rebon-session.workspace = true
+rebon-permissions.workspace = true
+rebon-hooks.workspace = true
+rebon-plugin-package.workspace = true
+rebon-types.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures-util.workspace = true
+
+[dev-dependencies]
+rebon-tool = { workspace = true, features = ["test-support"] }
+# Test-only: the modules that used them in the library moved out, so only
+# the boot tests read the command seat and the node-host service, and the
+# seat-membership test speaks the plugin host's invocation types.
+rebon-command-seat.workspace = true
+rebon-slash-commands.workspace = true
+rebon-plugin-node-host.workspace = true
+rebon-plugin-protocol.workspace = true
+rebon-plugin-supervisor.workspace = true
+tempfile = "3"

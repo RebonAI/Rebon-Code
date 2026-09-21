@@ -1,0 +1,56 @@
+[package]
+name = "rebon-kernel-seats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The built-in Core seats the kernel boots with: tools, dialogs, settings and credentials, the session scope, prompt sections, the web router, the composition tool registry and its dispatch, the `run_code` Code Mode tool, the built-in slash commands, and the tool ask/invoke pair a composed plugin reaches rebon's own tools through."
+
+[dependencies]
+# The seats themselves and the plugins that provide them.
+rebon-kernel.workspace = true
+# `core-commands` registers the built-in table on the `command-registry` seat
+# and installs the source `rebon_slash_commands::{all, find}` read through.
+rebon-command-seat.workspace = true
+rebon-slash-commands.workspace = true
+# The wire types the tool-invoke seat answers a composed plugin in
+# (`ToolInvoker` lives on the supervisor's request table).
+rebon-plugin-protocol.workspace = true
+rebon-plugin-supervisor.workspace = true
+# `ToolSeatService` and friends: the engine owns the seat definitions these
+# plugins provide on, plus the tool pipeline `run_code` dispatches through.
+rebon-core.workspace = true
+# `Tool`, `ToolContext`, `ToolFilter` — what a seat registers and what it hands
+# a session.
+rebon-tool.workspace = true
+# `BUILTIN_TOOL_FACTS`: the one place a tool's name, aliases and kind live.
+rebon-tools-core.workspace = true
+# The dialog registry seat's `ViewSpec` payloads.
+rebon-dialog.workspace = true
+rebon-ui-seat.workspace = true
+# Settings and credentials the config seats and Code Mode read.
+rebon-config.workspace = true
+# `default_projects_root` for the session seat's transcript root.
+rebon-session.workspace = true
+rebon-types.workspace = true
+# Code Mode runs its program in the same restricted Node runtime the plugin
+# host uses, through the shared code runner.
+rebon-code-runner.workspace = true
+rebon-node-runtime.workspace = true
+# The task registry the session scopes hand across a turn.
+rebon-plugin-tasks.workspace = true
+# Code Mode's model-facing instructions come from the prompt plugin's table.
+rebon-plugin-model-prompt.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+# `BoxFuture` for the nested tool dispatch Code Mode drives.
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rebon-tool = { workspace = true, features = ["test-support"] }
+tempfile = "3"

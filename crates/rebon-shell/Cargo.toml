@@ -1,0 +1,17 @@
+[package]
+name = "rebon-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Pure shell presentation and stats logic with no IO or rebon-* dependencies. Covers shell-output expansion, OutputLine projection, ShellTimeDisplay, ShellProgressMessage, date ranges, factoids, shot stats, and chart-data prep."
+
+[dependencies]
+serde_json = { workspace = true }
+# Deliberately near-dependency-free. `serde_json` is only used to probe and
+# pretty-print JSON lines; terminal width, hyperlink support and verbose mode
+# all arrive as plain input fields, so no rendering crate is needed.
+
+[dev-dependencies]
+# The test matrix is hand-rolled — no extra dev dependencies.

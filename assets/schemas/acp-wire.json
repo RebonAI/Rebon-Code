@@ -1,0 +1,4042 @@
+{
+  "$defs": {
+    "ActionResult": {
+      "description": "What the four `/api/*` levers answer: task cancel and dismiss, MCP\nreconnect and disconnect, a rewind, a compaction.\n\n`ok` is whether the thing was done, not whether the request was\nunderstood — a request that was not understood is a 400 with a reason and\nnever reaches this shape.",
+      "properties": {
+        "message": {
+          "description": "What to show the person who asked.",
+          "type": "string"
+        },
+        "ok": {
+          "description": "Whether it happened.",
+          "type": "boolean"
+        },
+        "prefillPrompt": {
+          "description": "A rewind hands back the prompt of the turn it rewound to, so the\ncomposer can be refilled with it. Absent on every other lever, and on\na rewind the owner performed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turns": {
+          "description": "How many turns the rewound conversation has left. Absent for the\nsame reason.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "ok",
+        "message"
+      ],
+      "type": "object"
+    },
+    "AgentCapabilities": {
+      "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "loadSession": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "mcpCapabilities": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "promptCapabilities": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PromptCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sessionCapabilities": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionCapabilities"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "AgentEntry": {
+      "description": "One entry of [`AgentsResponse::agents`].",
+      "properties": {
+        "background": {
+          "description": "Whether it runs in the background by default.",
+          "type": "boolean"
+        },
+        "description": {
+          "description": "When to use it, from the definition's own words.",
+          "type": "string"
+        },
+        "effort": {
+          "description": "The reasoning effort it pins, or `null`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "The model it pins, or `null` to follow the session's.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The agent type, which is what a spawn names.",
+          "type": "string"
+        },
+        "provider": {
+          "description": "The provider it pins, or `null`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runtime": {
+          "description": "Which runtime runs it.",
+          "type": "string"
+        },
+        "source": {
+          "description": "Where the definition came from: `builtin`, `plugin:<name>`, `user`,\n`project`, `local`, `flag`, `policy`.",
+          "type": "string"
+        },
+        "tools": {
+          "description": "The tools it is allowed, or `null` for the default set.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "runtime",
+        "background",
+        "source"
+      ],
+      "type": "object"
+    },
+    "AgentOption": {
+      "description": "One entry of [`ServerInfo::agents`].",
+      "properties": {
+        "id": {
+          "description": "The value to set the agent config option to.",
+          "type": "string"
+        },
+        "label": {
+          "description": "What to show in the picker.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "AgentsResponse": {
+      "description": "`GET /api/agents`.",
+      "properties": {
+        "agents": {
+          "description": "Every agent definition this server can run.",
+          "items": {
+            "$ref": "#/$defs/AgentEntry"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "agents"
+      ],
+      "type": "object"
+    },
+    "AnswerQuestionsParams": {
+      "description": "[`method::ANSWER_QUESTIONS`]: the answer to an AskUserQuestion.\n\nIts own method rather than the standard permission answer because\nAskUserQuestion is several questions with several selected options each,\nand the standard result carries one option id.",
+      "properties": {
+        "answers": {
+          "items": {
+            "$ref": "#/$defs/ForegroundQuestionAnswer"
+          },
+          "type": "array"
+        },
+        "queryId": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "turnGeneration": {
+          "default": 0,
+          "description": "Fences the answer against the turn that asked. Defaulted for the wire\nso a peer from before this field reads as turn zero, which is what it\nalways meant.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "queryId",
+        "answers"
+      ],
+      "type": "object"
+    },
+    "AssistantContentBlock": {
+      "description": "A single content block inside an assistant message. Dispatched\nby the `type` discriminant.\n\nThe deferred variants (`server_tool_use`, `advisor_tool_result`,\n`connector_text`, plus any future Anthropic content block\nvariants) fall through to [`AssistantContentBlock::Other`] via\n`#[serde(other)]`, preserving the raw JSON so legacy rows don't\nbreak parsing.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/AssistantTextBlock",
+          "properties": {
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/AssistantThinkingBlock",
+          "properties": {
+            "type": {
+              "const": "thinking",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/AssistantRedactedThinkingBlock",
+          "properties": {
+            "type": {
+              "const": "redacted_thinking",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/AssistantToolUseBlock",
+          "properties": {
+            "type": {
+              "const": "tool_use",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/AssistantGeneratedImageBlock",
+          "properties": {
+            "type": {
+              "const": "generated_image",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "const": "other",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AssistantGeneratedImageBlock": {
+      "description": "`{ type: 'generated_image', id, status?, revised_prompt?, media_type,\ndata, saved_path? }` — the assistant-side image payload produced by\nthe OpenAI Responses `image_generation` built-in tool. Kept aligned\nwith `rebon_api::GeneratedImageBlock` so transcripts round-trip.\n\nRebon no longer requests that tool (image generation is the `ImageGen`\ntool now); the block stays so transcripts written before still render.\n`data` is optional because the engine of that time stripped the base64\npayload once it had saved the image, leaving `saved_path` as the\nload-bearing field — the renderer surfaces that and the revised prompt.",
+      "properties": {
+        "data": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "media_type": {
+          "default": "image/png",
+          "type": "string"
+        },
+        "revised_prompt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "saved_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "AssistantMessage": {
+      "description": "One assistant row as persisted in a transcript line.\n\nOnly the fields the renderer reads are modelled; the engine-side\nbookkeeping (`requestId`, `apiError`, `error`, `errorDetails`,\n`isVirtual`, `usage`, `message.id`, `message.model`,\n`message.stop_reason`, `message.container`,\n`message.context_management`) is not duplicated here — it will\nland as part of the engine bridge.",
+      "properties": {
+        "advisorModel": {
+          "description": "`advisorModel` — threaded to advisor rows. Advisor blocks\nare not rendered yet but the field is preserved so round-trip\nstays lossless.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "isApiErrorMessage": {
+          "description": "`isApiErrorMessage` — keeps API error rows visible even in\nbrief-only mode.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "isStreamContinuation": {
+          "description": "`Some(true)` on a row minted when the inline overflow flush split\none still-streaming text block across scrollback commits. The\nrenderer joins such a row to the previous one — no leading margin,\nno gutter dot — so the split halves read as a single message.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "message": {
+          "$ref": "#/$defs/AssistantMessageInner"
+        },
+        "timestamp": {
+          "type": "string"
+        },
+        "uuid": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "uuid",
+        "timestamp",
+        "message"
+      ],
+      "type": "object"
+    },
+    "AssistantMessageInner": {
+      "description": "The `message` sub-object on an assistant row.",
+      "properties": {
+        "content": {
+          "items": {
+            "$ref": "#/$defs/AssistantContentBlock"
+          },
+          "type": "array"
+        },
+        "role": {
+          "$ref": "#/$defs/AssistantRole",
+          "default": "assistant",
+          "description": "Tolerated when absent, for the same reason as\n[`UserMessageInner::role`]."
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
+    },
+    "AssistantRedactedThinkingBlock": {
+      "description": "`{ type: 'redacted_thinking', data: '...' }` — the renderer shows\na `[redacted thinking]` placeholder and never reveals `data`.",
+      "properties": {
+        "data": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "AssistantRole": {
+      "enum": [
+        "assistant"
+      ],
+      "type": "string"
+    },
+    "AssistantTextBlock": {
+      "description": "`{ type: 'text', text: '...' }`.",
+      "properties": {
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "AssistantThinkingBlock": {
+      "description": "`{ type: 'thinking', thinking: '...' }` — note the inner field is\n`thinking`, not `text`, per the Anthropic SDK schema.",
+      "properties": {
+        "signature": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thinking": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thinking"
+      ],
+      "type": "object"
+    },
+    "AssistantToolUseBlock": {
+      "description": "`{ type: 'tool_use', id, name, input }`. The `input` is opaque\nAnthropic-SDK JSON — this code doesn't introspect it; per-tool\nrendering lands in future renderer extensions.",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "input": {
+          "default": null
+        },
+        "name": {
+          "type": "string"
+        },
+        "raw_output": {
+          "description": "Raw tool output payload, retained in-memory so rewind can\nrestore file contents for the current session.\n\nAlso on the wire, and not redundant with `tool_call_content`:\n`enrich_tool_use_blocks` leaves that `None` for a result with no\nstructured update content, and this is then the only carrier of\nthe output a card has to show."
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolCallStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional lifecycle status. Set live during a turn and on replay\nfrom the matching `tool_result`; serialized when present so a\ncard off the wire can tell a completed call from a failed one."
+        },
+        "tool_call_content": {
+          "description": "Tool call content payloads (e.g. `Diff` for Edit tools).\n\nPopulated from the streaming overlay when the tool completes, and\non replay by [`crate::transcript_replay::enrich_tool_use_blocks`]\nfrom the matching `tool_result`. Serialized when present so a\nsurface reading rows off the wire sees the tool output the\nterminal sees; absent when there is none, so a row that was never\nenriched serializes to exactly the bytes it did before.",
+          "items": {
+            "$ref": "#/$defs/ToolCallContent"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "AttachmentRow": {
+      "description": "`{ type: 'attachment', attachment: ... }` row wrapper. The inner\n`attachment` payload is kept as opaque JSON: the rich typed attachment\nshape lives with the engine, and keeping it opaque here avoids\ncross-crate type bleed.",
+      "properties": {
+        "attachment": true,
+        "timestamp": {
+          "type": "string"
+        },
+        "uuid": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "uuid",
+        "timestamp",
+        "attachment"
+      ],
+      "type": "object"
+    },
+    "AudioContent": {
+      "properties": {
+        "annotations": true,
+        "data": {
+          "type": "string"
+        },
+        "mimeType": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "mimeType",
+        "data"
+      ],
+      "type": "object"
+    },
+    "AuthMethod": {
+      "additionalProperties": true,
+      "description": "One way to authenticate with an agent, as advertised in\n`initialize`.\n\nThe spec's shape is `{ id, name, description? }`. Every field is\noptional here and unknown keys are kept, on purpose: nothing in\nRebon reads this yet, and an agent that grows a field would\notherwise fail the *whole* handshake over a value nobody looked at.\nA real agent already broke this once — `@agentclientprotocol/codex-acp`\nsends `{id, name, description, _meta}`, and requiring a `type` field\nthat the spec never had made `initialize` undecodable.",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "AutoModeAllowSource": {
+      "description": "Which part of the auto-mode gate let a tool call run without a dialog.\n\nDisplay-only, and worth distinguishing because the three are not the same\nevent: a classifier verdict is the machine's judgement, a cached verdict is\nthat judgement replayed, and an exemption is the *user's* own approval — a\nrow that says \"auto mode allowed this\" over an approval the user gave by\nhand misattributes it.",
+      "oneOf": [
+        {
+          "const": "classifier",
+          "description": "A fresh classifier verdict cleared the call.",
+          "type": "string"
+        },
+        {
+          "const": "cachedVerdict",
+          "description": "A classifier verdict remembered from an identical earlier call.",
+          "type": "string"
+        },
+        {
+          "const": "userExemption",
+          "description": "The user approved this call themselves (a `/permissions` retry).",
+          "type": "string"
+        },
+        {
+          "const": "unspecified",
+          "description": "Source not recorded — a transcript or a peer written before the\nsource was carried. Renders as the original unattributed note.",
+          "type": "string"
+        }
+      ]
+    },
+    "BackgroundIpcCancelFence": {
+      "properties": {
+        "pendingPermissionQueryId": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/BackgroundJobStatus"
+        },
+        "turnGeneration": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "updatedAtMs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "status",
+        "turnGeneration",
+        "updatedAtMs"
+      ],
+      "type": "object"
+    },
+    "BackgroundIpcEndpoint": {
+      "properties": {
+        "pid": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "port": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pid",
+        "port",
+        "token"
+      ],
+      "type": "object"
+    },
+    "BackgroundJobStatus": {
+      "enum": [
+        "queued",
+        "running",
+        "needs_input",
+        "idle",
+        "succeeded",
+        "failed",
+        "stopped"
+      ],
+      "type": "string"
+    },
+    "BackgroundPermissionOptionSnapshot": {
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "optionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "optionId",
+        "label",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "BackgroundPermissionQuerySnapshot": {
+      "properties": {
+        "endpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackgroundIpcEndpoint"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": true,
+        "options": {
+          "items": {
+            "$ref": "#/$defs/BackgroundPermissionOptionSnapshot"
+          },
+          "type": "array"
+        },
+        "queryId": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tool": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "toolCallId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "toolInput": true,
+        "turnGeneration": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "queryId",
+        "options"
+      ],
+      "type": "object"
+    },
+    "CancelCallParams": {
+      "description": "[`method::CANCEL_CALL`].\n\nNot a cancel of the *turn*: that is `session/cancel`. This releases one\ncall, because a client timeout that only drops its own receiver leaves the\nowner working on something nobody will read.",
+      "properties": {
+        "commandId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "commandId"
+      ],
+      "type": "object"
+    },
+    "CancelCallResult": {
+      "description": "Whether a waiter was actually let go.\n\nAlways an ok answer: cancelling a call that is not running is not a\nfailure, it is \"nothing to release\" — which is what a client that raced its\nown timeout needs to hear.",
+      "properties": {
+        "released": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "released"
+      ],
+      "type": "object"
+    },
+    "CancelTasksParams": {
+      "description": "[`method::CANCEL_TASKS`].",
+      "properties": {
+        "taskIds": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "ClientLease": {
+      "description": "One client holding a session open.",
+      "properties": {
+        "clientId": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ClientLeaseKind"
+        },
+        "pid": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "updatedAtMs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "clientId",
+        "kind",
+        "updatedAtMs"
+      ],
+      "type": "object"
+    },
+    "ClientLeaseKind": {
+      "description": "Which surface a lease belongs to. Carried so `rebon agents` and the Agent\nView can say *who* is holding a session open rather than only that someone\nis.",
+      "enum": [
+        "tui",
+        "app",
+        "serve",
+        "cli"
+      ],
+      "type": "string"
+    },
+    "CommandOutput": {
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "tone": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "tone"
+      ],
+      "type": "object"
+    },
+    "CompactParams": {
+      "description": "[`method::COMPACT`].",
+      "properties": {
+        "instructions": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ConfigOption": {
+      "properties": {
+        "category": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "currentValue": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "options": {
+          "items": {
+            "$ref": "#/$defs/ConfigOptionValue"
+          },
+          "type": "array"
+        },
+        "type": {
+          "$ref": "#/$defs/ConfigOptionType"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "type",
+        "currentValue",
+        "options"
+      ],
+      "type": "object"
+    },
+    "ConfigOptionType": {
+      "enum": [
+        "select",
+        "text"
+      ],
+      "type": "string"
+    },
+    "ConfigOptionValue": {
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "value",
+        "name"
+      ],
+      "type": "object"
+    },
+    "ContentBlock": {
+      "description": "MCP-compatible content block.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/TextContent",
+          "properties": {
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ImageContent",
+          "properties": {
+            "type": {
+              "const": "image",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/AudioContent",
+          "properties": {
+            "type": {
+              "const": "audio",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ResourceContent",
+          "properties": {
+            "type": {
+              "const": "resource",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ResourceLinkContent",
+          "properties": {
+            "type": {
+              "const": "resource_link",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DiffContent": {
+      "description": "Diff content payload — `oldText` may be `null` (when the file did not\nexist). `old_text` is optional, so the wire form `\"oldText\": null`\nround-trips faithfully.",
+      "properties": {
+        "newText": {
+          "type": "string"
+        },
+        "oldText": {
+          "description": "**Always serialized** — `null` rather than omitted when `None`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "oldText",
+        "newText"
+      ],
+      "type": "object"
+    },
+    "FilesResponse": {
+      "description": "`GET /api/files` — the file picker's candidates for one workspace.",
+      "properties": {
+        "files": {
+          "description": "The candidates, a directory marked by a trailing slash.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "problem": {
+          "description": "Why the directory could not be listed. Absent when it could.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "root": {
+          "description": "The directory the paths are relative to.",
+          "type": "string"
+        },
+        "scanning": {
+          "description": "Whether the workspace index is still being built, so an empty list\nmeans \"not yet\" rather than \"nothing\".",
+          "type": "boolean"
+        },
+        "truncated": {
+          "description": "Whether more matched than were returned.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "root",
+        "files",
+        "truncated",
+        "scanning"
+      ],
+      "type": "object"
+    },
+    "ForegroundQuestion": {
+      "description": "One interactive question (AskUserQuestion), mirrored for the controller.",
+      "properties": {
+        "header": {
+          "type": "string"
+        },
+        "multiSelect": {
+          "type": "boolean"
+        },
+        "options": {
+          "items": {
+            "$ref": "#/$defs/ForegroundQuestionOption"
+          },
+          "type": "array"
+        },
+        "question": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "header",
+        "question",
+        "multiSelect",
+        "options"
+      ],
+      "type": "object"
+    },
+    "ForegroundQuestionAnswer": {
+      "description": "The controller's answer to one interactive question: chosen option indices\nplus optional free-form text. With no selected option the text is an Other\nanswer; with selected options it is supplemental notes.",
+      "properties": {
+        "otherText": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selectedOptions": {
+          "default": [],
+          "items": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "ForegroundQuestionOption": {
+      "description": "One option of an interactive question, mirrored from the engine's\n`AskUserQuestionOption` so the controller can render it.",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "preview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "label",
+        "description"
+      ],
+      "type": "object"
+    },
+    "GapParams": {
+      "description": "[`method::GAP`]: the owner dropped deltas from its ring.\n\nWhat is missing between `from` and `to` is in the events file, which is the\nauthority; the client reads it from there and resumes. A gap is never an\nerror — an owner that outran a slow client is doing the right thing.",
+      "properties": {
+        "from": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "to": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "HelloParams": {
+      "description": "[`method::HELLO`], the first message on a new subscription.",
+      "properties": {
+        "cursor": {
+          "description": "Where the stream is resuming from.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "epoch": {
+          "description": "The owner's numbering. It restarts each time an owner starts, so a\ncursor alone cannot be compared with one written by its predecessor.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/$defs/SessionStatusSnapshot"
+        }
+      },
+      "required": [
+        "epoch",
+        "cursor",
+        "status"
+      ],
+      "type": "object"
+    },
+    "HistorySnapshot": {
+      "description": "`GET /api/history` — a session as the page reopens it.",
+      "properties": {
+        "cwd": {
+          "description": "The directory it belongs to.",
+          "type": "string"
+        },
+        "messages": {
+          "description": "**Deprecated.** The model's view of the\nsession, folded a second and different way: it carries tools meant\nfor their own surface, and it deletes a whole user block where the\nrow stream keeps the half a person typed. Nothing first-party reads\nit; `rows` is what the terminal, the page and the desktop app show."
+        },
+        "rows": {
+          "description": "The display rows the terminal draws, from the one producer."
+        },
+        "sessionId": {
+          "description": "The session read.",
+          "type": "string"
+        },
+        "title": {
+          "description": "Its title, or `null` for one that has none.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionId",
+        "cwd",
+        "rows",
+        "messages"
+      ],
+      "type": "object"
+    },
+    "ImageContent": {
+      "properties": {
+        "annotations": true,
+        "data": {
+          "type": "string"
+        },
+        "mimeType": {
+          "type": "string"
+        },
+        "uri": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "mimeType",
+        "data"
+      ],
+      "type": "object"
+    },
+    "ImplementationInfo": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "InitializeResult": {
+      "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "description": "Top-level extension data — a sibling of `agentCapabilities`,\nnot inside it. This is where the steering wire protocol\nadvertises itself: both `claude-agent-acp` and `codex-acp` put\n`{\"steering\": {\"supported\": true}}` here. `default` keeps\nagents without it decodable, which is also the compatibility\nstory: no `_meta`, no steering, fall back to queueing.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "agentCapabilities": {
+          "$ref": "#/$defs/AgentCapabilities"
+        },
+        "agentInfo": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImplementationInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "authMethods": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AuthMethod"
+          },
+          "type": "array"
+        },
+        "protocolVersion": {
+          "format": "int32",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "agentCapabilities"
+      ],
+      "type": "object"
+    },
+    "JsonRpcError": {
+      "description": "A JSON-RPC 2.0 error object.",
+      "properties": {
+        "code": {
+          "format": "int32",
+          "type": "integer"
+        },
+        "data": true,
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "KernelLoopOption": {
+      "description": "One kernel loop vendor, and whether this session could switch to it.",
+      "properties": {
+        "backendId": {
+          "description": "The backend name a switch would name.",
+          "type": "string"
+        },
+        "bundled": {
+          "description": "Whether this build carries the vendor's assembly. A known but\nunbundled vendor keeps its seat so the switch can say so loudly\ninstead of \"no such vendor\".",
+          "type": "boolean"
+        },
+        "configured": {
+          "description": "Whether a provider and model are configured for it.",
+          "type": "boolean"
+        },
+        "id": {
+          "description": "The vendor id: the `/kernel` argument and the config key.",
+          "type": "string"
+        },
+        "label": {
+          "description": "Human label for the list.",
+          "type": "string"
+        },
+        "model": {
+          "description": "The configured model, or `null`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "description": "The configured provider, or `null`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "switchable": {
+          "description": "Whether the router has this backend to switch to.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "bundled",
+        "backendId",
+        "configured",
+        "switchable"
+      ],
+      "type": "object"
+    },
+    "LeaseParams": {
+      "description": "[`method::LEASE`]. While any lease is live the owner stays up.",
+      "properties": {
+        "clientId": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ClientLeaseKind"
+        }
+      },
+      "required": [
+        "clientId",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "McpCapabilities": {
+      "properties": {
+        "http": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "sse": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "McpServerEntry": {
+      "description": "One MCP server.",
+      "properties": {
+        "error": {
+          "description": "The warning naming this server, if one does.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The name it is configured or connected under.",
+          "type": "string"
+        },
+        "status": {
+          "description": "`connected`, `failed`, `not started` or `disconnected`.",
+          "type": "string"
+        },
+        "tools": {
+          "description": "The tool names it contributes, prefixed. Empty unless connected.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "transport": {
+          "description": "`stdio`, `http` or `sse`; `null` for a server that only the client\nknows about, which is how an env-declared one arrives.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "status",
+        "tools"
+      ],
+      "type": "object"
+    },
+    "McpServerSnapshot": {
+      "description": "One MCP server the owner has configured, as the owner sees it.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "source": {
+          "description": "Where the entry came from: the project's `.mcp.json`, the CLI, a\nplugin.",
+          "type": "string"
+        },
+        "transport": {
+          "description": "`stdio`, `http` or `sse`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "transport",
+        "source"
+      ],
+      "type": "object"
+    },
+    "McpStatus": {
+      "description": "`GET /api/mcp` — the MCP servers this process configured and connected.",
+      "properties": {
+        "problem": {
+          "description": "Why the configuration could not be read at all.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "servers": {
+          "description": "One per server, configured or merely connected.",
+          "items": {
+            "$ref": "#/$defs/McpServerEntry"
+          },
+          "type": "array"
+        },
+        "warnings": {
+          "description": "Per-server warnings the loader collected.\n\nThe server has always sent these; declaring them here changes no\nbytes and lets the page read them without a cast.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "servers",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    "McpStatusSnapshot": {
+      "description": "The owner's MCP servers, for a client that hosts none of its own.\n\nNames and states only, never a tool's schema: this rides on every\n`status` event, and a client shows it rather than calling anything\nthrough it.",
+      "properties": {
+        "client": {
+          "description": "`ready`, `pending` or `not connected`.",
+          "type": "string"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "loader": {
+          "description": "`loading`, `ready`, `failed` or `not configured`.",
+          "type": "string"
+        },
+        "servers": {
+          "items": {
+            "$ref": "#/$defs/McpServerSnapshot"
+          },
+          "type": "array"
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/$defs/McpToolSnapshot"
+          },
+          "type": "array"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "loader",
+        "client"
+      ],
+      "type": "object"
+    },
+    "McpToolSnapshot": {
+      "description": "One tool the owner's MCP servers offer the model.",
+      "properties": {
+        "name": {
+          "description": "The `mcp__<server>__<tool>` name the model calls it by.",
+          "type": "string"
+        },
+        "tokens": {
+          "description": "What its definition costs the context, approximately.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "tokens"
+      ],
+      "type": "object"
+    },
+    "ModelOption": {
+      "description": "One entry of [`ModelsResponse::models`].",
+      "properties": {
+        "id": {
+          "description": "The model id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "ModelsResponse": {
+      "description": "`GET /api/models` — what this session can be switched to.",
+      "properties": {
+        "current": {
+          "description": "The model id in use.",
+          "type": "string"
+        },
+        "models": {
+          "description": "Every model the provider offers, the current one first if it is not\namong them.",
+          "items": {
+            "$ref": "#/$defs/ModelOption"
+          },
+          "type": "array"
+        },
+        "provider": {
+          "description": "The active custom provider, or the runtime's own provider name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "current",
+        "models"
+      ],
+      "type": "object"
+    },
+    "OutOfRangeRuntime": {
+      "description": "A Node that answered, but not with a version this build accepts.",
+      "properties": {
+        "executable": {
+          "description": "Where it lives.",
+          "type": "string"
+        },
+        "version": {
+          "description": "The version it reported.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "executable"
+      ],
+      "type": "object"
+    },
+    "PermissionOption": {
+      "description": "One option offered to the client when the agent asks for permission.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/PermissionOptionKind"
+        },
+        "name": {
+          "type": "string"
+        },
+        "optionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "optionId",
+        "name",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "PermissionOptionKind": {
+      "description": "Permission option kind.",
+      "enum": [
+        "allow_once",
+        "allow_always",
+        "reject_once",
+        "reject_always"
+      ],
+      "type": "string"
+    },
+    "PermissionOutcome": {
+      "description": "Outcome of a `session/request_permission` round-trip.",
+      "enum": [
+        "selected",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "PlanEntry": {
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "priority": {
+          "$ref": "#/$defs/PlanEntryPriority"
+        },
+        "status": {
+          "$ref": "#/$defs/PlanEntryStatus"
+        }
+      },
+      "required": [
+        "content",
+        "priority",
+        "status"
+      ],
+      "type": "object"
+    },
+    "PlanEntryPriority": {
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "type": "string"
+    },
+    "PlanEntryStatus": {
+      "enum": [
+        "pending",
+        "in_progress",
+        "completed"
+      ],
+      "type": "string"
+    },
+    "PluginEntry": {
+      "description": "One entry of the composition, and whether it loaded.\n\nA projection of the server's own `ComposeEntry`, not that type: the entry\ncarries a dozen more fields — config, seats, topics, command names — and\nthis listing shows seven of them.",
+      "properties": {
+        "entry": {
+          "description": "The module inside that package.",
+          "type": "string"
+        },
+        "id": {
+          "description": "The plugin id.",
+          "type": "string"
+        },
+        "llmProviders": {
+          "description": "LLM providers it declares.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "loaded": {
+          "description": "Whether this entry is in the running plane's loaded set.",
+          "type": "boolean"
+        },
+        "root": {
+          "description": "The package it loads from.",
+          "type": "string"
+        },
+        "services": {
+          "description": "Services it declares.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tools": {
+          "description": "Tools it declares.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "root",
+        "entry",
+        "loaded",
+        "services",
+        "tools",
+        "llmProviders"
+      ],
+      "type": "object"
+    },
+    "PluginPlaneStatus": {
+      "description": "The running plane, or the reasons there is none.",
+      "properties": {
+        "generation": {
+          "description": "Which generation it is, or `null` when nothing is running.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "loaded": {
+          "description": "The ids that loaded.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "problem": {
+          "description": "Why the composition could not be read at all.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "refusal": {
+          "description": "Why the composition was refused, in the refusal's own words.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "running": {
+          "description": "Whether a plane is up in this process.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "running",
+        "loaded"
+      ],
+      "type": "object"
+    },
+    "PluginRuntimeStatus": {
+      "description": "The Node runtime under a plugin plane.",
+      "properties": {
+        "configuredPlugins": {
+          "description": "How many entries `kernelPlugins` asks for. Zero is a normal state,\nnot a problem — the section is opt-in.\n\nA count, not a boolean: nothing on the page ever read it as a flag.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "installable": {
+          "description": "Whether `rebon node install` could fix this here.",
+          "type": "boolean"
+        },
+        "outOfRange": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OutOfRangeRuntime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A Node that was found and turned down for its version.\n\nSeparate from `problem` because it is a different situation with a\ndifferent fix."
+        },
+        "problem": {
+          "description": "The resolver's own words for why nothing resolved.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resolved": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResolvedRuntime"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The runtime that resolved, or `null` if none did."
+        },
+        "supported": {
+          "description": "The versions a runtime may report, as a range someone can read.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "configuredPlugins",
+        "supported",
+        "installable"
+      ],
+      "type": "object"
+    },
+    "PluginStatus": {
+      "description": "`GET /api/plugins` — the plugin plane as this process sees it.\n\nThe page's answer to \"is my plugin running\": what runtime it would run on,\nwhat the composition asked for, what loaded, and why the rest did not.",
+      "properties": {
+        "entries": {
+          "description": "One per leaf the composition resolved, in load order.",
+          "items": {
+            "$ref": "#/$defs/PluginEntry"
+          },
+          "type": "array"
+        },
+        "host": {
+          "description": "Which loop host this build carries, in one line.",
+          "type": "string"
+        },
+        "loops": {
+          "description": "The kernel loop vendors a session can be switched to.",
+          "items": {
+            "$ref": "#/$defs/KernelLoopOption"
+          },
+          "type": "array"
+        },
+        "plane": {
+          "$ref": "#/$defs/PluginPlaneStatus",
+          "description": "The plane that is actually up, if one is."
+        },
+        "runtime": {
+          "$ref": "#/$defs/PluginRuntimeStatus",
+          "description": "The Node runtime a composition would run on."
+        },
+        "skipped": {
+          "description": "Entries that could not be turned into a load request, and why.\n\nA plugin that starts and is then refused at every registration is a\nworse failure than one that never starts, so each line carries its\nreason rather than only a name.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "host",
+        "runtime",
+        "plane",
+        "entries",
+        "skipped",
+        "loops"
+      ],
+      "type": "object"
+    },
+    "PromptCapabilities": {
+      "properties": {
+        "audio": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "embeddedContext": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "image": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "RebonMeta": {
+      "description": "What rebon hangs at `_meta.rebon` on standard ACP messages.\n\nThe standard shapes are fixed, and several rebon facts have to ride along\nanyway: which cursor a `session/update` carries, which pending permission a\n`session/request_permission` is about, the fence a `session/cancel` is only\nvalid against. ACP reserves `_meta` for exactly this, so nothing standard\nis bent to fit.\n\nEvery field is optional and skipped when absent, so a message that needs\none fact does not carry the other nine as nulls.",
+      "properties": {
+        "commandId": {
+          "description": "Makes a retry idempotent: the owner answers a repeat of the same id\nfrom its recent-results memory instead of running the command twice.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cursor": {
+          "description": "Where in the owner's numbering a `session/update` sits.\n\nIn `_meta` rather than in the standard params because the client's\nde-duplication reads it (`crate::client::stream_watermark`) and the\nstandard shape has nowhere to put it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "epoch": {
+          "description": "Which numbering that cursor belongs to. An owner's cursors restart when\nit does, so a cursor from a previous epoch is not comparable with this\none and must not be used to skip anything.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "extraText": {
+          "description": "Free-form text alongside a permission answer.\n\nThe standard result carries an option id and an updated input and has\nnowhere for this, and it is not decoration: with no option selected it\n*is* the answer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackgroundIpcCancelFence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What a `session/cancel` is only valid against.\n\nStandard `session/cancel` is a bare notification, which is fine when a\nclient and an agent share one process and cannot disagree about what is\nrunning. Across a socket they can, so the cancel says which turn it\nmeant and the owner drops it if that is no longer the turn in flight."
+        },
+        "jobId": {
+          "description": "The job this addresses. A fence, not a routing key: a worker that has\nbeen replaced must not act on a command meant for its predecessor.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "queryId": {
+          "description": "Which pending permission a `session/request_permission` is about.\n\nCarried because the owner re-sends still-pending permissions to a\nclient that attached after they were raised, so the answer is merged by\nthis id rather than by which connection it arrived on.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sessionId": {
+          "description": "The session this addresses.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "token": {
+          "description": "The token a client presents on `initialize`. Checked once, when the\nconnection is established, because the connection is what it\nauthenticates.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turnGeneration": {
+          "description": "The turn a permission, an answer or a cancel belongs to, so a stale one\nis refused rather than applied to whatever is running now.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "RegularContent": {
+      "description": "Plain content-block wrapper.",
+      "properties": {
+        "content": {
+          "$ref": "#/$defs/ContentBlock"
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
+    },
+    "ReleaseLeaseParams": {
+      "description": "[`method::RELEASE_LEASE`].",
+      "properties": {
+        "clientId": {
+          "type": "string"
+        },
+        "deliberate": {
+          "default": false,
+          "description": "Whether the user meant to be done, as opposed to merely detaching.\n\nOnly decides how long the owner lingers, and only when this was the\nlast lease. Defaulted for the wire: a client from before this field\nreads as `false`, which is what every release did until it existed.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "clientId"
+      ],
+      "type": "object"
+    },
+    "RequestPermissionParams": {
+      "description": "Request body for `session/request_permission`.",
+      "properties": {
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "metadata": true,
+        "options": {
+          "items": {
+            "$ref": "#/$defs/PermissionOption"
+          },
+          "type": "array"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "toolCall": {
+          "$ref": "#/$defs/ToolCallReference"
+        },
+        "toolInput": true,
+        "toolName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionId",
+        "toolCall",
+        "options"
+      ],
+      "type": "object"
+    },
+    "RequestPermissionResult": {
+      "description": "Flat host-side outcome for `session/request_permission`.",
+      "properties": {
+        "optionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outcome": {
+          "$ref": "#/$defs/PermissionOutcome"
+        },
+        "updatedInput": true
+      },
+      "required": [
+        "outcome"
+      ],
+      "type": "object"
+    },
+    "RequestPermissionWireResult": {
+      "description": "Wire-format response body for `session/request_permission`.",
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/RequestPermissionResult"
+        },
+        "updatedInput": true
+      },
+      "required": [
+        "outcome"
+      ],
+      "type": "object"
+    },
+    "ResolvedRuntime": {
+      "description": "One resolved Node.",
+      "properties": {
+        "executable": {
+          "description": "Where it lives, as a string: the server has a path and the wire has\nno path type.",
+          "type": "string"
+        },
+        "origin": {
+          "description": "Which rung of the ladder answered: an explicit demand, a managed\ninstall, or `PATH`.",
+          "type": "string"
+        },
+        "version": {
+          "description": "The version it reported.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "executable",
+        "origin"
+      ],
+      "type": "object"
+    },
+    "ResourceBody": {
+      "properties": {
+        "blob": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mimeType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uri": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri"
+      ],
+      "type": "object"
+    },
+    "ResourceContent": {
+      "properties": {
+        "resource": {
+          "$ref": "#/$defs/ResourceBody"
+        }
+      },
+      "required": [
+        "resource"
+      ],
+      "type": "object"
+    },
+    "ResourceLinkContent": {
+      "properties": {
+        "annotations": true,
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mimeType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "size": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uri": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "uri",
+        "name"
+      ],
+      "type": "object"
+    },
+    "RewindCheckpoint": {
+      "description": "One entry of [`RewindResponse::checkpoints`].",
+      "properties": {
+        "complete": {
+          "description": "Whether the turn finished. An unfinished one is still a checkpoint.",
+          "type": "boolean"
+        },
+        "index": {
+          "description": "The turn number, counting from the start of the session.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "preview": {
+          "description": "The first 240 characters of the prompt, with an ellipsis when it was\ncut.",
+          "type": "string"
+        },
+        "timestamp": {
+          "description": "When it was sent, or `null` on a turn whose line carried no stamp.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uuid": {
+          "description": "The user message this turn began with.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "index",
+        "uuid",
+        "preview",
+        "complete"
+      ],
+      "type": "object"
+    },
+    "RewindParams": {
+      "description": "[`method::REWIND`].",
+      "properties": {
+        "scope": {
+          "$ref": "#/$defs/RewindScopeWire",
+          "default": "conversation"
+        },
+        "userMessageUuid": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "userMessageUuid"
+      ],
+      "type": "object"
+    },
+    "RewindResponse": {
+      "description": "`GET /api/rewind` — where a session can be rewound to.",
+      "properties": {
+        "checkpoints": {
+          "description": "The user turns, newest last.",
+          "items": {
+            "$ref": "#/$defs/RewindCheckpoint"
+          },
+          "type": "array"
+        },
+        "filesSupported": {
+          "description": "Whether it can restore files too, which needs the session's host —\nthe file-history snapshots are the host's.",
+          "type": "boolean"
+        },
+        "problem": {
+          "description": "Why files cannot be restored, or `null` when they can.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "supported": {
+          "description": "Whether this server can rewind a conversation at all.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "checkpoints",
+        "supported",
+        "filesSupported"
+      ],
+      "type": "object"
+    },
+    "RewindScopeWire": {
+      "description": "What a [`BackgroundIpcRequest::Rewind`] should restore.",
+      "oneOf": [
+        {
+          "const": "conversation",
+          "description": "The transcript only; files on disk are left alone.",
+          "type": "string"
+        },
+        {
+          "const": "code",
+          "description": "The files only, from the file-history snapshot.",
+          "type": "string"
+        },
+        {
+          "const": "both",
+          "description": "Both, refused up front unless the code half can be applied cleanly.",
+          "type": "string"
+        }
+      ]
+    },
+    "RunCommandParams": {
+      "description": "[`method::RUN_COMMAND`].",
+      "properties": {
+        "args": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "RunCommandResult": {
+      "description": "What a slash command produced.",
+      "properties": {
+        "output": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommandOutput"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Absent for a command that ran and printed nothing. A command that\n*failed* is a JSON-RPC error instead, so this is never an error channel."
+        }
+      },
+      "type": "object"
+    },
+    "ServerInfo": {
+      "description": "`GET /api/info` — what this server is and what it is running.",
+      "properties": {
+        "activeTurns": {
+          "description": "Sessions with a `session/prompt` in flight on the server right now.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "agentConfigOption": {
+          "description": "The config option id that selects an agent.",
+          "type": "string"
+        },
+        "agents": {
+          "description": "The agents the page may switch between.",
+          "items": {
+            "$ref": "#/$defs/AgentOption"
+          },
+          "type": "array"
+        },
+        "cwd": {
+          "description": "The directory the server was started in.",
+          "type": "string"
+        },
+        "initialize": {
+          "description": "The handshake the mux completed, or `null` before it has.\n\nThe mux keeps it as the JSON it received, so that is what is passed\non. An [`InitializeResult`] in every case that matters, and the page\nreads it as one; typing it here would mean a decode and a re-encode\non a value nothing in this process looks at, and a field the agent\nadded would be dropped on the way through."
+        },
+        "model": {
+          "description": "The model id the runtime resolves to.",
+          "type": "string"
+        },
+        "provider": {
+          "description": "The provider the runtime model resolves to.",
+          "type": "string"
+        },
+        "steering": {
+          "description": "Whether this server accepts steering mid-turn.",
+          "type": "boolean"
+        },
+        "version": {
+          "description": "The `rebon` build serving this page.",
+          "type": "string"
+        },
+        "webUi": {
+          "$ref": "#/$defs/WebUiSource",
+          "description": "Where the page's assets came from, for the footer."
+        }
+      },
+      "required": [
+        "version",
+        "cwd",
+        "provider",
+        "model",
+        "agents",
+        "agentConfigOption",
+        "activeTurns",
+        "webUi",
+        "steering"
+      ],
+      "type": "object"
+    },
+    "SessionCapabilities": {
+      "properties": {
+        "list": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionListCapability"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SessionExtAck": {
+      "description": "A method that answers nothing but \"done\".",
+      "type": "object"
+    },
+    "SessionExtNoParams": {
+      "description": "A method that takes nothing: [`method::PING`], [`method::STATUS`],\n[`method::RECONCILE_PLUGINS`].\n\nA struct rather than `null` so adding a field later is not a wire break: an\nold peer sending `{}` still decodes, and a new peer's extra key is ignored\nrather than refused.",
+      "type": "object"
+    },
+    "SessionInfo": {
+      "properties": {
+        "_meta": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updatedAt": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionId",
+        "cwd"
+      ],
+      "type": "object"
+    },
+    "SessionListCapability": {
+      "type": "object"
+    },
+    "SessionListResult": {
+      "properties": {
+        "nextCursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/SessionInfo"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "sessions"
+      ],
+      "type": "object"
+    },
+    "SessionLoadResult": {
+      "properties": {
+        "configOptions": {
+          "items": {
+            "$ref": "#/$defs/ConfigOption"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "slashCommands": {
+          "items": {
+            "$ref": "#/$defs/SlashCommand"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "type": "object"
+    },
+    "SessionNewResult": {
+      "properties": {
+        "configOptions": {
+          "items": {
+            "$ref": "#/$defs/ConfigOption"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "slashCommands": {
+          "items": {
+            "$ref": "#/$defs/SlashCommand"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "type": "object"
+    },
+    "SessionPromptResult": {
+      "properties": {
+        "stopReason": {
+          "$ref": "#/$defs/StopReason"
+        }
+      },
+      "required": [
+        "stopReason"
+      ],
+      "type": "object"
+    },
+    "SessionSetConfigOptionResult": {
+      "properties": {
+        "configOptions": {
+          "items": {
+            "$ref": "#/$defs/ConfigOption"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "configOptions"
+      ],
+      "type": "object"
+    },
+    "SessionStatusSnapshot": {
+      "description": "Everything a client must agree with the owner about (invariant I4).\n\nThe client keeps no authoritative copy of any of it: a permission mode, a\nmodel, or a busy flag that a client believes and the owner does not is the\nbug class this whole snapshot exists to remove.",
+      "properties": {
+        "agent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "askUserQuestions": {
+          "items": {
+            "$ref": "#/$defs/ForegroundQuestion"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "busy": {
+          "description": "A model turn is in flight, so a client shows Stop rather than Send.",
+          "type": "boolean"
+        },
+        "clientLeases": {
+          "items": {
+            "$ref": "#/$defs/ClientLease"
+          },
+          "type": "array"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "jobId": {
+          "type": "string"
+        },
+        "lastCommandAtMs": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "lastCommandError": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lastCommandId": {
+          "description": "The `command_id` most recently processed, and how it went. A client that\nlost its connection mid-command reads the outcome here instead of\nguessing whether to retry.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpStatusSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The owner's MCP servers. `None` from an owner that hosts none, or one\nfrom before this field existed."
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pendingPermission": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackgroundPermissionQuerySnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "permissionMode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "planMode": {
+          "default": false,
+          "type": "boolean"
+        },
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/BackgroundJobStatus"
+        },
+        "turnGeneration": {
+          "description": "Fences every answer and cancel against the turn it was meant for.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "updatedAtMs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionUsageSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "jobId",
+        "cwd",
+        "status",
+        "busy",
+        "turnGeneration",
+        "updatedAtMs"
+      ],
+      "type": "object"
+    },
+    "SessionSteeringResult": {
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/SteeringOutcome"
+        }
+      },
+      "required": [
+        "outcome"
+      ],
+      "type": "object"
+    },
+    "SessionUpdate": {
+      "description": "Discriminated union of `session/update` notification payloads.",
+      "oneOf": [
+        {
+          "description": "Streaming text content from the model.",
+          "properties": {
+            "content": {
+              "$ref": "#/$defs/ContentBlock"
+            },
+            "sessionUpdate": {
+              "const": "agent_message_chunk",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate",
+            "content"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "User input that was queued while a prompt was already running and then\nconsumed between tool rounds.",
+          "properties": {
+            "content": {
+              "items": {
+                "$ref": "#/$defs/ContentBlock"
+              },
+              "type": "array"
+            },
+            "imagePasteIds": {
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "sessionUpdate": {
+              "const": "queued_user_message",
+              "type": "string"
+            },
+            "uuid": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate",
+            "uuid",
+            "content"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Streaming extended-thinking delta.",
+          "properties": {
+            "sessionUpdate": {
+              "const": "thinking_delta",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "End of thinking stream for the current turn.",
+          "properties": {
+            "sessionUpdate": {
+              "const": "thinking_end",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Initial tool-call announcement.",
+          "properties": {
+            "content": {
+              "items": {
+                "$ref": "#/$defs/ToolCallContent"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "kind": {
+              "$ref": "#/$defs/ToolKind"
+            },
+            "locations": {
+              "items": {
+                "$ref": "#/$defs/ToolCallLocation"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "rawInput": {
+              "additionalProperties": true,
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "rawOutput": {
+              "additionalProperties": true,
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "sessionUpdate": {
+              "const": "tool_call",
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/$defs/ToolCallStatus"
+            },
+            "title": {
+              "type": "string"
+            },
+            "toolCallId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate",
+            "toolCallId",
+            "title",
+            "kind",
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Follow-up tool-call status/content transitions.",
+          "properties": {
+            "content": {
+              "items": {
+                "$ref": "#/$defs/ToolCallContent"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "locations": {
+              "items": {
+                "$ref": "#/$defs/ToolCallLocation"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "rawOutput": {
+              "additionalProperties": true,
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "sessionUpdate": {
+              "const": "tool_call_update",
+              "type": "string"
+            },
+            "status": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolCallStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "toolCallId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate",
+            "toolCallId"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A tool call cleared rebon's auto-mode gate without a permission\ndialog.\n\nPurely an annotation for the tool row that is already on screen: it\ncarries no content, and clients must not fold it into anything the\nmodel reads back.",
+          "properties": {
+            "sessionUpdate": {
+              "const": "tool_call_auto_mode_allowed",
+              "type": "string"
+            },
+            "source": {
+              "$ref": "#/$defs/AutoModeAllowSource",
+              "default": "unspecified",
+              "description": "Defaulted so a peer that predates the field still decodes — it\nlands as `Unspecified` and renders the unattributed note."
+            },
+            "toolCallId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate",
+            "toolCallId"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Context compaction has started.",
+          "properties": {
+            "messages_before": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sessionUpdate": {
+              "const": "compacting_started",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate",
+            "messages_before"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Context compaction finished.",
+          "properties": {
+            "messages_after": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sessionUpdate": {
+              "const": "compacting_done",
+              "type": "string"
+            },
+            "used_model": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "sessionUpdate",
+            "messages_after",
+            "used_model"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Plan entries.",
+          "properties": {
+            "entries": {
+              "items": {
+                "$ref": "#/$defs/PlanEntry"
+              },
+              "type": "array"
+            },
+            "sessionUpdate": {
+              "const": "plan",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate",
+            "entries"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Slash commands list.",
+          "properties": {
+            "commands": {
+              "items": {
+                "$ref": "#/$defs/SlashCommand"
+              },
+              "type": "array"
+            },
+            "sessionUpdate": {
+              "const": "slash_commands",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate",
+            "commands"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Config option update.",
+          "properties": {
+            "configOptions": {
+              "items": {
+                "$ref": "#/$defs/ConfigOption"
+              },
+              "type": "array"
+            },
+            "sessionUpdate": {
+              "const": "config_option_update",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate",
+            "configOptions"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Session-local context was reset and the engine is continuing\nwith a fresh conversation (e.g. approved clear-context plan).\n`plan` carries the plan text so the client can render it as a\nsystem message in the cleared transcript — without it the user\nsees a blank screen even though the model is executing the plan.",
+          "properties": {
+            "plan": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sessionUpdate": {
+              "const": "context_reset",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Session info update (title, timestamp).",
+          "properties": {
+            "_meta": {
+              "additionalProperties": true,
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "sessionUpdate": {
+              "const": "session_info_update",
+              "type": "string"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "updatedAt": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Token usage reported by the model during streaming.\nEmitted as snapshots arrive from the provider or as the engine\napproximates streamed output so the client can display progress.",
+          "properties": {
+            "inputTokens": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "outputTokens": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sessionUpdate": {
+              "const": "token_usage",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionUpdate"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SessionUpdateParams": {
+      "description": "Outer envelope for the `session/update` notification.",
+      "properties": {
+        "sessionId": {
+          "type": "string"
+        },
+        "update": {
+          "$ref": "#/$defs/SessionUpdate"
+        }
+      },
+      "required": [
+        "sessionId",
+        "update"
+      ],
+      "type": "object"
+    },
+    "SessionUsageSnapshot": {
+      "description": "Token spend for the session, as the status bars show it.",
+      "properties": {
+        "cacheCreationTokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cacheReadTokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inputTokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "outputTokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "inputTokens",
+        "outputTokens"
+      ],
+      "type": "object"
+    },
+    "SetOptionParams": {
+      "description": "[`method::SET_OPTION`].\n\nSeparate from running the slash command a human would type, because a\nclient that wants to *set* a value should not have to compose that command\nand the owner should not have to parse it back.",
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "value"
+      ],
+      "type": "object"
+    },
+    "SetPermissionModeParams": {
+      "description": "[`method::SET_PERMISSION_MODE`]. `mode` is a `PermissionMode` wire value.",
+      "properties": {
+        "mode": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "type": "object"
+    },
+    "SkillEntry": {
+      "description": "One entry of [`SkillsResponse::skills`].",
+      "properties": {
+        "description": {
+          "description": "One line about what it does.",
+          "type": "string"
+        },
+        "enabled": {
+          "description": "Whether it is switched on.",
+          "type": "boolean"
+        },
+        "hint": {
+          "description": "What its argument looks like, or `null`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The skill's id, which is also how it is invoked.",
+          "type": "string"
+        },
+        "path": {
+          "description": "The directory it was loaded from, or `null` for one that has none.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "Where it came from: `builtin`, `user`, `project`, `managed`, `local`,\n`flag`, `plugin`, `mcp`.",
+          "type": "string"
+        },
+        "title": {
+          "description": "The human title.",
+          "type": "string"
+        },
+        "userInvocable": {
+          "description": "Whether it appears in the `/` menu.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "title",
+        "description",
+        "source",
+        "enabled",
+        "userInvocable"
+      ],
+      "type": "object"
+    },
+    "SkillsResponse": {
+      "description": "`GET /api/skills`.",
+      "properties": {
+        "skills": {
+          "description": "Every skill the registry knows, enabled or not.",
+          "items": {
+            "$ref": "#/$defs/SkillEntry"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "skills"
+      ],
+      "type": "object"
+    },
+    "SlashCommand": {
+      "properties": {
+        "aliases": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "category": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SlashCommandCategory"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": "string"
+        },
+        "input": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SlashCommandInput"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "description"
+      ],
+      "type": "object"
+    },
+    "SlashCommandCategory": {
+      "description": "Category tag for slash commands.",
+      "oneOf": [
+        {
+          "const": "command",
+          "description": "Built-in CLI command (help, clear, compact, ...).",
+          "type": "string"
+        },
+        {
+          "const": "skill",
+          "description": "User/bundled skill (/simplify, /commit, ...).",
+          "type": "string"
+        },
+        {
+          "const": "agent",
+          "description": "Agent-related command (/agent, /agents, /teams, ...).",
+          "type": "string"
+        }
+      ]
+    },
+    "SlashCommandInput": {
+      "properties": {
+        "hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "StatusChangedParams": {
+      "description": "[`method::STATUS_CHANGED`].",
+      "properties": {
+        "snapshot": {
+          "$ref": "#/$defs/SessionStatusSnapshot"
+        }
+      },
+      "required": [
+        "snapshot"
+      ],
+      "type": "object"
+    },
+    "StatusResult": {
+      "description": "[`method::STATUS`].",
+      "properties": {
+        "snapshot": {
+          "$ref": "#/$defs/SessionStatusSnapshot"
+        }
+      },
+      "required": [
+        "snapshot"
+      ],
+      "type": "object"
+    },
+    "SteeringOutcome": {
+      "description": "What became of a steering request.",
+      "oneOf": [
+        {
+          "const": "injected",
+          "description": "Delivered into the running turn.",
+          "type": "string"
+        },
+        {
+          "const": "startedNewTurn",
+          "description": "The turn raced ahead and finished; the agent started a fresh\nturn with the message instead. Fire-and-forget on the agent's\nside — the new turn's output flows through `session/update`\nwith nobody awaiting a prompt response.",
+          "type": "string"
+        }
+      ]
+    },
+    "StopReason": {
+      "enum": [
+        "end_turn",
+        "max_tokens",
+        "max_turn_requests",
+        "refusal",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "SubscribeParams": {
+      "description": "[`method::SUBSCRIBE`].",
+      "properties": {
+        "since": {
+          "description": "Resume from just after this cursor. Absent means \"from wherever the\nowner's ring starts\", and the [`method::HELLO`] that follows says where\nthat turned out to be.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SystemLevel": {
+      "description": "`SystemMessageLevel` — wire union `'info' | 'warning' | 'error'`.",
+      "enum": [
+        "info",
+        "warning",
+        "error"
+      ],
+      "type": "string"
+    },
+    "SystemMessage": {
+      "description": "`{ type: 'system', subtype, level, content, ... }`.\n\nSubtype-specific payloads (API error, file snapshot, compact boundary,\nlocal command, …) exist on the wire but are not typed here.\nThis type only exposes the common fields the renderer reads:\n`subtype`, `content`, `level`, `isMeta`. The rest stay on the wire\nas extra JSON fields — they're not dropped, they just aren't\nsurfaced as typed fields here.",
+      "properties": {
+        "content": {
+          "description": "Present on most typed subtypes; optional so legacy rows\ndon't fail to parse.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "isMeta": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "level": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SystemLevel"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "subtype": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "string"
+        },
+        "uuid": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "uuid",
+        "timestamp",
+        "subtype"
+      ],
+      "type": "object"
+    },
+    "TaskEntry": {
+      "description": "One entry of [`TasksResponse::tasks`].",
+      "properties": {
+        "backgrounded": {
+          "description": "Whether it was sent to the background.",
+          "type": "boolean"
+        },
+        "createdAt": {
+          "description": "ISO-8601, or `null` on a task with no start time.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "description": {
+          "description": "Its latest progress line, or `null`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "description": "Why it failed, or `null`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "The task id, which is what an action names.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "What kind of task it is.",
+          "type": "string"
+        },
+        "output": {
+          "description": "Its result as text, or `null` while it runs.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "Where it has got to.",
+          "type": "string"
+        },
+        "title": {
+          "description": "The one-line title.",
+          "type": "string"
+        },
+        "updatedAt": {
+          "description": "ISO-8601, or `null` while it runs.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "status",
+        "title",
+        "backgrounded"
+      ],
+      "type": "object"
+    },
+    "TaskReplyParams": {
+      "description": "[`method::TASK_REPLY`].",
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "taskId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "taskId",
+        "message"
+      ],
+      "type": "object"
+    },
+    "TasksResponse": {
+      "description": "`GET /api/tasks` — the background tasks of one session.",
+      "properties": {
+        "tasks": {
+          "description": "Newest first.",
+          "items": {
+            "$ref": "#/$defs/TaskEntry"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "tasks"
+      ],
+      "type": "object"
+    },
+    "TerminalContent": {
+      "description": "Terminal handle reference inside a tool-call content payload.",
+      "properties": {
+        "terminalId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "terminalId"
+      ],
+      "type": "object"
+    },
+    "TextContent": {
+      "properties": {
+        "annotations": true,
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "ToolCallContent": {
+      "description": "Content payload attached to a tool-call update — discriminated by `type`.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/DiffContent",
+          "properties": {
+            "type": {
+              "const": "diff",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/TerminalContent",
+          "properties": {
+            "type": {
+              "const": "terminal",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/RegularContent",
+          "properties": {
+            "type": {
+              "const": "content",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ToolCallLocation": {
+      "description": "File-system anchor that a tool call references.",
+      "properties": {
+        "line": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "ToolCallReference": {
+      "description": "Reference to the tool call a permission request is gating.",
+      "properties": {
+        "toolCallId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "toolCallId"
+      ],
+      "type": "object"
+    },
+    "ToolCallStatus": {
+      "description": "Tool call lifecycle status.",
+      "enum": [
+        "pending",
+        "in_progress",
+        "completed",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "ToolKind": {
+      "description": "Tool kind enum used by `tool_call` updates.",
+      "enum": [
+        "read",
+        "edit",
+        "delete",
+        "move",
+        "search",
+        "execute",
+        "think",
+        "fetch",
+        "other"
+      ],
+      "type": "string"
+    },
+    "ToolResultContent": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": true,
+          "type": "array"
+        }
+      ],
+      "description": "Union of the two valid shapes for a tool_result `content` field."
+    },
+    "TranscriptRow": {
+      "description": "Single transcript row type matched by the Rust renderer.\n\n`#[serde(tag = \"type\")]` maps directly to the wire `type` field —\nso `{\"type\":\"user\", ...}` deserializes as `Message::User(_)`\nfor each row in a JSONL transcript file.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/UserMessage",
+          "properties": {
+            "type": {
+              "const": "user",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/AssistantMessage",
+          "properties": {
+            "type": {
+              "const": "assistant",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/AttachmentRow",
+          "description": "`type: 'attachment'` row. Kept as opaque JSON; the richer variant\nmodelling lives with the engine's own attachment message type and is\nnot modelled here.",
+          "properties": {
+            "type": {
+              "const": "attachment",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/SystemMessage",
+          "properties": {
+            "type": {
+              "const": "system",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Open-world fallback — any top-level `type` value not listed\nabove (including `grouped_tool_use` / `collapsed_read_search`,\nplus legacy `progress` rows\nbridged from legacy data). The raw JSON is preserved byte-for-byte\nso round-trips are lossless.",
+          "properties": {
+            "type": {
+              "const": "unknown",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "TurnParams": {
+      "description": "[`method::TURN`].",
+      "properties": {
+        "state": {
+          "$ref": "#/$defs/TurnStreamState"
+        },
+        "stopReason": {
+          "description": "Why a turn ended. Absent on the one that started, and on an end whose\nreason the owner does not have.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stopRefused": {
+          "description": "Why a cancel did not stop this turn.\n\nThe turn is still running when this is set -- `state` says so. It is\nhere rather than in the answer to whoever asked, because every client\nwatching is looking at a turn that did not stop.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "state"
+      ],
+      "type": "object"
+    },
+    "TurnStreamState": {
+      "description": "Whether a turn is in flight.",
+      "enum": [
+        "running",
+        "idle"
+      ],
+      "type": "string"
+    },
+    "UsageResponse": {
+      "description": "`GET /api/usage` — the token ledger for one session.",
+      "properties": {
+        "cacheCreationTokens": {
+          "description": "Cache writes, on the same terms.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cacheReadTokens": {
+          "description": "Cache reads, which only the session's own host counts. `null`\nwithout one.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "durationMs": {
+          "description": "How long the session has been open, or `null` for one this server\ndid not open.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "inputTokens": {
+          "description": "Tokens sent, including the turn in flight.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "messages": {
+          "description": "Messages on disk, or `null` when the transcript could not be read.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "The model the runtime resolves to.",
+          "type": "string"
+        },
+        "outputTokens": {
+          "description": "Tokens received, including the turn in flight.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "problem": {
+          "description": "Which of the two counts this is, in words, because the difference\nmatters to whoever reads the number.",
+          "type": "string"
+        },
+        "sessionId": {
+          "description": "The session this counts.",
+          "type": "string"
+        },
+        "turns": {
+          "description": "How many turns the ledger has seen.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sessionId",
+        "inputTokens",
+        "outputTokens",
+        "turns",
+        "model",
+        "problem"
+      ],
+      "type": "object"
+    },
+    "UserContentBlock": {
+      "description": "A single content block inside a user message. Dispatched by\nthe `type` discriminant: `text`, `image` or `tool_result`.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/UserTextBlock",
+          "properties": {
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/UserImageBlock",
+          "properties": {
+            "type": {
+              "const": "image",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/UserToolResultBlock",
+          "properties": {
+            "type": {
+              "const": "tool_result",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "UserImageBlock": {
+      "description": "`{ type: 'image', source: { ... } }` content block. The source\nshape is Anthropic-SDK defined and not consumed by the renderer\ndirectly here — preserved as opaque JSON so wire\nround-trip is lossless.",
+      "properties": {
+        "source": {
+          "default": null
+        }
+      },
+      "type": "object"
+    },
+    "UserMessage": {
+      "description": "Normalized user message fields consumed by the Rust renderer.\n\n* `uuid`, `timestamp` — row identity.\n* `message.content` — the Anthropic content block array.\n* `isCompactSummary` — branch to compact-summary rendering.\n* `isMeta`, `isVisibleInTranscriptOnly` — filter hints used by\n  user-message visibility and sticky-prompt handling.\n* `imagePasteIds` — paste ids for `<image>` blocks.\n* `planContent` — optional plan override path.",
+      "properties": {
+        "imagePasteIds": {
+          "items": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "isCompactSummary": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "isMeta": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "isVisibleInTranscriptOnly": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "message": {
+          "$ref": "#/$defs/UserMessageInner"
+        },
+        "planContent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timestamp": {
+          "type": "string"
+        },
+        "uuid": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "uuid",
+        "timestamp",
+        "message"
+      ],
+      "type": "object"
+    },
+    "UserMessageInner": {
+      "description": "The `message` sub-object on a user row. Matches the shape that the\nAnthropic SDK's `MessageParam` wraps — a `role: 'user'` string and\na `content` array.",
+      "properties": {
+        "content": {
+          "items": {
+            "$ref": "#/$defs/UserContentBlock"
+          },
+          "type": "array"
+        },
+        "role": {
+          "$ref": "#/$defs/UserRole",
+          "default": "user",
+          "description": "Absent on a hand-authored or older line; a row that says nothing\nabout its role is the role its parent row already declared, and\ndropping it whole would lose a message a person really sent."
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
+    },
+    "UserRole": {
+      "description": "The `role` literal on a user message. Always `\"user\"` on the\nwire; modelled as a single-variant enum so deserialization\nrejects a *wrong* role instead of silently accepting it as `Other`.\nA *missing* one is tolerated — see [`UserMessageInner::role`].",
+      "enum": [
+        "user"
+      ],
+      "type": "string"
+    },
+    "UserTextBlock": {
+      "description": "`{ type: 'text', text: '...' }` content block.",
+      "properties": {
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "UserToolResultBlock": {
+      "description": "`{ type: 'tool_result', tool_use_id, content, is_error? }`.\n\n`content` on the wire can be a string OR an array of content\nblocks (Anthropic's nested content format). This implementation\naccepts both via an untagged helper: strings become\n`ToolResultContent::Text(_)`, arrays become\n`ToolResultContent::Blocks(_)`. The renderer currently only\nformats the string form; the Blocks form falls through to a\nJSON-stringify display.",
+      "properties": {
+        "content": {
+          "$ref": "#/$defs/ToolResultContent"
+        },
+        "is_error": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "tool_use_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool_use_id",
+        "content"
+      ],
+      "type": "object"
+    },
+    "WebUiSource": {
+      "description": "Where the page's own files came from.\n\nThe two cases are not the same shape and never have been: an embedded\nbuild reports the commit it was built from and a null path, and a\ndirectory reports its path and no `built` key at all. Kept asymmetric on\npurpose — adding `\"built\": null` to the directory case would be a change\nto the wire.",
+      "properties": {
+        "built": {
+          "description": "What the embedded build was built from. Absent for a directory.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "The directory being served, or `null` when embedded.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "`embedded` or `directory`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Generated by `cargo run -p rebon-schema-gen` from crates/rebon-proto, crates/rebon-types and crates/rebon-session-host. Do not edit by hand.",
+  "title": "rebon ACP wire types"
+}

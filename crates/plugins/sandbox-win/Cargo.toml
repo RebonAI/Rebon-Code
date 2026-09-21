@@ -1,0 +1,62 @@
+[package]
+name = "sandbox-win"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The binary half of the `sandbox` plugin: sandbox-win.exe, the Windows sandbox helper Rebon shells out to. No `PluginDef` of its own. `core` is the pure verdict logic, `sys` the Win32 shell, `helper` the subcommands."
+
+# The binary name is the frozen half of the install contract: the sandbox
+# plugin spawns `sandbox-win.exe`, looking for it beside the executable and
+# under %ProgramFiles%\Rebon. That is why it carries no `rebon-` prefix.
+[[bin]]
+name = "sandbox-win"
+path = "src/bin/sandbox-win.rs"
+
+# No clap. The `exec` argv is a frozen contract with two load-bearing
+# properties: everything after `--` must reach the child untouched, and an
+# unrecognised flag must be a refusal rather than a shrug. An argument-parsing
+# library has opinions about both, and the hand-rolled dispatch is forty lines.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+# Every `exec` read-modify-writes the ledger, and several sandboxed commands can
+# run at once. An atomic rename stops a torn file but not a lost update, and a
+# lost update means an ACE stays on the user's disk with nothing left that
+# knows about it.
+fs2.workspace = true
+
+# `src/sys` is the only part that touches Win32. Off Windows it compiles to a
+# "not supported here" stub, so a workspace check still works on a mac, while
+# `src/core` carries no platform gate at all and its verdict matrix therefore
+# runs on every platform's CI.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_NetManagement",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Environment",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Rpc",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_UI_Shell",
+] }
+
+[dev-dependencies]
+tempfile = "3"

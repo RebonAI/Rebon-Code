@@ -1,0 +1,47 @@
+[package]
+name = "rebon-boa-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "One-shot process boundary for restricted Boa status scripts"
+exclude = [
+    "src/bin/rebon-boa-adversarial-fixture.rs",
+    "tests/adversarial.rs",
+]
+
+[features]
+default = []
+adversarial-fixtures = []
+
+[[bin]]
+name = "rebon-boa-test-helper"
+path = "src/bin/rebon-boa-helper.rs"
+
+[[bin]]
+name = "rebon-boa-adversarial-fixture"
+path = "src/bin/rebon-boa-adversarial-fixture.rs"
+required-features = ["adversarial-fixtures"]
+
+[dependencies]
+# Locating a binary that ships beside the main executable: `sibling_binary`.
+rebon-types.workspace = true
+boa_engine.workspace = true
+boa_gc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

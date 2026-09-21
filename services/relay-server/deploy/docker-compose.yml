@@ -1,0 +1,46 @@
+# Production deployment: Caddy terminates TLS (automatic Let's Encrypt) and
+# reverse-proxies to the relay. Requires a `.env` next to this file with:
+#
+#   RELAY_DOMAIN=relay.example.com
+#   REBON_RELAY_PUBLIC_URL=https://relay.example.com
+#   REBON_RELAY_TOKEN_HMAC_KEY=<base64url, no padding, of 32 random bytes>
+#
+# Generate the key once and keep it stable across restarts:
+#   openssl rand -base64 32 | tr '+/' '-_' | tr -d '='
+#
+# Caddy appends the real client IP to X-Forwarded-For, so the relay runs with
+# REBON_RELAY_TRUST_FORWARDED_FOR=true; the relay port is never published
+# directly.
+name: rebon-relay
+
+services:
+  relay:
+    build:
+      context: ..
+    restart: unless-stopped
+    environment:
+      REBON_RELAY_PUBLIC_URL: ${REBON_RELAY_PUBLIC_URL:?set REBON_RELAY_PUBLIC_URL in .env}
+      REBON_RELAY_TOKEN_HMAC_KEY: ${REBON_RELAY_TOKEN_HMAC_KEY:?set REBON_RELAY_TOKEN_HMAC_KEY in .env}
+      REBON_RELAY_TRUST_FORWARDED_FOR: "true"
+    volumes:
+      - relay-data:/data
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      RELAY_DOMAIN: ${RELAY_DOMAIN:?set RELAY_DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  relay-data:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,48 @@
+[package]
+name = "rebon-rc-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "`rebon rc`: the Remote Control runner. Registers this machine with an RC server, takes session work items, and serves them with real Rebon sessions through the session host — uplinking what a session does and running what a controller asks. An endpoint, like `rebon mcp serve`: it drives the session host and hosts no session itself."
+
+[dependencies]
+# The RC protocol and its two transports. `http` is the environment and
+# work-item API, `ws` the session stream; both are off by default in the
+# bridge and turned on here, in the one endpoint that talks to a server.
+rebon-bridge = { workspace = true, features = ["http", "ws"] }
+# Opening, resuming and following sessions: the owner states, the lease,
+# the subscription and the prompt ladder every endpoint shares.
+rebon-session-host.workspace = true
+# Transcript paths, the atomic and owner-only file writes.
+rebon-session.workspace = true
+# `PermissionOptionKind`, the kind vocabulary a permission option carries.
+# Already in the graph through `rebon-session-host`.
+rebon-proto.workspace = true
+# The `\\?\` rule for a canonicalized project path. Already in the graph.
+rebon-tools-core.workspace = true
+rebon-types.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+clap.workspace = true
+fs2.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+# The real RC server, run in process by `tests/rc_e2e.rs`: the runner's
+# serve loop and the bridge's HTTP and WebSocket clients against the same
+# axum stack an operator runs. A test-only edge; the server is its own
+# workspace and depends on nothing here but `rebon-bridge`.
+rebon-rc-server = { path = "../../services/rc-server" }
+# To serve `rebon_rc_server::app` on the test's own listener. Already in
+# the graph through the server.
+axum = "0.8"

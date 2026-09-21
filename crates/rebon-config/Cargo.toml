@@ -1,0 +1,31 @@
+[package]
+name = "rebon-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Rebon provider/config resolution: reads ~/.rebon config.json + .credentials.json, resolves the active provider into a ResolvedProvider, OAuth refresh, and provider/settings CRUD. Extracted from the rebon-cli binary so the GPUI app + harness can resolve providers in-process."
+
+[dependencies]
+rebon-types.workspace = true
+# The shared config-home resolution, so this crate and the session/transcript
+# paths cannot disagree about where the data lives.
+rebon-session.workspace = true
+rebon-api.workspace = true
+# `PermissionMode` and the mode vocabulary the profile store parses against.
+rebon-permissions.workspace = true
+# The one reader of `installed.json` and `rebon-plugin.json`: this crate needs
+# to know which external model providers exist, and asks rather than parsing
+# the files a second time.
+rebon-plugin-package.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+# Only for the async OAuth-refresh tests.
+tokio.workspace = true

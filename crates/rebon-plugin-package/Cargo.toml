@@ -1,0 +1,22 @@
+[package]
+name = "rebon-plugin-package"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The plugin package layer for rebon: the `rebon-plugin.json` schema, its validation, installed-package records, and read-only discovery of what is installed."
+
+[dependencies]
+# Shared manifest values: the app visual effect and the kernel plugin
+# declaration both have readers outside this crate.
+rebon-hooks.workspace = true
+rebon-types.workspace = true
+# The install state file is published through the shared atomic write.
+rebon-session.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

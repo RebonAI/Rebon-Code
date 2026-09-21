@@ -1,0 +1,19 @@
+[package]
+name = "rebon-shell-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Static shell / git classification and the repository's only shell tokenisers."
+
+[dependencies]
+# The classifier reads tool input straight off the wire (`{"command": "…"}`),
+# so it needs the JSON value type and nothing else from serde.
+serde_json.workspace = true
+# `shell_command_only_deletes_inside_roots` compares deletion targets against
+# write roots with the scope-path helpers that stay in the core crate.
+rebon-tools-core.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

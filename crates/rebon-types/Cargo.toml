@@ -1,0 +1,30 @@
+[package]
+name = "rebon-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Shared data types and utilities for rebon — content blocks, tool-call payloads, session updates, slash commands, and other wire-compatible structures used across multiple crates."
+
+[dependencies]
+rebon-tools-core.workspace = true
+# Session ids are drawn from the OS entropy source, already in the graph via the
+# tool, cli and onboarding crates, so this costs no extra build.
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+schemars = { workspace = true, optional = true }
+
+[features]
+# Off by default: derives `JsonSchema` on the wire types so a schema exporter can
+# publish their JSON Schema. Only that crate turns it on, so `schemars` stays out
+# of every shipped binary.
+schema = ["dep:schemars"]
+
+[dev-dependencies]
+# `sibling_binary`'s locator tests build a real directory layout: a candidate
+# list is only meaningful against files that do or do not exist on disk.
+tempfile = "3"

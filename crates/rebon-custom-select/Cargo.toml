@@ -1,0 +1,18 @@
+[package]
+name = "rebon-customselect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Keyboard-navigable selection logic (options, navigation, single/multi-select state, row layout projections) that powers every picker, dialog, and menu in the app. Pure logic, no IO, no rebon-* dependencies."
+
+[dependencies]
+# Intentionally empty. This crate is pure logic with no runtime
+# dependencies — every UI concern (rendering, keybinding dispatch,
+# overlay registration, clipboard, image paste, external editor) is
+# delegated to the caller through owned strings, structs, enums or
+# callback seams.
+
+[dev-dependencies]
+# Intentionally empty. The test matrix is hand-rolled.

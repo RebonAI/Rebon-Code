@@ -1,0 +1,87 @@
+# Treat this vendored fork as its own workspace root so the parent
+# workspace at the repo root doesn't try to include it (which would pull
+# ratatui's lints into our crates and conflict with our build config).
+# Cargo still resolves the path correctly via [patch.crates-io].
+[workspace]
+
+[package]
+name = "ratatui"
+# Vendored fork of ratatui 0.29.0 with tactical local extensions for
+# Terminal::set_viewport_height, cell-level Crossterm hyperlinks, and the
+# shared rebon-width display-width policy. The
+# viewport extension lets the inline runner grow while streaming content would
+# otherwise be cropped. Keep this version string in lockstep with upstream
+# 0.29.0 so the [patch.crates-io] override resolves cleanly.
+version = "0.29.0"
+authors = ["Florian Dehau <work@fdehau.com>", "The Ratatui Developers"]
+description = "Ratatui 0.29.0 vendored fork with Rebon terminal extensions"
+edition = "2021"
+rust-version = "1.74.0"
+license = "MIT"
+publish = false
+# Examples/benches/tests live in upstream; we vendor only `src/` so they
+# stay out of the dep graph. Cargo would still try to walk autodiscovered
+# targets, so explicitly disable each.
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+name = "ratatui"
+path = "src/lib.rs"
+bench = false
+
+[dependencies]
+bitflags = "2.3"
+cassowary = "0.3"
+compact_str = "0.8.0"
+crossterm = { version = "0.28.1", optional = true }
+document-features = { version = "0.2.7", optional = true }
+indoc = "2"
+instability = "0.3.1"
+itertools = "0.13"
+lru = "0.12.0"
+paste = "1.0.2"
+palette = { version = "0.7.6", optional = true }
+serde = { version = "1", optional = true, features = ["derive"] }
+strum = { version = "0.26.3", features = ["derive"] }
+termwiz = { version = "0.22.0", optional = true }
+time = { version = "0.3.11", optional = true, features = ["local-offset"] }
+unicode-segmentation = "1.10"
+unicode-truncate = "1"
+# Display width comes from Rebon, not from unicode-width directly: the
+# cells diffed here and the strings laid out in the rest of Rebon have
+# to agree about East Asian ambiguous characters or partial redraws
+# land a column off. `unicode-truncate` still pulls unicode-width in.
+rebon-width = { path = "../../crates/rebon-width" }
+
+[target.'cfg(not(windows))'.dependencies]
+termion = { version = "4.0.0", optional = true }
+
+[features]
+default = ["crossterm", "underline-color"]
+crossterm = ["dep:crossterm"]
+termion = ["dep:termion"]
+termwiz = ["dep:termwiz"]
+serde = ["dep:serde", "bitflags/serde", "compact_str/serde"]
+macros = []
+palette = ["dep:palette"]
+scrolling-regions = []
+all-widgets = ["widget-calendar"]
+widget-calendar = ["dep:time"]
+underline-color = ["dep:crossterm"]
+unstable = [
+  "unstable-rendered-line-info",
+  "unstable-widget-ref",
+  "unstable-backend-writer",
+]
+unstable-rendered-line-info = []
+unstable-widget-ref = []
+unstable-backend-writer = []
+
+[lints.rust]
+# Upstream sets this to `forbid`; we keep the same posture but in our local
+# fork the lint is downgraded to `deny` so we can selectively `allow(unsafe_code)`
+# inside the set_viewport_height implementation if it ever needs raw access.
+unsafe_code = "deny"

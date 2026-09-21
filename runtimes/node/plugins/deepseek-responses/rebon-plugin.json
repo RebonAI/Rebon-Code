@@ -1,0 +1,37 @@
+{
+  "name": "deepseek-responses",
+  "version": "0.4.1",
+  "description": "DeepSeek Responses API model provider (deepseek-v4-pro, deepseek-v4-flash) running as an llm/stream adapter on rebon's plugin plane.",
+  "capabilities": {
+    "modelProviders": {
+      "deepseek": {
+        "transport": {
+          "type": "plugin",
+          "entry": "provider.mjs"
+        },
+        "capabilities": {
+          "forcedToolChoice": true,
+          "webSearch": true,
+          "anchoredMinimal": true,
+          "reasoningText": true,
+          "customToolCall": true
+        },
+        "defaultModel": "deepseek-v4-pro",
+        "models": {
+          "deepseek-v4-pro": {
+            "contextWindow": 1000000,
+            "displayName": "DeepSeek V4 Pro"
+          },
+          "deepseek-v4-flash": {
+            "contextWindow": 1000000,
+            "displayName": "DeepSeek V4 Flash"
+          }
+        },
+        "profiles": {
+          "small": "deepseek-v4-flash"
+        },
+        "displayName": "DeepSeek Responses"
+      }
+    }
+  }
+}

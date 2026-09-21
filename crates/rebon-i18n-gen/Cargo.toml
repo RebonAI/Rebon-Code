@@ -1,0 +1,12 @@
+[package]
+name = "rebon-i18n-gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Generates the desktop, browser and mobile message catalogues from the one copy source in `i18n/`, so a string is written once and shipped three ways."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

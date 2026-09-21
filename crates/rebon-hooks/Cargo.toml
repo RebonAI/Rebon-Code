@@ -1,0 +1,26 @@
+[package]
+name = "rebon-hooks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Hooks configuration and runtime core: the hook data model (events, sources, command/prompt/agent/http variants), settings loading, the status-line command, and the runtime that matches and dispatches hooks. It is one subscriber on the engine's policy-event seat; what an event means where it lands belongs to the seat. Command and HTTP executors are built in; prompt/agent backends and settings-store reads are injected via traits."
+
+[dependencies]
+# `rebon-tools-core` is the one rebon-* dependency: three of the five answers
+# a hook can give are the same allow/deny/ask decision the tool pipeline acts
+# on, and they are spelled with the shared enum rather than a hook-local copy.
+rebon-tools-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Test matrix is hand-rolled. Host seams are injected via traits rather than
+# pulled in as Cargo deps.
+tempfile = "3"

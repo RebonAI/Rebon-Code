@@ -1,0 +1,55 @@
+[package]
+name = "rebon-plugin-tasks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The `tasks` feature plugin: task execution runtime, task/team/queue tools, and task attachment producers. Persistent task, team, mailbox, todo, and queue stores remain in rebon-tool."
+
+[features]
+# The one `TaskSnapshot` builder every surface test uses. Off by default so
+# it never reaches a release binary; a front end turns it on for its tests.
+test-support = []
+
+[dependencies]
+rebon-api.workspace = true
+# `/tasks`, `/workflows` and `/teams` are registered here, not in the
+# built-in table: they open this plugin's surfaces and go off with it.
+rebon-command-seat.workspace = true
+# One shortcut hint, in the remote-session progress line. A zero-dependency
+# leaf crate, so the edge is a name and nothing else.
+rebon-design-system.workspace = true
+# `DialogKey`: the backend-free key the two dialogs here read, so neither
+# has to name a terminal event type.
+rebon-dialog.workspace = true
+rebon-kernel.workspace = true
+rebon-core.workspace = true
+rebon-session-state.workspace = true
+rebon-tool.workspace = true
+rebon-tools-core.workspace = true
+# `format_duration_ms`, for the workflow phase table in the `/tasks`
+# detail pane: the same formatter the transcript workflow card uses, so
+# the two agree. `rebon-render` is the ratatui-free render projection; it
+# adds no third-party crate to this plugin's tree.
+rebon-render.workspace = true
+# Display-width truncation and padding for the rows the panel builds.
+rebon-width.workspace = true
+# The `ui-registry` seat the two dialogs are registered on, and the ids they
+# answer to.
+rebon-ui-seat.workspace = true
+rebon-types.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# `TestConfigHome` points the task/team stores at a temp config home; it is
+# the same fixture `rebon-tool`'s own tests use.
+rebon-tool = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }

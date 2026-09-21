@@ -1,0 +1,23 @@
+[package]
+name = "rebon-schema-gen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Exports the JSON Schema of rebon's ACP wire types and generates the browser client's TypeScript from it, so `rebon-web-ui` mirrors the Rust definitions by construction instead of by hand."
+
+[dependencies]
+rebon-proto = { workspace = true, features = ["schema"] }
+# The `/api/history` row shape. Not an ACP type, but the same argument
+# applies: the page had a hand-written mirror of it and a mirror drifts.
+rebon-render = { workspace = true, features = ["schema"] }
+rebon-types = { workspace = true, features = ["schema"] }
+# The `_session/*` extension. Not read by the browser — the page speaks
+# standard ACP — but generated here for the same reason as everything else:
+# it is a wire, and a wire that only exists in Rust is a wire nobody else
+# can check against.
+rebon-session-host = { workspace = true, features = ["schema"] }
+
+schemars.workspace = true
+serde_json.workspace = true

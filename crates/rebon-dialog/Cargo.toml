@@ -1,0 +1,25 @@
+[package]
+name = "rebon-dialog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Pure-logic state machines for Rebon's modal dialogs: option lists, confirm/cancel reducers, and display projections. Outbound side-effects are modeled as pre-built data shapes and action enums the consumer routes; no rebon-* deps and no IO."
+
+[dependencies]
+# The one exception to this crate's no-rebon-deps rule, and it is a
+# narrow one: `rebon-customselect` is itself dependency-free pure logic,
+# and it owns the option-list navigation state machine three of these
+# panels drive. Reimplementing it here would be the duplication the
+# seat exists to end.
+rebon-customselect.workspace = true
+
+# Intentionally dependency-free; pure logic. The outbound seams
+# (settings store, process shutdown, browser open,
+# updater, IDE plugin, MCP wire calls, UI widgets) are modeled as
+# pre-built input values or as small action enums the consumer wires
+# up, never Cargo deps.
+[dev-dependencies]
+# Intentionally empty. The test matrix is hand-rolled and lives beside the
+# code it pins.

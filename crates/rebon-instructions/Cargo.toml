@@ -1,0 +1,18 @@
+[package]
+name = "rebon-instructions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The project instruction documents rebon injects into every system prompt: global/project/local REBON.md, .rebon/rules, and their `@` includes — plus the kernel seam a surface asks for the whole loaded-document list through."
+
+[dependencies]
+# Config-home resolution: the global instruction file lives beside the rest
+# of rebon's data.
+rebon-session.workspace = true
+# The `loaded-documents` seam is a typed kernel service.
+rebon-kernel.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

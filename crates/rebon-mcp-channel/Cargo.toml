@@ -1,0 +1,35 @@
+[package]
+name = "rebon-mcp-channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "`rebon mcp serve`: Rebon's background jobs as an MCP server — start, inspect, answer and cancel a job, and push its outcome back to the client over the MCP channel extension. An endpoint, like the terminal and the desktop app: it drives the session host and owns no job."
+
+[dependencies]
+# The job record, the store transactions over it, and the launch / reply /
+# stop / answer paths every other endpoint uses. This crate is a session-host
+# client and nothing else.
+rebon-session-host.workspace = true
+# The transcript a finished job's result is read from.
+rebon-session.workspace = true
+# JSON-RPC framing and the channel wire contract the host half reads.
+rebon-proto.workspace = true
+# `path_scope`, the one answer to "is this directory inside that one".
+# Already in the graph through `rebon-session-host`.
+rebon-tool.workspace = true
+# The `\\?\` rule for a canonicalized cwd. Already in the graph likewise.
+rebon-tools-core.workspace = true
+rebon-types.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+fs2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

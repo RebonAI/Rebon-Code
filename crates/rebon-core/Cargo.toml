@@ -1,0 +1,69 @@
+[package]
+name = "rebon-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Harness / coordinator / task orchestration for rebon."
+
+[dependencies]
+rebon-kernel.workspace = true
+rebon-agent-core.workspace = true
+rebon-proto.workspace = true
+rebon-session.workspace = true
+rebon-session-state.workspace = true
+rebon-types.workspace = true
+rebon-api.workspace = true
+rebon-bridge.workspace = true
+rebon-instructions.workspace = true
+rebon-permissions.workspace = true
+rebon-tool.workspace = true
+rebon-tools-core.workspace = true
+rebon-hooks.workspace = true
+
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+futures-util.workspace = true
+chrono.workspace = true
+
+# Cron scheduler: file watcher (reload on change) and cross-process lock
+# (owner election).
+notify.workspace = true
+fs2.workspace = true
+
+[dev-dependencies]
+# Feature plugins, as dev-dependencies only.
+#
+# What these tests cover is the engine's *tool projection*: which tools a
+# given session kind sees eagerly, which it sees deferred, and which it must
+# not see at all. That question is only answerable against the full builtin
+# catalogue, and the catalogue now lives in the plugins — so the test module
+# builds one with `engine_with_every_builtin_tool()`, which registers each
+# plugin's `tools()` on a bare engine. A dev-dependency cycle (every one of
+# these crates depends on this one) is allowed by Cargo and does not affect
+# the built library.
+#
+# Not every plugin is here. A plugin whose own tests already run its tools
+# against a real seat is represented by a metadata-only
+# `FeatureProjectionTool` stand-in instead, which is all projection asks of
+# it: monitor, notebook, mcp, structured-output and skill.
+rebon-plugin-agents.workspace = true
+rebon-plugin-cron.workspace = true
+rebon-plugin-escalation.workspace = true
+# Not for its tools (it has none): the assembly golden vouches for that
+# crate's frozen base-plane fixture from the engine's side.
+rebon-plugin-model-prompt.workspace = true
+rebon-plugin-plan-mode.workspace = true
+rebon-plugin-profile.workspace = true
+rebon-plugin-tasks.workspace = true
+rebon-plugin-web.workspace = true
+rebon-plugin-workflow.workspace = true
+tempfile = "3"
+# `start_paused` tests (instant backoff sleeps) need tokio's test-util.
+tokio = { workspace = true, features = ["full", "test-util"] }

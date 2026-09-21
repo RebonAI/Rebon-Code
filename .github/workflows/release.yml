@@ -1,0 +1,395 @@
+name: release
+
+# Builds rebon-cli and publishes the @rebon/cli npm packages (per-platform +
+# wrapper) to the public npm registry.
+#
+# Each platform runner BUILDS AND PUBLISHES its own @rebon/cli-<os>-<cpu>
+# tarball directly (scripts/npm_publish_dist.{sh,ps1}); nothing is handed
+# between jobs as an artifact. The wrapper @rebon/cli and the bare `rebon`
+# alias are published last, once every platform package exists.
+#
+# Publishing is gated on v* tags: a push to main only runs verification jobs,
+# so it can never trigger the heavy build/publish jobs.
+#
+# Required secret: NPM_ORG_TOKEN (npm automation token with publish rights on
+# the @rebon scope). GITHUB_TOKEN is provided by Actions and is only used by
+# actions/checkout.
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  NPM_CONFIG_FUND: "false"
+  NPM_CONFIG_AUDIT: "false"
+  NPM_CONFIG_PROGRESS: "false"
+
+jobs:
+  verify:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Provision the pinned Node
+        # The gate below asserts against Node 24.19.0 exactly — the version
+        # rebon-node-runtime pins. Asking the runner's preinstalled Node made
+        # the gate fail on whatever the image last upgraded to, so the
+        # workflow provisions the pinned one.
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+      - name: Verify scripts
+        run: |
+          python3 -m py_compile scripts/build_npm_package.py scripts/publish_npm_package.py
+          bash -n scripts/npm_publish_dist.sh
+      - name: Cargo metadata
+        run: cargo metadata --format-version 1 --no-deps
+      - name: Cargo check
+        run: cargo check -p rebon-cli --locked
+      - name: No JS engine in the build graph
+        # V8 is gone and Boa is a separate one-shot process. Nothing rebon links
+        # embeds a JS engine, and the way that changes is one dependency line —
+        # so it is checked rather than remembered.
+        run: |
+          set -eu
+          cargo check -p rebon-harness -p rebon-kernel-seats -p rebon-provider -p rebon-plugin-host --locked
+          if cargo tree -p rebon-cli -i deno_core >/dev/null 2>&1; then
+            echo "deno_core is back in rebon-cli's dependency graph" >&2
+            exit 1
+          fi
+      - name: Containment limits probe
+        # Diagnostic, never fails the job: reports which setrlimit calls this
+        # mac accepts from a forked child, with the exact values the code-mode
+        # containment installs. When a containment spawn dies with a bare
+        # "Invalid argument (os error 22)" — pre_exec errors carry only the
+        # errno, not which call raised it — this table is the answer.
+        run: |
+          python3 - <<'EOF'
+          import os, resource, threading
+          LIMITS = [
+              ('RLIMIT_AS', resource.RLIMIT_AS, 8 << 30),
+              ('RLIMIT_CPU', resource.RLIMIT_CPU, 60),
+              ('RLIMIT_NOFILE', resource.RLIMIT_NOFILE, 32),
+              ('RLIMIT_CORE', resource.RLIMIT_CORE, 0),
+              ('RLIMIT_STACK', resource.RLIMIT_STACK, 4 << 20),
+              ('RLIMIT_NPROC', resource.RLIMIT_NPROC, 32),
+          ]
+          def probe():
+              pid = os.fork()
+              if pid == 0:
+                  try:
+                      os.setpgid(0, 0)
+                      os.write(1, b'setpgid: ok\n')
+                  except OSError as e:
+                      os.write(1, f'setpgid: errno {e.errno}\n'.encode())
+                  for name, rid, value in LIMITS:
+                      try:
+                          resource.setrlimit(rid, (value, value))
+                          os.write(1, f'{name}: ok\n'.encode())
+                      except OSError as e:
+                          os.write(1, f'{name}: errno {e.errno} ({e.strerror})\n'.encode())
+                  os._exit(0)
+              os.waitpid(pid, 0)
+          # Forked from a thread on purpose: production spawns happen on
+          # pthread workers, and xnu treats their stacks differently.
+          t = threading.Thread(target=probe)
+          t.start()
+          t.join()
+          EOF
+      - name: Verify plugin protocol on Node 24.19
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $node = (@(Get-Command node -CommandType Application -ErrorAction Stop))[0].Source
+          $version = & $node -p "process.versions.node"
+          if ($version -ne '24.19.0') { throw "plugin protocol requires Node 24.19.0, found $version at $node" }
+          $tests = Get-ChildItem runtimes/node/plugin-host/test/*.test.mjs | ForEach-Object { $_.FullName }
+          & $node --test @tests
+          if ($LASTEXITCODE -ne 0) { throw "Node plugin host tests failed with exit code $LASTEXITCODE" }
+          # The composition runtime runs the vendored dsh payload on this same
+          # Node. Its tests are what say whether a package in that payload still
+          # loads outside deno_core, so they belong to the same gate.
+          $composeTests = Get-ChildItem runtimes/node/compose-runtime/test/*.test.mjs | ForEach-Object { $_.FullName }
+          & $node --test @composeTests
+          if ($LASTEXITCODE -ne 0) { throw "Node compose runtime tests failed with exit code $LASTEXITCODE" }
+          $env:REBON_TEST_NODE = $node
+          $env:REBON_REQUIRE_TEST_NODE = '1'
+          cargo test -p rebon-plugin-protocol --locked
+          if ($LASTEXITCODE -ne 0) { throw "Rust plugin protocol tests failed with exit code $LASTEXITCODE" }
+          # The runtime crate's drift test reads the gate above back, so it has
+          # to run here: a range change that misses this file must fail CI.
+          cargo test -p rebon-node-runtime --locked
+          if ($LASTEXITCODE -ne 0) { throw "Node runtime tests failed with exit code $LASTEXITCODE" }
+          # The supervisor's integration tests drive real child processes; they
+          # skip without REBON_TEST_NODE, which is set above.
+          cargo test -p rebon-plugin-supervisor --locked
+          if ($LASTEXITCODE -ne 0) { throw "Plugin supervisor tests failed with exit code $LASTEXITCODE" }
+          # The embedder half: a real host, the real composition runtime, and
+          # rebon's own kernel seats on this side. It is the only test that
+          # proves the two halves agree about a whole composition.
+          # Serial: these share one process kernel and process-wide registration
+          # slots, so running them at once is three tests writing one seat table.
+          cargo test -p rebon-harness --test plugin_plane_e2e --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Plugin plane end-to-end tests failed with exit code $LASTEXITCODE" }
+          # And a whole agent loop on a host of its own, driven the way a session
+          # drives one. It sets process-wide environment, so it runs alone.
+          cargo test -p rebon-harness --test plugin_plane_loop_e2e --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Plugin plane loop tests failed with exit code $LASTEXITCODE" }
+          # Code Mode belongs to this gate for the reason it was broken: its
+          # suite takes whichever Node is on PATH, so on a machine with an older
+          # one it stayed green while every Code Mode process on the version
+          # rebon actually pins died at `bad option`. Running it here is what
+          # makes the pinned runtime the one the assertions are made against.
+          cargo test -p rebon-code-runner --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Code Mode executor tests failed with exit code $LASTEXITCODE" }
+          cargo test -p rebon-kernel-seats --test kernel_code_mode_js --locked
+          if ($LASTEXITCODE -ne 0) { throw "Code Mode acceptance tests failed with exit code $LASTEXITCODE" }
+          # The backend seam a session sees, on the plane. Sets process-wide
+          # environment, so it runs alone.
+          cargo test -p rebon-harness --test kernel_loop_backend_plane --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Kernel loop backend tests failed with exit code $LASTEXITCODE" }
+          # Rebon's own seats, reached the way a plugin reaches them. Serial:
+          # one kernel and process-wide registration slots.
+          cargo test -p rebon-plugin-host --test kernel_seats_plane --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Kernel seat tests failed with exit code $LASTEXITCODE" }
+          # And the whole chain from one config.json, which is the shape a user
+          # actually arrives in.
+          cargo test -p rebon-harness --test kernel_mainline_deepseek_js --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Mainline composition tests failed with exit code $LASTEXITCODE" }
+      - name: Check isolated Boa runner target portability
+        run: |
+          set -eu
+          targets="aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-pc-windows-msvc aarch64-linux-android"
+          rustup target add $targets
+          for target in $targets; do
+            cargo check -p rebon-boa-runner --all-features --locked --target "$target"
+            # The Code Mode executor ships on every one of these too, and it is
+            # where the platform-specific containment is actually spelled out.
+            cargo check -p rebon-code-runner --locked --target "$target"
+          done
+      - name: Test isolated Boa runner containment on macOS
+        run: cargo test -p rebon-boa-runner --all-features --locked -- --test-threads=1
+
+  test:
+    needs: verify
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'pull_request'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test -p rebon-cli --locked
+      - name: Test the crates the plugin-first refactor touches
+        # rebon-core's unit tests (and the ACP end-to-end tests that moved
+        # to rebon-harness) cannot run on the main development machine: its
+        # antivirus quarantines every freshly built test binary that drives a
+        # JSON-RPC loop. This step is the only place they run, so it is the
+        # gate. New feature plugins under crates/plugins/ go on this list.
+        run: >-
+          cargo test --locked
+          -p rebon-core -p rebon-harness -p rebon-tool -p rebon-acp
+          -p rebon-agent-core -p rebon-slash-commands -p rebon-acp-client -p rebon-config
+          -p rebon-proto
+          -p rebon-schema-gen -p rebon-i18n-gen
+          -p rebon-session-state -p rebon-kernel
+          -p rebon-kernel-seats -p rebon-provider -p rebon-plugin-host
+          -p rebon-instructions -p rebon-session -p rebon-session-host -p rebon-session-runtime
+          -p rebon-mcp-channel -p rebon-rc-runner
+          -p rebon-command-seat -p rebon-dialog -p rebon-tui
+          -p rebon-render -p rebon-message-tui
+          -p rebon-plugin-cron -p rebon-plugin-web -p rebon-plugin-monitor
+          -p rebon-plugin-memory -p rebon-plugin-notebook
+          -p rebon-plugin-structured-output -p rebon-plugin-profile
+          -p rebon-plugin-computer-use -p rebon-plugin-skill
+          -p rebon-plugin-image-gen
+          -p rebon-plugin-escalation -p rebon-plugin-mcp
+          -p rebon-plugin-tasks -p rebon-plugin-plan-mode
+          -p rebon-plugin-updater -p rebon-plugin-agents
+          -p rebon-plugin-remote -p rebon-plugin-model-routing
+          -p rebon-plugin-lsp-mcp -p rebon-plugin-browser
+          -p rebon-plugin-onboarding -p sandbox-win
+          -p rebon-plugin-sandbox -p rebon-plugin-workflow
+
+  boa-runtime:
+    needs: verify
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test isolated Boa runner containment
+        run: cargo test -p rebon-boa-runner --all-features --locked -- --test-threads=1
+
+  # ---- release: build + publish per platform, only on v* tags ----
+
+  # Both darwin targets cross-compile from the same Apple Silicon runner.
+  publish-darwin:
+    needs: [verify, boa-runtime]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-14
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            cpu: arm64
+          - target: x86_64-apple-darwin
+            cpu: x64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + package
+        run: |
+          set -eu
+          rustup target add ${{ matrix.target }}
+          rm -rf dist/npm && mkdir -p dist/npm
+          cargo build -p rebon-cli --release --locked --target ${{ matrix.target }}
+          # The plugin binaries: derived from crates/plugins/, never named
+          python3 scripts/build_npm_package.py --build-plugin-binaries --target ${{ matrix.target }}
+          python3 scripts/build_npm_package.py \
+            --kind platform \
+            --binary target/${{ matrix.target }}/release/rebon \
+            --os darwin --cpu ${{ matrix.cpu }} \
+            --out-dir dist/npm
+      - name: Publish to npm
+        env:
+          NPM_ORG_TOKEN: ${{ secrets.NPM_ORG_TOKEN }}
+        run: bash scripts/npm_publish_dist.sh
+
+  # Both Linux targets build on a Linux runner via cargo-zigbuild
+  # (musl -> fully static), which is also what cross-compiles aarch64.
+  publish-linux:
+    needs: [verify, boa-runtime]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            cpu: x64
+          - target: aarch64-unknown-linux-musl
+            cpu: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install zig + cargo-zigbuild
+        # zig comes from the ziglang wheel rather than a package manager:
+        # cargo-zigbuild falls back to `python3 -m ziglang` when no `zig` is on
+        # PATH, so one pip install covers every runner image. The second pip
+        # form is for the images whose system Python is externally managed
+        # (PEP 668) and refuses a plain --user install.
+        run: |
+          set -eu
+          if ! command -v zig >/dev/null 2>&1 && ! python3 -c 'import ziglang' 2>/dev/null; then
+            python3 -m pip install --user ziglang \
+              || python3 -m pip install --user --break-system-packages ziglang
+          fi
+          command -v cargo-zigbuild >/dev/null 2>&1 || cargo install --locked cargo-zigbuild
+          rustup target add ${{ matrix.target }}
+      - name: Build + package
+        run: |
+          set -eu
+          rm -rf dist/npm && mkdir -p dist/npm
+          cargo zigbuild -p rebon-cli --release --locked --target ${{ matrix.target }}
+          # Same derived manifest, built with the same cross toolchain.
+          python3 scripts/build_npm_package.py --build-plugin-binaries --builder cargo-zigbuild --target ${{ matrix.target }}
+          python3 scripts/build_npm_package.py \
+            --kind platform \
+            --binary target/${{ matrix.target }}/release/rebon \
+            --os linux --cpu ${{ matrix.cpu }} \
+            --out-dir dist/npm
+      - name: Publish to npm
+        env:
+          NPM_ORG_TOKEN: ${{ secrets.NPM_ORG_TOKEN }}
+        run: bash scripts/npm_publish_dist.sh
+
+  publish-windows:
+    needs: [verify, boa-runtime]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + package
+        shell: pwsh
+        run: |
+          if (Test-Path dist/npm) { Remove-Item -Recurse -Force dist/npm }
+          New-Item -ItemType Directory -Force -Path dist/npm | Out-Null
+          cargo build -p rebon-cli --release --locked
+          python scripts/build_npm_package.py --build-plugin-binaries
+          python scripts/build_npm_package.py --kind platform `
+            --binary target/release/rebon.exe `
+            --os win32 --cpu x64 `
+            --out-dir dist/npm
+      - name: Publish to npm
+        shell: pwsh
+        env:
+          NPM_ORG_TOKEN: ${{ secrets.NPM_ORG_TOKEN }}
+        run: ./scripts/npm_publish_dist.ps1
+
+  # The wrapper package (@rebon/cli) is platform-independent JS whose
+  # optionalDependencies point at the per-platform packages, so it publishes
+  # only after all of them exist. The bare `rebon` alias (depends on
+  # @rebon/cli ^<version>) ships from the same job so `npm install -g rebon`
+  # always resolves the release being cut — a stale ^0.x range on the alias
+  # pins users to the previous minor (bit us at 0.2.1 -> 0.3.0).
+  publish-wrapper:
+    needs: [publish-darwin, publish-linux, publish-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build wrapper + bare alias
+        run: |
+          set -eu
+          rm -rf dist/npm && mkdir -p dist/npm
+          python3 scripts/build_npm_package.py --kind wrapper --out-dir dist/npm
+          python3 scripts/build_npm_package.py --kind bare --out-dir dist/npm
+      - name: Publish to npm
+        env:
+          NPM_ORG_TOKEN: ${{ secrets.NPM_ORG_TOKEN }}
+        run: bash scripts/npm_publish_dist.sh
+
+  # ---- release gate: a tag that published nothing must read as a failure ----
+
+  # Every publish job hangs off `needs:`, and a job whose dependency failed is
+  # reported as *skipped*, not failed. So a tag whose verification died
+  # produced a run of grey rows, no npm publish, and nothing shaped like an
+  # error — which is how v1.1.0 got a tag while the registry stayed on 1.0.3,
+  # and v1.1.1 after it. This job says out loud what the run does not.
+  release-gate:
+    needs: [verify, test, publish-darwin, publish-linux, publish-windows, publish-wrapper]
+    if: always() && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Deliberately without a checkout: this job has to outlive whatever broke
+      # the run it is judging, and it only reads results the runner already
+      # holds.
+      - name: Every job this tag needed must have succeeded
+        run: |
+          set -u
+          status=0
+          for entry in \
+            "verify=${{ needs.verify.result }}" \
+            "test=${{ needs.test.result }}" \
+            "publish-darwin=${{ needs.publish-darwin.result }}" \
+            "publish-linux=${{ needs.publish-linux.result }}" \
+            "publish-windows=${{ needs.publish-windows.result }}" \
+            "publish-wrapper=${{ needs.publish-wrapper.result }}"; do
+            printf '%-16s %s\n' "${entry%%=*}" "${entry#*=}"
+            [ "${entry#*=}" = "success" ] || status=1
+          done
+          if [ "$status" -ne 0 ]; then
+            echo ""
+            echo "This tag published nothing usable: a job above did not succeed."
+            echo "A 'skipped' row was blocked by a dependency that failed, so read"
+            echo "upwards to the first row that is neither success nor skipped."
+            exit 1
+          fi

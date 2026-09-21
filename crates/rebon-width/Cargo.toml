@@ -1,0 +1,13 @@
+[package]
+name = "rebon-width"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "One display-width policy for the whole render stack: unicode-width plus a process-wide East Asian ambiguous-width setting, so what Rebon lays out and what the terminal paints agree. No rebon-* dependencies; the only dependency is unicode-width."
+
+[dependencies]
+# Pinned to the workspace table so every caller measures with the same one —
+# the point of this crate is that there is only one answer.
+unicode-width.workspace = true

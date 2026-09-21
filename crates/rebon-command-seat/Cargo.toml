@@ -1,0 +1,13 @@
+[package]
+name = "rebon-command-seat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The kernel's `command-registry` seat: where every slash command — built-in or plugin — is registered, with a handler that says what running it means. Registration is a kernel effect (dispose the context, the command is gone). Depends only on rebon-kernel, rebon-slash-commands and rebon-types."
+
+[dependencies]
+rebon-kernel.workspace = true
+rebon-slash-commands.workspace = true
+rebon-types.workspace = true

@@ -1,0 +1,65 @@
+# Cargo build artifacts
+/target
+target
+target-dev
+**/*.rs.bk
+*.pdb
+# rc-server and relay-server are their own workspaces, so each has its own
+# target directory.
+/services/rc-server/target
+/services/relay-server/target
+
+# The lock file is kept: this workspace ships binaries.
+# (Do not ignore Cargo.lock.)
+
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local runtime state and packaging output
+.rebon
+dist
+migration
+jobs
+requests/
+system.md
+**/__pycache__/
+
+# The web UI build is committed: crates/rebon-cli/build.rs embeds it, so
+# `cargo build` never needs Node.
+!/assets/web-ui/dist/
+
+# Local relay / test artifacts (relay smoke runs write the sqlite store to the
+# cwd unless REBON_RELAY_DATABASE_PATH points elsewhere; the headless e2e
+# harness drops logs under services/relay-server/)
+rebon-relay*.sqlite3*
+services/relay-server/.e2e-relay.*
+
+# Cygwin/MSYS crash dumps, written into whatever the cwd happened to be.
+*.stackdump
+nul
+
+# Packaged plugin bundles: rebuilt from the sources sitting next to them, and a
+# stale one is worse than none.
+/runtimes/node/plugins/*.zip
+/runtimes/node/plugins/*/dist/
+
+# Local provider probes and everything a run of one leaves behind. The scripts
+# talk to real endpoints and tend to carry a key inline, so they stay out of
+# the tree by default.
+/runtimes/node/plugins/*/probe_workspace/
+/runtimes/node/plugins/*/*_probe.py
+/runtimes/node/plugins/*/*_probe.jsonl
+
+# Local secrets / publish credentials (never commit real tokens)
+.npmrc
+.env
+.env.*
+!.env.example
+!.env.*.example
+.mcp.json

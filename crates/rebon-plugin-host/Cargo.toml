@@ -1,0 +1,58 @@
+[package]
+name = "rebon-plugin-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The Node plugin plane: the in-process host that loads external plugins, the composition it is asked to run, the manifests that describe one, the patches applied to a vendored payload, the decision about when to start a host at all, and the provider registry an external provider is loaded onto."
+
+[dependencies]
+# The plane registers what a plugin provides on kernel seats and forks a scope
+# per plugin.
+rebon-kernel.workspace = true
+rebon-command-seat.workspace = true
+# The seats a loaded plugin's tools land on.
+rebon-kernel-seats.workspace = true
+# The `llm/stream` adapter a plugin may register as a provider.
+rebon-provider.workspace = true
+# The supervisor is the transport: one process, one request table, one stderr
+# drain, for every plugin.
+rebon-plugin-supervisor.workspace = true
+rebon-plugin-protocol.workspace = true
+# Where a Node runtime is found and which version is pinned.
+rebon-node-runtime.workspace = true
+# The `node-host` plugin's own half: the switches, the wanted set, the service
+# a host resolves before starting a plane. The plugin cannot name this crate
+# back — that is the seam `kernel_node_host` implements.
+rebon-plugin-node-host.workspace = true
+# `ModelClient` and the built-in provider clients the registry builds, plus the
+# connection config a plane-hosted provider is handed each turn.
+rebon-api.workspace = true
+# `AgentBackend` / `PromptExecutor`: what a vendor loop is, to a session.
+rebon-agent-core.workspace = true
+# `TurnJournal` / `TranscriptJournal` for the kernel loop backend.
+rebon-acp-client.workspace = true
+# The seats a plane publishes on, and the tool-invoke host it hands a plugin.
+rebon-session.workspace = true
+# An installed package's manifest, as data.
+rebon-plugin-package.workspace = true
+# `Tool` definitions the plane exposes back to the engine.
+rebon-core.workspace = true
+rebon-tool.workspace = true
+# The settings chain `kernelPlugins` is read from.
+rebon-config.workspace = true
+rebon-types.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# `kernel_seats_plane.rs` boots a host, registers the seats on it and routes a
+# model request across; the three crates it needs for that are ordinary
+# dependencies now that the boot decision lives here too.
+tempfile = "3"

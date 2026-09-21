@@ -1,0 +1,1405 @@
+{
+  "version": 1,
+  "note": "Shared method-payload corpus. Rust reads it from tests/methods_corpus.rs and Node from test/methods.test.mjs; both must reach the same verdict and, on refusal, the same bracketed code. Validation order inside one payload is part of the contract, because it decides which code a payload with two problems reports.",
+  "cases": [
+    {
+      "name": "load_minimal",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs"
+      },
+      "accept": true
+    },
+    {
+      "name": "load_full",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs",
+        "services": [
+          "compose",
+          "render"
+        ],
+        "eventTopics": [
+          "session"
+        ],
+        "publishedTopics": [
+          "compose:session/append"
+        ],
+        "llmProviders": [
+          "deepseek"
+        ],
+        "invokableTools": [
+          "read_file"
+        ],
+        "tools": [
+          "grep"
+        ],
+        "seats": [
+          "credentials"
+        ],
+        "config": {
+          "baseURL": "https://example.invalid",
+          "models": [
+            {
+              "id": "m"
+            }
+          ]
+        }
+      },
+      "accept": true
+    },
+    {
+      "name": "load_unknown_field",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs",
+        "extra": 1
+      },
+      "code": "[UNKNOWN_FIELD]"
+    },
+    {
+      "name": "load_missing_entry",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a"
+      },
+      "code": "[MISSING_FIELD]"
+    },
+    {
+      "name": "load_reserved_plugin_id",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "$rebon/platform",
+        "root": "/packages/demo",
+        "entry": "index.mjs"
+      },
+      "code": "[RESERVED_PLUGIN_ID]"
+    },
+    {
+      "name": "load_empty_plugin_id",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "",
+        "root": "/packages/demo",
+        "entry": "index.mjs"
+      },
+      "code": "[EMPTY_NAME]"
+    },
+    {
+      "name": "load_control_character_entry",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index\u0001.mjs"
+      },
+      "code": "[CONTROL_CHARACTER]"
+    },
+    {
+      "name": "load_duplicate_service",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs",
+        "services": [
+          "compose",
+          "compose"
+        ]
+      },
+      "code": "[DUPLICATE_DECLARATION]"
+    },
+    {
+      "name": "load_services_not_an_array",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs",
+        "services": "compose"
+      },
+      "code": "[WRONG_SHAPE]"
+    },
+    {
+      "name": "load_plugin_id_not_a_string",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": 1,
+        "root": "/packages/demo",
+        "entry": "index.mjs"
+      },
+      "code": "[WRONG_SHAPE]"
+    },
+    {
+      "name": "load_plugin_id_too_long",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "root": "/packages/demo",
+        "entry": "index.mjs"
+      },
+      "code": "[NAME_TOO_LONG]"
+    },
+    {
+      "name": "load_reports_the_plugin_id_before_the_entry",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "",
+        "root": "/packages/demo",
+        "entry": ""
+      },
+      "code": "[EMPTY_NAME]"
+    },
+    {
+      "name": "load_multibyte_plugin_id_is_bounded_by_utf8_bytes",
+      "note": "43 characters, 129 UTF-8 bytes. A host measuring UTF-16 units would accept this and disagree with the other one.",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一",
+        "root": "/packages/demo",
+        "entry": "index.mjs"
+      },
+      "code": "[NAME_TOO_LONG]"
+    },
+    {
+      "name": "load_multibyte_plugin_id_within_the_byte_bound",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一",
+        "root": "/packages/demo",
+        "entry": "index.mjs"
+      },
+      "accept": true
+    },
+    {
+      "name": "load_relative_root",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "packages/demo",
+        "entry": "index.mjs"
+      },
+      "code": "[PATH_NOT_ABSOLUTE]"
+    },
+    {
+      "name": "load_windows_root_is_absolute_everywhere",
+      "note": "A supervisor and its host always run on the same machine, so both spellings count as absolute regardless of which platform reads this corpus.",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "C:/packages/demo",
+        "entry": "index.mjs"
+      },
+      "accept": true
+    },
+    {
+      "name": "load_absolute_entry",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "/etc/passwd"
+      },
+      "code": "[PATH_NOT_RELATIVE]"
+    },
+    {
+      "name": "load_entry_climbs_out",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "src/../../index.mjs"
+      },
+      "code": "[PATH_ESCAPES]"
+    },
+    {
+      "name": "load_entry_with_a_backslash",
+      "note": "A backslash separates on Windows only, so this path would mean two different things on two machines.",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "src\\index.mjs"
+      },
+      "code": "[PATH_ESCAPES]"
+    },
+    {
+      "name": "load_nested_entry",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "dist/src/index.mjs"
+      },
+      "accept": true
+    },
+    {
+      "name": "ready_minimal",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a"
+      },
+      "accept": true
+    },
+    {
+      "name": "ready_full",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "services": [
+          "compose"
+        ],
+        "eventTopics": [
+          "session"
+        ]
+      },
+      "accept": true
+    },
+    {
+      "name": "ready_unknown_field",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "entry": "index.mjs"
+      },
+      "code": "[UNKNOWN_FIELD]"
+    },
+    {
+      "name": "unload_minimal",
+      "kind": "plugin_unload",
+      "payload": {
+        "pluginId": "plugin.a"
+      },
+      "accept": true
+    },
+    {
+      "name": "unload_unknown_field",
+      "kind": "plugin_unload",
+      "payload": {
+        "pluginId": "plugin.a",
+        "force": true
+      },
+      "code": "[UNKNOWN_FIELD]"
+    },
+    {
+      "name": "drain_minimal",
+      "kind": "plugin_drain",
+      "payload": {
+        "pluginId": "plugin.a"
+      },
+      "accept": true
+    },
+    {
+      "name": "drain_full",
+      "kind": "plugin_drain",
+      "payload": {
+        "pluginId": "plugin.a",
+        "outstandingCalls": [
+          "call-1"
+        ],
+        "revokedSubscriptions": [
+          "sub-1"
+        ]
+      },
+      "accept": true
+    },
+    {
+      "name": "service_call",
+      "kind": "service_call",
+      "payload": {
+        "service": "compose",
+        "request": {
+          "n": 1
+        }
+      },
+      "accept": true
+    },
+    {
+      "name": "service_call_null_request",
+      "kind": "service_call",
+      "payload": {
+        "service": "compose",
+        "request": null
+      },
+      "accept": true
+    },
+    {
+      "name": "service_call_missing_request",
+      "kind": "service_call",
+      "payload": {
+        "service": "compose"
+      },
+      "code": "[MISSING_FIELD]"
+    },
+    {
+      "name": "service_call_empty_service",
+      "kind": "service_call",
+      "payload": {
+        "service": "",
+        "request": null
+      },
+      "code": "[EMPTY_NAME]"
+    },
+    {
+      "name": "subscribe",
+      "kind": "event_subscribe",
+      "payload": {
+        "subscription": "s1",
+        "topic": "session"
+      },
+      "accept": true
+    },
+    {
+      "name": "subscribe_unknown_field",
+      "kind": "event_subscribe",
+      "payload": {
+        "subscription": "s1",
+        "topic": "session",
+        "filter": "*"
+      },
+      "code": "[UNKNOWN_FIELD]"
+    },
+    {
+      "name": "subscribe_reports_the_subscription_before_the_topic",
+      "kind": "event_subscribe",
+      "payload": {
+        "subscription": "",
+        "topic": ""
+      },
+      "code": "[EMPTY_NAME]"
+    },
+    {
+      "name": "unsubscribe",
+      "kind": "event_unsubscribe",
+      "payload": {
+        "subscription": "s1"
+      },
+      "accept": true
+    },
+    {
+      "name": "unsubscribe_missing_subscription",
+      "kind": "event_unsubscribe",
+      "payload": {},
+      "code": "[MISSING_FIELD]"
+    },
+    {
+      "name": "deliver",
+      "kind": "event_deliver",
+      "payload": {
+        "subscription": "s1",
+        "topic": "session",
+        "event": {
+          "kind": "turn"
+        }
+      },
+      "accept": true
+    },
+    {
+      "name": "deliver_control_character_topic",
+      "kind": "event_deliver",
+      "payload": {
+        "subscription": "s1",
+        "topic": "sess\u0007ion",
+        "event": null
+      },
+      "code": "[CONTROL_CHARACTER]"
+    },
+    {
+      "name": "deliver_missing_event",
+      "kind": "event_deliver",
+      "payload": {
+        "subscription": "s1",
+        "topic": "session"
+      },
+      "code": "[MISSING_FIELD]"
+    },
+    {
+      "name": "load_tools_absent_is_empty",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs",
+        "invokableTools": []
+      },
+      "accept": true
+    },
+    {
+      "name": "load_tool_name_empty",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs",
+        "invokableTools": [
+          ""
+        ]
+      },
+      "code": "[EMPTY_NAME]"
+    },
+    {
+      "name": "load_tool_declared_twice",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs",
+        "invokableTools": [
+          "read_file",
+          "read_file"
+        ]
+      },
+      "code": "[DUPLICATE_DECLARATION]"
+    },
+    {
+      "name": "tool_invoke_minimal",
+      "kind": "tool_invoke",
+      "payload": {
+        "tool": "read_file",
+        "input": null
+      },
+      "accept": true
+    },
+    {
+      "name": "tool_invoke_object_input",
+      "kind": "tool_invoke",
+      "payload": {
+        "tool": "read_file",
+        "input": {
+          "path": "README.md"
+        }
+      },
+      "accept": true
+    },
+    {
+      "name": "tool_invoke_missing_input",
+      "kind": "tool_invoke",
+      "payload": {
+        "tool": "read_file"
+      },
+      "code": "[MISSING_FIELD]"
+    },
+    {
+      "name": "tool_invoke_unknown_field",
+      "kind": "tool_invoke",
+      "payload": {
+        "tool": "read_file",
+        "input": null,
+        "scope": "x"
+      },
+      "code": "[UNKNOWN_FIELD]"
+    },
+    {
+      "name": "tool_invoke_name_empty",
+      "kind": "tool_invoke",
+      "payload": {
+        "tool": "",
+        "input": null
+      },
+      "code": "[EMPTY_NAME]"
+    },
+    {
+      "name": "tool_invoke_name_control_character",
+      "kind": "tool_invoke",
+      "payload": {
+        "tool": "read\u0001file",
+        "input": null
+      },
+      "code": "[CONTROL_CHARACTER]"
+    },
+    {
+      "name": "tool_invoke_name_not_a_string",
+      "kind": "tool_invoke",
+      "payload": {
+        "tool": 7,
+        "input": null
+      },
+      "code": "[WRONG_SHAPE]"
+    },
+    {
+      "name": "load_provider_declared_twice",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs",
+        "llmProviders": [
+          "deepseek",
+          "deepseek"
+        ]
+      },
+      "code": "[DUPLICATE_DECLARATION]"
+    },
+    {
+      "name": "ready_provider_absent_is_empty",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a"
+      },
+      "accept": true
+    },
+    {
+      "name": "ready_with_providers",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "llmProviders": [
+          "deepseek"
+        ]
+      },
+      "accept": true
+    },
+    {
+      "name": "llm_stream_minimal",
+      "kind": "llm_stream",
+      "payload": {
+        "provider": "deepseek",
+        "request": null
+      },
+      "accept": true
+    },
+    {
+      "name": "llm_stream_opaque_request",
+      "kind": "llm_stream",
+      "payload": {
+        "provider": "deepseek",
+        "request": {
+          "model": "chat",
+          "messages": []
+        }
+      },
+      "accept": true
+    },
+    {
+      "name": "llm_stream_missing_request",
+      "kind": "llm_stream",
+      "payload": {
+        "provider": "deepseek"
+      },
+      "code": "[MISSING_FIELD]"
+    },
+    {
+      "name": "llm_stream_unknown_field",
+      "kind": "llm_stream",
+      "payload": {
+        "provider": "deepseek",
+        "request": null,
+        "model": "chat"
+      },
+      "code": "[UNKNOWN_FIELD]"
+    },
+    {
+      "name": "llm_stream_provider_empty",
+      "kind": "llm_stream",
+      "payload": {
+        "provider": "",
+        "request": null
+      },
+      "code": "[EMPTY_NAME]"
+    },
+    {
+      "name": "llm_stream_provider_control_character",
+      "kind": "llm_stream",
+      "payload": {
+        "provider": "deep\u0001seek",
+        "request": null
+      },
+      "code": "[CONTROL_CHARACTER]"
+    },
+    {
+      "name": "llm_stream_provider_not_a_string",
+      "kind": "llm_stream",
+      "payload": {
+        "provider": 7,
+        "request": null
+      },
+      "code": "[WRONG_SHAPE]"
+    },
+    {
+      "name": "load_provided_tools",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs",
+        "tools": [
+          "grep"
+        ],
+        "invokableTools": [
+          "read_file"
+        ]
+      },
+      "accept": true
+    },
+    {
+      "name": "ready_with_tool_definitions",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "tools": [
+          {
+            "name": "grep",
+            "description": "search files",
+            "inputSchema": {
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "accept": true
+    },
+    {
+      "name": "ready_tool_missing_description",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "tools": [
+          {
+            "name": "grep",
+            "inputSchema": null
+          }
+        ]
+      },
+      "code": "[MISSING_FIELD]"
+    },
+    {
+      "name": "ready_tool_empty_description",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "tools": [
+          {
+            "name": "grep",
+            "description": "",
+            "inputSchema": null
+          }
+        ]
+      },
+      "code": "[EMPTY_DESCRIPTION]"
+    },
+    {
+      "name": "ready_tool_description_too_long",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "tools": [
+          {
+            "name": "grep",
+            "description": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "inputSchema": null
+          }
+        ]
+      },
+      "code": "[DESCRIPTION_TOO_LONG]"
+    },
+    {
+      "name": "ready_tool_unknown_field",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "tools": [
+          {
+            "name": "grep",
+            "description": "d",
+            "inputSchema": null,
+            "extra": 1
+          }
+        ]
+      },
+      "code": "[UNKNOWN_FIELD]"
+    },
+    {
+      "name": "ready_tool_declared_twice",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "tools": [
+          {
+            "name": "grep",
+            "description": "search files",
+            "inputSchema": {
+              "type": "object"
+            }
+          },
+          {
+            "name": "grep",
+            "description": "search files",
+            "inputSchema": {
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "code": "[DUPLICATE_DECLARATION]"
+    },
+    {
+      "name": "ready_tool_name_empty",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "tools": [
+          {
+            "name": "",
+            "description": "d",
+            "inputSchema": null
+          }
+        ]
+      },
+      "code": "[EMPTY_NAME]"
+    },
+    {
+      "name": "load_seat_declared_twice",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs",
+        "seats": [
+          "credentials",
+          "credentials"
+        ]
+      },
+      "code": "[DUPLICATE_DECLARATION]"
+    },
+    {
+      "name": "seat_call_minimal",
+      "kind": "seat_call",
+      "payload": {
+        "seat": "credentials",
+        "method": "resolveEnv",
+        "params": null
+      },
+      "accept": true
+    },
+    {
+      "name": "seat_call_opaque_params",
+      "kind": "seat_call",
+      "payload": {
+        "seat": "logger",
+        "method": "warn",
+        "params": {
+          "message": "hi"
+        }
+      },
+      "accept": true
+    },
+    {
+      "name": "seat_call_missing_params",
+      "kind": "seat_call",
+      "payload": {
+        "seat": "logger",
+        "method": "warn"
+      },
+      "code": "[MISSING_FIELD]"
+    },
+    {
+      "name": "seat_call_unknown_field",
+      "kind": "seat_call",
+      "payload": {
+        "seat": "logger",
+        "method": "warn",
+        "params": null,
+        "owner": "x"
+      },
+      "code": "[UNKNOWN_FIELD]"
+    },
+    {
+      "name": "seat_call_seat_empty",
+      "kind": "seat_call",
+      "payload": {
+        "seat": "",
+        "method": "warn",
+        "params": null
+      },
+      "code": "[EMPTY_NAME]"
+    },
+    {
+      "name": "seat_call_seat_checked_before_method",
+      "kind": "seat_call",
+      "payload": {
+        "seat": "",
+        "method": "",
+        "params": null
+      },
+      "code": "[EMPTY_NAME]"
+    },
+    {
+      "name": "seat_call_method_control_character",
+      "kind": "seat_call",
+      "payload": {
+        "seat": "logger",
+        "method": "wa\u0001rn",
+        "params": null
+      },
+      "code": "[CONTROL_CHARACTER]"
+    },
+    {
+      "name": "seat_call_method_not_a_string",
+      "kind": "seat_call",
+      "payload": {
+        "seat": "logger",
+        "method": 7,
+        "params": null
+      },
+      "code": "[WRONG_SHAPE]"
+    },
+    {
+      "name": "load_published_topic_declared_twice",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs",
+        "publishedTopics": [
+          "session",
+          "session"
+        ]
+      },
+      "code": "[DUPLICATE_DECLARATION]"
+    },
+    {
+      "name": "load_published_topics_absent_is_empty",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs"
+      },
+      "accept": true
+    },
+    {
+      "name": "load_published_topic_control_character",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs",
+        "publishedTopics": [
+          "session\u0001append"
+        ]
+      },
+      "code": "[CONTROL_CHARACTER]"
+    },
+    {
+      "name": "emit_minimal",
+      "kind": "event_emit",
+      "payload": {
+        "topic": "compose:session/append",
+        "event": null
+      },
+      "accept": true
+    },
+    {
+      "name": "emit_carries_an_opaque_event",
+      "kind": "event_emit",
+      "payload": {
+        "topic": "session",
+        "event": {
+          "type": "append",
+          "data": [
+            1,
+            2,
+            3
+          ]
+        }
+      },
+      "accept": true
+    },
+    {
+      "name": "emit_missing_event",
+      "kind": "event_emit",
+      "payload": {
+        "topic": "session"
+      },
+      "code": "[MISSING_FIELD]"
+    },
+    {
+      "name": "emit_unknown_field",
+      "kind": "event_emit",
+      "payload": {
+        "topic": "session",
+        "event": null,
+        "subscription": "sub-1"
+      },
+      "code": "[UNKNOWN_FIELD]"
+    },
+    {
+      "name": "emit_empty_topic",
+      "kind": "event_emit",
+      "payload": {
+        "topic": "",
+        "event": null
+      },
+      "code": "[EMPTY_NAME]"
+    },
+    {
+      "name": "emit_topic_not_a_string",
+      "kind": "event_emit",
+      "payload": {
+        "topic": 7,
+        "event": null
+      },
+      "code": "[WRONG_SHAPE]"
+    },
+    {
+      "name": "emit_topic_too_long",
+      "kind": "event_emit",
+      "payload": {
+        "topic": "ttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+        "event": null
+      },
+      "code": "[NAME_TOO_LONG]"
+    },
+    {
+      "name": "load_config_absent_is_null",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs"
+      },
+      "accept": true
+    },
+    {
+      "name": "load_config_may_be_any_json",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs",
+        "config": [
+          1,
+          "two",
+          null
+        ]
+      },
+      "accept": true
+    },
+    {
+      "name": "ready_with_adapter_info",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "llmProviders": [
+          "deepseek"
+        ],
+        "llmAdapters": {
+          "deepseek": {
+            "capabilities": {
+              "reasoningText": true
+            },
+            "defaultModel": "v4"
+          }
+        }
+      },
+      "accept": true
+    },
+    {
+      "name": "ready_adapter_info_absent_is_empty",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "llmProviders": [
+          "deepseek"
+        ]
+      },
+      "accept": true
+    },
+    {
+      "name": "ready_adapter_info_for_undeclared_provider",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "llmProviders": [
+          "deepseek"
+        ],
+        "llmAdapters": {
+          "other": {}
+        }
+      },
+      "code": "[UNDECLARED_ADAPTER]"
+    },
+    {
+      "name": "ready_adapter_info_not_an_object",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "llmProviders": [
+          "deepseek"
+        ],
+        "llmAdapters": [
+          "deepseek"
+        ]
+      },
+      "code": "[WRONG_SHAPE]"
+    },
+    {
+      "name": "llm_control_reset",
+      "kind": "llm_control",
+      "payload": {
+        "provider": "deepseek",
+        "signal": "reset"
+      },
+      "accept": true
+    },
+    {
+      "name": "llm_control_end_turn",
+      "kind": "llm_control",
+      "payload": {
+        "provider": "deepseek",
+        "signal": "endTurn"
+      },
+      "accept": true
+    },
+    {
+      "name": "llm_control_invalidate",
+      "kind": "llm_control",
+      "payload": {
+        "provider": "deepseek",
+        "signal": "invalidate"
+      },
+      "accept": true
+    },
+    {
+      "name": "llm_control_unknown_signal",
+      "kind": "llm_control",
+      "payload": {
+        "provider": "deepseek",
+        "signal": "forget"
+      },
+      "code": "[UNKNOWN_LLM_SIGNAL]"
+    },
+    {
+      "name": "llm_control_missing_signal",
+      "kind": "llm_control",
+      "payload": {
+        "provider": "deepseek"
+      },
+      "code": "[MISSING_FIELD]"
+    },
+    {
+      "name": "llm_control_unknown_field",
+      "kind": "llm_control",
+      "payload": {
+        "provider": "deepseek",
+        "signal": "reset",
+        "extra": 1
+      },
+      "code": "[UNKNOWN_FIELD]"
+    },
+    {
+      "name": "llm_control_provider_empty",
+      "kind": "llm_control",
+      "payload": {
+        "provider": "",
+        "signal": "reset"
+      },
+      "code": "[EMPTY_NAME]"
+    },
+    {
+      "name": "load_declares_commands",
+      "kind": "plugin_load",
+      "payload": {
+        "pluginId": "plugin.a",
+        "root": "/packages/demo",
+        "entry": "index.mjs",
+        "commands": [
+          "demo"
+        ]
+      },
+      "accept": true
+    },
+    {
+      "name": "ready_with_a_prompt_command",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "commands": [
+          {
+            "name": "demo",
+            "description": "do the thing",
+            "kind": {
+              "type": "prompt"
+            }
+          }
+        ]
+      },
+      "accept": true
+    },
+    {
+      "name": "ready_with_an_explain_command",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "commands": [
+          {
+            "name": "demo",
+            "description": "do the thing",
+            "kind": {
+              "type": "explain",
+              "text": "not here"
+            }
+          }
+        ]
+      },
+      "accept": true
+    },
+    {
+      "name": "ready_with_a_panel_command",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "commands": [
+          {
+            "name": "demo",
+            "description": "do the thing",
+            "kind": {
+              "type": "panel",
+              "dialog": "demo-panel"
+            }
+          }
+        ]
+      },
+      "accept": true
+    },
+    {
+      "name": "ready_with_a_full_command_spec",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "commands": [
+          {
+            "name": "demo",
+            "description": "do the thing",
+            "kind": {
+              "type": "prompt"
+            },
+            "aliases": [
+              "d"
+            ],
+            "zhAliases": [
+              "演示"
+            ],
+            "hint": "<prompt>",
+            "category": "agent",
+            "surfaces": [
+              "tui",
+              "desktop"
+            ]
+          }
+        ]
+      },
+      "accept": true
+    },
+    {
+      "name": "ready_command_unknown_kind",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "commands": [
+          {
+            "name": "demo",
+            "description": "do the thing",
+            "kind": {
+              "type": "native"
+            }
+          }
+        ]
+      },
+      "code": "[WRONG_SHAPE]"
+    },
+    {
+      "name": "ready_command_explain_without_text",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "commands": [
+          {
+            "name": "demo",
+            "description": "do the thing",
+            "kind": {
+              "type": "explain"
+            }
+          }
+        ]
+      },
+      "code": "[MISSING_FIELD]"
+    },
+    {
+      "name": "ready_command_explain_empty_text",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "commands": [
+          {
+            "name": "demo",
+            "description": "do the thing",
+            "kind": {
+              "type": "explain",
+              "text": ""
+            }
+          }
+        ]
+      },
+      "code": "[EMPTY_DESCRIPTION]"
+    },
+    {
+      "name": "ready_command_panel_empty_dialog",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "commands": [
+          {
+            "name": "demo",
+            "description": "do the thing",
+            "kind": {
+              "type": "panel",
+              "dialog": ""
+            }
+          }
+        ]
+      },
+      "code": "[EMPTY_NAME]"
+    },
+    {
+      "name": "ready_command_empty_description",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "commands": [
+          {
+            "name": "demo",
+            "description": "",
+            "kind": {
+              "type": "prompt"
+            }
+          }
+        ]
+      },
+      "code": "[EMPTY_DESCRIPTION]"
+    },
+    {
+      "name": "ready_command_declared_twice",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "commands": [
+          {
+            "name": "demo",
+            "description": "do the thing",
+            "kind": {
+              "type": "prompt"
+            }
+          },
+          {
+            "name": "demo",
+            "description": "do the thing",
+            "kind": {
+              "type": "prompt"
+            }
+          }
+        ]
+      },
+      "code": "[DUPLICATE_DECLARATION]"
+    },
+    {
+      "name": "ready_command_unknown_field",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "commands": [
+          {
+            "name": "demo",
+            "description": "do the thing",
+            "kind": {
+              "type": "prompt"
+            },
+            "extra": 1
+          }
+        ]
+      },
+      "code": "[UNKNOWN_FIELD]"
+    },
+    {
+      "name": "ready_command_bad_surface",
+      "kind": "plugin_ready",
+      "payload": {
+        "pluginId": "plugin.a",
+        "commands": [
+          {
+            "name": "demo",
+            "description": "do the thing",
+            "kind": {
+              "type": "prompt"
+            },
+            "surfaces": [
+              "telepathy"
+            ]
+          }
+        ]
+      },
+      "code": "[WRONG_SHAPE]"
+    },
+    {
+      "name": "command_invoke_minimal",
+      "kind": "command_invoke",
+      "payload": {
+        "name": "demo",
+        "raw": "/demo hi",
+        "rest": "hi",
+        "surface": "tui"
+      },
+      "accept": true
+    },
+    {
+      "name": "command_invoke_missing_rest",
+      "kind": "command_invoke",
+      "payload": {
+        "name": "demo",
+        "raw": "/demo",
+        "surface": "tui"
+      },
+      "code": "[MISSING_FIELD]"
+    },
+    {
+      "name": "command_invoke_unknown_field",
+      "kind": "command_invoke",
+      "payload": {
+        "name": "demo",
+        "raw": "/demo",
+        "rest": "",
+        "surface": "tui",
+        "extra": 1
+      },
+      "code": "[UNKNOWN_FIELD]"
+    },
+    {
+      "name": "command_invoke_bad_surface",
+      "kind": "command_invoke",
+      "payload": {
+        "name": "demo",
+        "raw": "/demo",
+        "rest": "",
+        "surface": "telepathy"
+      },
+      "code": "[WRONG_SHAPE]"
+    },
+    {
+      "name": "command_invoke_empty_name",
+      "kind": "command_invoke",
+      "payload": {
+        "name": "",
+        "raw": "/",
+        "rest": "",
+        "surface": "tui"
+      },
+      "code": "[EMPTY_NAME]"
+    }
+  ]
+}

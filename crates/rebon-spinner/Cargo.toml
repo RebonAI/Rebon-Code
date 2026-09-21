@@ -1,0 +1,19 @@
+[package]
+name = "rebon-spinner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Pure-logic helpers for spinner/status-line animation and layout. Covers frame-based glyph dispatch, shimmer and glimmer messages, flashing and stalled-state color math, brief-spinner segments, status-row fitting, and teammate projections."
+
+[dependencies]
+# Pure logic only. Drawing, the animation-frame driver, UI lifecycle state,
+# theme resolution, the task/activity stores, verb selection, grapheme
+# segmentation and width measurement all stay with the caller; this crate takes
+# owned inputs, plain callbacks and pre-computed widths.
+#
+# The one `rebon-*` dependency is the task-list row that the next-task planner
+# reads, defined once rather than re-declared by every surface that reads it.
+rebon-types = { workspace = true }
+# Test matrix is hand-rolled — no extra deps.

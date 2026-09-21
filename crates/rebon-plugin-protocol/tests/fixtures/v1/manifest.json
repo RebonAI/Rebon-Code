@@ -1,0 +1,740 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "request_lf",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"plugin.example\",\"scope_id\":\"scope-1\",\"scope_generation\":3,\"call_id\":\"req\",\"message\":{\"type\":\"request\",\"method\":\"opaque\",\"payload\":null}}\n"
+      },
+      "accept": 1,
+      "sha256": "909efbf323e14327aeb3dda15afb4e221667d93b51f48b36d0c9e7340eac9179",
+      "expected": {
+        "host_epoch": 7,
+        "plugin_id": "plugin.example",
+        "scope_id": "scope-1",
+        "scope_generation": 3,
+        "call_id": "req",
+        "message_type": "request",
+        "method": "opaque"
+      }
+    },
+    {
+      "name": "terminal_crlf",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"plugin.example\",\"scope_id\":\"scope-1\",\"scope_generation\":3,\"call_id\":\"term\",\"message\":{\"type\":\"terminal\",\"status\":\"success\",\"payload\":42}}\r\n"
+      },
+      "accept": 1,
+      "sha256": "3e8749036c93720fcb45658b5fe758c7f23e634c269d5dd1396973d6af9ee2ac",
+      "expected": {
+        "host_epoch": 7,
+        "plugin_id": "plugin.example",
+        "scope_id": "scope-1",
+        "scope_generation": 3,
+        "call_id": "term",
+        "message_type": "terminal",
+        "status": "success"
+      }
+    },
+    {
+      "name": "notification",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"plugin.example\",\"scope_id\":\"scope-1\",\"scope_generation\":3,\"call_id\":\"note\",\"message\":{\"type\":\"notification\",\"method\":\"opaque\",\"payload\":[]}}\n"
+      },
+      "accept": 1,
+      "sha256": "368b2fa8642105feb14d1ef4f30bf71f0a515f5ad9c5a4760f7bf1370d4939f3",
+      "expected": {
+        "host_epoch": 7,
+        "plugin_id": "plugin.example",
+        "scope_id": "scope-1",
+        "scope_generation": 3,
+        "call_id": "note",
+        "message_type": "notification",
+        "method": "opaque"
+      }
+    },
+    {
+      "name": "control_exact",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"$rebon/platform\",\"scope_id\":\"$rebon/control\",\"scope_generation\":0,\"call_id\":\"control-1\",\"message\":{\"type\":\"request\",\"method\":\"platform/initialize\",\"payload\":null}}\n"
+      },
+      "accept": 1,
+      "sha256": "0e1f026ce2eba909ec4a34ae02e49400748f5140bc97d8ae836dd7c64de6ec8d",
+      "expected": {
+        "host_epoch": 7,
+        "plugin_id": "$rebon/platform",
+        "scope_id": "$rebon/control",
+        "scope_generation": 0,
+        "call_id": "control-1",
+        "message_type": "request",
+        "method": "platform/initialize"
+      }
+    },
+    {
+      "name": "multiple_frames",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":0,\"plugin_id\":\"\",\"scope_id\":\"\",\"scope_generation\":-0,\"call_id\":\"a\",\"message\":{\"type\":\"notification\",\"method\":\"\",\"payload\":true}}\n{\"protocol_version\":1,\"host_epoch\":0,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":0,\"call_id\":\"b\",\"message\":{\"type\":\"terminal\",\"status\":\"cancelled\",\"payload\":\"x\"}}\n"
+      },
+      "chunks": [
+        1,
+        2,
+        7,
+        31
+      ],
+      "accept": 2,
+      "sha256": "4f1e7e57170295642cfa26f2bb9a3b4d5e0faab9e99dd93c1c92a14122513f37"
+    },
+    {
+      "name": "generated_small",
+      "source": {
+        "generator": "padded_request",
+        "body_bytes": 256,
+        "ending": "lf"
+      },
+      "accept": 1,
+      "sha256": "4f3cf0a887f7746fa037a388507265cc838c3c413fb9f26737724c3b2609273f"
+    },
+    {
+      "name": "exact_max_lf",
+      "source": {
+        "generator": "padded_request",
+        "body_bytes": 8388608,
+        "ending": "lf"
+      },
+      "accept": 1,
+      "sha256": "7a4ae99419a4a2c16b3795387ee3730cb023987ca9e7cd2825b706be46d049ab"
+    },
+    {
+      "name": "exact_max_crlf",
+      "source": {
+        "generator": "padded_request",
+        "body_bytes": 8388608,
+        "ending": "crlf"
+      },
+      "accept": 1,
+      "sha256": "5de5caf2777c3ab881d1eec2f24bd0282c77daf792250480047509b4b2c7b510"
+    },
+    {
+      "name": "oversize",
+      "source": {
+        "generator": "padded_request",
+        "body_bytes": 8388609,
+        "ending": "none"
+      },
+      "error": "frame_too_large",
+      "sha256": "9264c1d83b974e77d395cfcb739d587d3b9d24dc47ae5774c7df2e80f75e1a31"
+    },
+    {
+      "name": "empty",
+      "source": {
+        "ascii": "\n"
+      },
+      "error": "empty_frame",
+      "sha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+    },
+    {
+      "name": "malformed",
+      "source": {
+        "ascii": "{bad}\n"
+      },
+      "error": "malformed_json",
+      "sha256": "9c1b9a81fd4dad8959a7e958eda355b060a24ae388be9abdd5ac1cfbea6fa538"
+    },
+    {
+      "name": "primitive",
+      "source": {
+        "ascii": "1\n"
+      },
+      "error": "wrong_shape",
+      "sha256": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865"
+    },
+    {
+      "name": "array",
+      "source": {
+        "ascii": "[]\n"
+      },
+      "error": "wrong_shape",
+      "sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+    },
+    {
+      "name": "unknown_top_field",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":0,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":0,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null},\"x\":1}\n"
+      },
+      "error": "unknown_field",
+      "sha256": "293d220023c13f3f66df2afaf962072bd0942a153c85ad7862be06a67078bb8a"
+    },
+    {
+      "name": "unknown_message_field",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":0,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":0,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null,\"x\":1}}\n"
+      },
+      "error": "unknown_field",
+      "sha256": "121edc89a66818e833de498502928985ffe1fadfea0d08f792ed9ada654c5717"
+    },
+    {
+      "name": "bad_status",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":0,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":0,\"call_id\":\"c\",\"message\":{\"type\":\"terminal\",\"status\":\"done\",\"payload\":null}}\n"
+      },
+      "error": "bad_status",
+      "sha256": "17194fd1eda36cdcc586ce4d362ea3f084840149c0706f35260fe12fb462200e"
+    },
+    {
+      "name": "bad_version",
+      "source": {
+        "ascii": "{\"protocol_version\":2,\"host_epoch\":0,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":0,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "bad_version",
+      "sha256": "686425f4fcf121e686571973b2bb4bfb42997ce44fd3d09043c9eca0aaf23893"
+    },
+    {
+      "name": "unsafe_integer",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":9007199254740992,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":0,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "unsafe_integer",
+      "sha256": "0dfc0357274c4d7fd42534c792dabd55e1d4613c9eaa63ba3e4e16e53b2d4155"
+    },
+    {
+      "name": "invalid_utf8",
+      "source": {
+        "hex": "ff0a"
+      },
+      "error": "invalid_utf8",
+      "sha256": "e4688624e5f1ad0629505e6768e3bb36244f2f3e33e751215afa820334a76ed3"
+    },
+    {
+      "name": "partial_eof",
+      "source": {
+        "ascii": "{\"protocol_version\":1"
+      },
+      "finish": true,
+      "error": "incomplete_frame",
+      "sha256": "e1972717d1e58f6238a1654325273b9fa3328f560ac4df483545c7e58f57d8af"
+    },
+    {
+      "name": "rounding_1_00000000000000001",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":1.00000000000000001,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "unsafe_integer",
+      "sha256": "24bd0ab3262d65db11460a37199333616a3a430a1a47911d6959d4f285f0f663"
+    },
+    {
+      "name": "rounding_9007199254740990_9",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":9007199254740990.9,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "unsafe_integer",
+      "sha256": "caa8b67f4cb4518896bbbe06d0a134030d4f60c38518553aea435fc12288d9ed"
+    },
+    {
+      "name": "rounding_9007199254740991_1",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":9007199254740991.1,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "unsafe_integer",
+      "sha256": "2545c138682be28b719a3ebc7f9f76760f9c7e2766a35518ea66b4dc37223c11"
+    },
+    {
+      "name": "rounding_9007199254740991_0000000001",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":9007199254740991.0000000001,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "unsafe_integer",
+      "sha256": "8e5ed419c629a1c4588d55938ed383ca1de83391ed1b0c38fb497f14c97675f9"
+    },
+    {
+      "name": "integer_70e_minus_1",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":70e-1,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "accept": 1,
+      "expected": {
+        "host_epoch": 7,
+        "plugin_id": "p",
+        "scope_id": "s",
+        "scope_generation": 3,
+        "call_id": "c",
+        "message_type": "notification",
+        "method": "m"
+      },
+      "sha256": "3039bfcbc6e2d9ea8173922b4ccb662de072359b9231909b2bcae0d1254908bb"
+    },
+    {
+      "name": "integer_7e_minus_0",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7e-0,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "accept": 1,
+      "expected": {
+        "host_epoch": 7,
+        "plugin_id": "p",
+        "scope_id": "s",
+        "scope_generation": 3,
+        "call_id": "c",
+        "message_type": "notification",
+        "method": "m"
+      },
+      "sha256": "cc36b06b9fff910e5f20e6959378d4656d258dbbbdbb2f57523f97f9ccadbc56"
+    },
+    {
+      "name": "safe_max_exponent",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":9007199254740991e0,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "accept": 1,
+      "expected": {
+        "host_epoch": 9007199254740991,
+        "plugin_id": "p",
+        "scope_id": "s",
+        "scope_generation": 3,
+        "call_id": "c",
+        "message_type": "notification",
+        "method": "m"
+      },
+      "sha256": "f34f057e2ef02d98d1e21a8d6fb3ad5b8f08a303f745e88c72eb2551a4343ddb"
+    },
+    {
+      "name": "tiny_positive_payload",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":0.0000000000000000001}}\n"
+      },
+      "accept": 1,
+      "expected": {
+        "host_epoch": 7,
+        "plugin_id": "p",
+        "scope_id": "s",
+        "scope_generation": 3,
+        "call_id": "c",
+        "message_type": "notification",
+        "method": "m",
+        "payload_raw": "0.0000000000000000001"
+      },
+      "sha256": "5ec526309e94cd3b8ef99f49eea5d0bbdb9739fd3caeb9ef2d0f4aecf674e7d5"
+    },
+    {
+      "name": "tiny_negative_payload",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":-0.0000000000000000001}}\n"
+      },
+      "accept": 1,
+      "expected": {
+        "host_epoch": 7,
+        "plugin_id": "p",
+        "scope_id": "s",
+        "scope_generation": 3,
+        "call_id": "c",
+        "message_type": "notification",
+        "method": "m",
+        "payload_raw": "-0.0000000000000000001"
+      },
+      "sha256": "779a2d18b5a76f16eeab5145bf204a744d013f937b110ae84c35d32043742eb4"
+    },
+    {
+      "name": "zero_plain",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":0,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "accept": 1,
+      "expected": {
+        "host_epoch": 0,
+        "plugin_id": "p",
+        "scope_id": "s",
+        "scope_generation": 3,
+        "call_id": "c",
+        "message_type": "notification",
+        "method": "m"
+      },
+      "sha256": "9de527246a77be82495a8dccaf6b496e5917e8103745a49313d5888d47c54a1d"
+    },
+    {
+      "name": "zero_negative",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":-0,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "accept": 1,
+      "expected": {
+        "host_epoch": 0,
+        "plugin_id": "p",
+        "scope_id": "s",
+        "scope_generation": 3,
+        "call_id": "c",
+        "message_type": "notification",
+        "method": "m"
+      },
+      "sha256": "452aa4cbf34bbb36f1e713b4abfce9f7383ab74082e484e17bb8b944c64356dc"
+    },
+    {
+      "name": "zero_positive_huge_exp",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":0e999999999999,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "accept": 1,
+      "expected": {
+        "host_epoch": 0,
+        "plugin_id": "p",
+        "scope_id": "s",
+        "scope_generation": 3,
+        "call_id": "c",
+        "message_type": "notification",
+        "method": "m"
+      },
+      "sha256": "7a1d78df10388f7611a87d280f952583079b1a72a842ca1ff45e902ed4e0c607"
+    },
+    {
+      "name": "zero_negative_huge_exp",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":-0e-999999999999,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "accept": 1,
+      "expected": {
+        "host_epoch": 0,
+        "plugin_id": "p",
+        "scope_id": "s",
+        "scope_generation": 3,
+        "call_id": "c",
+        "message_type": "notification",
+        "method": "m"
+      },
+      "sha256": "0582447b0378222ca40602d970438e9aebfa5d13c158946fc16359ada37c3082"
+    },
+    {
+      "name": "nonzero_huge_exponent",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":1e999999999999,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "unsafe_integer",
+      "sha256": "b269c5a8fdf245244169fd39513ce66678ebeb2859f1b808d20176e7cb3b197a"
+    },
+    {
+      "name": "version_fraction",
+      "source": {
+        "ascii": "{\"protocol_version\":1.0,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "bad_version",
+      "sha256": "906d3ba34d327f83a82bd7826dceb8d949b535d7a70a2e6d027a41b0086a4e3e"
+    },
+    {
+      "name": "version_exponent",
+      "source": {
+        "ascii": "{\"protocol_version\":1e0,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "bad_version",
+      "sha256": "5dc955ad850348d52d25345cdaa80549bfeb8128c0c2987f91c7f32180c58036"
+    },
+    {
+      "name": "version_negative_zero",
+      "source": {
+        "ascii": "{\"protocol_version\":-0,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "bad_version",
+      "sha256": "7844d415a5f6c761c6945b92014173d25808bba92562579b8e43bac7cd745d45"
+    },
+    {
+      "name": "version_unsafe",
+      "source": {
+        "ascii": "{\"protocol_version\":9007199254740992,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "bad_version",
+      "sha256": "118bbb95e8d71823b60fb8d0f11411f921a6c044a948e3e197858b99ce57786a"
+    },
+    {
+      "name": "duplicate_protocol_version",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"protocol_version\":1,\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "duplicate_field",
+      "sha256": "bd58ada050e9d45aac6760ec1519408c439e29836819ac5860c22752baca64e4"
+    },
+    {
+      "name": "duplicate_host_epoch",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"host_epoch\":7,\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "duplicate_field",
+      "sha256": "275a48c8ff9c697d3fb79452ad570a66ae39574b12b60e30b5e062a0ed403f2e"
+    },
+    {
+      "name": "duplicate_call_id",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"call_id\":\"other\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "duplicate_field",
+      "sha256": "76c216d388195fa740a03bab2ef5dff02fe151f43d4262f8ab3462797f6dc1ce"
+    },
+    {
+      "name": "duplicate_message_type",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "duplicate_field",
+      "sha256": "9051a76a3ec4f170b56cd04527727425cd44581ae7b3d1888fbe430d9c1cc008"
+    },
+    {
+      "name": "duplicate_method",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"method\":\"n\",\"payload\":null}}\n"
+      },
+      "error": "duplicate_field",
+      "sha256": "c1725419055be1629782fd03249d03169bfec88baeb45d903eeab44e2a77d229"
+    },
+    {
+      "name": "duplicate_payload",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null,\"payload\":1}}\n"
+      },
+      "error": "duplicate_field",
+      "sha256": "25b18560419051fb31178e2b0b6c3b36e5f02747063f67c31dd493e1343940cd"
+    },
+    {
+      "name": "decoded_alias_duplicate",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"host_\\u0065poch\":7,\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "duplicate_field",
+      "sha256": "1233bb6c2923395b127a7471e772c00a8c6b9f40b0c046d31707119f28663522"
+    },
+    {
+      "name": "utf8_bom",
+      "source": {
+        "ascii": "﻿{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "utf8_bom",
+      "sha256": "040dc77554ca0d935487c3c7c0295e584533219f9ac089cf78abe414320d9351"
+    },
+    {
+      "name": "lone_high_surrogate",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"\\ud800\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "invalid_surrogate",
+      "sha256": "7728b4776ea9f0960349c84f0f6acfaf6755070603cc3df81be8b67a2d350452"
+    },
+    {
+      "name": "lone_low_surrogate",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"\\udc00\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "invalid_surrogate",
+      "sha256": "7f711efc0534c0e7b13bd4a1284e055cce8078323bff74d6eeac9f450812f60b"
+    },
+    {
+      "name": "valid_surrogate_pair",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"\\ud83d\\ude00\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "accept": 1,
+      "expected": {
+        "host_epoch": 7,
+        "plugin_id": "😀",
+        "scope_id": "s",
+        "scope_generation": 3,
+        "call_id": "c",
+        "message_type": "notification",
+        "method": "m"
+      },
+      "sha256": "592893a6e76c7da8437e3a22f7840c091cff72c6a1b672548fdaf75af25ceef7"
+    },
+    {
+      "name": "raw_non_bmp_characters",
+      "source": {
+        "hex": "7b2270726f746f636f6c5f76657273696f6e223a312c22686f73745f65706f6368223a372c22706c7567696e5f6964223a22e99baaf09f9880222c2273636f70655f6964223a2273222c2273636f70655f67656e65726174696f6e223a332c2263616c6c5f6964223a2263222c226d657373616765223a7b2274797065223a226e6f74696669636174696f6e222c226d6574686f64223a22f09f9880f09d92b3222c227061796c6f6164223a6e756c6c7d7d0a"
+      },
+      "accept": 1,
+      "expected": {
+        "host_epoch": 7,
+        "plugin_id": "雪😀",
+        "scope_id": "s",
+        "scope_generation": 3,
+        "call_id": "c",
+        "message_type": "notification",
+        "method": "😀𝒳"
+      },
+      "sha256": "b95b2d99b2db2f5761c3e121883fc065c5655d4f7d937bacfae53d4e5d136c8f"
+    },
+    {
+      "name": "trailing_token",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}} true\n"
+      },
+      "error": "trailing_json",
+      "sha256": "958aaf6fdf5b36caaa9a42b7367d65808ceac008a0289f76e642d19fade980ee"
+    },
+    {
+      "name": "payload_internal_duplicate",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":{\"a\":1,\"a\":2}}}\n"
+      },
+      "accept": 1,
+      "expected": {
+        "host_epoch": 7,
+        "plugin_id": "p",
+        "scope_id": "s",
+        "scope_generation": 3,
+        "call_id": "c",
+        "message_type": "notification",
+        "method": "m",
+        "payload": {
+          "a": 2
+        }
+      },
+      "sha256": "c1e6ab1b225a2affe71d8a39d55f070c55123ea2170a41d3017e77fe15cdd79c"
+    },
+    {
+      "name": "payload_arbitrary_fraction",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":{\"n\":0.10000000000000001}}}\n"
+      },
+      "accept": 1,
+      "expected": {
+        "host_epoch": 7,
+        "plugin_id": "p",
+        "scope_id": "s",
+        "scope_generation": 3,
+        "call_id": "c",
+        "message_type": "notification",
+        "method": "m",
+        "payload_number_raw": "0.10000000000000001"
+      },
+      "sha256": "68818b6f110d2cccd6a651824a5b68d7de56277258e27af2c81aff64f38db440"
+    },
+    {
+      "name": "cr_whitespace",
+      "source": {
+        "ascii": "{\r \"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\r\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "accept": 1,
+      "expected": {
+        "host_epoch": 7,
+        "plugin_id": "p",
+        "scope_id": "s",
+        "scope_generation": 3,
+        "call_id": "c",
+        "message_type": "notification",
+        "method": "m"
+      },
+      "sha256": "435d380344625a41c0003bedb8c3bacaf2bd4f781229e418ee971cc366689df0"
+    },
+    {
+      "name": "unknown_request_field",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null,\"status\":\"success\"}}\n"
+      },
+      "error": "unknown_field",
+      "sha256": "21329b3124a5185ec017e70af508e215f92163dc16ded2c9692533fa56c78979"
+    },
+    {
+      "name": "unknown_terminal_field",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"message\":{\"type\":\"terminal\",\"status\":\"success\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "unknown_field",
+      "sha256": "fecf99b88cf886008a296d97e9ee05ec52c607e2ce8d474f8d5bee04e6671d7d"
+    },
+    {
+      "name": "duplicate_scope_generation",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"scope_generation\":3,\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "duplicate_field",
+      "sha256": "aa6440e1d40fab97213f7610d2b15a6f60714ed8390cc9367a5be187e6064eb5"
+    },
+    {
+      "name": "duplicate_plugin_id",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"plugin_id\":\"p\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "duplicate_field",
+      "sha256": "d9aea540436b94e04044267aad4dbe5ed52516e992e306e91fd07e05970724a4"
+    },
+    {
+      "name": "duplicate_scope_id",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"p\",\"scope_id\":\"s\",\"scope_generation\":3,\"call_id\":\"c\",\"scope_id\":\"s\",\"message\":{\"type\":\"notification\",\"method\":\"m\",\"payload\":null}}\n"
+      },
+      "error": "duplicate_field",
+      "sha256": "306fe7fb1cc738803252fe0b9ddea293da1330934bcd2dae1519c9412947a3bf"
+    },
+    {
+      "name": "chunk_null_payload",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"plugin.example\",\"scope_id\":\"scope-1\",\"scope_generation\":3,\"call_id\":\"stream\",\"message\":{\"type\":\"chunk\",\"payload\":null}}\n"
+      },
+      "sha256": "2c6f750ded4827318a2d4ae2d79c14eb55e1d7db6458a2e0c6a3bd9489335d2c",
+      "accept": 1,
+      "expected": {
+        "host_epoch": 7,
+        "plugin_id": "plugin.example",
+        "scope_id": "scope-1",
+        "scope_generation": 3,
+        "call_id": "stream",
+        "message_type": "chunk"
+      }
+    },
+    {
+      "name": "chunk_object_payload",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"plugin.example\",\"scope_id\":\"scope-1\",\"scope_generation\":3,\"call_id\":\"stream\",\"message\":{\"type\":\"chunk\",\"payload\":{\"delta\":\"hi\"}}}\n"
+      },
+      "sha256": "fc073fea5a3c37774f5fa08bfa0b9780d1c1d688720603fdf2add0463fe0e8b3",
+      "accept": 1,
+      "expected": {
+        "host_epoch": 7,
+        "plugin_id": "plugin.example",
+        "scope_id": "scope-1",
+        "scope_generation": 3,
+        "call_id": "stream",
+        "message_type": "chunk"
+      }
+    },
+    {
+      "name": "chunk_with_method",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"plugin.example\",\"scope_id\":\"scope-1\",\"scope_generation\":3,\"call_id\":\"stream\",\"message\":{\"type\":\"chunk\",\"method\":\"llm/stream\",\"payload\":null}}\n"
+      },
+      "sha256": "a8a7a793d12e24a3a609bf6860c42cfa3dd7bb68936428486181d21eb67b98a1",
+      "error": "unknown_field"
+    },
+    {
+      "name": "chunk_with_status",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"plugin.example\",\"scope_id\":\"scope-1\",\"scope_generation\":3,\"call_id\":\"stream\",\"message\":{\"type\":\"chunk\",\"status\":\"success\",\"payload\":null}}\n"
+      },
+      "sha256": "8274f9043ad1b12d4ff3395c7249c77b4adead740421289c340a2bed404a2bd3",
+      "error": "unknown_field"
+    },
+    {
+      "name": "chunk_missing_payload",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"plugin.example\",\"scope_id\":\"scope-1\",\"scope_generation\":3,\"call_id\":\"stream\",\"message\":{\"type\":\"chunk\"}}\n"
+      },
+      "sha256": "c8be5b2c9c74c1d9b4a9db7542d61ded10ef6789509aaaa73096971168b803f4",
+      "error": "wrong_shape"
+    },
+    {
+      "name": "terminal_missing_payload",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"plugin.example\",\"scope_id\":\"scope-1\",\"scope_generation\":3,\"call_id\":\"stream\",\"message\":{\"type\":\"terminal\",\"status\":\"success\"}}\n"
+      },
+      "sha256": "bd93862ee9e496ebb6e806628c10caae963bed6587adf51c7c330489a2da4c32",
+      "error": "wrong_shape"
+    },
+    {
+      "name": "request_missing_payload",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"plugin.example\",\"scope_id\":\"scope-1\",\"scope_generation\":3,\"call_id\":\"stream\",\"message\":{\"type\":\"request\",\"method\":\"opaque\"}}\n"
+      },
+      "sha256": "bcf570bdcb65075711c1fdc3c5c371b3d4d4aa344e5c08d6e0d36651f0492cb2",
+      "error": "wrong_shape"
+    },
+    {
+      "name": "chunk_unknown_field",
+      "source": {
+        "ascii": "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"plugin.example\",\"scope_id\":\"scope-1\",\"scope_generation\":3,\"call_id\":\"stream\",\"message\":{\"type\":\"chunk\",\"payload\":null,\"bogus\":1}}\n"
+      },
+      "sha256": "fffc690418090d988a02dc3353a4f3fcb34e2ceb0d783476941fd2342b21aaac",
+      "error": "unknown_field"
+    }
+  ]
+}

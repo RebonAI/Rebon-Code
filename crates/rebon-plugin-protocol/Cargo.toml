@@ -1,0 +1,21 @@
+[package]
+name = "rebon-plugin-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Versioned wire messages, strict NDJSON framing, and lifecycle validation for the rebon plugin plane."
+
+[dependencies]
+serde.workspace = true
+# `raw_value`, deliberately not `arbitrary_precision`. Both preserve a number's
+# exact token, but `arbitrary_precision` does it by changing how every crate in
+# the build graph sees JSON numbers, which stops internally-tagged enums and
+# flattened structs with numeric fields from deserializing at all. See
+# `src/payload.rs`.
+serde_json = { workspace = true, features = ["raw_value"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true

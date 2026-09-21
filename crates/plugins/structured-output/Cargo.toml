@@ -1,0 +1,19 @@
+[package]
+name = "rebon-plugin-structured-output"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The `structured-output` feature plugin: the StructuredOutput tool on the kernel's tool seat. Its channel and schema validator stay in rebon-tool, where ToolContext and the coordinator's post-turn validator read them."
+
+[dependencies]
+rebon-kernel.workspace = true
+rebon-core.workspace = true
+rebon-tool.workspace = true
+rebon-tools-core.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

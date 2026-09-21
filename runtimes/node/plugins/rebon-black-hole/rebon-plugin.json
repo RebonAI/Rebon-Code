@@ -1,0 +1,22 @@
+{
+  "name": "rebon-black-hole",
+  "version": "0.1.0",
+  "description": "A window-wide gravitational black-hole lens that drifts in from the upper-right corner.",
+  "capabilities": {
+    "appVisualEffects": [
+      {
+        "id": "black-hole",
+        "surface": "chatEmpty",
+        "kind": "blackHole",
+        "priority": 100,
+        "options": {
+          "autoRotate": true,
+          "mouseParallax": true,
+          "rotationSeconds": 12.0,
+          "parallaxStrength": 0.08,
+          "size": 300
+        }
+      }
+    ]
+  }
+}

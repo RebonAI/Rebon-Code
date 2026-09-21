@@ -1,0 +1,109 @@
+#!/bin/sh
+# Nothing unformatted, and nothing CI would reject, leaves this machine.
+#
+# The tree drifts out of rustfmt shape between releases, and a later
+# `cargo fmt --all` then buries a real change under hundreds of unrelated
+# reformatting lines. So: format before the push, and if that moved
+# anything, stop and let the author decide what to do with it — a hook
+# that quietly amends commits is worse than one that says no.
+#
+# Then scripts/preflight.sh runs what CI runs. A release that dies in
+# `verify` costs a tag move and a re-run; the same failure costs minutes
+# here. It is slow on purpose and there is no quiet way off it: skipping is
+# `git push --no-verify`, which says in the reflog that it was skipped.
+#
+# Installed with: git config core.hooksPath scripts/hooks
+# Bypassed with:  git push --no-verify
+#
+# core.hooksPath shadows .git/hooks entirely, so this chains to a locally
+# installed .git/hooks/pre-push at the end — the release scripts rely on that
+# guard to catch a tag whose version does not match the committed manifest.
+
+set -e
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+# Can this push even authenticate? git runs a pre-push hook AFTER contacting
+# the remote but BEFORE sending anything, so an expired credential is not
+# discovered until the gates below have already run — four minutes of tests
+# thrown away by a 401 that took one second to find out about. This asks
+# first, with --no-verify so the probe does not re-enter this hook.
+#
+# Only an authentication failure stops the push here. Any other refusal — a
+# non-fast-forward, a protected branch — is left to the real push to report,
+# because it will report it better than a dry run would.
+remote=${1:-origin}
+if probe=$(git push --dry-run --no-verify "$remote" HEAD 2>&1); then
+    :
+else
+    case "$probe" in
+        *401*|*[Aa]uthenticat*|*[Dd]enied*|*[Uu]nauthorized*)
+            echo >&2
+            echo "pre-push: $remote refused the credentials, so the gates below were skipped:" >&2
+            printf '%s\n' "$probe" | sed 's/^/    /' >&2
+            echo >&2
+            echo "Refresh the credential and push again (nothing was tested, and" >&2
+            echo "nothing was sent)." >&2
+            exit 1
+            ;;
+    esac
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-push: cargo not on PATH — skipping the rustfmt gate." >&2
+    exit 0
+fi
+
+before=$(git diff)
+cargo fmt --all
+after=$(git diff)
+
+if [ "$before" != "$after" ]; then
+    echo >&2
+    echo "pre-push: cargo fmt --all changed the working tree." >&2
+    echo "Uncommitted changes now in the tree (formatting included):" >&2
+    git --no-pager diff --stat >&2
+    echo >&2
+    echo "The reformatting is not in the commits you are pushing. Review it," >&2
+    echo "commit or stash it, then push again (or push with --no-verify to" >&2
+    echo "skip this check)." >&2
+    exit 1
+fi
+
+# The pushed refs, read once. git gives them on stdin and only once, so they
+# are held here and replayed to the chained hook below rather than consumed.
+refs=$(cat)
+
+# What CI would say. A deletion is a push of the all-zero oid and builds
+# nothing, so a push that only deletes refs has nothing to test — which is
+# also what makes `git push origin :refs/tags/vX` during a re-tag cheap.
+deleting_only=1
+while read -r _local_ref local_oid _remote_ref _remote_oid; do
+    [ -n "${local_oid:-}" ] || continue
+    case "$local_oid" in *[!0]*) deleting_only=0 ;; esac
+done <<REFS
+$refs
+REFS
+
+if [ "$deleting_only" = 1 ]; then
+    echo "pre-push: deletions only, nothing to test." >&2
+else
+    sh "$root/scripts/preflight.sh"
+fi
+
+# Hand over to the repo-local hook the release scripts expect, replaying the
+# refs on its stdin because this script has already read them.
+#
+# `--git-common-dir`, not `--git-path hooks/…`: the latter is rewritten by
+# core.hooksPath and hands back *this* script, which then runs itself forever.
+# The env guard is the backstop for any other way the two paths can meet.
+legacy="$(git rev-parse --git-common-dir)/hooks/pre-push"
+if [ -x "$legacy" ] && [ -z "${REBON_PRE_PUSH_CHAINED:-}" ]; then
+    REBON_PRE_PUSH_CHAINED=1
+    export REBON_PRE_PUSH_CHAINED
+    printf '%s\n' "$refs" | "$legacy" "$@"
+    exit $?
+fi
+
+exit 0

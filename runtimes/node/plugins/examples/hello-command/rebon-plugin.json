@@ -1,0 +1,21 @@
+{
+  "name": "hello-command",
+  "version": "0.1.0",
+  "description": "The smallest kernel-plane plugin there is: one module, one slash command. Documentation and end-to-end fixture; nothing here loads unless a config.json asks for it.",
+  "capabilities": {
+    "kernelPlugins": {
+      "hello-command": {
+        "entry": "plugin.mjs",
+        "commands": ["hello"],
+        "seats": ["settings"],
+        "settings": [
+          {
+            "name": "greeting",
+            "type": "string",
+            "default": "Hello from the plugin plane"
+          }
+        ]
+      }
+    }
+  }
+}

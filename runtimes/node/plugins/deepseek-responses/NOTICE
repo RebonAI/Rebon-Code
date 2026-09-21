@@ -1,0 +1,33 @@
+Rebon's Anchored Minimal bootstrap profile reproduces the model-facing surface
+of the DeepSeek Harness **Minimal** agent preset. The following material is
+copied or adapted from:
+
+  https://github.com/deepseek-ai/deepseek-harness
+  commit 47f943859bef60e4160492346772ded9b24f765a
+
+  - the Minimal preset persona text
+    (`apps/cli/config/agent-presets/minimal/agent.cordis.yml`)
+  - the Minimal preset's `bash` description override (same file) and the
+    `bash` parameter schema
+    (`packages/shell/tool-bash-persistent/src/index.ts`)
+  - the `str_replace_editor` description and parameter schema
+    (`packages/fs/tool-str-replace-editor/src/index.ts`)
+
+It appears in this repository at:
+
+  - crates/rebon-core/src/anchored_minimal.rs
+  - crates/rebon-tool/src/str_replace_editor.rs
+
+DeepSeek Harness is distributed under the MIT License:
+
+  Copyright (c) 2026 DeepSeek
+
+The full permission notice is in LICENSE-DEEPSEEK-HARNESS next to this file.
+
+The two-phase bootstrap/promotion technique this profile implements was
+described and measured by the community preset
+https://github.com/xiaobright/dsh-anchored-standard (MIT). No code from that
+repository is included here; only its findings informed the design.
+
+DeepSeek and DeepSeek Harness are names of their respective owner. Rebon is not
+affiliated with or endorsed by DeepSeek.

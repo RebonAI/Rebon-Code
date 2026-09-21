@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Rebon Browser</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <span id="status-dot" class="status-dot"></span>
+        <div>
+          <h1>Rebon Browser</h1>
+          <p id="status-text">正在连接本地 Rebon…</p>
+        </div>
+      </header>
+
+      <section class="card">
+        <div class="row"><span>本地插件</span><strong id="bridge-status">未连接</strong></div>
+        <div class="row"><span>页面访问</span><strong id="access-status">未授权</strong></div>
+        <div class="row"><span>控制状态</span><strong id="control-status">未控制</strong></div>
+      </section>
+
+      <section id="pairing-section" class="card hidden">
+        <label for="pairing-code">配对码</label>
+        <div class="pairing-row">
+          <input id="pairing-code" inputmode="numeric" maxlength="6" placeholder="000000" autocomplete="one-time-code">
+          <button id="pair-button" class="primary">配对</button>
+        </div>
+        <p class="hint">在 Rebon 中调用 browser status 获取 6 位配对码。</p>
+      </section>
+
+      <p id="message" class="message hidden"></p>
+
+      <div class="actions">
+        <button id="access-button" class="primary">启用页面访问</button>
+        <button id="stop-button">停止控制</button>
+        <button id="forget-button" class="danger">忘记配对</button>
+      </div>
+
+      <footer>Rebon 只会控制由它创建并放入蓝色“Rebon”标签组的页面。</footer>
+    </main>
+    <script src="shared.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

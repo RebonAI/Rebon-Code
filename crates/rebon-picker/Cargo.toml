@@ -1,0 +1,18 @@
+[package]
+name = "rebon-picker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Pure picker behavior used by Rebon's theme and message-selection UIs. Outbound effects are represented as actions or pre-built inputs; the crate performs no IO and has no rebon-* dependencies."
+
+[dependencies]
+# Intentionally empty. Every outbound effect is modeled as a value the
+# caller builds or an action the caller routes: the settings store and
+# registry lookups arrive as pre-built inputs, the design-system Select
+# widget and rendering stay outside, and the message store is never
+# touched.
+
+[dev-dependencies]
+# Intentionally empty. The test matrix is hand-rolled.

@@ -1,0 +1,58 @@
+[package]
+name = "rebon-plugin-agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The `agents` feature plugin: the `Agent` tool (aliases `AgentTool`, `Task`) that delegates work to a sub-agent, and the runtime behind it — the sub-agent spawner, the worker loop, and the team manager. The sub-agent domain they speak — the spawner trait, the spec/result pair, the agent registry and the built-in agent definitions — stays in rebon-tool."
+
+[dependencies]
+rebon-kernel.workspace = true
+rebon-core.workspace = true
+# The worker loop is `rebon_core::run_query` over a `ModelClient`, and the
+# spawner resolves a turn's provider/model through the model router.
+rebon-api.workspace = true
+rebon-agent-core.workspace = true
+# A spawned agent is a row in the task registry: the spawner registers it,
+# pushes progress, and completes or fails there, and the team manager drives a
+# teammate's turns through the same runtime. Plugin-on-plugin, and the same
+# edge this runtime already had before it moved.
+rebon-plugin-tasks.workspace = true
+# `/agents` is this plugin's panel and this plugin's command: the dialog
+# model and the two seats it registers on.
+rebon-command-seat.workspace = true
+rebon-dialog.workspace = true
+rebon-ui-seat.workspace = true
+# The panel formats its own rows, so it needs the one display-width policy.
+rebon-width.workspace = true
+# The `memory` scope a spawned agent can be given ("project" / "local") is
+# read straight off disk when the spec asks for one.
+rebon-instructions.workspace = true
+# `config_home` is where an agent file lives: the surface takes the paths as
+# values, and this is the crate that resolves them.
+rebon-session.workspace = true
+rebon-tool.workspace = true
+rebon-tools-core.workspace = true
+rebon-types.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+# `WorkerSpawnError`.
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# `TestConfigHome` points the team/task stores at a temp config home; it is
+# the same fixture `rebon-tool`'s own tests use.
+rebon-tool = { workspace = true, features = ["test-support"] }
+# The end-to-end spawner tests drive a worker that answers with a structured
+# output channel, which is that plugin's tool.
+rebon-plugin-structured-output.workspace = true
+futures-util.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["full", "test-util"] }

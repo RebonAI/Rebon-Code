@@ -1,0 +1,46 @@
+[package]
+name = "rebon-session-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The shared half of a rebon session host: persistent job state and its store transactions, the localhost IPC protocol, the owner/lease state machine, and the one client every endpoint (terminal, desktop app, serve) uses to reach a running session. Single source of truth so the writer and its readers never drift."
+
+[features]
+# Off by default, the shape the other crates use: `schemars` stays out of
+# every shipped binary and is on only for a schema exporter.
+schema = ["dep:schemars"]
+
+[dependencies]
+schemars = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+getrandom.workspace = true
+anyhow.workspace = true
+fs2.workspace = true
+rebon-types.workspace = true
+# The JSON-RPC envelope and the two ACP wire framings. A downward edge:
+# `rebon-proto` is a leaf that depends only on `rebon-types`. It brings the
+# codec, not the eleven thousand lines of server and handler surface that
+# taking `rebon-acp` would have brought.
+rebon-proto.workspace = true
+rebon-tool.workspace = true
+rebon-session.workspace = true
+# Windows verbatim-prefix stripping for canonicalized worktree roots.
+rebon-tools-core.workspace = true
+rebon-node-runtime.workspace = true
+tracing.workspace = true
+tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# setsid at spawn (workers/supervisor outlive the terminal) and
+# process-group signalling at stop (a worker's tool subprocesses go with it).
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
+
+[dev-dependencies]
+tempfile = "3"

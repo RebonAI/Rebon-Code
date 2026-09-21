@@ -1,0 +1,24 @@
+[package]
+name = "rebon-code-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "One-shot contained Node process for PTC / Code Mode: model-authored programs run behind an OS containment unit and Node's permission model, never in rebon's own process"
+
+[dependencies]
+rebon-boa-runner.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }

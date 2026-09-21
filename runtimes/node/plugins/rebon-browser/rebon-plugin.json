@@ -1,0 +1,19 @@
+{
+  "name": "rebon-browser",
+  "version": "0.1.0",
+  "description": "Control a dedicated Chrome or Edge tab group through the local Rebon browser extension.",
+  "capabilities": {
+    "mcpServers": {
+      "browser": {
+        "command": "{rebon_bin:rebon-browser-mcp}",
+        "args": [
+          "--extension-dir",
+          "{plugin_dir}/extension"
+        ]
+      }
+    }
+  },
+  "requirements": {
+    "externalCommands": []
+  }
+}

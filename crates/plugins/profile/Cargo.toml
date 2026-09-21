@@ -1,0 +1,33 @@
+[package]
+name = "rebon-plugin-profile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The `profile` feature plugin: the whole `/profile` surface plus the ProfileSwitch / ProfileSave tools. Parsing, one-field editing, the proposal a permission prompt shows, and the text every front end prints. Storage stays in rebon-config; reaching a live session goes through the ProfileSession trait, so a front end supplies handles and nothing else."
+
+[dependencies]
+rebon-kernel.workspace = true
+rebon-core.workspace = true
+rebon-tool.workspace = true
+rebon-tools-core.workspace = true
+
+# The `/profile` surface. Storage, validation and the bypass gate come from
+# `rebon-config`; this crate never re-decides any of it, it is the surface over
+# the top. `rebon-command-seat` is where `/profile` itself is registered.
+rebon-command-seat.workspace = true
+rebon-config.workspace = true
+rebon-permissions.workspace = true
+rebon-slash-commands.workspace = true
+rebon-types.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio.workspace = true

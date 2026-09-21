@@ -1,0 +1,31 @@
+#!/bin/sh
+# Keeps a personal commit-msg hook working inside this repository.
+#
+# core.hooksPath names ONE directory. Setting it to scripts/hooks so that the
+# repo's own gates run also shadows whatever global hooks directory the author
+# had, silently — the personal hook simply stops firing and nothing says so.
+# This forwards to it.
+#
+# Nothing repo-specific lives here on purpose: the repo's own rules belong in
+# hooks of their own, and this file exists only so that installing them costs
+# the author nothing they already had.
+set -e
+
+global=$(git config --global --get core.hooksPath 2>/dev/null || true)
+[ -n "$global" ] || exit 0
+
+# `git config` hands back the literal `~/...` it was given.
+case "$global" in
+    "~/"*) global="$HOME/${global#\~/}" ;;
+    "~") global="$HOME" ;;
+esac
+
+hook="$global/commit-msg"
+[ -x "$hook" ] || exit 0
+
+# A global hooksPath pointing back at this directory would recurse.
+here=$(cd "$(dirname "$0")" && pwd)
+there=$(cd "$global" 2>/dev/null && pwd) || exit 0
+[ "$here" != "$there" ] || exit 0
+
+exec "$hook" "$@"

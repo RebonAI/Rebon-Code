@@ -1,0 +1,24 @@
+[package]
+name = "rebon-plugin-notebook"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The notebook feature plugin: Jupyter cell editing with the shared file-mutation contracts."
+
+[dependencies]
+rebon-kernel.workspace = true
+rebon-core.workspace = true
+rebon-tool.workspace = true
+rebon-tools-core.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+rebon-agent-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tempfile = "3"

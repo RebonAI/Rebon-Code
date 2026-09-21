@@ -1,0 +1,358 @@
+{
+  "web.reconnectIn": [
+    {
+      "name": "s",
+      "type": "number"
+    }
+  ],
+  "web.permissionTitle": [
+    {
+      "name": "tool",
+      "type": "string"
+    }
+  ],
+  "web.permissionFrom": [
+    {
+      "name": "s",
+      "type": "string"
+    }
+  ],
+  "web.questionChosen": [
+    {
+      "name": "c",
+      "type": "string"
+    }
+  ],
+  "web.turnEnded": [
+    {
+      "name": "r",
+      "type": "string"
+    }
+  ],
+  "web.turnFailed": [
+    {
+      "name": "e",
+      "type": "string"
+    }
+  ],
+  "web.compacted": [
+    {
+      "name": "n",
+      "type": "string"
+    }
+  ],
+  "web.compacting": [
+    {
+      "name": "n",
+      "type": "string"
+    }
+  ],
+  "web.couldNotLoad": [
+    {
+      "name": "e",
+      "type": "string"
+    }
+  ],
+  "web.modelsIntro": [
+    {
+      "name": "p",
+      "type": "string"
+    }
+  ],
+  "web.configureLoop": [
+    {
+      "name": "id",
+      "type": "string"
+    }
+  ],
+  "web.unknownCommand": [
+    {
+      "name": "n",
+      "type": "string"
+    }
+  ],
+  "web.attachTooBig": [
+    {
+      "name": "n",
+      "type": "string"
+    }
+  ],
+  "web.fileTooBig": [
+    {
+      "name": "n",
+      "type": "string"
+    }
+  ],
+  "web.binaryFile": [
+    {
+      "name": "n",
+      "type": "string"
+    }
+  ],
+  "web.changedTo": [
+    {
+      "name": "k",
+      "type": "string"
+    },
+    {
+      "name": "v",
+      "type": "string"
+    }
+  ],
+  "mobile.updateAvailableBody": [
+    {
+      "name": "version",
+      "type": "String"
+    }
+  ],
+  "mobile.updateAvailableBodyAbi": [
+    {
+      "name": "version",
+      "type": "String"
+    },
+    {
+      "name": "abi",
+      "type": "String"
+    }
+  ],
+  "mobile.activityTokens": [
+    {
+      "name": "count",
+      "type": "String"
+    }
+  ],
+  "mobile.activityCurrentStreak": [
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.activityLongestStreak": [
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.activityDayTokens": [
+    {
+      "name": "date",
+      "type": "String"
+    },
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.showMoreItems": [
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.minutesAgo": [
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.hoursAgo": [
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.daysAgo": [
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.thinkingStepCount": [
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.questionCount": [
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.connectedTo": [
+    {
+      "name": "name",
+      "type": "String"
+    }
+  ],
+  "mobile.connectionStatus": [
+    {
+      "name": "status",
+      "type": "String"
+    }
+  ],
+  "mobile.approvalRequired": [
+    {
+      "name": "tool",
+      "type": "String"
+    }
+  ],
+  "mobile.answerRequired": [
+    {
+      "name": "question",
+      "type": "String"
+    }
+  ],
+  "mobile.logsRestricted": [
+    {
+      "name": "elapsed",
+      "type": "String"
+    }
+  ],
+  "mobile.subagentCount": [
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.sessionLaunchFailed": [
+    {
+      "name": "status",
+      "type": "String"
+    }
+  ],
+  "mobile.sendErrorDraftKept": [
+    {
+      "name": "error",
+      "type": "String"
+    }
+  ],
+  "mobile.sessionOverviewCounts": [
+    {
+      "name": "files",
+      "type": "int"
+    },
+    {
+      "name": "agents",
+      "type": "int"
+    }
+  ],
+  "mobile.changeCount": [
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.changeNumber": [
+    {
+      "name": "number",
+      "type": "int"
+    }
+  ],
+  "mobile.invalidPairingContent": [
+    {
+      "name": "error",
+      "type": "String"
+    }
+  ],
+  "mobile.pairedWith": [
+    {
+      "name": "name",
+      "type": "String"
+    }
+  ],
+  "mobile.recognizedConnecting": [
+    {
+      "name": "name",
+      "type": "String"
+    }
+  ],
+  "mobile.connectionFailedWithError": [
+    {
+      "name": "error",
+      "type": "String"
+    }
+  ],
+  "mobile.cameraUnavailable": [
+    {
+      "name": "details",
+      "type": "String"
+    }
+  ],
+  "mobile.notificationApprovalFrom": [
+    {
+      "name": "session",
+      "type": "String"
+    }
+  ],
+  "mobile.liveActivitySessionsRunning": [
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.liveActivityApprovalsWaiting": [
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.terminalExitedWithCode": [
+    {
+      "name": "code",
+      "type": "int"
+    }
+  ],
+  "mobile.terminalResize": [
+    {
+      "name": "cols",
+      "type": "int"
+    },
+    {
+      "name": "rows",
+      "type": "int"
+    }
+  ],
+  "mobile.filesTruncatedEntries": [
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.filesItemCount": [
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.filesReferencePrompt": [
+    {
+      "name": "path",
+      "type": "String"
+    }
+  ],
+  "mobile.projectChangesTruncated": [
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.projectChangesShowAll": [
+    {
+      "name": "count",
+      "type": "int"
+    }
+  ],
+  "mobile.terminalRunningElsewhere": [
+    {
+      "name": "cwd",
+      "type": "String"
+    }
+  ],
+  "mobile.sendFailureStatus": [
+    {
+      "name": "reason",
+      "type": "String"
+    }
+  ]
+}

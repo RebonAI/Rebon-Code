@@ -1,0 +1,44 @@
+[package]
+name = "rebon-plugin-workflow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The `workflow` feature plugin: the `Workflow` tool (alias `RunWorkflow`) and the Boa runtime behind it, which executes a deterministic JavaScript orchestration script against a fleet of sub-agents. The launch contract — `WorkflowLauncher`, its spec / status / preview, and the `workflow-launcher` seat — stays in rebon-tool, because the engine and the sub-agent spawner read it too."
+
+[dependencies]
+rebon-kernel.workspace = true
+rebon-core.workspace = true
+rebon-tool.workspace = true
+rebon-tools-core.workspace = true
+rebon-types.workspace = true
+# A workflow run *is* a row in the task registry: it registers itself, pushes
+# progress, and completes or fails there, and `/tasks` is where a user watches
+# it. Plugin-on-plugin, and deliberately so.
+rebon-plugin-tasks.workspace = true
+# A call's `modelProfile` is checked against the same router every sub-agent
+# spawn resolves through (`validate_profile`). The `agents` plugin asks it too,
+# and a plugin may not depend on another plugin, so the router sits here.
+rebon-agent-core.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+# The script engine. Boa rather than V8: a workflow script is deterministic
+# orchestration, not a general JS host, and an embedded interpreter is what
+# keeps `rebon` a single binary.
+boa_engine.workspace = true
+boa_gc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `agent()` results are cached by a hash of the call, so a resumed run replays
+# instead of re-spending.
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# Trailing commas: a workflow script's JSON literals are repaired before parse.
+regex.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"

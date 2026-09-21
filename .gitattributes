@@ -1,0 +1,40 @@
+# The tree is LF on every platform. The byte-for-byte fixture tests pinned
+# individually below are why it matters: a Windows checkout under
+# core.autocrlf=true would hand them CRLF, and every clone would look stale.
+* text=auto eol=lf
+
+# The Windows icon is handed to the resource compiler as bytes, so it must never
+# be run through the `eol=lf` above on the strength of content sniffing alone.
+*.ico binary
+
+# Shell scripts must stay LF even when checked out on Windows — a CRLF `.sh`
+# breaks under sh/bash (a `\r` in the shebang or in `read`/`case` values).
+# Covers scripts/release-*.sh and any other repo shell scripts.
+*.sh text eol=lf
+
+# The model-prompt golden is compared byte for byte by `include_str!`; a
+# CRLF checkout would fail it on every Windows clone.
+crates/plugins/model-prompt/tests/fixtures/*.txt text eol=lf
+
+# `cargo run -p rebon-schema-gen` writes LF and `generated_files_are_current`
+# compares against what it writes. Left to `core.autocrlf`, a Windows checkout
+# would hand the test CRLF and every clone would look stale.
+assets/schemas/*.json text eol=lf
+assets/web-ui/acp/types.generated.ts text eol=lf
+# The committed Vite build. `vite build` copies `index.html` with whatever
+# endings the checkout gave it, so without this every Windows rebuild rewrites
+# all eighteen lines of it and buries the one file that actually changed.
+assets/web-ui/dist/index.html text eol=lf
+# `include_str!` golden compared byte-for-byte by rebon-render
+crates/rebon-render/tests/golden/*.json text eol=lf
+# The imagegen skill is embedded with `include_str!` and written out as is;
+# its frontmatter is read by `---\n` markers, which a CRLF checkout breaks.
+crates/plugins/image-gen/skill/** text eol=lf
+
+# The copy source and everything `cargo run -p rebon-i18n-gen` writes from it,
+# pinned for the same reason: `generated_catalogues_are_current` compares the
+# checked-in catalogues against a fresh run.
+i18n/*.json text eol=lf
+assets/i18n/desktop/*.json text eol=lf
+assets/i18n/web/i18n.generated.ts text eol=lf
+assets/i18n/mobile/*.arb text eol=lf

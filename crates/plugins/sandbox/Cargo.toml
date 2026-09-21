@@ -1,0 +1,47 @@
+[package]
+name = "rebon-plugin-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The `sandbox` feature plugin: confining a shell command with the operating system. The pure view models `/sandbox` and `/doctor` render, the bubblewrap / seatbelt / sandbox-win wrapping runtime, the loopback proxy that filters a confined command's outbound connections by hostname, the decision table that says whether a command is wrapped at all, and the `session-sandbox` seat the front ends resolve it through."
+
+[dependencies]
+# The seam this plugin fills. `rebon-tool` owns the neutral vocabulary — a
+# shell prefix, a command to spawn, the `CommandSandbox` trait and the
+# `session-sandbox` seat; this crate is the only thing that knows those words
+# mean bwrap, seatbelt and sandbox-win.
+rebon-kernel.workspace = true
+rebon-tool.workspace = true
+rebon-tools-core.workspace = true
+
+# `/sandbox`: the command on the command seat, the panel on the `ui-registry`
+# seat, and the keyboard-reducer trait the panel implements. Switching the
+# plugin off takes all three away with the confinement they describe.
+rebon-command-seat.workspace = true
+rebon-dialog.workspace = true
+rebon-ui-seat.workspace = true
+
+# The settings-file chain (user / project / local) is read from one place, so
+# the doctor screen and the executor cannot disagree about which files count.
+rebon-config.workspace = true
+# One rule for "a binary that ships beside `rebon`", shared with the Boa
+# status-line helper and the binary halves of plugins: `sibling_binary`.
+rebon-types.workspace = true
+
+anyhow = { workspace = true }
+# The violations tab stamps each denial with the local wall clock, which std
+# cannot do: it has no timezone.
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# The proxy is a listener; the wrapping half has no async runtime and stays
+# that way.
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["full"] }

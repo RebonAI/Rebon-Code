@@ -1,0 +1,13 @@
+[package]
+name = "rebon-plugin-model-prompt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The `model-prompt` feature plugin: the model-preference sections of the system prompt (tone and style, output efficiency), chosen per model family and put on the engine's prompt-sections seat. The engine's own table no longer carries them."
+
+[dependencies]
+rebon-api.workspace = true
+rebon-core.workspace = true
+rebon-kernel.workspace = true

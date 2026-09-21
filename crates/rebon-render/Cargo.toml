@@ -1,0 +1,46 @@
+[package]
+name = "rebon-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The one ratatui-free render projection: session-message display state, tool-call bodies and diffs, markdown layout, and structured-diff formatting. Every front-end (ratatui TUI, GPUI app, serve/web) projects through this crate and only then paints; nothing here knows what a terminal cell is."
+
+[dependencies]
+# Deliberately short, and the shortness is the contract. This crate is pure
+# projection: no IO, no runtime registries, no rendering framework. Anything
+# the projection needs from the host arrives as plain data or an injected
+# callback.
+serde_json = { workspace = true }
+# `transcript_row` is the serde mirror of a persisted transcript line, so the
+# derives have to be here. This adds no crate to anyone's tree: serde and
+# serde_derive already arrive through serde_json and rebon-types.
+serde = { workspace = true, features = ["derive"] }
+# The builtin tool facts table (names, aliases, kinds, path fields). A
+# compile-time constant, not a runtime registry -- the alternative was keeping
+# a second copy of the tool names here, and that copy had already drifted from
+# the real one.
+rebon-tools-core = { workspace = true }
+# The shared ACP content-block / tool-kind values.
+rebon-types = { workspace = true }
+# The workspace's one display-width policy, a leaf over unicode-width, so what
+# this crate lays out and what a front-end paints agree about East Asian
+# ambiguous characters. Left a separate crate on purpose: the rendering
+# frameworks depend on it too, and folding it in here would point them at the
+# whole projection.
+rebon-width = { workspace = true }
+# Theme colors, as plain color intent. Zero runtime dependencies itself.
+rebon-design-system = { workspace = true }
+# Off unless the schema exporter asks for it; see [features] below.
+schemars = { workspace = true, optional = true }
+
+[features]
+# Off by default: derives `JsonSchema` on `transcript_row`, the row shape the
+# history endpoint serves. The schema exporter turns it on so the browser
+# client's TypeScript is generated from this definition instead of a
+# hand-written mirror, which keeps `schemars` out of every shipped binary.
+schema = ["dep:schemars", "rebon-types/schema"]
+
+[dev-dependencies]
+# Test matrix is hand-rolled -- keep this crate dependency-light.

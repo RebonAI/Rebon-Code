@@ -1,0 +1,25 @@
+[package]
+name = "rebon-session-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "In-memory session state for rebon — the session table, per-session attachment state, and the replay/transcript handover protocol shared by the ACP server and the engine."
+
+[dependencies]
+rebon-proto = { workspace = true }
+rebon-permissions = { workspace = true }
+# `tool_output` now lives in the projection crate and is re-exported from here
+# so both existing paths keep resolving. The edge only ever points this way:
+# `rebon-render` must never depend on a session table.
+rebon-render = { workspace = true }
+rebon-session = { workspace = true }
+rebon-types = { workspace = true }
+
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

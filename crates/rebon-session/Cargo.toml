@@ -1,0 +1,27 @@
+[package]
+name = "rebon-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Protocol-agnostic session infrastructure for rebon — on-disk transcripts, project directory keying, session locks, rewind, and file-history snapshots."
+
+[dependencies]
+# `memory_paths` strips the Windows extended-length prefix off a canonicalized
+# project path before keying on it; that rule has one home.
+rebon-tools-core.workspace = true
+rebon-types.workspace = true
+
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+fs2.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+# Missing from the workspace dependency table: declared here at the same
+# version the source crate used.
+tempfile = "3"

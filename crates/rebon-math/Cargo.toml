@@ -1,0 +1,16 @@
+[package]
+name = "rebon-math"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "UI-independent offline formula rendering with RaTeX, SVG, RGBA rasterization, and bounded caching."
+
+[dependencies]
+ratex-parser = { workspace = true }
+ratex-layout = { workspace = true }
+ratex-types = { workspace = true }
+ratex-svg = { workspace = true }
+ratex-katex-fonts = { workspace = true }
+resvg = { workspace = true }

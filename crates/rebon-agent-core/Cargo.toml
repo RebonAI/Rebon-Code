@@ -1,0 +1,28 @@
+[package]
+name = "rebon-agent-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Direction-neutral agent turn seam for rebon — the prompt-turn interface, the outbound update/permission sinks, and the backend trait both the local engine and a third-party ACP agent implement."
+
+[dependencies]
+rebon-proto.workspace = true
+rebon-api.workspace = true
+# Only for the `declared-agent-source` seat: a plugin that knows about agents
+# this crate cannot see hands them over through the kernel registry.
+rebon-kernel.workspace = true
+rebon-session.workspace = true
+rebon-types.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
