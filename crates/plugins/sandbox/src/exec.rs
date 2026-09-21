@@ -46,7 +46,9 @@ use std::sync::Arc;
 use rebon_tool::command_sandbox::{BinShell, CommandSandbox, PreparedCommand};
 use rebon_tools_core::{ToolError, ToolId, ToolResult};
 
-use crate::runtime::{CommandRequest, SandboxError, SandboxRuntime, WrappedCommand};
+use crate::runtime::{
+    CommandRequest, FsProbe, RealFs, SandboxError, SandboxRuntime, WrappedCommand,
+};
 use crate::view::{OverrideMode, SandboxPlatform};
 
 /// Sandbox policy that governs how command-execution tools (Bash,
@@ -225,6 +227,38 @@ impl CommandSandbox for SandboxPolicy {
         cwd: Option<&str>,
         dangerously_disable_sandbox: bool,
     ) -> ToolResult<PreparedCommand> {
+        self.prepare_with_fs(
+            tool,
+            policy_command,
+            payload,
+            shell,
+            cwd,
+            dangerously_disable_sandbox,
+            &RealFs,
+        )
+    }
+}
+
+impl SandboxPolicy {
+    /// [`SandboxPolicy::prepare`] against an injected filesystem.
+    ///
+    /// The mount plan asks the real filesystem about the paths it pins,
+    /// so a test that asserts on the notices a command produces would
+    /// otherwise be reading the machine it runs on: on macOS `/etc` is a
+    /// symlink to `/private/etc`, which is a perfectly good reason to
+    /// drop an ancestor pin and a note saying so -- and nothing to do
+    /// with the command under test.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_with_fs(
+        &self,
+        tool: &ToolId,
+        policy_command: &str,
+        payload: &str,
+        shell: BinShell,
+        cwd: Option<&str>,
+        dangerously_disable_sandbox: bool,
+        fs: &dyn FsProbe,
+    ) -> ToolResult<PreparedCommand> {
         match self.verdict(policy_command, dangerously_disable_sandbox) {
             Verdict::Unwrapped => return Ok(PreparedCommand::passthrough(&shell, payload, cwd)),
             Verdict::Refuse => {
@@ -272,7 +306,7 @@ impl CommandSandbox for SandboxPolicy {
             .assert_confined(true)
             .map_err(|err| sandbox_error(tool, err))?;
         let wrapped = runtime
-            .wrap(&request)
+            .wrap_with_fs(&request, fs)
             .map_err(|err| sandbox_error(tool, err))?;
         // Asked again after the wrap: the first call proved the machine
         // can confine something, this one is the last point before spawn
@@ -474,15 +508,28 @@ mod tests {
             |session| session.filesystem.deny_read = vec![PathBuf::from("/secret")],
             Arc::new(AlwaysConfined),
         );
-        let prepared = prepare(
-            &policy(OverrideMode::Closed, Some(runtime)),
-            "echo hi",
-            "echo hi",
-            bash_shell(),
-            None,
-            false,
-        )
-        .unwrap();
+        // Against a filesystem this test describes, not the one it happens
+        // to run on: the mount plan pins ancestors of the paths it binds,
+        // and on macOS `/etc` is a symlink to `/private/etc`, which earns
+        // a perfectly correct note that has nothing to do with `echo hi`.
+        let fs = crate::runtime::fs_probe::FakeFs::new()
+            .dir("/etc")
+            .dir("/etc/ssh")
+            .dir("/etc/ssh/ssh_config.d")
+            .dir("/usr")
+            .dir("/usr/bin")
+            .dir("/tmp");
+        let prepared = policy(OverrideMode::Closed, Some(runtime))
+            .prepare_with_fs(
+                &tool(),
+                "echo hi",
+                "echo hi",
+                bash_shell(),
+                None,
+                false,
+                &fs,
+            )
+            .unwrap();
 
         let mut result = serde_json::json!({ "stdout": "" });
         attach_notices(&mut result, &prepared);
