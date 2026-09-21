@@ -10,6 +10,7 @@ description = "The `updater` feature plugin: everything Rebon knows about its ow
 [dependencies]
 # The command seat `/update` registers on, and the parser helper the slash
 # grammar shares with every other command.
+rebon-config-seat.workspace = true
 rebon-command-seat.workspace = true
 rebon-kernel.workspace = true
 rebon-slash-commands.workspace = true

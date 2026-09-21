@@ -68,6 +68,9 @@ pub use updater::*;
 
 /// Stable id: the config key `plugins.updater.enabled` and the name in
 /// `/kernel plugins`.
+mod settings_row;
+pub use settings_row::AUTO_INSTALL_OPTION;
+
 pub const PLUGIN_ID: &str = "updater";
 
 /// This plugin's update-check seat as `ctx` sees it, or `None` when
@@ -98,7 +101,9 @@ pub struct UpdaterPlugin;
 
 impl Plugin for UpdaterPlugin {
     fn meta(&self) -> PluginMeta {
-        PluginMeta::new(PLUGIN_ID).inject(&[COMMAND_SEAT_SERVICE])
+        PluginMeta::new(PLUGIN_ID)
+            .inject(&[COMMAND_SEAT_SERVICE])
+            .optional_inject(&[rebon_config_seat::CONFIG_SEAT_SERVICE])
     }
 
     fn apply(&self, ctx: &Context) -> Result<(), KernelError> {
@@ -120,6 +125,8 @@ impl Plugin for UpdaterPlugin {
         let spec = command_spec();
         let handler = CommandHandler::Native(spec.name.clone());
         commands.register(ctx, spec, handler)?;
+
+        settings_row::register(ctx)?;
 
         Ok(())
     }
