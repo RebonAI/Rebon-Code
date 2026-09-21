@@ -4916,6 +4916,70 @@ fn response_language_name(language: &str) -> Option<&'static str> {
     }
 }
 
+/// The locales [`saved_language`] recognises, as the settings panel offers
+/// them. `auto` is the absence of the key, not a value written to it.
+pub const LANGUAGE_LOCALES: [&str; 3] = ["en", "zh-CN", "ja"];
+
+/// The locale the language key holds, as written rather than as a prompt name.
+///
+/// [`saved_language`] answers what the model is told ("Chinese"); a settings
+/// row has to show and cycle what the file holds ("zh-CN"). `None` means the
+/// key is absent or holds something unrecognised, which both read as "follow
+/// the model's own default".
+pub fn saved_language_locale() -> Option<String> {
+    saved_language_locale_in_dir(&config_home_dir())
+}
+
+pub fn saved_language_locale_in_dir(config_dir: &Path) -> Option<String> {
+    let target = config_dir.join("settings.json");
+    let settings = read_settings_json_object(&target).ok()?;
+    let raw = settings
+        .get(LANGUAGE_CONFIG_KEY)
+        .or_else(|| {
+            settings
+                .get(APP_APPEARANCE_CONFIG_KEY)
+                .and_then(serde_json::Value::as_object)
+                .and_then(|appearance| appearance.get(LANGUAGE_CONFIG_KEY))
+        })
+        .and_then(serde_json::Value::as_str)?;
+    // Only a locale the reader recognises is reported. A row that showed a
+    // value `saved_language` will not act on would say the setting is in
+    // force when the model is never told about it.
+    let canonical = LANGUAGE_LOCALES
+        .iter()
+        .find(|locale| locale.eq_ignore_ascii_case(raw.trim()))?;
+    Some((*canonical).to_string())
+}
+
+/// Write the response-language preference, or clear it.
+///
+/// Always the top-level key: `appAppearance.language` is read for the app's
+/// sake but never written here, so one file cannot end up with two answers.
+pub fn save_language(locale: Option<&str>) -> anyhow::Result<()> {
+    save_language_in_dir(&config_home_dir(), locale)
+}
+
+pub fn save_language_in_dir(config_dir: &Path, locale: Option<&str>) -> anyhow::Result<()> {
+    let target = config_dir.join("settings.json");
+    let mut settings = read_settings_json_object(&target).unwrap_or_default();
+    match locale {
+        Some(locale) => {
+            let canonical = LANGUAGE_LOCALES
+                .iter()
+                .find(|known| known.eq_ignore_ascii_case(locale.trim()))
+                .ok_or_else(|| anyhow::anyhow!("unknown language `{locale}`"))?;
+            settings.insert(
+                LANGUAGE_CONFIG_KEY.to_string(),
+                serde_json::Value::String((*canonical).to_string()),
+            );
+        }
+        None => {
+            settings.remove(LANGUAGE_CONFIG_KEY);
+        }
+    }
+    write_settings_json_object(&target, &settings)
+}
+
 #[cfg(test)]
 mod saved_language_tests {
     use super::*;
@@ -4924,6 +4988,68 @@ mod saved_language_tests {
     fn absent_language_does_not_create_a_prompt_preference() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("settings.json"), "{}").unwrap();
+        assert_eq!(saved_language_in_dir(dir.path()), None);
+    }
+
+    /// The settings row writes a locale and reads the same one back, and the
+    /// prompt side agrees about what was written. Two readers of one key that
+    /// disagree is the failure this pins.
+    #[test]
+    fn a_written_locale_reads_back_as_itself_and_as_a_prompt_name() {
+        let dir = tempfile::tempdir().unwrap();
+        for (locale, prompt_name) in [("zh-CN", "Chinese"), ("en", "English"), ("ja", "Japanese")] {
+            save_language_in_dir(dir.path(), Some(locale)).expect("writes");
+            assert_eq!(
+                saved_language_locale_in_dir(dir.path()).as_deref(),
+                Some(locale)
+            );
+            assert_eq!(
+                saved_language_in_dir(dir.path()).as_deref(),
+                Some(prompt_name)
+            );
+        }
+    }
+
+    #[test]
+    fn a_locale_is_canonicalised_on_the_way_in_and_an_unknown_one_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        save_language_in_dir(dir.path(), Some("ZH-cn")).expect("case does not matter");
+        assert_eq!(
+            saved_language_locale_in_dir(dir.path()).as_deref(),
+            Some("zh-CN")
+        );
+        save_language_in_dir(dir.path(), Some("klingon")).expect_err("unknown locale refused");
+        assert_eq!(
+            saved_language_locale_in_dir(dir.path()).as_deref(),
+            Some("zh-CN"),
+            "a refused write must not have changed the file"
+        );
+    }
+
+    #[test]
+    fn clearing_the_language_removes_the_key_rather_than_writing_a_word_for_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        save_language_in_dir(dir.path(), Some("ja")).expect("writes");
+        save_language_in_dir(dir.path(), None).expect("clears");
+        assert_eq!(saved_language_locale_in_dir(dir.path()), None);
+        assert_eq!(saved_language_in_dir(dir.path()), None);
+        let raw = std::fs::read_to_string(dir.path().join("settings.json")).unwrap();
+        assert!(
+            !raw.contains(LANGUAGE_CONFIG_KEY),
+            "the key should be gone, not set to a placeholder: {raw}"
+        );
+    }
+
+    /// The locale reader only reports what the prompt reader will act on.
+    #[test]
+    fn an_unrecognised_locale_in_the_file_reads_as_absent_on_both_sides() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            format!(r#"{{"{LANGUAGE_CONFIG_KEY}":"fr-FR"}}"#),
+        )
+        .unwrap();
+        assert_eq!(saved_language_locale_in_dir(dir.path()), None);
         assert_eq!(saved_language_in_dir(dir.path()), None);
     }
 
