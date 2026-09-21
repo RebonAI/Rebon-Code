@@ -34,7 +34,46 @@ mod tests {
     /// local controls. A command that leaves this table is one whose
     /// implementation left `rebon-cli` / `rebon-harness` / `rebon-core`
     /// first.
-    const BUILTIN_COMMAND_COUNT: usize = 42;
+    const BUILTIN_COMMAND_COUNT: usize = 43;
+
+    #[test]
+    fn code_mode_experiment_uses_builtin_plugin_switch_without_enabling_sessions() {
+        use rebon_kernel::{Kernel, PluginHost, PluginKind, PluginRegistry};
+        use rebon_kernel_seats::kernel_code_mode::RunCodeTool;
+        let definition = rebon_harness::kernel_bootstrap::builtin_plugin_defs()
+            .iter()
+            .find(|definition| definition.id == "code-mode")
+            .unwrap();
+        assert_eq!(definition.kind, PluginKind::Feature);
+        assert!(!definition.default_enabled);
+        let kernel = Kernel::new();
+        let registry = PluginRegistry::new(
+            kernel.clone(),
+            &[*definition],
+            PluginHost {
+                kernel: kernel.clone(),
+                config_dir: std::env::temp_dir(),
+            },
+        );
+        registry.reconcile(&Default::default());
+        let tool = RunCodeTool::new(
+            Arc::new(rebon_core::Engine::new()),
+            kernel.context().fork_scoped("session"),
+        );
+        assert!(tool.command(&["on".into()]).is_err());
+        assert!(registry
+            .set_enabled("code-mode", true)
+            .unwrap()
+            .failed
+            .is_empty());
+        assert!(tool.command(&[]).unwrap().contains("off"));
+        tool.command(&["on".into()]).unwrap();
+        assert!(tool.command(&[]).unwrap().contains("on"));
+        registry.set_enabled("code-mode", false).unwrap();
+        assert!(tool.command(&[]).unwrap().contains("off"));
+        registry.set_enabled("code-mode", true).unwrap();
+        assert!(tool.command(&[]).unwrap().contains("off"));
+    }
 
     /// The seat, on this binary's one process kernel.
     ///
@@ -130,6 +169,7 @@ mod tests {
             "clear",
             "compact",
             "context",
+            "codemode",
             "cost",
             "doctor",
             "effort",
@@ -195,6 +235,7 @@ mod tests {
             "memory",
             "doctor",
             "status",
+            "codemode",
             "cost",
             "mcp",
             "hooks",
@@ -207,7 +248,7 @@ mod tests {
         session_control.sort_unstable();
         assert_eq!(names(Surface::SessionControl), session_control);
         let mut mobile = vec![
-            "status", "cost", "context", "memory", "mcp", "hooks", "doctor",
+            "codemode", "status", "cost", "context", "memory", "mcp", "hooks", "doctor",
         ];
         mobile.sort_unstable();
         assert_eq!(names(Surface::Mobile), mobile);
@@ -216,6 +257,7 @@ mod tests {
             "new",
             "clear",
             "status",
+            "codemode",
             "cost",
             "stop",
             "effort",
@@ -246,6 +288,7 @@ mod tests {
         assert_eq!(names(Surface::Web), web);
         let mut acp = vec![
             "context",
+            "codemode",
             "cost",
             "doctor",
             "hooks",

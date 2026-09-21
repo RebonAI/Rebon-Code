@@ -63,6 +63,17 @@ pub fn execute_session_control_command(
         format!("/{name} {}", args.join(" "))
     };
     let result = match name.as_str() {
+        "codemode" => {
+            let lease = session
+                .engine_half
+                .kernel_scopes
+                .acquire(&session.session_id);
+            let text = rebon_kernel_seats::kernel_code_mode::command(lease.context(), args)?;
+            SessionControlCommandResult {
+                output: control_command_output(text, false),
+                replay_requests: Vec::new(),
+            }
+        }
         "context" if args.is_empty() => SessionControlCommandResult {
             output: control_command_output(execute_context_command(inputs, session), false),
             replay_requests: Vec::new(),

@@ -1540,6 +1540,7 @@ impl crate::policy_seat::PolicySubscriber for RefusesEveryTool {
 
 mod anchored_minimal;
 mod attachments_and_transcripts;
+mod code_mode;
 mod context_reset_and_cache_trace;
 mod executor_integration;
 mod model_routing;

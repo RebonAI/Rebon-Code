@@ -171,22 +171,17 @@ fn every_model_reproduces_the_frozen_base_byte_for_byte() {
     }
 }
 
-/// Astra's plane is the frozen one plus its addendum at the very end —
-/// after the efficiency section, nothing between — with the batching line
-/// present exactly when the turn offers `run_code`.
+/// Astra 的基础前缀不随 run_code 的可用性变化。
 #[test]
 fn astra_gets_the_base_plus_the_working_addendum_at_the_end() {
     let (kernel, _registry) = boot();
     let base = FROZEN.to_string();
     let without = base_for(&kernel, "gpt-6-astra", &["Read"]);
-    assert_eq!(
-        without,
-        format!("{base}\n\n{}", sections::astra_working(false))
-    );
+    assert_eq!(without, format!("{base}\n\n{}", sections::astra_working()));
     let with = base_for(&kernel, "gpt-6-astra", &["Read", RUN_CODE_TOOL]);
-    assert_eq!(with, format!("{base}\n\n{}", sections::astra_working(true)));
+    assert_eq!(with, without);
     assert!(!without.contains("`run_code`"));
-    assert!(with.contains("Combine independent reads or searches in a single `run_code` program"));
+    assert!(!with.contains("`run_code`"));
     for prompt in [&without, &with] {
         assert!(prompt.contains(
             "In one line between tool calls, explain your current action and its purpose"

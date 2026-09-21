@@ -191,6 +191,7 @@ pub fn builtin_plugin_defs() -> &'static [PluginDef] {
             default_enabled: true,
             factory: make_core_config_options,
         },
+        rebon_kernel_seats::kernel_code_mode::PLUGIN,
         rebon_plugin_cron::PLUGIN,
         rebon_plugin_web::PLUGIN,
         rebon_plugin_monitor::PLUGIN,

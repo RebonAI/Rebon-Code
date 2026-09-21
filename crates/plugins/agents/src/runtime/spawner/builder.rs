@@ -28,6 +28,7 @@ impl EngineSubAgentSpawner {
             automatic_routes: Arc::new(Mutex::new(HashMap::new())),
             task_registry_resolver: None,
             task_registry: None,
+            session_tools: None,
             escalation_registry: EscalationRegistry::new(),
             file_history_tracker: None,
             capability_failures: Arc::new(Mutex::new(HashMap::new())),
@@ -179,8 +180,10 @@ impl EngineSubAgentSpawner {
             .ok_or_else(|| {
                 "sub-agent task registration requires a parent session id".to_string()
             })?;
-        let registry = resolver.resolve(session_id)?;
+        let (registry, lease) = resolver.resolve_with_lease(session_id)?;
         let mut scoped = self.clone();
+        let engine = self.engine.upgrade().ok_or("engine has been dropped")?;
+        scoped.session_tools = Some(engine.scoped_tool_resolver(Some(lease), &[], None));
         scoped.task_registry = Some(registry.as_ref().clone());
         scoped.escalation_registry = registry.escalation_registry();
         Ok(scoped)

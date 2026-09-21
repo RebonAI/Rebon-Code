@@ -111,6 +111,7 @@ const NATIVE_COMMAND_IDS: &[&str] = &[
     "background-agents",
     "ceo",
     "clear",
+    "codemode",
     "compact",
     "context",
     "cost",
@@ -263,6 +264,7 @@ pub(super) fn native_dispatch(
         "hooks" => run_hooks(cx, command),
         "status" => run_status(cx, command),
         "statusline" => run_statusline(cx, command),
+        "codemode" => run_codemode(cx, command),
         "cost" => run_cost(cx, command),
         "doctor" => run_doctor(cx, command),
         "review" => run_review(cx, command),
@@ -600,6 +602,21 @@ fn run_statusline(cx: Cx<'_>, command: &str) -> Option<bool> {
     accept(app, session, command);
     let output = execute_statusline_command(app);
     feedback(app, "statusline", &output);
+    Some(false)
+}
+
+fn run_codemode(cx: Cx<'_>, command: &str) -> Option<bool> {
+    use crate::session::commands::control::{
+        execute_session_control_command, parse_session_control_command,
+    };
+    let (name, args) = parse_session_control_command(command)?;
+    let (app, session, ..) = cx.split();
+    accept(app, session, command);
+    let inputs = session_command_inputs_from_app(app, session.ui_mode);
+    match execute_session_control_command(&inputs, session, &name, &args) {
+        Ok(result) => feedback(app, "codemode", &result.output.text),
+        Err(error) => command_result(app, true, &error),
+    }
     Some(false)
 }
 

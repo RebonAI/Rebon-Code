@@ -59,10 +59,9 @@ fn session_control_serves_status_cost_and_mcp_without_arguments() {
     }
 }
 
-/// The twelve the surface bit carried the day the hand-written list was
-/// deleted, so the boot below is checked to have found the whole set and
-/// not, say, eleven of them with the `memory` plugin off.
+/// 固定完整的共享命令集合，避免插件未加载时悄悄漏测。
 const SESSION_CONTROL_COMMANDS: &[&str] = &[
+    "codemode",
     "context",
     "memory",
     "doctor",
@@ -77,11 +76,7 @@ const SESSION_CONTROL_COMMANDS: &[&str] = &[
     "backend",
 ];
 
-/// Every command carrying the `SESSION_CONTROL` bit, off the booted seat.
-///
-/// The kernel is booted because `/memory` lives in its plugin and
-/// the compiled-in table no longer holds it; reading the table alone
-/// would quietly check eleven commands and call it twelve.
+/// 从已启动的 seat 读取所有共享命令，包括插件提供的 `/memory`。
 fn forwardable_command_names() -> Vec<String> {
     rebon_harness::kernel_bootstrap::process_kernel();
     let mut names: Vec<String> = rebon_slash_commands::all()
@@ -174,6 +169,42 @@ fn the_match_answers_nothing_the_list_omits() {
             spec.name
         );
     }
+}
+
+#[test]
+fn codemode_uses_shared_session_control_and_two_gates() {
+    use rebon_harness::rebon_kernel::Plugin;
+    let tempdir = TempDir::new().unwrap();
+    let _config_dir = ConfigDirGuard::set(tempdir.path());
+    let app = AppState::new();
+    let session = make_test_tui_session();
+    let inputs = crate::session_shell::session_command_inputs_from_app(&app, session.ui_mode);
+    let run =
+        |args: &[String]| execute_session_control_command(&inputs, &session, "codemode", args);
+    assert!(run(&[]).unwrap().output.text.contains("off"));
+    let err = run(&["on".into()]).err().unwrap();
+    assert!(
+        err.contains("settings.json") && err.contains("code-mode") && err.contains("/codemode on")
+    );
+    let lease = session
+        .engine_half
+        .kernel_scopes
+        .acquire(&session.session_id);
+    let experiment = lease.context().fork("test-experiment");
+    rebon_kernel_seats::kernel_code_mode::CodeModePlugin
+        .apply(&experiment)
+        .unwrap();
+    assert!(run(&[]).unwrap().output.text.contains("off"));
+    assert!(run(&["on".into()]).unwrap().output.text.contains("on"));
+    assert!(run(&[]).unwrap().output.text.contains("on"));
+    assert!(run(&["off".into()]).unwrap().output.text.contains("off"));
+    assert!(run(&["bad".into()]).is_err());
+    experiment.dispose();
+    assert!(run(&["on".into()]).is_err());
+    assert_eq!(
+        parse_session_control_command("/codemode on"),
+        Some(("codemode".into(), vec!["on".into()]))
+    );
 }
 
 #[test]

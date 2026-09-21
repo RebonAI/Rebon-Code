@@ -1285,7 +1285,7 @@ async fn finish_tool_round(
                 AttachmentPollPhase::Regular,
                 (iteration as u64).saturating_add(1),
                 manager.messages(),
-                params,
+                params.attachment_poller.as_ref(),
             );
             let _ =
                 apply_turn_hook_writeback(manager, params, context, tx, iteration + 1, writeback);
@@ -1319,8 +1319,10 @@ struct BuiltRequest {
     request_cache_trace_context: Option<rebon_api::CacheTraceContext>,
 }
 
-/// Build a request after the iteration-zero attachment poll.
+/// 在首次 attachment poll 及压缩之后准备本次 provider 请求。
 fn build_iteration_request(
+    control: &TurnControlPlugin,
+    fresh_history: bool,
     manager: &mut ContextManager,
     params: &mut QueryParams,
     context: &mut ToolContext,
@@ -1329,9 +1331,25 @@ fn build_iteration_request(
     cache_miss_reason: CacheMissReason,
 ) -> BuiltRequest {
     if iteration == 0 {
-        let writeback =
-            tx.dispatch_attachment_poll(AttachmentPollPhase::Eager, 0, manager.messages(), params);
+        let writeback = tx.dispatch_attachment_poll(
+            AttachmentPollPhase::Eager,
+            0,
+            manager.messages(),
+            params.attachment_poller.as_ref(),
+        );
         let _ = apply_turn_hook_writeback(manager, params, context, tx, 0, writeback);
+    }
+
+    if let Some(notification) = code_mode::prepare(
+        &control.engine,
+        &control.session,
+        params,
+        context,
+        manager.messages(),
+        fresh_history,
+    ) {
+        let writeback = notification.dispatch(tx, manager.messages(), params, iteration);
+        let _ = apply_turn_hook_writeback(manager, params, context, tx, iteration, writeback);
     }
 
     let request = build_model_request(&manager, &params);
@@ -1456,6 +1474,7 @@ impl TurnControlPlugin {
         let engine = self.engine.clone();
         let session = self.session.clone();
         let mut params = self.params.clone();
+        let fresh_history = code_mode::fresh_history(&params.messages);
         let mut context = self.context.clone();
         let cancel = self.cancel.clone();
         let tx = self.tx.clone();
@@ -1547,6 +1566,8 @@ impl TurnControlPlugin {
                 request,
                 request_cache_trace_context,
             } = build_iteration_request(
+                self,
+                fresh_history,
                 &mut manager,
                 &mut params,
                 &mut context,
@@ -1554,6 +1575,8 @@ impl TurnControlPlugin {
                 iteration,
                 cache_miss_reason,
             );
+            announced_tools.remove(RUN_CODE_TOOL);
+            extend_announced_tools(&params, &mut announced_tools);
 
             let accumulator = match open_and_drain_stream(
                 &mut manager,

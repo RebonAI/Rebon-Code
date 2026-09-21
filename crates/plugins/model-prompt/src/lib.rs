@@ -18,14 +18,9 @@
 //! it to a sub-agent's prompt through a different path) and the coordinator
 //! contract (which never carries these two sections).
 //!
-//! **Families.** The two shared sections go to every model unchanged, byte
-//! for byte, which is what `tests/base_prompt_golden.rs` pins. GPT-6 Astra
-//! additionally gets a short addendum
-//! ([`sections::astra_working`]) after the efficiency section, and its one
-//! tool-specific line is only issued when the turn actually offers
-//! `run_code`. Which family a model is in is asked of the vendor catalogue
-//! in exactly one place, [`model_family`]; nothing else in the tree spells
-//! a model's name for this purpose.
+//! 两个共享段落保持原文；Astra 的工作附录位于效率段落之后。
+//! Code Mode 的统一优先指令不属于模型家族偏好，由公共 query 按工具
+//! 可用性和会话生命周期添加。模型家族仍只在 [`model_family`] 查询。
 //!
 //! **Switching it off.** `plugins.model-prompt.enabled = false` takes every
 //! section here out of the prompt for *every* model: the base plane then
@@ -58,12 +53,8 @@ pub const OUTPUT_EFFICIENCY_SECTION: &str = "model-prompt/output-efficiency";
 /// Section name of the Astra addendum.
 pub const ASTRA_WORKING_SECTION: &str = "model-prompt/astra-working";
 
-/// The Code Mode tool, by the name the turn's projection lists it under.
-///
-/// The same string as `rebon_kernel_seats::kernel_code_mode::RUN_CODE_TOOL_NAME`
-/// — a drift test there keeps them equal — spelled here because the
-/// harness depends on this crate, not the other way round.
-pub const RUN_CODE_TOOL: &str = "run_code";
+/// 保留既有导出，工具名称由公共 query 提供。
+pub use rebon_core::query::RUN_CODE_TOOL;
 
 /// The catalogue id of GPT-6 Astra, the one model with a family of its own.
 const ASTRA_CATALOGUE_ID: &str = "gpt-6-astra";
@@ -110,7 +101,7 @@ pub fn sections_for_subject(subject: &PromptSubject) -> Vec<PluginPromptSection>
             PluginPromptSection::new(
                 ASTRA_WORKING_SECTION,
                 Rung::Efficiency,
-                sections::astra_working(subject.has_tool(RUN_CODE_TOOL)),
+                sections::astra_working(),
             )
             // After the shared efficiency section on the same rung.
             .with_order(1.0),
@@ -265,11 +256,9 @@ mod tests {
         }
     }
 
-    /// Astra gets the addendum on the efficiency rung after the shared
-    /// section, and the batching line only when the turn offers `run_code`
-    /// — eagerly or through tool search.
+    /// Astra 的附录不缓存工具可用性；Code Mode 由公共 query 生命周期负责。
     #[test]
-    fn astra_gets_the_addendum_and_the_batching_line_only_with_run_code() {
+    fn astra_addendum_is_independent_of_code_mode_availability() {
         let (kernel, _registry) = boot();
         let session = kernel.context().fork_scoped("session/abc");
 
@@ -283,7 +272,7 @@ mod tests {
             addendum.order > sections[1].order,
             "after the shared section"
         );
-        assert_eq!(addendum.text, sections::astra_working(false));
+        assert_eq!(addendum.text, sections::astra_working());
         assert!(!addendum.text.contains("run_code"));
         assert!(addendum.text.contains("quote the sentence responsible"));
 
@@ -293,8 +282,8 @@ mod tests {
             PromptSubject::new("gpt-6-astra").with_tools(vec![], vec![RUN_CODE_TOOL.into()]);
         for subject in [eager, deferred] {
             let text = &sections_for(&session, &subject)[2].text;
-            assert_eq!(text, &sections::astra_working(true));
-            assert!(text.contains("a single `run_code` program"));
+            assert_eq!(text, &sections::astra_working());
+            assert!(!text.contains("run_code"));
         }
 
         // Nobody else gets it, run_code or not.

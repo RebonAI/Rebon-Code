@@ -505,6 +505,9 @@ impl EngineSubAgentSpawner {
                 self.escalation_registry
                     .worker_client(agent_id.clone(), Some(registry_title.clone())),
             );
+        if let Some(resolver) = &self.session_tools {
+            child_context = child_context.with_tool_resolver(resolver.clone());
+        }
         if let Some(cwd) = spec.cwd.as_deref() {
             child_context = child_context.with_cwd(cwd.to_string());
         }

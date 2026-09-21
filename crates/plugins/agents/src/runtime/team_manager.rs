@@ -480,6 +480,7 @@ pub struct InProcessTeamManager {
     engine: Arc<Engine>,
     client: Arc<dyn ModelClient>,
     registry: TaskRegistry,
+    session_tools: Option<Arc<dyn rebon_tool::ToolResolver>>,
     default_model: String,
     model_config: SubAgentModelConfig,
     model_profiles: ModelProfileMap,
@@ -513,6 +514,7 @@ impl InProcessTeamManager {
             engine,
             client,
             registry,
+            session_tools: None,
             default_model: default_model.into(),
             model_config: SubAgentModelConfig::default(),
             model_profiles: ModelProfileMap::default(),
@@ -602,6 +604,7 @@ impl InProcessTeamManager {
         let model_router = self.model_router();
         let base_filter = self.base_filter.clone();
         let waiters = self.waiters.clone();
+        let session_tools = self.session_tools.clone();
         tokio::spawn(async move {
             run_teammate_loop(
                 engine,
@@ -617,6 +620,7 @@ impl InProcessTeamManager {
                 model_profiles,
                 model_router,
                 base_filter,
+                session_tools,
                 waiters,
             )
             .await;
@@ -1600,6 +1604,7 @@ async fn run_teammate_loop(
     _model_profiles: ModelProfileMap,
     model_router: Arc<dyn AgentModelRouter>,
     base_filter: Option<SharedToolFilter>,
+    session_tools: Option<Arc<dyn rebon_tool::ToolResolver>>,
     waiters: Arc<Mutex<HashMap<String, oneshot::Sender<TeammateHandoff>>>>,
 ) {
     let mut next_request = initial_request;
@@ -1776,7 +1781,7 @@ async fn run_teammate_loop(
         let TeammateTurn {
             session,
             turn_user_message,
-            worker_spec,
+            mut worker_spec,
         } = build_teammate_turn(
             &engine,
             &registry,
@@ -1794,6 +1799,11 @@ async fn run_teammate_loop(
             prompt_already_in_transcript,
         );
 
+        if let Some(resolver) = &session_tools {
+            worker_spec.tool_context = worker_spec
+                .tool_context
+                .with_tool_resolver(resolver.clone());
+        }
         let result = match spawn_worker(engine.clone(), session, worker_spec, cancel.clone()) {
             Ok(handle) => drive_in_process_teammate_worker_turn(&registry, &turn, handle).await,
             Err(err) => {
@@ -2154,7 +2164,7 @@ impl SessionTaskTeamManager {
         }
         // Resolve on every operation so plugin disable and scope disposal are
         // observed even when a manager for this session already exists.
-        let registry = self.registry_resolver.resolve(session_id)?;
+        let (registry, lease) = self.registry_resolver.resolve_with_lease(session_id)?;
         {
             let managers = self
                 .managers
@@ -2180,6 +2190,7 @@ impl SessionTaskTeamManager {
         if let Some(filter) = &self.base_filter {
             manager = manager.with_shared_base_filter(filter.clone());
         }
+        manager.session_tools = Some(self.engine.scoped_tool_resolver(Some(lease), &[], None));
         let manager = Arc::new(manager);
         let mut managers = self
             .managers

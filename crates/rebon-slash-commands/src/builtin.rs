@@ -62,6 +62,10 @@ pub fn builtin_command_table() -> Vec<CommandSpec> {
         CommandSpec::new("stop", "Interrupt the running turn")
             .zh_aliases(["停止", "中断"])
             .surfaces(LOCAL_WEB),
+        CommandSpec::new("codemode", "开启或关闭当前会话的实验性 Code Mode")
+            .hint("[on|off]")
+            .surfaces(ALL_EVERYWHERE)
+            .kind(Session),
         CommandSpec::new("effort", "Show or set this session's reasoning effort")
             .zh_aliases(["推理强度", "思考强度"])
             .hint("[xhigh|high|medium|low|auto]")
@@ -277,4 +281,25 @@ pub fn builtin_command_table() -> Vec<CommandSpec> {
             .aliases(["host"])
             .surfaces(Surfaces::TUI_ONLY),
     ]
+}
+
+#[cfg(test)]
+mod code_mode_tests {
+    #[test]
+    fn code_mode_is_a_shared_session_command() {
+        let commands = super::builtin_command_table();
+        let command = commands
+            .iter()
+            .find(|spec| spec.name == "codemode")
+            .unwrap();
+        for surface in [
+            crate::Surface::Tui,
+            crate::Surface::Web,
+            crate::Surface::Mobile,
+            crate::Surface::SessionControl,
+        ] {
+            assert!(command.available_on(surface));
+        }
+        assert_eq!(command.kind, crate::CommandKind::Session);
+    }
 }

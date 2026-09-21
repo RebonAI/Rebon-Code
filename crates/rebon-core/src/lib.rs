@@ -550,6 +550,7 @@ pub struct Engine {
     permission_broker: Arc<dyn PermissionBroker>,
     shell_process_registry: Arc<ShellProcessRegistry>,
     monitor_registry: Arc<MonitorRegistry>,
+    code_mode_prompts: query::CodeModePromptCache,
     /// Bridge runtime state. Held behind a `std::sync::RwLock` so the
     /// async tool-invoke path can take shared references to `Engine` and
     /// still mutate the attached bridge handle on attach/detach. Critical
@@ -568,6 +569,7 @@ impl Engine {
             permission_broker: Arc::new(DenyAskPermissionBroker),
             shell_process_registry: Arc::new(ShellProcessRegistry::new()),
             monitor_registry: Arc::new(MonitorRegistry::new()),
+            code_mode_prompts: query::CodeModePromptCache::default(),
             bridge: RwLock::new(BridgeRuntimeState::default()),
         }
     }

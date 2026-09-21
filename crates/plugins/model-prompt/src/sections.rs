@@ -34,24 +34,9 @@ Prioritize these in your text:
 Use one sentence instead of three whenever one suffices. Favor brief, direct sentences \
 over lengthy explanations. Code and tool calls are exempt from this guidance.";
 
-/// The Astra addendum (`Rung::Efficiency`, after the efficiency section).
-///
-/// Three habits GPT-6 Astra is tuned for and the two shared sections do not
-/// ask of it: batching independent tool work into one program, narrating
-/// between tool calls and closing with a self-contained answer, and naming
-/// the instruction that stopped it. The batching line names `run_code`, so
-/// it is only issued when the turn offers that tool — an instruction about
-/// a tool the model cannot see is exactly the kind of conflicting context
-/// OpenAI's migration guide warns makes Astra stop mid-task.
-pub fn astra_working(offers_run_code: bool) -> String {
+/// Astra 的独立工作习惯；Code Mode 优先指令由公共 query 路径负责。
+pub fn astra_working() -> String {
     let mut lines = vec!["# Working in this session".to_string()];
-    if offers_run_code {
-        lines.push(
-            "- Combine independent reads or searches in a single `run_code` program rather \
-than making a separate tool call for each."
-                .to_string(),
-        );
-    }
     lines.push(
         "- In one line between tool calls, explain your current action and its purpose."
             .to_string(),

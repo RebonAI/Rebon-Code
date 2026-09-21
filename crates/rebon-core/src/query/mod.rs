@@ -73,6 +73,9 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::Engine;
 
+mod code_mode;
+pub(crate) use code_mode::CodeModePromptCache;
+pub use code_mode::RUN_CODE_TOOL;
 mod compact;
 mod executor;
 mod file_history;

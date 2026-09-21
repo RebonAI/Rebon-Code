@@ -134,12 +134,18 @@ fn install_code_runtime(
     events: &rebon_kernel::Context,
     budget: Duration,
 ) {
-    tools.set_run_code(RunCodeTool::with_budget_and_runtime(
+    use rebon_kernel::Plugin;
+    rebon_kernel_seats::kernel_code_mode::CodeModePlugin
+        .apply(events)
+        .unwrap();
+    let tool = RunCodeTool::with_budget_and_runtime(
         engine.clone(),
         events.clone(),
         budget,
         code_node_runtime(),
-    ));
+    );
+    tool.command(&["on".into()]).unwrap();
+    tools.set_run_code(tool);
 }
 
 fn slash(path: &std::path::Path) -> String {
@@ -184,6 +190,73 @@ fn code_mode_resolves_a_runtime_from_the_launcher_or_a_managed_install() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn code_mode_live_session_seat_gate_and_filter_matrix() {
+    use rebon_core::permission::KernelContextLease;
+    use rebon_core::tool_seat::SessionToolsService;
+    use rebon_kernel::Plugin;
+    use rebon_kernel_seats::kernel_code_mode::{command, CodeModePlugin, CodeModeSessionService};
+    use rebon_kernel_seats::kernel_tool_dispatch::SessionPluginTools;
+    use rebon_tool::ToolFilter;
+
+    let kernel = Kernel::new();
+    let engine = Arc::new(Engine::new());
+    let first = kernel.context().fork_scoped("first");
+    let second = kernel.context().fork_scoped("second");
+    for scope in [&first, &second] {
+        let tool = RunCodeTool::with_budget_and_runtime(
+            engine.clone(),
+            scope.clone(),
+            Duration::from_secs(10),
+            code_node_runtime(),
+        );
+        let tools = SessionPluginTools::new(engine.clone());
+        tools.set_run_code(tool.clone());
+        scope.provide::<CodeModeSessionService>(tool).unwrap();
+        scope.provide::<SessionToolsService>(tools).unwrap();
+    }
+    let resolver = engine.scoped_tool_resolver(
+        Some(KernelContextLease::unmanaged(first.clone())),
+        &[],
+        None,
+    );
+    let sibling = engine.scoped_tool_resolver(
+        Some(KernelContextLease::unmanaged(second.clone())),
+        &[],
+        None,
+    );
+    let context = ToolContext::new().with_tool_resolver(resolver.clone());
+    let input = json!({"code":"return 42", "description":"测试门控"});
+    assert!(resolver.resolve("run_code", None).unwrap().is_none());
+    assert!(command(&first, &["on".into()]).is_err());
+    let experiment = kernel.context().fork("experiment");
+    CodeModePlugin.apply(&experiment).unwrap();
+    assert!(resolver.resolve("run_code", None).unwrap().is_none());
+    command(&first, &["on".into()]).unwrap();
+    let held = resolver.resolve("run_code", None).unwrap().unwrap();
+    assert!(sibling.resolve("run_code", None).unwrap().is_none());
+    let output = engine
+        .invoke_tool("run_code", input.clone(), &context)
+        .await
+        .unwrap();
+    assert!(output.to_string().contains("42"));
+    let filtered = context
+        .clone()
+        .with_tool_filter(Some(ToolFilter::allow_only(["Read"])));
+    assert!(engine
+        .invoke_tool("run_code", input.clone(), &filtered)
+        .await
+        .is_err());
+    command(&first, &["off".into()]).unwrap();
+    assert!(resolver.resolve("run_code", None).unwrap().is_none());
+    assert!(held.call(input.clone(), &context).await.is_err());
+    command(&first, &["on".into()]).unwrap();
+    assert!(resolver.resolve("run_code", None).unwrap().is_some());
+    experiment.dispose();
+    assert!(resolver.resolve("run_code", None).unwrap().is_none());
+    assert!(held.call(input, &context).await.is_err());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -399,6 +472,7 @@ return messages;
         Duration::from_secs(1),
         code_node_runtime(),
     );
+    run_code.command(&["on".into()]).unwrap();
     let err = run_code
         .call(
             json!({ "code": "for (;;) {}", "description": "Spin forever" }),

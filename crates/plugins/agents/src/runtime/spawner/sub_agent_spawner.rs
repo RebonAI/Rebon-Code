@@ -247,6 +247,7 @@ impl SubAgentSpawner for EngineSubAgentSpawner {
             automatic_routes: self.automatic_routes.clone(),
             task_registry_resolver: scoped.task_registry_resolver.clone(),
             task_registry: scoped.task_registry.clone(),
+            session_tools: scoped.session_tools.clone(),
             escalation_registry: scoped.escalation_registry.clone(),
             file_history_tracker: self.file_history_tracker.clone(),
             capability_failures: self.capability_failures.clone(),

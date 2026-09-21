@@ -1359,14 +1359,14 @@ impl QueryEventSender {
         phase: crate::query::AttachmentPollPhase,
         next_iteration: u64,
         history: &[ApiMessage],
-        params: &QueryParams,
+        attachment_poller: Option<&crate::query::AttachmentPollerBinding>,
     ) -> TurnHookContext {
         self.ordered(|hooks| {
             hooks.dispatch_attachment_poll(&AttachmentPollHookEvent {
                 phase,
                 next_iteration,
                 history,
-                attachment_poller: params.attachment_poller.as_ref(),
+                attachment_poller,
             })
         })
     }

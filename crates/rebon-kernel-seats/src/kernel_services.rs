@@ -11,9 +11,8 @@ use std::time::Duration;
 use rebon_core::Engine;
 use rebon_kernel::{Context, Kernel, SessionClosed, SessionOpened};
 
-/// `tool-registry` is a [`SessionPluginTools`]: the engine catalog and the
-/// session's Code Mode tool. The returned handle is what hosts hang on the
-/// session's `ToolContext` via `with_plugin_tools`.
+/// 返回会话 context 与共享插件工具表。Code Mode 单独挂在 context 的
+/// `session-tools` 服务上，由持有会话 lease 的工具解析器读取。
 pub fn bootstrap_session_context_with_tools(
     kernel: &Kernel,
     session_id: &str,
@@ -120,20 +119,14 @@ fn bind_session_scope_with_label(
         let tools = reuse_tools.unwrap_or_else(|| {
             crate::kernel_tool_dispatch::SessionPluginTools::new(engine.clone())
         });
-        // PTC / Code Mode: `run_code` joins the shared plugin tool layer
-        // (model-visible, dispatchable) unless the kill switch disables it.
-        //
-        // Its context is the kernel root, not this generation. The seat only
-        // emits nested-dispatch lifecycle events, and those go out
-        // registry-wide — scoping never applied to them. Binding it to a
-        // session fork would make the shared tool table point at whichever
-        // generation registered most recently, including disposed forks.
-        if crate::kernel_code_mode::code_mode_enabled() {
-            tools.set_run_code(crate::kernel_code_mode::RunCodeTool::new(
-                engine.clone(),
-                kernel.context().clone(),
-            ));
-        }
+        // Code Mode 是会话私有工具，不能注册到多个会话复用的 tools。
+        let run_code = crate::kernel_code_mode::RunCodeTool::new(engine.clone(), ctx.clone());
+        let session_tools = crate::kernel_tool_dispatch::SessionPluginTools::new(engine.clone());
+        session_tools.set_run_code(run_code.clone());
+        ctx.provide::<crate::kernel_code_mode::CodeModeSessionService>(run_code)
+            .expect("会话 Code Mode 服务注册失败");
+        ctx.provide::<rebon_core::tool_seat::SessionToolsService>(session_tools)
+            .expect("会话工具服务注册失败");
         // The service registry keys both planes by one name, so a JSON-only
         // `tool-registry` on this fork would hide the root's typed seat from
         // every lookup made under it. Re-provide the process seat here as
@@ -639,6 +632,43 @@ mod tests {
                 "open sess-x at session/sess-x".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn code_mode_is_not_registered_in_shared_session_tools_by_default() {
+        use rebon_tool::PluginToolProvider;
+        let kernel = Kernel::new();
+        let engine = engine_with_builtin_tools();
+        for session_id in ["code-mode-first", "code-mode-second"] {
+            let scope = bind_session_scope(&kernel, session_id, &engine, None, None);
+            assert!(!scope.tools.tool_names().contains(&"run_code".to_string()));
+        }
+    }
+
+    #[test]
+    fn code_mode_session_command_persists_between_leases_and_isolates_sessions() {
+        use crate::kernel_code_mode::{command, CodeModePlugin};
+        use rebon_kernel::Plugin;
+        let (_projects, scopes) = scope_table(4);
+        let first = scopes.acquire("first");
+        assert!(command(first.context(), &[]).unwrap().contains("off"));
+        assert!(command(first.context(), &["on".into()])
+            .unwrap_err()
+            .contains("code-mode"));
+        let experiment = scopes.kernel.context().fork("experiment");
+        CodeModePlugin.apply(&experiment).unwrap();
+        assert!(command(first.context(), &[]).unwrap().contains("off"));
+        command(first.context(), &["on".into()]).unwrap();
+        drop(first);
+        let next_turn = scopes.acquire("first");
+        assert!(command(next_turn.context(), &[]).unwrap().contains("on"));
+        let second = scopes.acquire("second");
+        assert!(command(second.context(), &[]).unwrap().contains("off"));
+        command(next_turn.context(), &["off".into()]).unwrap();
+        assert!(command(next_turn.context(), &[]).unwrap().contains("off"));
+        command(next_turn.context(), &["on".into()]).unwrap();
+        experiment.dispose();
+        assert!(command(next_turn.context(), &[]).unwrap().contains("off"));
     }
 
     /// Every session the host binds carries the session-scope seat, and it

@@ -189,6 +189,7 @@ pub struct EngineSubAgentSpawner {
     /// only on a short-lived clone after a spawn spec supplies its session id.
     task_registry_resolver: Option<rebon_plugin_tasks::TaskRegistryResolver>,
     task_registry: Option<TaskRegistry>,
+    session_tools: Option<Arc<dyn rebon_tool::ToolResolver>>,
     escalation_registry: EscalationRegistry,
     /// Optional session file-history tracker. When present it is
     /// injected into every worker's `ToolContext` so Write/Edit made
@@ -225,6 +226,7 @@ impl Clone for EngineSubAgentSpawner {
             policy: self.policy.clone(),
             task_registry_resolver: self.task_registry_resolver.clone(),
             task_registry: self.task_registry.clone(),
+            session_tools: self.session_tools.clone(),
             escalation_registry: self.escalation_registry.clone(),
             file_history_tracker: self.file_history_tracker.clone(),
             capability_failures: self.capability_failures.clone(),
@@ -3086,6 +3088,94 @@ mod tests {
         async fn call(&self, input: Value, _context: &ToolContext) -> ToolResult<Value> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(input)
+        }
+    }
+
+    #[tokio::test]
+    async fn code_mode_subagent_session_and_filter_matrix() {
+        use rebon_core::permission::KernelContextLease;
+        use rebon_core::tool_seat::SessionToolsService;
+        use rebon_kernel::{Kernel, PluginState, PluginStateChanged};
+        struct CodeTool;
+        #[async_trait]
+        impl Tool for CodeTool {
+            fn id(&self) -> ToolId {
+                ToolId::new("run_code")
+            }
+            fn description(&self) -> &str {
+                "测试会话工具"
+            }
+            fn input_schema(&self) -> ToolInputSchema {
+                json!({"type":"object"})
+            }
+            async fn call(&self, _: Value, _: &ToolContext) -> ToolResult<Value> {
+                Ok(Value::Null)
+            }
+        }
+        struct Provider;
+        impl rebon_tool::PluginToolProvider for Provider {
+            fn tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
+                (name == "run_code").then(|| Arc::new(CodeTool) as Arc<dyn Tool>)
+            }
+            fn tool_names(&self) -> Vec<String> {
+                vec!["run_code".into()]
+            }
+        }
+        let _home = TestTaskHome::new("code-mode");
+        let _coord = CoordModeGuard::set(false);
+        let kernel = Kernel::new();
+        let first = kernel.context().fork_scoped("first");
+        let second = kernel.context().fork_scoped("second");
+        first
+            .provide::<SessionToolsService>(Arc::new(Provider))
+            .unwrap();
+        for scope in [&first, &second] {
+            rebon_plugin_tasks::provide_task_registry(scope, Arc::new(TaskRegistry::new()))
+                .unwrap();
+        }
+        kernel.context().emit(&PluginStateChanged {
+            id: "tasks".into(),
+            from: PluginState::Disabled,
+            to: PluginState::Loaded,
+            generation: 1,
+        });
+        let resolver = rebon_plugin_tasks::TaskRegistryResolver::new(Arc::new(move |id| {
+            Some(KernelContextLease::unmanaged(if id == "first" {
+                first.clone()
+            } else {
+                second.clone()
+            }))
+        }));
+        let mut engine = Engine::new();
+        engine.register_tool(Arc::new(NullTool));
+        let engine = Arc::new(engine);
+        for (session_id, filtered) in [("first", false), ("second", false), ("first", true)] {
+            let mock = Arc::new(MockModelClient::new());
+            mock.push_turn(text_turn("完成"));
+            let spawner = EngineSubAgentSpawner::new(Arc::downgrade(&engine), mock.clone())
+                .with_default_model("mock")
+                .with_coordinator_mode(false)
+                .with_task_registry_resolver(resolver.clone());
+            let mut spec = SubAgentSpec::new("测试会话工具");
+            spec.metadata = json!({"parent_session_id":session_id});
+            if filtered {
+                spec.tool_filter = Some(ToolFilter::allow_only(["NullTool"]));
+            }
+            spawner.spawn(spec).await.unwrap();
+            let requests = mock.captured_requests();
+            let expected = session_id == "first" && !filtered;
+            assert_eq!(
+                requests[0].tools.iter().any(|tool| tool.name == "run_code"),
+                expected
+            );
+            assert_eq!(
+                requests[0]
+                    .system
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("# Code Mode"),
+                expected
+            );
         }
     }
 

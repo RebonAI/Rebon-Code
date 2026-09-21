@@ -17,7 +17,7 @@
 //! auto-allow, write-class tools Ask through the session broker exactly
 //! as a direct call would). `run_code` cannot call itself.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -153,17 +153,43 @@ pub fn code_mode_runtime_reachable() -> bool {
     })
 }
 
-/// Whether Code Mode is enabled (default on under kernel-js; env kill
-/// switch until the declarative profile round grows a config field).
-pub fn code_mode_enabled() -> bool {
-    !std::env::var("REBON_CODE_MODE")
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "off" | "false" | "no"
-            )
-        })
-        .unwrap_or(false)
+pub const PLUGIN_ID: &str = "code-mode";
+
+struct ExperimentService;
+impl rebon_kernel::Service for ExperimentService {
+    type Interface = ();
+    const NAME: &'static str = "code-mode-experiment";
+}
+
+pub struct CodeModePlugin;
+impl rebon_kernel::Plugin for CodeModePlugin {
+    fn meta(&self) -> rebon_kernel::PluginMeta {
+        rebon_kernel::PluginMeta::new(PLUGIN_ID).provides(&["code-mode-experiment"])
+    }
+
+    fn apply(&self, ctx: &rebon_kernel::Context) -> Result<(), rebon_kernel::KernelError> {
+        ctx.provide::<ExperimentService>(Arc::new(()))
+    }
+}
+
+pub static PLUGIN: rebon_kernel::PluginDef = rebon_kernel::PluginDef {
+    id: PLUGIN_ID,
+    title: "实验性 Code Mode（需 /codemode on）",
+    kind: rebon_kernel::PluginKind::Feature,
+    default_enabled: false,
+    factory: |_| Ok(Box::new(CodeModePlugin)),
+};
+
+pub struct CodeModeSessionService;
+impl rebon_kernel::Service for CodeModeSessionService {
+    type Interface = RunCodeTool;
+    const NAME: &'static str = "code-mode-session";
+}
+
+pub fn command(ctx: &rebon_kernel::Context, args: &[String]) -> Result<String, String> {
+    ctx.get::<CodeModeSessionService>()
+        .ok_or_else(|| "当前会话未绑定 Code Mode 服务".to_string())?
+        .command(args)
 }
 
 /// The `run_code` tool for one session.
@@ -175,9 +201,48 @@ pub struct RunCodeTool {
     budget: Duration,
     max_parallel: usize,
     node_runtime: Option<CodeNodeRuntime>,
+    // 显式开启只对当前实验插件实例有效；卸载再开放不会自动恢复开启。
+    activation: Mutex<Option<Weak<()>>>,
 }
 
 impl RunCodeTool {
+    fn requested(&self) -> bool {
+        let current = self.events.get::<ExperimentService>();
+        let activated = self
+            .activation
+            .lock()
+            .expect("Code Mode 状态锁损坏")
+            .as_ref()
+            .and_then(Weak::upgrade);
+        matches!((current, activated), (Some(current), Some(activated)) if Arc::ptr_eq(&current, &activated))
+    }
+
+    pub fn command(&self, args: &[String]) -> Result<String, String> {
+        match args {
+            [] => Ok(format!(
+                "Code Mode: {}（当前会话）",
+                if self.requested() { "on" } else { "off" }
+            )),
+            [arg] if arg == "off" => {
+                *self.activation.lock().expect("Code Mode 状态锁损坏") = None;
+                Ok("Code Mode: off（当前会话）".into())
+            }
+            [arg] if arg == "on" => {
+                let experiment = self.events.get::<ExperimentService>().ok_or_else(|| {
+                    "Code Mode 实验特性尚未开放。请先执行 /kernel enable code-mode，再执行 /codemode on。也可在 ~/.rebon/settings.json（或项目 .rebon/settings.json）中设置 {\"plugins\":{\"code-mode\":{\"enabled\":true}}}，重启后再执行 /codemode on；开放实验本身不会开启当前会话。".to_string()
+                })?;
+                *self.activation.lock().expect("Code Mode 状态锁损坏") =
+                    Some(Arc::downgrade(&experiment));
+                Ok(if self.is_enabled() {
+                    "Code Mode: on（仅当前会话；run_code 优先，权限与工具过滤仍生效）".into()
+                } else {
+                    "Code Mode: on（仅当前会话）；run_code 暂不可用：缺少受信任的 Node runtime。请执行 rebon node install 后重启并重新 /codemode on。".into()
+                })
+            }
+            _ => Err("用法：/codemode [on|off]".into()),
+        }
+    }
+
     pub fn new(engine: Arc<Engine>, events: rebon_kernel::Context) -> Arc<Self> {
         Arc::new(Self {
             engine,
@@ -185,6 +250,7 @@ impl RunCodeTool {
             budget: DEFAULT_PROGRAM_BUDGET,
             max_parallel: DEFAULT_MAX_PARALLEL,
             node_runtime: None,
+            activation: Mutex::new(None),
         })
     }
 
@@ -200,6 +266,7 @@ impl RunCodeTool {
             budget,
             max_parallel: DEFAULT_MAX_PARALLEL,
             node_runtime: None,
+            activation: Mutex::new(None),
         })
     }
 
@@ -217,6 +284,7 @@ impl RunCodeTool {
             budget,
             max_parallel: DEFAULT_MAX_PARALLEL,
             node_runtime: Some(node_runtime),
+            activation: Mutex::new(None),
         })
     }
 }
@@ -446,20 +514,8 @@ impl Tool for RunCodeTool {
         run_code_input_schema()
     }
 
-    /// Offered only where a program could actually run.
-    ///
-    /// A `run_code` that is guaranteed to answer "Code Mode Node runtime is
-    /// unavailable" costs a schema in every request and invites the model to
-    /// keep trying — the same reasoning `powershell_tool_enabled` applies to
-    /// a box with no PowerShell.
-    ///
-    /// A tool that was *handed* a runtime is enabled without asking anything
-    /// else: this instance already knows what it will run the program on, and
-    /// process-wide discovery has no standing to overrule it. Only the
-    /// `None` case — the tool that will have to go looking — consults the
-    /// probe.
     fn is_enabled(&self) -> bool {
-        self.node_runtime.is_some() || crate::kernel_code_mode::code_mode_runtime_reachable()
+        self.requested() && (self.node_runtime.is_some() || code_mode_runtime_reachable())
     }
 
     fn is_read_only(&self, _input: &Value) -> bool {
@@ -517,6 +573,12 @@ impl Tool for RunCodeTool {
     }
 
     async fn call(&self, input: Value, context: &ToolContext) -> ToolResult<Value> {
+        if !self.requested() {
+            return Err(ToolError::Execution {
+                tool: self.id(),
+                source: anyhow::anyhow!("Code Mode 未开启；需要开放实验特性并执行 /codemode on"),
+            });
+        }
         let code = input
             .get("code")
             .and_then(Value::as_str)
@@ -818,8 +880,48 @@ mod tests {
     }
 
     #[test]
-    fn kill_switch_reads_the_environment() {
-        // Default (unset in the test environment) is enabled.
-        assert!(code_mode_enabled());
+    fn code_mode_experiment_and_session_gate_matrix() {
+        use rebon_kernel::Plugin;
+        assert!(!PLUGIN.default_enabled);
+        assert_eq!(PLUGIN.kind, rebon_kernel::PluginKind::Feature);
+        for experiment_open in [false, true] {
+            let kernel = rebon_kernel::Kernel::new();
+            let experiment = kernel.context().fork("experiment");
+            if experiment_open {
+                CodeModePlugin.apply(&experiment).unwrap();
+            }
+            let engine = Arc::new(Engine::new());
+            let first = RunCodeTool::new(engine.clone(), kernel.context().fork_scoped("first"));
+            let second = RunCodeTool::new(engine, kernel.context().fork_scoped("second"));
+            assert!(!first.requested());
+            assert!(!first.is_enabled());
+            assert!(first.command(&[]).unwrap().contains("off"));
+            for args in [vec!["invalid".into()], vec!["on".into(), "off".into()]] {
+                assert!(first.command(&args).is_err());
+                assert!(!first.requested());
+            }
+            let result = first.command(&["on".into()]);
+            assert_eq!(result.is_ok(), experiment_open);
+            assert_eq!(first.requested(), experiment_open);
+            if !experiment_open {
+                let error = result.unwrap_err();
+                assert!(error.contains("\"code-mode\":{\"enabled\":true}"));
+                assert!(error.contains("/codemode on"));
+            }
+            assert!(!second.requested());
+            first.command(&["off".into()]).unwrap();
+            assert!(!first.requested());
+            if experiment_open {
+                first.command(&["on".into()]).unwrap();
+                experiment.dispose();
+                assert!(!first.requested());
+                assert!(!first.is_enabled());
+                let reopened = kernel.context().fork("reopened");
+                CodeModePlugin.apply(&reopened).unwrap();
+                assert!(!first.requested());
+                first.command(&["on".into()]).unwrap();
+                assert!(first.requested());
+            }
+        }
     }
 }

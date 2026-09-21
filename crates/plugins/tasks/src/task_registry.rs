@@ -87,11 +87,8 @@ pub fn require_task_registry(ctx: &Context) -> Result<Arc<TaskRegistry>, KernelE
     ctx.require::<TaskRegistryService>()?.registry()
 }
 
-/// Session-id resolver used at non-kernel execution boundaries.
-///
-/// It acquires the exact scope generation, resolves `task-registry` there, and
-/// returns only the registry Arc. A missing/disposed/disabled scope is an error,
-/// never a request to create another registry.
+/// 按会话 id 获取当前作用域中的任务注册表，可同时保留原始 lease。
+/// 缺失、已释放或被禁用的作用域均返回错误，不会隐式创建注册表。
 #[derive(Clone)]
 pub struct TaskRegistryResolver {
     kernel: KernelContextLeaseResolver,
@@ -111,11 +108,27 @@ impl TaskRegistryResolver {
     }
 
     pub fn resolve(&self, session_id: &str) -> Result<Arc<TaskRegistry>, String> {
+        self.resolve_with_lease(session_id)
+            .map(|(registry, _)| registry)
+    }
+
+    /// 让后台任务同时保留所属会话的工具作用域，避免代际切换后串用其他会话。
+    pub fn resolve_with_lease(
+        &self,
+        session_id: &str,
+    ) -> Result<
+        (
+            Arc<TaskRegistry>,
+            rebon_core::permission::KernelContextLease,
+        ),
+        String,
+    > {
         if session_id.trim().is_empty() {
             return Err("task-registry resolution requires a non-empty session id".into());
         }
         let lease = (self.kernel)(session_id)
             .ok_or_else(|| format!("no live kernel scope for session `{session_id}`"))?;
-        require_task_registry(lease.context()).map_err(|error| error.to_string())
+        let registry = require_task_registry(lease.context()).map_err(|error| error.to_string())?;
+        Ok((registry, lease))
     }
 }

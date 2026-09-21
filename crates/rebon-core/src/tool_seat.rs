@@ -74,6 +74,13 @@ impl Service for ToolSeatService {
     const NAME: &'static str = TOOL_SEAT_SERVICE;
 }
 
+/// 会话私有工具通过当前 lease 消费，不写入多个会话共享的 provider。
+pub struct SessionToolsService;
+impl Service for SessionToolsService {
+    type Interface = dyn PluginToolProvider;
+    const NAME: &'static str = "session-tools";
+}
+
 /// One source of tools behind a seat. A provider answers by name and can
 /// list what it has; the seat does the precedence and the liveness.
 pub trait SeatToolProvider: Send + Sync {
@@ -502,7 +509,7 @@ impl Engine {
     }
 
     /// Bind one turn's providers into a scoped typed kernel seat.
-    pub(crate) fn scoped_tool_resolver(
+    pub fn scoped_tool_resolver(
         &self,
         parent: Option<KernelContextLease>,
         mcp_definitions: &[(String, McpToolDefinition)],
@@ -537,6 +544,18 @@ impl Engine {
         {
             seat.register(&context, "mcp", Priority::Mcp, provider)
                 .expect("fresh tool seat accepts MCP contribution");
+        }
+        if let Some(provider) = parent
+            .as_ref()
+            .and_then(|lease| lease.context().get::<SessionToolsService>())
+        {
+            seat.register(
+                &context,
+                "session",
+                Priority::Plugin,
+                Arc::new(PluginToolProviderAdapter { provider }),
+            )
+            .expect("会话工具注册失败");
         }
         if let Some(provider) = plugin_tools {
             seat.register(
