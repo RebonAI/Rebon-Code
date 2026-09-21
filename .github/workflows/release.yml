@@ -37,6 +37,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Incremental compilation is for a developer rebuilding the same tree. A CI
+  # job builds once on a machine that is then destroyed, so all it buys here
+  # is the I/O and the disk of writing the incremental state.
+  CARGO_INCREMENTAL: "0"
+  # Full debuginfo is most of what a build of this workspace writes and much
+  # of what it spends linking. Line tables keep panic backtraces pointing at
+  # real line numbers, which is the only part of it CI reads.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
   NPM_CONFIG_FUND: "false"
   NPM_CONFIG_AUDIT: "false"
   NPM_CONFIG_PROGRESS: "false"
@@ -44,8 +53,23 @@ env:
 jobs:
   verify:
     runs-on: macos-14
+    # The long pole, and nothing was bounding it.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - name: Cache the cargo registry
+        # The registry only. `target/` is not cached on purpose: a build of
+        # this workspace produces far more than the 10 GB a repository gets,
+        # so caching it would evict itself every run and buy nothing. What
+        # this does buy is not re-fetching 619 crates on every job.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
       - name: Provision the pinned Node
         # The gate below asserts against Node 24.19.0 exactly — the version
         # rebon-node-runtime pins. Asking the runner's preinstalled Node made
@@ -190,8 +214,22 @@ jobs:
     needs: verify
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'pull_request'
     runs-on: macos-14
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+      - name: Cache the cargo registry
+        # The registry only. `target/` is not cached on purpose: a build of
+        # this workspace produces far more than the 10 GB a repository gets,
+        # so caching it would evict itself every run and buy nothing. What
+        # this does buy is not re-fetching 619 crates on every job.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
       - run: cargo test -p rebon-cli --locked
       - name: Test the crates the plugin-first refactor touches
         # rebon-core's unit tests (and the ACP end-to-end tests that moved
@@ -234,6 +272,19 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: Cache the cargo registry
+        # The registry only. `target/` is not cached on purpose: a build of
+        # this workspace produces far more than the 10 GB a repository gets,
+        # so caching it would evict itself every run and buy nothing. What
+        # this does buy is not re-fetching 619 crates on every job.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
       - name: Test isolated Boa runner containment
         run: cargo test -p rebon-boa-runner --all-features --locked -- --test-threads=1
 
@@ -255,7 +306,8 @@ jobs:
     # what keeps push access from being publish access.
     environment: npm-publish
     runs-on: macos-14
-    timeout-minutes: 30
+    # A cold release build of this workspace on a 3-core runner; 30 was tight.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -266,6 +318,19 @@ jobs:
             cpu: x64
     steps:
       - uses: actions/checkout@v4
+      - name: Cache the cargo registry
+        # The registry only. `target/` is not cached on purpose: a build of
+        # this workspace produces far more than the 10 GB a repository gets,
+        # so caching it would evict itself every run and buy nothing. What
+        # this does buy is not re-fetching 619 crates on every job.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
       - name: npm with trusted publishing
         # Trusted publishing needs npm >= 11.5.1; a runner's bundled npm is
         # older and fails with a plain authentication error that does not name
@@ -318,6 +383,19 @@ jobs:
             cpu: arm64
     steps:
       - uses: actions/checkout@v4
+      - name: Cache the cargo registry
+        # The registry only. `target/` is not cached on purpose: a build of
+        # this workspace produces far more than the 10 GB a repository gets,
+        # so caching it would evict itself every run and buy nothing. What
+        # this does buy is not re-fetching 619 crates on every job.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
       - name: npm with trusted publishing
         # Trusted publishing needs npm >= 11.5.1; a runner's bundled npm is
         # older and fails with a plain authentication error that does not name
@@ -370,9 +448,23 @@ jobs:
     # what keeps push access from being publish access.
     environment: npm-publish
     runs-on: windows-latest
-    timeout-minutes: 30
+    # As above, and Windows runners are slower.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: Cache the cargo registry
+        # The registry only. `target/` is not cached on purpose: a build of
+        # this workspace produces far more than the 10 GB a repository gets,
+        # so caching it would evict itself every run and buy nothing. What
+        # this does buy is not re-fetching 619 crates on every job.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
       - name: npm with trusted publishing
         # Trusted publishing needs npm >= 11.5.1; a runner's bundled npm is
         # older and fails with a plain authentication error that does not name
@@ -420,6 +512,19 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Cache the cargo registry
+        # The registry only. `target/` is not cached on purpose: a build of
+        # this workspace produces far more than the 10 GB a repository gets,
+        # so caching it would evict itself every run and buy nothing. What
+        # this does buy is not re-fetching 619 crates on every job.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
       - name: npm with trusted publishing
         # Trusted publishing needs npm >= 11.5.1; a runner's bundled npm is
         # older and fails with a plain authentication error that does not name
