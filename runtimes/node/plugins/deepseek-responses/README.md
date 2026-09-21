@@ -2,9 +2,9 @@
 
 DeepSeek Responses API model provider plugin for Rebon. It runs on Rebon's
 plugin plane — one `llm/stream` adapter in the shared Node host, registered by
-`activate` — and owns the whole DeepSeek dialect: request trimming,
-`reasoning_text` streaming, custom tool calls, web search events, error and
-usage translation, so Rebon core never grows provider-specific branches.
+`activate` — and owns the whole DeepSeek dialect: request trimming, image
+input, `reasoning_text` streaming, custom tool calls, web search events, error
+and usage translation, so Rebon core never grows provider-specific branches.
 
 ## Install
 
@@ -153,7 +153,8 @@ output ceiling:
 | id | display | notes |
 |---|---|---|
 | `deepseek-v4-pro` | DeepSeek V4 Pro | **default**; 1.6T MoE flagship, ~4× Flash's output price |
-| `deepseek-v4-flash` | DeepSeek V4 Flash | cheap; also the `small` profile |
+| `deepseek-flash` | DeepSeek Flash | cheap; also the `small` profile |
+| `deepseek-v4-flash` | DeepSeek Flash (legacy id) | the pre-rename id of the same model, kept so an entry pinned to it keeps working |
 
 Pro is the default because it is the flagship and because the Anchored Minimal
 measurements this plugin's bootstrap profile is built on were made on V4 Pro at
@@ -161,7 +162,7 @@ measurements this plugin's bootstrap profile is built on were made on V4 Pro at
 pay Pro output rates by default:
 
 ```json
-{ "name": "deepseek", "model": "deepseek-v4-flash" }
+{ "name": "deepseek", "model": "deepseek-flash" }
 ```
 
 The `small` profile deliberately stays on Flash regardless of the default: it
@@ -180,9 +181,13 @@ stateless and silently ignores unsupported parameters):
   the official endpoint silently ignores it, while OpenAI-compatible
   gateways with keyed prefix caches (e.g. opencode Go) route and retain by
   it. Opt out with `options.omitBodyFields: ["prompt_cache_key"]`.
-- Image input is replaced with placeholder text (the same thing DeepSeek
-  does server-side) instead of failing the turn; file/document input in
-  tool results gets the same treatment.
+- Image input is translated to `input_image` content parts carrying a base64
+  data URL (`detail` is deliberately left unset — the endpoint's default there
+  means "keep the original"), and replayed history translates the same way.
+  Images are accepted in user messages only, so a tool result's images travel
+  in a user message of their own, right after the `function_call_output` that
+  carries its text — the shape the built-in Responses path sends. A document
+  has no DeepSeek equivalent and is replaced with placeholder text.
 - The stable system prompt is sent as `instructions`; per-turn transient
   context uses Rebon's canonical runtime-context user message at the input
   tail, so changing runtime state does not invalidate the reusable prefix.
@@ -221,8 +226,10 @@ block; the `response.web_search_call.*` status pings are ignored),
 tokens (`input_tokens_details.cached_tokens`) and
 `output_tokens_details.reasoning_tokens`.
 
-Image input is not accepted by either V4 model, so image blocks are replaced
-with placeholder text rather than failing the turn.
+Every V4 model serves images now, so a user image is sent as an `input_image`
+part rather than stripped. An image in a system or assistant message is the one
+case that still becomes placeholder text, because the endpoint answers it with
+a 400; documents become placeholder text wherever they appear.
 
 If the DeepSeek dialect drifts, `options.body` / `options.extraBody` /
 `options.omitBodyFields` on the provider entry (also per-model under
@@ -283,4 +290,5 @@ Runs translation unit tests plus an end-to-end drive of the plugin contract
 (`activate` → one registered adapter → a turn with `emit` and an abort signal)
 against a local mock SSE server. The Rust side pins the emitted event shapes in
 `rebon-api`'s `deepseek_plugin_frame_shapes_deserialize` test and validates
-this manifest in `rebon-cli`'s `in_repo_deepseek_responses_plugin_materializes`.
+this manifest in `rebon-session-runtime`'s
+`in_repo_deepseek_responses_plugin_materializes` test.

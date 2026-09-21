@@ -54,9 +54,16 @@ function testRequestTranslation() {
       true,
     "manifest opts deepseek into Anchored Minimal",
   );
+  const declared = manifest.capabilities?.modelProviders?.["deepseek"];
+  assertEq(
+    Object.keys(declared?.models ?? {}),
+    ["deepseek-v4-pro", "deepseek-flash", "deepseek-v4-flash"],
+    "manifest exposes the renamed Flash id and keeps the legacy one",
+  );
+  assertEq(declared?.profiles?.small, "deepseek-flash", "the small profile follows the rename");
 
   const request = {
-    model: "deepseek-v4-flash",
+    model: "deepseek-flash",
     system: "sys",
     transientContext: "volatile",
     maxTokens: 4096,
@@ -99,12 +106,12 @@ function testRequestTranslation() {
       extraBody: { ds_flag: true },
     },
     modelRequestOptions: {
-      "deepseek-v4-flash": { body: { top_p: 0.8 } },
+      "deepseek-flash": { body: { top_p: 0.8 } },
     },
   };
   const body = buildRequestBody(request, connection);
 
-  assertEq(body.model, "deepseek-v4-flash", "model passes through");
+  assertEq(body.model, "deepseek-flash", "model passes through");
   assertEq(body.instructions, "sys", "transient context does not invalidate stable instructions");
   assertEq(body.max_output_tokens, 4096, "maxTokens → max_output_tokens");
   assert(!("temperature" in body), "omitBodyFields removes temperature");
@@ -143,15 +150,22 @@ function testRequestTranslation() {
   );
   assertEq(
     input[4],
-    {
-      type: "function_call_output",
-      call_id: "call_1",
-      output: "file.txt\n[image omitted: not supported by deepseek-responses]",
-    },
-    "tool_result → function_call_output with image placeholder",
+    { type: "function_call_output", call_id: "call_1", output: "file.txt" },
+    "tool_result text stays the call's output on its own",
   );
   assertEq(
     input[5],
+    {
+      role: "user",
+      content: [
+        { type: "input_text", text: "file.txt" },
+        { type: "input_image", image_url: "data:image/png;base64,x" },
+      ],
+    },
+    "a tool result's image follows its call as an input_image part",
+  );
+  assertEq(
+    input[6],
     {
       role: "user",
       content: [
@@ -216,29 +230,123 @@ function testRequestTranslation() {
   );
   assertEq(withTransientContext([], ""), [], "empty transient context leaves messages unchanged");
 
-  const imgInput = buildInput([
-    {
-      role: "user",
-      content: [
-        { type: "image", source: {} },
-        { type: "text", text: "what is this" },
-      ],
-    },
-  ]);
+  const image = (data, mediaType = "image/png") => ({
+    type: "image",
+    source: { type: "base64", mediaType, data },
+  });
   assertEq(
-    imgInput,
+    buildInput([
+      { role: "user", content: [image("AAAA"), { type: "text", text: "what is this" }] },
+    ]),
     [
       {
         role: "user",
         content: [
+          { type: "input_image", image_url: "data:image/png;base64,AAAA" },
+          { type: "input_text", text: "what is this" },
+        ],
+      },
+    ],
+    "user image → input_image part carrying a data URL",
+  );
+
+  assertEq(
+    buildInput([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "before" },
+          image("BBBB", "image/jpeg"),
+          { type: "text", text: "after" },
+        ],
+      },
+    ]),
+    [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: "before" },
+          { type: "input_image", image_url: "data:image/jpeg;base64,BBBB" },
+          { type: "input_text", text: "after" },
+        ],
+      },
+    ],
+    "text around an image keeps its order and its media type",
+  );
+
+  assertEq(
+    buildInput([
+      {
+        role: "user",
+        content: [
           {
-            type: "input_text",
-            text: "[image omitted: this model does not accept image input]\nwhat is this",
+            type: "tool_result",
+            tool_use_id: "call_img",
+            content: [image("CCCC"), image("DDDD", "image/webp")],
+            is_error: false,
+          },
+        ],
+      },
+    ]),
+    [
+      { type: "function_call_output", call_id: "call_img", output: "" },
+      {
+        role: "user",
+        content: [
+          { type: "input_image", image_url: "data:image/png;base64,CCCC" },
+          { type: "input_image", image_url: "data:image/webp;base64,DDDD" },
+        ],
+      },
+    ],
+    "an image-only tool result carries both images and no text parts",
+  );
+
+  assertEq(
+    buildInput([
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_doc",
+            content: [
+              { type: "text", text: "report" },
+              { type: "document", source: { type: "base64", mediaType: "application/pdf", data: "ZZ" } },
+            ],
+            is_error: false,
+          },
+        ],
+      },
+    ]),
+    [
+      {
+        type: "function_call_output",
+        call_id: "call_doc",
+        output: "report\n[document omitted: not supported by deepseek-responses]",
+      },
+    ],
+    "documents stay placeholder text in the call's output, with no extra message",
+  );
+
+  assertEq(
+    buildInput([
+      {
+        role: "assistant",
+        content: [image("EEEE"), { type: "text", text: "see above" }],
+      },
+    ]),
+    [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "output_text",
+            text: "[image omitted: images are only accepted in user messages]\nsee above",
           },
         ],
       },
     ],
-    "image input replaced with placeholder text (matches upstream behavior)",
+    "an image outside a user message keeps placeholder text (the endpoint 400s on it)",
   );
 
   const wsInput = buildInput([

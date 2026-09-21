@@ -12,9 +12,12 @@
 // This file owns the whole DeepSeek dialect so Rebon core never grows
 // `if is_deepseek` branches:
 //   - request translation and parameter trimming (no service_tier, no
-//     previous_response_id, store:false, no stop_sequences, no image/file
-//     input; the host's prompt_cache_key is forwarded only when the
-//     connection opts in — see buildRequestBody),
+//     previous_response_id, store:false, no stop_sequences; the host's
+//     prompt_cache_key is forwarded only when the connection opts in — see
+//     buildRequestBody),
+//   - image blocks -> `input_image` parts carrying a base64 data URL; the
+//     endpoint takes images in user messages only, so tool-result images
+//     follow their call in a user message of their own,
 //   - `response.reasoning_text.delta` -> thinking_delta,
 //   - `response.custom_tool_call_input.delta` -> tool_use input,
 //   - `response.web_search_call.*` -> server_tool_use blocks,
@@ -65,23 +68,45 @@ export function translateReasoningEffort(effort) {
   }
 }
 
-function textOfToolResultContent(content) {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((block) => {
-      switch (block.type) {
-        case "text":
-          return block.text;
-        case "image":
-          return "[image omitted: not supported by deepseek-responses]";
-        case "document":
-          return "[document omitted: not supported by deepseek-responses]";
-        default:
-          return "";
-      }
-    })
-    .join("\n");
+/// Splits a tool result into the text lines of its `function_call_output` and
+/// the image blocks that follow it.
+///
+/// A document has no DeepSeek equivalent and keeps the placeholder text it
+/// already had; an image is not text, so it leaves the output string entirely
+/// and becomes an `input_image` part — see the tool_result arm of buildInput.
+function splitToolResult(content) {
+  if (typeof content === "string") return { lines: [content], images: [] };
+  if (!Array.isArray(content)) return { lines: [], images: [] };
+  const lines = [];
+  const images = [];
+  for (const block of content) {
+    switch (block.type) {
+      case "text":
+        lines.push(block.text);
+        break;
+      case "document":
+        lines.push("[document omitted: not supported by deepseek-responses]");
+        break;
+      case "image":
+        images.push(block);
+        break;
+      default:
+        break;
+    }
+  }
+  return { lines, images };
+}
+
+/// One `input_image` part from a Rebon image block.
+///
+/// The data URL is the whole input: the endpoint reads the format from the
+/// bytes rather than from the media type, and `detail` is left off because its
+/// default already means "keep the original".
+function imageInputPart(block) {
+  return {
+    type: "input_image",
+    image_url: `data:${block.source.mediaType};base64,${block.source.data}`,
+  };
 }
 
 /// Replayed reasoning for one assistant turn, or "" when it must not be sent.
@@ -122,12 +147,21 @@ export function buildInput(messages) {
         content: [{ type: "reasoning_text", text: reasoningText }],
       });
     }
+    // One `{role, content}` item per contiguous run of content, so a turn that
+    // interleaves text and a tool call keeps its text where it was.
     let textParts = [];
+    let contentParts = [];
     const flushText = () => {
       if (textParts.length === 0) return;
       const type = role === "assistant" ? "output_text" : "input_text";
-      input.push({ role, content: [{ type, text: textParts.join("\n") }] });
+      contentParts.push({ type, text: textParts.join("\n") });
       textParts = [];
+    };
+    const flushRun = () => {
+      flushText();
+      if (contentParts.length === 0) return;
+      input.push({ role, content: contentParts });
+      contentParts = [];
     };
     // user 文本会开启新回合；必须先交齐上一回合的工具结果，避免 DeepSeek 判定结果缺失。
     const blocks = role === "user"
@@ -142,16 +176,22 @@ export function buildInput(messages) {
           textParts.push(block.text);
           break;
         case "image":
-          // DeepSeek replaces image input with placeholder text server-side;
-          // do the same explicitly instead of failing the turn.
-          textParts.push("[image omitted: this model does not accept image input]");
+          // Only user (and developer) messages may carry `input_image`; the
+          // endpoint answers an image anywhere else with a 400, so those keep
+          // the placeholder text instead.
+          if (role !== "user") {
+            textParts.push("[image omitted: images are only accepted in user messages]");
+            break;
+          }
+          flushText();
+          contentParts.push(imageInputPart(block));
           break;
         case "thinking":
           // Already emitted as a `reasoning` item ahead of this turn's content
           // when the turn calls a tool; otherwise deliberately dropped.
           break;
         case "tool_use":
-          flushText();
+          flushRun();
           input.push({
             type: "function_call",
             call_id: block.id,
@@ -159,18 +199,34 @@ export function buildInput(messages) {
             arguments: JSON.stringify(block.input ?? {}),
           });
           break;
-        case "tool_result":
-          flushText();
+        case "tool_result": {
+          flushRun();
+          const { lines, images } = splitToolResult(block.content);
           input.push({
             type: "function_call_output",
             call_id: block.tool_use_id,
-            output: textOfToolResultContent(block.content),
+            output: lines.join("\n"),
           });
+          if (images.length > 0) {
+            // The call's output stays the text string and its images follow in
+            // a user message of their own — the shape the built-in Responses
+            // path sends, and the only role an image is accepted in.
+            input.push({
+              role: "user",
+              content: [
+                ...lines
+                  .filter((line) => line !== "")
+                  .map((line) => ({ type: "input_text", text: line })),
+                ...images.map(imageInputPart),
+              ],
+            });
+          }
           break;
+        }
         case "server_tool_use":
           // Replay web_search_call items as-is: the server restores the
           // search results from the call id.
-          flushText();
+          flushRun();
           input.push({
             type: "web_search_call",
             id: block.id,
@@ -192,7 +248,7 @@ export function buildInput(messages) {
           break;
       }
     }
-    flushText();
+    flushRun();
   }
   return input;
 }
