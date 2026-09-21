@@ -7,7 +7,7 @@
 // Part 2 drives the plugin the way rebon's plugin host does — `activate`, one
 // registered adapter, one turn per call with an `emit` and an abort signal —
 // against a local mock DeepSeek SSE server. No network, and no child process:
-// the provider stopped being one when it moved onto the shared plugin host.
+// the provider runs on the shared plugin host, not one of its own.
 
 import { createServer } from "node:http";
 import { readFileSync } from "node:fs";

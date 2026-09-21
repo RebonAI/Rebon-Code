@@ -7,12 +7,10 @@
 //! same plugin, and the team the messages travel through is
 //! [`TeamCreate`](crate::TeamCreateTool)'s.
 //!
-//! It lived in `rebon_core::attachments` and ran inside its fixed producer
-//! order, seventh of eight: after everything that describes the session's own
-//! state, before the task nudge. It runs there still — the producer sits on
-//! the kernel's `attachment-producers` seat at [`Order::Mailbox`], between the
-//! engine's own session poller and this plugin's [`Order::Reminder`] nudge.
-//! Text, filters and position are unchanged.
+//! It arrives after everything that describes the session's own state and
+//! before the task nudge: the producer sits on the kernel's
+//! `attachment-producers` seat at [`Order::Mailbox`], between the engine's own
+//! session poller and this plugin's [`Order::Reminder`] nudge.
 //!
 //! **Two surfaces, one drain.** The lead reads its inbox through the seat
 //! ([`MailboxAttachmentProducer`]); a teammate worker reads its own through

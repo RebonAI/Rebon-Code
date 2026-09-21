@@ -48,7 +48,7 @@ pub const PROMPT_SEAT_SERVICE: &str = "prompt-sections";
 /// Each rung is one plane plus one rank inside it. The base rungs mirror the
 /// engine's own base table (`system_prompt::assembly`), so a plugin section
 /// on a base rung renders right after the engine section that holds the same
-/// rank — or in its place, once that engine section has moved out.
+/// rank, or in its place when the engine has no section at that rank.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Rung {
     /// Who the model is (base plane, the engine's `intro`).

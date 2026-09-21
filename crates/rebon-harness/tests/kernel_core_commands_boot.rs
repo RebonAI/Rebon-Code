@@ -1,13 +1,11 @@
 //! The `core-commands` seat, booted on the real plugin table.
 //!
-//! These moved out of `rebon_kernel_seats::kernel_core_commands`: the
-//! seat is a plugin, and every question worth asking about it — what the table
-//! registered, which surfaces a command is offered on, whether a command that
-//! moved to its own plugin still reaches `/help` — is a question about the
-//! *whole* built-in list. That list is `builtin_plugin_defs()`, which lives
-//! here and names every plugin crate, so this is the only place the boot can
-//! happen. The seat crate keeps the checks that read nothing but the static
-//! table.
+//! The seat is a plugin, and every question worth asking about it — what the
+//! table registered, which surfaces a command is offered on, whether a command
+//! a plugin owns still reaches `/help` — is a question about the *whole*
+//! built-in list. That list is `builtin_plugin_defs()`, which lives here and
+//! names every plugin crate, so this is the only place the boot can happen.
+//! The checks that read nothing but the static table stay beside the seat.
 //!
 //! One binary, one process kernel, and the tests share it on purpose: two of
 //! them read what a sibling registered on the same seat and say so.

@@ -18,13 +18,11 @@
 //!   *nothing to reject with* is [`error_code::NO_USABLE_OPTION`]. The two
 //!   existing tests that pin this semantics do not change by a word.
 //!
-//! The numbers moved. The original plan specified `-32000..-32006`; `-32000` was
-//! already `SESSION_OWNED_ELSEWHERE`, which `session/load` answers today and
-//! which the serve tests pin. One number cannot mean two things on one wire,
-//! so the block was moved down whole to `-32010` and kept its order. See
-//! `rebon_proto::error_code`. `Cancelled` was given `-32017` of its own on top
-//! of that, because a client branches on it and the plan's table had no row
-//! for it.
+//! The block starts at `-32010` rather than `-32000`, because `-32000` is
+//! `SESSION_OWNED_ELSEWHERE`, which `session/load` answers and the serve tests
+//! pin: one number cannot mean two things on one wire. `Cancelled` holds
+//! `-32017` of its own, because a client branches on it and it needs a row
+//! nothing else shares. See `rebon_proto::error_code`.
 //!
 //! This lives here rather than beside the server because **both halves read
 //! the same table**: the owner encodes a failure, and the client decodes it

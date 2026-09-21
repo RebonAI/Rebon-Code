@@ -7,15 +7,14 @@
 //!
 //! # Why one load per entry
 //!
-//! The composition used to be a single opaque thing that registered into rebon
-//! from the inside, over synchronous calls that only worked because it lived in
-//! this process. Across a process boundary none of that survives: the
-//! unregistrations lived in Cordis disposers, disposers cannot await, and an
-//! answer cannot be had without waiting. So the direction is inverted. A load
-//! *reports* what an entry provides, rebon registers it here, and unload is
-//! what withdraws it — which also makes single-plugin unload, generation and
-//! reload protocol operations rather than a control service the composition
-//! serves itself.
+//! A composition cannot register into rebon from the inside, because the
+//! plane is across a process boundary: registering that way needs synchronous
+//! calls, Cordis puts unregistration in disposers, disposers cannot await, and
+//! an answer cannot be had without waiting. So the direction is inverted. A
+//! load *reports* what an entry provides, rebon registers it here, and unload
+//! is what withdraws it — which is also what makes single-plugin unload,
+//! generation and reload protocol operations rather than a control service the
+//! composition serves itself.
 //!
 //! # What the plane exposes, and to whom
 //!

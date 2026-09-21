@@ -3,9 +3,9 @@ use rebon_proto::types::{ConfigOption, ConfigOptionType, ConfigOptionValue};
 /// The rows a *session* answers for, which the `config-options` seat does not
 /// hold.
 ///
-/// Everything backed by the config file has moved to that seat, registered by
+/// Everything backed by the config file is on that seat, registered by
 /// whoever owns the setting: the Core `core-config-options` plugin for rebon's
-/// own keys, and each feature plugin for its own. What is left here is session
+/// own keys, and each feature plugin for its own. What is here is session
 /// state — the permission mode and the model in force, the pruning this
 /// session does — which the seat cannot answer because in `--acp` and `serve`
 /// one process holds many sessions and each has its own.

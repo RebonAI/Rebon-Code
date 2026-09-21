@@ -1,11 +1,10 @@
 //! End-to-end tests that drive `rebon-core` through the `rebon-acp`
 //! server.
 //!
-//! These used to live inside `rebon-core`'s own unit tests, which forced
-//! the engine to depend on the ACP server crate. The engine no longer does,
-//! so the tests moved up to `rebon-harness` — the lowest crate that already
-//! depends on both sides. The assertions are unchanged; only the test-local
-//! helpers were copied over from the engine's test module.
+//! They live in `rebon-harness` because it is the lowest crate that depends
+//! on both sides. Putting them with the engine would make the engine depend
+//! on the ACP server crate, which is the edge this layering exists to
+//! prevent.
 
 use std::sync::{Arc, Mutex};
 

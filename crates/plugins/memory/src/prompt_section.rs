@@ -1,12 +1,11 @@
 //! The auto-memory system-prompt section, on the kernel's `prompt-sections`
 //! seat.
 //!
-//! Until it moved here, this was rank 40 of the engine's own stable table, built
-//! from a `DynamicPromptContext.memory_prompt` the engine resolved itself. It
-//! is now a section this plugin registers at
-//! [`Rung::Memory`], which is the same rank on the same plane, so the bytes a
-//! model receives are unchanged while the plugin is on and the section simply
-//! is not there while it is off.
+//! The plugin registers it at [`Rung::Memory`], which fixes where it lands
+//! among the other sections: the rung is the rank, so the bytes a model
+//! receives do not depend on when this plugin happened to load. Switch the
+//! plugin off and the section is simply not there — nothing else in the
+//! prompt shifts to cover for it.
 //!
 //! Three inputs decide the text, and all three arrive on the
 //! [`PromptSubject`]:

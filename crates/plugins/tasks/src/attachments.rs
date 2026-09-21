@@ -4,13 +4,12 @@
 //! exist, sent only to a session that has both the tools and a task list going
 //! stale, and throttled hard enough that a long session sees it once or twice.
 //!
-//! It lived in `rebon_core::attachments` and ran inside its fixed producer
-//! order, last of eight. It runs last here too: the plugin's producer sits on
-//! the kernel's `attachment-producers` seat at [`Order::Reminder`], the rung
-//! the seat splits *behind* the engine's own session poller. The message a
-//! turn sees, its triggers and its position are unchanged.
+//! It runs last of everything a turn collects: the producer sits on the
+//! kernel's `attachment-producers` seat at [`Order::Reminder`], the rung the
+//! seat splits *behind* the engine's own session poller. The rung is what
+//! fixes that, not load order, so it holds however the plugins are composed.
 //!
-//! **What stayed behind.** The two task fields on `SessionAttachmentState` —
+//! **What lives elsewhere.** The two task fields on `SessionAttachmentState` —
 //! the last iteration a task tool ran, the last iteration this reminder fired
 //! — and the two `ServerState` methods that write them are still
 //! `rebon-session-state`'s, next to the plan-mode flags. This module is their

@@ -1,4 +1,4 @@
-//! The eight real MCP dispatch tests formerly owned by `rebon-core`'s query module.
+//! Eight real MCP dispatch tests, driven the way a turn drives one.
 //! Metadata comes from the plugin provider; execution goes through the typed seat.
 use super::*;
 use async_trait::async_trait;

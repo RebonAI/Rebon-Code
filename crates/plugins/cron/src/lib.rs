@@ -3,8 +3,9 @@
 //!
 //! `CronCreate` / `CronList` / `CronDelete` are the model's face on the
 //! scheduler. The arithmetic and the on-disk task list they operate over
-//! (`rebon_tool::cron`) stay in `rebon-tool`, because `rebon-core`'s tick
-//! loop and the desktop app read the same store; only the tools moved here.
+//! (`rebon_tool::cron`) live in `rebon-tool`, because `rebon-core`'s tick
+//! loop and the desktop app read the same store. Only the tools are this
+//! plugin's.
 //!
 //! Turning the plugin off (`plugins.cron.enabled = false`, or the legacy
 //! `REBON_DISABLE_CRON`) disposes this context, which takes the three tools

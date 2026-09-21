@@ -71,9 +71,8 @@ pub struct CompositionRoots {
 /// relative to a package, and a load request has to name that package. Same
 /// ladder, read from this side.
 ///
-/// The tree used to live in the crate that hosted V8, because that host is what
-/// shipped. It lives beside its runtime now, which is the move its own comment
-/// said to make when V8 left.
+/// The tree lives beside the runtime that reads it, not beside whatever
+/// happens to ship it.
 pub fn payload_root(compose_root: &Path) -> PathBuf {
     match std::env::var_os("REBON_KERNEL_JS_DIR") {
         Some(dir) => PathBuf::from(dir),

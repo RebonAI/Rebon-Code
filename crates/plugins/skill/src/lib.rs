@@ -348,11 +348,11 @@ mod tests {
             .contains(&PROGRESSIVE_SKILL_DISCOVERY_HOOK_ID.to_string()));
     }
 
-    /// `rebon-tool` pins the kinded builtins it still owns against the shared
-    /// facts table; `Skill` moved here, so this crate pins it. The row is
-    /// what policy reads to know `SkillTool` names this tool, and what the
-    /// engine reads to name the tool it dispatches a skill invocation
-    /// through — neither of which can ask the tool itself any more.
+    /// Each crate pins its own tools against the shared facts table, and
+    /// `Skill` is this one's. The row is what policy reads to know
+    /// `SkillTool` names this tool, and what the engine reads to name the
+    /// tool it dispatches a skill invocation through — neither of which can
+    /// ask the tool itself.
     #[test]
     fn the_skill_tool_matches_the_shared_facts_table() {
         let tool = SkillTool;

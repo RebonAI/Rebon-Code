@@ -938,8 +938,8 @@ mod tests {
         assert_eq!(decode_yaml_double_quoted(r"C:\\tmp"), "C:\\tmp");
     }
 
-    /// The escape rules, which moved here from the writer so the two
-    /// halves cannot drift apart.
+    /// The escape rules, pinned beside the decoder so the two halves cannot
+    /// drift apart.
     #[test]
     fn the_escape_rules_run_backslash_then_quote_then_newline() {
         assert_eq!(escape_yaml_double_quoted("hello"), "hello");

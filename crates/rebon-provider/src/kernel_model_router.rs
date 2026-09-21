@@ -598,10 +598,9 @@ impl ProviderRuntimeResolver for KernelAwareProviderResolver {
                 // outside the native typed registration. The plane registers one
                 // for every `llmProviders` entry a plugin declares.
                 //
-                // This used to be gated on the embedded runtime, from when the
-                // host trait lived in that crate — which meant a build without
-                // it, which is the one that ships, could not resolve any route a
-                // plugin had registered.
+                // Deliberately not gated on the embedded runtime: the build
+                // without it is the one that ships, and gating here would
+                // leave it unable to resolve any route a plugin registered.
                 if let Some(host) = crate::kernel_llm_dispatch::llm_host_for(name) {
                     return Ok(ProviderModelRuntime {
                         provider_name: name.to_string(),

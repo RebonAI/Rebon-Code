@@ -15,9 +15,9 @@
 //! session* is four handles, and the several hundred lines around them —
 //! parsing the command, editing one field, deciding which rows a prompt shows,
 //! writing the sentence the user reads — are not front-end work at all. They
-//! lived in the terminal because that is where the first front end was, and in
-//! a crate of their own after that, which put half of one feature below the
-//! plugin holding the other half.
+//! belong to the feature, not to whichever surface happens to show it — and
+//! keeping them anywhere else puts half of one feature below the plugin
+//! holding the other half.
 //!
 //! So the split is:
 //!

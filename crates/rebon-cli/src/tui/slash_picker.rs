@@ -1,11 +1,11 @@
 //! Slash command picker — wires `rebon-customselect`'s navigation
 //! reducer into the `/` command overlay.
 //!
-//! This module replaces the hand-rolled index + viewport math that
-//! previously lived inline in the runner with a proper
-//! `NavigationState<String>` from `rebon-customselect`. The navigation
-//! reducer provides wrap-around, page-up/down, viewport clamping, and
-//! validated-focus fallback for free.
+//! The index and viewport arithmetic is `rebon-customselect`'s
+//! `NavigationState<String>` rather than this module's own: wrap-around,
+//! page-up/down, viewport clamping and validated-focus fallback are the
+//! navigation reducer's, and a second hand-rolled copy here would be a
+//! second set of answers about where the cursor goes.
 //!
 //! ## Design
 //!

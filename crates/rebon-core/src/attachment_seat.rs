@@ -1,14 +1,12 @@
 //! Kernel-backed attachment-production seat.
 //!
 //! The engine's query loop sees one [`AttachmentPoller`] per turn, however
-//! many things want to speak into it. Every producer used to live in
-//! [`crate::attachments`] and the loop reached all eight of them through one
-//! session-backed poller. A producer that belongs to a feature has no business
-//! being wired into the engine, so this seat lets a plugin put one there
-//! instead — and all eight took it. The engine keeps two of the pollers
-//! (`date_change`, `runtime_prompts`), because a calendar and a queued prompt
-//! are nobody's feature, but they reach a turn through this seat like
-//! everything else, registered by `core-tools`.
+//! many things want to speak into it. A producer that belongs to a feature has
+//! no business being wired into the engine, so this seat is where a plugin
+//! puts one instead. Two of them are nobody's feature — a calendar
+//! (`date_change`) and a queued prompt (`runtime_prompts`) — and those are
+//! registered by `core-tools`, reaching a turn through this seat like
+//! everything else.
 //!
 //! Shape. The seat is a **process-level** registry: a plugin registers once,
 //! on its own context, and the binding to a session arrives later. It has to
@@ -20,10 +18,10 @@
 //! `None` to stay out of that turn entirely.
 //!
 //! Order. Producers run in [`Order`] then provider-id order, and that sequence
-//! is now the whole of it — there is no longer an engine-owned poller sitting
-//! in the middle for the rungs to be measured against. Each rung is the place
-//! one of the original eight held in the fixed order it was moved out of, so
-//! what the model reads is unchanged: plan mode's reminders at
+//! is the whole of it: no engine-owned poller sits in the middle for the rungs
+//! to be measured against. Each rung names what belongs there, so what the
+//! model reads does not depend on which plugins loaded or when: plan mode's
+//! reminders at
 //! [`Order::Transition`], the date roll at [`Order::DayRoll`], the skill
 //! listing at [`Order::Listing`], nested memory at [`Order::Context`], the
 //! queued prompts at [`Order::Prompt`], the teammate mailbox at

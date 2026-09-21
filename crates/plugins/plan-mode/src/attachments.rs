@@ -10,14 +10,13 @@
 //! | `plan_mode` | the mode is `plan`, and the throttle has elapsed |
 //! | `plan_mode_reentry` | as above, and the session has been out of plan mode before |
 //!
-//! They lived in `rebon_core::attachments` and ran inside its fixed
-//! producer order, first of eight. They run first here too: the plugin's
-//! producer sits on the kernel's `attachment-producers` seat at
-//! [`Order::Transition`], and every seat producer polls before the engine's
-//! own session poller. The messages a turn sees, and their order, are
-//! unchanged.
+//! They run before everything else a turn collects: the producer sits on the
+//! kernel's `attachment-producers` seat at [`Order::Transition`], and every
+//! seat producer polls before the engine's own session poller. A mode change
+//! has to be the first thing a turn hears about, or the messages after it
+//! describe a mode that is no longer in force.
 //!
-//! **What stayed behind.** The seven plan-mode fields on
+//! **What lives elsewhere.** The seven plan-mode fields on
 //! `SessionAttachmentState` and the eight `ServerState` methods that write
 //! them are still `rebon-session-state`'s, because the TUI's Shift+Tab mode
 //! cycle writes them directly and never goes through a tool. This module is
@@ -374,8 +373,9 @@ fn escalation_downgrade_note(requested: &str, applied: &str) -> String {
 /// [`ServerState`] setters. The state takes the session mutex for the read
 /// and the writes separately — a racing `session/set_config_option` that
 /// flips the mode between them is possible, but the outcome (an extra
-/// `plan_mode` attachment or a slightly late exit attachment) is benign and
-/// tolerated, exactly as it was when this lived in the engine.
+/// `plan_mode` attachment or a slightly late exit attachment) is benign, and
+/// tolerated rather than locked against: one lock across both would hold the
+/// session mutex for the whole poll.
 pub struct PlanModeAttachmentPoller {
     state: Arc<ServerState>,
     session_id: String,

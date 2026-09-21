@@ -653,10 +653,9 @@ mod tests {
         assert!(seat.resolve(TODO_WRITE_TOOL_NAME, None).unwrap().is_some());
     }
 
-    /// `rebon-tool` pins the kinded builtins it still owns against the shared
-    /// facts table; the six `ToolKind::Task` tools moved here, so this crate
-    /// pins them. Without it, a name or kind could drift on one side
-    /// unnoticed.
+    /// Each crate pins its own tools against the shared facts table, and the
+    /// six `ToolKind::Task` tools are this one's. Without it, a name or kind
+    /// could drift on one side unnoticed.
     #[test]
     fn the_kinded_tools_match_the_shared_facts_table() {
         let kinded: Vec<Arc<dyn Tool>> = vec![

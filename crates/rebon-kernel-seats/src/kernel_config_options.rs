@@ -1,12 +1,6 @@
 //! `core-config-options`: the Core plugin that owns the `config-options` seat
 //! and the settings rows rebon itself answers for.
 //!
-//! The settings panel's Config tab used to be a fixed list inside
-//! `rebon-acp`, which had two consequences worth naming. A terminal user's
-//! panel was built by the ACP *server* crate, and a plugin could not add a row
-//! at all — so a setting a plugin owned either went unexposed or was
-//! hard-coded next to settings it had nothing to do with.
-//!
 //! `apply` provides the seat on the kernel root and registers the rows whose
 //! value is rebon's own `settings.json`. A plugin registers its rows the same
 //! way, on its own context, and they leave with it.

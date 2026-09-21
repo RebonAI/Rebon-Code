@@ -14,10 +14,10 @@
 //! This was a crate of its own, whose whole point was an empty
 //! `[dependencies]` table: pure logic, no `rebon-*` and no external crates,
 //! with filesystem I/O and async left to the layer above. Folding it into the
-//! plugin that owns skills removed a crate the engine had to depend on to
-//! build a system prompt — but the purity is still worth having, so the
-//! constraint moved with the code: these modules import nothing, and the
-//! `the_pure_layer_imports_nothing` canary below fails if one starts to.
+//! plugin that owns skills is what keeps the engine from depending on a crate
+//! to build a system prompt — and the purity is worth having on its own:
+//! these modules import nothing, and the `the_pure_layer_imports_nothing`
+//! canary below fails if one starts to.
 //! The I/O layer is [`loader`](crate::loader) and
 //! [`bundled_cache`](crate::bundled_cache), one directory up.
 

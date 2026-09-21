@@ -44,10 +44,10 @@ fn current_detection_options() -> InstallationDetectionOptions {
 /// sitting under `target/` is recognised as a development build.
 ///
 /// Counted, not searched: this crate's manifest is at
-/// `<root>/crates/plugins/updater`, so the root is three levels up. It was two
-/// while the caller lived in `crates/rebon-cli`; getting the count wrong does
-/// not fail to compile, it just stops calling a dev build a dev build, which
-/// is why the depth is asserted in a test rather than inlined at the call.
+/// `<root>/crates/plugins/updater`, so the root is three levels up. The count
+/// depends on where this crate sits, and getting it wrong does not fail to
+/// compile — it just stops calling a dev build a dev build, which is why the
+/// depth is asserted in a test rather than inlined at the call.
 fn workspace_root_of(manifest_dir: Option<&str>) -> Option<PathBuf> {
     let dir = Path::new(manifest_dir?);
     Some(dir.parent()?.parent()?.parent()?.to_path_buf())

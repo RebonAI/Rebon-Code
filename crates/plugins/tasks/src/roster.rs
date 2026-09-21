@@ -7,16 +7,15 @@
 //! accumulating in the transcript. `SendMessage` and `TeamCreate` are this
 //! plugin's, so the answer to "who is on this team" is too.
 //!
-//! It lived in `rebon_core::attachments`, read off the same session-backed
-//! poller as the seven attachment producers. It reaches a turn the same way
-//! they do now: this producer sits on the kernel's `attachment-producers` seat
-//! at [`Order::Listing`](rebon_core::attachment_seat::Order::Listing) — the
-//! rung for a catalogue the session can draw on — and answers
+//! It reaches a turn like any other attachment: the producer sits on the
+//! kernel's `attachment-producers` seat at
+//! [`Order::Listing`](rebon_core::attachment_seat::Order::Listing) — the rung
+//! for a catalogue the session can draw on — and answers
 //! [`AttachmentPoller::transient_context`] instead of `poll`. The composite
 //! poller merges every half's transient context rather than taking the first,
-//! so a seat producer can contribute it.
+//! which is what lets a seat producer contribute it at all.
 //!
-//! **What stayed behind.** The roster itself is `rebon-tool`'s `TeamManager`,
+//! **What lives elsewhere.** The roster itself is `rebon-tool`'s `TeamManager`,
 //! and the executor resolves it per turn onto the binding
 //! ([`TurnTeammateRoster`]). This module only renders it.
 //!

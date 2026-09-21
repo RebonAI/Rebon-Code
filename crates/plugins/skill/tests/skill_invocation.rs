@@ -1,11 +1,10 @@
 //! Real-execution regressions for how a skill invocation reaches the model.
 //!
-//! These ran in `rebon-core`'s query tests while the registry was
-//! `rebon-tool`'s and the executor resolved a typed `/name` against it
-//! directly. They moved here with the code: the catalogue is this plugin's
-//! now, and what the engine has is one handle it asks. Both paths still run a
-//! real `EngineQueryExecutor` turn, so what they pin is the request the model
-//! receives and the transcript the session keeps.
+//! The catalogue is this plugin's and what the engine holds is one handle it
+//! asks, so the seam under test is that handle. Both paths run a real
+//! `EngineQueryExecutor` turn, which is what makes these pin the request the
+//! model receives and the transcript the session keeps rather than a call
+//! into the registry.
 
 mod support;
 

@@ -31,10 +31,9 @@
 //! `dontAsk` at all, which fails closed rather than quietly prompting a
 //! surface that promised never to.
 //!
-//! These lived in `rebon_core::permission` as `matches!(tool_name, ...)`
-//! arms and a `match option_id` truth table. The engine now asks the
-//! `permission-rules` seat instead, so nothing there knows these two tools by
-//! name.
+//! The rules reach the engine through the `permission-rules` seat, so nothing
+//! in the engine knows these two tools by name: the truth table for which
+//! option id means what lives here, beside the tools it decides for.
 
 use rebon_core::permission_seat::{DecisionScope, PermissionRule, RejectionNote};
 use rebon_tool::ToolContext;

@@ -1,9 +1,8 @@
 // The composition's doorway to rebon, on the plugin plane.
 //
-// On deno_core this was `js/bridge.js`: seven synchronous ops reaching a
-// kernel that lived in the same process. Across a process boundary none of
-// that survives unchanged, and the differences are the protocol's, not this
-// module's:
+// The plane is across a process boundary, so there are no synchronous ops
+// into an in-process kernel here. Three consequences follow, and they are the
+// protocol's rather than this module's:
 //
 //   * **Everything is async.** `callService` returned a value from an op; a
 //     `seat/call` is a request that has to be answered. The one place this
@@ -14,11 +13,11 @@
 //     handler. `AsyncLocalStorage` is what carries the handler's context down
 //     to code that has no way to be handed it — a dsh credential provider is
 //     called by an adapter that knows nothing about rebon.
-//   * **Registration is not a call.** `op_rebon_call_service('model-router',
-//     'register', …)` and its compensating `unregister` are gone. What a
-//     composition provides is reported once, in the `plugin/load` ready
-//     report, and revoked by `plugin/unload` draining. That is the only shape
-//     that works: the unregisters lived in cordis disposers.
+//   * **Registration is not a call.** What a composition provides is
+//     reported once, in the `plugin/load` ready report, and revoked by
+//     `plugin/unload` draining. It has to be that shape: a compensating
+//     `unregister` would have to run from a cordis disposer, and a disposer
+//     cannot await the answer.
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { sessionOf } from './registry.mjs';
 

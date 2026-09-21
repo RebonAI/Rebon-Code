@@ -1,8 +1,7 @@
 //! The animated asterisk the landing screen and the header draw.
 //!
-//! Moved here from the logo crate, which was a crate of its own for this one
-//! reducer plus two mascot modules nothing ever called. A reducer that only
-//! the terminal's own header renders belongs next to the header.
+//! A reducer that only the terminal's own header renders belongs next to the
+//! header, not in a crate of its own.
 //!
 //! Note the third `hue_to_rgb` in the tree: `crate::input::voice_cursor` has
 //! one for the waveform cursor. Same conversion, different callers, and

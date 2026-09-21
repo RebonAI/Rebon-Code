@@ -17,12 +17,11 @@
 //! the model needs to hear: the user can still change profile themselves, and
 //! resubmitting will be denied again.
 //!
-//! These lived in `rebon_core::permission` as `matches!(tool_name, ...)`
-//! arms and a hand-written deny sentence. The engine asks the
-//! `permission-rules` seat now, so nothing there knows these two tools by
-//! name — and turning this plugin off, which takes the two tools off the tool
-//! seat, takes the carve-out off with them rather than leaving a rule about
-//! calls that can no longer be made.
+//! The rule reaches the engine through the `permission-rules` seat, so
+//! nothing in the engine knows these two tools by name. Turning this plugin
+//! off takes the two tools off the tool seat and the carve-out off with them,
+//! rather than leaving a rule behind about calls that can no longer be
+//! made.
 
 use rebon_core::permission_seat::{DecisionScope, PermissionRule};
 use rebon_tool::ToolContext;

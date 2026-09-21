@@ -11,9 +11,9 @@
 //! runtime fields, session handover and startup, the CLI overrides).
 //! The level is a domain enum, not a status row, so it sank to
 //! `rebon-types` instead — a headless path must not reach through the
-//! terminal crate for it. It is `rebon_types::ReasoningEffort`: the
-//! module used to carry a second five-variant enum of its own, deleted
-//! once both lived in the same crate.
+//! terminal crate for it. It is `rebon_types::ReasoningEffort`, and there is
+//! exactly one such enum: a second five-variant copy here would be two
+//! answers to what "high" means.
 //!
 //! This module provides independent status display projections. Each helper reads
 //! pre-resolved state, decides whether to show, chooses color/text, and emits a

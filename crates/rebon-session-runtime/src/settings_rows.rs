@@ -23,11 +23,10 @@ use rebon_types::{ConfigOption, ConfigOptionType};
 
 /// Format a token count as a compact human-readable string.
 ///
-/// Lived in the binary's `tui::dialog_support`, which is why it reads
-/// like a rendering helper. It is not one: this module is the only caller,
-/// and a panel that shows "12.4k" rather than "12408" is choosing wording,
-/// not drawing. Moving it here cut the last real edge from `session/` to the
-/// terminal outside `startup_gates`.
+/// It reads like a rendering helper and is not one: this module is the only
+/// caller, and a panel that shows "12.4k" rather than "12408" is choosing
+/// wording, not drawing. Keeping it here is what leaves `session/` with no
+/// edge to the terminal outside `startup_gates`.
 fn format_token_count(count: u32) -> String {
     if count >= 1_000_000 {
         format!("{:.1}M", count as f64 / 1_000_000.0)

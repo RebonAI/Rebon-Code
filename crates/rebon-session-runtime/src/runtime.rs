@@ -586,12 +586,12 @@ fn session_plugin_extensions(
     extensions
 }
 
-/// Build the engine core: the segment that lived inline between the
-/// "system prompt config ready" and "query executor built" startup
-/// checkpoints, plus the blueprint fork, moved whole.
-/// The checkpoints move with it; a session that runs turns logs them in
-/// the same relative order, now after "startup skills loaded" because the
-/// inputs include everything session-scoped.
+/// Build the engine core: everything between the "system prompt config ready"
+/// and "query executor built" startup checkpoints, plus the blueprint fork.
+///
+/// The checkpoints are logged from here, after "startup skills loaded",
+/// because the inputs include everything session-scoped — a session that runs
+/// turns logs them in that order.
 fn build_engine_core(inputs: EngineCoreInputs) -> EngineCore {
     let EngineCoreInputs {
         startup_started,

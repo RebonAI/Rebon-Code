@@ -7,10 +7,9 @@
 //! plugin table booted, and that table lives here. The unit tests beside the
 //! host keep a kernel of their own, where the engine's catalog is what answers.
 //!
-//! Moved here with the host itself: `EngineToolInvokeHost` used to look
-//! the process kernel up for its upstream context, so this test came for free.
-//! It now goes in through `ToolInvoker::invoke`, which is the door the plane
-//! itself uses.
+//! It goes in through `ToolInvoker::invoke`, which is the door the plane
+//! itself uses, rather than reaching for the process kernel: what is under
+//! test is the seat, not how a caller happens to find it.
 
 use rebon_kernel_seats::kernel_tool_invoke::{EngineToolInvokeHost, CORE_TOOL_SEAT};
 use rebon_plugin_protocol::{CallIdentity, Payload};

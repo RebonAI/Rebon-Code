@@ -8,12 +8,10 @@
 //! [`Skill`](crate::SkillTool) — without the listing the model has names
 //! it never saw.
 //!
-//! It lived in `rebon_core::attachments` and ran second of eight, right
-//! behind `date_change`. It runs there still: this producer sits on the
-//! kernel's `attachment-producers` seat at `Order::Listing`, and the date
-//! roll took `Order::DayRoll` on the same seat when this one left, so the
-//! two kept their relative order and both stayed ahead of the engine's own
-//! session poller.
+//! The producer sits on the kernel's `attachment-producers` seat at
+//! `Order::Listing`, which puts it behind `Order::DayRoll` — the date roll —
+//! and ahead of the engine's own session poller. The order is the seat's to
+//! decide, not load order's, so it holds however the plugins are composed.
 //!
 //! **What it reads from outside the record.** One handle off the binding:
 //! [`TurnSkillCatalog`] answers what this turn can invoke. The host binds

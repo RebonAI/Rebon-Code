@@ -1,16 +1,13 @@
 //! # `surface` — pure logic for the agents-management surface
 //!
-//! Was the `rebon-agents` crate; it moved here whole when the agents
-//! feature became a plugin, because everything it describes — where an
-//! agent file lives, what a valid agent is, how the create wizard
-//! steps — is this plugin's, and switching the plugin off should take
-//! all of it with the `Agent` tool.
+//! Everything it describes — where an agent file lives, what a valid agent
+//! is, how the create wizard steps — is this plugin's, so switching the
+//! plugin off takes all of it along with the `Agent` tool.
 //!
-//! Still pure logic, and still free of IO and of any terminal type: the
-//! filesystem and the LLM call are injected seams, and the painting is
-//! the surface's. What it may now name is the rest of the plugin, which
-//! is what lets [`super::dialog`] hold the `/agents` panel here rather
-//! than in the terminal.
+//! Pure logic, free of IO and of any terminal type: the filesystem and the
+//! LLM call are injected seams, and the painting is the surface's. It may
+//! name the rest of the plugin, which is what lets [`super::dialog`] hold
+//! the `/agents` panel here rather than in the terminal.
 //!
 //! This module implements the agents surface as pure logic:
 //!

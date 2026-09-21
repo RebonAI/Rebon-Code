@@ -1,9 +1,9 @@
 //! `TodoWrite`: the pre-Task todo list.
 //!
-//! The store it writes to stayed in `rebon_tool::todo_write` — the TUI's task
-//! pane reads it directly, so it cannot depend on this plugin being loaded.
-//! What moved here is the tool: the schema, the validation and the
-//! state-replacement call.
+//! The store it writes to is `rebon_tool::todo_write`, not this plugin's: the
+//! TUI's task pane reads it directly and cannot depend on this plugin being
+//! loaded. What is this plugin's is the tool — the schema, the validation and
+//! the state-replacement call.
 
 use async_trait::async_trait;
 use rebon_tool::todo_write::{get_todos, set_todos, TodoItem, DEFAULT_TODO_KEY};

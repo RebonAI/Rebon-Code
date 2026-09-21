@@ -1,9 +1,9 @@
 //! The `node-host` plugin, on the real plugin table.
 //!
-//! Moved here with the module itself. The question is whether the boot
-//! this crate performs *loads* the plugin and leaves its service resolvable,
-//! and only the crate that owns `builtin_plugin_defs()` can boot that table.
-//! What stayed beside the module is what reads the definition alone.
+//! The question is whether the boot this crate performs *loads* the plugin
+//! and leaves its service resolvable, and only the crate that owns
+//! `builtin_plugin_defs()` can boot that table. What reads the definition
+//! alone belongs beside the module instead.
 
 use rebon_plugin_host::kernel_node_host::PLUGIN_ID;
 

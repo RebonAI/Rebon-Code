@@ -1,11 +1,10 @@
 //! Shared fixtures for this crate's real-execution regressions.
 //!
-//! These ran inside `rebon-core`'s own test module, against helpers that
-//! module already had. The tests moved here with the code they cover, so the
-//! helpers they need are rebuilt against the engine's public API: a mock
-//! stream, a tool that records what it was called with, an engine that
-//! approves every permission, and a kernel with this plugin loaded on the
-//! three seats it registers onto.
+//! Everything here is built against the engine's *public* API, because these
+//! tests live beside the plugin rather than inside the engine: a mock stream,
+//! a tool that records what it was called with, an engine that approves every
+//! permission, and a kernel with this plugin loaded on the three seats it
+//! registers onto.
 
 #![allow(dead_code)] // Shared by several test binaries; each uses a subset.
 

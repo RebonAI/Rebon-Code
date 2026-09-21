@@ -64,9 +64,9 @@ use rebon_types::constant_time_eq;
 // `ipc::events`; the binary's facade imported these one at a time for the same
 // reason.
 // The projection from a live permission query to the snapshot the wire
-// carries. It used to live in `rebon-session-host`, which had to depend on
-// `rebon-core` for the query type; this crate depends on both halves
-// already, so it sits here and that edge is gone.
+// carries. It sits here rather than in `rebon-session-host` because that
+// crate would need `rebon-core` for the query type; this one depends on both
+// halves already, so the edge is not there to add.
 pub use permission_snapshot::background_permission_snapshot;
 
 pub use rebon_session_host::BACKGROUND_SUMMARY_UPDATE_INTERVAL_MS;

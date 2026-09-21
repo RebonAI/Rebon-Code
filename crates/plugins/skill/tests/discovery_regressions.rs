@@ -1,9 +1,9 @@
 //! Real-execution regressions for progressive skill discovery.
 //!
-//! These ran in `rebon-core`'s query tests while the subscriber was one of
-//! the engine's builtin turn hooks. They moved here with it: the subscriber is
-//! this plugin's now, so the seam under test is the plugin registering on the
-//! `turn-hooks` seat and reading its state out of the turn's extension bag.
+//! The subscriber is this plugin's, so the seam under test is the plugin
+//! registering on the `turn-hooks` seat and reading its state out of the
+//! turn's extension bag — which is why these live beside it rather than with
+//! the engine.
 //!
 //! Every one of them drives a real `run_query` against a mock model stream, so
 //! what they pin is the behaviour the model and the registry actually see, not

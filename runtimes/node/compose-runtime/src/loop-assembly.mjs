@@ -14,13 +14,13 @@
 //  3. **Drive** — `loop:control` is the embedder's inbound face
 //     (followup / steer / cancel / status).
 //
-// Two things moved with the transport:
+// Two consequences of the transport:
 //
-//   * **The catalog is configuration, not a call.** It used to be
-//     `describeTools()`, an op straight into rebon. There is no such method on
-//     the plane, and there should not be: what rebon offers a model is settled
-//     when the composition is built, so rebon hands it over at load. A snapshot
-//     either way — the old op was read once during `apply` too.
+//   * **The catalog is configuration, not a call.** There is no `describeTools`
+//     method on the plane, and there should not be: what rebon offers a model
+//     is settled when the composition is built, so rebon hands it over at
+//     load. It is a snapshot either way; asking would only make the moment it
+//     was taken harder to see.
 //   * **Events publish through a scope handle.** A loop produces turn events on
 //     its own schedule, with no inbound call to hang them on, so the assembly
 //     takes a handle on each open session and fans its events to whichever are

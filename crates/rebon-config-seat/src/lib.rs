@@ -8,9 +8,9 @@
 //! settings disappear with the plugin instead of lingering as a row that
 //! changes nothing.
 //!
-//! The catalogue used to be a fixed list inside `rebon-acp`, which meant a
-//! terminal user's settings panel was built by the ACP server crate, and a
-//! plugin could not add a row at all. Every surface now reads the seat.
+//! Every surface reads the seat. A fixed list somewhere would mean one
+//! surface's crate deciding what every other surface shows, and a plugin with
+//! no way to add a row at all.
 //!
 //! Two things a fixed list could not do, and the reason the provider is a
 //! trait rather than a value:

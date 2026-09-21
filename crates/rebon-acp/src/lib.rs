@@ -19,11 +19,10 @@
 //! here forced every consumer to depend on this server crate. Both are
 //! re-exported below under their old paths.
 //!
-//! The prompt-turn seam and the outbound update/permission sinks used to live
-//! here too. They now live in [`rebon_agent_core`], because they were never
-//! server-specific: the ACP *client* (Rebon spawning a third-party agent CLI)
-//! runs turns and publishes updates through exactly the same types, and must
-//! not depend on the server to do it.
+//! The prompt-turn seam and the outbound update/permission sinks are
+//! [`rebon_agent_core`]'s, not this crate's: the ACP *client* (Rebon spawning
+//! a third-party agent CLI) runs turns and publishes updates through exactly
+//! the same types, and must not depend on the server to do it.
 //!
 //! Beyond the session-state re-exports named above, nothing upstream is
 //! re-exported from here, on purpose — `rebon-proto`,

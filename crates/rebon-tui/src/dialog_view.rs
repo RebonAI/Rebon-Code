@@ -8,9 +8,9 @@
 //!
 //! [`render_panel_view`] is the widest of the painters: a bordered frame
 //! with an optional tab strip, one or two panes of styled rows, and a
-//! segmented footer. It is what the panels that used to own a renderer
-//! each — diagnostics, the plugin manager, the hook browser, settings —
-//! are described with instead.
+//! segmented footer. It is what every panel is described with —
+//! diagnostics, the plugin manager, the hook browser, settings — rather
+//! than each owning a renderer of its own.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
