@@ -21,6 +21,8 @@
 //! - [`kernel_code_mode`] — the `run_code` tool.
 //! - [`kernel_core_commands`] — the `command-registry` seat and the built-in
 //!   slash commands registered on it.
+//! - [`kernel_config_options`] — the `config-options` seat and the settings
+//!   rows backed by rebon's own config file.
 //! - [`kernel_tool_asks`] — the suspend-and-answer surface a composed plugin's
 //!   ungranted tool call parks on.
 //! - [`kernel_tool_invoke`] — the engine-backed invoker behind that seat.
@@ -31,6 +33,7 @@
 
 pub mod kernel_code_mode;
 pub mod kernel_compose_tools;
+pub mod kernel_config_options;
 pub mod kernel_config_seats;
 pub mod kernel_core_commands;
 pub mod kernel_core_tools;

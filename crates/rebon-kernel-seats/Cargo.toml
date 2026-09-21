@@ -13,6 +13,7 @@ rebon-kernel.workspace = true
 # `core-commands` registers the built-in table on the `command-registry` seat
 # and installs the source `rebon_slash_commands::{all, find}` read through.
 rebon-command-seat.workspace = true
+rebon-config-seat.workspace = true
 rebon-slash-commands.workspace = true
 # The wire types the tool-invoke seat answers a composed plugin in
 # (`ToolInvoker` lives on the supervisor's request table).

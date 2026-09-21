@@ -121,6 +121,12 @@ fn make_core_commands(host: &PluginHost) -> Result<Box<dyn Plugin>, KernelError>
     ))
 }
 
+fn make_core_config_options(_: &PluginHost) -> Result<Box<dyn Plugin>, KernelError> {
+    Ok(Box::new(
+        rebon_kernel_seats::kernel_config_options::CoreConfigOptionsPlugin,
+    ))
+}
+
 fn make_core_tools(_: &PluginHost) -> Result<Box<dyn Plugin>, KernelError> {
     Ok(Box::new(
         rebon_kernel_seats::kernel_core_tools::CoreToolsPlugin,
@@ -177,6 +183,13 @@ pub fn builtin_plugin_defs() -> &'static [PluginDef] {
             kind: PluginKind::Core,
             default_enabled: true,
             factory: make_core_ui,
+        },
+        PluginDef {
+            id: rebon_kernel_seats::kernel_config_options::PLUGIN_ID,
+            title: "Settings option seat",
+            kind: PluginKind::Core,
+            default_enabled: true,
+            factory: make_core_config_options,
         },
         rebon_plugin_cron::PLUGIN,
         rebon_plugin_web::PLUGIN,
