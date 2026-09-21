@@ -1,16 +1,15 @@
 # Windows counterpart of npm_publish_dist.sh: publish every @rebon/cli tarball
 # in dist/npm to the public npm registry, with a watchdog for npm publish's
-# post-success lingering bug and for network stalls. Requires
-# $env:NPM_ORG_TOKEN. Used by the publish-windows job in release.yml.
+# post-success lingering bug and for network stalls. Used by the
+# publish-windows job in release.yml.
+#
+# Authentication is npm trusted publishing (OIDC). There is no token and no
+# .npmrc: npm reads an `_authToken` as an instruction to authenticate as that
+# token's owner, and having done so it will not attempt a trusted publish.
+# The job supplies `permissions: id-token: write` instead, and npm exchanges
+# that for a short-lived credential the registry checks against the trusted
+# publisher configured on each package. See the .sh for the whole of it.
 $ErrorActionPreference = 'Stop'
-
-if (-not $env:NPM_ORG_TOKEN) { throw 'NPM_ORG_TOKEN secret required' }
-
-@"
-@rebon:registry=https://registry.npmjs.org/
-//registry.npmjs.org/:_authToken=$($env:NPM_ORG_TOKEN)
-"@ | Set-Content -Encoding ascii .npmrc
-$env:NPM_CONFIG_USERCONFIG = (Resolve-Path .npmrc).Path
 
 # A 36 MB payload over a slow residential uplink can legitimately take
 # minutes; the old 180s watchdog killed a mid-flight win32 upload on v0.1.4.
@@ -76,7 +75,11 @@ function Publish-Attempt([string] $tarball) {
     } -ArgumentList $tarball
 
     $hardTimeout = 480
-    $grace = 5
+    # Wide enough to cover what still happens after the success line: a
+    # trusted publish signs the provenance attestation and uploads it once the
+    # tarball is accepted, so killing at the old five seconds could land
+    # between the two and leave a published version with no attestation.
+    $grace = 30
     $start = Get-Date
     $sawSuccessAt = $null
     while ($job.State -eq 'Running') {
@@ -104,14 +107,12 @@ function Publish-Attempt([string] $tarball) {
     throw "publish failed for $tarball"
 }
 
-try {
-    & npm whoami --registry=https://registry.npmjs.org/
-    # rebon-cli-*.tgz covers @rebon/cli + platform packages. dist/npm is wiped
-    # before every build, so the broad glob only sees this job's output.
-    $tarballs = Get-ChildItem 'dist/npm/rebon-*.tgz' -File
-    if (-not $tarballs) { throw 'no rebon-*.tgz in dist/npm' }
-    foreach ($t in $tarballs) { Publish-One $t.FullName }
-}
-finally {
-    Remove-Item .npmrc -ErrorAction SilentlyContinue
-}
+# No `npm whoami`: there is no user to be. A trusted publish authenticates per
+# publish, so the first thing that proves the credential works is the publish.
+#
+# rebon-*.tgz covers @rebon/cli, the platform packages and the bare alias.
+# dist/npm is wiped before every build, so the broad glob only sees this job's
+# own output.
+$tarballs = Get-ChildItem 'dist/npm/rebon-*.tgz' -File
+if (-not $tarballs) { throw 'no rebon-*.tgz in dist/npm' }
+foreach ($t in $tarballs) { Publish-One $t.FullName }

@@ -11,9 +11,22 @@ name: release
 # Publishing is gated on v* tags: a push to main only runs verification jobs,
 # so it can never trigger the heavy build/publish jobs.
 #
-# Required secret: NPM_ORG_TOKEN (npm automation token with publish rights on
-# the @rebon scope). GITHUB_TOKEN is provided by Actions and is only used by
-# actions/checkout.
+# No secret is required. Publishing is npm trusted publishing (OIDC): the
+# four publish jobs ask for `id-token: write`, npm exchanges that for a
+# short-lived credential, and the registry checks the claim against the
+# trusted publisher configured on each package — owner, repository, workflow
+# filename and environment. Nothing long-lived is stored in this repository,
+# so there is no token to leak and none to rotate.
+#
+# That means the workflow filename is part of the credential. Renaming this
+# file, or publishing from a second workflow, is refused by the registry
+# until the trusted publisher on every package is updated to match.
+#
+# Each of these packages needs its own trusted publisher configured:
+#   @rebon/cli, rebon,
+#   @rebon/cli-{darwin-arm64,darwin-x64,linux-x64,linux-arm64,win32-x64}
+#
+# GITHUB_TOKEN is provided by Actions and is only used by actions/checkout.
 
 on:
   push:
@@ -230,6 +243,17 @@ jobs:
   publish-darwin:
     needs: [verify, boa-runtime]
     if: startsWith(github.ref, 'refs/tags/v')
+    # Trusted publishing: npm exchanges this for a short-lived credential
+    # scoped to this workflow, and the registry checks it against the trusted
+    # publisher configured on each package. No NPM_ORG_TOKEN anywhere.
+    permissions:
+      id-token: write
+      contents: read
+    # Must match the environment name registered with each package's trusted
+    # publisher, or the registry refuses the claim. It is also where a
+    # reviewer requirement and a `v*`-only tag rule are configured, which is
+    # what keeps push access from being publish access.
+    environment: npm-publish
     runs-on: macos-14
     timeout-minutes: 30
     strategy:
@@ -242,6 +266,14 @@ jobs:
             cpu: x64
     steps:
       - uses: actions/checkout@v4
+      - name: npm with trusted publishing
+        # Trusted publishing needs npm >= 11.5.1; a runner's bundled npm is
+        # older and fails with a plain authentication error that does not name
+        # the version.
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install -g npm@latest
       - name: Build + package
         run: |
           set -eu
@@ -256,8 +288,6 @@ jobs:
             --os darwin --cpu ${{ matrix.cpu }} \
             --out-dir dist/npm
       - name: Publish to npm
-        env:
-          NPM_ORG_TOKEN: ${{ secrets.NPM_ORG_TOKEN }}
         run: bash scripts/npm_publish_dist.sh
 
   # Both Linux targets build on a Linux runner via cargo-zigbuild
@@ -265,6 +295,17 @@ jobs:
   publish-linux:
     needs: [verify, boa-runtime]
     if: startsWith(github.ref, 'refs/tags/v')
+    # Trusted publishing: npm exchanges this for a short-lived credential
+    # scoped to this workflow, and the registry checks it against the trusted
+    # publisher configured on each package. No NPM_ORG_TOKEN anywhere.
+    permissions:
+      id-token: write
+      contents: read
+    # Must match the environment name registered with each package's trusted
+    # publisher, or the registry refuses the claim. It is also where a
+    # reviewer requirement and a `v*`-only tag rule are configured, which is
+    # what keeps push access from being publish access.
+    environment: npm-publish
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -277,6 +318,14 @@ jobs:
             cpu: arm64
     steps:
       - uses: actions/checkout@v4
+      - name: npm with trusted publishing
+        # Trusted publishing needs npm >= 11.5.1; a runner's bundled npm is
+        # older and fails with a plain authentication error that does not name
+        # the version.
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install -g npm@latest
       - name: Install zig + cargo-zigbuild
         # zig comes from the ziglang wheel rather than a package manager:
         # cargo-zigbuild falls back to `python3 -m ziglang` when no `zig` is on
@@ -304,17 +353,34 @@ jobs:
             --os linux --cpu ${{ matrix.cpu }} \
             --out-dir dist/npm
       - name: Publish to npm
-        env:
-          NPM_ORG_TOKEN: ${{ secrets.NPM_ORG_TOKEN }}
         run: bash scripts/npm_publish_dist.sh
 
   publish-windows:
     needs: [verify, boa-runtime]
     if: startsWith(github.ref, 'refs/tags/v')
+    # Trusted publishing: npm exchanges this for a short-lived credential
+    # scoped to this workflow, and the registry checks it against the trusted
+    # publisher configured on each package. No NPM_ORG_TOKEN anywhere.
+    permissions:
+      id-token: write
+      contents: read
+    # Must match the environment name registered with each package's trusted
+    # publisher, or the registry refuses the claim. It is also where a
+    # reviewer requirement and a `v*`-only tag rule are configured, which is
+    # what keeps push access from being publish access.
+    environment: npm-publish
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: npm with trusted publishing
+        # Trusted publishing needs npm >= 11.5.1; a runner's bundled npm is
+        # older and fails with a plain authentication error that does not name
+        # the version.
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install -g npm@latest
       - name: Build + package
         shell: pwsh
         run: |
@@ -328,8 +394,6 @@ jobs:
             --out-dir dist/npm
       - name: Publish to npm
         shell: pwsh
-        env:
-          NPM_ORG_TOKEN: ${{ secrets.NPM_ORG_TOKEN }}
         run: ./scripts/npm_publish_dist.ps1
 
   # The wrapper package (@rebon/cli) is platform-independent JS whose
@@ -341,10 +405,29 @@ jobs:
   publish-wrapper:
     needs: [publish-darwin, publish-linux, publish-windows]
     if: startsWith(github.ref, 'refs/tags/v')
+    # Trusted publishing: npm exchanges this for a short-lived credential
+    # scoped to this workflow, and the registry checks it against the trusted
+    # publisher configured on each package. No NPM_ORG_TOKEN anywhere.
+    permissions:
+      id-token: write
+      contents: read
+    # Must match the environment name registered with each package's trusted
+    # publisher, or the registry refuses the claim. It is also where a
+    # reviewer requirement and a `v*`-only tag rule are configured, which is
+    # what keeps push access from being publish access.
+    environment: npm-publish
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: npm with trusted publishing
+        # Trusted publishing needs npm >= 11.5.1; a runner's bundled npm is
+        # older and fails with a plain authentication error that does not name
+        # the version.
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install -g npm@latest
       - name: Build wrapper + bare alias
         run: |
           set -eu
@@ -352,8 +435,6 @@ jobs:
           python3 scripts/build_npm_package.py --kind wrapper --out-dir dist/npm
           python3 scripts/build_npm_package.py --kind bare --out-dir dist/npm
       - name: Publish to npm
-        env:
-          NPM_ORG_TOKEN: ${{ secrets.NPM_ORG_TOKEN }}
         run: bash scripts/npm_publish_dist.sh
 
   # ---- release gate: a tag that published nothing must read as a failure ----

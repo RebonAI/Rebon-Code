@@ -1,27 +1,37 @@
 #!/usr/bin/env bash
 # Publish every @rebon/cli tarball sitting in dist/npm to the public npm
 # registry. Used by the per-platform jobs in .github/workflows/release.yml:
-# there is no cross-job artifact staging (upload-artifact hangs on the
-# self-hosted Gitea), so each runner builds AND publishes only its own
-# tarball(s), and this script just publishes whatever rebon-cli-*.tgz are
-# present in dist/npm.
+# nothing is handed between jobs as an artifact, so each runner builds AND
+# publishes only its own tarball(s), and this script publishes whatever
+# rebon-*.tgz are present in dist/npm.
 #
-# Requires NPM_ORG_TOKEN in the environment. Includes a watchdog for two npm
-# failure modes: (1) npm prints the `+ @rebon/...` success line but the
-# process lingers because of a keep-alive HTTP agent that never gets
-# destroyed; (2) the publish stalls before any success line. The success
-# line is npm's authoritative "registry accepted" marker, trusted even if we
-# had to SIGKILL the lingering process.
+# Authentication is npm trusted publishing (OIDC), so there is no token here
+# and there must not be one: npm reads an `_authToken` as an instruction to
+# authenticate as that token's owner, and having done so it will not attempt a
+# trusted publish. What the job supplies instead is `permissions: id-token:
+# write`, which npm exchanges for a short-lived credential scoped to this
+# workflow. The registry checks the claim against the trusted publisher
+# configured on each package — owner, repository, workflow filename and
+# environment — so a publish from another workflow, or from a fork, has
+# nothing to present.
+#
+# Provenance comes with it: npm attests the build from the same credential,
+# which is why nothing here passes --provenance.
+#
+# Requires npm >= 11.5.1, which the publish jobs install. A runner's bundled
+# npm is generally older and fails with a plain authentication error rather
+# than anything that names the version.
+#
+# The watchdog covers two npm failure modes: (1) npm prints the `+ @rebon/...`
+# success line but the process lingers because of a keep-alive HTTP agent that
+# never gets destroyed; (2) the publish stalls before any success line. The
+# success line is npm's authoritative "registry accepted" marker, trusted even
+# if we had to SIGKILL the lingering process.
 set -eu
 
-test -n "${NPM_ORG_TOKEN:-}" || { echo "NPM_ORG_TOKEN secret required" >&2; exit 1; }
-
-printf '@rebon:registry=https://registry.npmjs.org/\n//registry.npmjs.org/:_authToken=%s\n' \
-  "$NPM_ORG_TOKEN" > .npmrc
-export NPM_CONFIG_USERCONFIG="$PWD/.npmrc"
-trap 'rm -f "$PWD/.npmrc"' EXIT
-
-npm whoami --registry=https://registry.npmjs.org/
+# No .npmrc, and no `npm whoami`: there is no user to be. A trusted publish
+# authenticates per publish, so the first thing that proves the credential
+# works is the publish itself.
 
 # A 36 MB payload over a slow residential uplink can legitimately take
 # minutes; 180s killed a mid-flight win32 upload on v0.1.4. Keep the watchdog
@@ -77,7 +87,11 @@ publish_attempt() {
   tarball="$1"
   logfile="$(mktemp)"
   hard_timeout=480
-  lingering_grace=5
+  # Wide enough to cover what still happens after the success line: a trusted
+  # publish signs the provenance attestation and uploads it once the tarball
+  # is accepted, so killing at the old five seconds could land between the two
+  # and leave a published version with no attestation.
+  lingering_grace=30
 
   npm publish "$tarball" --tag latest --access public \
       --registry=https://registry.npmjs.org/ \
