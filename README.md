@@ -177,6 +177,17 @@ You can also just rerun:
 npm install -g @rebon/cli@latest
 ```
 
+## Privacy
+
+Rebon has no telemetry — no analytics, no crash reporting, no usage events,
+no anonymous install ID. The only request it makes on its own is the update
+check above: a plain `GET` for `@rebon/cli`'s public npm metadata, carrying
+no identifiers and not even your current version. Everything else on the
+wire is a request you made — a model turn, a `WebFetch`, an MCP call.
+
+[PRIVACY.md](PRIVACY.md) lists every outbound request the binary can make,
+with the file each one lives in, plus the commands to verify it yourself.
+
 ## Troubleshooting
 
 - **"missing optional platform package"** — reinstall without

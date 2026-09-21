@@ -165,6 +165,17 @@ TUI 里：
 npm install -g @rebon/cli@latest
 ```
 
+## 隐私
+
+Rebon 没有遥测 —— 没有 analytics，没有崩溃上报，没有使用事件，没有匿名安装
+ID。它唯一自己发起的请求就是上面这个更新检查：一个纯 `GET`，读取
+`@rebon/cli` 的公开 npm 元数据，不带任何标识，连你当前的版本都不会上报。
+其余所有出站流量都是你自己发起的请求 —— 一轮模型对话、一次 `WebFetch`、
+一次 MCP 调用。
+
+[PRIVACY.zh-CN.md](PRIVACY.zh-CN.md) 列出了这个二进制所有可能发出的请求、
+每条各自所在的文件，以及你自己动手核实的命令。
+
 ## 排查
 
 - **"missing optional platform package"** —— 去掉 `--omit=optional` /
