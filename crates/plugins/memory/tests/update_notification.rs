@@ -55,7 +55,7 @@ fn annotate(booted: &Booted, tool: &str, input: Value, cwd: &str) -> Value {
     output
 }
 
-/// The line the pre-move tools produced, formatted the same way.
+/// The line, formatted the same way from the same inputs.
 fn expected_line(memory_file: &str, cwd: &str) -> String {
     let home = rebon_session::platform_home_dir()
         .map(|home| home.to_string_lossy().into_owned())

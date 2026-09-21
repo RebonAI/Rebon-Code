@@ -84,10 +84,9 @@ pub fn tools() -> Vec<Arc<dyn rebon_tool::Tool>> {
 
 /// `/skills` as the command seat sees it.
 ///
-/// The four fields are the ones the built-in table declared, carried over
-/// unchanged: the same name, the same one-line description, the same Chinese
-/// alias, the same `Panel` kind, and the same two surfaces — both local front
-/// ends and the `rebon serve` page, which was `LOCAL_WEB` in that table.
+/// The fields, each of them load-bearing: the one-line description the `/`
+/// picker shows, the Chinese alias, the `Panel` kind, and the two surfaces —
+/// both local front ends and the `rebon serve` page.
 ///
 /// The command opens [`dialog::SkillsDialogState`], which this plugin also
 /// registers, so the two arrive and leave together: with the plugin off there
@@ -256,9 +255,8 @@ mod tests {
         assert!(seat.resolve(SKILL_TOOL_NAME, None).unwrap().is_some());
     }
 
-    /// `/skills` is this plugin's command, and it carries the five fields the
-    /// built-in table declared, so moving it off that table is not a change to
-    /// what `/help` or the `/` picker shows.
+    /// `/skills` is this plugin's command, carrying the fields `/help` and
+    /// the `/` picker show.
     #[test]
     fn the_switch_takes_the_command_off_the_seat_and_puts_it_back() {
         let (kernel, registry) = loaded_kernel();
@@ -272,9 +270,9 @@ mod tests {
         assert_eq!(registered.owner, PLUGIN_ID);
         assert_eq!(registered.handler.native_id(), Some("skills"));
         // Spelled out rather than compared against `command_spec()`, which
-        // would only compare the function against itself. These are the fields the
-        // built-in row carried, and losing one is invisible until a picker
-        // stops finding the command or `/help` files it under the wrong tab.
+        // would only compare the function against itself. Losing one of these
+        // is invisible until a picker stops finding the command or `/help`
+        // files it under the wrong tab.
         let spec = &registered.spec;
         assert_eq!(spec.description.as_ref(), "Manage available skills");
         assert_eq!(spec.zh_aliases, vec!["技能"]);
@@ -282,8 +280,7 @@ mod tests {
         assert_eq!(spec.hint, None);
         assert_eq!(spec.kind, CommandKind::Panel);
         assert_eq!(spec.category, rebon_command_seat::Category::Command);
-        // Both local front ends and the `rebon serve` page — `LOCAL_WEB` in
-        // the table this row came from — and nothing else.
+        // Both local front ends and the `rebon serve` page, and nothing else.
         assert_eq!(spec.surfaces, Surfaces::LOCAL.with(Surfaces::WEB));
         assert!(spec.available_on(Surface::Tui));
 

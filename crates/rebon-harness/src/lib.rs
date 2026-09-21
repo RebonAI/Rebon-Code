@@ -2380,8 +2380,8 @@ pub async fn build_headless_session(
     // Sub-agent delegation, on the same terms as every other surface.
     //
     // This seam was simply never connected here. `rebon exec` passed
-    // `sub_agents_enabled: false` from the day it was written
-    // (`3cf042b4`) with no comment, and the flag was telling the truth:
+    // `sub_agents_enabled: false` from the day it was written with no
+    // comment, and the flag was telling the truth:
     // with no spawner in the context, `Agent` would have failed at call
     // time. But the flag is a *user setting* that defaults to on
     // ("users opt out via the settings toggle, not opt in" —

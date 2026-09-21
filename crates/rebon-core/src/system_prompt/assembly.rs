@@ -255,7 +255,7 @@ fn standard_base_sections() -> Vec<PromptSectionDef> {
         }),
         // Ranks 60 and 70 — tone-and-style and output-efficiency — are
         // `Rung::Style` / `Rung::Efficiency` on the prompt seat, held by
-        // `rebon-plugin-model-prompt` since 2026-09-05.
+        // `rebon-plugin-model-prompt`.
     ]
 }
 
@@ -293,7 +293,7 @@ fn stable_context_sections() -> Vec<PromptSectionDef> {
             optional_non_empty(&ctx.rebon_md_content)
         }),
         // Rank 40 is `Rung::Memory`: the auto-`MEMORY.md` section is
-        // `rebon-plugin-memory`'s, off the prompt seat, since 2026-09-05.
+        // `rebon-plugin-memory`'s, off the prompt seat.
         // Nothing else stands here, so with that plugin off the plane closes
         // up and the project instruction files run straight into the MCP
         // instructions — which is what "auto-memory is off" has always meant.
@@ -346,20 +346,16 @@ mod tests {
     use super::*;
     use crate::prompt_seat::Rung;
 
-    /// The pre-registry builders, copied VERBATIM from `system_prompt.rs`
-    /// as they stood before the registry migration (coordinator env read
-    /// parameterized so tests never mutate the environment). This is the
-    /// golden reference: the registry must reproduce every byte.
+    /// The reference builders the registry is compared against: the section
+    /// order and join rules written out plainly, without the registry, so the
+    /// assembly has something to reproduce byte for byte (coordinator env read
+    /// parameterized so tests never mutate the environment).
     ///
-    /// Two amendments since, both the same shape: a section left the engine
-    /// table for a plugin, so the reference drops it and the plugin crate
-    /// owns the golden for the full plane. The base builder's last two
-    /// sections (tone and style, output efficiency) moved to
-    /// `rebon-plugin-model-prompt` on 2026-09-05, so the reference base is
-    /// five sections and that crate's `tests/base_prompt_golden.rs` pins the
-    /// seven-section plane. The stable builder's auto-memory section moved to
-    /// `rebon-plugin-memory` the same day; its
-    /// `tests/stable_prompt_golden.rs` pins the plane with memory back in.
+    /// Two sections are not in this reference. Tone and style and output
+    /// efficiency belong to `rebon-plugin-model-prompt`, whose
+    /// `tests/base_prompt_golden.rs` pins the full seven-section base plane,
+    /// and the auto-memory section belongs to `rebon-plugin-memory`, whose
+    /// `tests/stable_prompt_golden.rs` pins the stable plane.
     mod legacy {
         use super::super::super::sections::{
             actions_section, doing_tasks_section, env_info_section, intro_section,
@@ -686,8 +682,7 @@ mod tests {
                 "env-info",
                 "language",
                 "rebon-md",
-                // Rank 40 (`memory`) left the table for the memory plugin's
-                // `Rung::Memory` on 2026-09-05.
+                // Rank 40 is the memory plugin's `Rung::Memory`.
                 "mcp-instructions",
                 "runtime-tools",
                 "session-guidance",
@@ -765,8 +760,8 @@ mod tests {
     }
 
     /// The model-prompt plugin's golden fixture, vouched for from this side:
-    /// its first five sections are what the legacy builder produces, and
-    /// what follows is exactly the two texts the plugin registers. The
+    /// its first five sections are what the reference base builder produces,
+    /// and what follows is exactly the two texts the plugin registers. The
     /// plugin's own golden assembles the plane through the seat; this one
     /// never touches the seat, so the two cannot be wrong together.
     #[test]

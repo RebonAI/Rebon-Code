@@ -207,8 +207,8 @@ impl Plugin for TasksPlugin {
 
         // `/tasks`, `/workflows` and `/teams`: the three ways a person asks to
         // see the work these tools created. They belong to the same switch as
-        // the tools, so they are registered here rather than listed in the
-        // built-in table. The handler is `Native` — opening a panel is a write
+        // the tools, so they are registered here. The handler is `Native` —
+        // opening a panel is a write
         // into the front end's own state, so the front end runs it by name.
         let commands = ctx.require::<CommandSeatService>()?;
         for spec in ui::commands::command_specs() {

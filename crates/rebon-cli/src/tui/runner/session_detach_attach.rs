@@ -266,8 +266,7 @@ pub(super) const MID_TURN_HANDOVER_REFUSAL: &str = "Finish or cancel the running
 /// same handover with the TUI staying on it. Afterwards the engine that owns
 /// this conversation lives in a process that outlives the terminal, so
 /// closing the TUI detaches instead of killing — and every sub-agent the
-/// session spawns lives in that worker too, which is the whole point (see
-/// an out-of-tree survey).
+/// session spawns lives in that worker too, which is the whole point.
 pub(super) fn host_current_session_in_worker(
     app: &mut AppState,
     session: &mut TuiEngineSession,

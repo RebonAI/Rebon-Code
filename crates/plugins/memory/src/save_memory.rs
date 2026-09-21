@@ -230,8 +230,8 @@ mod tests {
     /// take this before touching it — and it is *the* lock this crate's
     /// tests take, not a second one.
     ///
-    /// This module kept its own until the store moved in beside it on
-    /// 2026-09-05. Two locks over one process-global serialise nothing:
+    /// This module kept its own until the store moved in beside it.
+    /// Two locks over one process-global serialise nothing:
     /// `loaded_files` started reading the real `~/.rebon/REBON.md` whenever
     /// one of these tests happened to restore the environment mid-read. A
     /// lock cannot be shared across *crates* and does not need to be, since

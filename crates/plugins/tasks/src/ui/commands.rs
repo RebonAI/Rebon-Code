@@ -4,8 +4,7 @@
 //! reducer live next door in [`crate::ui`], over data only the task runtime
 //! has. Turning `plugins.tasks.enabled` off takes the thirteen tools and
 //! every one of those surfaces with it, so these three have to go too —
-//! which is why they are registered here on the command seat rather than
-//! listed in `rebon-slash-commands`'s built-in table.
+//! which is why they are registered here, on the command seat.
 //!
 //! The handler stays `CommandHandler::Native`: opening a dialog means
 //! writing into the front end's own state, so the front end runs it, keyed

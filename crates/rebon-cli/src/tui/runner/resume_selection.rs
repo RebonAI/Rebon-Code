@@ -511,7 +511,7 @@ pub(super) fn prepare_resumed_session_summary(
 /// committed from the picker, once in an in-process resume that did its own
 /// locking — and the two copies drifted before the second was deleted for
 /// having had no caller outside `cfg(test)` since the async resume chooser
-/// landed in `a167d225`.
+/// landed.
 ///
 /// Adopting the resumed directory as the screen's and releasing the ACP raw
 /// transcript stay at the call site: they belong to committing a resume, not

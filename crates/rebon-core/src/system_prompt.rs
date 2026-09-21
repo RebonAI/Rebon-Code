@@ -881,7 +881,7 @@ mod tests {
 
     /// What the `memory` plugin puts on the prompt seat: one section on
     /// [`crate::prompt_seat::Rung::Memory`], rank 40 of the stable plane —
-    /// the slot the engine's own `memory` section held until 2026-09-05.
+    /// the slot the engine's own `memory` section held.
     fn memory_section(text: &str) -> PluginPromptSection {
         PluginPromptSection::new("memory prompt", crate::prompt_seat::Rung::Memory, text)
     }

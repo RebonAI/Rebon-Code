@@ -32,7 +32,7 @@ use rebon_tools_core::{
 };
 use rebon_types::SessionUpdate;
 
-// ── Test-local helpers (copied verbatim from the engine test module) ──
+// ── Test-local helpers ──
 
 fn temp_projects_root(tag: &str) -> tempfile::TempDir {
     tempfile::Builder::new()

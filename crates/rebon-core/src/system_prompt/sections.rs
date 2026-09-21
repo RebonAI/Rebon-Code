@@ -520,8 +520,8 @@ pub(super) fn session_specific_guidance_section(
 }
 
 // `# Tone and style` and `# Output efficiency` — the model-preference
-// sections that used to follow here — are `rebon-plugin-model-prompt`'s
-// since 2026-09-05, contributed through the prompt-sections seat at
+// sections that used to follow here — are `rebon-plugin-model-prompt`'s,
+// contributed through the prompt-sections seat at
 // `Rung::Style` / `Rung::Efficiency`.
 
 /// The `Notes:` block appended to a sub-agent's system prompt.

@@ -205,8 +205,8 @@ crate as `crates/rebon-<name>/`, a Rust feature plugin as
   removal of a single-consumer crate boundary.
 - **Moving a module is not a home for its data shapes.** Before folding
   something into the terminal crate, put the data shapes it carries somewhere
-  both sides can reach: `PromptPasteContent` (in `rebon-session-host`, formerly
-  `rebon-background`, carried between detach and attach) and `effort_indicator`
+  both sides can reach: `PromptPasteContent` (in `rebon-session-host`,
+  carried between detach and attach) and `effort_indicator`
   (headless paths such as `rebon exec` read `ReasoningEffort`, and a synonymous
   `EffortLevel` lives here too) both sank into `rebon-types`. The test is
   "would a headless path have to reach for ratatui to get this". A junk drawer
@@ -225,16 +225,13 @@ crate as `crates/rebon-<name>/`, a Rust feature plugin as
   itself; it once lived alone in `rebon-settings`, at the cost of every crate
   using `PermissionMode` depending on an interface crate. `rebon-config` only
   reads and writes the config file; no interface projections go in it.
-- `plugins/agents/src/surface/` (formerly the dependency-free crate
-  `rebon-agents`) is no longer bound by the zero-dependency contract now that it
-  is in a plugin, and keeps two rules instead: no IO (file access through the
+- `plugins/agents/src/surface/` keeps two rules: no IO (file access through the
   injected `AgentFs`, LLM calls through `AgentGenerator`) and no ratatui (it
   produces `String`s and data structures; the terminal does the painting).
-- `plugins/onboarding/src/onboarding/` (formerly the dependency-free crate
-  `rebon-onboarding`, allowed only sha2 + base64) is likewise no longer bound by
-  that contract, but it is OAuth's decision layer: a new dependency still needs
-  its reason written down, and crypto is always `sha2` / `base64`, never
-  hand-rolled. IO belongs to the same plugin's `oauth/`, config read/write to
+- `plugins/onboarding/src/onboarding/` is OAuth's decision layer: its only
+  dependencies are `sha2` and `base64`, a new one needs its reason written
+  down, and crypto is never hand-rolled. IO belongs to the same plugin's
+  `oauth/`, config read/write to
   `store.rs`, and painting to the terminal. The import step `migrate.rs` is a
   pure library that app and cli call directly rather than through a seat — the
   import keeps working with the plugin turned off.

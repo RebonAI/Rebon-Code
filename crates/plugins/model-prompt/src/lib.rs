@@ -3,14 +3,10 @@
 //!
 //! Two sections of the base plane are preferences about how a model should
 //! talk rather than facts about the session — `# Tone and style` and
-//! `# Output efficiency`. They used to be rows 60 and 70 of the engine's own
-//! base table; they are this plugin's now, put on the kernel's
-//! `prompt-sections` seat ([`rebon_core::prompt_seat`]) at the rungs that
-//! hold those ranks, [`Rung::Style`] and [`Rung::Efficiency`]. The engine
-//! assembles them exactly where it used to, so with the plugin loaded the
-//! base plane keeps the layout it had before the move — the golden in
-//! `tests/base_prompt_golden.rs` holds the pre-move layout plus the later
-//! wording-only prompt rewrite, as that file's own docs say.
+//! `# Output efficiency`. This plugin puts them on the kernel's
+//! `prompt-sections` seat ([`rebon_core::prompt_seat`]) at [`Rung::Style`]
+//! and [`Rung::Efficiency`], the ranks the engine's base table leaves for
+//! them, and the engine assembles them there.
 //!
 //! **Why a plugin.** Different models do not benefit equally from one
 //! prompt, and a preference that varies by model has no business as an
@@ -18,13 +14,13 @@
 //! [`PromptSubject`], so the answer can depend on the model and on the
 //! tools the turn offers, and the engine never learns a model's name.
 //!
-//! **What stayed behind.** `sub_agent_notes_section` (the spawner appends it
-//! to a sub-agent's prompt through a different path) and the coordinator
-//! contract (which never carried these two sections) are the engine's.
+//! **What the engine keeps.** `sub_agent_notes_section` (the spawner appends
+//! it to a sub-agent's prompt through a different path) and the coordinator
+//! contract (which never carries these two sections).
 //!
-//! **Families.** The two shared sections go to every model unchanged — for
-//! Claude that equality with the pre-move prompt is the hard constraint of
-//! the move. GPT-6 Astra additionally gets a short addendum
+//! **Families.** The two shared sections go to every model unchanged, byte
+//! for byte, which is what `tests/base_prompt_golden.rs` pins. GPT-6 Astra
+//! additionally gets a short addendum
 //! ([`sections::astra_working`]) after the efficiency section, and its one
 //! tool-specific line is only issued when the turn actually offers
 //! `run_code`. Which family a model is in is asked of the vendor catalogue
@@ -96,11 +92,7 @@ pub fn model_family(model: &str) -> ModelFamily {
 /// The sections this plugin contributes for one turn's subject, in render
 /// order: the two shared sections, then the Astra addendum for that family.
 pub fn sections_for_subject(subject: &PromptSubject) -> Vec<PluginPromptSection> {
-    // Both sections go to every model unchanged. Scaling them by capability
-    // was built and measured on 2026-09-09 (an out-of-tree A/B bench, thirty runs
-    // each on a frontier and a small model) and dropped: neither the long
-    // text nor a shorter one changed anything measurable, and a prompt sent
-    // every turn is not edited on a hunch.
+    // Both sections go to every model unchanged.
     let mut sections = vec![
         PluginPromptSection::new(
             TONE_AND_STYLE_SECTION,

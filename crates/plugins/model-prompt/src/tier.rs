@@ -18,9 +18,8 @@
 //! plan*, competing with the one the model already made. That is where
 //! "stopped halfway" and "would not stop" come from.
 //!
-//! This module classifies models and nothing else: the per-tier
-//! scaffolding it was written for was measured and dropped, so no prompt
-//! text is changed from here.
+//! This module classifies models and nothing else: no prompt text is
+//! changed from here.
 //!
 //! # Measure first, judge second
 //!

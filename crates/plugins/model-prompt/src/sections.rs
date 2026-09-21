@@ -1,7 +1,5 @@
-//! These sections originated at ranks 60 and 70 in the engine's table
-//! (`rebon-core/src/system_prompt/sections.rs`, until 2026-09-05).
-//! Their current wording is pinned together with the rest of the base plane
-//! by `tests/base_prompt_golden.rs`; unpaired edits intentionally fail it.
+//! The wording here is pinned together with the rest of the base plane by
+//! `tests/base_prompt_golden.rs`; unpaired edits intentionally fail it.
 
 /// The `# Tone and style` section (`Rung::Style`).
 pub const TONE_AND_STYLE: &str = "# Tone and style
@@ -18,14 +16,6 @@ with a period rather than \"Let me read the file:\".";
 /// The `# Output efficiency` section (`Rung::Efficiency`). Kept short on
 /// purpose: it is re-sent on every turn, so every extra sentence is a
 /// recurring token cost.
-///
-/// A shorter rewrite was tried and dropped. On 2026-09-09 an out-of-tree A/B bench
-/// measured this text against a 47-word version that cut the four repeated
-/// "be concise" sentences: thirty runs each on `gpt-6-astra` (answer length
-/// 323 vs 319 characters) and `gpt-5.6-luna` (231 vs 238), requirements met
-/// identical at 48/48 on both. Nothing measurable was gained, so nothing is
-/// changed — the bar for editing a prompt every turn pays for is evidence,
-/// and there was none either way.
 pub const OUTPUT_EFFICIENCY: &str = "# Output efficiency
 
 IMPORTANT: Get to the point immediately. Begin with the simplest approach and avoid \

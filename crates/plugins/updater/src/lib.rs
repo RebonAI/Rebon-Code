@@ -87,9 +87,9 @@ pub fn update_check_seat(ctx: &Context) -> Option<Arc<UpdateCheckSeat>> {
 ///
 /// The hint is the grammar [`parse_update_command`] accepts, written next to
 /// the parser rather than in a table someone editing the parser would never
-/// open. [`Surfaces::LOCAL`] is what the built-in table declared: the desktop
-/// app lists the command even though only the terminal runs it, and narrowing
-/// that is a product decision, not this crate's.
+/// open. [`Surfaces::LOCAL`]: the desktop app lists the command even though
+/// only the terminal runs it, and narrowing that is a product decision, not
+/// this crate's.
 pub fn command_spec() -> CommandSpec {
     CommandSpec::new("update", "Manage local Rebon update checks")
         .zh_aliases(["更新"])

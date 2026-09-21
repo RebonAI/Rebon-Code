@@ -18,13 +18,13 @@
 //! turns has to be read before the model acts, not one tool round later, and
 //! that eager phase also keeps message index 0 frozen — the trigger is appended
 //! to history rather than rewritten into the system prompt. The seat forwards
-//! the complete request unchanged, so this survived the move.
+//! the complete request unchanged.
 //!
-//! **What stayed behind.** Finding the triggers is the engine's:
-//! `query::session_prompt` diffs the document snapshot at turn start and the
-//! executor hands the result over on the binding, so
-//! [`NestedMemoryTrigger`] is `rebon_core::attachment_seat`'s like every
-//! other binding payload. This module only renders them.
+//! **Finding the triggers is the engine's.** `query::session_prompt` diffs the
+//! document snapshot at turn start and the executor hands the result over on
+//! the binding, so [`NestedMemoryTrigger`] is
+//! `rebon_core::attachment_seat`'s like every other binding payload. This
+//! module only renders them.
 
 use std::sync::Arc;
 

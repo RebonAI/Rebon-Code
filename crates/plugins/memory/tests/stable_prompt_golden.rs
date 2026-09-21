@@ -1,18 +1,17 @@
-//! The stable runtime-context plane with this plugin loaded is byte-identical
-//! to the plane the engine assembled on its own before the auto-memory
-//! section moved here, and losing exactly that block is what switching the
-//! plugin off does.
+//! The stable runtime-context plane with this plugin loaded carries the
+//! auto-memory section between the project instruction files and the MCP
+//! instructions, and switching the plugin off removes exactly that block.
 //!
 //! There is no frozen text fixture, because the section quotes absolute paths
 //! under the user's config home — a golden file would pin one machine's
-//! directories. The reference is the pre-move *rule* instead, copied verbatim
-//! into [`legacy_memory_prompt`] from `rebon-core`'s
-//! `resolve_dynamic_context_with_language` as it stood before the section moved
-//! out of the engine. The plane is then compared three ways: the text
+//! directories. The reference is the *rule* instead: [`legacy_memory_prompt`]
+//! resolves the block in its own code, so the seat's rendering is compared
+//! against a second implementation rather than against itself. The plane is
+//! then compared three ways: the text
 //! the seat contributes matches what that rule produces, the assembled plane
 //! with the plugin on is the plane without it plus that block and nothing
 //! else, and the block sits between the project instruction files and the MCP
-//! instructions — rank 40, where the engine's own `memory` section stood.
+//! instructions — rank 40, the memory rung.
 
 mod support;
 
@@ -25,10 +24,10 @@ use rebon_core::system_prompt::{
 use support::{boot, Booted, HomeGuard};
 
 // ---------------------------------------------------------------------------
-// The pre-move rule, copied verbatim
+// The reference rule, written out independently of the seat
 // ---------------------------------------------------------------------------
 
-/// `rebon-core`'s auto-memory resolution as it stood before the move, with
+/// The auto-memory resolution the seat's text is compared against, with
 /// `available_tool_names` / `coordinator_mode` / `cwd` as the parameters the
 /// engine held as locals. Not called by production code — it is the reference
 /// the migrated path is compared against.

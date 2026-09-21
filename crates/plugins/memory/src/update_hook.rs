@@ -1,16 +1,11 @@
 //! The `Memory updated in … · /memory to edit` line, as a turn hook.
 //!
-//! Until 2026-09-05 this was three copies of the same branch inside `Write`,
-//! `Edit` and `MultiEdit` — each asking the memory store whether the path it
-//! had just written was an auto-memory path, and each formatting the same
-//! notification: a feature had reached into the core file tools.
-//!
-//! It is now one subscriber on the kernel's `turn-hooks` seat, annotating any
+//! One subscriber on the kernel's `turn-hooks` seat, annotating any
 //! successful file-edit call whose target lands in an auto-memory directory.
 //! Which tools those are, and which input field names their path, comes from
 //! `rebon-tools-core`'s builtin tool table rather than a list of names written
 //! here — so `NotebookEdit`, which is in the same permission class and has
-//! always had the same auto-memory carve-out, now gets the notification too.
+//! always had the same auto-memory carve-out, gets the notification too.
 //!
 //! Switching the plugin off takes the line away with it, which is the point:
 //! there is no `/memory` to edit when there is no memory feature.

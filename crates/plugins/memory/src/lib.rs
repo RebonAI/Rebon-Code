@@ -73,10 +73,9 @@ pub fn tools() -> Vec<Arc<dyn rebon_tool::Tool>> {
 
 /// `/memory` as the command seat sees it.
 ///
-/// Every field is the one the built-in table declared, carried over
-/// unchanged: the same name, the same one-line description, the same Chinese
-/// alias, the same `Session` kind, and the same wide surface set — every
-/// front end, the `rebon serve` page, the mobile app, and the
+/// The fields, each of them load-bearing: the one-line description the `/`
+/// picker shows, the Chinese alias, the `Session` kind, and the wide surface
+/// set — every front end, the `rebon serve` page, the mobile app, and the
 /// session-control bit that makes a mirror forward it to the process owning
 /// the session rather than answering from a stale projection.
 ///
@@ -124,19 +123,17 @@ impl Plugin for MemoryPlugin {
             Arc::new(NestedMemoryProducer),
         )?;
 
-        // The auto-`MEMORY.md` prompt section. `Rung::Memory` is rank 40 of
-        // the stable plane — where the engine's own `memory` section stood
-        // until this took it over — so a session with the plugin on receives
-        // the same bytes it always did, and one with it off loses exactly
-        // that block. The project instruction files at rank 30 are not
-        // memory and stay with the engine.
+        // The auto-`MEMORY.md` prompt section: `Rung::Memory`, rank 40 of the
+        // stable plane, so a session with the plugin on receives the same
+        // bytes the engine's own `memory` section produced, and one with it
+        // off loses exactly that block. The project instruction files at
+        // rank 30 are not memory and stay with the engine.
         let prompt_seat = ctx.require::<PromptSeatService>()?;
         prompt_seat.register(ctx, PROVIDER_ID, Arc::new(MemoryPromptSections))?;
 
-        // The `Memory updated in … · /memory to edit` line, which used to be
-        // three copies of an auto-memory branch inside `Write`, `Edit` and
-        // `MultiEdit`. Ordinary order: it only adds a field, and nothing else
-        // in the phase reads it.
+        // The `Memory updated in … · /memory to edit` line, on the turn-hooks
+        // seat. Ordinary order: it only adds a field, and nothing else in the
+        // phase reads it.
         let turn_hooks = ctx.require::<TurnHookSeatService>()?;
         turn_hooks.subscribe_scoped(
             ctx,
@@ -275,10 +272,9 @@ mod tests {
         assert!(seat.resolve(SAVE_MEMORY_TOOL_NAME, None).unwrap().is_some());
     }
 
-    /// `/memory` is this plugin's command, and it carries every field the
-    /// built-in table declared — the wide surface set most of all, since it is
-    /// what puts the command on the mobile app and makes a mirror forward it
-    /// instead of answering from a stale projection.
+    /// `/memory` is this plugin's command, carrying the wide surface set in
+    /// particular: that is what puts the command on the mobile app and makes a
+    /// mirror forward it instead of answering from a stale projection.
     #[test]
     fn the_switch_takes_the_command_off_the_seat_and_puts_it_back() {
         let kernel = Kernel::new();
@@ -298,8 +294,7 @@ mod tests {
         assert_eq!(registered.owner, PLUGIN_ID);
         assert_eq!(registered.handler.native_id(), Some("memory"));
         // Spelled out rather than compared against `command_spec()`, which
-        // would only compare the function with itself. These are the fields the
-        // built-in row carried.
+        // would only compare the function with itself.
         let spec = &registered.spec;
         assert_eq!(
             spec.description.as_ref(),

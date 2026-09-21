@@ -238,9 +238,8 @@ mod tests {
             "memory",
             "doctor",
             "hooks",
-            // Registered by `plugins/agents` and `plugins/tasks`. They carry
-            // the `WEB` bit their built-in rows carried; reading the table
-            // alone had stopped seeing them.
+            // Registered by `plugins/agents` and `plugins/tasks`; their `WEB`
+            // bit comes from the seat, not from the built-in table.
             "agents",
             "tasks",
             "workflows",
@@ -282,9 +281,8 @@ mod tests {
                 .clone()
         };
 
-        // The three that moved and stayed (`/login` and `/logout` moved too,
-        // then were removed outright). Their descriptions are the ones the
-        // built-in table carried, word for word.
+        // The three plugin commands `/help` has to keep listing, with the
+        // descriptions word for word.
         assert_eq!(described("/skills"), "Manage available skills");
         assert_eq!(
             described("/memory"),

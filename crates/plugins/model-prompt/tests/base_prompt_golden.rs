@@ -1,9 +1,6 @@
 //! The base plane with this plugin loaded matches the approved wording in
 //! the golden fixture, preserving the layout from before the sections moved.
 //!
-//! `fixtures/base-prompt-2026-09-05.txt` originated as the pre-move plane,
-//! dumped from the engine's assembly at the last commit carrying those rows
-//! (`47da82f1`), and has since received the wording-only prompt rewrite.
 //! The sections come off a real seat through a real load of
 //! [`rebon_plugin_model_prompt::PLUGIN`], so the golden also pins which rung
 //! and order the plugin registers at, and that the switch removes them.
@@ -158,9 +155,6 @@ fn base_plane_retains_safety_and_protocol_literals() {
 /// The models named here sit at opposite ends of the capability table —
 /// `tier::model_tier` reads the first two as frontier and the rest not —
 /// and the assertion is that this makes no difference to the bytes.
-/// Scaling the prompt by capability was built, measured on
-/// an out-of-tree A/B bench, and dropped for want of an effect; this is what keeps
-/// it dropped.
 #[test]
 fn every_model_reproduces_the_frozen_base_byte_for_byte() {
     let (kernel, _registry) = boot();

@@ -122,12 +122,11 @@ impl rebon_kernel::Service for OnboardingService {
 
 /// `/onboarding` as the command seat sees it.
 ///
-/// The four fields are the ones the built-in table declared, carried over
-/// unchanged: the same name, the same one-line description, the same two
-/// Chinese aliases, and the same `Panel` kind, which is what tells a front end
-/// this command opens a surface rather than sending text. The built-in row
-/// never set `surfaces`, so this one does not either — both take the
-/// `Surfaces::LOCAL` default.
+/// Four fields, each of them load-bearing: the one-line description the `/`
+/// picker shows, the two Chinese aliases, and the `Panel` kind, which is
+/// what tells a front end this command opens a surface rather than sending
+/// text. `surfaces` is left unset, so the spec takes the `Surfaces::LOCAL`
+/// default — both local front ends, not over the wire.
 pub fn command_spec() -> CommandSpec {
     CommandSpec::new("onboarding", "Re-run the setup wizard")
         .zh_aliases(["向导", "引导"])
@@ -137,10 +136,9 @@ pub fn command_spec() -> CommandSpec {
 /// `/migrate` as the command seat sees it.
 ///
 /// The import it runs is [`migrate`] — this crate's, and the wizard's own
-/// step — so the command belongs to the same switch. The four fields are the
-/// ones the built-in table declared, `surfaces` unset there and here, which
-/// takes the `Surfaces::LOCAL` default: both local front ends, not over the
-/// wire.
+/// step — so the command belongs to the same switch. `surfaces` is left
+/// unset, which takes the `Surfaces::LOCAL` default: both local front ends,
+/// not over the wire.
 pub fn migrate_command_spec() -> CommandSpec {
     CommandSpec::new(
         "migrate",
@@ -246,9 +244,8 @@ mod tests {
         (kernel, registry)
     }
 
-    /// `/onboarding` is this plugin's command, and it carries the four fields
-    /// the built-in table declared, so moving it off that table is not a
-    /// change to what the `/` picker shows.
+    /// `/onboarding` is this plugin's command, carrying the fields the `/`
+    /// picker shows.
     #[test]
     fn the_switch_takes_the_command_off_the_seat_and_puts_it_back() {
         let (kernel, registry) = booted();
@@ -264,9 +261,8 @@ mod tests {
         assert_eq!(registered.spec.kind, CommandKind::Panel);
         assert!(registered.spec.available_on(Surface::Tui));
 
-        // Both Chinese spellings the built-in row carried are still on the
-        // spec. `find` matches `name` and `aliases` only, so this is what
-        // carrying them over means today, and it is the same as before.
+        // Both Chinese spellings are live on the spec. `find` matches `name`
+        // and `aliases` only, so these are the two a user can type.
         assert_eq!(
             registered.spec.zh_aliases.as_ref(),
             ["向导".to_string(), "引导".to_string()]
@@ -283,8 +279,7 @@ mod tests {
 
     /// `/migrate`, `/login` and `/logout` are this plugin's too: the import
     /// runs [`migrate`] and the sign-in runs [`oauth`], both of which are in
-    /// this crate. Each carries the fields its built-in row declared, and all
-    /// three leave with the switch.
+    /// this crate. All three leave with the switch.
     #[test]
     fn the_switch_also_takes_migrate_login_and_logout() {
         let (kernel, registry) = booted();
@@ -305,8 +300,8 @@ mod tests {
             migrate.spec.zh_aliases.as_ref(),
             ["导入".to_string(), "迁移".to_string()]
         );
-        // The built-in row set no `surfaces`, so this one takes the same
-        // `LOCAL` default: both local front ends, not over the wire.
+        // `surfaces` is unset, so this spec takes the `LOCAL` default: both
+        // local front ends, not over the wire.
         assert_eq!(migrate.spec.surfaces, Surfaces::LOCAL);
 
         registry
