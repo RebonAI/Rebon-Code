@@ -21,6 +21,8 @@ rebon-agent-core.workspace = true
 rebon-plugin-tasks.workspace = true
 # `/agents` is this plugin's panel and this plugin's command: the dialog
 # model and the two seats it registers on.
+rebon-config.workspace = true
+rebon-config-seat.workspace = true
 rebon-command-seat.workspace = true
 rebon-dialog.workspace = true
 rebon-ui-seat.workspace = true

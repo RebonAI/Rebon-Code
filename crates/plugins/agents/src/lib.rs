@@ -77,6 +77,9 @@ pub use runtime::team_manager::{InProcessTeamManager, SessionTaskTeamManager};
 pub use rebon_tool::agent::AGENT_TOOL_NAME;
 
 /// Stable id: the config key `plugins.agents.enabled`.
+mod settings_row;
+pub use settings_row::SUB_AGENTS_OPTION;
+
 pub const PLUGIN_ID: &str = "agents";
 
 const PROVIDER_ID: &str = "agents";
@@ -313,6 +316,7 @@ impl Plugin for AgentsPlugin {
             .optional_inject(&[
                 rebon_instructions::agent_documents::AGENT_MEMORY_SERVICE,
                 <UiSeatService as Service>::NAME,
+                rebon_config_seat::CONFIG_SEAT_SERVICE,
             ])
             .provides(&[
                 rebon_tool::SUB_AGENT_SPAWNER_SERVICE,
@@ -342,6 +346,8 @@ impl Plugin for AgentsPlugin {
         if let Ok(ui) = ctx.require::<UiSeatService>() {
             ui.register_dialog(ctx, dialog_def())?;
         }
+
+        settings_row::register(ctx)?;
 
         Ok(())
     }
