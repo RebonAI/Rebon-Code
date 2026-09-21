@@ -3,6 +3,8 @@
 An agent CLI for coding and more — a terminal harness that drives an LLM through
 a real agent loop with tools, sessions, permissions, and a full TUI.
 
+> 中文版：[docs/README.zh-CN.md](docs/README.zh-CN.md)
+
 ## What is in this repository
 
 The `rebon` command-line agent and everything it needs to build: the crates, the
@@ -20,6 +22,19 @@ Comments here name them because the code they share was shaped by them:
 `assets/` holds the artefacts the CLI reads from those surfaces — the Windows
 icon, the generated i18n catalogues, and a committed build of the web UI that
 `build.rs` embeds so `cargo build` never needs Node.
+
+### About the tags in this repository
+
+This repository was previously where Rebon's releases were published, so its
+refs carry a large number of `app-v*` tags from the desktop app. They are kept
+deliberately: they are where those releases live, and deleting them would
+break the links pointing at them.
+
+They have nothing to do with the CLI. The CLI's own releases are the `v*`
+tags, and those are what the release workflow builds and publishes from.
+
+The desktop source is not here yet. It needs sorting out before it can be
+opened, and it will land in this repository when it is.
 
 ## Install
 
