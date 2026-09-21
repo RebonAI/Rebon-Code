@@ -728,9 +728,21 @@ pub(super) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replacement_and_host_join_close_unpublished_stdio_child() {
-        let node = std::env::var("REBON_TEST_NODE")
-            .expect("set REBON_TEST_NODE to the absolute node executable");
-        assert!(std::path::Path::new(&node).is_absolute());
+        // Gated the same way as every other test that drives a real Node
+        // child: the release workflow only exports REBON_TEST_NODE on the
+        // runner that has one, so elsewhere this skips rather than fails.
+        let Some(node) = std::env::var_os("REBON_TEST_NODE") else {
+            assert_ne!(
+                std::env::var_os("REBON_REQUIRE_TEST_NODE").as_deref(),
+                Some(std::ffi::OsStr::new("1")),
+                "REBON_REQUIRE_TEST_NODE=1 requires an absolute REBON_TEST_NODE"
+            );
+            eprintln!("skipping: set REBON_TEST_NODE to an absolute Node executable");
+            return;
+        };
+        let node = std::path::PathBuf::from(node);
+        assert!(node.is_absolute(), "REBON_TEST_NODE must be absolute");
+        let node = node.to_string_lossy().into_owned();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let script = format!(
             "const s = require('net').connect({}, '127.0.0.1', () => s.write('ready')); process.stdin.resume(); setInterval(() => {{}}, 1000);",
