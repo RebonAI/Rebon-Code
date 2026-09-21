@@ -48,9 +48,6 @@ break the links pointing at them.
 They have nothing to do with the CLI. The CLI's own releases are the `v*`
 tags, and those are what the release workflow builds and publishes from.
 
-The desktop source is not here yet. It needs sorting out before it can be
-opened, and it will land in this repository when it is.
-
 ## Install
 
 ```bash
