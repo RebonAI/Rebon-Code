@@ -1157,6 +1157,21 @@ mod tests {
         let mut active_prompt = None;
         let mut pending_permission = None;
         let mut theme = RenderTheme::default();
+        // The feedback row only appears when there is a transcript to put it
+        // in: on the empty startup screen `/fast` refreshes the banner
+        // instead, which the test below covers. Put one row in first so this
+        // test is about the row it is named after.
+        rebon_tui::reducer(
+            &mut app.rebon_tui,
+            rebon_tui::Action::Commit(rebon_tui::Message::System(rebon_tui::SystemMessage {
+                uuid: "seed".into(),
+                timestamp: String::new(),
+                subtype: "info".into(),
+                content: Some("earlier turn".into()),
+                level: None,
+                is_meta: None,
+            })),
+        );
 
         let should_quit = handle_key_action(
             &mut app,
@@ -1178,14 +1193,61 @@ mod tests {
         assert!(session.model.service_tier.is_fast());
         assert!(app.follow_transcript_tail);
         let rows = app.rebon_tui.transcript.rows();
-        assert_eq!(rows.len(), 1);
-        let rebon_tui::Message::System(system) = &rows[0] else {
+        assert_eq!(rows.len(), 2);
+        let rebon_tui::Message::System(system) = &rows[1] else {
             panic!("expected local feedback system row");
         };
         assert_eq!(system.subtype, "local_command");
         assert!(system.uuid.starts_with("s-fast-"));
         let content = system.content.as_deref().unwrap_or("");
         assert!(content.contains("Fast mode"), "{content}");
+        drop(runtime);
+    }
+
+    /// On the empty startup screen the result goes to the banner instead of
+    /// the transcript. This branch had no test at this level, which is how
+    /// both `/fast` tests above came to assert a row that is no longer
+    /// produced there and went red without naming what had changed.
+    ///
+    /// `TestConfigHome` rather than `lock_env` plus a hand-set
+    /// `REBON_CONFIG_DIR`: the two are different mechanisms over the same
+    /// process-global state, and a test holding one clobbers a test holding
+    /// the other.
+    #[test]
+    fn toggle_fast_on_the_empty_startup_screen_refreshes_the_banner_instead() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("fast-toggle-banner");
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        let mut session = make_test_tui_session();
+        session.model.service_tier_available = true;
+        let mut active_prompt = None;
+        let mut pending_permission = None;
+        let mut theme = RenderTheme::default();
+
+        assert!(
+            app.startup_banner_is_empty(),
+            "this test is about the empty screen"
+        );
+        handle_key_action(
+            &mut app,
+            KeyAction::ToggleFastMode,
+            &mut session,
+            &handle,
+            &mut active_prompt,
+            &mut pending_permission,
+            UiMode::Screen,
+            &mut theme,
+        );
+
+        assert!(session.model.service_tier.is_fast(), "the toggle still took");
+        assert!(
+            app.rebon_tui.transcript.is_empty(),
+            "the empty screen stays empty rather than gaining a row"
+        );
+        assert!(
+            app.pending_inline_banner_refresh,
+            "the banner is what reports it here"
+        );
         drop(runtime);
     }
 }

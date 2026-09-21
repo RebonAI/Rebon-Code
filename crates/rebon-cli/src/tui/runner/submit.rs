@@ -4765,6 +4765,21 @@ mod tests {
         let mut session = make_test_tui_session();
         session.model.service_tier_available = true;
         let mut active_prompt = None;
+        // The feedback row only appears when there is a transcript to put it
+        // in: on the empty startup screen `/fast` refreshes the banner
+        // instead, which the test below covers. Put one row in first so this
+        // test is about the row it is named after.
+        rebon_tui::reducer(
+            &mut app.rebon_tui,
+            rebon_tui::Action::Commit(rebon_tui::Message::System(rebon_tui::SystemMessage {
+                uuid: "seed".into(),
+                timestamp: String::new(),
+                subtype: "info".into(),
+                content: Some("earlier turn".into()),
+                level: None,
+                is_meta: None,
+            })),
+        );
 
         let should_quit = submit_or_queue(
             &mut app,
@@ -4789,8 +4804,8 @@ mod tests {
         assert!(active_prompt.is_none());
         assert!(app.follow_transcript_tail);
         let rows = app.rebon_tui.transcript.rows();
-        assert_eq!(rows.len(), 1);
-        let rebon_tui::Message::System(system) = &rows[0] else {
+        assert_eq!(rows.len(), 2);
+        let rebon_tui::Message::System(system) = &rows[1] else {
             panic!("expected local feedback system row");
         };
         assert_eq!(system.subtype, "local_command");
