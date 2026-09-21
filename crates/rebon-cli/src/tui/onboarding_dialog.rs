@@ -2773,7 +2773,7 @@ mod tests {
                 state.provider_form.base_url.value,
                 "https://api.deepseek.com"
             );
-            assert_eq!(state.provider_form.model.value, "deepseek-v4-flash");
+            assert_eq!(state.provider_form.model.value, "deepseek-flash");
         } else {
             assert!(state.selected_provider.is_some());
         }
@@ -3035,7 +3035,7 @@ mod tests {
             "https://api.deepseek.com"
         );
         assert_eq!(state.provider_form.format(), "openai");
-        assert_eq!(state.provider_form.model.value, "deepseek-v4-flash");
+        assert_eq!(state.provider_form.model.value, "deepseek-flash");
     }
 
     #[test]
@@ -3082,7 +3082,7 @@ mod tests {
             "https://api.deepseek.com"
         );
         assert_eq!(state.provider_form.format(), "openai");
-        assert_eq!(state.provider_form.model.value, "deepseek-v4-flash");
+        assert_eq!(state.provider_form.model.value, "deepseek-flash");
 
         let outcome = handle_key(&mut state, &key(KeyCode::Enter));
 
@@ -3119,7 +3119,7 @@ mod tests {
             state.provider_form.selected_preset(),
             ProviderPresetSelection::Custom
         );
-        assert_eq!(state.provider_form.model.value, "deepseek-v4-flash2");
+        assert_eq!(state.provider_form.model.value, "deepseek-flash2");
         assert_eq!(state.provider_form.name.value, "deepseek");
     }
 
@@ -3156,7 +3156,7 @@ mod tests {
                 api_key: "$DS".into(),
                 base_url: "https://api.deepseek.com".into(),
                 format: "openai".into(),
-                model: "deepseek-v4-flash".into(),
+                model: "deepseek-flash".into(),
             }
         );
     }

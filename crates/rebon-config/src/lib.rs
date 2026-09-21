@@ -3006,7 +3006,7 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         format: "openai",
         base_url: "https://api.deepseek.com",
         anthropic_base_url: Some("https://api.deepseek.com/anthropic"),
-        default_model: "deepseek-v4-flash",
+        default_model: "deepseek-flash",
         api_key_env: "DEEPSEEK_API_KEY",
         api_key_required: true,
         key_url: "https://platform.deepseek.com/api_keys",
@@ -9659,14 +9659,14 @@ mod tests {
         let preset = provider_preset_by_id("deepseek").unwrap();
         assert_eq!(preset.format, "openai");
         assert_eq!(preset.base_url, "https://api.deepseek.com");
-        assert_eq!(preset.default_model, "deepseek-v4-flash");
+        assert_eq!(preset.default_model, "deepseek-flash");
         assert_eq!(preset.api_key_env, "DEEPSEEK_API_KEY");
         assert_eq!(preset.vendor, rebon_api::ProviderVendor::DeepSeek);
         let models = preset.models();
         assert_eq!(models[0].id, "deepseek-v4-pro");
         assert_eq!(models[0].context_window, Some(1_000_000));
         assert_eq!(models[0].max_output_tokens, Some(384_000));
-        assert!(models.iter().any(|m| m.id == "deepseek-v4-flash"));
+        assert!(models.iter().any(|m| m.id == "deepseek-flash"));
 
         let glm = provider_preset_by_id("glm").unwrap();
         assert_eq!(glm.base_url, "https://open.bigmodel.cn/api/paas/v4");
@@ -10108,12 +10108,12 @@ mod tests {
         assert_eq!(info.format, "openai");
         assert_eq!(info.base_url, "https://api.deepseek.com");
         assert_eq!(info.api_key, "$DEEPSEEK_API_KEY");
-        assert_eq!(info.model, "deepseek-v4-flash");
+        assert_eq!(info.model, "deepseek-flash");
         assert_eq!(
             info.models,
             vec![
                 "deepseek-v4-pro".to_string(),
-                "deepseek-v4-flash".to_string(),
+                "deepseek-flash".to_string(),
                 "deepseek-v4-flash-vision-exp".to_string()
             ]
         );
@@ -10122,7 +10122,7 @@ mod tests {
             .expect("active preset provider");
         assert_eq!(resolved.vendor, rebon_api::ProviderVendor::DeepSeek);
         assert_eq!(
-            resolved.model_context_windows.get("deepseek-v4-flash"),
+            resolved.model_context_windows.get("deepseek-flash"),
             Some(&1_000_000)
         );
         assert_eq!(

@@ -699,7 +699,7 @@ mod tests {
         assert!(result.text.contains("Run /provider add"));
         assert!(!result.text.contains("<apiKey>"));
         assert!(result.text.contains("https://api.deepseek.com"));
-        assert!(result.text.contains("deepseek-v4-flash: 1000000"));
+        assert!(result.text.contains("deepseek-flash: 1000000"));
         assert!(result.text.contains("deepseek-v4-pro: 1000000"));
         assert!(result.runtime_update.is_none());
     }
@@ -734,7 +734,7 @@ mod tests {
         assert!(result.text.contains("Key:    $DEEPSEEK_API_KEY"));
         let update = result.runtime_update.expect("runtime update");
         assert_eq!(update.provider_name, "deepseek");
-        assert_eq!(update.model_name, "deepseek-v4-flash");
+        assert_eq!(update.model_name, "deepseek-flash");
     }
 
     #[test]

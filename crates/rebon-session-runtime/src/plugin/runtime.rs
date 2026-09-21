@@ -331,14 +331,14 @@ mod tests {
         assert_eq!(provider.default_model.as_deref(), Some("deepseek-v4-pro"));
         // The `small` profile drives compaction summaries; it stays on Flash so
         // a Pro default does not make every compaction cost Pro output rates.
-        assert_eq!(provider.profiles.get("small"), Some("deepseek-v4-flash"));
+        assert_eq!(provider.profiles.get("small"), Some("deepseek-flash"));
         assert_eq!(
             provider
                 .models
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            vec!["deepseek-v4-flash", "deepseek-v4-pro"]
+            vec!["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"]
         );
         assert_eq!(
             provider.models["deepseek-v4-pro"].context_window,

@@ -312,7 +312,7 @@ const GEMINI_MODELS: &[KnownModel] = &[
 /// api-docs.deepseek.com/quick_start/pricing.
 const DEEPSEEK_MODELS: &[KnownModel] = &[
     known("deepseek-v4-pro", 1_000_000, Some(384_000)),
-    known("deepseek-v4-flash", 1_000_000, Some(384_000)),
+    known("deepseek-flash", 1_000_000, Some(384_000)),
     known("deepseek-v4-flash-vision-exp", 1_000_000, Some(384_000)),
 ];
 

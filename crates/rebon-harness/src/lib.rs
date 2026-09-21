@@ -1276,7 +1276,7 @@ fn prune_handle_from_model_config(
 /// `context_length_exceeded` error.
 fn infer_openai_context_window(model: &str) -> u32 {
     let m = model.to_ascii_lowercase();
-    if m == "deepseek-v4-flash" {
+    if m == "deepseek-flash" {
         200_000
     } else if m == "deepseek-v4-pro" {
         1_000_000
@@ -1682,7 +1682,7 @@ pub fn build_env_compact_provider(
 ///
 /// Provider-specific fallback:
 /// - Anthropic (`ANTHROPIC_API_KEY` set) → `claude-sonnet-4-6`
-/// - DeepSeek (`DEEPSEEK_API_KEY` set) → `deepseek-v4-flash`
+/// - DeepSeek (`DEEPSEEK_API_KEY` set) → `deepseek-flash`
 /// - otherwise → `gpt-4o`
 ///
 /// `REBON_MODEL` overrides the fallback in every case; the DeepSeek
@@ -1699,7 +1699,7 @@ pub fn default_model() -> String {
     {
         std::env::var("REBON_MODEL")
             .or_else(|_| std::env::var("DEEPSEEK_MODEL"))
-            .unwrap_or_else(|_| "deepseek-v4-flash".to_string())
+            .unwrap_or_else(|_| "deepseek-flash".to_string())
     } else {
         std::env::var("REBON_MODEL").unwrap_or_else(|_| "gpt-4o".to_string())
     }
@@ -3593,7 +3593,7 @@ mod tests {
         assert_eq!(infer_openai_context_window("gpt-4o"), 128_000);
         assert_eq!(infer_openai_context_window("o4-mini"), 200_000);
         assert_eq!(infer_openai_context_window("gpt-5.3-codex"), 1_000_000);
-        assert_eq!(infer_openai_context_window("deepseek-v4-flash"), 200_000);
+        assert_eq!(infer_openai_context_window("deepseek-flash"), 200_000);
         assert_eq!(infer_openai_context_window("deepseek-v4-pro"), 1_000_000);
         assert_eq!(infer_openai_context_window("unknown-model"), 128_000);
     }
@@ -3675,7 +3675,7 @@ mod tests {
         ]);
         clear_model_env();
         std::env::set_var("DEEPSEEK_API_KEY", "sk-deepseek");
-        assert_eq!(default_model(), "deepseek-v4-flash");
+        assert_eq!(default_model(), "deepseek-flash");
         std::env::set_var("DEEPSEEK_MODEL", "deepseek-v4-pro");
         assert_eq!(default_model(), "deepseek-v4-pro");
     }
