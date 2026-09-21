@@ -884,20 +884,60 @@ impl DefaultHandler {
         if config_id == "permissions" && PermissionMode::from_wire(value).is_session_scoped() {
             return;
         }
+        // A seat row needs no seeding. Seeding exists because this handler's
+        // list held a copy of the value that startup had to fill in; a seat
+        // row holds none, so writing one back would be the stale copy this
+        // seat was built to remove.
+        if Self::seat_owns(config_id) {
+            return;
+        }
         let _ = self.update_config_options_shared(config_id, value);
     }
 }
 
 impl DefaultHandler {
     pub(super) fn config_options_snapshot(&self) -> Vec<ConfigOption> {
-        self.config_options
+        self.config_options_with_seat_rows(None)
+    }
+
+    /// The session rows this handler holds, followed by every row registered
+    /// on the `config-options` seat.
+    ///
+    /// The seat is read on every call rather than copied in at startup: a row
+    /// reports what its owner reads *now*, so a value changed by a slash
+    /// command or by an edit to the config file is already right, and a plugin
+    /// that loaded or unloaded since the last call is reflected without anyone
+    /// being told. No seat — before the kernel boots, or a composition that
+    /// leaves the Core plugin out — means the session rows alone, which is
+    /// what this handler could offer before the seat existed.
+    fn config_options_with_seat_rows(&self, session_id: Option<&str>) -> Vec<ConfigOption> {
+        let mut options = self
+            .config_options
             .lock()
             .expect("config options mutex poisoned")
-            .clone()
+            .clone();
+        if let Some(seat) = rebon_config_seat::process_config_seat() {
+            // A session row wins a clash: it is the one that can answer for
+            // *this* session, and the seat's would quietly report another's.
+            let taken: Vec<String> = options.iter().map(|option| option.id.clone()).collect();
+            options.extend(
+                seat.options(session_id)
+                    .into_iter()
+                    .filter(|option| !taken.contains(&option.id)),
+            );
+        }
+        options
+    }
+
+    /// Whether the seat owns `config_id`, in which case applying it is the
+    /// registrar's business and not this handler's.
+    fn seat_owns(config_id: &str) -> bool {
+        rebon_config_seat::process_config_seat()
+            .is_some_and(|seat| seat.has(config_id))
     }
 
     pub fn config_options_for_session(&self, session_id: &str) -> Vec<ConfigOption> {
-        let options = self.config_options_snapshot();
+        let options = self.config_options_with_seat_rows(Some(session_id));
         let Some(session) = self.state.get_session(session_id) else {
             return options;
         };
@@ -926,6 +966,35 @@ impl DefaultHandler {
         config_id: &str,
         value: &str,
     ) -> Vec<ConfigOption> {
+        // A seat row is applied by whoever registered it. Going through the
+        // seat is what keeps one setting's persistence in one place: the same
+        // row reached from the terminal, from `serve` and over ACP used to be
+        // three copies of the same write.
+        if Self::seat_owns(config_id) {
+            if let Some(seat) = rebon_config_seat::process_config_seat() {
+                match seat.apply(Some(session_id), config_id, value) {
+                    // Persisted. The surface is still told, because some of
+                    // these have live state a file cannot reach: the service
+                    // tier a running session sends, the shell tools a session
+                    // offers. The seat owns *what the setting is*; reacting to
+                    // it is the surface's.
+                    Ok(()) => {
+                        if let Some(apply) = &self.config_option_applier {
+                            apply(config_id, value);
+                        }
+                    }
+                    // Refused: nothing was written, so nothing reacts either.
+                    // Telling the surface here would leave the live state
+                    // saying one thing and the file another.
+                    Err(reason) => tracing::warn!(
+                        config_id, value, %reason,
+                        "a settings row refused the value it was given"
+                    ),
+                }
+            }
+            return self.config_options_for_session(session_id);
+        }
+
         let current = self.config_options_snapshot();
         if !has_config_option_value(&current, config_id, value) {
             return self.config_options_for_session(session_id);

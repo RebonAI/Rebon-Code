@@ -1,5 +1,4 @@
 use super::*;
-use crate::server::config::default_config_options;
 use async_trait::async_trait;
 use rebon_agent_core::prompt_executor::{PromptExecutor, PromptExecutorError, PromptRequest};
 use rebon_proto::types::{error_code, ConfigOptionType, JsonRpcResponse, RequestId};
@@ -5870,51 +5869,8 @@ async fn serve_with_publishers_ignores_duplicate_permission_response() {
 
 // ---- sub_agents ConfigOption -----------------------------------
 
-#[test]
-fn default_config_options_include_sub_agents_with_on_default() {
-    let options = default_config_options();
-    let sub_agents = options
-        .iter()
-        .find(|o| o.id == "sub_agents")
-        .expect("sub_agents option must be in the default list");
-    assert_eq!(sub_agents.current_value, "on");
-    assert_eq!(sub_agents.name, "Sub-agents");
-    let values: Vec<&str> = sub_agents
-        .options
-        .iter()
-        .map(|v| v.value.as_str())
-        .collect();
-    assert_eq!(values, vec!["on", "off"]);
-}
 
-#[test]
-fn sub_agents_option_is_a_select() {
-    let options = default_config_options();
-    let sub_agents = options.iter().find(|o| o.id == "sub_agents").unwrap();
-    assert!(matches!(sub_agents.option_type, ConfigOptionType::Select));
-}
 
-#[test]
-fn default_config_options_include_update_auto_install_with_off_default() {
-    let options = default_config_options();
-    let update_auto_install = options
-        .iter()
-        .find(|o| o.id == "update_auto_install")
-        .expect("update_auto_install option must be in the default list");
-    assert_eq!(update_auto_install.current_value, "off");
-    assert_eq!(update_auto_install.name, "Auto install updates");
-    assert_eq!(update_auto_install.category.as_deref(), Some("updates"));
-    assert!(matches!(
-        update_auto_install.option_type,
-        ConfigOptionType::Select
-    ));
-    let values: Vec<&str> = update_auto_install
-        .options
-        .iter()
-        .map(|v| v.value.as_str())
-        .collect();
-    assert_eq!(values, vec!["on", "off"]);
-}
 
 #[test]
 fn session_scoped_permission_config_updates_do_not_change_shared_default() {
@@ -5984,19 +5940,39 @@ fn seed_config_option_value_ignores_session_scoped_permission_defaults() {
 #[test]
 fn seed_config_option_value_updates_current_value() {
     let handler = DefaultHandler::default();
-    handler.seed_config_option_value("sub_agents", "off");
+    handler.seed_config_option_value("auto_compact", "off");
     let options = handler.config_options_snapshot();
-    let sub_agents = options.iter().find(|o| o.id == "sub_agents").unwrap();
-    assert_eq!(sub_agents.current_value, "off");
+    let auto_compact = options.iter().find(|o| o.id == "auto_compact").unwrap();
+    assert_eq!(auto_compact.current_value, "off");
 }
 
 #[test]
 fn seed_config_option_value_ignores_unknown_value() {
     let handler = DefaultHandler::default();
-    handler.seed_config_option_value("sub_agents", "garbage");
+    handler.seed_config_option_value("auto_compact", "garbage");
     let options = handler.config_options_snapshot();
-    let sub_agents = options.iter().find(|o| o.id == "sub_agents").unwrap();
-    assert_eq!(sub_agents.current_value, "on");
+    let auto_compact = options.iter().find(|o| o.id == "auto_compact").unwrap();
+    assert_eq!(auto_compact.current_value, "on");
+}
+
+/// The handler's own rows are the session's; everything else arrives from the
+/// `config-options` seat, which is how a plugin gets a row at all.
+#[test]
+fn the_handlers_own_rows_are_the_session_scoped_ones() {
+    let handler = DefaultHandler::default();
+    let ids: Vec<String> = handler
+        .config_options_snapshot()
+        .into_iter()
+        .map(|option| option.id)
+        .collect();
+    // No kernel has booted in this test, so the seat is absent and the list is
+    // the session rows alone — which is also the fallback a composition
+    // without the Core plugin gets.
+    assert_eq!(
+        ids,
+        vec!["permissions", "model", "context_prune", "auto_compact"],
+        "a row backed by the config file belongs to whoever owns the setting"
+    );
 }
 
 #[test]
@@ -6005,7 +5981,7 @@ fn seed_config_option_value_ignores_unknown_id() {
     handler.seed_config_option_value("does_not_exist", "on");
     // No panic, other options untouched.
     let options = handler.config_options_snapshot();
-    assert!(options.iter().any(|o| o.id == "sub_agents"));
+    assert!(options.iter().any(|o| o.id == "permissions"));
     assert!(options.iter().any(|o| o.id == "auto_compact"));
 }
 
@@ -6150,17 +6126,6 @@ fn ultrawork_reminder_preserves_policy_across_fresh_and_saved_user_resume() {
     }
 }
 
-#[test]
-fn apply_config_option_local_toggles_sub_agents() {
-    let handler = DefaultHandler::default();
-    let updated = handler.apply_config_option_local("sid", "sub_agents", "off");
-    let sub_agents = updated.iter().find(|o| o.id == "sub_agents").unwrap();
-    assert_eq!(sub_agents.current_value, "off");
-
-    let updated = handler.apply_config_option_local("sid", "sub_agents", "on");
-    let sub_agents = updated.iter().find(|o| o.id == "sub_agents").unwrap();
-    assert_eq!(sub_agents.current_value, "on");
-}
 
 // --- `_session/steering` ---
 

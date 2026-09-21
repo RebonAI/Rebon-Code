@@ -40,6 +40,10 @@ use crate::session_agent_router::{SessionAgentRouter, SessionAgentRouterConfig};
 fn acp_config_option_applier(
     service_tier: rebon_api::ServiceTierHandle,
 ) -> Arc<dyn Fn(&str, &str) + Send + Sync> {
+    // Only what this process has to *do* about a change. Persisting a setting
+    // backed by the config file is the `config-options` seat's, registered by
+    // whoever owns the setting — this used to be the third of three copies of
+    // those writes, one per surface.
     Arc::new(move |config_id, value| {
         if config_id == "permissions" {
             if let Err(err) = crate::rebon_config::save_default_permission_mode_wire(value) {
@@ -51,42 +55,10 @@ fn acp_config_option_applier(
                 tracing::warn!(error = %err, model = value, "failed to persist model from ACP config option");
             }
         }
+        // Live state the seat's write cannot reach: what the next request
+        // sends, and which shell tools a session offers.
         if config_id == "fast_mode" {
             service_tier.set_fast(value == "on");
-            if let Err(err) = crate::rebon_config::save_fast_mode_enabled(value == "on") {
-                tracing::warn!(error = %err, "failed to persist fast mode from ACP config option");
-            }
-        }
-        if config_id == "update_auto_install" {
-            match crate::rebon_config::load_update_preferences() {
-                Ok(mut prefs) => {
-                    prefs.auto_install = value == "on";
-                    if let Err(err) = crate::rebon_config::save_update_preferences(&prefs) {
-                        tracing::warn!(error = %err, "failed to persist update auto-install from ACP config option");
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "failed to load update preferences from ACP config option");
-                }
-            }
-        }
-        if config_id == "sub_agents" {
-            let enabled = value != "off";
-            rebon_tool::set_sub_agents_enabled(enabled);
-            if let Err(err) = crate::rebon_config::save_sub_agents_enabled_in_dir(
-                &crate::rebon_config::config_home_dir(),
-                enabled,
-            ) {
-                tracing::warn!(error = %err, "failed to persist sub_agents from ACP config option");
-            }
-        }
-        if config_id == "claude_codex_fallback" {
-            if let Err(err) = crate::rebon_config::save_claude_codex_fallback_enabled_in_dir(
-                &crate::rebon_config::config_home_dir(),
-                value == "on",
-            ) {
-                tracing::warn!(error = %err, "failed to persist Claude/Codex fallback from ACP config option");
-            }
         }
         if config_id == "shell_tool" {
             crate::session::build::apply_shell_tool_choice(value);

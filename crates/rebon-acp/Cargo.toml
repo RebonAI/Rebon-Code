@@ -10,6 +10,7 @@ description = "Agent Client Protocol server for rebon — JSON-RPC dispatch, ser
 [dependencies]
 rebon-proto.workspace = true
 rebon-agent-core.workspace = true
+rebon-config-seat.workspace = true
 rebon-command-seat.workspace = true
 rebon-hooks.workspace = true
 rebon-instructions.workspace = true

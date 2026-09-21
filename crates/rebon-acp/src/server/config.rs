@@ -1,16 +1,23 @@
 use rebon_proto::types::{ConfigOption, ConfigOptionType, ConfigOptionValue};
 
+/// The rows a *session* answers for, which the `config-options` seat does not
+/// hold.
+///
+/// Everything backed by the config file has moved to that seat, registered by
+/// whoever owns the setting: the Core `core-config-options` plugin for rebon's
+/// own keys, and each feature plugin for its own. What is left here is session
+/// state — the permission mode and the model in force, the pruning this
+/// session does — which the seat cannot answer because in `--acp` and `serve`
+/// one process holds many sessions and each has its own.
+///
+/// [`DefaultHandler`](super::handler::DefaultHandler) concatenates the seat's
+/// rows onto these, so a plugin's row and rebon's own arrive through one list.
 pub(super) fn default_config_options() -> Vec<ConfigOption> {
     vec![
         permissions_config_option(),
         model_config_option(),
         context_prune_config_option(),
         auto_compact_config_option(),
-        fast_mode_config_option(),
-        update_auto_install_config_option(),
-        sub_agents_config_option(),
-        shell_tool_config_option(),
-        claude_codex_fallback_config_option(),
     ]
 }
 
@@ -107,28 +114,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn claude_codex_fallback_defaults_off_and_requires_restart() {
-        let options = default_config_options();
-        let fallback = options
-            .iter()
-            .find(|option| option.id == "claude_codex_fallback")
-            .expect("Claude/Codex fallback option must be present");
 
-        assert_eq!(fallback.current_value, "off");
-        assert_eq!(
-            fallback
-                .options
-                .iter()
-                .map(|option| option.value.as_str())
-                .collect::<Vec<_>>(),
-            vec!["on", "off"]
-        );
-        assert!(fallback
-            .description
-            .as_deref()
-            .is_some_and(|description| description.contains("restarting Rebon")));
-    }
 }
 
 fn permissions_config_option() -> ConfigOption {
@@ -274,188 +260,3 @@ fn auto_compact_config_option() -> ConfigOption {
     }
 }
 
-fn fast_mode_config_option() -> ConfigOption {
-    ConfigOption {
-        id: "fast_mode".to_string(),
-        name: "Fast Mode".to_string(),
-        description: Some(
-            "Use OpenAI service_tier: priority on fast-capable model requests".to_string(),
-        ),
-        category: Some("optimization".to_string()),
-        option_type: ConfigOptionType::Select,
-        current_value: "off".to_string(),
-        options: vec![
-            ConfigOptionValue {
-                value: "on".to_string(),
-                name: "On".to_string(),
-                description: Some("Send service_tier: priority from the next request".to_string()),
-            },
-            ConfigOptionValue {
-                value: "off".to_string(),
-                name: "Off".to_string(),
-                description: Some("Do not send service_tier: priority".to_string()),
-            },
-        ],
-    }
-}
-
-fn update_auto_install_config_option() -> ConfigOption {
-    ConfigOption {
-        id: "update_auto_install".to_string(),
-        name: "Auto install updates".to_string(),
-        description: Some(
-            "Stores the auto-install preference; register the per-user background runner explicitly with `rebon update service install`. Package installation waits for installer support."
-                .to_string(),
-        ),
-        category: Some("updates".to_string()),
-        option_type: ConfigOptionType::Select,
-        current_value: "off".to_string(),
-        options: vec![
-            ConfigOptionValue {
-                value: "on".to_string(),
-                name: "On".to_string(),
-                description: Some(
-                    "Store the preference only; install the background runner explicitly."
-                        .to_string(),
-                ),
-            },
-            ConfigOptionValue {
-                value: "off".to_string(),
-                name: "Off".to_string(),
-                description: Some("Do not allow automatic update installation".to_string()),
-            },
-        ],
-    }
-}
-
-fn sub_agents_config_option() -> ConfigOption {
-    // Delegation to sub-agents. The actual toggle lives in
-    // `rebon_tool::agent::SUB_AGENTS_ENABLED` (process-global
-    // atomic) and `~/.rebon/config.json` (persistence). When
-    // `off`, the engine filters `AgentTool` out of `tool_names`
-    // and `system_prompt::agent_tool_section` is suppressed.
-    //
-    // We default to "on" here; the CLI runner overrides the
-    // `current_value` at startup from the persisted setting via
-    // `DefaultHandler::seed_config_option_value`.
-    ConfigOption {
-        id: "sub_agents".to_string(),
-        name: "Sub-agents".to_string(),
-        description: Some(
-            "Let the main agent delegate to specialized sub-agents (Explore, Plan, etc.) \
-             via the Agent tool. When off, the Agent tool is hidden and the system prompt \
-             drops the delegation guidance."
-                .to_string(),
-        ),
-        category: Some("agent".to_string()),
-        option_type: ConfigOptionType::Select,
-        current_value: "on".to_string(),
-        options: vec![
-            ConfigOptionValue {
-                value: "on".to_string(),
-                name: "On".to_string(),
-                description: Some(
-                    "Advertise the Agent tool; include sub-agent delegation guidance \
-                     in the system prompt."
-                        .to_string(),
-                ),
-            },
-            ConfigOptionValue {
-                value: "off".to_string(),
-                name: "Off".to_string(),
-                description: Some(
-                    "Hide the Agent tool and omit the delegation guidance section.".to_string(),
-                ),
-            },
-        ],
-    }
-}
-
-fn shell_tool_config_option() -> ConfigOption {
-    // Which shell tool the model is offered. The live switch is
-    // `rebon_tool::set_shell_tool_preference` (a process-global atomic
-    // read by `BashTool::is_enabled` / `PowerShellTool::is_enabled`), and
-    // `~/.rebon/config.json`'s `shellTool` key persists it. Changing it
-    // takes effect on the next turn: the disabled shell drops out of both
-    // the API tool list and the system prompt's tool section.
-    //
-    // Defaults to "auto"; the CLI runner overrides `current_value` at
-    // startup from the persisted setting.
-    ConfigOption {
-        id: "shell_tool".to_string(),
-        name: "Shell tool".to_string(),
-        description: Some(
-            "Which shell the agent runs commands through. Bash and PowerShell are separate \
-             tools with their own syntax, permission rules, and prompt guidance."
-                .to_string(),
-        ),
-        category: Some("agent".to_string()),
-        option_type: ConfigOptionType::Select,
-        current_value: "auto".to_string(),
-        options: vec![
-            ConfigOptionValue {
-                value: "auto".to_string(),
-                name: "Auto".to_string(),
-                description: Some(
-                    "Pick per platform: PowerShell on Windows, Bash elsewhere, and \
-                     PowerShell alone when no Git Bash is installed."
-                        .to_string(),
-                ),
-            },
-            ConfigOptionValue {
-                value: "bash".to_string(),
-                name: "Bash".to_string(),
-                description: Some("Offer the Bash tool only.".to_string()),
-            },
-            ConfigOptionValue {
-                value: "powershell".to_string(),
-                name: "PowerShell".to_string(),
-                description: Some(
-                    "Offer the PowerShell tool only. Requires PowerShell to be installed."
-                        .to_string(),
-                ),
-            },
-            ConfigOptionValue {
-                value: "both".to_string(),
-                name: "Both".to_string(),
-                description: Some(
-                    "Offer both and let the model pick per command. Costs one extra tool \
-                     schema per request."
-                        .to_string(),
-                ),
-            },
-        ],
-    }
-}
-
-fn claude_codex_fallback_config_option() -> ConfigOption {
-    ConfigOption {
-        id: "claude_codex_fallback".to_string(),
-        name: "Claude/Codex fallback".to_string(),
-        description: Some(
-            "Load compatible skills and commands from .claude and .codex directories. \
-             Takes effect after restarting Rebon."
-                .to_string(),
-        ),
-        category: Some("agent".to_string()),
-        option_type: ConfigOptionType::Select,
-        current_value: "off".to_string(),
-        options: vec![
-            ConfigOptionValue {
-                value: "on".to_string(),
-                name: "On".to_string(),
-                description: Some(
-                    "Include user and project .claude/.codex skills and commands after restart."
-                        .to_string(),
-                ),
-            },
-            ConfigOptionValue {
-                value: "off".to_string(),
-                name: "Off".to_string(),
-                description: Some(
-                    "Only load Rebon and plugin skills and commands after restart.".to_string(),
-                ),
-            },
-        ],
-    }
-}

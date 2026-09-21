@@ -666,6 +666,16 @@ fn apply_settings_config(
             }
         }
     }
+    // Fast mode has a live half the config file cannot reach — this session's
+    // service tier and the banner that reports it — so the terminal still
+    // reacts to it. `set_fast_mode` is the same path `/fast` takes and writes
+    // the file itself; the seat has written it by now too, with the same
+    // value, which is why it stays rather than being trimmed: `/fast` on a
+    // process with no kernel booted would otherwise stop persisting.
+    //
+    // The rows backed only by the config file — update_auto_install,
+    // sub_agents, shell_tool, claude_codex_fallback — are written by whoever
+    // registered them and need nothing from the terminal at all.
     if config_id == "fast_mode" {
         match set_fast_mode(session, applied_value == "on") {
             Ok(_) => {
@@ -673,24 +683,6 @@ fn apply_settings_config(
             }
             Err(text) => super::inject_system_message(app, "warning", &text),
         }
-    }
-    if config_id == "update_auto_install" {
-        if let Err(err) =
-            rebon_plugin_updater::save_update_auto_install_setting(applied_value == "on")
-        {
-            tracing::warn!(error = %err, "failed to persist update auto-install setting");
-        }
-    }
-    if config_id == "sub_agents" {
-        let enabled = applied_value == "on";
-        // Flip the process-global atomic so the engine
-        // filters AgentTool (and the system-prompt
-        // delegation section) from the next turn without
-        // needing a restart.
-        rebon_tool::set_sub_agents_enabled(enabled);
-        // Write to the user config file so the choice
-        // survives restarts.
-        crate::rebon_config::save_sub_agents_enabled(enabled);
     }
     if let Some(mode) = permission_mode_to_apply {
         app.set_permission_mode(mode);
