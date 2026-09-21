@@ -501,7 +501,8 @@ impl DeadlineWatchdog {
     fn arm(
         mut kill: WatchdogKill,
         deadline: Instant,
-        stall_after_firing_claim: Option<Duration>,
+        #[cfg(feature = "adversarial-fixtures")] stall_after_firing_claim: Option<TestStallHook>,
+        #[cfg(not(feature = "adversarial-fixtures"))] stall_after_firing_claim: Option<Duration>,
     ) -> io::Result<Self> {
         let (stop, receiver) = mpsc::channel();
         let deadline_claimed = Arc::new(AtomicBool::new(false));
@@ -538,6 +539,15 @@ impl DeadlineWatchdog {
                 // Fault injection is intentionally after the thread has decided the deadline won
                 // while it still owns the numeric Unix PGID kill capability. The parent must join
                 // and retain the unreaped leader throughout this pause.
+                #[cfg(feature = "adversarial-fixtures")]
+                if let Some(stall) = stall_after_firing_claim {
+                    // Past the deadline by definition, so the hook's own
+                    // cutoff has to sit beyond it or the stall would be
+                    // skipped outright.
+                    let latest_start = Instant::now() + stall.duration;
+                    run_test_stall_hook(stall, latest_start);
+                }
+                #[cfg(not(feature = "adversarial-fixtures"))]
                 if let Some(stall) = stall_after_firing_claim {
                     thread::sleep(stall);
                 }
@@ -655,7 +665,7 @@ pub struct IsolatedJsRunner {
     #[cfg(feature = "adversarial-fixtures")]
     supervisor_stall_before_containment_seal: Option<TestStallHook>,
     #[cfg(feature = "adversarial-fixtures")]
-    watchdog_stall_after_firing_claim: Option<Duration>,
+    watchdog_stall_after_firing_claim: Option<TestStallHook>,
     #[cfg(feature = "adversarial-fixtures")]
     cpu_seconds_override: Option<u64>,
 }
@@ -757,7 +767,35 @@ impl IsolatedJsRunner {
     #[cfg(feature = "adversarial-fixtures")]
     #[doc(hidden)]
     pub fn with_test_watchdog_stall_after_firing_claim(mut self, duration: Duration) -> Self {
-        self.watchdog_stall_after_firing_claim = Some(duration);
+        self.watchdog_stall_after_firing_claim = Some(TestStallHook {
+            duration,
+            gate: None,
+            reached: None,
+            release: None,
+        });
+        self
+    }
+
+    /// Stall the watchdog after it claims the kill until the test releases it,
+    /// rather than for a fixed span. A duration has to be guessed wide enough
+    /// to cover process startup on a loaded machine, which makes the test a
+    /// race it can lose; waiting for a file the test writes makes the ordering
+    /// explicit instead. `maximum_duration` is only a backstop against a test
+    /// that never releases.
+    #[cfg(feature = "adversarial-fixtures")]
+    #[doc(hidden)]
+    pub fn with_test_watchdog_stall_after_firing_claim_until_release(
+        mut self,
+        reached: impl Into<PathBuf>,
+        release: impl Into<PathBuf>,
+        maximum_duration: Duration,
+    ) -> Self {
+        self.watchdog_stall_after_firing_claim = Some(TestStallHook {
+            duration: maximum_duration,
+            gate: None,
+            reached: Some(reached.into()),
+            release: Some(release.into()),
+        });
         self
     }
 
@@ -868,7 +906,7 @@ impl IsolatedJsRunner {
             }
         };
         #[cfg(feature = "adversarial-fixtures")]
-        let watchdog_stall = self.watchdog_stall_after_firing_claim;
+        let watchdog_stall = self.watchdog_stall_after_firing_claim.clone();
         #[cfg(not(feature = "adversarial-fixtures"))]
         let watchdog_stall = None;
         let watchdog = match DeadlineWatchdog::arm(watchdog_kill, deadline, watchdog_stall) {
@@ -1488,21 +1526,6 @@ pub fn run_adversarial_fixture() -> i32 {
             loop {
                 std::thread::sleep(Duration::from_secs(30));
             }
-        }
-        "delayed-success" => {
-            let (Some(delay), Some(phase_marker)) = (
-                args.next()
-                    .and_then(|value| value.into_string().ok())
-                    .and_then(|value| value.parse::<u64>().ok()),
-                args.next(),
-            ) else {
-                return 64;
-            };
-            std::thread::sleep(Duration::from_millis(delay));
-            if write_test_marker(Path::new(&phase_marker), b"delayed-success-phase").is_err() {
-                return 74;
-            }
-            fixture_success(&handoff)
         }
         "exit-no-response" => 0,
         "missing-completion" => fixture_corruption(&handoff, FixtureCorruption::MissingCompletion),
