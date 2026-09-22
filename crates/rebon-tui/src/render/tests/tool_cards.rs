@@ -172,6 +172,42 @@ fn render_code_sequence(
 }
 
 #[test]
+fn shell_tabbed_output_renders_with_stable_columns() {
+    for status in [
+        ToolCallStatus::InProgress,
+        ToolCallStatus::Completed,
+        ToolCallStatus::Failed,
+    ] {
+        for verbosity in [
+            ToolOutputVerbosity::Compact,
+            ToolOutputVerbosity::Normal,
+            ToolOutputVerbosity::Verbose,
+        ] {
+            let mut overlay = StreamingOverlay::new();
+            overlay.upsert_streaming_tool_use(streaming_tool_with_raw_output(
+                streaming_tool(
+                    "tabs",
+                    "Bash",
+                    ToolKind::Execute,
+                    status,
+                    vec![("command", json!("find crates -type f"))],
+                ),
+                vec![(
+                    "stdout",
+                    json!("209703\tcrates/rebon-cli/src/tui/agent_view.rs\n"),
+                )],
+            ));
+            let snap = render_code_sequence(&overlay, verbosity, 120);
+            assert!(!snap.contains('\t'), "{status:?} {verbosity:?}: {snap}");
+            assert!(
+                snap.contains("209703  crates/rebon-cli/src/tui/agent_view.rs"),
+                "{status:?} {verbosity:?}: {snap}"
+            );
+        }
+    }
+}
+
+#[test]
 fn run_code_completion_retains_multiple_calls_console_outputs_and_return_value() {
     let mut overlay = run_code_sequence_overlay();
     // The actual kernel returns a JSON string; use the engine's projection, not

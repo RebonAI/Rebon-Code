@@ -225,7 +225,8 @@ pub(super) fn collect_shell_tool_body_lines(
         None => [stdout, stderr].into_iter().flatten().collect(),
     };
     for output in outputs {
-        let trimmed = output.trim();
+        let rendered = rebon_render::expand_tabs_for_tui(output);
+        let trimmed = rendered.trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -647,6 +648,58 @@ mod tests {
         .expect("PowerShell is a shell tool");
 
         assert_eq!(lines, vec!["same live line", "same live line"]);
+    }
+
+    #[test]
+    fn shell_output_expands_tabs_in_raw_streams() {
+        for tool_name in ["Bash", "PowerShell"] {
+            for (stdout, stderr) in [
+                (Some("209703\tcrates/rebon-cli/src/tui/agent_view.rs"), None),
+                (None, Some("209703\tcrates/rebon-cli/src/tui/agent_view.rs")),
+            ] {
+                let lines = super::collect_shell_tool_body_lines(
+                    tool_name, None, stdout, stderr, None, false,
+                )
+                .expect("shell tool");
+                assert_eq!(lines, ["209703  crates/rebon-cli/src/tui/agent_view.rs"]);
+            }
+        }
+    }
+
+    #[test]
+    fn shell_output_expands_tabs_after_interleaving_streams() {
+        let lines = super::collect_shell_tool_body_lines(
+            "Bash",
+            None,
+            Some("1\ta.rs\n2\tb.rs"),
+            Some("error\tpath"),
+            Some("o1,e1,o1"),
+            false,
+        )
+        .expect("shell tool");
+        assert_eq!(lines, ["1  a.rs", "error  path", "2  b.rs"]);
+    }
+
+    #[test]
+    fn shell_output_deduplicates_tabbed_raw_streams_against_content() {
+        let content = vec![ToolCallContent::Content(rebon_types::RegularContent {
+            content: ContentBlock::Text(rebon_types::TextContent {
+                text: "209703\tcrates/rebon-cli/src/tui/agent_view.rs".into(),
+                annotations: None,
+            }),
+        })];
+        for include_content in [false, true] {
+            let lines = super::collect_shell_tool_body_lines(
+                "Bash",
+                Some(&content),
+                Some("209703\tcrates/rebon-cli/src/tui/agent_view.rs"),
+                None,
+                None,
+                include_content,
+            )
+            .expect("shell tool");
+            assert_eq!(lines, ["209703  crates/rebon-cli/src/tui/agent_view.rs"]);
+        }
     }
 
     #[test]

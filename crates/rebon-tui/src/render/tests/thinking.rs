@@ -9,6 +9,68 @@ use crate::state::{reducer, Action};
 use serde_json::json;
 
 #[test]
+fn streaming_thinking_incremental_frames_match_full_repaint() {
+    let text = "The user asked me to count .rs files under crates/rebon-cli/src/tui/";
+    for width in [24, 80, 120] {
+        for verbosity in [
+            ToolOutputVerbosity::Compact,
+            ToolOutputVerbosity::Normal,
+            ToolOutputVerbosity::Verbose,
+        ] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 16))
+                    .expect("test terminal");
+            let mut thinking = crate::streaming::StreamingThinking {
+                thinking: String::new(),
+                is_streaming: true,
+                streaming_ended_at: None,
+            };
+            for ch in text.chars() {
+                thinking.thinking.push(ch);
+                let area = Rect::new(0, 0, width, 16);
+                let mut expected = new_buf(width, 16);
+                let theme = RenderTheme::plain();
+                super::super::streaming::render_streaming_thinking(
+                    &thinking,
+                    area,
+                    &mut expected,
+                    &theme,
+                    verbosity,
+                    StreamingOverlayRenderMode::Paint,
+                    false,
+                );
+                terminal
+                    .draw(|frame| {
+                        super::super::streaming::render_streaming_thinking(
+                            &thinking,
+                            area,
+                            frame.buffer_mut(),
+                            &theme,
+                            verbosity,
+                            StreamingOverlayRenderMode::Paint,
+                            false,
+                        );
+                    })
+                    .expect("draw thinking");
+                assert_eq!(
+                    terminal.backend().buffer(),
+                    &expected,
+                    "{width} {verbosity:?}: {}",
+                    thinking.thinking
+                );
+                if width == 120 {
+                    assert!(
+                        all_text(&expected).contains(thinking.thinking.trim()),
+                        "{}",
+                        all_text(&expected)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn committed_assistant_text_between_tool_uses_breaks_the_run() {
     // An assistant message that mixes text with tool_use (or is
     // pure text) must NOT be absorbed into a collapsed group.
