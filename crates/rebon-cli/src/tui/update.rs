@@ -1670,7 +1670,7 @@ mod tests {
     #[test]
     fn automatic_model_routing_notice_is_rendered_as_ui_only_system_row() {
         let mut app = AppState::new();
-        let notice = rebon_core::model_routing::selection_notice("selected", None);
+        let notice = rebon_core::model_routing::selection_notice("mock", "selected", None);
         translate_session_update(
             &mut app,
             params(rebon_core::model_routing::notice_update(notice.clone())),

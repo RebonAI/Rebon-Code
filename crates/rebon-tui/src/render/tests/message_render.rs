@@ -1470,3 +1470,342 @@ fn committed_shell_stop_block_renders_single_status_line() {
         vec!["stopping"]
     );
 }
+
+// ------------------------------------------------------------------
+// Committed Code Mode (`run_code`) bodies
+//
+// A committed assistant row carrying prose *and* a `run_code` call never
+// reaches the streaming card: it renders through the message projection,
+// which collects the tool body with `collect_tool_block_body_lines_with_width`.
+// Code Mode progress events are execution activity, not output, so that body
+// must show the shared completion summary plus the final output — and never
+// replay the progress stream or the JSON of its structured payloads.
+// ------------------------------------------------------------------
+
+const RUN_CODE_PROGRAM: &str = "const a = await tools.Read({file_path: 'a'});\n\
+console.log('PROGRAM-SOURCE-MARKER');";
+
+fn text_tool_content(text: &str) -> rebon_types::ToolCallContent {
+    rebon_types::ToolCallContent::Content(rebon_types::RegularContent {
+        content: rebon_types::ContentBlock::Text(rebon_types::TextContent {
+            text: text.into(),
+            annotations: None,
+        }),
+    })
+}
+
+fn code_progress_content(
+    kind: &str,
+    message: &str,
+    payload: Value,
+) -> rebon_types::ToolCallContent {
+    rebon_render::tool_output::tool_progress_update_content(
+        &rebon_tools_core::ToolProgressUpdate::new(kind)
+            .with_message(message)
+            .with_payload(payload),
+    )
+    .expect("progress text")
+    .remove(0)
+}
+
+/// Two nested calls (Read, Bash) as the engine emits them: every start and
+/// finish is a progress event with its own structured payload.
+fn code_mode_progress_events() -> Vec<rebon_types::ToolCallContent> {
+    vec![
+        code_progress_content(
+            "code_mode/program",
+            "Running JavaScript (2 lines)",
+            json!({"language": "javascript"}),
+        ),
+        code_progress_content(
+            "code_mode/dispatch-start",
+            "→ Read (a)",
+            json!({"seq": 0, "tool": "Read"}),
+        ),
+        code_progress_content(
+            "code_mode/dispatch",
+            "← Read succeeded",
+            json!({"seq": 0, "tool": "Read", "isError": false}),
+        ),
+        code_progress_content(
+            "code_mode/dispatch-start",
+            "→ Bash (check)",
+            json!({"seq": 1, "tool": "Bash"}),
+        ),
+        code_progress_content(
+            "code_mode/dispatch",
+            "← Bash succeeded",
+            json!({"seq": 1, "tool": "Bash", "isError": false}),
+        ),
+    ]
+}
+
+/// Every string a leaked progress event would put on screen: its prose and
+/// the JSON of its payload.
+const PROGRESS_LEAK_MARKERS: [&str; 9] = [
+    "Running JavaScript (2 lines)",
+    "→ Read (a)",
+    "← Read succeeded",
+    "→ Bash (check)",
+    "← Bash succeeded",
+    r#"{"seq":0,"tool":"Read"}"#,
+    r#"{"seq":1,"tool":"Bash"}"#,
+    r#""seq":0"#,
+    r#""seq":1"#,
+];
+
+/// A committed assistant row with prose before a `run_code` call — the shape
+/// that bypasses the streaming card. `raw_output` mirrors what the engine
+/// leaves behind: the last progress payload, or the terminal error.
+fn committed_run_code_message(
+    status: ToolCallStatus,
+    tool_call_content: Vec<rebon_types::ToolCallContent>,
+    raw_output: Option<Value>,
+) -> Message {
+    Message::Assistant(AssistantMessage {
+        uuid: "a-mixed-run-code".into(),
+        timestamp: "t".into(),
+        message: AssistantMessageInner {
+            role: AssistantRole::Assistant,
+            content: vec![
+                AssistantContentBlock::Text(AssistantTextBlock {
+                    text: "Running a sequence".into(),
+                }),
+                AssistantContentBlock::ToolUse(AssistantToolUseBlock {
+                    id: "code-1".into(),
+                    name: "run_code".into(),
+                    input: json!({
+                        "description": "Inspect and check files",
+                        "code": RUN_CODE_PROGRAM,
+                    }),
+                    tool_call_content: Some(tool_call_content),
+                    raw_output,
+                    title: None,
+                    locations: None,
+                    status: Some(status),
+                }),
+            ],
+        },
+        is_api_error_message: None,
+        advisor_model: None,
+        is_stream_continuation: None,
+    })
+}
+
+fn render_committed_run_code(
+    status: ToolCallStatus,
+    tool_call_content: Vec<rebon_types::ToolCallContent>,
+    raw_output: Option<Value>,
+    verbosity: ToolOutputVerbosity,
+) -> String {
+    let message = committed_run_code_message(status, tool_call_content, raw_output);
+    let mut buf = new_buf(100, 30);
+    render_message(
+        &message,
+        Rect::new(0, 0, 100, 30),
+        &mut buf,
+        &RenderTheme::plain(),
+        verbosity,
+    );
+    all_text(&buf)
+}
+
+fn assert_no_progress_leak(snap: &str, verbosity: ToolOutputVerbosity) {
+    for marker in PROGRESS_LEAK_MARKERS {
+        assert!(
+            !snap.contains(marker),
+            "{verbosity:?}: Code Mode progress leaked into the committed body: \
+             {marker:?}\n{snap}"
+        );
+    }
+}
+
+/// The program body is what Ctrl+O reveals while streaming; a committed row
+/// has no such expansion, so it only appears in explicit Verbose.
+fn assert_program_body(snap: &str, verbosity: ToolOutputVerbosity) {
+    let verbose = verbosity == ToolOutputVerbosity::Verbose;
+    assert_eq!(
+        snap.contains("JavaScript:"),
+        verbose,
+        "{verbosity:?}: program label\n{snap}"
+    );
+    assert_eq!(
+        snap.contains("PROGRAM-SOURCE-MARKER"),
+        verbose,
+        "{verbosity:?}: program body\n{snap}"
+    );
+}
+
+#[test]
+fn committed_run_code_body_shows_the_summary_and_never_the_progress_stream() {
+    let final_output = "final console output\nreturned value";
+
+    for verbosity in [
+        ToolOutputVerbosity::Compact,
+        ToolOutputVerbosity::Normal,
+        ToolOutputVerbosity::Verbose,
+    ] {
+        for status in [ToolCallStatus::Completed, ToolCallStatus::Failed] {
+            for shape in ["progress events", "final output only"] {
+                let with_progress = shape == "progress events";
+                let mut content = if with_progress {
+                    code_mode_progress_events()
+                } else {
+                    Vec::new()
+                };
+                // A failed call still carries the last progress payload when the
+                // program threw before reporting an error of its own.
+                let raw_output = if with_progress {
+                    Some(json!({"seq": 1, "tool": "Bash", "isError": false}))
+                } else {
+                    None
+                };
+                content.push(text_tool_content(if status == ToolCallStatus::Failed {
+                    "program failed: boom"
+                } else {
+                    final_output
+                }));
+
+                let snap = render_committed_run_code(status, content, raw_output, verbosity);
+                let case = format!("{status:?} / {shape} / {verbosity:?}");
+
+                assert_no_progress_leak(&snap, verbosity);
+                assert_program_body(&snap, verbosity);
+
+                if status == ToolCallStatus::Failed {
+                    assert!(
+                        snap.contains("program failed: boom"),
+                        "{case}: the failure reason is missing\n{snap}"
+                    );
+                    assert!(
+                        !snap.contains("Completed"),
+                        "{case}: a failed call must not claim completion\n{snap}"
+                    );
+                } else {
+                    assert!(
+                        snap.contains("Completed"),
+                        "{case}: the completion summary is missing\n{snap}"
+                    );
+                    assert!(
+                        snap.contains("final console output") && snap.contains("returned value"),
+                        "{case}: the final output is missing\n{snap}"
+                    );
+                    if with_progress {
+                        assert!(
+                            snap.contains("Completed · 2 calls")
+                                && snap.contains("Read ×1")
+                                && snap.contains("Bash ×1"),
+                            "{case}: the summary must count the nested calls\n{snap}"
+                        );
+                    } else {
+                        assert!(
+                            !snap.contains("Completed · "),
+                            "{case}: no dispatch events means no call counts\n{snap}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn committed_run_code_completed_without_final_output_says_so() {
+    for verbosity in [
+        ToolOutputVerbosity::Compact,
+        ToolOutputVerbosity::Normal,
+        ToolOutputVerbosity::Verbose,
+    ] {
+        // Only progress events: the sequence ran, and nothing was returned.
+        let snap = render_committed_run_code(
+            ToolCallStatus::Completed,
+            code_mode_progress_events(),
+            None,
+            verbosity,
+        );
+        assert!(
+            snap.contains("Completed · 2 calls"),
+            "{verbosity:?}: the summary still reports what ran\n{snap}"
+        );
+        assert!(
+            snap.contains("No final output received"),
+            "{verbosity:?}: a completed call with no output must say so, as the \
+             streaming card does\n{snap}"
+        );
+        assert_no_progress_leak(&snap, verbosity);
+    }
+}
+
+#[test]
+fn committed_run_code_completed_preview_uses_the_shared_line_budget() {
+    let mut content = code_mode_progress_events();
+    content.extend((1..=6).map(|n| text_tool_content(&format!("output line {n}"))));
+
+    let compact = render_committed_run_code(
+        ToolCallStatus::Completed,
+        content.clone(),
+        None,
+        ToolOutputVerbosity::Compact,
+    );
+    assert!(compact.contains("Completed · 2 calls"), "{compact}");
+    assert!(
+        compact.contains("output line 1") && compact.contains("output line 3"),
+        "{compact}"
+    );
+    assert!(
+        !compact.contains("output line 4"),
+        "the shared four-line preview budget must bound the body\n{compact}"
+    );
+    assert!(compact.contains("… +3 lines"), "{compact}");
+    assert_program_body(&compact, ToolOutputVerbosity::Compact);
+
+    let verbose = render_committed_run_code(
+        ToolCallStatus::Completed,
+        content,
+        None,
+        ToolOutputVerbosity::Verbose,
+    );
+    for n in 1..=6 {
+        assert!(
+            verbose.contains(&format!("output line {n}")),
+            "Verbose must not truncate the final output\n{verbose}"
+        );
+    }
+    assert!(!verbose.contains("… +"), "{verbose}");
+    assert_program_body(&verbose, ToolOutputVerbosity::Verbose);
+}
+
+#[test]
+fn committed_run_code_failure_prefers_the_reported_error_over_the_last_block() {
+    let mut content = code_mode_progress_events();
+    content.push(text_tool_content("boom from the content block"));
+
+    let reported = render_committed_run_code(
+        ToolCallStatus::Failed,
+        content.clone(),
+        Some(json!({"error": "boom from the error payload"})),
+        ToolOutputVerbosity::Normal,
+    );
+    assert!(
+        reported.contains("boom from the error payload"),
+        "{reported}"
+    );
+    assert!(
+        !reported.contains("boom from the content block"),
+        "{reported}"
+    );
+    assert!(!reported.contains("Completed"), "{reported}");
+    assert_no_progress_leak(&reported, ToolOutputVerbosity::Normal);
+
+    let fallback = render_committed_run_code(
+        ToolCallStatus::Failed,
+        content,
+        None,
+        ToolOutputVerbosity::Normal,
+    );
+    assert!(
+        fallback.contains("boom from the content block"),
+        "without an error payload the last content block is the reason\n{fallback}"
+    );
+    assert_no_progress_leak(&fallback, ToolOutputVerbosity::Normal);
+}

@@ -18,6 +18,7 @@ impl FirstPromptModelRouter for Router {
             "error" => anyhow::bail!("mock classification failure"),
             "pending" => std::future::pending().await,
             _ => Ok(ModelRoutingDecision {
+                provider: (self.mode == "provider").then(|| "other".into()),
                 model: (self.mode != "effort").then(|| "selected".into()),
                 reasoning_effort: Some(ReasoningEffort::High),
             }),
@@ -51,6 +52,20 @@ fn runtime(client: Arc<dyn ModelClient>) -> SharedRuntimeModel {
     runtime.set_runtime_resolver(Arc::new(move |provider, model| {
         assert_eq!(provider, "mock");
         let value = config(client.clone(), &model);
+        Box::pin(async move { Ok(value) })
+    }));
+    runtime
+}
+/// 一个把请求的 provider 都答出来的 runtime，用来看路由真的换了腿。
+fn switching_runtime(
+    client: Arc<dyn ModelClient>,
+    asked: Arc<std::sync::Mutex<Vec<String>>>,
+) -> SharedRuntimeModel {
+    let runtime = SharedRuntimeModel::new(config(client.clone(), "initial"));
+    runtime.set_runtime_resolver(Arc::new(move |provider, model| {
+        asked.lock().unwrap().push(provider.clone());
+        let mut value = config(client.clone(), &model);
+        value.provider_name = provider;
         Box::pin(async move { Ok(value) })
     }));
     runtime
@@ -210,6 +225,72 @@ async fn errors_and_timeouts_warn_and_never_retry() {
 }
 
 #[tokio::test]
+async fn cross_provider_decision_switches_the_session_runtime() {
+    let root = temp_projects_root("routing_provider");
+    let client: Arc<dyn ModelClient> = Arc::new(MockModelClient::new());
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let runtime = switching_runtime(client, asked.clone());
+    let router = router("provider");
+    let mut req = request("one", "work");
+    let selected = runtime
+        .prepare_first_prompt(root.path().into(), &mut req, false, Some(router.clone()))
+        .await
+        .unwrap();
+    let config = selected.runtime.unwrap().get();
+    assert_eq!(config.provider_name, "other");
+    assert_eq!(config.model, "selected");
+    assert_eq!(asked.lock().unwrap().as_slice(), ["other".to_string()]);
+    let notice = selected.notice.unwrap();
+    assert!(notice.contains("other / selected"), "{notice}");
+    let saved = model_selection::load(root.path(), "work", "one")
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.provider.as_deref(), Some("other"));
+    assert_eq!(saved.model.as_deref(), Some("selected"));
+    // 同一会话的后续 turn 继续用换过去的腿，不再分类。
+    let mut next = request("one", "work");
+    let again = runtime
+        .prepare_first_prompt(root.path().into(), &mut next, false, Some(router.clone()))
+        .await
+        .unwrap();
+    assert_eq!(again.runtime.unwrap().get().provider_name, "other");
+    assert_eq!(router.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(asked.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn resolver_returning_another_provider_is_refused() {
+    let root = temp_projects_root("routing_provider_drift");
+    let runtime = runtime(Arc::new(MockModelClient::new()));
+    runtime.set_runtime_resolver(Arc::new(|_, model| {
+        let mut value = config(Arc::new(MockModelClient::new()), &model);
+        value.provider_name = "drifted".into();
+        Box::pin(async move { Ok(value) })
+    }));
+    let mut req = request("one", "work");
+    let result = runtime
+        .prepare_first_prompt(
+            root.path().into(),
+            &mut req,
+            false,
+            Some(router("provider")),
+        )
+        .await
+        .unwrap();
+    assert!(result.runtime.is_none());
+    let notice = result.notice.unwrap();
+    assert!(
+        notice.contains("resolver returned a different provider than requested"),
+        "{notice}"
+    );
+    // 分类没成功，选型就没有写进 sidecar。
+    let saved = model_selection::load(root.path(), "work", "one")
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.provider, None);
+}
+
+#[tokio::test]
 async fn cancellation_is_not_swallowed_and_consumes_attempt() {
     let root = temp_projects_root("routing_cancel");
     let runtime = runtime(Arc::new(MockModelClient::new()));
@@ -287,7 +368,7 @@ async fn executor_notice_is_ui_only_and_loaded_history_does_not_route() {
         executor.execute(req).await.unwrap();
     }
     let updates = serde_json::to_string(&publisher.snapshot()).unwrap();
-    assert!(updates.contains("Auto switched model to selected with high effort"));
+    assert!(updates.contains("Auto switched to mock / selected with high effort"));
     assert_eq!(router.calls.load(Ordering::SeqCst), 1);
     let requests = client.captured_requests();
     assert_eq!(requests[0].model, "selected");

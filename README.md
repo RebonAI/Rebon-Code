@@ -22,28 +22,12 @@
 
 ## Demo
 
-Type `/` for the command list and `@` to complete a filename. Ask what the file
-does and Rebon has to read it, so it stops and asks you first. Approve, ask a
-follow-up, and it still knows what was just said.
-
-![Rebon core loop](assets/demo/core-loop.webp)
-
-Each `shift+tab` switches permission mode, four in all: default, plan, accept
-edits, auto. In auto it stops asking and finishes the rest by itself.
-
-![Rebon permission modes](assets/demo/modes-auto.webp)
-
-`/agent` sends a job to a second agent. It runs in the background, so you don't
-wait for it and can keep asking about something else. `/tasks` shows how long
-it ran, what it spent, and what it came back with.
-
-![Rebon background sub-agent](assets/demo/background-agent.webp)
-
-Broke something and want out of it? `/rewind` lists every message you sent
-earlier. Pick one and both the files and the conversation go back to how they
-were before you sent it.
-
-![Rebon rewind](assets/demo/rewind.webp)
+| Feature | Demo |
+| --- | --- |
+| Type `/` for the command list and `@` to complete a filename. Ask what the file does and Rebon has to read it, so it stops and asks you first. Approve, ask a follow-up, and it still knows what was just said. | <img src="assets/demo/core-loop.webp" width="440" alt="Rebon core loop"> |
+| Each `shift+tab` switches permission mode, four in all: default, plan, accept edits, auto. In auto it stops asking and finishes the rest by itself. | <img src="assets/demo/modes-auto.webp" width="440" alt="Rebon permission modes"> |
+| `/agent` sends a job to a second agent. It runs in the background, so you don't wait for it and can keep asking about something else. `/tasks` shows how long it ran, what it spent, and what it came back with. | <img src="assets/demo/background-agent.webp" width="440" alt="Rebon background sub-agent"> |
+| Broke something and want out of it? `/rewind` lists every message you sent earlier. Pick one and both the files and the conversation go back to how they were before you sent it. | <img src="assets/demo/rewind.webp" width="440" alt="Rebon rewind"> |
 
 ## What is in this repository
 
