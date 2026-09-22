@@ -94,14 +94,20 @@ fn cross_provider_decision_must_name_its_own_model() {
 }
 
 #[test]
-fn cross_provider_effort_is_checked_against_the_target_model() {
-    // 自建 provider 的模型不在模型表里，扛不住 effort 校验，就不该给它带。
-    assert!(
-        decision(r#"{"provider":"local","model":"self-hosted","reasoningEffort":"low"}"#).is_err()
-    );
+fn effort_is_checked_against_the_models_the_table_knows() {
+    // 表里有行的模型：不支持的 effort 依旧拒绝（gpt-5.4 没有 max）。
+    assert!(decision(r#"{"model":"gpt-5.4","reasoningEffort":"max"}"#).is_err());
     assert!(
         decision(r#"{"provider":"openai","model":"gpt-5.4","reasoningEffort":"high"}"#).is_ok()
     );
+    // 表里没有的模型（自建 provider 自己的 id）：表不为它表态，路由也不拦，
+    // 否则定义了自有模型的安装根本用不了路由。
+    for text in [
+        r#"{"provider":"local","model":"self-hosted","reasoningEffort":"low"}"#,
+        r#"{"model":"plain-model","reasoningEffort":"high"}"#,
+    ] {
+        assert!(decision(text).is_ok(), "refused {text}");
+    }
 }
 
 #[test]
@@ -118,7 +124,7 @@ fn rejects_invalid_unknown_and_unsupported_outputs() {
         r#"{"model":"gpt-5.4","model":"plain-model"}"#,
         r#"{"reasoningEffort":"HIGH"}"#,
         r#"{"reasoningEffort":"auto"}"#,
-        r#"{"model":"plain-model","reasoningEffort":"high"}"#,
+        r#"{"model":"gpt-5.4","reasoningEffort":"max"}"#,
     ] {
         assert!(decision(text).is_err(), "accepted {text}");
     }
@@ -229,6 +235,58 @@ async fn request_is_isolated_bounded_toolless_and_contains_only_raw_prompt() {
         request.messages[0].content[0].as_text(),
         Some("raw task only")
     );
+}
+
+#[tokio::test]
+async fn the_policy_is_handed_to_the_classifier_trimmed() {
+    let (result, client) = classify(
+        serde_json::json!({
+            "routerModel":"active-model",
+            "policy":"  hard work goes to the frontier model  "
+        }),
+        response(
+            serde_json::json!([{"type":"text","text":"{\"model\":\"active-model\"}"}]),
+            "end_turn",
+        ),
+    )
+    .await;
+    assert!(result.is_ok(), "{result:?}");
+    let system = client.requests.lock().unwrap()[0]
+        .system
+        .clone()
+        .expect("the classifier is given a system prompt");
+    assert!(
+        system.contains("hard work goes to the frontier model"),
+        "{system}"
+    );
+    assert!(
+        system.contains("decides over the cost preference"),
+        "a policy has to say it outranks the default bias: {system}"
+    );
+}
+
+#[tokio::test]
+async fn without_a_policy_the_classifier_keeps_the_cost_bias() {
+    for policy in [serde_json::Value::Null, serde_json::json!("   ")] {
+        let (result, client) = classify(
+            serde_json::json!({"routerModel":"active-model","policy":policy}),
+            response(
+                serde_json::json!([{"type":"text","text":"{\"model\":\"active-model\"}"}]),
+                "end_turn",
+            ),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        let system = client.requests.lock().unwrap()[0]
+            .system
+            .clone()
+            .expect("the classifier is given a system prompt");
+        assert!(system.contains("cheapest"), "{system}");
+        assert!(
+            !system.contains("routing policy"),
+            "a blank policy must not be spelled out: {system}"
+        );
+    }
 }
 
 #[tokio::test]
