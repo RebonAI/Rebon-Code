@@ -290,6 +290,9 @@ pub(super) fn collect_tool_block_body_lines_with_width(
     if plan_ledger_input(&tu.name, &tu.input).is_some() {
         return collect_plan_ledger_body_lines(tu, verbosity);
     }
+    if tu.name == rebon_render::code_mode::RUN_CODE_TOOL_NAME {
+        return collect_code_mode_body_lines(tu, verbosity, content_width);
+    }
     if tu.name == "Sleep" {
         return Vec::new();
     }
@@ -476,6 +479,74 @@ pub(super) fn collect_tool_block_body_lines_with_width(
         content_width,
     ));
     normalize_tool_body_lines(lines, matches!(verbosity, ToolOutputVerbosity::Verbose))
+}
+
+/// Body lines for a committed `run_code` (Code Mode) call.
+///
+/// A row that also carries prose never reaches the streaming card, so this
+/// mirrors that card's own rules — the shared completion summary, the final
+/// output, and, in `Verbose`, the program — through the same `rebon_render`
+/// helpers. Progress events are execution activity, not output: a sequence
+/// that dispatched ten tools shows its summary and result rather than
+/// replaying every dispatch into the transcript. A committed row has no
+/// Ctrl+O expansion of its own, so the program only appears in `Verbose`.
+fn collect_code_mode_body_lines(
+    tu: &AssistantToolUseBlock,
+    verbosity: ToolOutputVerbosity,
+    content_width: u16,
+) -> Vec<String> {
+    let content = tu.tool_call_content.as_deref().unwrap_or_default();
+    let mut lines = Vec::new();
+    if tu.status == Some(ToolCallStatus::Failed) {
+        if let Some(reason) = code_mode_failure_reason(tu, content) {
+            lines.push(reason);
+        }
+    } else {
+        lines.push(rebon_render::code_mode::completed_summary(content));
+        let output = content
+            .iter()
+            .filter(|item| rebon_render::tool_output::tool_progress_metadata(item).is_none())
+            .flat_map(|item| {
+                render_tool_call_content(item)
+                    .lines()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            });
+        let mut output = normalize_tool_body_lines(output.collect(), false);
+        if output.is_empty() {
+            output.push("No final output received".into());
+        }
+        lines.extend(output);
+    }
+    if matches!(verbosity, ToolOutputVerbosity::Verbose) {
+        if let Some(program) = rebon_render::code_mode::program_text(&tu.name, &tu.input) {
+            lines.push("JavaScript:".to_string());
+            lines.extend(
+                rebon_render::text::expand_tabs_for_tui(&program)
+                    .lines()
+                    .map(str::to_string),
+            );
+        }
+    }
+    let lines = normalize_tool_body_lines(lines, matches!(verbosity, ToolOutputVerbosity::Verbose));
+    tool_content_preview_lines(&lines, &tu.name, verbosity, content_width)
+}
+
+/// The one reason line a failed `run_code` shows: the error the tool reported,
+/// or the last content block when the result carries no error of its own.
+fn code_mode_failure_reason(
+    tu: &AssistantToolUseBlock,
+    content: &[ToolCallContent],
+) -> Option<String> {
+    let raw = tu
+        .raw_output
+        .as_ref()
+        .and_then(|output| output.get("error"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| content.last().map(render_tool_call_content))?;
+    let reason = raw.lines().find(|line| !line.trim().is_empty())?.trim();
+    Some(rebon_render::text::expand_tabs_for_tui(reason))
 }
 
 /// Convert `StreamingToolUse.raw_input` (a `HashMap`) into a
