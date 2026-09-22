@@ -22,25 +22,26 @@
 
 ## Demo
 
-One exchange from end to end: the slash-command palette opens, `@` completes a
-filename, the question sends Rebon to read that file behind a permission
-prompt, and the follow-up still knows what was said.
+Type `/` for the command list and `@` to complete a filename. Ask what the file
+does and Rebon has to read it, so it stops and asks you first. Approve, ask a
+follow-up, and it still knows what was just said.
 
 ![Rebon core loop](assets/demo/core-loop.webp)
 
-`shift+tab` moves between the four permission modes: default, plan, accept
-edits, auto. Once it reaches auto, the rest of the task finishes with nothing
-left to click.
+Each `shift+tab` switches permission mode, four in all: default, plan, accept
+edits, auto. In auto it stops asking and finishes the rest by itself.
 
 ![Rebon permission modes](assets/demo/modes-auto.webp)
 
-`/agent` hands a job to a sub-agent. It works in the background while you carry
-on asking about something else, and `/tasks` shows what it came back with.
+`/agent` sends a job to a second agent. It runs in the background, so you don't
+wait for it and can keep asking about something else. `/tasks` shows how long
+it ran, what it spent, and what it came back with.
 
 ![Rebon background sub-agent](assets/demo/background-agent.webp)
 
-`/rewind` lists the points you can go back to. Pick one and the code and the
-conversation both return to it.
+Broke something and want out of it? `/rewind` lists every message you sent
+earlier. Pick one and both the files and the conversation go back to how they
+were before you sent it.
 
 ![Rebon rewind](assets/demo/rewind.webp)
 

@@ -6,8 +6,8 @@
     <td valign="middle">
       <h1>rebon</h1>
       <p>
-        面向编码及更多场景的 agent CLI —— 一个终端 harness，通过真正的 agent
-        循环驱动大模型，带工具、会话、权限和完整 TUI。
+        一个在终端里跑的编码 agent。它真的会动手：调工具、记住上下文、按你给的
+        权限行事，界面是完整的 TUI。
       </p>
       <p>
         <a href="https://www.npmjs.com/package/@rebon/cli"><img src="https://img.shields.io/npm/v/@rebon/cli?label=%40rebon%2Fcli" alt="npm"></a>
@@ -19,53 +19,54 @@
   </tr>
 </table>
 
-> 两份文档描述同一套东西；有出入时以英文版为准。
+> 这份和英文版讲的是同一个东西。两边对不上的时候，以英文版为准。
 
 ## 演示
 
-一次完整的问答：打开斜杠命令面板，用 `@` 补全文件名，提问之后它去读文件、弹出权限
-确认框；再追问一句，它还记得前面聊过什么。
+输入 `/` 会弹出命令列表，输入 `@` 能补全文件名。问它某个文件是干什么的，它要读这个
+文件，会先停下来问你准不准；批准之后再追问一句，它还记得刚才说过什么。
 
 ![Rebon 基本用法](../assets/demo/core-loop.webp)
 
-按 `shift+tab` 在四种权限模式之间切换：default、plan、accept edits、auto。切到 auto
-之后，剩下的活它自己干完，不用再点确认。
+按一次 `shift+tab` 换一种权限模式，一共四种：default、plan、accept edits、auto。
+换到 auto 之后它不再问你，剩下的自己做完。
 
 ![Rebon 权限模式](../assets/demo/modes-auto.webp)
 
-用 `/agent` 把一件事丢给子代理，它在后台自己做，你这边可以接着问别的。做完用
-`/tasks` 看它做出了什么。
+用 `/agent` 另派一个 agent 去干一件事。它在后台跑，你这边不用等，可以接着问别的。
+`/tasks` 里能看到它跑了多久、花了多少 token、最后交出什么。
 
-![Rebon 后台子代理](../assets/demo/background-agent.webp)
+![Rebon 后台 agent](../assets/demo/background-agent.webp)
 
-用 `/rewind` 列出能退回去的位置，挑一个，代码和对话一起退回那时候。
+改坏了想反悔，用 `/rewind`。它会列出你之前发过的每一条消息，选中哪一条，文件和聊天
+记录就都回到你发那条消息之前的样子。
 
-![Rebon 回滚](../assets/demo/rewind.webp)
+![Rebon 回退改动](../assets/demo/rewind.webp)
 
 ## 这个仓库里有什么
 
-`rebon` 命令行 agent 本体，以及构建它所需的一切：各个 crate、插件、打包链和发布
-workflow。
+`rebon` 这个命令行 agent，以及把它构建出来所需要的全部东西：各个 crate、插件、
+打包脚本和发布 workflow。
 
-Rebon 的其他端各自按自己的节奏发布，**不在**这棵树里。这里的注释会提到它们，是因为
-共用的那部分代码是被它们塑形的：
+Rebon 还有别的客户端，各自按自己的节奏发版，**不在**这个仓库里。代码注释里会提到
+它们，因为有些共用的代码当初就是为它们写的：
 
-| 端 | 位置 |
+| 客户端 | 在哪 |
 | --- | --- |
 | 桌面端 | <https://reboncode.ai> |
 | 移动端 | <https://reboncode.ai> |
 | Web UI（`rebon serve`） | `@rebon/rebon-web` npm 包 |
 
-`assets/` 放的是 CLI 从这些端读取的产物 —— Windows 图标、生成的 i18n 文案表，以及
-一份提交进仓库的 Web UI 构建结果；`build.rs` 会把它嵌进二进制，所以 `cargo build`
-从不需要 Node。
+`assets/` 放的是 CLI 要用、但来自这些客户端的文件：Windows 图标、生成好的 i18n
+文案表，还有一份直接提交进仓库的 Web UI 构建结果。`build.rs` 会把它打进二进制，
+所以 `cargo build` 用不着 Node。
 
 ### 关于这个仓库里的 tag
 
-这个仓库之前是 Rebon 发布 Releases 的地方，所以 refs 里有大量来自桌面端的
-`app-v*` tag。它们是刻意保留的：那些发布就在那里，删掉会让指向它们的链接失效。
+这个仓库以前是 Rebon 发 Release 的地方，所以留着一大堆桌面端的 `app-v*` tag。
+这些是故意不删的：那些发布就挂在上面，删了指过去的链接会全部失效。
 
-它们和 CLI 无关。CLI 自己的发布是 `v*` tag，发布 workflow 也只认这个。
+它们和 CLI 无关。CLI 自己的发布用 `v*` tag，发布 workflow 也只认这个。
 
 ## 安装
 
@@ -79,11 +80,11 @@ npm install -g @rebon/cli
 npm install -g @rebon/cli@latest
 ```
 
-`@rebon/cli` 是一个很薄的启动器，通过 optional dependency 拉取匹配的原生二进制。
-支持的平台：`win32-x64`、`darwin-x64`、`darwin-arm64`、`linux-x64`、`linux-arm64`。
+`@rebon/cli` 本身只是个壳，真正的原生二进制靠 optional dependency 按平台装。
+支持 `win32-x64`、`darwin-x64`、`darwin-arm64`、`linux-x64`、`linux-arm64`。
 
-> 如果安装时报 "missing optional platform package"，通常是你传了
-> `--omit=optional` 或 `--no-optional`。去掉那个参数重装即可。
+> 装的时候报 "missing optional platform package"，多半是你加了
+> `--omit=optional` 或 `--no-optional`。去掉重装就行。
 
 ## 快速开始
 
@@ -91,68 +92,68 @@ npm install -g @rebon/cli@latest
 # 在当前目录启动本地 TUI
 rebon
 
-# 恢复之前的会话
+# 接着上次的会话继续
 rebon --resume k7m2q-4xr9t-hb3wz-p8ncv
 
-# 覆盖当前的 provider / 模型
+# 临时换一个 provider / 模型
 rebon --provider openrouter --model gpt-5.5
 
-# 作为 ACP JSON-RPC 服务跑在 stdio 上（供编辑器 / IDE 集成）
+# 作为 ACP JSON-RPC 服务跑在 stdio 上（给编辑器 / IDE 用）
 rebon --acp
 
-# 在另一台机器上的项目里工作
+# 在另一台机器上的项目里干活
 rebon remote add prod deploy@build.example --path /srv/app
 rebon --remote prod
 ```
 
-首次运行会进入引导流程：选 provider、登录（Claude / OpenAI 走 OAuth + PKCE，或者
-直接粘贴 API key），然后就可以用了。
+第一次运行会带你走一遍设置：挑 provider、登录（Claude / OpenAI 走 OAuth + PKCE，
+也可以直接粘 API key），然后就能用了。
 
 ## 命令行参数
 
 | 参数 | 作用 |
 | --- | --- |
 | `--acp` | 作为 ACP JSON-RPC 服务跑在 stdio 上。 |
-| `--provider <name>` | 覆盖 `~/.rebon/config.json` 里的 `activeCustomProvider`。 |
-| `--model <id>` | 覆盖解析出的 provider 的默认模型。 |
-| `--resume <id>` | 读取磁盘上的转录并回放进 TUI。 |
-| `--remote <name>` | 通过 ssh 在已配置的远端主机上跑这个会话。 |
-| `--remote-path <p>` | 该远端上的项目目录。必须与 `--remote` 一起用。 |
+| `--provider <name>` | 盖掉 `~/.rebon/config.json` 里的 `activeCustomProvider`。 |
+| `--model <id>` | 盖掉当前 provider 的默认模型。 |
+| `--resume <id>` | 把存在磁盘上的聊天记录读出来，重新放回 TUI。 |
+| `--remote <name>` | 通过 ssh 把这个会话跑在配置好的远端机器上。 |
+| `--remote-path <p>` | 远端上的项目目录。必须和 `--remote` 一起用。 |
 
 ## 配置与数据
 
-- `~/.rebon/config.json` —— provider、模型、凭证、默认值。
-- `~/.rebon/sessions/` —— 保存的转录。
-- `~/.rebon/skills/`、`~/.rebon/agents/`、`~/.rebon/memory/` —— 用户资产。
-- `$REBON_LOG_DIR/rebon.log` —— TUI 日志文件（Windows 下默认
-  `%TEMP%/rebon/logs/rebon.log`，其他平台 `$TMPDIR/rebon/logs/rebon.log`）。
-  `--acp` 模式改为输出到 stderr。
+- `~/.rebon/config.json`：provider、模型、凭证、各种默认值。
+- `~/.rebon/sessions/`：存下来的聊天记录。
+- `~/.rebon/skills/`、`~/.rebon/agents/`、`~/.rebon/memory/`：你自己的东西。
+- `$REBON_LOG_DIR/rebon.log`：TUI 的日志（Windows 下默认在
+  `%TEMP%/rebon/logs/rebon.log`，其他平台在 `$TMPDIR/rebon/logs/rebon.log`）。
+  `--acp` 模式下改成输出到 stderr。
 
-项目级的覆盖配置放在工作目录下的 `.rebon/` 和 `.claude/` 里。
+只想对某个项目生效的配置，放在那个项目目录下的 `.rebon/` 和 `.claude/` 里。
 
-## 你会得到什么
+## 它能做什么
 
-- **本地 TUI** —— 带历史记录、粘贴、图片粘贴、`@` 提及与斜杠命令选择器、排队提交、
-  模式切换的输入区；带 markdown、工具分组、思考块、计划审批、权限弹窗的流式转录；
-  覆盖引导、设置、恢复、回退、快速打开、历史搜索、全局搜索、任务、后台任务、团队、
-  agent 的完整对话框栈。
-- **Agent 工具循环** —— Bash / PowerShell、Read / Write / Edit、Glob / Grep、Sleep、
+- **本地 TUI**。输入框记得历史、能粘文字也能粘图、打 `@` 选文件、打 `/` 选命令、
+  可以排队提交、可以切换模式。回答是流式出来的，带 markdown 渲染、工具调用分组、
+  思考过程、计划审批和权限弹窗。另有一整套对话框：初次设置、设置面板、恢复会话、
+  回退改动、快速打开、搜历史、全局搜索、任务、后台任务、团队、agent。
+- **它能调的工具**。Bash / PowerShell、Read / Write / Edit、Glob / Grep、Sleep、
   TaskCreate / TaskUpdate / TaskList / TaskGet / TaskStop、Agent、SkillTool、
   AskUserQuestion、SendMessage、EnterPlanMode / ExitPlanMode、ToolSearch、
-  Team{Create,Delete,Files,Mailbox,Manager}、Worktree，以及 MCP 工具（stdio、
-  Streamable HTTP、旧版 SSE）。
-- **Provider** —— Anthropic、OpenAI 和 OpenAI-Responses，支持流式、compact /
-  上下文裁剪，以及自动生成会话标题。
-- **权限、钩子、沙箱** —— 对 shell、文件系统、网页抓取和 skill 调用做细粒度的
-  允许 / 拒绝；用户自定义钩子；带违规上报的沙箱配置。
-- **Skill、agent、记忆** —— 内置和用户自己的 skill；可派生的 worker agent 以及
-  负责后台任务的协调者；带召回与呈现的持久化记忆层。
-- **远端主机** —— 通过 ssh 对另一台机器上的项目跑会话。远端会装一份 server 构建，
-  agent 在那边执行 —— shell、文件系统、git —— 而本机只保留界面和转录。先
-  `rebon remote add`，再 `rebon --remote <name>`。
-- **ACP 服务** —— 从编辑器通过 stdio JSON-RPC 驱动 Rebon：`initialize`、
+  Team{Create,Delete,Files,Mailbox,Manager}、Worktree，再加上 MCP 工具
+  （stdio、Streamable HTTP、旧的 SSE）。
+- **支持的 provider**。Anthropic、OpenAI 和 OpenAI-Responses，都支持流式输出、
+  上下文压缩和裁剪，会话标题也是自动起的。
+- **权限、钩子、沙箱**。对执行 shell、读写文件、抓网页、调 skill 分别设允许或
+  拒绝；可以自己写钩子；沙箱越界了会报给你。
+- **Skill、agent、记忆**。内置的和你自己写的 skill 都能用；可以派 agent 去后台
+  干活，也有一个协调者管着它们；它还会记住东西，下次用得上的时候自己捞出来。
+- **在别的机器上干活**。通过 ssh 对另一台机器上的项目开会话。第一次连的时候会在
+  对面装一份 server，之后 shell、读写文件、git 都在那边跑，你这台机器只管界面和
+  聊天记录。先 `rebon remote add`，再 `rebon --remote <name>`。
+- **ACP 服务**。让编辑器通过 stdio JSON-RPC 驱动 Rebon：`initialize`、
   `session/new`、`session/load`、`session/list`、`session/prompt`、
-  `session/cancel`、反向 RPC 的权限询问、流式工具输出。
+  `session/cancel`，权限询问走反向 RPC，工具输出是流式的。
 
 ## 常用操作
 
@@ -160,27 +161,27 @@ rebon --remote prod
 # 在当前仓库开一个新会话
 rebon
 
-# 恢复上次的会话（在 TUI 里按 Tab 可以浏览）
+# 接着上次的会话继续（在 TUI 里按 Tab 可以翻）
 rebon --resume <session-id>
 
-# 通过 ACP 接入编辑器（stdio 由编辑器管理）
+# 接进编辑器（stdio 由编辑器管）
 rebon --acp
 
-# 不改配置文件，临时覆盖 provider / 模型
+# 不动配置文件，临时换 provider / 模型
 rebon --provider anthropic --model claude-opus-4-7
 ```
 
 TUI 里：
 
-- `?` —— 键盘帮助
-- `/` —— 斜杠命令选择器
-- `@` —— 文件 / 符号提及
-- `Tab` —— 切换面板 / 列表
-- `Esc` —— 取消当前步骤或关掉对话框
+- `?`：看快捷键
+- `/`：选命令
+- `@`：选文件或符号
+- `Tab`：在面板和列表之间切
+- `Esc`：取消当前这步，或关掉对话框
 
 ## 更新
 
-`rebon` 自带更新器，启动时会检查新版本。你也可以直接重跑：
+`rebon` 自带更新器，启动时会看一眼有没有新版本。你也可以自己重装：
 
 ```bash
 npm install -g @rebon/cli@latest
@@ -188,24 +189,24 @@ npm install -g @rebon/cli@latest
 
 ## 隐私
 
-Rebon 没有遥测 —— 没有 analytics，没有崩溃上报，没有使用事件，没有匿名安装
-ID。它唯一自己发起的请求就是上面这个更新检查：一个纯 `GET`，读取
-`@rebon/cli` 的公开 npm 元数据，不带任何标识，连你当前的版本都不会上报。
-其余所有出站流量都是你自己发起的请求 —— 一轮模型对话、一次 `WebFetch`、
-一次 MCP 调用。
+Rebon 不做遥测：没有 analytics，没有崩溃上报，没有使用事件，没有匿名安装 ID。
+它自己主动发出的请求只有上面那个版本检查：一个纯 `GET`，读 `@rebon/cli` 的公开
+npm 元数据，不带任何能认出你的信息，连你现在装的是哪个版本都不告诉对面。除此
+之外所有往外发的流量，都是你自己让它发的——问一次模型、抓一个网页、调一次 MCP。
 
-[PRIVACY.zh-CN.md](PRIVACY.zh-CN.md) 列出了这个二进制所有可能发出的请求、
-每条各自所在的文件，以及你自己动手核实的命令。
+[PRIVACY.zh-CN.md](PRIVACY.zh-CN.md) 把这个二进制可能发出的请求一条条列了出来，
+写明每条在哪个文件里，以及你自己动手核实的命令。
 
 ## 排查
 
-- **"missing optional platform package"** —— 去掉 `--omit=optional` /
+- **"missing optional platform package"**：去掉 `--omit=optional` /
   `--no-optional` / `--ignore-optional` 重装。
-- **"unsupported platform"** —— 你的 `process.platform` / `process.arch` 不在
-  支持的五个目标里。
-- **TUI 显示错乱** —— 确认终端支持真彩色和 Unicode 宽度表（新版 Windows Terminal、
-  iTerm2、Alacritty、WezTerm、Kitty 都可以）。旧的 `cmd.exe` 和 `conhost` 不支持。
-- **日志** —— 看 `$REBON_LOG_DIR/rebon.log`（TUI）或 stderr（`--acp`）。
+- **"unsupported platform"**：你的 `process.platform` / `process.arch` 不在支持
+  的那五个里。
+- **TUI 显示错乱**：看看终端支不支持真彩色和 Unicode 字宽（新版 Windows
+  Terminal、iTerm2、Alacritty、WezTerm、Kitty 都可以）。老的 `cmd.exe` 和
+  `conhost` 不行。
+- **想看日志**：`$REBON_LOG_DIR/rebon.log`（TUI）或 stderr（`--acp`）。
 
 ## Friends
 
