@@ -19,7 +19,7 @@ pub fn acp_advertised_slash_commands() -> Vec<SlashCommand> {
 mod tests {
     use super::*;
 
-    /// The seven below are the compiled-in table. `/memory` is advertised
+    /// The eight below are the compiled-in table. `/memory` is advertised
     /// on this surface too, but it is the memory plugin's command and only
     /// exists once the kernel has booted, which this crate's tests never
     /// do; the booted list is pinned by the harness test
@@ -36,6 +36,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "codemode",
                 "context",
                 "cost",
                 "doctor",

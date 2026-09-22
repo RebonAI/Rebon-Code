@@ -4044,7 +4044,7 @@ async fn session_load_response_restores_command_and_config_metadata() {
         .expect("slashCommands must be restored");
     // The compiled-in table; a booted server adds the memory plugin's
     // `/memory` (see `acp_advertised_commands_are_exactly_the_implemented_set`).
-    assert_eq!(commands.len(), 7);
+    assert_eq!(commands.len(), 8);
     assert!(commands.iter().any(|command| command["name"] == "status"));
     assert!(commands.iter().any(|command| command["name"] == "doctor"));
     assert!(commands.iter().any(|command| {
