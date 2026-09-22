@@ -23,22 +23,22 @@
 
 ## 演示
 
-核心回合 —— 斜杠命令面板、`@` 文件补全、带权限确认框的工具调用，以及一次沿用上文的
-追问：
+一次完整的问答：打开斜杠命令面板，用 `@` 补全文件名，提问之后它去读文件、弹出权限
+确认框；再追问一句，它还记得前面聊过什么。
 
-![Rebon 核心回合](../assets/demo/core-loop.webp)
+![Rebon 基本用法](../assets/demo/core-loop.webp)
 
-权限模式 —— `shift+tab` 逐级循环 default、plan、accept-edits、auto；随后任务在 auto
-模式分类器下无人值守跑完：
+按 `shift+tab` 在四种权限模式之间切换：default、plan、accept edits、auto。切到 auto
+之后，剩下的活它自己干完，不用再点确认。
 
 ![Rebon 权限模式](../assets/demo/modes-auto.webp)
 
-后台工作 —— `/agent` 把一件事交给子代理自己跑，会话本身不被占住，`/tasks` 再把结果
-收回来：
+用 `/agent` 把一件事丢给子代理，它在后台自己做，你这边可以接着问别的。做完用
+`/tasks` 看它做出了什么。
 
 ![Rebon 后台子代理](../assets/demo/background-agent.webp)
 
-`/rewind` —— 选一个还原点，把代码和对话一起回滚：
+用 `/rewind` 列出能退回去的位置，挑一个，代码和对话一起退回那时候。
 
 ![Rebon 回滚](../assets/demo/rewind.webp)
 

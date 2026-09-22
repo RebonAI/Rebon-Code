@@ -22,23 +22,25 @@
 
 ## Demo
 
-The core loop — slash-command palette, `@`-file completion, a tool call with its
-permission prompt, and a follow-up that keeps the earlier context:
+One exchange from end to end: the slash-command palette opens, `@` completes a
+filename, the question sends Rebon to read that file behind a permission
+prompt, and the follow-up still knows what was said.
 
 ![Rebon core loop](assets/demo/core-loop.webp)
 
-Permission modes — `shift+tab` cycles default, plan, accept-edits and auto; the
-task then runs unattended under the auto-mode classifier:
+`shift+tab` moves between the four permission modes: default, plan, accept
+edits, auto. Once it reaches auto, the rest of the task finishes with nothing
+left to click.
 
 ![Rebon permission modes](assets/demo/modes-auto.webp)
 
-Background work — `/agent` hands a job to a sub-agent that runs on its own while
-the session stays free, and `/tasks` collects the result:
+`/agent` hands a job to a sub-agent. It works in the background while you carry
+on asking about something else, and `/tasks` shows what it came back with.
 
 ![Rebon background sub-agent](assets/demo/background-agent.webp)
 
-`/rewind` — pick a restore point and roll the code and the conversation back
-together:
+`/rewind` lists the points you can go back to. Pick one and the code and the
+conversation both return to it.
 
 ![Rebon rewind](assets/demo/rewind.webp)
 
