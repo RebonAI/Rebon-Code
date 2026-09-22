@@ -112,15 +112,17 @@ pub const OPENAI_OAUTH_PROVIDER_MODEL: &str = "gpt-5.4";
 /// Models offered by the built-in OpenAI Codex OAuth provider. The
 /// first entry becomes the provider's active model on login. The
 /// gpt-5.6 family is Sol (flagship; `gpt-5.6` is its alias), Terra
-/// (balanced) and Luna (fastest/cheapest); `gpt-6-astra` is the GPT-6
-/// flagship Codex ships (a staged rollout, so it is listed but not the
-/// login default).
+/// (balanced) and Luna (fastest/cheapest); `gpt-6-astra`, `gpt-6-sol` and
+/// `gpt-6-luna` are the GPT-6 line Codex ships (a staged rollout, so they
+/// are listed but not the login default).
 pub const OPENAI_OAUTH_PROVIDER_MODELS: &[&str] = &[
     OPENAI_OAUTH_PROVIDER_MODEL,
     "gpt-5.6-sol",
     // Virtual alias: sent as gpt-5.6-sol + `reasoning.mode: "pro"`.
     "gpt-5.6-sol-pro",
     "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "gpt-5.5",

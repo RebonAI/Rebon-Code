@@ -277,6 +277,11 @@ const OPENAI_MODELS: &[KnownModel] = &[
     // developers.openai.com/api/docs/models/gpt-6-astra (2026-09-05):
     // 1,050,000 context window, 128,000 max output tokens.
     known("gpt-6-astra", 1_050_000, Some(128_000)),
+    // developers.openai.com/api/docs/models/gpt-6-sol: 1,050,000 context
+    // window, 128,000 max output tokens.
+    known("gpt-6-sol", 1_050_000, Some(128_000)),
+    // developers.openai.com/api/docs/models/gpt-6-luna: same limits.
+    known("gpt-6-luna", 1_050_000, Some(128_000)),
     known("gpt-5.6-terra", 1_050_000, Some(128_000)),
     known("gpt-5.6-luna", 1_050_000, Some(128_000)),
     known("gpt-5.5", 1_050_000, Some(128_000)),
