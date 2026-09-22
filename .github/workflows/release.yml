@@ -579,3 +579,29 @@ jobs:
             echo "upwards to the first row that is neither success nor skipped."
             exit 1
           fi
+      # The results above cannot see the failure this job exists for. Every
+      # publish job reports success when npm answers "cannot publish over the
+      # previously published versions": npm_publish_dist.sh reads that as the
+      # idempotent retry it is built around and says `skip: ... already
+      # published`. A tag pushed without bumping `[workspace.package] version`
+      # therefore ships nothing and leaves six green rows, because the version
+      # the tarballs carry is read from that manifest and never from the tag —
+      # v1.5.0 did exactly that and published 1.4.0 again, or rather tried to.
+      # The registry is the only witness that a publish happened, so it is
+      # asked directly, and asked even when a row above already failed.
+      - name: The registry must carry the version this tag names
+        if: always()
+        run: |
+          set -eu
+          expected="${GITHUB_REF_NAME#v}"
+          actual=$(curl -fsS "https://registry.npmjs.org/@rebon%2fcli/latest" \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')
+          printf 'tag %s -> %s; registry latest %s\n' "$GITHUB_REF_NAME" "$expected" "$actual"
+          if [ "$actual" != "$expected" ]; then
+            echo >&2
+            echo "@rebon/cli@latest is $actual, but this tag names $expected. The" >&2
+            echo "publish jobs skipped over an already-published version and shipped" >&2
+            echo "nothing: bump [workspace.package] version (scripts/release-cli.sh)" >&2
+            echo "and cut the tag again." >&2
+            exit 1
+          fi
