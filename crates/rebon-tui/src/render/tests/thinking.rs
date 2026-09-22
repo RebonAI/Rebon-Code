@@ -493,9 +493,49 @@ fn compact_transcript_keeps_thinking_preview_before_agent_tool_rows() {
         "only the first thinking line should be visible in compact view: {snap:?}"
     );
     assert!(snap.contains("Ctrl+O to expand"), "{snap:?}");
-    assert!(snap.contains("Agent ("), "{snap:?}");
+    // The row is named by the shared display-name map, so an Agent is shown
+    // under its subagent type here exactly as the streaming card shows it.
+    assert!(snap.contains("Explore ("), "{snap:?}");
     assert!(snap.contains("Review ACP code"), "{snap:?}");
     assert_no_adjacent_blank_rows(&rows);
+}
+
+#[test]
+fn committed_rows_name_run_code_from_the_shared_display_name_map() {
+    use crate::state::{reducer, Action};
+
+    let mut s = AppState::new();
+    reducer(
+        &mut s,
+        Action::Commit(assistant_thinking_and_tool_uses(
+            "a-code",
+            "sequence reasoning",
+            vec![(
+                "code-1",
+                "run_code",
+                json!({
+                    "description": "Inspect tasks",
+                    "code": "return await tools.TaskList();"
+                }),
+            )],
+        )),
+    );
+
+    let mut buf = new_buf(100, 12);
+    render_transcript(
+        &s,
+        Rect::new(0, 0, 100, 12),
+        &mut buf,
+        &RenderTheme::plain(),
+        0,
+        ToolOutputVerbosity::Verbose,
+        0,
+        None,
+    );
+    let snap = semantic_rows(&buf).join("\n");
+
+    assert!(snap.contains("Run sequence ("), "{snap:?}");
+    assert!(!snap.contains("run_code ("), "{snap:?}");
 }
 
 #[test]

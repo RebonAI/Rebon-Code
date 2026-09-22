@@ -69,15 +69,11 @@ pub(super) fn to_message_row(
                         })
                     }
                     AssistantContentBlock::ToolUse(tu) => {
-                        let display_name = if tu.name == "InvokeDeferredTool" {
-                            tu.input
-                                .get("tool_name")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                                .unwrap_or_else(|| tu.name.clone())
-                        } else {
-                            tu.name.clone()
-                        };
+                        let display_name =
+                            rebon_render::summary::streaming_tool_display_name_for_value(
+                                &tu.name, &tu.input,
+                            )
+                            .to_string();
                         let is_web_search = display_name == "WebSearch";
                         let shell_management_summary = tu.raw_output.as_ref().and_then(|raw| {
                             rebon_render::shell_output::shell_management_header_summary_from_value(

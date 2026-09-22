@@ -205,25 +205,40 @@ fn snake_to_title(s: &str) -> String {
         .join(" ")
 }
 
+/// The one decision about what to call a tool in a transcript row, for every
+/// caller that has the input as a map.
 pub fn streaming_tool_display_name<'a>(
     tool_name: &'a str,
     raw_input: Option<&'a HashMap<String, Value>>,
 ) -> &'a str {
+    display_name_for_tool(tool_name, |key| {
+        raw_input
+            .and_then(|input| input.get(key))
+            .and_then(Value::as_str)
+    })
+}
+
+/// [`streaming_tool_display_name`] for callers holding the tool input as a
+/// `serde_json::Value` — the same names for the same tools.
+pub fn streaming_tool_display_name_for_value<'a>(
+    tool_name: &'a str,
+    raw_input: &'a Value,
+) -> &'a str {
+    display_name_for_tool(tool_name, |key| raw_input.get(key).and_then(Value::as_str))
+}
+
+fn display_name_for_tool<'a>(
+    tool_name: &'a str,
+    input_field: impl Fn(&str) -> Option<&'a str>,
+) -> &'a str {
     match tool_name {
         crate::code_mode::RUN_CODE_TOOL_NAME => "Run sequence",
-        "Agent" => raw_input
-            .and_then(|input| {
-                input
-                    .get("subagent_type")
-                    .or_else(|| input.get("subagentType"))
-            })
-            .and_then(Value::as_str)
+        "Agent" => input_field("subagent_type")
+            .or_else(|| input_field("subagentType"))
             .map(str::trim)
             .filter(|agent_type| !agent_type.is_empty() && *agent_type != "general-purpose")
             .unwrap_or(tool_name),
-        "InvokeDeferredTool" => raw_input
-            .and_then(|input| input.get("tool_name"))
-            .and_then(Value::as_str)
+        "InvokeDeferredTool" => input_field("tool_name")
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .unwrap_or(tool_name),
