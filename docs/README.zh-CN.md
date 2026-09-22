@@ -33,6 +33,11 @@
 
 ![Rebon 权限模式](../assets/demo/modes-auto.webp)
 
+后台工作 —— `/agent` 把一件事交给子代理自己跑，会话本身不被占住，`/tasks` 再把结果
+收回来：
+
+![Rebon 后台子代理](../assets/demo/background-agent.webp)
+
 `/rewind` —— 选一个还原点，把代码和对话一起回滚：
 
 ![Rebon 回滚](../assets/demo/rewind.webp)

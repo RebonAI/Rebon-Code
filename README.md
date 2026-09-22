@@ -32,6 +32,11 @@ task then runs unattended under the auto-mode classifier:
 
 ![Rebon permission modes](assets/demo/modes-auto.webp)
 
+Background work — `/agent` hands a job to a sub-agent that runs on its own while
+the session stays free, and `/tasks` collects the result:
+
+![Rebon background sub-agent](assets/demo/background-agent.webp)
+
 `/rewind` — pick a restore point and roll the code and the conversation back
 together:
 
