@@ -9,7 +9,10 @@ use rebon_agent_core::{PromptExecutorError, PromptRequest};
 use rebon_session::model_selection::{self, SessionModelSelection};
 
 use super::SharedRuntimeModel;
-use crate::model_routing::{FirstPromptModelRouter, ModelRoutingInput, ModelRuntimeResolver};
+use crate::model_routing::{
+    routed_target, selection_notice, FirstPromptModelRouter, ModelRoutingInput,
+    ModelRuntimeResolver,
+};
 
 type Key = (PathBuf, String, String);
 
@@ -174,23 +177,24 @@ impl SharedRuntimeModel {
                                         session,
                                     })
                                     .await?;
-                                let runtime = match decision
-                                    .model
-                                    .as_ref()
-                                    .filter(|model| *model != &current.model)
+                                let (provider, model) = routed_target(
+                                    &decision,
+                                    &current.provider_name,
+                                    &current.model,
+                                );
+                                let runtime = if provider == current.provider_name
+                                    && model == current.model
                                 {
-                                    Some(model) => {
-                                        let resolve = resolver.ok_or_else(|| {
-                                            anyhow::anyhow!("runtime model resolver unavailable")
-                                        })?;
-                                        resolve(current.provider_name.clone(), model.clone())
-                                            .await?
-                                    }
-                                    None => current.clone(),
+                                    current.clone()
+                                } else {
+                                    let resolve = resolver.ok_or_else(|| {
+                                        anyhow::anyhow!("runtime model resolver unavailable")
+                                    })?;
+                                    resolve(provider.clone(), model).await?
                                 };
                                 anyhow::ensure!(
-                                    runtime.provider_name == current.provider_name,
-                                    "router cannot switch providers"
+                                    runtime.provider_name == provider,
+                                    "resolver returned a different provider than requested"
                                 );
                                 let choice = SessionModelSelection {
                                     provider: Some(runtime.provider_name.clone()),
@@ -212,10 +216,11 @@ impl SharedRuntimeModel {
                                         &choice,
                                     ) {
                                         Ok(true) => {
-                                            notice = Some(match choice.effort.as_deref() {
-                                                Some(effort) => format!("Auto switched model to {} with {effort} effort; continuing the task.", runtime.model),
-                                                None => format!("Auto switched model to {}; continuing the task.", runtime.model),
-                                            });
+                                            notice = Some(selection_notice(
+                                                &runtime.provider_name,
+                                                &runtime.model,
+                                                choice.effort.as_deref(),
+                                            ));
                                             state.runtime = Some(SharedRuntimeModel::new(runtime));
                                             state.selected = Some(choice.clone());
                                             selection = Some(choice);

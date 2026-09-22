@@ -20,6 +20,7 @@ impl FirstPromptModelRouter for Router {
             "error" => anyhow::bail!("mock failure"),
             "pending" => std::future::pending().await,
             _ => Ok(ModelRoutingDecision {
+                provider: (self.mode == "provider").then(|| "other".into()),
                 model: Some("selected".into()),
                 reasoning_effort: Some(ReasoningEffort::Low),
             }),
@@ -100,6 +101,76 @@ async fn automatic_routing_once_per_task_and_parent_isolation() {
     assert_eq!(notices.len(), 3);
     assert_eq!(notices[0].0, "p1");
     assert!(notices[0].1.contains("with low effort"));
+}
+
+/// 自动路由选中的 provider 就是 worker 真正跑的那条腿，而不是父会话那一个。
+///
+/// `ProviderFollower` 把请求的 provider 原样答回：真实 router 会在这一步重建另一个
+/// provider 的 client，测试只需要看请求有没有把 provider 换成决策点名的那一个。
+#[tokio::test]
+async fn automatic_routing_can_move_the_worker_to_another_provider() {
+    struct ProviderFollower;
+    #[async_trait::async_trait]
+    impl rebon_agent_core::model_router::AgentModelRouter for ProviderFollower {
+        async fn resolve(
+            &self,
+            request: ModelRouteRequest,
+        ) -> anyhow::Result<ResolvedModelRuntime> {
+            Ok(ResolvedModelRuntime {
+                provider_name: request.provider.clone().unwrap_or_else(|| "mock".into()),
+                client: Arc::new(MockModelClient::new()),
+                model: request.model.clone().unwrap_or_else(|| "initial".into()),
+                reasoning_effort: request.reasoning_effort,
+            })
+        }
+        async fn resolve_automatic(
+            &self,
+            request: ModelRouteRequest,
+        ) -> anyhow::Result<ResolvedModelRuntime> {
+            self.resolve(request).await
+        }
+    }
+    let (kernel, _engine, spawner, router, current) = setup("provider", true);
+    let notices = Arc::new(Mutex::new(Vec::new()));
+    let capture = notices.clone();
+    kernel.context().fork("test-routing-provider-notice").on(
+        move |notice: &rebon_core::model_routing::ModelRoutingNotice| {
+            capture.lock().unwrap().push(notice.text.clone());
+        },
+    );
+    let spawner = spawner.with_model_router(Arc::new(ProviderFollower));
+    let (selected, auto) = spawner
+        .automatically_route_worker(
+            &spec("p"),
+            "one",
+            ModelRouteRequest::default(),
+            current.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(auto);
+    assert_eq!(selected.provider_name, "other");
+    assert_eq!(selected.model, "selected");
+    assert_eq!(router.calls.load(Ordering::SeqCst), 1);
+    assert!(
+        notices.lock().unwrap()[0].contains("other / selected"),
+        "{:?}",
+        notices.lock().unwrap()
+    );
+    // 声明过 provider 的派发不吃自动路由：那是调用方的决定，不是分类器的。
+    let mut declared = current;
+    declared.provider_name = "declared".into();
+    let request = ModelRouteRequest {
+        provider: Some("declared".into()),
+        ..Default::default()
+    };
+    let (kept, auto) = spawner
+        .automatically_route_worker(&spec("p2"), "two", request, declared)
+        .await
+        .unwrap();
+    assert!(!auto);
+    assert_eq!(kept.provider_name, "declared");
+    assert_eq!(router.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

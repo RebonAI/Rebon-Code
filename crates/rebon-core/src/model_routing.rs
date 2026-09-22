@@ -45,13 +45,12 @@ pub async fn run_bounded<T>(
     Ok(result)
 }
 
-pub fn selection_notice(model: &str, effort: Option<rebon_types::ReasoningEffort>) -> String {
+pub fn selection_notice(provider: &str, model: &str, effort: Option<&str>) -> String {
     match effort {
         Some(effort) => format!(
-            "Auto switched model to {model} with {} effort; continuing the task.",
-            effort.as_str()
+            "Auto switched to {provider} / {model} with {effort} effort; continuing the task."
         ),
-        None => format!("Auto switched model to {model}; continuing the task."),
+        None => format!("Auto switched to {provider} / {model}; continuing the task."),
     }
 }
 
@@ -66,8 +65,34 @@ pub struct ModelRoutingInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRoutingDecision {
+    /// The provider to run on, when it is not the one the session is on.
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<rebon_types::ReasoningEffort>,
+}
+
+/// The provider/model pair a decision asks for, read against the pair the
+/// session is on now.
+///
+/// A named provider replaces the current one and needs a model with it: a model
+/// id belongs to the provider that serves it, so a provider-only decision would
+/// ask the new provider for a model it may not have. Every caller that turns a
+/// decision into a runtime reads it here, so the rule holds for the main session
+/// and for a spawned worker alike.
+pub fn routed_target(
+    decision: &ModelRoutingDecision,
+    provider: &str,
+    model: &str,
+) -> (String, String) {
+    let target_model = decision.model.clone().unwrap_or_else(|| model.to_owned());
+    match decision
+        .provider
+        .as_deref()
+        .filter(|named| !named.is_empty())
+    {
+        Some(named) => (named.to_owned(), target_model),
+        None => (provider.to_owned(), target_model),
+    }
 }
 
 #[async_trait]

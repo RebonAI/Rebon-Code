@@ -855,7 +855,7 @@ impl EngineSubAgentSpawner {
         current: rebon_agent_core::model_router::ResolvedModelRuntime,
     ) -> Result<(rebon_agent_core::model_router::ResolvedModelRuntime, bool), String> {
         use rebon_core::model_routing::{
-            run_bounded, selection_notice, ModelRoutingInput, ModelRoutingNotice,
+            routed_target, run_bounded, selection_notice, ModelRoutingInput, ModelRoutingNotice,
             ModelRoutingService,
         };
         let Some(engine) = self.engine.upgrade() else {
@@ -881,8 +881,10 @@ impl EngineSubAgentSpawner {
             .or_default()
             .clone();
         let mut cached = entry.lock().await;
-        // 后续显式派发设置也必须优先，不能被任务缓存的自动选择覆盖。
-        if request.model.is_some()
+        // 后续显式派发设置也必须优先，不能被任务缓存的自动选择覆盖。provider 也
+        // 算显式设置：路由现在能换 provider，声明过的就更不能被它顶掉。
+        if request.provider.is_some()
+            || request.model.is_some()
             || request.model_profile.is_some()
             || request.reasoning_effort.is_some()
             || self
@@ -893,7 +895,8 @@ impl EngineSubAgentSpawner {
                     None,
                 )
                 .is_some_and(|selection| {
-                    selection.model.is_some()
+                    selection.provider.is_some()
+                        || selection.model.is_some()
                         || selection.model_profile.is_some()
                         || selection.reasoning_effort.is_some()
                 })
@@ -920,18 +923,21 @@ impl EngineSubAgentSpawner {
                 session: SessionHandle::borrowed(current.client.clone()),
             };
             let decision = router.route(input).await?;
+            // 换 provider 时 worker 也要换腿，所以目标 runtime 由决策决定而不是当前 provider。
+            let (provider, model) =
+                routed_target(&decision, &current.provider_name, &current.model);
             let runtime = self
                 .model_router()
                 .resolve_automatic(ModelRouteRequest {
-                    provider: Some(current.provider_name.clone()),
-                    model: Some(decision.model.unwrap_or_else(|| current.model.clone())),
+                    provider: Some(provider.clone()),
+                    model: Some(model),
                     reasoning_effort: decision.reasoning_effort.or(current.reasoning_effort),
                     ..Default::default()
                 })
                 .await?;
             anyhow::ensure!(
-                runtime.provider_name == current.provider_name,
-                "router cannot switch providers"
+                runtime.provider_name == provider,
+                "worker router returned a different provider than requested"
             );
             Ok(runtime)
         };
@@ -941,7 +947,11 @@ impl EngineSubAgentSpawner {
             .map_err(|error| error.to_string())?;
         let (runtime, text) = match result {
             Ok(runtime) => {
-                let text = selection_notice(&runtime.model, runtime.reasoning_effort);
+                let text = selection_notice(
+                    &runtime.provider_name,
+                    &runtime.model,
+                    runtime.reasoning_effort.map(|effort| effort.as_str()),
+                );
                 *cached = Some(runtime.clone());
                 (runtime, text)
             }

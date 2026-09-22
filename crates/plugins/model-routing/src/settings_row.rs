@@ -42,8 +42,10 @@ pub(crate) fn register(ctx: &Context) -> Result<(), KernelError> {
         ctx,
         ConfigOptionSpec::select(ROUTER_MODEL_OPTION, "Router model")
             .describe(
-                "The cheap model that picks this session's model and reasoning effort on \
-                 the first real prompt. Routing does nothing until one is chosen.",
+                "The cheap model that picks this session's provider, model and reasoning \
+                 effort on the first real prompt. Routing does nothing until one is chosen. \
+                 It can move the task onto another configured provider, so the picker itself \
+                 has to be a model of the provider in force.",
             )
             .in_category("model"),
         Arc::new(RouterModelOption {

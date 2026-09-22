@@ -466,7 +466,7 @@ impl rebon_agent_core::model_router::AgentModelRouter for AutomaticRuntimeModelR
             .await?;
         anyhow::ensure!(
             rebuilt.provider_name == resolved.provider_name,
-            "router cannot switch providers"
+            "runtime rebuild returned a different provider than the route resolved"
         );
         resolved.client = rebuilt.client;
         resolved.model = rebuilt.model;
