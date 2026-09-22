@@ -1164,6 +1164,23 @@ fn is_transient_ws_send_error(message: &str) -> bool {
         || message.contains("not connected")
 }
 
+/// Is the WebSocket frame-read error a transport break that a fresh
+/// connection can recover from?
+///
+/// The pump task exits on the first read error, so this only separates
+/// "the socket died" from "the peer sent something we could not parse":
+/// replaying a malformed frame cannot fix it.
+fn is_transient_ws_frame_error(error: &tungstenite::Error) -> bool {
+    matches!(
+        error,
+        tungstenite::Error::Io(_)
+            | tungstenite::Error::ConnectionClosed
+            | tungstenite::Error::Protocol(
+                tungstenite::error::ProtocolError::ResetWithoutClosingHandshake
+            )
+    )
+}
+
 #[async_trait]
 impl ChatProvider for OpenAiResponsesProvider {
     fn provider_name(&self) -> &'static str {
@@ -2660,6 +2677,13 @@ enum WsTurnResolution {
     /// `previous_response_not_found` vs an overflow-driven prune)
     /// instead of collapsing every cause into one generic label.
     RetryWithoutPreviousResponseId(CacheMissReason),
+    /// The socket died mid-turn — a read error, a close frame, or EOF
+    /// before `response.completed`. The connection is gone, so the turn
+    /// is not resumable: reconnect and replay it from the start. Carries
+    /// the transport error so a replay attempt that loses its socket too
+    /// reports the transport failure (transient) rather than a protocol
+    /// error.
+    ReconnectAndReplay(ModelError),
 }
 
 /// Return the baseline prefix — the items we sent on the previous
@@ -3322,8 +3346,11 @@ async fn drive_ws_turn_once(
 ///
 /// Generic transport and server failures are returned immediately to the
 /// caller so [`crate::RetryMiddleware`] is the only retry budget and backoff
-/// owner. A rejected connection-scoped `previous_response_id` gets exactly
-/// one protocol recovery: reconnect and replay the full request.
+/// owner. Two failures are recovered here instead, each with exactly one
+/// "reconnect and replay the whole turn" attempt, because neither the
+/// middleware nor the engine can recover them: a rejected connection-scoped
+/// `previous_response_id`, and a socket that died mid-response (nothing
+/// about the request was wrong, and the partial response is not resumable).
 ///
 /// Holds the `ws_conn` lock for the entire turn: ensures the
 /// connection exists (creating one if needed), sends the
@@ -3355,6 +3382,18 @@ async fn drive_ws_turn(
     let reason = match resolution {
         WsTurnResolution::Completed => return Ok(()),
         WsTurnResolution::RetryWithoutPreviousResponseId(reason) => reason,
+        // A dead socket says nothing about the request, so the replay is not
+        // a correction of anything: reconnect and re-send the same turn.
+        // Neither the engine nor the retry middleware can do it — a
+        // half-received response leaves the engine with output already
+        // streamed, and its replay guard only fires before visible output.
+        WsTurnResolution::ReconnectAndReplay(error) => {
+            tracing::warn!(
+                error = %error,
+                "openai-responses: websocket died mid-turn; reconnecting and replaying the turn"
+            );
+            CacheMissReason::RetryWithoutPreviousResponseId
+        }
     };
 
     if tx.is_closed() {
@@ -3388,6 +3427,9 @@ async fn drive_ws_turn(
         WsTurnResolution::RetryWithoutPreviousResponseId(_) => Err(ModelError::Protocol(
             "responses continuation recovery repeated after full replay".into(),
         )),
+        // The replay lost its socket too: report the transport failure, which
+        // the engine reads as transient.
+        WsTurnResolution::ReconnectAndReplay(error) => Err(error),
     }
 }
 
@@ -5337,6 +5379,303 @@ mod tests {
                 .clone(),
             Some("resp_fresh".into())
         );
+    }
+
+    /// One complete Responses turn as the server sends it.
+    fn ws_turn_frames(response_id: &str, text: &str) -> Vec<Value> {
+        vec![
+            json!({
+                "type": "response.created",
+                "response": {"id": response_id, "model": "gpt-5.4"}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "message"}
+            }),
+            json!({"type": "response.output_text.delta", "delta": text}),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "message", "status": "completed"}
+            }),
+            json!({"type": "response.completed", "response": {"id": response_id}}),
+        ]
+    }
+
+    /// A socket that dies mid-response must not fail the prompt: the driver
+    /// reconnects and replays the whole turn on a fresh connection.
+    ///
+    /// The peer closes the TCP connection without a close handshake here,
+    /// which is the `Connection reset without closing handshake` transport
+    /// error a real session sees when a server or proxy drops the socket
+    /// between `response.created` and `response.completed`. The turn replayed
+    /// onto the fresh connection must not carry the continuation chain: it
+    /// existed only in the dead socket's server-side state.
+    #[tokio::test]
+    async fn ws_mid_turn_reset_reconnects_and_replays_the_turn() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            // Turn 1 completes and seeds the continuation chain.
+            let tungstenite::Message::Text(opening) = ws.next().await.unwrap().unwrap() else {
+                panic!("expected the first turn's response.create frame");
+            };
+            assert!(!opening.contains("previous_response_id"));
+            for frame in ws_turn_frames("resp_1", "pong") {
+                ws.send(tungstenite::Message::Text(frame.to_string()))
+                    .await
+                    .unwrap();
+            }
+
+            // Turn 2 rides that chain, then the peer disappears mid-response.
+            let tungstenite::Message::Text(second) = ws.next().await.unwrap().unwrap() else {
+                panic!("expected the second turn's response.create frame");
+            };
+            assert!(
+                second.contains("previous_response_id"),
+                "turn 2 must ride the chain turn 1 seeded: {second}"
+            );
+            for frame in [
+                json!({
+                    "type": "response.created",
+                    "response": {"id": "resp_dying", "model": "gpt-5.4"}
+                }),
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type": "message"}
+                }),
+                json!({"type": "response.output_text.delta", "delta": "half"}),
+            ] {
+                ws.send(tungstenite::Message::Text(frame.to_string()))
+                    .await
+                    .unwrap();
+            }
+            drop(ws);
+
+            // The replay arrives on a fresh connection, without the chain the
+            // dead socket owned.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut replay_ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let tungstenite::Message::Text(replay) = replay_ws.next().await.unwrap().unwrap()
+            else {
+                panic!("expected the replayed turn's response.create frame");
+            };
+            assert!(
+                !replay.contains("previous_response_id"),
+                "the replay must be a full create: {replay}"
+            );
+            for frame in ws_turn_frames("resp_2", "ok") {
+                replay_ws
+                    .send(tungstenite::Message::Text(frame.to_string()))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut config =
+            OpenAiResponsesClientConfig::with_base_url(format!("http://{addr}"), "sk-test");
+        config.use_websocket = true;
+        let provider = OpenAiResponsesProvider::new(config);
+        let request = CreateMessageRequest::simple("gpt-5.4", "ping");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ModelResult<StreamEvent>>(64);
+
+        drive_ws_turn(
+            &provider,
+            provider.ws_conn.clone(),
+            provider.session_state.clone(),
+            request.clone(),
+            &tx,
+        )
+        .await
+        .expect("the first turn completes");
+
+        let mut second_request = request;
+        second_request
+            .messages
+            .push(Message::user_text("ping again"));
+        drive_ws_turn(
+            &provider,
+            provider.ws_conn.clone(),
+            provider.session_state.clone(),
+            second_request,
+            &tx,
+        )
+        .await
+        .expect("a mid-turn reset must be replayed on a fresh websocket");
+        server_task.await.unwrap();
+
+        let mut text = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let Ok(StreamEvent::ContentBlockDelta {
+                delta: ContentBlockDelta::TextDelta { text: delta },
+                ..
+            }) = event
+            {
+                text.push_str(&delta);
+            }
+        }
+        assert!(
+            text.contains("ok"),
+            "the replayed turn's output must reach the stream: {text}"
+        );
+        assert_eq!(
+            provider
+                .session_state
+                .last_response_id
+                .lock()
+                .unwrap()
+                .clone(),
+            Some("resp_2".into())
+        );
+    }
+
+    /// A close frame that arrives before `response.completed` is the same dead
+    /// end as a broken socket, and gets the same recovery: the peer said it is
+    /// done, but the response it was streaming never finished.
+    #[tokio::test]
+    async fn ws_mid_turn_close_frame_reconnects_and_replays_the_turn() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = ws.next().await.unwrap().unwrap();
+            ws.send(tungstenite::Message::Text(
+                json!({
+                    "type": "response.created",
+                    "response": {"id": "resp_dying", "model": "gpt-5.4"}
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+            ws.close(None).await.unwrap();
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut replay_ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = replay_ws.next().await.unwrap().unwrap();
+            for frame in ws_turn_frames("resp_2", "ok") {
+                replay_ws
+                    .send(tungstenite::Message::Text(frame.to_string()))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut config =
+            OpenAiResponsesClientConfig::with_base_url(format!("http://{addr}"), "sk-test");
+        config.use_websocket = true;
+        let provider = OpenAiResponsesProvider::new(config);
+        let request = CreateMessageRequest::simple("gpt-5.4", "ping");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ModelResult<StreamEvent>>(64);
+
+        drive_ws_turn(
+            &provider,
+            provider.ws_conn.clone(),
+            provider.session_state.clone(),
+            request,
+            &tx,
+        )
+        .await
+        .expect("a close frame before response.completed must be replayed");
+        server_task.await.unwrap();
+
+        let mut saw_text = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(
+                event,
+                Ok(StreamEvent::ContentBlockDelta {
+                    delta: ContentBlockDelta::TextDelta { ref text },
+                    ..
+                }) if text == "ok"
+            ) {
+                saw_text = true;
+            }
+        }
+        assert!(saw_text);
+    }
+
+    /// The recovery is bounded to one replay per turn: a socket that dies again
+    /// on the fresh connection surfaces the transport error (which the engine
+    /// reads as transient) instead of reconnecting forever.
+    ///
+    /// The connection count is the assertion — a third one means the driver
+    /// looped. The listener stops accepting after the replay, so a third
+    /// attempt would surface as a connect error rather than this read error.
+    #[tokio::test]
+    async fn ws_repeated_mid_turn_resets_surface_after_one_replay() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+
+        /// Long enough for the replay to arrive, short enough that a driver
+        /// which gave up after the first reset ends the server task promptly
+        /// instead of leaving the test waiting on an accept that never comes.
+        const SERVER_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut connections = 0usize;
+            while connections < 2 {
+                let Ok(accepted) =
+                    tokio::time::timeout(SERVER_ACCEPT_TIMEOUT, listener.accept()).await
+                else {
+                    break;
+                };
+                let (stream, _) = accepted.unwrap();
+                connections += 1;
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let _ = ws.next().await.unwrap().unwrap();
+                ws.send(tungstenite::Message::Text(
+                    json!({
+                        "type": "response.created",
+                        "response": {"id": "resp_dying", "model": "gpt-5.4"}
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+                drop(ws);
+            }
+            connections
+        });
+
+        let mut config =
+            OpenAiResponsesClientConfig::with_base_url(format!("http://{addr}"), "sk-test");
+        config.use_websocket = true;
+        let provider = OpenAiResponsesProvider::new(config);
+        let request = CreateMessageRequest::simple("gpt-5.4", "ping");
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ModelResult<StreamEvent>>(64);
+
+        let error = drive_ws_turn(
+            &provider,
+            provider.ws_conn.clone(),
+            provider.session_state.clone(),
+            request,
+            &tx,
+        )
+        .await
+        .expect_err("a second mid-turn reset must surface instead of retrying again");
+        let connections = server_task.await.unwrap();
+
+        assert_eq!(
+            connections, 2,
+            "the turn must be replayed exactly once after the first reset"
+        );
+        assert!(
+            matches!(&error, ModelError::Http(message) if message.contains("websocket error")),
+            "got: {error:?}"
+        );
+        assert!(error.is_transient());
+        assert!(provider.ws_conn.lock().await.is_none());
     }
 
     /// An abandoned turn (stream receiver dropped mid-response — e.g.
@@ -8248,19 +8587,29 @@ async fn send_and_pump_ws_turn(
                     complete_ws_turn_state(session_state, commit_incremental_state);
                     return Ok(WsTurnResolution::Completed);
                 }
-                session_state.set_last_response_id(None);
-                session_state.discard_pending_request();
-                tracing::warn!("openai-responses: ws closed before response.completed");
-                return Err(ModelError::Http(
+                // The peer hung up before the response finished. Nothing was
+                // wrong with the request: drop the chain that lived on this
+                // socket and let the driver replay the turn on a fresh one.
+                session_state.clear();
+                return Ok(WsTurnResolution::ReconnectAndReplay(ModelError::Http(
                     "websocket closed before response.completed".into(),
-                ));
+                )));
             }
             Some(Ok(_)) => continue,
             Some(Err(e)) => {
+                let error = ModelError::Http(format!("websocket error: {e}"));
                 **guard = None;
+                if is_transient_ws_frame_error(&e) {
+                    // The socket died under the read loop. The half-received
+                    // response is not resumable, so the whole turn is replayed
+                    // on a fresh connection; the response-id chain went with
+                    // the socket and must not travel into the replay.
+                    session_state.clear();
+                    return Ok(WsTurnResolution::ReconnectAndReplay(error));
+                }
                 session_state.set_last_response_id(None);
                 session_state.discard_pending_request();
-                return Err(ModelError::Http(format!("websocket error: {e}")));
+                return Err(error);
             }
         }
     }
