@@ -83,8 +83,12 @@ pub fn recorded_process_tree_is_running(
 ) -> anyhow::Result<bool> {
     #[cfg(unix)]
     if owner_detached_group {
-        verify_group_leader_identity(pid, expected_identity)?;
-        return Ok(!active_unix_group_members(pid)?.is_empty());
+        let active = active_unix_group_members(pid)?;
+        if active.is_empty() {
+            return Ok(false);
+        }
+        verify_live_group_leader_identity(pid, expected_identity, &active)?;
+        return Ok(true);
     }
     #[cfg(not(unix))]
     let _ = owner_detached_group;
@@ -206,6 +210,23 @@ fn verify_group_leader_identity(pid: u32, expected_identity: Option<&str>) -> an
             Err(error).with_context(|| format!("could not safely probe process-group leader {pid}"))
         }
     }
+}
+
+/// Verify the recorded owner's identity while it is still an active group
+/// member. A leader that already exited keeps its pid until it is reaped, so
+/// no other process can have taken that identity over — and macOS libproc
+/// answers nothing for a zombie, which would otherwise fail every stop that
+/// killed its own worker and then waited for the group to drain.
+#[cfg(unix)]
+fn verify_live_group_leader_identity(
+    pid: u32,
+    expected_identity: Option<&str>,
+    active: &[u32],
+) -> anyhow::Result<()> {
+    if active.contains(&pid) {
+        verify_group_leader_identity(pid, expected_identity)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -332,10 +353,8 @@ fn wait_for_recorded_unix_group_exit(
 ) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     loop {
-        if process_is_running(pid) == Some(true) {
-            verify_group_leader_identity(pid, expected_identity)?;
-        }
         let active = active_unix_group_members(pid)?;
+        verify_live_group_leader_identity(pid, expected_identity, &active)?;
         if active.is_empty() {
             return Ok(());
         }
@@ -356,15 +375,14 @@ fn terminate_recorded_unix_group(
     expected_identity: Option<&str>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    let _leader_alive = verify_group_leader_identity(pid, expected_identity)?;
-    let active_before = active_unix_group_members(pid)?;
-    if active_before.is_empty() {
+    let active = active_unix_group_members(pid)?;
+    if active.is_empty() {
         return Ok(());
     }
-    // Recheck after enumeration. The scan can take long enough for the leader
-    // to exit or for a stale pid to become visibly mismatched; never turn that
-    // observation into a signal against the newly observed process group.
-    let _leader_alive = verify_group_leader_identity(pid, expected_identity)?;
+    // The scan can take long enough for the leader to exit, so the check sits
+    // directly after it and speaks only for a live leader: a zombie reports no
+    // identity on macOS, and its pid cannot be reused until it is reaped.
+    verify_live_group_leader_identity(pid, expected_identity, &active)?;
     let group = checked_unix_pid(pid)?
         .checked_neg()
         .ok_or_else(|| anyhow::anyhow!("cannot represent process group {pid}"))?;
@@ -570,8 +588,16 @@ fn linux_stat_is_zombie(stat: &str) -> bool {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 pub fn process_is_running(pid: u32) -> Option<bool> {
-    let pid = libc::pid_t::try_from(pid).ok()?;
-    match unix_kill(pid, 0) {
+    let checked = libc::pid_t::try_from(pid).ok()?;
+    match unix_kill(checked, 0) {
+        // Existence is not liveness: `kill(pid, 0)` answers for a zombie too,
+        // and a zombie has exited. Linux reads that from the state field of
+        // `/proc/<pid>/stat`; macOS libproc still describes a live process and
+        // answers nothing for one whose parent has not reaped it yet, so the
+        // identity read is what separates the two here. A pid we may signal but
+        // cannot describe is an exited child, not a running worker.
+        #[cfg(target_os = "macos")]
+        Ok(true) => Some(process_identity(pid).is_some()),
         Ok(exists) => Some(exists),
         // EPERM means the target exists but is unsignalable. unix_kill keeps
         // that distinct from ESRCH; liveness must report it as present.
