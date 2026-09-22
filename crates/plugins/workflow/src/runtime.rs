@@ -6163,7 +6163,10 @@ return { first, both, seq };
             permission_prompts_unavailable: false,
             nested_workflows: Vec::new(),
             budget_total: None,
-            agent_concurrency_cap: None,
+            // Two agent slots for THIS run: a dual-core CI derives a cap of 1
+            // and would serialize the two branches, failing the assertion
+            // below for a reason that has nothing to do with `parallel`.
+            agent_concurrency_cap: Some(2),
         };
         let body = r#"
 const both = await parallel([
@@ -6544,7 +6547,7 @@ return { chained, nested };
         let temp = TempDir::new().expect("tempdir");
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
-        let run = workflow_test_run(
+        let mut run = workflow_test_run(
             &temp,
             "wf_pipeline_flow",
             ToolContext::new().with_sub_agent_spawner(Arc::new(BlockingSpawner {
@@ -6559,6 +6562,10 @@ return await pipeline(['a', 'b', 'c'],
   prev => agent(`s2:${prev}`),
 );
 "#;
+        // Two agent slots for THIS run, so the three stage-1 agents really do
+        // overlap; a dual-core CI derives a cap of 1 and would otherwise skip
+        // the independence assertion below.
+        run.agent_concurrency_cap = Some(2);
 
         let result = ScriptRuntime::new(
             &run,
@@ -6572,12 +6579,10 @@ return await pipeline(['a', 'b', 'c'],
 
         assert_eq!(result["result"], json!(["s2:s1:a", "s2:s1:b", "s2:s1:c"]));
         assert_eq!(result["agentCount"], 6);
-        if workflow_agent_concurrency_cap() > 1 {
-            assert!(
-                max_active.load(Ordering::SeqCst) > 1,
-                "pipeline serialized items instead of flowing them independently"
-            );
-        }
+        assert!(
+            max_active.load(Ordering::SeqCst) > 1,
+            "pipeline serialized items instead of flowing them independently"
+        );
     }
 
     #[tokio::test]
