@@ -7,6 +7,10 @@
 # be run through the `eol=lf` above on the strength of content sniffing alone.
 *.ico binary
 
+# Same reasoning for the README demo recordings: animated WebP is a RIFF
+# container, and nothing in it may be rewritten by `eol=lf`.
+*.webp binary
+
 # Shell scripts must stay LF even when checked out on Windows — a CRLF `.sh`
 # breaks under sh/bash (a `\r` in the shebang or in `read`/`case` values).
 # Covers scripts/release-*.sh and any other repo shell scripts.

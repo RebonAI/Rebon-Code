@@ -20,6 +20,23 @@
   </tr>
 </table>
 
+## Demo
+
+The core loop — slash-command palette, `@`-file completion, a tool call with its
+permission prompt, and a follow-up that keeps the earlier context:
+
+![Rebon core loop](assets/demo/core-loop.webp)
+
+Permission modes — `shift+tab` cycles default, plan, accept-edits and auto; the
+task then runs unattended under the auto-mode classifier:
+
+![Rebon permission modes](assets/demo/modes-auto.webp)
+
+`/rewind` — pick a restore point and roll the code and the conversation back
+together:
+
+![Rebon rewind](assets/demo/rewind.webp)
+
 ## What is in this repository
 
 The `rebon` command-line agent and everything it needs to build: the crates, the

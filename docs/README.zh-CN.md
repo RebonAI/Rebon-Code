@@ -21,6 +21,22 @@
 
 > 两份文档描述同一套东西；有出入时以英文版为准。
 
+## 演示
+
+核心回合 —— 斜杠命令面板、`@` 文件补全、带权限确认框的工具调用，以及一次沿用上文的
+追问：
+
+![Rebon 核心回合](../assets/demo/core-loop.webp)
+
+权限模式 —— `shift+tab` 逐级循环 default、plan、accept-edits、auto；随后任务在 auto
+模式分类器下无人值守跑完：
+
+![Rebon 权限模式](../assets/demo/modes-auto.webp)
+
+`/rewind` —— 选一个还原点，把代码和对话一起回滚：
+
+![Rebon 回滚](../assets/demo/rewind.webp)
+
 ## 这个仓库里有什么
 
 `rebon` 命令行 agent 本体，以及构建它所需的一切：各个 crate、插件、打包链和发布
