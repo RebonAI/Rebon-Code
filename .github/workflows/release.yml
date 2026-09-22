@@ -553,7 +553,7 @@ jobs:
     needs: [verify, test, publish-darwin, publish-linux, publish-windows, publish-wrapper]
     if: always() && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       # Deliberately without a checkout: this job has to outlive whatever broke
       # the run it is judging, and it only reads results the runner already
@@ -594,14 +594,33 @@ jobs:
         run: |
           set -eu
           expected="${GITHUB_REF_NAME#v}"
-          actual=$(curl -fsS "https://registry.npmjs.org/@rebon%2fcli/latest" \
-            | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])')
-          printf 'tag %s -> %s; registry latest %s\n' "$GITHUB_REF_NAME" "$expected" "$actual"
-          if [ "$actual" != "$expected" ]; then
-            echo >&2
-            echo "@rebon/cli@latest is $actual, but this tag names $expected. The" >&2
-            echo "publish jobs skipped over an already-published version and shipped" >&2
-            echo "nothing: bump [workspace.package] version (scripts/release-cli.sh)" >&2
-            echo "and cut the tag again." >&2
-            exit 1
-          fi
+          # A publish npm has accepted is not on the registry yet. The win32
+          # tarball's `time` entry landed four minutes after its publish job
+          # printed `+ @rebon/cli-win32-x64@1.5.0`, so a single read taken as
+          # soon as publish-wrapper finished reported 1.4.0 about a run that
+          # had shipped 1.5.0. Wait for the version to appear: the question is
+          # whether the registry ever carries it, not whether it already did.
+          attempts=20
+          delay=30
+          actual=unreadable
+          for attempt in $(seq 1 "$attempts"); do
+            actual=$(curl -fsS "https://registry.npmjs.org/@rebon%2fcli/latest" 2>/dev/null \
+              | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])' 2>/dev/null \
+              || echo 'unreadable')
+            if [ "$actual" = "$expected" ]; then
+              printf 'tag %s -> %s; registry latest %s after %ss\n' \
+                "$GITHUB_REF_NAME" "$expected" "$actual" "$(( (attempt - 1) * delay ))"
+              exit 0
+            fi
+            if [ "$attempt" -lt "$attempts" ]; then
+              printf 'registry latest is %s, not %s yet; retrying in %ss\n' \
+                "$actual" "$expected" "$delay"
+              sleep "$delay"
+            fi
+          done
+          echo >&2
+          echo "@rebon/cli@latest is $actual, but this tag names $expected. The" >&2
+          echo "publish jobs skipped over an already-published version and shipped" >&2
+          echo "nothing: bump [workspace.package] version (scripts/release-cli.sh)" >&2
+          echo "and cut the tag again." >&2
+          exit 1
