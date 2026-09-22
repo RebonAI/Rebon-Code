@@ -83,8 +83,12 @@ pub fn recorded_process_tree_is_running(
 ) -> anyhow::Result<bool> {
     #[cfg(unix)]
     if owner_detached_group {
-        verify_group_leader_identity(pid, expected_identity)?;
-        return Ok(!active_unix_group_members(pid)?.is_empty());
+        let active = active_unix_group_members(pid)?;
+        if active.is_empty() {
+            return Ok(false);
+        }
+        verify_live_group_leader_identity(pid, expected_identity, &active)?;
+        return Ok(true);
     }
     #[cfg(not(unix))]
     let _ = owner_detached_group;
@@ -206,6 +210,23 @@ fn verify_group_leader_identity(pid: u32, expected_identity: Option<&str>) -> an
             Err(error).with_context(|| format!("could not safely probe process-group leader {pid}"))
         }
     }
+}
+
+/// Verify the recorded owner's identity while it is still an active group
+/// member. A leader that already exited keeps its pid until it is reaped, so
+/// no other process can have taken that identity over — and macOS libproc
+/// answers nothing for a zombie, which would otherwise fail every stop that
+/// killed its own worker and then waited for the group to drain.
+#[cfg(unix)]
+fn verify_live_group_leader_identity(
+    pid: u32,
+    expected_identity: Option<&str>,
+    active: &[u32],
+) -> anyhow::Result<()> {
+    if active.contains(&pid) {
+        verify_group_leader_identity(pid, expected_identity)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -332,10 +353,8 @@ fn wait_for_recorded_unix_group_exit(
 ) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     loop {
-        if process_is_running(pid) == Some(true) {
-            verify_group_leader_identity(pid, expected_identity)?;
-        }
         let active = active_unix_group_members(pid)?;
+        verify_live_group_leader_identity(pid, expected_identity, &active)?;
         if active.is_empty() {
             return Ok(());
         }
