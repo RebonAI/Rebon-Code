@@ -23,25 +23,12 @@
 
 ## 演示
 
-输入 `/` 会弹出命令列表，输入 `@` 能补全文件名。问它某个文件是干什么的，它要读这个
-文件，会先停下来问你准不准；批准之后再追问一句，它还记得刚才说过什么。
-
-![Rebon 基本用法](../assets/demo/core-loop.webp)
-
-按一次 `shift+tab` 换一种权限模式，一共四种：default、plan、accept edits、auto。
-换到 auto 之后它不再问你，剩下的自己做完。
-
-![Rebon 权限模式](../assets/demo/modes-auto.webp)
-
-用 `/agent` 另派一个 agent 去干一件事。它在后台跑，你这边不用等，可以接着问别的。
-`/tasks` 里能看到它跑了多久、花了多少 token、最后交出什么。
-
-![Rebon 后台 agent](../assets/demo/background-agent.webp)
-
-改坏了想反悔，用 `/rewind`。它会列出你之前发过的每一条消息，选中哪一条，文件和聊天
-记录就都回到你发那条消息之前的样子。
-
-![Rebon 回退改动](../assets/demo/rewind.webp)
+| 功能 | 演示 |
+| --- | --- |
+| 输入 `/` 会弹出命令列表，输入 `@` 能补全文件名。问它某个文件是干什么的，它要读这个文件，会先停下来问你准不准；批准之后再追问一句，它还记得刚才说过什么。 | <img src="../assets/demo/core-loop.webp" width="440" alt="Rebon 基本用法"> |
+| 按一次 `shift+tab` 换一种权限模式，一共四种：default、plan、accept edits、auto。换到 auto 之后它不再问你，剩下的自己做完。 | <img src="../assets/demo/modes-auto.webp" width="440" alt="Rebon 权限模式"> |
+| 用 `/agent` 另派一个 agent 去干一件事。它在后台跑，你这边不用等，可以接着问别的。`/tasks` 里能看到它跑了多久、花了多少 token、最后交出什么。 | <img src="../assets/demo/background-agent.webp" width="440" alt="Rebon 后台 agent"> |
+| 改坏了想反悔，用 `/rewind`。它会列出你之前发过的每一条消息，选中哪一条，文件和聊天记录就都回到你发那条消息之前的样子。 | <img src="../assets/demo/rewind.webp" width="440" alt="Rebon 回退改动"> |
 
 ## 这个仓库里有什么
 
