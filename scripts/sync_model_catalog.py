@@ -293,7 +293,9 @@ def main() -> int:
         return 0
 
     SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
-    SNAPSHOT.write_text(rendered, encoding="utf-8")
+    # Bytes, not text: a text-mode write would translate `\n` to the
+    # platform's separator, and the tree is pinned to LF (`.gitattributes`).
+    SNAPSHOT.write_bytes(rendered.encode("utf-8"))
     models = sum(len(p["models"]) for p in catalogue["providers"].values())
     print(
         f"wrote {SNAPSHOT.relative_to(REPO_ROOT)}: "
