@@ -436,6 +436,10 @@ fn the_backend_setting_chooses_the_classifier_and_refuses_anything_else() {
         ),
         (serde_json::json!({"backend": ""}), Backend::Prompt),
         (serde_json::json!({"backend": "jev"}), Backend::TypeSafe),
+        (
+            serde_json::json!({"backend": "typesafe"}),
+            Backend::TypeSafe,
+        ),
     ] {
         assert_eq!(
             backend(&settings).expect("reads"),

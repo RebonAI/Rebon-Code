@@ -12,8 +12,8 @@ use rebon_api::{ModelClient, ModelResult, SessionHandle, StreamEventStream};
 use rebon_types::ModelProfileMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::typesafe::{api_key_from, SystemOneClient, DEFAULT_MODEL};
 use super::*;
+use rebon_api::typesafe::{api_key_from, SystemOneClient, DEFAULT_MODEL};
 
 /// One request the fake received.
 #[derive(Debug, Clone)]
@@ -211,6 +211,7 @@ async fn the_request_carries_the_key_the_state_and_both_questions() {
         &input("raw task only"),
         &candidates,
         Some("hard work goes to the frontier model"),
+        DEFAULT_MODEL,
     )
     .expect("builds");
     let response = client(&api).ask(&request).await.expect("answers");
@@ -252,6 +253,7 @@ async fn a_retryable_status_is_tried_once_more() {
         &input("raw task"),
         &candidates_of(&[("openai", &["gpt-5.4"])]),
         None,
+        DEFAULT_MODEL,
     )
     .expect("builds");
     assert!(client(&api).ask(&request).await.is_ok());
@@ -265,6 +267,7 @@ async fn a_second_retryable_status_is_reported() {
         &input("raw task"),
         &candidates_of(&[("openai", &["gpt-5.4"])]),
         None,
+        DEFAULT_MODEL,
     )
     .expect("builds");
     let error = client(&api).ask(&request).await.expect_err("gives up");
@@ -285,6 +288,7 @@ async fn a_request_error_is_not_retried() {
             &input("raw task"),
             &candidates_of(&[("openai", &["gpt-5.4"])]),
             None,
+            DEFAULT_MODEL,
         )
         .expect("builds");
         let error = client(&api)
@@ -303,10 +307,11 @@ async fn a_body_that_is_not_a_response_is_an_error() {
         &input("raw task"),
         &candidates_of(&[("openai", &["gpt-5.4"])]),
         None,
+        DEFAULT_MODEL,
     )
     .expect("builds");
     let error = client(&api).ask(&request).await.expect_err("refuses");
-    assert!(error.to_string().contains("routing response"), "{error}");
+    assert!(error.to_string().contains("System One response"), "{error}");
 }
 
 #[tokio::test]
@@ -316,6 +321,7 @@ async fn a_stalled_endpoint_times_out() {
         &input("raw task"),
         &candidates_of(&[("openai", &["gpt-5.4"])]),
         None,
+        DEFAULT_MODEL,
     )
     .expect("builds");
     let error = client(&api).ask(&request).await.expect_err("times out");
@@ -385,7 +391,14 @@ async fn decide(
     confidence: f64,
 ) -> (anyhow::Result<ModelRoutingDecision>, usize) {
     let api = FakeApi::start(vec![(200, body(target, effort, confidence))]).await;
-    let result = crate::jev::route(&client(&api), &input("raw task only"), candidates, None).await;
+    let result = crate::jev::route(
+        &client(&api),
+        &input("raw task only"),
+        candidates,
+        None,
+        DEFAULT_MODEL,
+    )
+    .await;
     (result, api.seen().len())
 }
 
@@ -505,6 +518,7 @@ async fn a_missing_or_foreign_answer_is_refused() {
             &input("raw task"),
             &candidates_of(&[("openai", &["gpt-5.4"])]),
             None,
+            DEFAULT_MODEL,
         )
         .await;
         assert!(result.is_err(), "accepted {answers}");
@@ -516,7 +530,14 @@ async fn a_missing_or_foreign_answer_is_refused() {
 #[test]
 fn the_target_question_offers_every_pair_and_a_keep() {
     let candidates = candidates_of(&[("openai", &["gpt-5.4", "plain"]), ("local", &["self"])]);
-    let request = crate::jev::request(&input("task"), &candidates, None).expect("builds");
+    let request =
+        crate::jev::request(&input("task"), &candidates, None, DEFAULT_MODEL).expect("builds");
+    assert!(request.questions[crate::jev::TARGET_QUESTION]
+        .instructions
+        .as_str()
+        .expect("default rule")
+        .contains("cheapest provider and model that suit the task"));
+    assert_eq!(request.model, DEFAULT_MODEL);
     let question = &request.questions[crate::jev::TARGET_QUESTION];
     let options: Vec<&str> = question.criteria.keys().map(String::as_str).collect();
     assert_eq!(
@@ -544,6 +565,7 @@ fn a_candidate_the_catalogue_never_heard_of_is_still_described() {
         &input("task"),
         &candidates_of(&[("local", &["self-hosted"])]),
         None,
+        DEFAULT_MODEL,
     )
     .expect("builds");
     let described = request.questions[crate::jev::TARGET_QUESTION].criteria["local/self-hosted"]
@@ -557,7 +579,8 @@ fn more_pairs_than_the_api_takes_are_refused() {
     let models: Vec<String> = (0..255).map(|index| format!("model-{index}")).collect();
     let borrowed: Vec<&str> = models.iter().map(String::as_str).collect();
     let candidates = candidates_of(&[("openai", &borrowed)]);
-    let error = crate::jev::request(&input("task"), &candidates, None).expect_err("refuses");
+    let error =
+        crate::jev::request(&input("task"), &candidates, None, DEFAULT_MODEL).expect_err("refuses");
     assert!(
         error.to_string().contains("254") && error.to_string().contains("255"),
         "the limit has to be named, not just hit: {error}"
@@ -568,7 +591,7 @@ fn more_pairs_than_the_api_takes_are_refused() {
 fn the_effort_question_leaves_out_levels_no_candidate_takes() {
     // gpt-5.4 的表行没有 max，所以只有一个候选时 max 不该出现在题面上。
     let known = candidates_of(&[("openai", &["gpt-5.4"])]);
-    let request = crate::jev::request(&input("task"), &known, None).expect("builds");
+    let request = crate::jev::request(&input("task"), &known, None, DEFAULT_MODEL).expect("builds");
     let options: Vec<&str> = request.questions[crate::jev::EFFORT_QUESTION]
         .criteria
         .keys()
@@ -580,24 +603,60 @@ fn the_effort_question_leaves_out_levels_no_candidate_takes() {
 
     // 表里没有行的自建模型不受表约束，于是 max 又可选。
     let with_custom = candidates_of(&[("openai", &["gpt-5.4"]), ("local", &["self"])]);
-    let request = crate::jev::request(&input("task"), &with_custom, None).expect("builds");
+    let request =
+        crate::jev::request(&input("task"), &with_custom, None, DEFAULT_MODEL).expect("builds");
     assert!(request.questions[crate::jev::EFFORT_QUESTION]
         .criteria
         .contains_key("max"));
 }
 
 #[test]
+fn a_configured_classifier_model_is_sent_without_changing_the_choices() {
+    let candidates = candidates_of(&[("openai", &["gpt-5.4"])]);
+    let request = crate::jev::request(&input("task"), &candidates, None, "another-systemone-id")
+        .expect("builds");
+    assert_eq!(request.model, "another-systemone-id");
+    assert!(request.questions[crate::jev::TARGET_QUESTION]
+        .criteria
+        .contains_key("openai/gpt-5.4"));
+}
+
+#[test]
+fn a_user_policy_overrides_the_default_cost_preference() {
+    let candidates = candidates_of(&[("openai", &["gpt-5.4"])]);
+    let request = crate::jev::request(
+        &input("task"),
+        &candidates,
+        Some("prioritize quality"),
+        DEFAULT_MODEL,
+    )
+    .expect("builds");
+    let instructions = &request.questions[crate::jev::TARGET_QUESTION].instructions;
+    assert_eq!(instructions[0], "prioritize quality");
+    assert!(instructions[1]
+        .as_str()
+        .unwrap()
+        .contains("cheapest provider and model"));
+}
+
+#[test]
 fn the_policy_is_an_extra_instruction_and_its_absence_is_one_instruction() {
     let candidates = candidates_of(&[("openai", &["gpt-5.4"])]);
-    let with = crate::jev::request(&input("task"), &candidates, Some("always plan first"))
-        .expect("builds");
+    let with = crate::jev::request(
+        &input("task"),
+        &candidates,
+        Some("always plan first"),
+        DEFAULT_MODEL,
+    )
+    .expect("builds");
     let instructions = with.questions[crate::jev::TARGET_QUESTION]
         .instructions
         .clone();
     assert_eq!(instructions[0], "always plan first");
     assert!(instructions.as_array().expect("a list").len() == 2);
 
-    let without = crate::jev::request(&input("task"), &candidates, None).expect("builds");
+    let without =
+        crate::jev::request(&input("task"), &candidates, None, DEFAULT_MODEL).expect("builds");
     assert!(
         without.questions[crate::jev::TARGET_QUESTION]
             .instructions
@@ -614,6 +673,7 @@ fn a_long_prompt_is_cut_to_its_head() {
         &input(&prompt),
         &candidates_of(&[("openai", &["gpt-5.4"])]),
         None,
+        DEFAULT_MODEL,
     )
     .expect("builds");
     let state = request.state["prompt"].as_str().expect("state text");

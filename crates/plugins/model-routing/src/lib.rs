@@ -2,6 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use anyhow::{bail, ensure, Context as _};
 use async_trait::async_trait;
+use rebon_api::typesafe;
 use rebon_api::{ContentBlock, CreateMessageRequest, Message, StopReason};
 use rebon_core::model_routing::{
     FirstPromptModelRouter, ModelRoutingDecision, ModelRoutingInput, ModelRoutingService,
@@ -18,8 +19,9 @@ use serde::Deserialize;
 
 mod jev;
 mod settings_row;
-mod typesafe;
-pub use settings_row::{BACKEND_OPTION, ROUTER_MODEL_OPTION, ROUTING_POLICY_OPTION};
+pub use settings_row::{
+    BACKEND_OPTION, CLASSIFIER_MODEL_OPTION, ROUTER_MODEL_OPTION, ROUTING_POLICY_OPTION,
+};
 
 pub const PLUGIN_ID: &str = "model-routing";
 /// The cheap model that does the classifying, for the text backend.
@@ -28,10 +30,11 @@ pub(crate) const ROUTER_MODEL_SETTING: &str = "routerModel";
 pub(crate) const POLICY_SETTING: &str = "policy";
 /// Which classifier runs.
 pub(crate) const BACKEND_SETTING: &str = "backend";
+pub(crate) const CLASSIFIER_MODEL_SETTING: &str = "classifierModel";
 /// A model of the provider in force, answering exactly one JSON object.
 pub(crate) const BACKEND_PROMPT: &str = "prompt";
 /// TypeSafe's System One, answering typed choices.
-pub(crate) const BACKEND_TYPESAFE: &str = "jev";
+pub(crate) const BACKEND_TYPESAFE: &str = "typesafe";
 // 分类只需要三个短字段，限制响应大小以免预检消耗主任务的资源。
 const OUTPUT_LIMIT: usize = 4096;
 const ROUTING_MAX_TOKENS: u32 = 256;
@@ -68,7 +71,7 @@ fn backend(settings: &serde_json::Value) -> anyhow::Result<Backend> {
         None => Ok(Backend::Prompt),
         Some(serde_json::Value::String(value)) => match value.trim() {
             "" | BACKEND_PROMPT => Ok(Backend::Prompt),
-            BACKEND_TYPESAFE => Ok(Backend::TypeSafe),
+            BACKEND_TYPESAFE | "jev" => Ok(Backend::TypeSafe),
             other => bail!(
                 "plugins.model-routing.{BACKEND_SETTING} is `{other}`, not `{BACKEND_PROMPT}` or \
                  `{BACKEND_TYPESAFE}`"
@@ -429,8 +432,15 @@ impl FirstPromptModelRouter for Router {
                 Self::route_with_prompt(&input, &candidates, policy, &settings).await
             }
             Backend::TypeSafe => {
+                let classifier_model = match settings.get(CLASSIFIER_MODEL_SETTING) {
+                    None => typesafe::DEFAULT_MODEL,
+                    Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+                        value.trim()
+                    }
+                    _ => bail!("plugins.model-routing.classifierModel must be a non-empty string"),
+                };
                 let client = typesafe::SystemOneClient::from_env()?;
-                jev::route(&client, &input, &candidates, policy).await
+                jev::route(&client, &input, &candidates, policy, classifier_model).await
             }
         }
     }
@@ -445,6 +455,7 @@ impl Plugin for ModelRoutingPlugin {
             .optional_inject(&[rebon_config_seat::CONFIG_SEAT_SERVICE])
             .settings(vec![
                 SettingKey::new(BACKEND_SETTING, SettingType::String),
+                SettingKey::new(CLASSIFIER_MODEL_SETTING, SettingType::String),
                 SettingKey::new(ROUTER_MODEL_SETTING, SettingType::String),
                 SettingKey::new(POLICY_SETTING, SettingType::String),
             ])

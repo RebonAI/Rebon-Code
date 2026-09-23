@@ -15,11 +15,11 @@ use std::collections::BTreeMap;
 
 use anyhow::{ensure, Context as _};
 
-use crate::typesafe::{ChoiceQuestion, Request, Response, SystemOneClient, DEFAULT_MODEL};
 use crate::{
     model_takes_effort, resolve_decision, Candidates, ModelRoutingDecision, ModelRoutingInput,
     ProviderCandidate, RawChoice,
 };
+use rebon_api::typesafe::{ChoiceQuestion, Request, Response, SystemOneClient};
 use rebon_types::ReasoningEffort;
 
 /// The id the target question is asked and answered under.
@@ -179,6 +179,7 @@ pub(crate) fn request(
     input: &ModelRoutingInput,
     candidates: &Candidates,
     policy: Option<&str>,
+    classifier_model: &str,
 ) -> anyhow::Result<Request> {
     let state = serde_json::json!({
         "prompt": input.prompt.chars().take(MAX_STATE_CHARS).collect::<String>(),
@@ -193,7 +194,7 @@ pub(crate) fn request(
         TARGET_QUESTION.to_string(),
         ChoiceQuestion::new(
             instructions(
-                "Which provider and model should this task run on? Answer `keep` to leave the \
+                "Which provider and model should this task run on? Pick the cheapest provider and model that suit the task unless the user's policy says otherwise. Answer `keep` to leave the \
                  session where it is.",
                 policy,
             ),
@@ -213,7 +214,7 @@ pub(crate) fn request(
     );
     Ok(Request {
         state,
-        model: DEFAULT_MODEL.to_string(),
+        model: classifier_model.to_string(),
         questions,
     })
 }
@@ -224,8 +225,9 @@ pub(crate) async fn route(
     input: &ModelRoutingInput,
     candidates: &Candidates,
     policy: Option<&str>,
+    classifier_model: &str,
 ) -> anyhow::Result<ModelRoutingDecision> {
-    let request = request(input, candidates, policy)?;
+    let request = request(input, candidates, policy, classifier_model)?;
     let response = client.ask(&request).await?;
     let decision = decide(&response, input, candidates)?;
     tracing::debug!(

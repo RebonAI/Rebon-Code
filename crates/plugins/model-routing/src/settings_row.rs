@@ -1,9 +1,8 @@
 //! The rows this plugin puts in the settings panel.
 //!
-//! Routing has three things to choose: which classifier runs, the cheap model
-//! that one of them classifies with, and the policy either classifier follows.
-//! The rows are registered by the plugin rather than built into the panel's
-//! list, so they are there exactly when the feature is.
+//! Routing offers a backend, a model for each backend and a policy. The rows
+//! are registered by the plugin rather than built into the panel's list, so
+//! they are there exactly when the feature is.
 //!
 //! What the model row offers is the models the router would actually accept.
 //! `route()` refuses a `routerModel` that does not belong to the provider in
@@ -22,12 +21,13 @@ use rebon_kernel::{Context, KernelError};
 use rebon_kernel_seats::kernel_config_seats::PluginSettings;
 
 use crate::{
-    BACKEND_PROMPT, BACKEND_SETTING, BACKEND_TYPESAFE, PLUGIN_ID, POLICY_SETTING,
-    ROUTER_MODEL_SETTING,
+    BACKEND_PROMPT, BACKEND_SETTING, BACKEND_TYPESAFE, CLASSIFIER_MODEL_SETTING, PLUGIN_ID,
+    POLICY_SETTING, ROUTER_MODEL_SETTING,
 };
 
 /// The id the panel and every surface's dispatch name the backend row by.
 pub const BACKEND_OPTION: &str = "model_routing_backend";
+pub const CLASSIFIER_MODEL_OPTION: &str = "model_routing_classifier_model";
 
 /// The id the panel and every surface's dispatch name this row by.
 pub const ROUTER_MODEL_OPTION: &str = "model_routing_router_model";
@@ -55,12 +55,25 @@ pub(crate) fn register(ctx: &Context) -> Result<(), KernelError> {
             .describe(
                 "Which classifier picks this session's provider, model and reasoning effort on \
                  the first real prompt. `Prompt` asks a model of the provider in force, so it \
-                 needs a router model. `TypeSafe Jev` sends the first prompt to api.typesafe.ai \
+                 needs a router model. `TypeSafe System One` sends the first prompt to api.typesafe.ai \
                  and reads typed answers back: it needs TYPESAFE_API_KEY in the environment and \
                  is not tied to the provider in force.",
             )
             .in_category("model"),
         Arc::new(BackendOption {
+            settings: PluginSettings::new(ctx, PLUGIN_ID),
+        }),
+    )?;
+    seat.register(
+        ctx,
+        ConfigOptionSpec::text(CLASSIFIER_MODEL_OPTION, "TypeSafe classifier model")
+            .describe(
+                "The System One model ID used by this router when the backend is TypeSafe. \
+                 Leave empty for jev-latest; other IDs work only if TypeSafe serves them through \
+                 /v1/systemone. This does not change the permission classifier model.",
+            )
+            .in_category("model"),
+        Arc::new(ClassifierModelOption {
             settings: PluginSettings::new(ctx, PLUGIN_ID),
         }),
     )?;
@@ -148,7 +161,7 @@ impl ConfigOptionProvider for BackendOption {
             },
             ConfigOptionValue {
                 value: BACKEND_TYPESAFE.to_string(),
-                name: "TypeSafe Jev".to_string(),
+                name: "TypeSafe System One".to_string(),
                 description: Some(
                     "api.typesafe.ai classifies the first prompt as a typed choice. Needs \
                      TYPESAFE_API_KEY in the environment, and that prompt leaves this machine."
@@ -169,6 +182,38 @@ impl ConfigOptionProvider for BackendOption {
             .write(settings_patch(BACKEND_SETTING, Some(value)))
             .map(|_| ())
             .map_err(|error| format!("could not save the router backend: {error}"))
+    }
+}
+
+struct ClassifierModelOption {
+    settings: PluginSettings,
+}
+
+impl ConfigOptionProvider for ClassifierModelOption {
+    fn current(&self, _session: Option<&str>) -> String {
+        self.settings
+            .read()
+            .ok()
+            .as_ref()
+            .and_then(|settings| settings.get(CLASSIFIER_MODEL_SETTING))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or(rebon_api::typesafe::DEFAULT_MODEL)
+            .to_string()
+    }
+
+    fn choices(&self, _session: Option<&str>) -> Vec<ConfigOptionValue> {
+        Vec::new()
+    }
+
+    fn apply(&self, _session: Option<&str>, value: &str) -> Result<(), String> {
+        let value = value.trim();
+        let configured =
+            (value != rebon_api::typesafe::DEFAULT_MODEL && !value.is_empty()).then_some(value);
+        self.settings
+            .write(settings_patch(CLASSIFIER_MODEL_SETTING, configured))
+            .map(|_| ())
+            .map_err(|error| format!("could not save the TypeSafe classifier model: {error}"))
     }
 }
 
@@ -327,12 +372,14 @@ mod tests {
         let scope = kernel.context().fork(PLUGIN_ID);
         register(&scope).expect("registers");
         assert!(seat.has(BACKEND_OPTION));
+        assert!(seat.has(CLASSIFIER_MODEL_OPTION));
         assert!(seat.has(ROUTER_MODEL_OPTION));
         assert!(seat.has(ROUTING_POLICY_OPTION));
 
         scope.dispose();
         assert!(
             !seat.has(BACKEND_OPTION)
+                && !seat.has(CLASSIFIER_MODEL_OPTION)
                 && !seat.has(ROUTER_MODEL_OPTION)
                 && !seat.has(ROUTING_POLICY_OPTION),
             "an experimental plugin's rows must not outlive the plugin"
@@ -412,6 +459,25 @@ mod tests {
         assert!(err.contains("provider in force"), "{err}");
     }
 
+    #[test]
+    fn type_safe_classifier_model_has_an_independent_setting() {
+        let _home =
+            rebon_tool::tasks::test_support::TestConfigHome::new("routing-classifier-model");
+        let root = tempfile::tempdir().unwrap();
+        let option = ClassifierModelOption {
+            settings: option_settings(root.path()),
+        };
+        assert_eq!(option.current(None), rebon_api::typesafe::DEFAULT_MODEL);
+        assert!(option.choices(None).is_empty());
+        option.apply(None, "  another-systemone-id  ").unwrap();
+        assert_eq!(option.current(None), "another-systemone-id");
+        let settings = option.settings.read().unwrap();
+        assert_eq!(settings[CLASSIFIER_MODEL_SETTING], "another-systemone-id");
+        assert!(settings.get(ROUTER_MODEL_SETTING).is_none());
+        option.apply(None, "").unwrap();
+        assert_eq!(option.current(None), rebon_api::typesafe::DEFAULT_MODEL);
+    }
+
     fn backend_option(root: &std::path::Path) -> BackendOption {
         BackendOption {
             settings: option_settings(root),
@@ -426,7 +492,7 @@ mod tests {
         let option = backend_option(root.path());
         assert_eq!(option.current(None), BACKEND_PROMPT, "nothing written yet");
 
-        option.apply(None, "jev").expect("writes");
+        option.apply(None, "typesafe").expect("writes");
         assert_eq!(option.current(None), BACKEND_TYPESAFE);
 
         let err = option.apply(None, "automatic").expect_err("refused");

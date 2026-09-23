@@ -109,6 +109,7 @@ pub mod session_handle;
 pub mod session_title;
 pub mod sse;
 pub mod types;
+pub mod typesafe;
 pub mod vendor;
 
 /// Shared runtime switch for OpenAI `service_tier: "priority"`.

@@ -3060,6 +3060,7 @@ dependencies = [
 name = "rebon-api"
 version = "1.5.5"
 dependencies = [
+ "anyhow",
  "async-trait",
  "bytes",
  "futures-util",

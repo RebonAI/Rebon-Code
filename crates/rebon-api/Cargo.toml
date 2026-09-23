@@ -8,6 +8,7 @@ publish.workspace = true
 description = "Unified model client layer for rebon."
 
 [dependencies]
+anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
