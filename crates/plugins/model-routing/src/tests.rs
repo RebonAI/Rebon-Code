@@ -422,3 +422,46 @@ async fn rejects_truncated_and_tool_outputs() {
         );
     }
 }
+
+/// 后端设置：没写或写了空白就是文字后端（老配置照旧），两个名字各选一个，
+/// 别的值要让这一轮路由带着原因跳过而不是悄悄换个后端。
+#[test]
+fn the_backend_setting_chooses_the_classifier_and_refuses_anything_else() {
+    for (settings, expected) in [
+        (serde_json::json!({}), Backend::Prompt),
+        (serde_json::json!({"backend": "prompt"}), Backend::Prompt),
+        (
+            serde_json::json!({"backend": "  prompt  "}),
+            Backend::Prompt,
+        ),
+        (serde_json::json!({"backend": ""}), Backend::Prompt),
+        (serde_json::json!({"backend": "jev"}), Backend::TypeSafe),
+    ] {
+        assert_eq!(
+            backend(&settings).expect("reads"),
+            expected,
+            "settings: {settings}"
+        );
+    }
+    for settings in [
+        serde_json::json!({"backend": "automatic"}),
+        serde_json::json!({"backend": 42}),
+    ] {
+        let error = backend(&settings).expect_err("refused");
+        assert!(error.to_string().contains("backend"), "{error}");
+    }
+}
+
+/// 文字后端仍然要 routerModel，TypeSafe 后端不读它：同一个设置文件里留着一条
+/// 属于另一个后端的值，不该影响这一轮。
+#[tokio::test]
+async fn the_text_backend_still_needs_a_router_model() {
+    let (result, client) = classify(
+        serde_json::json!({"backend": "prompt"}),
+        serde_json::Value::Null,
+    )
+    .await;
+    let error = result.expect_err("refused");
+    assert!(error.to_string().contains("routerModel"), "{error}");
+    assert!(client.requests.lock().unwrap().is_empty());
+}

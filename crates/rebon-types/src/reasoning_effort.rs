@@ -30,6 +30,15 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
+    /// Every level, ascending — the order to offer them in.
+    ///
+    /// A backend that has to enumerate the levels for someone else (a picker's
+    /// option list, a classifier's question) reads them here rather than
+    /// spelling the five wire strings a second time. Kept in step with
+    /// [`Self::as_str`], [`Self::from_wire_exact`] and [`FromStr`], which the
+    /// compiler already forces to list every variant.
+    pub const ALL: [Self; 5] = [Self::Low, Self::Medium, Self::High, Self::XHigh, Self::Max];
+
     /// The canonical spelling of this level — identical to what `serde`
     /// emits on the wire and what [`FromStr`] accepts back.
     pub fn as_str(&self) -> &'static str {
@@ -180,6 +189,25 @@ mod tests {
             assert_eq!(effort.to_string(), effort.as_str());
             let json = serde_json::to_string(&effort).unwrap();
             assert_eq!(json, format!("{:?}", effort.as_str()));
+        }
+    }
+
+    /// `ReasoningEffort::ALL` 与枚举同步。新增一个等级时，`as_str`、
+    /// `from_wire_exact`、`FromStr` 的穷尽匹配会先编译不过（编译器逼着改），
+    /// 下面这份名单就是把 `ALL` 也一起改的提醒：名单里少一个线值就红。
+    #[test]
+    fn all_lists_every_level_once() {
+        let mut wire: Vec<&str> = ReasoningEffort::ALL
+            .iter()
+            .map(ReasoningEffort::as_str)
+            .collect();
+        wire.sort_unstable();
+        assert_eq!(wire, ["high", "low", "max", "medium", "xhigh"]);
+        for effort in ReasoningEffort::ALL {
+            assert_eq!(
+                ReasoningEffort::from_wire_exact(effort.as_str()),
+                Some(effort)
+            );
         }
     }
 }

@@ -18,8 +18,11 @@ rebon-config-seat.workspace = true
 rebon-kernel-seats.workspace = true
 rebon-provider.workspace = true
 rebon-types.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 rebon-tool = { workspace = true, features = ["test-support"] }

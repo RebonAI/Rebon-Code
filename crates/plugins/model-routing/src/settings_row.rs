@@ -1,17 +1,16 @@
-//! The two rows this plugin puts in the settings panel.
+//! The rows this plugin puts in the settings panel.
 //!
-//! Routing has exactly two things to choose: the cheap model that does the
-//! classifying, and the policy that classifier follows. Until now the only way to
-//! set either was to edit `settings.json` by hand. The rows are registered by the
-//! plugin rather than built into the panel's list, so they are there exactly when
-//! the feature is.
+//! Routing has three things to choose: which classifier runs, the cheap model
+//! that one of them classifies with, and the policy either classifier follows.
+//! The rows are registered by the plugin rather than built into the panel's
+//! list, so they are there exactly when the feature is.
 //!
 //! What the model row offers is the models the router would actually accept.
 //! `route()` refuses a `routerModel` that does not belong to the provider in
 //! force, so a row offering anything else would let the panel write a value the
-//! next turn rejects. The policy row is free text: it is the user's own
-//! instruction to a model, and the plugin only appends it to the classifier's
-//! system prompt.
+//! next turn rejects. The backend row offers the two classifiers `route()`
+//! knows and nothing else. The policy row is free text: it is the user's own
+//! instruction to a model, and both backends hand it to whatever they ask.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -22,7 +21,13 @@ use rebon_config_seat::{
 use rebon_kernel::{Context, KernelError};
 use rebon_kernel_seats::kernel_config_seats::PluginSettings;
 
-use crate::{PLUGIN_ID, POLICY_SETTING, ROUTER_MODEL_SETTING};
+use crate::{
+    BACKEND_PROMPT, BACKEND_SETTING, BACKEND_TYPESAFE, PLUGIN_ID, POLICY_SETTING,
+    ROUTER_MODEL_SETTING,
+};
+
+/// The id the panel and every surface's dispatch name the backend row by.
+pub const BACKEND_OPTION: &str = "model_routing_backend";
 
 /// The id the panel and every surface's dispatch name this row by.
 pub const ROUTER_MODEL_OPTION: &str = "model_routing_router_model";
@@ -46,12 +51,27 @@ pub(crate) fn register(ctx: &Context) -> Result<(), KernelError> {
     };
     seat.register(
         ctx,
+        ConfigOptionSpec::select(BACKEND_OPTION, "Router backend")
+            .describe(
+                "Which classifier picks this session's provider, model and reasoning effort on \
+                 the first real prompt. `Prompt` asks a model of the provider in force, so it \
+                 needs a router model. `TypeSafe Jev` sends the first prompt to api.typesafe.ai \
+                 and reads typed answers back: it needs TYPESAFE_API_KEY in the environment and \
+                 is not tied to the provider in force.",
+            )
+            .in_category("model"),
+        Arc::new(BackendOption {
+            settings: PluginSettings::new(ctx, PLUGIN_ID),
+        }),
+    )?;
+    seat.register(
+        ctx,
         ConfigOptionSpec::select(ROUTER_MODEL_OPTION, "Router model")
             .describe(
                 "The cheap model that picks this session's provider, model and reasoning \
-                 effort on the first real prompt. Routing does nothing until one is chosen. \
-                 It can move the task onto another configured provider, so the picker itself \
-                 has to be a model of the provider in force.",
+                 effort on the first real prompt, for the `Prompt` backend. Routing does \
+                 nothing until one is chosen. It can move the task onto another configured \
+                 provider, so the picker itself has to be a model of the provider in force.",
             )
             .in_category("model"),
         Arc::new(RouterModelOption {
@@ -86,6 +106,70 @@ fn settings_patch(key: &str, value: Option<&str>) -> serde_json::Value {
         }),
     );
     serde_json::Value::Object(patch)
+}
+
+/// Which classifier runs.
+///
+/// Both values are real choices, so the row stores the one that is picked
+/// rather than treating one of them as "unset" — absent still reads as the
+/// text backend, which is what a settings file written before this row existed
+/// meant.
+struct BackendOption {
+    settings: PluginSettings,
+}
+
+impl ConfigOptionProvider for BackendOption {
+    fn current(&self, _session: Option<&str>) -> String {
+        let Some(settings) = self.settings.read().ok() else {
+            return BACKEND_PROMPT.to_string();
+        };
+        match crate::backend(&settings) {
+            Ok(backend) => backend.as_str().to_string(),
+            // 文件里是一个路由会拒绝的值：原样显示它，而不是把面板显示成一个
+            // 其实没在生效的后端。
+            Err(_) => settings
+                .get(BACKEND_SETTING)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        }
+    }
+
+    fn choices(&self, _session: Option<&str>) -> Vec<ConfigOptionValue> {
+        vec![
+            ConfigOptionValue {
+                value: BACKEND_PROMPT.to_string(),
+                name: "Prompt".to_string(),
+                description: Some(
+                    "A model of the provider in force answers with one JSON object. Needs the \
+                     Router model row set."
+                        .to_string(),
+                ),
+            },
+            ConfigOptionValue {
+                value: BACKEND_TYPESAFE.to_string(),
+                name: "TypeSafe Jev".to_string(),
+                description: Some(
+                    "api.typesafe.ai classifies the first prompt as a typed choice. Needs \
+                     TYPESAFE_API_KEY in the environment, and that prompt leaves this machine."
+                        .to_string(),
+                ),
+            },
+        ]
+    }
+
+    fn apply(&self, _session: Option<&str>, value: &str) -> Result<(), String> {
+        let value = value.trim();
+        if value != BACKEND_PROMPT && value != BACKEND_TYPESAFE {
+            return Err(format!(
+                "`{value}` is not `{BACKEND_PROMPT}` or `{BACKEND_TYPESAFE}`"
+            ));
+        }
+        self.settings
+            .write(settings_patch(BACKEND_SETTING, Some(value)))
+            .map(|_| ())
+            .map_err(|error| format!("could not save the router backend: {error}"))
+    }
 }
 
 struct RouterModelOption {
@@ -242,19 +326,22 @@ mod tests {
 
         let scope = kernel.context().fork(PLUGIN_ID);
         register(&scope).expect("registers");
+        assert!(seat.has(BACKEND_OPTION));
         assert!(seat.has(ROUTER_MODEL_OPTION));
         assert!(seat.has(ROUTING_POLICY_OPTION));
 
         scope.dispose();
         assert!(
-            !seat.has(ROUTER_MODEL_OPTION) && !seat.has(ROUTING_POLICY_OPTION),
+            !seat.has(BACKEND_OPTION)
+                && !seat.has(ROUTER_MODEL_OPTION)
+                && !seat.has(ROUTING_POLICY_OPTION),
             "an experimental plugin's rows must not outlive the plugin"
         );
     }
 
-    /// 策略行的写入与读回。一个只属于自己的配置目录，临时目录由调用方持有；
-    /// 插件本身也要装上，否则 settings 席位不认识它声明的键。
-    fn policy_option(root: &std::path::Path) -> RoutingPolicyOption {
+    /// 一个只属于自己的配置目录的 settings 席位；插件本身也要装上，否则它不
+    /// 认识这些行声明的键。临时目录由调用方持有。
+    fn option_settings(root: &std::path::Path) -> PluginSettings {
         let kernel = Kernel::new();
         kernel
             .load(vec![
@@ -267,8 +354,13 @@ mod tests {
                 Box::new(ModelRoutingPlugin),
             ])
             .unwrap();
+        PluginSettings::new(kernel.context(), PLUGIN_ID)
+    }
+
+    /// 策略行的写入与读回。
+    fn policy_option(root: &std::path::Path) -> RoutingPolicyOption {
         RoutingPolicyOption {
-            settings: PluginSettings::new(kernel.context(), PLUGIN_ID),
+            settings: option_settings(root),
         }
     }
 
@@ -318,5 +410,57 @@ mod tests {
             .expect_err("refused");
         assert!(err.contains("a-model-no-provider-offers"), "{err}");
         assert!(err.contains("provider in force"), "{err}");
+    }
+
+    fn backend_option(root: &std::path::Path) -> BackendOption {
+        BackendOption {
+            settings: option_settings(root),
+        }
+    }
+
+    /// 后端行：没写过时就是文字后端（老配置照旧），写入后读回，别的值被拒。
+    #[test]
+    fn the_backend_row_round_trips_and_refuses_what_it_does_not_offer() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("model-routing-backend");
+        let root = tempfile::tempdir().unwrap();
+        let option = backend_option(root.path());
+        assert_eq!(option.current(None), BACKEND_PROMPT, "nothing written yet");
+
+        option.apply(None, "jev").expect("writes");
+        assert_eq!(option.current(None), BACKEND_TYPESAFE);
+
+        let err = option.apply(None, "automatic").expect_err("refused");
+        assert!(err.contains("automatic"), "{err}");
+
+        option.apply(None, "prompt").expect("writes");
+        assert_eq!(option.current(None), BACKEND_PROMPT);
+    }
+
+    /// 两个后端都是真选项；选 TypeSafe 那一项要把"prompt 会离开本机"说清楚。
+    #[test]
+    fn the_backend_row_offers_both_classifiers() {
+        let root = tempfile::tempdir().unwrap();
+        let choices = backend_option(root.path()).choices(None);
+        let values: Vec<&str> = choices.iter().map(|choice| choice.value.as_str()).collect();
+        assert_eq!(values, [BACKEND_PROMPT, BACKEND_TYPESAFE]);
+        let type_safe = choices[1].description.as_deref().expect("described");
+        assert!(type_safe.contains("TYPESAFE_API_KEY"), "{type_safe}");
+        assert!(type_safe.contains("leaves this machine"), "{type_safe}");
+    }
+
+    /// 文件里放着路由会拒绝的值时，面板显示的是那个值本身：显示成 `prompt`
+    /// 会让用户以为有一个后端在生效。
+    #[test]
+    fn the_backend_row_shows_a_value_the_router_would_refuse_as_itself() {
+        let _home =
+            rebon_tool::tasks::test_support::TestConfigHome::new("model-routing-backend-raw");
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("settings.json"),
+            br#"{"plugins":{"model-routing":{"backend":"automatic"}}}"#,
+        )
+        .expect("writes the settings file");
+
+        assert_eq!(backend_option(root.path()).current(None), "automatic");
     }
 }
