@@ -120,7 +120,12 @@ fn bind_session_scope_with_label(
             crate::kernel_tool_dispatch::SessionPluginTools::new(engine.clone())
         });
         // Code Mode 是会话私有工具，不能注册到多个会话复用的 tools。
-        let run_code = crate::kernel_code_mode::RunCodeTool::new(engine.clone(), ctx.clone());
+        let default_on = crate::kernel_code_mode::default_on_in(
+            &rebon_config::config_home_dir(),
+            &std::env::current_dir().expect("session working directory must exist"),
+        );
+        let run_code =
+            crate::kernel_code_mode::RunCodeTool::new(engine.clone(), ctx.clone(), default_on);
         let session_tools = crate::kernel_tool_dispatch::SessionPluginTools::new(engine.clone());
         session_tools.set_run_code(run_code.clone());
         ctx.provide::<crate::kernel_code_mode::CodeModeSessionService>(run_code)
@@ -646,9 +651,36 @@ mod tests {
     }
 
     #[test]
+    fn a_new_session_uses_code_mode_default_only_while_experiment_is_open() {
+        use crate::kernel_code_mode::{command, CodeModePlugin};
+        use rebon_kernel::Plugin;
+        let home = rebon_tool::tasks::test_support::TestConfigHome::new("code-mode-default");
+        std::fs::write(
+            home.path().join("settings.json"),
+            r#"{"plugins":{"code-mode":{"enabled":true,"defaultOn":true}}}"#,
+        )
+        .unwrap();
+        let kernel = Kernel::new();
+        let engine = Arc::new(Engine::new());
+        let closed = bind_session_scope(&kernel, "closed", &engine, None, None);
+        assert!(command(&closed.ctx, &[]).unwrap().contains("off"));
+        let experiment = kernel.context().fork("experiment");
+        CodeModePlugin.apply(&experiment).unwrap();
+        let first = bind_session_scope(&kernel, "first", &engine, None, None);
+        assert!(command(&first.ctx, &[]).unwrap().contains("on"));
+        command(&first.ctx, &["off".into()]).unwrap();
+        let second = bind_session_scope(&kernel, "second", &engine, None, None);
+        assert!(command(&first.ctx, &[]).unwrap().contains("off"));
+        assert!(command(&second.ctx, &[]).unwrap().contains("on"));
+        experiment.dispose();
+        assert!(command(&second.ctx, &[]).unwrap().contains("off"));
+    }
+
+    #[test]
     fn code_mode_session_command_persists_between_leases_and_isolates_sessions() {
         use crate::kernel_code_mode::{command, CodeModePlugin};
         use rebon_kernel::Plugin;
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("code-mode-sessions");
         let (_projects, scopes) = scope_table(4);
         let first = scopes.acquire("first");
         assert!(command(first.context(), &[]).unwrap().contains("off"));

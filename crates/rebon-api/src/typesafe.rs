@@ -12,9 +12,10 @@ use std::time::Duration;
 use anyhow::{bail, Context as _};
 use serde::{Deserialize, Serialize};
 
-/// Where a production call goes. The client takes its endpoint from the caller
-/// so a test can point it at a loopback server.
+/// Default System One endpoints. Vercel's TypeSafe-compatible API keeps the
+/// same request and answer shape but uses its own model ID and credential.
 pub const DEFAULT_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
+pub const VERCEL_ENDPOINT: &str = "https://ai-gateway.vercel.sh/typesafe/v1/systemone";
 /// TypeSafe's alias for the model that serves `systemone`. The response names
 /// the exact build that answered.
 pub const DEFAULT_MODEL: &str = "jev-latest";
@@ -105,7 +106,25 @@ impl Answer {
 /// name is checked first so a shell exporting several agents' keys can point
 /// this one at a key of its own.
 pub fn api_key_from(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
-    ["REBON_TYPESAFE_API_KEY", "TYPESAFE_API_KEY"]
+    api_key_for_endpoint(DEFAULT_ENDPOINT, lookup)
+}
+
+fn is_vercel_endpoint(endpoint: &str) -> bool {
+    reqwest::Url::parse(endpoint)
+        .ok()
+        .is_some_and(|url| url.host_str() == Some("ai-gateway.vercel.sh"))
+}
+
+pub fn api_key_for_endpoint(
+    endpoint: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let names: &[&str] = if is_vercel_endpoint(endpoint) {
+        &["REBON_AI_GATEWAY_API_KEY", "AI_GATEWAY_API_KEY"]
+    } else {
+        &["REBON_TYPESAFE_API_KEY", "TYPESAFE_API_KEY"]
+    };
+    names
         .iter()
         .filter_map(|name| lookup(name))
         .map(|value| value.trim().to_string())
@@ -120,11 +139,19 @@ pub struct SystemOneClient {
 
 impl SystemOneClient {
     pub fn from_env() -> anyhow::Result<Self> {
-        Self::new(
-            DEFAULT_ENDPOINT,
-            api_key_from(|name| std::env::var(name).ok()),
-            ATTEMPT_TIMEOUT,
-        )
+        Self::from_env_with_endpoint(DEFAULT_ENDPOINT)
+    }
+
+    pub fn from_env_with_endpoint(endpoint: &str) -> anyhow::Result<Self> {
+        let api_key = api_key_for_endpoint(endpoint, |name| std::env::var(name).ok());
+        let api_key = if is_vercel_endpoint(endpoint) {
+            Some(api_key.context(
+                "set AI_GATEWAY_API_KEY (or REBON_AI_GATEWAY_API_KEY) in the environment to use Vercel AI Gateway",
+            )?)
+        } else {
+            api_key
+        };
+        Self::new(endpoint, api_key, ATTEMPT_TIMEOUT)
     }
 
     /// The key is `None` when the environment has none, which is the one

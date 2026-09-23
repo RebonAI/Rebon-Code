@@ -202,6 +202,109 @@ fn body(target: &str, effort: &str, confidence: f64) -> String {
     .to_string()
 }
 
+#[test]
+fn gateway_and_typesafe_keys_stay_bound_to_their_endpoints() {
+    use rebon_api::typesafe::{api_key_for_endpoint, VERCEL_ENDPOINT};
+    let keys = |name: &str| match name {
+        "TYPESAFE_API_KEY" => Some("official-key".to_string()),
+        "AI_GATEWAY_API_KEY" => Some("gateway-key".to_string()),
+        _ => None,
+    };
+    assert_eq!(
+        api_key_for_endpoint(rebon_api::typesafe::DEFAULT_ENDPOINT, keys),
+        Some("official-key".into())
+    );
+    assert_eq!(
+        api_key_for_endpoint(VERCEL_ENDPOINT, keys),
+        Some("gateway-key".into())
+    );
+    assert_eq!(
+        api_key_for_endpoint(VERCEL_ENDPOINT, |name| {
+            (name == "TYPESAFE_API_KEY").then(|| "official-key".to_string())
+        }),
+        None
+    );
+    assert_eq!(
+        api_key_for_endpoint(rebon_api::typesafe::DEFAULT_ENDPOINT, |name| {
+            (name == "AI_GATEWAY_API_KEY").then(|| "gateway-key".to_string())
+        }),
+        None
+    );
+    assert_eq!(
+        api_key_for_endpoint(VERCEL_ENDPOINT, |name| {
+            match name {
+                "REBON_AI_GATEWAY_API_KEY" => Some("  preferred  ".to_string()),
+                "AI_GATEWAY_API_KEY" => Some("gateway-key".to_string()),
+                _ => None,
+            }
+        }),
+        Some("preferred".into())
+    );
+}
+
+#[test]
+fn classifier_endpoint_uses_official_default_or_configured_https_url() {
+    assert_eq!(
+        classifier_endpoint(&serde_json::json!({})).unwrap(),
+        rebon_api::typesafe::DEFAULT_ENDPOINT
+    );
+    assert_eq!(
+        classifier_endpoint(&serde_json::json!({
+            "classifierEndpoint": " https://ai-gateway.vercel.sh/typesafe/v1/systemone "
+        }))
+        .unwrap(),
+        "https://ai-gateway.vercel.sh/typesafe/v1/systemone"
+    );
+    for invalid in [
+        serde_json::json!(""),
+        serde_json::json!("http://example.com/v1/systemone"),
+        serde_json::json!("not-a-url"),
+        serde_json::json!(42),
+    ] {
+        let err =
+            classifier_endpoint(&serde_json::json!({"classifierEndpoint": invalid})).unwrap_err();
+        assert!(err.to_string().contains("classifierEndpoint"));
+    }
+}
+
+#[tokio::test]
+async fn vercel_typesafe_wire_uses_gateway_model_endpoint_and_bearer_key() {
+    let response = serde_json::json!({
+        "model": "typesafe-ai/jev",
+        "answers": {
+            crate::jev::TARGET_QUESTION: answer("keep", 1.0),
+            crate::jev::EFFORT_QUESTION: answer("keep", 1.0),
+        },
+        "provider_metadata": {"gateway": {"cost": "0.00001"}}
+    })
+    .to_string();
+    let api = FakeApi::start(vec![(200, response)]).await;
+    let endpoint = format!("{}/typesafe/v1/systemone", api.base);
+    let client = SystemOneClient::new(
+        &endpoint,
+        Some("gateway-key".into()),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let candidates = candidates_of(&[("openai", &["gpt-5.4"])]);
+    let decision = crate::jev::route(
+        &client,
+        &input("choose a model"),
+        &candidates,
+        None,
+        "typesafe-ai/jev",
+    )
+    .await
+    .unwrap();
+    assert!(decision.provider.is_none());
+    assert!(decision.model.is_none());
+    let seen = api.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].path, "/typesafe/v1/systemone");
+    assert_eq!(seen[0].authorization, "Bearer gateway-key");
+    assert_eq!(seen[0].body["model"], "typesafe-ai/jev");
+}
+
 /// 一次成功的往返：请求形状、鉴权头、状态与题目。
 #[tokio::test]
 async fn the_request_carries_the_key_the_state_and_both_questions() {

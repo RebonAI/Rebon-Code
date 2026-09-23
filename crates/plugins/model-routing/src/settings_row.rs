@@ -21,13 +21,14 @@ use rebon_kernel::{Context, KernelError};
 use rebon_kernel_seats::kernel_config_seats::PluginSettings;
 
 use crate::{
-    BACKEND_PROMPT, BACKEND_SETTING, BACKEND_TYPESAFE, CLASSIFIER_MODEL_SETTING, PLUGIN_ID,
-    POLICY_SETTING, ROUTER_MODEL_SETTING,
+    BACKEND_PROMPT, BACKEND_SETTING, BACKEND_TYPESAFE, CLASSIFIER_ENDPOINT_SETTING,
+    CLASSIFIER_MODEL_SETTING, PLUGIN_ID, POLICY_SETTING, ROUTER_MODEL_SETTING,
 };
 
 /// The id the panel and every surface's dispatch name the backend row by.
 pub const BACKEND_OPTION: &str = "model_routing_backend";
 pub const CLASSIFIER_MODEL_OPTION: &str = "model_routing_classifier_model";
+pub const CLASSIFIER_ENDPOINT_OPTION: &str = "model_routing_classifier_endpoint";
 
 /// The id the panel and every surface's dispatch name this row by.
 pub const ROUTER_MODEL_OPTION: &str = "model_routing_router_model";
@@ -55,9 +56,10 @@ pub(crate) fn register(ctx: &Context) -> Result<(), KernelError> {
             .describe(
                 "Which classifier picks this session's provider, model and reasoning effort on \
                  the first real prompt. `Prompt` asks a model of the provider in force, so it \
-                 needs a router model. `TypeSafe System One` sends the first prompt to api.typesafe.ai \
-                 and reads typed answers back: it needs TYPESAFE_API_KEY in the environment and \
-                 is not tied to the provider in force.",
+                 needs a router model. `TypeSafe System One` sends the first prompt to a \
+                 TypeSafe-compatible endpoint and reads typed answers back. The key comes from \
+                 TYPESAFE_API_KEY for TypeSafe or AI_GATEWAY_API_KEY for Vercel, independently \
+                 of the provider in force.",
             )
             .in_category("model"),
         Arc::new(BackendOption {
@@ -69,11 +71,25 @@ pub(crate) fn register(ctx: &Context) -> Result<(), KernelError> {
         ConfigOptionSpec::text(CLASSIFIER_MODEL_OPTION, "TypeSafe classifier model")
             .describe(
                 "The System One model ID used by this router when the backend is TypeSafe. \
-                 Leave empty for jev-latest; other IDs work only if TypeSafe serves them through \
-                 /v1/systemone. This does not change the permission classifier model.",
+                 Leave empty for jev-latest; use typesafe-ai/jev when routing through Vercel's \
+                 TypeSafe-compatible API. This does not change the permission classifier model.",
             )
             .in_category("model"),
         Arc::new(ClassifierModelOption {
+            settings: PluginSettings::new(ctx, PLUGIN_ID),
+        }),
+    )?;
+    seat.register(
+        ctx,
+        ConfigOptionSpec::text(CLASSIFIER_ENDPOINT_OPTION, "TypeSafe classifier endpoint")
+            .describe(format!(
+                "Full HTTPS System One URL. Leave empty for {}; use {} for Vercel AI Gateway. \
+                 The first prompt is sent to this endpoint with its matching API key.",
+                rebon_api::typesafe::DEFAULT_ENDPOINT,
+                rebon_api::typesafe::VERCEL_ENDPOINT,
+            ))
+            .in_category("model"),
+        Arc::new(ClassifierEndpointOption {
             settings: PluginSettings::new(ctx, PLUGIN_ID),
         }),
     )?;
@@ -163,8 +179,9 @@ impl ConfigOptionProvider for BackendOption {
                 value: BACKEND_TYPESAFE.to_string(),
                 name: "TypeSafe System One".to_string(),
                 description: Some(
-                    "api.typesafe.ai classifies the first prompt as a typed choice. Needs \
-                     TYPESAFE_API_KEY in the environment, and that prompt leaves this machine."
+                    "A TypeSafe-compatible endpoint classifies the first prompt as a typed choice. \
+                     Needs TYPESAFE_API_KEY (or AI_GATEWAY_API_KEY for Vercel) in the environment, \
+                     and that prompt leaves this machine."
                         .to_string(),
                 ),
             },
@@ -214,6 +231,41 @@ impl ConfigOptionProvider for ClassifierModelOption {
             .write(settings_patch(CLASSIFIER_MODEL_SETTING, configured))
             .map(|_| ())
             .map_err(|error| format!("could not save the TypeSafe classifier model: {error}"))
+    }
+}
+
+struct ClassifierEndpointOption {
+    settings: PluginSettings,
+}
+
+impl ConfigOptionProvider for ClassifierEndpointOption {
+    fn current(&self, _session: Option<&str>) -> String {
+        self.settings
+            .read()
+            .ok()
+            .as_ref()
+            .and_then(|settings| settings.get(CLASSIFIER_ENDPOINT_SETTING))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(rebon_api::typesafe::DEFAULT_ENDPOINT)
+            .to_string()
+    }
+
+    fn choices(&self, _session: Option<&str>) -> Vec<ConfigOptionValue> {
+        Vec::new()
+    }
+
+    fn apply(&self, _session: Option<&str>, value: &str) -> Result<(), String> {
+        let value = value.trim();
+        let configured =
+            (value != rebon_api::typesafe::DEFAULT_ENDPOINT && !value.is_empty()).then_some(value);
+        if let Some(value) = configured {
+            crate::classifier_endpoint(&settings_patch(CLASSIFIER_ENDPOINT_SETTING, Some(value)))
+                .map_err(|error| error.to_string())?;
+        }
+        self.settings
+            .write(settings_patch(CLASSIFIER_ENDPOINT_SETTING, configured))
+            .map(|_| ())
+            .map_err(|error| format!("could not save the TypeSafe classifier endpoint: {error}"))
     }
 }
 
@@ -373,6 +425,7 @@ mod tests {
         register(&scope).expect("registers");
         assert!(seat.has(BACKEND_OPTION));
         assert!(seat.has(CLASSIFIER_MODEL_OPTION));
+        assert!(seat.has(CLASSIFIER_ENDPOINT_OPTION));
         assert!(seat.has(ROUTER_MODEL_OPTION));
         assert!(seat.has(ROUTING_POLICY_OPTION));
 
@@ -380,6 +433,7 @@ mod tests {
         assert!(
             !seat.has(BACKEND_OPTION)
                 && !seat.has(CLASSIFIER_MODEL_OPTION)
+                && !seat.has(CLASSIFIER_ENDPOINT_OPTION)
                 && !seat.has(ROUTER_MODEL_OPTION)
                 && !seat.has(ROUTING_POLICY_OPTION),
             "an experimental plugin's rows must not outlive the plugin"
@@ -476,6 +530,31 @@ mod tests {
         assert!(settings.get(ROUTER_MODEL_SETTING).is_none());
         option.apply(None, "").unwrap();
         assert_eq!(option.current(None), rebon_api::typesafe::DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn type_safe_classifier_endpoint_round_trips_and_refuses_http() {
+        let _home =
+            rebon_tool::tasks::test_support::TestConfigHome::new("routing-classifier-endpoint");
+        let root = tempfile::tempdir().unwrap();
+        let option = ClassifierEndpointOption {
+            settings: option_settings(root.path()),
+        };
+        assert_eq!(option.current(None), rebon_api::typesafe::DEFAULT_ENDPOINT);
+        assert!(option.choices(None).is_empty());
+        let endpoint = "https://ai-gateway.vercel.sh/typesafe/v1/systemone";
+        option.apply(None, &format!("  {endpoint}  ")).unwrap();
+        assert_eq!(option.current(None), endpoint);
+        assert_eq!(
+            option.settings.read().unwrap()[CLASSIFIER_ENDPOINT_SETTING],
+            endpoint
+        );
+        assert!(option
+            .apply(None, "http://example.com/v1/systemone")
+            .is_err());
+        assert_eq!(option.current(None), endpoint);
+        option.apply(None, "").unwrap();
+        assert_eq!(option.current(None), rebon_api::typesafe::DEFAULT_ENDPOINT);
     }
 
     fn backend_option(root: &std::path::Path) -> BackendOption {

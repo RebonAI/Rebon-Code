@@ -59,6 +59,7 @@ mod tests {
         let tool = RunCodeTool::new(
             Arc::new(rebon_core::Engine::new()),
             kernel.context().fork_scoped("session"),
+            false,
         );
         assert!(tool.command(&["on".into()]).is_err());
         assert!(registry

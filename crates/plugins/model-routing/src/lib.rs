@@ -20,7 +20,8 @@ use serde::Deserialize;
 mod jev;
 mod settings_row;
 pub use settings_row::{
-    BACKEND_OPTION, CLASSIFIER_MODEL_OPTION, ROUTER_MODEL_OPTION, ROUTING_POLICY_OPTION,
+    BACKEND_OPTION, CLASSIFIER_ENDPOINT_OPTION, CLASSIFIER_MODEL_OPTION, ROUTER_MODEL_OPTION,
+    ROUTING_POLICY_OPTION,
 };
 
 pub const PLUGIN_ID: &str = "model-routing";
@@ -31,6 +32,7 @@ pub(crate) const POLICY_SETTING: &str = "policy";
 /// Which classifier runs.
 pub(crate) const BACKEND_SETTING: &str = "backend";
 pub(crate) const CLASSIFIER_MODEL_SETTING: &str = "classifierModel";
+pub(crate) const CLASSIFIER_ENDPOINT_SETTING: &str = "classifierEndpoint";
 /// A model of the provider in force, answering exactly one JSON object.
 pub(crate) const BACKEND_PROMPT: &str = "prompt";
 /// TypeSafe's System One, answering typed choices.
@@ -80,6 +82,23 @@ fn backend(settings: &serde_json::Value) -> anyhow::Result<Backend> {
         Some(other) => {
             bail!("plugins.model-routing.{BACKEND_SETTING} must be a string, not {other}")
         }
+    }
+}
+
+fn classifier_endpoint(settings: &serde_json::Value) -> anyhow::Result<&str> {
+    match settings.get(CLASSIFIER_ENDPOINT_SETTING) {
+        None => Ok(typesafe::DEFAULT_ENDPOINT),
+        Some(serde_json::Value::String(value)) => {
+            let endpoint = value.trim();
+            let url = reqwest::Url::parse(endpoint)
+                .context("plugins.model-routing.classifierEndpoint must be an HTTPS URL")?;
+            ensure!(
+                url.scheme() == "https",
+                "plugins.model-routing.classifierEndpoint must be an HTTPS URL"
+            );
+            Ok(endpoint)
+        }
+        _ => bail!("plugins.model-routing.classifierEndpoint must be an HTTPS URL"),
     }
 }
 
@@ -439,7 +458,9 @@ impl FirstPromptModelRouter for Router {
                     }
                     _ => bail!("plugins.model-routing.classifierModel must be a non-empty string"),
                 };
-                let client = typesafe::SystemOneClient::from_env()?;
+                let client = typesafe::SystemOneClient::from_env_with_endpoint(
+                    classifier_endpoint(&settings)?,
+                )?;
                 jev::route(&client, &input, &candidates, policy, classifier_model).await
             }
         }
@@ -456,6 +477,7 @@ impl Plugin for ModelRoutingPlugin {
             .settings(vec![
                 SettingKey::new(BACKEND_SETTING, SettingType::String),
                 SettingKey::new(CLASSIFIER_MODEL_SETTING, SettingType::String),
+                SettingKey::new(CLASSIFIER_ENDPOINT_SETTING, SettingType::String),
                 SettingKey::new(ROUTER_MODEL_SETTING, SettingType::String),
                 SettingKey::new(POLICY_SETTING, SettingType::String),
             ])

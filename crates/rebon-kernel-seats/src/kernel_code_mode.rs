@@ -154,6 +154,14 @@ pub fn code_mode_runtime_reachable() -> bool {
 }
 
 pub const PLUGIN_ID: &str = "code-mode";
+const DEFAULT_ON_SETTING: &str = "defaultOn";
+
+pub fn default_on_in(config_dir: &std::path::Path, cwd: &std::path::Path) -> bool {
+    rebon_config::plugin_settings_in(config_dir, cwd, PLUGIN_ID)
+        .get(DEFAULT_ON_SETTING)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
 
 struct ExperimentService;
 impl rebon_kernel::Service for ExperimentService {
@@ -174,7 +182,7 @@ impl rebon_kernel::Plugin for CodeModePlugin {
 
 pub static PLUGIN: rebon_kernel::PluginDef = rebon_kernel::PluginDef {
     id: PLUGIN_ID,
-    title: "实验性 Code Mode（需 /codemode on）",
+    title: "实验性 Code Mode（默认关闭）",
     kind: rebon_kernel::PluginKind::Feature,
     default_enabled: false,
     factory: |_| Ok(Box::new(CodeModePlugin)),
@@ -201,7 +209,7 @@ pub struct RunCodeTool {
     budget: Duration,
     max_parallel: usize,
     node_runtime: Option<CodeNodeRuntime>,
-    // 显式开启只对当前实验插件实例有效；卸载再开放不会自动恢复开启。
+    // 启用状态只对当前实验插件实例有效；卸载再开放不会自动恢复开启。
     activation: Mutex<Option<Weak<()>>>,
 }
 
@@ -243,14 +251,21 @@ impl RunCodeTool {
         }
     }
 
-    pub fn new(engine: Arc<Engine>, events: rebon_kernel::Context) -> Arc<Self> {
+    pub fn new(engine: Arc<Engine>, events: rebon_kernel::Context, default_on: bool) -> Arc<Self> {
+        let activation = if default_on {
+            events
+                .get::<ExperimentService>()
+                .map(|experiment| Arc::downgrade(&experiment))
+        } else {
+            None
+        };
         Arc::new(Self {
             engine,
             events,
             budget: DEFAULT_PROGRAM_BUDGET,
             max_parallel: DEFAULT_MAX_PARALLEL,
             node_runtime: None,
-            activation: Mutex::new(None),
+            activation: Mutex::new(activation),
         })
     }
 
@@ -880,6 +895,77 @@ mod tests {
     }
 
     #[test]
+    fn code_mode_default_setting_follows_user_project_local_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        let project = dir.path().join("project");
+        let project_settings = project.join(".rebon");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&project_settings).unwrap();
+        assert!(!default_on_in(&config_dir, &project));
+
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"plugins":{"code-mode":{"enabled":true,"defaultOn":true}}}"#,
+        )
+        .unwrap();
+        assert!(default_on_in(&config_dir, &project));
+        std::fs::write(
+            project_settings.join("settings.json"),
+            r#"{"plugins":{"code-mode":{"defaultOn":false}}}"#,
+        )
+        .unwrap();
+        assert!(!default_on_in(&config_dir, &project));
+        std::fs::write(
+            project_settings.join("settings.local.json"),
+            r#"{"plugins":{"code-mode":{"defaultOn":true}}}"#,
+        )
+        .unwrap();
+        assert!(default_on_in(&config_dir, &project));
+    }
+
+    #[test]
+    fn code_mode_default_setting_requires_a_boolean() {
+        let dir = tempfile::tempdir().unwrap();
+        for value in [r#""true""#, "null", "0"] {
+            std::fs::write(
+                dir.path().join("settings.json"),
+                format!(r#"{{"plugins":{{"code-mode":{{"defaultOn":{value}}}}}}}"#),
+            )
+            .unwrap();
+            assert!(!default_on_in(dir.path(), dir.path()));
+        }
+    }
+
+    #[test]
+    fn code_mode_default_activation_respects_experiment_and_session_overrides() {
+        use rebon_kernel::Plugin;
+        for experiment_open in [false, true] {
+            let kernel = rebon_kernel::Kernel::new();
+            let experiment = kernel.context().fork("experiment");
+            if experiment_open {
+                CodeModePlugin.apply(&experiment).unwrap();
+            }
+            let engine = Arc::new(Engine::new());
+            let first =
+                RunCodeTool::new(engine.clone(), kernel.context().fork_scoped("first"), true);
+            let second = RunCodeTool::new(engine, kernel.context().fork_scoped("second"), false);
+            assert_eq!(first.requested(), experiment_open);
+            assert!(!second.requested());
+            first.command(&["off".into()]).unwrap();
+            assert!(!first.requested());
+            if experiment_open {
+                first.command(&["on".into()]).unwrap();
+                experiment.dispose();
+                assert!(!first.requested());
+                let reopened = kernel.context().fork("reopened");
+                CodeModePlugin.apply(&reopened).unwrap();
+                assert!(!first.requested());
+            }
+        }
+    }
+
+    #[test]
     fn code_mode_experiment_and_session_gate_matrix() {
         use rebon_kernel::Plugin;
         assert!(!PLUGIN.default_enabled);
@@ -891,8 +977,9 @@ mod tests {
                 CodeModePlugin.apply(&experiment).unwrap();
             }
             let engine = Arc::new(Engine::new());
-            let first = RunCodeTool::new(engine.clone(), kernel.context().fork_scoped("first"));
-            let second = RunCodeTool::new(engine, kernel.context().fork_scoped("second"));
+            let first =
+                RunCodeTool::new(engine.clone(), kernel.context().fork_scoped("first"), false);
+            let second = RunCodeTool::new(engine, kernel.context().fork_scoped("second"), false);
             assert!(!first.requested());
             assert!(!first.is_enabled());
             assert!(first.command(&[]).unwrap().contains("off"));
