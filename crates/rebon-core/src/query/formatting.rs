@@ -151,6 +151,25 @@ pub(super) fn compact_tool_result_for_model(
                 ToolResultContent::text(format!("The file {path} has been updated successfully."))
             }
         }
+        "MultiEdit" => {
+            // The raw result carries `content` and `originalFile` (both whole
+            // files) plus every edit's strings for the diff renderer; echoing
+            // them would park two copies of the file in the context for the
+            // rest of the session.
+            let path = value
+                .get("filePath")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let edits = value.get("editCount").and_then(Value::as_u64).unwrap_or(1);
+            let replacements = value
+                .get("replacements")
+                .and_then(Value::as_u64)
+                .unwrap_or(edits);
+            ToolResultContent::text(format!(
+                "The file {path} has been updated successfully. \
+                 Applied {edits} edit(s), {replacements} replacement(s)."
+            ))
+        }
         "Write" | "FileWriteTool" => {
             let path = value
                 .get("filePath")
@@ -635,6 +654,30 @@ mod tests {
             .expect("fallback result is text")
             .to_string();
         assert!(blind.starts_with('{'), "{blind}");
+    }
+
+    #[test]
+    fn multi_edit_result_is_a_confirmation_not_the_file() {
+        let whole_file = "fn main() {}\n".repeat(2_000);
+        let value = json!({
+            "type": "update",
+            "filePath": "src/main.rs",
+            "oldString": "a",
+            "newString": "b",
+            "editCount": 3,
+            "replacements": 4,
+            "edits": [{ "old_string": "a", "new_string": "b", "replace_all": true, "replacements": 2 }],
+            "content": whole_file,
+            "originalFile": whole_file,
+        });
+
+        let content = compact_tool_result_for_model("MultiEdit", None, &value, None);
+        let text = content.as_text().expect("multi edit result is text");
+        assert_eq!(
+            text,
+            "The file src/main.rs has been updated successfully. \
+             Applied 3 edit(s), 4 replacement(s)."
+        );
     }
 
     #[test]
