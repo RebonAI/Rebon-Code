@@ -554,6 +554,18 @@ impl BackgroundIpcServer {
         }
     }
 
+    /// A handle that publishes the record's status from outside this server,
+    /// for code that sees the record change but holds no reference here.
+    pub(crate) fn status_publisher(&self) -> StatusPublisher {
+        StatusPublisher {
+            events: self.events.clone(),
+            live_permission_mode: Arc::clone(&self.live_permission_mode),
+            live_mcp_status: Arc::clone(&self.live_mcp_status),
+            live_agent: Arc::clone(&self.live_agent),
+            recent_command_results: Arc::clone(&self.recent_command_results),
+        }
+    }
+
     /// Push the session's state as the record has it right now.
     ///
     /// For the moments the record changed in a way every client shows and no
@@ -2055,6 +2067,31 @@ fn set_session_option(
             }))
         }
         Err(err) => Err(request_error(err)),
+    }
+}
+
+/// [`BackgroundIpcServer::publish_status_now`] for a holder of no server: the
+/// turn's update pump, which is where a first-prompt routing decision passes.
+#[derive(Clone)]
+pub(crate) struct StatusPublisher {
+    events: SessionEventStream,
+    live_permission_mode: SharedLivePermissionModeState,
+    live_mcp_status: SharedLiveMcpStatus,
+    live_agent: SharedLiveAgent,
+    recent_command_results: SharedRecentCommandResults,
+}
+
+impl StatusPublisher {
+    pub(crate) fn publish_now(&self, store: &BackgroundStore, job_id: &str) {
+        if let Ok(state) = store.read_state(job_id) {
+            self.events.publish_status(session_status_snapshot(
+                &state,
+                &self.live_permission_mode,
+                &self.live_mcp_status,
+                &self.live_agent,
+                &self.recent_command_results,
+            ));
+        }
     }
 }
 

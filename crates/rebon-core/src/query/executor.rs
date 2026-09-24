@@ -4467,10 +4467,16 @@ impl PromptExecutor for EngineQueryExecutor {
             if let Some(notice) = prepared.notice {
                 tracing::info!(%notice, "session model routing");
                 if let Some(publisher) = &request.update_publisher {
+                    let update = match &prepared.routed {
+                        Some(selection) => {
+                            crate::model_routing::selection_update(notice, selection)
+                        }
+                        None => crate::model_routing::notice_update(notice),
+                    };
                     publisher
                         .publish_owned(rebon_types::SessionUpdateParams {
                             session_id: request.session_id.clone(),
-                            update: crate::model_routing::notice_update(notice),
+                            update,
                         })
                         .await;
                 }

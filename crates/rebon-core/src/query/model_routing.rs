@@ -33,6 +33,9 @@ struct RouteState {
 pub(crate) struct PreparedModel {
     pub runtime: Option<SharedRuntimeModel>,
     pub notice: Option<String>,
+    /// The decision this call made, when it made one. `None` for a turn that
+    /// restores an earlier decision, whose clients were told at the time.
+    pub routed: Option<crate::model_routing::RoutedSelection>,
 }
 
 impl SharedRuntimeModel {
@@ -103,6 +106,7 @@ impl SharedRuntimeModel {
                     return Ok(PreparedModel {
                         runtime: None,
                         notice: None,
+                        routed: None,
                     })
                 }
                 Err(error) => {
@@ -110,6 +114,7 @@ impl SharedRuntimeModel {
                     return Ok(PreparedModel {
                         runtime: None,
                         notice: None,
+                        routed: None,
                     });
                 }
                 Ok(Some(_)) => {}
@@ -131,6 +136,7 @@ impl SharedRuntimeModel {
         };
         let (root, cwd, id) = &key;
         let mut notice = None;
+        let mut routed = None;
         let eligible = router.is_some() && !state.started && request.user_prompt.is_some();
         if eligible {
             state.started = true;
@@ -143,6 +149,7 @@ impl SharedRuntimeModel {
                 return Ok(PreparedModel {
                     runtime: None,
                     notice: Some(format!("Experimental model routing skipped: {error}")),
+                    routed: None,
                 });
             }
         };
@@ -221,6 +228,11 @@ impl SharedRuntimeModel {
                                                 &runtime.model,
                                                 choice.effort.as_deref(),
                                             ));
+                                            routed = Some(crate::model_routing::RoutedSelection {
+                                                provider: runtime.provider_name.clone(),
+                                                model: runtime.model.clone(),
+                                                effort: choice.effort.clone(),
+                                            });
                                             state.runtime = Some(SharedRuntimeModel::new(runtime));
                                             state.selected = Some(choice.clone());
                                             selection = Some(choice);
@@ -330,6 +342,7 @@ impl SharedRuntimeModel {
         Ok(PreparedModel {
             runtime: state.runtime.clone(),
             notice,
+            routed,
         })
     }
 }

@@ -578,12 +578,19 @@ pub fn translate_session_update(app: &mut AppState, params: SessionUpdateParams)
             app.config_options = config_options;
         }
         SessionUpdate::SessionInfoUpdate { title, meta, .. } => {
-            if let Some(notice) = meta
-                .as_ref()
-                .and_then(|meta| meta.get("uiNotice"))
-                .and_then(serde_json::Value::as_str)
-            {
+            let info = SessionUpdate::SessionInfoUpdate {
+                title: None,
+                updated_at: None,
+                meta,
+            };
+            if let Some(notice) = rebon_core::model_routing::ui_notice(&info) {
                 super::runner::inject_system_message(app, "info", notice);
+            }
+            // The engine already runs on the routed model; the terminal's own
+            // copy of it is what the status bar reads, and only the runner,
+            // which holds the session, can move it.
+            if let Some(selection) = rebon_core::model_routing::routed_selection(&info) {
+                app.pending_routed_model = Some(selection);
             }
             // store the session title for the status bar /
             // terminal window title display.
@@ -788,7 +795,18 @@ pub(crate) fn project_remote_session_update(
         // Slash/config updates are controls for the local engine session, not
         // display state owned by the attached worker.
         SessionUpdate::SlashCommands { .. } | SessionUpdate::ConfigOptionUpdate { .. } => {}
-        SessionUpdate::SessionInfoUpdate { title, .. } => {
+        SessionUpdate::SessionInfoUpdate { title, meta, .. } => {
+            // A worker's notices reach this terminal only through here. The
+            // model a routing decision moved the worker onto arrives with the
+            // owner's next status snapshot, which the status bar reads.
+            let info = SessionUpdate::SessionInfoUpdate {
+                title: None,
+                updated_at: None,
+                meta,
+            };
+            if let Some(notice) = rebon_core::model_routing::ui_notice(&info) {
+                super::runner::inject_system_message(app, "info", notice);
+            }
             if let Some(title) = title {
                 app.session_title = Some(title);
             }
@@ -1682,6 +1700,61 @@ mod tests {
             panic!("expected UI-only system row")
         };
         assert_eq!(message.content.as_deref(), Some(notice.as_str()));
+    }
+
+    fn routed_update() -> (String, rebon_types::SessionUpdate) {
+        let selection = rebon_core::model_routing::RoutedSelection {
+            provider: "deepseek".into(),
+            model: "deepseek-flash".into(),
+            effort: Some("high".into()),
+        };
+        let notice = rebon_core::model_routing::selection_notice(
+            &selection.provider,
+            &selection.model,
+            selection.effort.as_deref(),
+        );
+        let update = rebon_core::model_routing::selection_update(notice.clone(), &selection);
+        (notice, update)
+    }
+
+    /// A local session hands the decision to the runner, which moves the
+    /// terminal's copy of the session model; the notice shows either way.
+    #[test]
+    fn a_routing_decision_is_shown_and_queued_for_the_status_bar() {
+        let mut app = AppState::new();
+        let (notice, update) = routed_update();
+
+        translate_session_update(&mut app, params(update));
+
+        let rows = app.rebon_tui.transcript.rows();
+        let Message::System(message) = &rows[0] else {
+            panic!("expected UI-only system row")
+        };
+        assert_eq!(message.content.as_deref(), Some(notice.as_str()));
+        let routed = app.pending_routed_model.expect("decision queued");
+        assert_eq!(routed.provider, "deepseek");
+        assert_eq!(routed.model, "deepseek-flash");
+    }
+
+    /// Sessions run in a worker by default, and a worker's notices reach the
+    /// terminal only through the remote projector, which used to read the
+    /// title off a `SessionInfoUpdate` and drop the rest.
+    #[test]
+    fn a_workers_routing_notice_reaches_the_mirroring_terminal() {
+        let mut app = AppState::new();
+        let (notice, update) = routed_update();
+
+        project_remote_session_update(&mut app, params(update), &mut HashSet::new());
+
+        let rows = app.rebon_tui.transcript.rows();
+        assert_eq!(rows.len(), 1);
+        let Message::System(message) = &rows[0] else {
+            panic!("expected UI-only system row")
+        };
+        assert_eq!(message.content.as_deref(), Some(notice.as_str()));
+        // The worker owns the model a mirror shows; its status snapshot says
+        // it, and the terminal's own copy stays out of it.
+        assert!(app.pending_routed_model.is_none());
     }
 
     #[test]

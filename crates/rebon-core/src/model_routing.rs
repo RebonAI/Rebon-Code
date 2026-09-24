@@ -18,10 +18,64 @@ pub fn notice_update(text: String) -> rebon_types::SessionUpdate {
         title: None,
         updated_at: None,
         meta: Some(std::collections::HashMap::from([(
-            "uiNotice".into(),
+            UI_NOTICE_META_KEY.into(),
             serde_json::Value::String(text),
         )])),
     }
+}
+
+/// `SessionInfoUpdate._meta` key of a line for the user's transcript.
+pub const UI_NOTICE_META_KEY: &str = "uiNotice";
+/// `SessionInfoUpdate._meta` key of a routing decision just made, beside its
+/// notice. Whoever shows the session's model reads it: the notice alone is
+/// prose, and a status bar still naming the model the session left is what
+/// made a switch look like it had not happened.
+pub const MODEL_SELECTION_META_KEY: &str = "modelSelection";
+
+/// What a first-prompt routing decision moved the session onto.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RoutedSelection {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// The notice for a routing decision, carrying the decision itself.
+pub fn selection_update(text: String, selection: &RoutedSelection) -> rebon_types::SessionUpdate {
+    let mut update = notice_update(text);
+    if let rebon_types::SessionUpdate::SessionInfoUpdate {
+        meta: Some(meta), ..
+    } = &mut update
+    {
+        meta.insert(
+            MODEL_SELECTION_META_KEY.into(),
+            serde_json::to_value(selection).expect("a routed selection serialises"),
+        );
+    }
+    update
+}
+
+/// The routing decision an update carries, if it is one.
+pub fn routed_selection(update: &rebon_types::SessionUpdate) -> Option<RoutedSelection> {
+    let rebon_types::SessionUpdate::SessionInfoUpdate {
+        meta: Some(meta), ..
+    } = update
+    else {
+        return None;
+    };
+    serde_json::from_value(meta.get(MODEL_SELECTION_META_KEY)?.clone()).ok()
+}
+
+/// The transcript line an update carries, if any.
+pub fn ui_notice(update: &rebon_types::SessionUpdate) -> Option<&str> {
+    let rebon_types::SessionUpdate::SessionInfoUpdate {
+        meta: Some(meta), ..
+    } = update
+    else {
+        return None;
+    };
+    meta.get(UI_NOTICE_META_KEY)?.as_str()
 }
 
 // 分类只是前置步骤，限制等待时间以免轻量路由阻塞真实任务。
@@ -116,3 +170,29 @@ pub type ModelRuntimeResolver = Arc<
         + Send
         + Sync,
 >;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_selection_update_carries_its_notice_and_its_decision() {
+        let selection = RoutedSelection {
+            provider: "deepseek".into(),
+            model: "deepseek-flash".into(),
+            effort: Some("low".into()),
+        };
+        let update = selection_update("switched".into(), &selection);
+
+        assert_eq!(ui_notice(&update), Some("switched"));
+        assert_eq!(routed_selection(&update), Some(selection));
+    }
+
+    #[test]
+    fn a_plain_notice_carries_no_decision() {
+        let update = notice_update("Experimental model routing skipped: no key".into());
+
+        assert!(ui_notice(&update).is_some());
+        assert_eq!(routed_selection(&update), None);
+    }
+}

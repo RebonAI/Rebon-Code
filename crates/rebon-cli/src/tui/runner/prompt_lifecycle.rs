@@ -148,6 +148,7 @@ pub(super) fn maybe_update_loading_state(
     // AssistantToolUseBlock.tool_call_content to be None and the
     // diff to be lost.
     drain_main_agent_updates(app, &mut session.engine_half.update_rx);
+    sync_routed_model(app, session);
     let restore_foreground_agent_after_main_finalize = app.foregrounded_task_id.is_some();
     let mut foreground_after_completion = None;
     if restore_foreground_agent_after_main_finalize {
@@ -1237,6 +1238,18 @@ pub(super) fn sync_current_session_title(app: &mut AppState, session: &TuiEngine
     app.session_title = record.title;
 }
 
+/// Point the terminal's copy of the session model at the one first-prompt
+/// routing moved the engine onto. The engine switched runtimes on its own;
+/// this copy is what the status bar and usage attribution read, and it kept
+/// naming the model the session had left.
+pub(super) fn sync_routed_model(app: &mut AppState, session: &mut TuiEngineSession) {
+    let Some(selection) = app.pending_routed_model.take() else {
+        return;
+    };
+    session.model.provider_name = selection.provider;
+    session.model.name = selection.model;
+}
+
 /// Re-resolve the runtime for a provider/model change an approved
 /// `ProfileSwitch` already wrote to disk.
 ///
@@ -1279,6 +1292,7 @@ pub(super) fn drain_ui_channels(
     };
     drain_main_agent_updates(app, &mut session.engine_half.update_rx);
     sync_current_session_title(app, session);
+    sync_routed_model(app, session);
     let after_overlay_empty = if app.foregrounded_task_id.is_some() {
         app.main_agent_view
             .as_ref()

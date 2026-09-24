@@ -543,6 +543,9 @@ pub struct AppState {
     /// Session title from `SessionUpdate::SessionInfoUpdate`. Shown
     /// in the status bar or terminal window title.
     pub session_title: Option<String>,
+    /// A first-prompt routing decision the engine made and the runner has
+    /// not yet applied to the terminal's copy of the session model.
+    pub pending_routed_model: Option<rebon_core::model_routing::RoutedSelection>,
     /// Whether the assistant is currently generating a response.
     /// Set to `true` by the runner when `active_prompt.is_some()`,
     /// cleared when the prompt completes or is cancelled.
@@ -908,6 +911,7 @@ impl AppState {
             plan_entries: Vec::new(),
             config_options: Vec::new(),
             session_title: None,
+            pending_routed_model: None,
             is_loading: false,
             prompt_completion_status: None,
             retry_info: None,

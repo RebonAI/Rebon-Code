@@ -1117,6 +1117,25 @@ struct BackgroundTurnSideChannels {
 /// `previous_response_id` chain, and an abandoned one can leave its response
 /// to be consumed by the main turn as `{"summary":...}` assistant text. One
 /// isolated client is forked here and reused for every refresh in this run.
+/// Write a first-prompt routing decision into the job record, the owner's
+/// published answer to what the session runs on. Provider and model only: the
+/// record's effort is what a turn applies as an explicit override, and the
+/// routed effort is already applied, as a default, by the engine that chose it.
+fn record_routed_selection(
+    store: &BackgroundStore,
+    job_id: &str,
+    selection: &rebon_core::model_routing::RoutedSelection,
+) {
+    let written = store.update_state(job_id, |state| {
+        state.identity.runtime.provider = Some(selection.provider.clone());
+        state.identity.runtime.model = Some(selection.model.clone());
+        Ok(())
+    });
+    if let Err(error) = written {
+        tracing::warn!(%error, "could not record the routed model in the job record");
+    }
+}
+
 fn start_background_side_channels(
     store: &BackgroundStore,
     state: &BackgroundJobState,
@@ -1158,8 +1177,17 @@ fn start_background_side_channels(
     let update_summary_client = Arc::clone(&summary_client);
     let update_summary_model = session.model.title_name.clone();
     let update_events = ipc.events.clone();
+    let update_status = ipc.status_publisher();
     let mut last_model_summary_refresh_ms = None;
     let update_pump = spawn_background_update_pump(update_rx, move |update| {
+        // A first-prompt routing decision moves the session onto another
+        // model inside the engine. The record is what every client's status
+        // bar reads, so it has to say so too — before the notice, so a client
+        // never shows the notice beside the model the session just left.
+        if let Some(selection) = rebon_core::model_routing::routed_selection(&update.update) {
+            record_routed_selection(&update_store, &update_job_id, &selection);
+            update_status.publish_now(&update_store, &update_job_id);
+        }
         // Push before the file write. The log stays as the Agent View's
         // summary source and as crash forensics; this is what a live
         // client reads, and it must not wait on a disk round trip to see
@@ -2473,5 +2501,64 @@ fn apply_background_ceo_command(session: &mut crate::EngineSession, prompt: &mut
             }
         };
         *prompt = format!("<system-reminder>\n{reminder}\n</system-reminder>\n\n{prompt}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::BackgroundRuntimeFields;
+
+    fn runtime() -> BackgroundRuntimeFields {
+        BackgroundRuntimeFields {
+            provider: Some("openai".into()),
+            model: Some("gpt-6-sol".into()),
+            fast_mode: None,
+            channels: Vec::new(),
+            development_channels: Vec::new(),
+            provider_format: None,
+            ui_mode: None,
+            effort_level: Some("xhigh".into()),
+            permission_mode: None,
+            capability_mode: rebon_types::AgentCapabilityMode::Normal,
+            settings: Vec::new(),
+            add_dirs: Vec::new(),
+            plugin_dirs: Vec::new(),
+            mcp_configs: Vec::new(),
+            strict_mcp_config: false,
+        }
+    }
+
+    /// The record is what a mirroring terminal's status bar shows, so a
+    /// routed session has to name the model it moved onto — and keep the
+    /// effort the user set, which the record applies as an explicit override.
+    #[test]
+    fn a_routing_decision_moves_the_records_provider_and_model_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BackgroundStore::new(dir.path().join(".rebon").join("background"));
+        let job = store
+            .create_job("route me".into(), std::path::PathBuf::from("."), runtime())
+            .unwrap();
+
+        record_routed_selection(
+            &store,
+            &job.identity.job_id,
+            &rebon_core::model_routing::RoutedSelection {
+                provider: "deepseek".into(),
+                model: "deepseek-flash".into(),
+                effort: Some("high".into()),
+            },
+        );
+
+        let state = store.read_state(&job.identity.job_id).unwrap();
+        assert_eq!(state.identity.runtime.provider.as_deref(), Some("deepseek"));
+        assert_eq!(
+            state.identity.runtime.model.as_deref(),
+            Some("deepseek-flash")
+        );
+        assert_eq!(
+            state.identity.runtime.effort_level.as_deref(),
+            Some("xhigh")
+        );
     }
 }
