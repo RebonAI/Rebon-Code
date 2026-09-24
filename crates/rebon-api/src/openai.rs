@@ -339,7 +339,9 @@ impl OpenAiCompatibleProvider {
     fn endpoint(&self) -> String {
         let base = self.config.base_url.trim_end_matches('/');
         let last_segment = base.rsplit('/').next().unwrap_or_default();
-        if last_segment
+        if self.config.effective_vendor().api_root_is_unversioned() {
+            format!("{base}/chat/completions")
+        } else if last_segment
             .strip_prefix('v')
             .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()))
         {
@@ -2659,6 +2661,38 @@ mod tests {
             provider.endpoint(),
             "https://open.bigmodel.cn/api/paas/v4/chat/completions"
         );
+    }
+
+    /// Copilot's chat API has no version segment, so a bare host must not
+    /// grow a `/v1` — while every other bare host still does.
+    #[test]
+    fn copilot_endpoint_hangs_off_the_host_without_a_version() {
+        for base in [
+            "https://api.githubcopilot.com",
+            "https://api.githubcopilot.com/",
+            "https://api.individual.githubcopilot.com",
+        ] {
+            let provider = OpenAiCompatibleProvider::new(
+                OpenAiCompatibleClientConfig::with_base_url(base, "t"),
+            );
+            assert_eq!(
+                provider.endpoint(),
+                format!("{}/chat/completions", base.trim_end_matches('/'))
+            );
+        }
+        // A pin wins over the host, in both directions.
+        let mut pinned =
+            OpenAiCompatibleClientConfig::with_base_url("https://relay.example.com", "t");
+        pinned.vendor = ProviderVendor::GithubCopilot;
+        assert_eq!(
+            OpenAiCompatibleProvider::new(pinned).endpoint(),
+            "https://relay.example.com/chat/completions"
+        );
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleClientConfig::with_base_url(
+            "https://api.x.ai",
+            "t",
+        ));
+        assert_eq!(provider.endpoint(), "https://api.x.ai/v1/chat/completions");
     }
 
     #[test]

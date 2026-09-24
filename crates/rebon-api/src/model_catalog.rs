@@ -118,7 +118,11 @@ pub async fn discover_models(
     }
     let (raw, endpoint, documented) = match request.vendor.model_listing(request.wire) {
         ModelListing::OpenAiCompatible { query, documented } => {
-            let url = openai_models_url(base_url, query);
+            let url = if request.vendor.api_root_is_unversioned() {
+                unversioned_models_url(base_url, query)
+            } else {
+                openai_models_url(base_url, query)
+            };
             (
                 fetch_openai_list(http, request, &url).await?,
                 url,
@@ -254,12 +258,13 @@ fn finish(
 /// (flagship first), then everything else alphabetically. A list of sixty
 /// ids is only useful when the ones worth picking are at the top.
 fn sort_for_display(vendor: ProviderVendor, models: &mut [DiscoveredModel]) {
-    let catalogue: Vec<KnownModel> = match vendor {
-        ProviderVendor::OpenCode | ProviderVendor::Unknown => ProviderVendor::ALL
+    let catalogue: Vec<KnownModel> = if vendor.is_reseller() {
+        ProviderVendor::ALL
             .iter()
             .flat_map(|v| v.known_models().iter().copied())
-            .collect(),
-        other => other.known_models().to_vec(),
+            .collect()
+    } else {
+        vendor.known_models().to_vec()
     };
     let rank = |id: &str| -> (usize, String) {
         let lower = id.to_ascii_lowercase();
@@ -297,6 +302,25 @@ pub fn openai_models_url(base_url: &str, query: &str) -> String {
     } else {
         format!("{base}/v1/models")
     };
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(query);
+    }
+    url
+}
+
+/// `GET /models` on an API whose paths hang directly off the host
+/// ([`ProviderVendor::api_root_is_unversioned`]): no `/v1` is inserted, and
+/// a pasted endpoint path is stripped the way [`openai_models_url`] strips it.
+pub fn unversioned_models_url(base_url: &str, query: &str) -> String {
+    let mut base = base_url.trim().trim_end_matches('/');
+    for suffix in ["/chat/completions", "/responses", "/completions"] {
+        if let Some(stripped) = base.strip_suffix(suffix) {
+            base = stripped;
+            break;
+        }
+    }
+    let mut url = format!("{base}/models");
     if !query.is_empty() {
         url.push('?');
         url.push_str(query);
@@ -739,6 +763,22 @@ mod tests {
             max_output_tokens: None,
             limits_source: LimitsSource::None,
         }
+    }
+
+    #[test]
+    fn unversioned_models_url_never_inserts_a_version() {
+        assert_eq!(
+            unversioned_models_url("https://api.githubcopilot.com", ""),
+            "https://api.githubcopilot.com/models"
+        );
+        assert_eq!(
+            unversioned_models_url("https://api.githubcopilot.com/", ""),
+            "https://api.githubcopilot.com/models"
+        );
+        assert_eq!(
+            unversioned_models_url("https://api.githubcopilot.com/chat/completions", "a=b"),
+            "https://api.githubcopilot.com/models?a=b"
+        );
     }
 
     #[test]

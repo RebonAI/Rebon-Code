@@ -54,6 +54,12 @@ pub enum ProviderVendor {
     Kimi,
     /// MiniMax (`api.minimaxi.com`, `api.minimax.io`).
     MiniMax,
+    /// xAI Grok (`api.x.ai`).
+    Xai,
+    /// GitHub Copilot's chat API (`api.githubcopilot.com` and the
+    /// per-plan `api.<plan>.githubcopilot.com` hosts), reached through a
+    /// Copilot account login rather than an API key.
+    GithubCopilot,
     /// Nothing recognised: plain OpenAI-compatible semantics.
     #[default]
     Unknown,
@@ -91,6 +97,8 @@ pub enum EffortVocabulary {
     LowHighMax,
     /// `low | medium | high` only — `xhigh` and `max` fold to `high`.
     LowMediumHigh,
+    /// `low | medium | high | xhigh` — `max` folds to `xhigh`.
+    LowToXHigh,
     /// The field is rejected or ignored; never emit it.
     Unsupported,
 }
@@ -118,6 +126,10 @@ impl EffortVocabulary {
                 "low" => "low",
                 "medium" => "medium",
                 _ => "high",
+            }),
+            Self::LowToXHigh => Some(match level {
+                "max" => "xhigh",
+                other => other,
             }),
             Self::Unsupported => None,
         }
@@ -399,6 +411,19 @@ const MINIMAX_MODELS: &[KnownModel] = &[
     known("MiniMax-M2.1", 204_800, Some(204_800)),
 ];
 
+/// docs.x.ai/docs/models. The page states context windows only; the
+/// multi-agent model is left out because `reasoning_effort` picks its
+/// agent count there rather than a depth, which no Rebon knob means.
+const XAI_MODELS: &[KnownModel] = &[
+    known("grok-4.7", 500_000, None),
+    known("grok-4.6", 500_000, None),
+    known("grok-4.5", 500_000, None),
+    known("grok-4.3", 1_000_000, None),
+    known("grok-4.20-0309-reasoning", 1_000_000, None),
+    known("grok-4.20-0309-non-reasoning", 1_000_000, None),
+    known("grok-build-0.1", 256_000, None),
+];
+
 impl ProviderVendor {
     /// Every vendor with a real identity, in display order.
     pub const ALL: &'static [ProviderVendor] = &[
@@ -414,6 +439,8 @@ impl ProviderVendor {
         Self::Qwen,
         Self::Kimi,
         Self::MiniMax,
+        Self::Xai,
+        Self::GithubCopilot,
     ];
 
     /// Stable identifier, also the value of the `vendor` config key.
@@ -431,6 +458,8 @@ impl ProviderVendor {
             Self::Qwen => "qwen",
             Self::Kimi => "kimi",
             Self::MiniMax => "minimax",
+            Self::Xai => "xai",
+            Self::GithubCopilot => "github-copilot",
             Self::Unknown => "unknown",
         }
     }
@@ -450,13 +479,15 @@ impl ProviderVendor {
             Self::DeepSeek => "DeepSeek",
             Self::Kimi => "Kimi",
             Self::MiniMax => "MiniMax",
+            Self::Xai => "xAI Grok",
+            Self::GithubCopilot => "GitHub Copilot",
             Self::Unknown => "OpenAI 兼容",
         }
     }
 
     /// Parse a `vendor` config value. Case-insensitive; a few aliases people
     /// actually type are accepted (`glm`, `zhipuai`, `dashscope`, `ark`,
-    /// `moonshot`, `google`).
+    /// `moonshot`, `google`, `grok`, `copilot`).
     pub fn parse(id: &str) -> Option<Self> {
         match id.trim().to_ascii_lowercase().as_str() {
             "openai" => Some(Self::OpenAi),
@@ -471,6 +502,8 @@ impl ProviderVendor {
             "qwen" | "dashscope" | "aliyun" | "bailian" => Some(Self::Qwen),
             "kimi" | "moonshot" => Some(Self::Kimi),
             "minimax" => Some(Self::MiniMax),
+            "xai" | "grok" => Some(Self::Xai),
+            "github-copilot" | "copilot" => Some(Self::GithubCopilot),
             _ => None,
         }
     }
@@ -523,6 +556,10 @@ impl ProviderVendor {
             Self::Kimi
         } else if h == "api.minimaxi.com" || h == "api.minimax.io" || h == "api.minimax.chat" {
             Self::MiniMax
+        } else if h == "api.x.ai" || h.ends_with(".api.x.ai") {
+            Self::Xai
+        } else if h == "api.githubcopilot.com" || h.ends_with(".githubcopilot.com") {
+            Self::GithubCopilot
         } else if is_ollama_host(h, base_url) {
             Self::Ollama
         } else {
@@ -658,6 +695,33 @@ impl ProviderVendor {
                 unsupported_fields: &["tool_choice", "n", "user", "logit_bias"],
                 ..ChatWireRules::OPENAI
             },
+            // docs.x.ai/docs/guides/reasoning: `grok-4.7` and `grok-4.6`
+            // take `reasoning_effort` low|medium|high|xhigh, `grok-4.5`
+            // low|medium|high, and no other model takes it; reasoning
+            // models reject `presencePenalty`, `frequencyPenalty` and
+            // `stop`. No `thinking` switch exists on this surface.
+            Self::Xai => {
+                let effort = if model.starts_with("grok-4.7") || model.starts_with("grok-4.6") {
+                    EffortVocabulary::LowToXHigh
+                } else if model.starts_with("grok-4.5") {
+                    EffortVocabulary::LowMediumHigh
+                } else {
+                    EffortVocabulary::Unsupported
+                };
+                ChatWireRules {
+                    effort,
+                    unsupported_fields: if model.ends_with("-non-reasoning") {
+                        &[]
+                    } else {
+                        &["presence_penalty", "frequency_penalty", "stop"]
+                    },
+                    ..ChatWireRules::OPENAI
+                }
+            }
+            // Copilot publishes no reference for its chat API; it is
+            // spoken the way OpenAI's is, so plain OpenAI semantics apply
+            // rather than a guessed dialect.
+            Self::GithubCopilot => ChatWireRules::OPENAI,
             // Zen's chat-completions path fronts DeepSeek, GLM, Kimi and
             // MiniMax models, which do take a `thinking` object; a relay
             // nobody recognised gets the same benefit of the doubt.
@@ -752,7 +816,16 @@ impl ProviderVendor {
                 min_prefix_tokens: None,
                 hit_usage_field: "prompt_tokens_details.cached_tokens",
             },
-            Self::Ollama | Self::Unknown => PromptCacheProfile::NONE,
+            // docs.x.ai/developers/advanced-api-usage/prompt-caching:
+            // automatic, reported in `prompt_tokens_details.cached_tokens`;
+            // no floor is stated.
+            Self::Xai => PromptCacheProfile {
+                kind: PromptCacheKind::AutomaticPrefix,
+                min_prefix_tokens: None,
+                hit_usage_field: "prompt_tokens_details.cached_tokens",
+            },
+            // Copilot documents no cache contract.
+            Self::GithubCopilot | Self::Ollama | Self::Unknown => PromptCacheProfile::NONE,
         }
     }
 
@@ -785,6 +858,12 @@ impl ProviderVendor {
             // Ark's data plane has no list; the management plane is
             // HMAC-signed and out of reach for an API key.
             (Self::Volcengine, _) => ModelListing::Unsupported,
+            // Copilot's `GET /models` answers in OpenAI's shape (the list
+            // Zed and opencode read), but no public page describes it.
+            (Self::GithubCopilot, _) => ModelListing::OpenAiCompatible {
+                query: "",
+                documented: false,
+            },
             (_, _) => OPENAI_LIST,
         }
     }
@@ -804,8 +883,22 @@ impl ProviderVendor {
             Self::Qwen => QWEN_MODELS,
             Self::Kimi => KIMI_MODELS,
             Self::MiniMax => MINIMAX_MODELS,
-            Self::Ollama | Self::OpenCode | Self::Unknown => &[],
+            Self::Xai => XAI_MODELS,
+            Self::Ollama | Self::OpenCode | Self::GithubCopilot | Self::Unknown => &[],
         }
+    }
+
+    /// Whether this vendor resells other vendors' models, so a model's
+    /// documented limits are found in whichever catalogue lists it.
+    pub fn is_reseller(self) -> bool {
+        matches!(self, Self::OpenCode | Self::GithubCopilot | Self::Unknown)
+    }
+
+    /// Whether the API's paths hang directly off the host, with no version
+    /// segment: Copilot serves `/chat/completions` and `/models` rather than
+    /// `/v1/…` (the paths Zed's and opencode's Copilot clients call).
+    pub fn api_root_is_unversioned(self) -> bool {
+        matches!(self, Self::GithubCopilot)
     }
 
     /// The documented limits for `model`, if this vendor's catalogue (or,
@@ -820,7 +913,7 @@ impl ProviderVendor {
         }
         let tables: Vec<&'static [KnownModel]> = match self {
             Self::Ollama => Vec::new(),
-            Self::OpenCode | Self::Unknown => ProviderVendor::ALL
+            reseller if reseller.is_reseller() => ProviderVendor::ALL
                 .iter()
                 .map(|vendor| vendor.known_models())
                 .collect(),
@@ -1130,6 +1223,16 @@ mod tests {
             ("https://api.moonshot.cn/v1", ProviderVendor::Kimi),
             ("https://api.minimaxi.com/v1", ProviderVendor::MiniMax),
             ("https://api.minimax.io/v1", ProviderVendor::MiniMax),
+            ("https://api.x.ai/v1", ProviderVendor::Xai),
+            ("https://us-east-1.api.x.ai/v1", ProviderVendor::Xai),
+            (
+                "https://api.githubcopilot.com",
+                ProviderVendor::GithubCopilot,
+            ),
+            (
+                "https://api.business.githubcopilot.com",
+                ProviderVendor::GithubCopilot,
+            ),
             ("https://relay.example.com/v1", ProviderVendor::Unknown),
             ("http://localhost:8080/v1", ProviderVendor::Unknown),
             ("", ProviderVendor::Unknown),
@@ -1153,6 +1256,18 @@ mod tests {
         );
         assert_eq!(
             ProviderVendor::detect("https://bedrock-mantle.example.com/anthropic"),
+            ProviderVendor::Unknown
+        );
+        assert_eq!(
+            ProviderVendor::detect("https://api.x.ai.evil.example/v1"),
+            ProviderVendor::Unknown
+        );
+        assert_eq!(
+            ProviderVendor::detect("https://githubcopilot.com.evil.example"),
+            ProviderVendor::Unknown
+        );
+        assert_eq!(
+            ProviderVendor::detect("https://notapi.x.ai/v1"),
             ProviderVendor::Unknown
         );
     }
@@ -1363,6 +1478,93 @@ mod tests {
         );
         assert_eq!(EffortVocabulary::Unsupported.fold("high"), None);
         assert_eq!(EffortVocabulary::Passthrough.fold("ultra"), None);
+    }
+
+    #[test]
+    fn low_to_xhigh_keeps_xhigh_and_folds_max_into_it() {
+        let v = EffortVocabulary::LowToXHigh;
+        assert_eq!(v.fold("low"), Some("low"));
+        assert_eq!(v.fold("medium"), Some("medium"));
+        assert_eq!(v.fold("high"), Some("high"));
+        assert_eq!(v.fold("xhigh"), Some("xhigh"));
+        assert_eq!(v.fold("max"), Some("xhigh"));
+        assert_eq!(v.fold("ultra"), None);
+    }
+
+    /// docs.x.ai/docs/guides/reasoning, model by model.
+    #[test]
+    fn xai_effort_and_rejected_fields_follow_the_reasoning_guide() {
+        let xai = ProviderVendor::Xai;
+        assert_eq!(
+            xai.chat_wire_rules("grok-4.7").effort,
+            EffortVocabulary::LowToXHigh
+        );
+        assert_eq!(
+            xai.chat_wire_rules("grok-4.6").effort,
+            EffortVocabulary::LowToXHigh
+        );
+        assert_eq!(
+            xai.chat_wire_rules("grok-4.5").effort,
+            EffortVocabulary::LowMediumHigh
+        );
+        for other in ["grok-4.3", "grok-build-0.1", "grok-4.20-0309-reasoning"] {
+            assert_eq!(
+                xai.chat_wire_rules(other).effort,
+                EffortVocabulary::Unsupported,
+                "{other}"
+            );
+        }
+        let reasoning = xai.chat_wire_rules("grok-4.7");
+        for field in ["presence_penalty", "frequency_penalty", "stop"] {
+            assert!(reasoning.unsupported_fields.contains(&field), "{field}");
+        }
+        assert!(xai
+            .chat_wire_rules("grok-4.20-0309-non-reasoning")
+            .unsupported_fields
+            .is_empty());
+        assert_eq!(reasoning.thinking, ThinkingDialect::None);
+        assert!(xai.prompt_cache().is_prefix_based());
+        assert_eq!(
+            xai.model_listing(WireFamily::OpenAiChat),
+            ModelListing::OpenAiCompatible {
+                query: "",
+                documented: true
+            }
+        );
+        assert_eq!(xai.known_models()[0].id, "grok-4.7");
+    }
+
+    /// Copilot resells other vendors' models over an undocumented API: no
+    /// guessed dialect, no cache claim, limits from whoever lists the model,
+    /// and paths without a version segment.
+    #[test]
+    fn copilot_speaks_plain_openai_and_borrows_limits_from_the_catalogues() {
+        let copilot = ProviderVendor::GithubCopilot;
+        assert_eq!(
+            copilot.chat_wire_rules("gpt-5.6-sol"),
+            ChatWireRules::OPENAI
+        );
+        assert!(!copilot.prompt_cache().is_prefix_based());
+        assert_eq!(
+            copilot.model_listing(WireFamily::OpenAiChat),
+            ModelListing::OpenAiCompatible {
+                query: "",
+                documented: false
+            }
+        );
+        assert!(copilot.known_models().is_empty());
+        assert!(copilot.is_reseller());
+        assert_eq!(
+            copilot
+                .known_model("claude-sonnet-5")
+                .unwrap()
+                .context_window,
+            1_000_000
+        );
+        assert!(copilot.api_root_is_unversioned());
+        for vendor in ProviderVendor::ALL.iter().filter(|v| **v != copilot) {
+            assert!(!vendor.api_root_is_unversioned(), "{vendor:?}");
+        }
     }
 
     #[test]

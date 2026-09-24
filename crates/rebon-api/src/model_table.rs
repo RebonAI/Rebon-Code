@@ -402,6 +402,8 @@ pub fn provider_id(vendor: ProviderVendor) -> Option<&'static str> {
         ProviderVendor::Qwen => "alibaba",
         ProviderVendor::Volcengine => "volcengine",
         ProviderVendor::OpenCode => "opencode",
+        ProviderVendor::Xai => "xai",
+        ProviderVendor::GithubCopilot => "github-copilot",
         ProviderVendor::Ollama | ProviderVendor::Unknown => return None,
     })
 }
