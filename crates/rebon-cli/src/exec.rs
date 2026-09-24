@@ -266,6 +266,7 @@ pub async fn run(args: ExecArgs) -> anyhow::Result<()> {
         ExecPrompt::Answered(text) => {
             approver.abort();
             _server_state.close_session(&session_id);
+            rebon_core::system_prompt::remove_scratchpad_for(&cwd, &session_id);
             if json {
                 emit(&serde_json::json!({
                     "type": "message",
@@ -290,7 +291,7 @@ pub async fn run(args: ExecArgs) -> anyhow::Result<()> {
         user_prompt: Some(prompt_text.clone()),
         effort_is_session_default: true,
         session_id: session_id.clone(),
-        cwd,
+        cwd: cwd.clone(),
         prompt: vec![AcpContentBlock::Text(TextContent {
             text: prompt_text,
             annotations: None,
@@ -345,6 +346,7 @@ pub async fn run(args: ExecArgs) -> anyhow::Result<()> {
     // before the result is printed so a resume does not have to wait on stdout.
     approver.abort();
     _server_state.close_session(&session_id);
+    rebon_core::system_prompt::remove_scratchpad_for(&cwd, &session_id);
 
     match result {
         Ok(outcome) => {

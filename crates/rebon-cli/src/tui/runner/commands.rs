@@ -735,6 +735,7 @@ fn apply_new_session_with_inline_banner(
         }
     };
     let previous_session_id = session.session_id.clone();
+    let previous_scratchpad = session.owned_scratchpad();
     if let Err(err) = session.swap_runtime(&new_record.id, &new_record.cwd, app.is_loading) {
         super::inject_system_message(
             app,
@@ -748,6 +749,9 @@ fn apply_new_session_with_inline_banner(
         .engine_half
         .tasks
         .close_owner_session(&previous_session_id);
+    if let Some(scratchpad) = previous_scratchpad {
+        scratchpad.remove();
+    }
     app.mid_turn_queued_submit_poller = Some(session.engine_half.runtime.mid_turn_queue.clone());
     std::env::set_var("REBON_SESSION_ID", &new_record.id);
     rebon_tool::clear_current_team_name();
@@ -848,6 +852,7 @@ pub(super) fn apply_new_hosted_session_with(
         default_permission_mode.as_wire(),
     );
     let previous_session_id = session.session_id.clone();
+    let previous_scratchpad = session.owned_scratchpad();
     if let Err(err) = session.swap_runtime(&new_record.id, &new_record.cwd, app.is_loading) {
         super::inject_system_message(
             app,
@@ -861,6 +866,9 @@ pub(super) fn apply_new_hosted_session_with(
         .engine_half
         .tasks
         .close_owner_session(&previous_session_id);
+    if let Some(scratchpad) = previous_scratchpad {
+        scratchpad.remove();
+    }
     app.mid_turn_queued_submit_poller = Some(session.engine_half.runtime.mid_turn_queue.clone());
     std::env::set_var("REBON_SESSION_ID", &new_record.id);
     rebon_tool::clear_current_team_name();

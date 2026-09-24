@@ -575,10 +575,18 @@ crate as `crates/rebon-<name>/`, a Rust feature plugin as
   (`--acp` / `serve`) uses `with_policy_resolver`. They are mutually exclusive,
   because the handle carries whose session this is.
 - Every session with a session id gets a temporary directory in the system
-  prompt, isolated by project and session (`system_prompt::scratchpad_dir_for`),
-  and that same path is set as an auto-allowed write root on the `ToolContext`
-  and created ahead of time. Telling the model the path without allowing it
-  means every write hits an authorization dialog.
+  prompt, isolated by project and session (`rebon_session::scratchpad_dir_for`,
+  re-exported from `system_prompt`), and that same path is set as an
+  auto-allowed write root on the `ToolContext` and created ahead of time.
+  Telling the model the path without allowing it means every write hits an
+  authorization dialog. Whoever ends the session deletes it
+  (`remove_scratchpad_for`): the TUI on exit and on `/new` / `/resume` away
+  from a session it hosts, `exec` when the turn is over. A terminal that is
+  only mirroring a worker never does. Neither does a worker exiting — it
+  leaves on linger, stop or handover and the session goes on; a hosted
+  session ends when its job is removed (`BackgroundStore::remove_job`), and
+  even then only if no other job names the session and nobody holds its
+  active lock.
 - Bash's authorization-free deletion holds in exactly one case: the whole
   command does nothing but delete, and every target statically resolves inside a
   write root (`shell_command_only_deletes_inside_roots`). Anything chained onto

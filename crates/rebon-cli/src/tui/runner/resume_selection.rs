@@ -634,6 +634,7 @@ pub(super) fn commit_prepared_resume(
     };
 
     let previous_session_id = session.session_id.clone();
+    let previous_scratchpad = session.owned_scratchpad();
     if let Err(err) = session.swap_runtime(&resume_id, &storage_cwd, app.is_loading) {
         inject_system_message(
             app,
@@ -670,6 +671,9 @@ pub(super) fn commit_prepared_resume(
             .engine_half
             .tasks
             .close_owner_session(&previous_session_id);
+        if let Some(scratchpad) = previous_scratchpad {
+            scratchpad.remove();
+        }
     }
     adopt_session_as_owner(session, active_lock);
     std::env::set_var("REBON_SESSION_ID", &resume_id);

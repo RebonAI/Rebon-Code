@@ -1269,7 +1269,58 @@ impl BackgroundStore {
             roster.updated_at_ms = now_ms();
             let _ = self.write_roster(&roster);
         }
+        self.remove_scratchpad_of_removed_job(&state);
         Ok(())
+    }
+
+    /// A hosted session ends when its job is removed, not when its worker
+    /// exits: a worker leaves on linger, on stop, or to hand the session to a
+    /// terminal, and each time the session goes on. So this is where its
+    /// scratchpad goes.
+    ///
+    /// Only when nothing else still has the session: another job naming the
+    /// same session id (a respawn, an adopted session) or a process holding
+    /// its active lock (a terminal it was attached to) keeps it. Leaving a
+    /// directory behind is the cheaper mistake.
+    fn remove_scratchpad_of_removed_job(&self, state: &BackgroundJobState) {
+        let Some(session_id) = state
+            .identity
+            .session_id
+            .as_deref()
+            .and_then(non_empty_trimmed)
+        else {
+            return;
+        };
+        // The session ran under the worktree when the job had one, and under
+        // the job's cwd otherwise; either may be the key.
+        let mut cwds = vec![state.identity.cwd.clone()];
+        if let Some(worktree) = state
+            .workspace
+            .worktree_path
+            .as_deref()
+            .and_then(non_empty_trimmed)
+        {
+            cwds.push(worktree);
+        }
+        let Ok(jobs) = self.list_jobs() else {
+            return;
+        };
+        if jobs
+            .iter()
+            .any(|job| job.identity.session_id.as_deref() == Some(session_id.as_str()))
+        {
+            return;
+        }
+        let projects_root = self.root().join("projects");
+        if cwds
+            .iter()
+            .any(|cwd| rebon_session::is_session_active(&projects_root, cwd, &session_id))
+        {
+            return;
+        }
+        for cwd in &cwds {
+            rebon_session::remove_scratchpad_for(cwd, &session_id);
+        }
     }
 
     pub fn reconcile_stale_pid(&self, state: &mut BackgroundJobState) -> anyhow::Result<()> {

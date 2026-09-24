@@ -27,7 +27,10 @@ pub mod file_history;
 pub mod held_lock;
 pub mod memory_paths;
 pub mod model_selection;
+pub mod scratchpad;
 pub mod session_storage;
+
+pub use scratchpad::{remove_scratchpad_for, scratchpad_dir_for};
 
 pub use config_home::{config_home_with_env, platform_home_dir, platform_home_with_env};
 

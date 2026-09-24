@@ -398,6 +398,9 @@ pub fn run_blocking(
                     .engine_half
                     .tasks
                     .close_owner_session(&session.session_id);
+                if let Some(scratchpad) = session.owned_scratchpad() {
+                    scratchpad.remove();
+                }
             }
             return Err(err.into());
         }
@@ -717,6 +720,7 @@ fn finish_run(
     let final_session_id = slot.session_id().map(str::to_string);
     let final_result = result.map(|_| ());
     if let Some(mut session) = slot.into_session() {
+        let scratchpad = session.owned_scratchpad();
         stop_session_tasks(session.engine_half.tasks.as_ref());
         session
             .engine_half
@@ -747,6 +751,10 @@ fn finish_run(
             for message in rebon_core::hooks::apply_session_lifecycle_effects(&rest) {
                 tracing::info!(message = %message, "SessionEnd hook message after TUI exit");
             }
+        }
+        // After the SessionEnd hooks, which may still want to read it.
+        if let Some(scratchpad) = scratchpad {
+            scratchpad.remove();
         }
     }
 

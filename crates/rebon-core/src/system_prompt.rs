@@ -662,25 +662,9 @@ fn scratchpad_dir_for_session(cwd: &str, session_id: Option<&str>) -> Option<Str
     Some(scratchpad_dir_for(cwd, session_id?))
 }
 
-/// Resolve the scratchpad directory for a (project cwd, session key)
-/// pair: `$REBON_TMPDIR/rebon/<sanitised-cwd>/<key>/scratchpad`.
-///
-/// The same path function backs both the coordinator session prompt
-/// and sub-agent prompts, so a worker keyed by its parent session id
-/// lands in the parent's scratchpad and the parent can inspect
-/// whatever artifacts the worker leaves behind.
-pub fn scratchpad_dir_for(cwd: &str, session_key: &str) -> String {
-    let base_tmp_dir = std::env::var_os("REBON_TMPDIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base_tmp_dir
-        .join("rebon")
-        .join(rebon_session::project_dir_component(cwd))
-        .join(session_key)
-        .join("scratchpad")
-        .display()
-        .to_string()
-}
+/// The path lives in `rebon-session` so the job store, which ends hosted
+/// sessions and cannot depend on this crate, resolves the same one.
+pub use rebon_session::{remove_scratchpad_for, scratchpad_dir_for};
 
 /// Suffix appended to every sub-agent system prompt: the shared
 /// sub-agent notes plus a scratchpad pointer, so workers put temp
@@ -2206,18 +2190,6 @@ mod tests {
         assert!(coord_pos < scratch_pos);
         let worker_pos = prompt.find("Workers have: Read").expect("worker ctx");
         assert!(scratch_pos < worker_pos);
-    }
-
-    #[test]
-    fn scratchpad_dir_for_is_keyed_by_project_and_session() {
-        let dir = scratchpad_dir_for("F:/dev/proj", "sess-1");
-        let normalized = dir.replace('\\', "/");
-        assert!(normalized.contains("/rebon/"));
-        assert!(normalized.contains("sess-1"));
-        assert!(normalized.ends_with("/scratchpad"));
-        // Same inputs, same path — parent and worker must agree.
-        assert_eq!(dir, scratchpad_dir_for("F:/dev/proj", "sess-1"));
-        assert_ne!(dir, scratchpad_dir_for("F:/dev/proj", "sess-2"));
     }
 
     #[test]

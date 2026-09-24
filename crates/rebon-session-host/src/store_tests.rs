@@ -4363,6 +4363,78 @@ fn remove_job_deletes_terminal_job_metadata() {
     assert!(store.read_state(&state.identity.job_id).is_err());
 }
 
+/// A finished job bound to `session_id`, run from `cwd`, with a scratchpad
+/// that has something in it.
+fn finished_session_job(
+    store: &BackgroundStore,
+    cwd: &Path,
+    session_id: &str,
+) -> (BackgroundJobState, PathBuf) {
+    let mut state = store
+        .create_job("prompt".into(), cwd.to_path_buf(), runtime())
+        .unwrap();
+    state.identity.session_id = Some(session_id.to_string());
+    state.process.status = BackgroundJobStatus::Succeeded;
+    state.process.completed_at_ms = Some(now_ms());
+    store.write_state(&state).unwrap();
+    let scratchpad = PathBuf::from(rebon_session::scratchpad_dir_for(
+        &state.identity.cwd,
+        session_id,
+    ));
+    fs::create_dir_all(&scratchpad).unwrap();
+    fs::write(scratchpad.join("notes.txt"), "x").unwrap();
+    (state, scratchpad)
+}
+
+#[test]
+fn remove_job_deletes_the_scratchpad_of_the_session_it_ended() {
+    let (_dir, store) = store();
+    let project = tempfile::tempdir().unwrap();
+    let (state, scratchpad) = finished_session_job(&store, project.path(), "sess-ended");
+
+    store.remove_job(&state.identity.job_id).unwrap();
+
+    assert!(!scratchpad.exists());
+}
+
+#[test]
+fn remove_job_keeps_the_scratchpad_another_job_still_names() {
+    let (_dir, store) = store();
+    let project = tempfile::tempdir().unwrap();
+    let (first, scratchpad) = finished_session_job(&store, project.path(), "sess-shared");
+    let (second, _) = finished_session_job(&store, project.path(), "sess-shared");
+
+    store.remove_job(&first.identity.job_id).unwrap();
+    assert!(scratchpad.join("notes.txt").exists());
+
+    store.remove_job(&second.identity.job_id).unwrap();
+    assert!(
+        !scratchpad.exists(),
+        "the last job for the session takes it"
+    );
+}
+
+#[test]
+fn remove_job_keeps_the_scratchpad_of_a_session_someone_holds() {
+    let (_dir, store) = store();
+    let project = tempfile::tempdir().unwrap();
+    let (state, scratchpad) = finished_session_job(&store, project.path(), "sess-held");
+    // A terminal the session was attached to, still open.
+    let lock = rebon_session::try_acquire_session_active_lock(
+        &store.root().join("projects"),
+        &state.identity.cwd,
+        "sess-held",
+    )
+    .unwrap()
+    .expect("lock is free");
+
+    store.remove_job(&state.identity.job_id).unwrap();
+    assert!(scratchpad.join("notes.txt").exists());
+
+    drop(lock);
+    rebon_session::remove_scratchpad_for(&state.identity.cwd, "sess-held");
+}
+
 #[test]
 fn remove_job_rejects_active_and_invalid_ids() {
     let (_dir, store) = store();

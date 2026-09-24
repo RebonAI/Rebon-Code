@@ -107,6 +107,37 @@ impl TuiEngineSession {
         }
         Ok(replaced)
     }
+
+    /// This session's scratchpad, when this terminal is what hosts the
+    /// session: read it before the session is let go (`swap_runtime` forgets
+    /// the mirror state that decides it) and [`OwnedScratchpad::remove`] it
+    /// after.
+    ///
+    /// `None` for a mirror, a handover in flight, or a session opened from a
+    /// background job — in each of those a worker has, or can take back, the
+    /// session, and the scratchpad is its working directory too.
+    pub(crate) fn owned_scratchpad(&self) -> Option<OwnedScratchpad> {
+        let hosted_elsewhere = self.remote_background_attachment.is_some()
+            || self.pending_hosted_session.is_some()
+            || self.attached_background_job_id.is_some();
+        (!hosted_elsewhere).then(|| OwnedScratchpad {
+            cwd: self.cwd.clone(),
+            session_id: self.session_id.clone(),
+        })
+    }
+}
+
+/// A scratchpad whose session this terminal ended; see
+/// [`TuiEngineSession::owned_scratchpad`].
+pub(crate) struct OwnedScratchpad {
+    cwd: String,
+    session_id: String,
+}
+
+impl OwnedScratchpad {
+    pub(crate) fn remove(self) {
+        rebon_core::system_prompt::remove_scratchpad_for(&self.cwd, &self.session_id);
+    }
 }
 
 /// Read a session command's inputs off a terminal's state.
