@@ -581,8 +581,11 @@ crate as `crates/rebon-<name>/`, a Rust feature plugin as
   Telling the model the path without allowing it means every write hits an
   authorization dialog. Whoever ends the session deletes it
   (`remove_scratchpad_for`): the TUI on exit and on `/new` / `/resume` away
-  from a session it hosts, `exec` when the turn is over. A terminal that is
-  only mirroring a worker never does. Neither does a worker exiting — it
+  from a session it hosts, `exec` when the turn is over, `--acp` for every
+  session it holds the lock for once the connection closes (ACP has no
+  method that ends a session). A terminal that is only mirroring a worker
+  never does, and neither does `rebon serve`, whose sessions all live in
+  workers. Neither does a worker exiting — it
   leaves on linger, stop or handover and the session goes on; a hosted
   session ends when its job is removed (`BackgroundStore::remove_job`), and
   even then only if no other job names the session and nobody holds its

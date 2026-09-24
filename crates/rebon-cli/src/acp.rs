@@ -105,7 +105,38 @@ pub async fn run_acp_server(
         _cron_scheduler,
         ..
     } = build_acp_server(overrides).await?;
+    // ACP has no method that ends a session: an editor's sessions end with
+    // its connection. Kept past `serve_with_publishers`, which takes the
+    // handler, to clean up after them.
+    let state = handler.state().clone();
 
+    let result = serve_acp_transport(transport, handler, update_rx, permission_rx, &engine).await;
+    remove_owned_scratchpads(&state);
+    result
+}
+
+/// Delete the scratchpad of every session `state` hosts, once the connection
+/// that was using them is gone.
+///
+/// Called while `state` still holds the locks, so no other process can have
+/// opened one of these sessions while its scratchpad goes. A session this
+/// state only reads (`rebon serve`'s, which live in workers) holds no lock
+/// here and is not touched.
+fn remove_owned_scratchpads(state: &rebon_acp::ServerState) {
+    for (session_id, cwd) in state.owned_sessions() {
+        rebon_core::system_prompt::remove_scratchpad_for(&cwd, &session_id);
+    }
+}
+
+async fn serve_acp_transport(
+    transport: AcpTransport,
+    handler: DefaultHandler,
+    update_rx: tokio::sync::mpsc::UnboundedReceiver<rebon_proto::types::SessionUpdateParams>,
+    permission_rx: tokio::sync::mpsc::UnboundedReceiver<
+        rebon_agent_core::publisher::OutboundPermissionRequest,
+    >,
+    engine: &Engine,
+) -> anyhow::Result<()> {
     match transport {
         AcpTransport::Stdio => {
             tracing::info!(
@@ -1065,6 +1096,34 @@ mod tests {
             }
             rebon_tool::set_sub_agents_enabled(self.previous_sub_agents_enabled);
         }
+    }
+
+    /// An editor's sessions end with its connection; a session this server
+    /// only reads is a worker's and keeps its scratchpad.
+    #[test]
+    fn connection_end_removes_scratchpads_of_hosted_sessions_only() {
+        let projects_root = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let cwd = project.path().display().to_string();
+        let state = rebon_acp::ServerState::new();
+        assert!(state.enable_session_ownership(projects_root.path().to_path_buf()));
+        let hosted = state.create_session(cwd.clone(), Vec::new());
+        let read_only =
+            state.restore_empty_session("sess-worker".into(), cwd.clone(), Vec::new(), "default");
+        let scratchpad_of = |sid: &str| {
+            let dir =
+                std::path::PathBuf::from(rebon_core::system_prompt::scratchpad_dir_for(&cwd, sid));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        let hosted_scratchpad = scratchpad_of(&hosted.id);
+        let worker_scratchpad = scratchpad_of(&read_only.id);
+
+        remove_owned_scratchpads(&state);
+
+        assert!(!hosted_scratchpad.exists());
+        assert!(worker_scratchpad.is_dir());
+        rebon_core::system_prompt::remove_scratchpad_for(&cwd, &read_only.id);
     }
 
     async fn drain(mut reader: DuplexStream) -> Vec<u8> {

@@ -613,6 +613,28 @@ impl ServerState {
             .contains_key(sid)
     }
 
+    /// Every session this state holds the active lock for, with the cwd its
+    /// record runs under — what a host ending all of its sessions at once has
+    /// to clean up after. A record without a lock is somebody else's session
+    /// this state only reads, and is left out.
+    pub fn owned_sessions(&self) -> Vec<(String, String)> {
+        let owned: Vec<String> = self
+            .session_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        let sessions = self.sessions.lock().expect("session map mutex poisoned");
+        owned
+            .into_iter()
+            .filter_map(|sid| {
+                let cwd = sessions.get(&sid)?.cwd.clone();
+                Some((sid, cwd))
+            })
+            .collect()
+    }
+
     /// Take custody of a lock the caller acquired, returning whatever lock this
     /// state was holding for `sid`.
     ///
@@ -2808,6 +2830,27 @@ mod tests {
             "/work/off",
             &record.id
         ));
+    }
+
+    #[test]
+    fn owned_sessions_lists_only_the_sessions_this_state_holds() {
+        let tmp = fresh_load_session_tempdir("own-list");
+        let state = owning_state(tmp.path());
+        let owned = state.create_session("/work/owned".into(), Vec::new());
+        let closed = state.create_session("/work/closed".into(), Vec::new());
+        assert!(state.close_session(&closed.id));
+        state.restore_empty_session(
+            "sess-read".into(),
+            "/work/read".into(),
+            Vec::new(),
+            "default",
+        );
+
+        assert_eq!(
+            state.owned_sessions(),
+            vec![(owned.id.clone(), "/work/owned".to_string())]
+        );
+        assert!(ServerState::new().owned_sessions().is_empty());
     }
 
     #[test]
