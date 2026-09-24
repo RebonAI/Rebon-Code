@@ -1157,6 +1157,11 @@ fn resolve_env_runtime_model(overrides: &HarnessOverrides) -> anyhow::Result<Run
 /// 1. `REBON_CONTEXT_WINDOW`
 /// 2. `customProviders[].models[model].contextWindow`
 /// 3. Inference from provider format and model name
+///
+/// Whatever the window, auto-compact fires no later than
+/// [`rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT`] tokens (Codex's
+/// 272k × 90%). `REBON_AUTO_COMPACT_TOKEN_LIMIT` replaces that cap; `0`
+/// removes it so the trigger follows the window alone.
 pub fn prune_handle_from_env(
     format: &ProviderFormat,
     vendor: rebon_api::ProviderVendor,
@@ -1196,8 +1201,31 @@ pub fn prune_handle_from_env(
     if matches!(format, ProviderFormat::Anthropic) {
         handle.use_full_history_replay_microcompact_profile();
     }
+    handle
+        .budget
+        .set_auto_compact_token_limit(auto_compact_token_limit_from_env());
 
     handle
+}
+
+fn auto_compact_token_limit_from_env() -> Option<u32> {
+    match std::env::var("REBON_AUTO_COMPACT_TOKEN_LIMIT") {
+        Ok(value) => match value.trim().parse::<u32>() {
+            Ok(0) => None,
+            Ok(limit) => {
+                tracing::info!(limit, "auto-compact token limit override from env");
+                Some(limit)
+            }
+            Err(_) => {
+                tracing::warn!(
+                    value = %value,
+                    "REBON_AUTO_COMPACT_TOKEN_LIMIT is not a token count; using the default cap"
+                );
+                Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT)
+            }
+        },
+        Err(_) => Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT),
+    }
 }
 
 fn prune_handle_from_model_config(
@@ -3601,8 +3629,9 @@ mod tests {
     #[test]
     fn prune_handle_uses_configured_context_limits_and_model_overrides() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let _env = EnvRestore::new(&["REBON_CONTEXT_WINDOW"]);
+        let _env = EnvRestore::new(&["REBON_CONTEXT_WINDOW", "REBON_AUTO_COMPACT_TOKEN_LIMIT"]);
         std::env::remove_var("REBON_CONTEXT_WINDOW");
+        std::env::set_var("REBON_AUTO_COMPACT_TOKEN_LIMIT", "0");
         let handle = prune_handle_from_env(
             &ProviderFormat::OpenaiResponses,
             rebon_api::ProviderVendor::OpenAi,
@@ -3625,6 +3654,43 @@ mod tests {
         handle.set_context_window_for_model("gpt-5.6-sol");
         assert_eq!(handle.budget.context_window(), 500_000);
         assert_eq!(handle.budget.output_token_reserve(), 128_000);
+    }
+
+    #[test]
+    fn auto_compact_is_capped_like_codex_whatever_the_window() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::new(&["REBON_CONTEXT_WINDOW", "REBON_AUTO_COMPACT_TOKEN_LIMIT"]);
+        std::env::remove_var("REBON_CONTEXT_WINDOW");
+        std::env::remove_var("REBON_AUTO_COMPACT_TOKEN_LIMIT");
+        let build = || {
+            prune_handle_from_env(
+                &ProviderFormat::OpenaiResponses,
+                rebon_api::ProviderVendor::OpenAi,
+                "gpt-6-sol",
+                None,
+                None,
+                std::iter::empty::<(String, u32)>(),
+                std::iter::empty::<(String, u32)>(),
+            )
+        };
+
+        let handle = build();
+        assert_eq!(handle.budget.context_window(), 1_050_000);
+        assert_eq!(handle.budget.auto_compact_threshold(), 244_800);
+        // Switching models recomputes the window but keeps the cap, and so
+        // does a sub-agent fork.
+        handle.set_context_window_for_model("gpt-6-sol");
+        assert_eq!(handle.budget.auto_compact_threshold(), 244_800);
+        assert_eq!(
+            handle.fork_for_sub_agent().budget.auto_compact_threshold(),
+            244_800
+        );
+
+        std::env::set_var("REBON_AUTO_COMPACT_TOKEN_LIMIT", "400000");
+        assert_eq!(build().budget.auto_compact_threshold(), 400_000);
+
+        std::env::set_var("REBON_AUTO_COMPACT_TOKEN_LIMIT", "0");
+        assert_eq!(build().budget.auto_compact_threshold(), 875_900);
     }
 
     #[test]

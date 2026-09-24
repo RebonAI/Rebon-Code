@@ -211,7 +211,7 @@ pub use context_prune::{
     ensure_tool_result_pairing, ensure_tool_result_pairing_with_report, microcompact_tool_results,
     should_preserve_prefix_cache, sweep_recent_tool_results, ContextBudget, ContextPruneConfig,
     ContextPruneMiddleware, ContextUsageSnapshot, ContextUsageSource, PairingRepairReport,
-    PruneLevel, PruneLevelHandle, PruneStats, PruneStatsSnapshot,
+    PruneLevel, PruneLevelHandle, PruneStats, PruneStatsSnapshot, DEFAULT_AUTO_COMPACT_TOKEN_LIMIT,
     SYNTHETIC_TOOL_RESULT_PLACEHOLDER, SYNTHETIC_TOOL_RESULT_PREFIX, TOOL_RESULT_CLEARED,
 };
 pub use error::{

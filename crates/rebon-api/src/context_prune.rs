@@ -242,6 +242,14 @@ fn auto_compact_threshold_for_window(context_window: u32, output_token_reserve: 
 }
 const WARNING_THRESHOLD_BUFFER: u32 = 20_000;
 
+/// Absolute ceiling on the auto-compact trigger, matching Codex: its model
+/// catalogue advertises a 272k working window even for 1M-capable models and
+/// compacts at 90% of it. A long session otherwise resends several hundred
+/// thousand tokens on every tool round before the window-relative trigger
+/// fires, and cached input still counts against the account's quota.
+/// Callers opt in through [`ContextBudget::set_auto_compact_token_limit`].
+pub const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT: u32 = 272_000 * 9 / 10;
+
 // ── Microcompact thresholds ────────────────────────────────────
 // Microcompact trims stale tool results before heavier summarization.
 // The default is window-relative so large-context providers can use their
@@ -279,8 +287,11 @@ pub struct ContextBudget {
     context_window: AtomicU32,
     /// Tokens reserved for the model's maximum output.
     output_token_reserve: AtomicU32,
-    /// Auto-compact trigger = (context_window − output reserve) × trigger percentage.
+    /// Auto-compact trigger = min((context_window − output reserve) ×
+    /// trigger percentage, `auto_compact_token_limit`).
     auto_compact_threshold: AtomicU32,
+    /// Absolute cap on the auto-compact trigger. `u32::MAX` means none.
+    auto_compact_token_limit: AtomicU32,
     /// Provider-specific cap for the microcompact trigger. `u32::MAX`
     /// means the window-relative threshold is used unchanged.
     microcompact_trigger_max_tokens: AtomicU32,
@@ -315,6 +326,7 @@ impl ContextBudget {
             context_window: AtomicU32::new(context_window),
             output_token_reserve: AtomicU32::new(output_token_reserve),
             auto_compact_threshold: AtomicU32::new(threshold),
+            auto_compact_token_limit: AtomicU32::new(u32::MAX),
             microcompact_trigger_max_tokens: AtomicU32::new(u32::MAX),
             microcompact_target_max_tokens: AtomicU32::new(u32::MAX),
             last_input_tokens: AtomicU32::new(0),
@@ -367,7 +379,29 @@ impl ContextBudget {
         self.context_window.store(window, Ordering::Relaxed);
         self.output_token_reserve
             .store(output_token_reserve, Ordering::Relaxed);
-        let threshold = auto_compact_threshold_for_window(window, output_token_reserve);
+        self.recompute_auto_compact_threshold();
+    }
+
+    /// Cap the auto-compact trigger at `limit` tokens regardless of how
+    /// large the window is. `None` (or `u32::MAX`) removes the cap.
+    pub fn set_auto_compact_token_limit(&self, limit: Option<u32>) {
+        self.auto_compact_token_limit
+            .store(limit.unwrap_or(u32::MAX), Ordering::Relaxed);
+        self.recompute_auto_compact_threshold();
+    }
+
+    /// The absolute auto-compact cap, if one is set.
+    pub fn auto_compact_token_limit(&self) -> Option<u32> {
+        match self.auto_compact_token_limit.load(Ordering::Relaxed) {
+            u32::MAX => None,
+            limit => Some(limit),
+        }
+    }
+
+    fn recompute_auto_compact_threshold(&self) {
+        let threshold =
+            auto_compact_threshold_for_window(self.context_window(), self.output_token_reserve())
+                .min(self.auto_compact_token_limit.load(Ordering::Relaxed));
         self.auto_compact_threshold
             .store(threshold, Ordering::Relaxed);
     }
@@ -753,6 +787,7 @@ impl PruneLevelHandle {
         ));
         let (microcompact_trigger_max, microcompact_target_max) = self.budget.microcompact_caps();
         budget.set_microcompact_caps(microcompact_trigger_max, microcompact_target_max);
+        budget.set_auto_compact_token_limit(self.budget.auto_compact_token_limit());
         Self {
             inner: self.inner.clone(),
             stats: Arc::new(PruneStats::default()),

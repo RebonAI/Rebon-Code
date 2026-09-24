@@ -4038,6 +4038,16 @@ impl EngineQueryExecutor {
             history,
             budgeted_replay_target(frame.prune_level.as_ref(), max_tokens),
         );
+        // `history` was just rebuilt from the transcript and cut down by the
+        // replay window, so the server count the previous turn left behind
+        // describes a longer history. Left in place, the pre-turn check reads
+        // it and summarises a replay that is already small.
+        if let Some(handle) = frame.prune_level.as_ref() {
+            handle.report_estimated_usage(estimate_messages_input_tokens(
+                frame.prompt.effective_system.as_deref(),
+                &history,
+            ));
+        }
         if frame.resume_without_new_prompt {
             if !resume_history_has_valid_tail(&history, frame.prior_tail_uuid.as_deref()) {
                 return Err(PromptExecutorError::Execution(

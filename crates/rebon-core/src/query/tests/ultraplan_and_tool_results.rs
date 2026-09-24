@@ -466,6 +466,25 @@ fn mid_turn_compact_guard_only_allows_near_hard_limit() {
 }
 
 #[test]
+fn mid_turn_compact_guard_honours_the_absolute_auto_compact_cap() {
+    let handle = PruneLevelHandle::with_model_context_limits(
+        PruneLevel::Conservative,
+        1_050_000,
+        128_000,
+        std::iter::empty::<(String, u32)>(),
+        std::iter::empty::<(String, u32)>(),
+    );
+    assert_eq!(mid_turn_compact_guard_target(&handle, 4_000), 848_240);
+
+    handle
+        .budget
+        .set_auto_compact_token_limit(Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT));
+    assert_eq!(mid_turn_compact_guard_target(&handle, 4_000), 244_800);
+    assert!(mid_turn_compact_allowed(&handle, 4_000, 244_800));
+    assert!(!mid_turn_compact_allowed(&handle, 4_000, 244_799));
+}
+
+#[test]
 fn configured_output_reserve_sets_five_percent_hard_guard() {
     let handle = PruneLevelHandle::with_model_context_limits(
         PruneLevel::Conservative,

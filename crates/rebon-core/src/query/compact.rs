@@ -251,7 +251,15 @@ pub(super) fn mid_turn_compact_guard_target(handle: &PruneLevelHandle, max_token
         .max(handle.budget.output_token_reserve())
         .max(rebon_api::FLOOR_OUTPUT_TOKENS);
     let hard_input_limit = handle.budget.context_window().saturating_sub(reserve);
-    hard_input_limit.saturating_mul(92) / 100
+    let near_hard_limit = hard_input_limit.saturating_mul(92) / 100;
+    // An absolute auto-compact cap (Codex's 272k × 90%) is a budget
+    // decision, not an overflow guard: a single long tool loop must honour
+    // it too, or one turn can climb from 20k to several hundred thousand
+    // tokens and resend all of it every round.
+    match handle.budget.auto_compact_token_limit() {
+        Some(limit) => near_hard_limit.min(limit),
+        None => near_hard_limit,
+    }
 }
 
 pub(super) fn mid_turn_compact_allowed(
