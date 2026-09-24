@@ -464,6 +464,8 @@
   "LibraryOpenInEditor": "エディターで開く",
   "EditorGoToDefinition": "定義へ移動",
   "EditorCodeActions": "コードアクション",
+  "ExplorerAddFileToChat": "ファイルをチャットに追加",
+  "ExplorerAddFolderToChat": "フォルダーをチャットに追加",
   "EditorProblems": "エラー {errors} 件、警告 {warnings} 件",
   "EditorLspStarting": "言語サーバーを起動中…",
   "EditorLspServerStarting": "{server}：起動中…",

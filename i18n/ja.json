@@ -464,6 +464,8 @@
   "app.LibraryOpenInEditor": "エディターで開く",
   "app.EditorGoToDefinition": "定義へ移動",
   "app.EditorCodeActions": "コードアクション",
+  "app.ExplorerAddFileToChat": "ファイルをチャットに追加",
+  "app.ExplorerAddFolderToChat": "フォルダーをチャットに追加",
   "app.EditorProblems": "エラー {errors} 件、警告 {warnings} 件",
   "app.EditorLspStarting": "言語サーバーを起動中…",
   "app.EditorLspServerStarting": "{server}：起動中…",

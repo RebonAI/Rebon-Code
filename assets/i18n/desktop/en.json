@@ -464,6 +464,8 @@
   "LibraryOpenInEditor": "Open in editor",
   "EditorGoToDefinition": "Go to definition",
   "EditorCodeActions": "Code actions",
+  "ExplorerAddFileToChat": "Add file to chat",
+  "ExplorerAddFolderToChat": "Add folder to chat",
   "EditorProblems": "{errors} errors, {warnings} warnings",
   "EditorLspStarting": "Starting language server…",
   "EditorLspServerStarting": "{server}: starting…",
