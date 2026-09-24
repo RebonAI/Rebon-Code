@@ -560,8 +560,9 @@ pub struct OpenAiResponsesProvider {
     /// reusing `previous_response_id`. The `TokioMutex` serializes
     /// requests that target the same provider session.
     ws_conn: Arc<TokioMutex<Option<WsPump>>>,
-    /// Session-wide flag set when the server returns 426
-    /// UPGRADE_REQUIRED (or an unrecoverable WS handshake failure).
+    /// Session-wide flag set when the server refuses the WS upgrade
+    /// (426 UPGRADE_REQUIRED and friends). A TLS-handshake EOF burst uses
+    /// the time-boxed [`Self::websocket_retry_at`] hold instead.
     /// Once set, `send_message_stream` skips the WS branch and
     /// routes every subsequent request through the plain HTTP/SSE
     /// transport until the process restarts. Matches codex-ref's
@@ -574,13 +575,24 @@ pub struct OpenAiResponsesProvider {
     /// [`TLS_HANDSHAKE_EOF_BURST_WINDOW`] — scattered failures across
     /// hours are network noise, not a hostile intermediary. When the
     /// counter crosses [`TLS_HANDSHAKE_EOF_BURST_THRESHOLD`] within
-    /// the window, the provider flips `http_fallback_active` and
-    /// gives up on the WebSocket path for the rest of the session.
+    /// the window, the provider holds off the WebSocket path until
+    /// [`Self::websocket_retry_at`].
     consecutive_handshake_eofs: Arc<AtomicU32>,
     /// Wall-clock time of the most recent TLS-handshake EOF. Used to
     /// decide whether the next EOF extends the current burst (within
     /// [`TLS_HANDSHAKE_EOF_BURST_WINDOW`]) or starts a fresh streak.
     last_handshake_eof_at: Arc<StdMutex<Option<Instant>>>,
+    /// Set when a TLS-handshake EOF burst moved this provider onto
+    /// HTTP/SSE: the instant after which the WebSocket is tried again.
+    /// Unlike an upgrade refusal, an EOF burst is network weather, and
+    /// HTTP/SSE has no `previous_response_id`, so staying there for the
+    /// rest of a long session resends the whole history every request
+    /// with cache hits left to whichever replica answers.
+    websocket_retry_at: Arc<StdMutex<Option<Instant>>>,
+    /// `x-codex-turn-state` sticky-routing token the ChatGPT backend hands
+    /// out on the first HTTP response of a turn. Codex replays it on every
+    /// request of that turn and never into the next one.
+    http_turn_state: Arc<StdMutex<Option<String>>>,
     /// Optional notifier for the one-shot continuation recovery that
     /// retries without a rejected `previous_response_id`. Generic retry
     /// progress is owned exclusively by [`crate::RetryMiddleware`].
@@ -601,6 +613,16 @@ const TLS_HANDSHAKE_EOF_BURST_THRESHOLD: u32 = 5;
 /// must accumulate to trigger fallback. Outside the window, the
 /// streak resets to 1 — a single fresh EOF, not a burst.
 const TLS_HANDSHAKE_EOF_BURST_WINDOW: Duration = Duration::from_secs(60);
+
+/// How long an EOF burst keeps the provider on HTTP/SSE before the
+/// WebSocket is tried again. Long enough not to hammer a hostile
+/// intermediary; short enough that a transient outage does not cost the
+/// rest of the session its `previous_response_id` deltas.
+const WEBSOCKET_RETRY_AFTER_EOF_BURST: Duration = Duration::from_secs(10 * 60);
+
+/// Codex's sticky-routing header: returned by the ChatGPT backend on the
+/// first response of a turn, replayed on every later request of that turn.
+const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 
 /// `OpenAI-Beta` opt-in value that gates the Responses WebSocket
 /// transport. The ChatGPT Codex backend refuses the WS upgrade
@@ -672,7 +694,67 @@ impl OpenAiResponsesProvider {
             http_fallback_active: Arc::new(AtomicBool::new(false)),
             consecutive_handshake_eofs: Arc::new(AtomicU32::new(0)),
             last_handshake_eof_at: Arc::new(StdMutex::new(None)),
+            websocket_retry_at: Arc::new(StdMutex::new(None)),
+            http_turn_state: Arc::new(StdMutex::new(None)),
             retry_notifier: None,
+        }
+    }
+
+    fn current_http_turn_state(&self) -> Option<String> {
+        self.http_turn_state
+            .lock()
+            .expect("http_turn_state mutex poisoned")
+            .clone()
+    }
+
+    /// Keep the first `x-codex-turn-state` of a turn; later responses of
+    /// the same turn echo it and must not replace it.
+    fn remember_http_turn_state(&self, headers: &reqwest::header::HeaderMap) {
+        let Some(value) = headers
+            .get(X_CODEX_TURN_STATE_HEADER)
+            .and_then(|value| value.to_str().ok())
+        else {
+            return;
+        };
+        let mut turn_state = self
+            .http_turn_state
+            .lock()
+            .expect("http_turn_state mutex poisoned");
+        if turn_state.is_none() {
+            *turn_state = Some(value.to_string());
+        }
+    }
+
+    fn clear_http_turn_state(&self) {
+        *self
+            .http_turn_state
+            .lock()
+            .expect("http_turn_state mutex poisoned") = None;
+    }
+
+    /// Whether requests must skip the WebSocket right now: permanently
+    /// after an upgrade refusal, or until the retry time after an EOF
+    /// burst. Once that time passes the hold is cleared, and the next
+    /// request opens a fresh socket (one full replay, then deltas again).
+    fn websocket_unavailable(&self) -> bool {
+        if self.http_fallback_active.load(Ordering::Relaxed) {
+            return true;
+        }
+        let mut retry_at = self
+            .websocket_retry_at
+            .lock()
+            .expect("websocket_retry_at mutex poisoned");
+        match *retry_at {
+            Some(at) if Instant::now() < at => true,
+            Some(_) => {
+                *retry_at = None;
+                self.consecutive_handshake_eofs.store(0, Ordering::Relaxed);
+                tracing::info!(
+                    "openai-responses: EOF-burst hold expired, trying the websocket again"
+                );
+                false
+            }
+            None => false,
         }
     }
 
@@ -732,6 +814,7 @@ impl OpenAiResponsesProvider {
         http: &reqwest::Client,
         body: &Value,
         access_token: &str,
+        codex_session: Option<&str>,
     ) -> ModelResult<reqwest::Response> {
         let endpoint = self.endpoint();
         let mut http_req = http
@@ -743,10 +826,27 @@ impl OpenAiResponsesProvider {
         if let Some(org) = &self.config.organization {
             http_req = http_req.header("OpenAI-Organization", org);
         }
+        // The ChatGPT backend routes by these, as Codex sends them
+        // (`codex-api` `build_session_headers` + `x-client-request-id`, and
+        // the per-turn `x-codex-turn-state`). Without them a stateless
+        // HTTP request lands on whichever replica is free, and the prefix
+        // cache hit goes with it.
+        if let Some(session) = codex_session {
+            http_req = http_req
+                .header("session-id", session)
+                .header("thread-id", session)
+                .header("x-client-request-id", session);
+            if let Some(turn_state) = self.current_http_turn_state() {
+                http_req = http_req.header(X_CODEX_TURN_STATE_HEADER, turn_state);
+            }
+        }
         for (name, value) in &self.config.extra_headers {
             http_req = http_req.header(name, value);
         }
         let response = http_req.send().await?;
+        if codex_session.is_some() {
+            self.remember_http_turn_state(response.headers());
+        }
         let status = response.status();
         if !status.is_success() {
             let retry_after = crate::error::parse_retry_after(response.headers());
@@ -963,21 +1063,29 @@ impl OpenAiResponsesProvider {
                                     + 1
                             }
                         };
-                        if streak >= TLS_HANDSHAKE_EOF_BURST_THRESHOLD
-                            && !self.http_fallback_active.swap(true, Ordering::Relaxed)
-                        {
+                        let newly_held = streak >= TLS_HANDSHAKE_EOF_BURST_THRESHOLD && {
+                            let mut retry_at = self
+                                .websocket_retry_at
+                                .lock()
+                                .expect("websocket_retry_at mutex poisoned");
+                            let was_held = retry_at.is_some();
+                            *retry_at = Some(now + WEBSOCKET_RETRY_AFTER_EOF_BURST);
+                            !was_held
+                        };
+                        if newly_held {
                             tracing::warn!(
                                 streak,
                                 threshold = TLS_HANDSHAKE_EOF_BURST_THRESHOLD,
                                 window_secs = TLS_HANDSHAKE_EOF_BURST_WINDOW.as_secs(),
+                                retry_after_secs = WEBSOCKET_RETRY_AFTER_EOF_BURST.as_secs(),
                                 error = %msg,
                                 "openai-responses: consecutive TLS-handshake EOFs crossed threshold within window; \
-                                 falling back to HTTP/SSE for the rest of the session"
+                                 falling back to HTTP/SSE until the websocket retry time"
                             );
                             // Surface a retryable error so the outer
                             // retry path tries once more — but now the
-                            // session-wide `http_fallback_active` flag
-                            // routes the retry down the HTTP branch.
+                            // EOF-burst hold routes the retry down the
+                            // HTTP branch.
                             return Err(ModelError::Http(format!(
                                 "ws handshake EOF burst, switching to HTTP/SSE: {msg}"
                             )));
@@ -1052,8 +1160,9 @@ impl OpenAiResponsesProvider {
                     Ok(ws) => *guard = Some(ws),
                     Err(e) => {
                         // `connect_ws` sets `http_fallback_active`
-                        // when it observes a 426-class refusal.
-                        if self.http_fallback_active.load(Ordering::Relaxed) {
+                        // when it observes a 426-class refusal, and the
+                        // EOF-burst hold when the handshake keeps dying.
+                        if self.websocket_unavailable() {
                             return self.send_message_stream_http(http, request).await;
                         }
                         // Transient errors are surfaced to the
@@ -1221,32 +1330,12 @@ impl ChatProvider for OpenAiResponsesProvider {
         &self,
         prompt_cache_key: Option<String>,
     ) -> Option<Arc<dyn ChatProvider>> {
-        let prompt_cache_key = prompt_cache_key.or_else(|| self.config.prompt_cache_key.clone());
-        Some(Arc::new(Self {
-            config: Arc::new(OpenAiResponsesClientConfig {
-                prompt_cache_key: prompt_cache_key.clone(),
-                ..self.config.as_ref().clone()
-            }),
-            prompt_cache_key: prompt_cache_key.unwrap_or_else(default_prompt_cache_key),
-            auth: self.auth.clone(),
-            session_state: ResponsesSessionState::new(),
-            ws_conn: Arc::new(TokioMutex::new(None)),
-            http_fallback_active: self.http_fallback_active.clone(),
-            // Share the handshake-EOF streak (counter + timestamp +
-            // fallback-at instant) with the parent so a sub-agent
-            // inherits the same circuit-breaker state. If the parent
-            // already saw the burst and flipped fallback, the
-            // sub-agent observes the same flag; if the sub-agent
-            // sees another EOF, it reinforces the decision rather
-            // than being double-counted.
-            consecutive_handshake_eofs: self.consecutive_handshake_eofs.clone(),
-            last_handshake_eof_at: self.last_handshake_eof_at.clone(),
-            retry_notifier: self.retry_notifier.clone(),
-        }))
+        Some(Arc::new(self.fork_provider(prompt_cache_key)))
     }
 
     fn reset_session_state(&self) {
         self.session_state.clear();
+        self.clear_http_turn_state();
         // Drop the WebSocket so the next request reconnects fresh.
         // Use try_lock to avoid blocking — if another task holds the
         // lock we skip the drop; the next send will reconnect anyway.
@@ -1261,6 +1350,10 @@ impl ChatProvider for OpenAiResponsesProvider {
         // full replay. The send path drains the pump before each turn
         // and drops stale sockets there, where it can also invalidate
         // the response-id chain before building the next request body.
+        //
+        // The sticky-routing token is per turn: Codex never replays one
+        // turn's token into the next.
+        self.clear_http_turn_state();
     }
 
     fn invalidate_previous_response_id(&self) {
@@ -1288,13 +1381,13 @@ impl ChatProvider for OpenAiResponsesProvider {
         // Subsequent calls fall through to the plain HTTP/SSE path,
         // matching codex-ref's session-scoped fallback behaviour.
         //
-        // The fallback is deliberately sticky for the rest of the
-        // session — we never oscillate back to WS. Retrying WS after a
-        // fallback reconnects fresh with no live `previous_response_id`
-        // on the server, so that turn pays a full ~140K-token replay
-        // (worse cache-miss than just staying on HTTP, which keeps
-        // hitting the warm prompt cache via a stable prompt_cache_key).
-        if self.config.use_websocket && !self.http_fallback_active.load(Ordering::Relaxed) {
+        // An upgrade refusal is sticky for the rest of the session. An
+        // EOF burst is not: HTTP/SSE carries no `previous_response_id`,
+        // so every request is a full replay whose cache hit depends on
+        // which replica answers (observed: 0 or a ~9k-token head on most
+        // requests of a 300k-token session). Going back to the WebSocket
+        // costs one full replay, after which deltas resume.
+        if self.config.use_websocket && !self.websocket_unavailable() {
             return self.send_message_stream_ws(http, request).await;
         }
 
@@ -1341,9 +1434,14 @@ impl OpenAiResponsesProvider {
             CacheMissReason::PreviousResponseIdMissing,
         );
 
+        let codex_session = is_codex.then_some(effective_prompt_cache_key);
+
         // First attempt: use the currently cached access token.
         let (access_token, has_refresher) = self.snapshot_auth();
-        let response = match self.send_once(http, &body, &access_token).await {
+        let response = match self
+            .send_once(http, &body, &access_token, codex_session)
+            .await
+        {
             Ok(response) => response,
             Err(ModelError::Unauthorized(msg)) if has_refresher => {
                 tracing::info!(
@@ -1351,7 +1449,8 @@ impl OpenAiResponsesProvider {
                     "openai-responses: got 401, refreshing access token and retrying"
                 );
                 let new_token = self.refresh_bearer().await?;
-                self.send_once(http, &body, &new_token).await?
+                self.send_once(http, &body, &new_token, codex_session)
+                    .await?
             }
             Err(err) => return Err(err),
         };
@@ -1367,6 +1466,36 @@ impl OpenAiResponsesProvider {
                 last_response_id: None,
             },
         ))
+    }
+}
+
+impl OpenAiResponsesProvider {
+    /// The provider a sub-agent runs on: its own response chain, socket and
+    /// cache key, sharing auth and the endpoint's upgrade-refusal flag.
+    fn fork_provider(&self, prompt_cache_key: Option<String>) -> Self {
+        let prompt_cache_key = prompt_cache_key.or_else(|| self.config.prompt_cache_key.clone());
+        Self {
+            config: Arc::new(OpenAiResponsesClientConfig {
+                prompt_cache_key: prompt_cache_key.clone(),
+                ..self.config.as_ref().clone()
+            }),
+            prompt_cache_key: prompt_cache_key.unwrap_or_else(default_prompt_cache_key),
+            auth: self.auth.clone(),
+            session_state: ResponsesSessionState::new(),
+            ws_conn: Arc::new(TokioMutex::new(None)),
+            // An upgrade refusal is a property of the endpoint, so a
+            // sub-agent inherits it and does not retry a handshake the
+            // server already turned down.
+            http_fallback_active: self.http_fallback_active.clone(),
+            // The EOF streak and its hold are not shared: a batch of
+            // sub-agents opening sockets at once could otherwise push the
+            // parent off its WebSocket, costing it every later delta.
+            consecutive_handshake_eofs: Arc::new(AtomicU32::new(0)),
+            last_handshake_eof_at: Arc::new(StdMutex::new(None)),
+            websocket_retry_at: Arc::new(StdMutex::new(None)),
+            http_turn_state: Arc::new(StdMutex::new(None)),
+            retry_notifier: self.retry_notifier.clone(),
+        }
     }
 }
 
@@ -6449,6 +6578,8 @@ mod tests {
             http_fallback_active: parent.http_fallback_active.clone(),
             consecutive_handshake_eofs: parent.consecutive_handshake_eofs.clone(),
             last_handshake_eof_at: parent.last_handshake_eof_at.clone(),
+            websocket_retry_at: Arc::new(StdMutex::new(None)),
+            http_turn_state: Arc::new(StdMutex::new(None)),
             retry_notifier: parent.retry_notifier.clone(),
         };
 
@@ -6479,6 +6610,8 @@ mod tests {
             http_fallback_active: Arc::new(AtomicBool::new(false)),
             consecutive_handshake_eofs: Arc::new(AtomicU32::new(0)),
             last_handshake_eof_at: Arc::new(StdMutex::new(None)),
+            websocket_retry_at: Arc::new(StdMutex::new(None)),
+            http_turn_state: Arc::new(StdMutex::new(None)),
             retry_notifier: None,
         };
 
@@ -6524,6 +6657,8 @@ mod tests {
             http_fallback_active: Arc::new(AtomicBool::new(false)),
             consecutive_handshake_eofs: Arc::new(AtomicU32::new(0)),
             last_handshake_eof_at: Arc::new(StdMutex::new(None)),
+            websocket_retry_at: Arc::new(StdMutex::new(None)),
+            http_turn_state: Arc::new(StdMutex::new(None)),
             retry_notifier: None,
         };
 
@@ -6596,6 +6731,8 @@ mod tests {
             http_fallback_active: Arc::new(AtomicBool::new(false)),
             consecutive_handshake_eofs: Arc::new(AtomicU32::new(0)),
             last_handshake_eof_at: Arc::new(StdMutex::new(None)),
+            websocket_retry_at: Arc::new(StdMutex::new(None)),
+            http_turn_state: Arc::new(StdMutex::new(None)),
             retry_notifier: None,
         };
 
@@ -7113,44 +7250,40 @@ mod tests {
         );
     }
 
-    /// Forking for a sub-agent must **share** the
-    /// `http_fallback_active` flag so a sub-agent doesn't redundantly
-    /// retry a WS handshake we already know will fail. Built by
-    /// hand (mirroring the `fork_for_sub_agent` body) because the
-    /// trait object returned by the production method erases the
-    /// concrete type and we need field-level access to assert
-    /// Arc-sharing.
+    /// A sub-agent inherits the endpoint's upgrade refusal, so it does not
+    /// retry a handshake the server already turned down, but keeps its own
+    /// EOF streak and hold: a burst of sub-agent sockets must not push the
+    /// parent off its WebSocket.
     #[test]
-    fn manual_fork_shares_http_fallback_flag_with_parent() {
+    fn fork_shares_upgrade_refusal_but_not_the_eof_hold() {
         let parent = OpenAiResponsesProvider::new(ws_test_config());
         parent.http_fallback_active.store(true, Ordering::Relaxed);
+        let child = parent.fork_provider(None);
 
-        let child = OpenAiResponsesProvider {
-            config: parent.config.clone(),
-            prompt_cache_key: default_prompt_cache_key(),
-            auth: parent.auth.clone(),
-            session_state: ResponsesSessionState::new(),
-            ws_conn: Arc::new(TokioMutex::new(None)),
-            http_fallback_active: parent.http_fallback_active.clone(),
-            consecutive_handshake_eofs: parent.consecutive_handshake_eofs.clone(),
-            last_handshake_eof_at: parent.last_handshake_eof_at.clone(),
-            retry_notifier: None,
-        };
-
-        // Shared Arc: a flip on the parent is visible to the child.
         assert!(Arc::ptr_eq(
             &parent.http_fallback_active,
             &child.http_fallback_active
         ));
-        assert!(Arc::ptr_eq(
+        assert!(child.websocket_unavailable());
+        assert!(!Arc::ptr_eq(
             &parent.consecutive_handshake_eofs,
             &child.consecutive_handshake_eofs
         ));
-        assert!(Arc::ptr_eq(
+        assert!(!Arc::ptr_eq(
             &parent.last_handshake_eof_at,
             &child.last_handshake_eof_at
         ));
-        assert!(child.http_fallback_active.load(Ordering::Relaxed));
+        assert!(!Arc::ptr_eq(
+            &parent.websocket_retry_at,
+            &child.websocket_retry_at
+        ));
+
+        let parent = OpenAiResponsesProvider::new(ws_test_config());
+        let child = parent.fork_provider(None);
+        *child.websocket_retry_at.lock().unwrap() =
+            Some(Instant::now() + WEBSOCKET_RETRY_AFTER_EOF_BURST);
+        assert!(child.websocket_unavailable());
+        assert!(!parent.websocket_unavailable());
 
         // An unrelated provider constructed from scratch must
         // start with the flag clear — confirming fallback state
@@ -7159,12 +7292,63 @@ mod tests {
         assert!(!unrelated.http_fallback_active.load(Ordering::Relaxed));
     }
 
-    /// Fallback is sticky: once `http_fallback_active` is set, the
-    /// dispatcher must keep routing to HTTP/SSE for the rest of the
-    /// session and never re-arm the WebSocket path. Retrying WS after
-    /// a fallback would reconnect fresh with no live
-    /// `previous_response_id`, forcing a full replay on that turn —
-    /// strictly worse for cache-miss than staying on HTTP.
+    /// An EOF burst holds the provider on HTTP/SSE only until its retry
+    /// time; then the WebSocket (and with it `previous_response_id`
+    /// deltas) is tried again, with a clean streak.
+    #[test]
+    fn eof_burst_hold_expires_and_the_websocket_is_retried() {
+        let provider = OpenAiResponsesProvider::new(ws_test_config());
+        assert!(!provider.websocket_unavailable());
+
+        *provider.websocket_retry_at.lock().unwrap() =
+            Some(Instant::now() + Duration::from_secs(60));
+        assert!(provider.websocket_unavailable());
+
+        provider
+            .consecutive_handshake_eofs
+            .store(TLS_HANDSHAKE_EOF_BURST_THRESHOLD, Ordering::Relaxed);
+        *provider.websocket_retry_at.lock().unwrap() = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("clock supports past instants"),
+        );
+        assert!(!provider.websocket_unavailable());
+        assert!(provider.websocket_retry_at.lock().unwrap().is_none());
+        assert_eq!(
+            provider.consecutive_handshake_eofs.load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    /// Codex's sticky-routing contract: keep the first turn-state token of
+    /// a turn, replay it for the rest of that turn, never into the next.
+    #[test]
+    fn http_turn_state_is_kept_for_the_turn_and_dropped_at_its_end() {
+        let provider = OpenAiResponsesProvider::new(ws_test_config());
+        let headers = |value: &str| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(X_CODEX_TURN_STATE_HEADER, value.parse().unwrap());
+            headers
+        };
+
+        assert_eq!(provider.current_http_turn_state(), None);
+        provider.remember_http_turn_state(&headers("first"));
+        provider.remember_http_turn_state(&headers("second"));
+        assert_eq!(provider.current_http_turn_state().as_deref(), Some("first"));
+
+        provider.end_turn();
+        assert_eq!(provider.current_http_turn_state(), None);
+
+        provider.remember_http_turn_state(&headers("next-turn"));
+        provider.reset_session_state();
+        assert_eq!(provider.current_http_turn_state(), None);
+    }
+
+    /// An upgrade refusal is sticky: once `http_fallback_active` is set,
+    /// the dispatcher keeps routing to HTTP/SSE for the rest of the
+    /// session. The server said it does not speak WebSocket here, so a
+    /// retry would only be refused again. (An EOF burst, by contrast, is
+    /// held only until its retry time.)
     #[test]
     fn http_fallback_is_sticky_and_never_retries_ws() {
         let provider = OpenAiResponsesProvider::new(ws_test_config());
