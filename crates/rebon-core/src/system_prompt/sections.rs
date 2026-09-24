@@ -490,15 +490,37 @@ pub(super) fn session_specific_guidance_section(
         );
     }
 
+    // Every model round resends the whole conversation, so how the model
+    // waits on a background shell decides whether a ten-minute build costs
+    // one request or a hundred.
+    if has("Bash") || has("PowerShell") {
+        if auto_continue_background_agents {
+            bullets.push(
+                " - A background shell (`run_in_background`) announces its completion with a \
+                 task notification, which opens a new turn if you are idle. Once no \
+                 independent foreground work is left, end your turn instead of waiting on it. \
+                 Never poll it with repeated short ShellOutput calls or Sleep."
+                    .to_string(),
+            );
+        } else {
+            bullets.push(
+                " - This session cannot wake you after your turn ends, and background shells \
+                 stop when it does. To wait for a background shell, make one ShellOutput call \
+                 with wait=true and a long timeout (up to 300000 ms); it blocks until the \
+                 process exits. Never poll it with repeated short ShellOutput calls or Sleep."
+                    .to_string(),
+            );
+        }
+    }
+
     if has_monitor {
         bullets.push(
             " - Monitor is for selective event streams from external commands or WebSockets \
              whose events could affect your next action. Never wait for Agent completion \
-             through Monitor: completion is already announced automatically. Monitor events and \
-             background shell completions are pushed to you as notifications, so never poll \
-             either with ShellOutput or Sleep; to watch a stream, use Monitor rather than a \
-             background shell. Coarse recurring full prompts belong in `/loop`; do not use \
-             Monitor as a scheduler."
+             through Monitor: completion is already announced automatically. Monitor events \
+             are pushed to you as notifications, so never poll them with ShellOutput or Sleep; \
+             to watch a stream, use Monitor rather than a background shell. Coarse recurring \
+             full prompts belong in `/loop`; do not use Monitor as a scheduler."
                 .to_string(),
         );
     }
@@ -539,6 +561,9 @@ pub fn sub_agent_notes_section() -> &'static str {
     "Notes:\n\
 - Use absolute file paths exclusively: an Agent thread's cwd is reset between \
 bash calls.\n\
+- A background shell you start does not wake you when it finishes and stops when your run \
+ends. To wait for it, make one ShellOutput call with wait=true and a long timeout (up to \
+300000 ms); never poll it with repeated short calls.\n\
 - Give task-relevant file paths in your final reply, always absolute and never relative. \
 Quote code only if its exact text matters, such as a discovered bug or a function \
 signature requested by the caller. Do not summarize code solely because you read it.\n\

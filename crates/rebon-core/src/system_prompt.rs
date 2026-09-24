@@ -1187,6 +1187,24 @@ mod tests {
         }
     }
 
+    /// How the model waits on a background shell has to match what the
+    /// frontend can do: one that wakes the model on completion tells it to
+    /// end the turn; one that cannot tells it to block in a single long wait.
+    #[test]
+    fn background_shell_guidance_follows_whether_the_frontend_can_wake_the_model() {
+        let tools = ["Bash".to_string()];
+        let wakes = session_specific_guidance_section(&tools, &[], true).unwrap();
+        assert!(wakes.contains("end your turn instead of waiting on it"), "{wakes}");
+        assert!(!wakes.contains("cannot wake you"), "{wakes}");
+
+        let cannot = session_specific_guidance_section(&tools, &[], false).unwrap();
+        assert!(cannot.contains("cannot wake you"), "{cannot}");
+        assert!(cannot.contains("wait=true and a long timeout"), "{cannot}");
+
+        let no_shell = session_specific_guidance_section(&[], &[], true).unwrap();
+        assert!(!no_shell.contains("background shell"), "{no_shell}");
+    }
+
     #[test]
     fn minimal_prompt_override_keeps_minimal_context_empty() {
         let parts = build_minimal_prompt_parts(Some("custom minimal persona"));

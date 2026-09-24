@@ -377,9 +377,15 @@ impl ShellProcessRegistry {
         let mut changes = entry.changes.subscribe();
         let deadline = Instant::now() + Duration::from_millis(wait_timeout_ms);
 
+        // A wait collects output until the deadline, like Codex's
+        // `write_stdin` poll: returning on the first chunk turned every wait
+        // on a chatty build into a model round-trip every few seconds, each
+        // one resending the whole conversation. It ends early only when there
+        // is nothing more to wait for (the process finished) or no room left
+        // (the response already holds `OUTPUT_RESPONSE_BYTES`).
         loop {
             let snapshot = entry.output_snapshot(cursor, caller)?;
-            if !wait || snapshot.completed || !snapshot.events.is_empty() {
+            if !wait || snapshot.completed || snapshot.has_more {
                 let fully_observed = snapshot.completed && !snapshot.has_more;
                 let value = snapshot.into_value(false);
                 if fully_observed {
@@ -1997,6 +2003,17 @@ mod tests {
         }
     }
 
+    fn ticking_script() -> &'static str {
+        #[cfg(windows)]
+        {
+            "foreach ($i in 1..100) { Write-Output \"tick $i\"; Start-Sleep -Milliseconds 100 }"
+        }
+        #[cfg(not(windows))]
+        {
+            "i=0; while [ $i -lt 100 ]; do i=$((i+1)); printf 'tick %s\\n' \"$i\"; sleep 0.1; done"
+        }
+    }
+
     fn long_running_script_with_initial_line() -> &'static str {
         #[cfg(windows)]
         {
@@ -2582,6 +2599,81 @@ mod tests {
             .unwrap();
         let completed = wait_for_completion(&registry, shell_id, 0).await;
         assert_eq!(completed["status"], "stopped");
+    }
+
+    /// A wait on a process that prints steadily must last until its deadline
+    /// and hand back everything printed meanwhile. Returning on the first
+    /// chunk made each wait on a build a model round-trip every few seconds.
+    #[tokio::test]
+    async fn output_wait_collects_until_the_deadline_instead_of_the_first_chunk() {
+        let _env = crate::test_env::hold_env();
+        let registry = ShellProcessRegistry::new();
+        let result = registry
+            .spawn(
+                &context("session-a"),
+                configured_command(ticking_script()),
+                "PowerShell",
+                "test".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        let shell_id = result["shellId"].as_str().unwrap();
+
+        // Start the timed wait once the process is demonstrably printing, so
+        // a slow shell start-up cannot eat the window under test.
+        let started = tokio::time::Instant::now();
+        let cursor = loop {
+            let poll = registry
+                .output(&context("session-a"), "ShellOutput", shell_id, 0, false, 0)
+                .await
+                .unwrap();
+            if poll["output"]
+                .as_str()
+                .is_some_and(|out| out.contains("tick"))
+            {
+                break poll["nextCursor"].as_u64().unwrap();
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "no tick: {poll}"
+            );
+            sleep(Duration::from_millis(20)).await;
+        };
+
+        let waited = tokio::time::Instant::now();
+        let output = registry
+            .output(
+                &context("session-a"),
+                "ShellOutput",
+                shell_id,
+                cursor,
+                true,
+                1_500,
+            )
+            .await
+            .unwrap();
+        let elapsed = waited.elapsed();
+
+        assert_eq!(output["waitTimedOut"], true, "{output}");
+        assert!(
+            elapsed >= Duration::from_millis(1_400),
+            "returned after {elapsed:?}"
+        );
+        let ticks = output["output"]
+            .as_str()
+            .unwrap_or("")
+            .matches("tick")
+            .count();
+        assert!(
+            ticks >= 3,
+            "expected the ticks printed during the wait: {output}"
+        );
+
+        registry
+            .stop(&context("session-a"), "ShellStop", shell_id)
+            .unwrap();
+        wait_for_completion(&registry, shell_id, 0).await;
     }
 
     #[tokio::test]

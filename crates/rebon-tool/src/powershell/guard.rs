@@ -63,8 +63,8 @@ pub fn blocked_sleep_refusal(command: &str) -> Option<String> {
         format!(
             "This command sleeps for {:.0}s, which would hold the tool call open doing nothing. \
              Use the Monitor tool (load it with ToolSearch) to wait on a condition, or \
-             `run_in_background: true` for the process itself: its completion is announced \
-             automatically.",
+             `run_in_background: true` for the process itself, then one ShellOutput call \
+             with wait=true and a long timeout to block until it exits.",
             millis as f64 / 1000.0
         )
     })

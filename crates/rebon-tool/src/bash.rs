@@ -84,8 +84,9 @@ commands fail.\n\
 /// Describes the `run_in_background` parameter.
 const BASH_BACKGROUND_USAGE_NOTE: &str = " - Use `run_in_background` for long-running commands \
 you want to watch (builds, test suites, dev servers you will read output from) without appending '&'. \
-The call returns a `shellId` immediately and you are notified when the process finishes, so \
-keep working instead of polling. Use ShellOutput to list shells or read incremental output you \
+The call returns a `shellId` immediately; keep working instead of polling. To block until it \
+finishes, make one ShellOutput call with wait=true and a long timeout (up to 300000 ms), which \
+returns when the process exits. Use ShellOutput to list shells or read incremental output you \
 need, and use ShellStop to terminate the process tree. To react to a stream of events (log lines, \
 status changes) or wait for an external condition, load the deferred Monitor tool with ToolSearch \
 instead of polling a background shell with ShellOutput. Background shells are killed when the session ends and are not persisted across Rebon \
@@ -221,9 +222,9 @@ const BASH_MODEL_DESCRIPTION: &str = "Executes a given bash command and returns 
 \n\
 Use this for system commands and terminal operations that require shell execution. Prefer \
 dedicated file/search/edit tools when available. Supports `timeout` in milliseconds (up to \
-600000) and `run_in_background` for long-running commands. Background calls return a `shellId` \
-and you are notified when they finish, so do not poll them; use ShellOutput only to read output \
-you need and ShellStop to terminate them. To react to a stream of events (log lines, status \
+600000) and `run_in_background` for long-running commands. Background calls return a `shellId`; \
+do not poll them. To block until one finishes, make one ShellOutput call with wait=true and a \
+long timeout (up to 300000 ms); use ShellStop to terminate them. To react to a stream of events (log lines, status \
 changes) or wait for an external condition, load the deferred Monitor tool with ToolSearch \
 instead of polling a background shell with ShellOutput.";
 

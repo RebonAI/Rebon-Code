@@ -119,8 +119,9 @@ const EXECUTION_NOTES: &str = "Usage notes:\n\
 the user in the approval prompt.\n\
  - `timeout` is in milliseconds (default 60000, max 600000). Set `run_in_background: true` for \
 a long-running command instead of raising the timeout: the call returns a `shellId` \
-immediately and you are notified when it finishes, so keep working instead of polling; \
-ShellOutput / ShellStop read and terminate it. To react to a stream of events or wait for an \
+immediately; keep working instead of polling. To block until it finishes, make one \
+ShellOutput call with wait=true and a long timeout (up to 300000 ms), which returns when the \
+process exits; ShellStop terminates it. To react to a stream of events or wait for an \
 external condition, load the deferred Monitor tool with ToolSearch instead of polling a \
 background shell with ShellOutput.\n\
  - Environment changes do not persist between calls — each call is a fresh `-NoProfile` \
@@ -165,8 +166,8 @@ pub fn build_model_description(edition: PowerShellEdition) -> String {
          {chaining} Spawned with `-NoProfile -NonInteractive` and no stdin, so interactive \
          cmdlets (`Read-Host`, `Get-Credential`) will fail — pass `-Confirm:$false` to \
          destructive cmdlets. Supports `timeout` in milliseconds (up to 600000) and \
-         `run_in_background`; background calls return a `shellId` for ShellOutput/ShellStop \
-         and announce their completion, so do not poll them. For event streams or waiting on \
+         `run_in_background`; background calls return a `shellId` for ShellOutput/ShellStop; \
+         do not poll them: one ShellOutput wait with a long timeout blocks until exit. For event streams or waiting on \
          an external condition, load the deferred Monitor tool with ToolSearch."
     )
 }

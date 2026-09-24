@@ -10,7 +10,12 @@ pub const SHELL_OUTPUT_TOOL_NAME: &str = "ShellOutput";
 pub const SHELL_STOP_TOOL_NAME: &str = "ShellStop";
 const INVALID_INPUT_CODE: i64 = 400;
 const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
-const MAX_WAIT_TIMEOUT_MS: u64 = 30_000;
+/// Codex's `background_terminal_max_timeout` default: long enough that one
+/// wait can cover a whole build instead of a string of short polls.
+const MAX_WAIT_TIMEOUT_MS: u64 = 300_000;
+/// Codex's `MIN_EMPTY_YIELD_TIME_MS`: a wait shorter than this is almost
+/// always a poll loop in the making, and each poll resends the conversation.
+const MIN_WAIT_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ShellOutputTool;
@@ -36,8 +41,9 @@ impl Tool for ShellOutputTool {
         "Lists background Bash/PowerShell shells or reads their incremental output. Omit shellId \
          to list shells visible in the current session/agent. With shellId, new text arrives in \
          `output` (stdout) and `stderr`; pass the returned nextCursor to avoid duplicate output. \
-         Completion is announced automatically, so do not call this in a loop to wait; \
-         wait=true is only for when you need the next output now and have nothing else to do. \
+         wait=true blocks until the process exits or `timeout` elapses (5s to 300s) and returns \
+         everything printed meanwhile; it does not return on the first new line. To block on a \
+         build or test run, make one call with a long timeout rather than many short ones. \
          Monitor tasks are not readable here: their events arrive as task notifications."
     }
 
@@ -56,13 +62,13 @@ impl Tool for ShellOutputTool {
                 },
                 "wait": {
                     "type": "boolean",
-                    "description": "Wait for new output or a terminal process state."
+                    "description": "Block until the process exits or the timeout elapses, collecting output meanwhile."
                 },
                 "timeout": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_WAIT_TIMEOUT_MS,
-                    "description": "Maximum wait time in milliseconds; only valid with wait=true."
+                    "description": "Maximum wait time in milliseconds (values under 5000 wait 5000); only valid with wait=true."
                 }
             },
             "additionalProperties": false
@@ -186,7 +192,7 @@ fn parse_shell_output_input(input: &Value) -> ToolResult<ShellOutputInput> {
         shell_id,
         cursor,
         wait,
-        timeout_ms,
+        timeout_ms: timeout_ms.max(MIN_WAIT_TIMEOUT_MS),
     })
 }
 
