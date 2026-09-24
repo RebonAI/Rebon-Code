@@ -17,6 +17,10 @@ const REMEMBER_MD: &str = include_str!("../../../../../skills/bundled/remember/S
 const SKILLIFY_MD: &str = include_str!("../../../../../skills/bundled/skillify/SKILL.md");
 const LOOP_MD: &str = include_str!("../../../../../skills/bundled/loop/SKILL.md");
 const INSTALL_MD: &str = include_str!("../../../../../skills/bundled/install/SKILL.md");
+// Always on rather than owned by the model-routing plugin: that plugin is off
+// by default, and a skill it owned would not exist when the user asks to turn
+// routing on in the first place.
+const MODEL_ROUTING_MD: &str = include_str!("../../../../../skills/bundled/model-routing/SKILL.md");
 
 // ---------------------------------------------------------------------------
 // Frontmatter parsing (minimal, for embedded skills only)
@@ -150,6 +154,7 @@ pub fn built_in_skills() -> Vec<BundledSkillDefinition> {
         parse_skill_md(SKILLIFY_MD),
         parse_skill_md(LOOP_MD),
         parse_skill_md(INSTALL_MD),
+        parse_skill_md(MODEL_ROUTING_MD),
     ]
 }
 
@@ -171,7 +176,7 @@ mod tests {
     #[test]
     fn all_embedded_skills_parse_successfully() {
         let skills = built_in_skills();
-        assert_eq!(skills.len(), 7);
+        assert_eq!(skills.len(), 8);
 
         for skill in &skills {
             assert!(!skill.name.is_empty(), "skill name must not be empty");
@@ -252,7 +257,7 @@ mod tests {
     fn register_built_in_populates_registry() {
         let mut registry = BundledSkillRegistry::new();
         register_built_in_skills(&mut registry);
-        assert_eq!(registry.len(), 7);
+        assert_eq!(registry.len(), 8);
         assert!(registry.get_by_name("simplify").is_some());
         assert!(registry.get_by_name("batch").is_some());
         assert!(registry.get_by_name("stuck").is_some());
@@ -261,6 +266,41 @@ mod tests {
         assert!(registry.get_by_name("imagegen").is_none());
         assert!(registry.get_by_name("loop").is_some());
         assert!(registry.get_by_name("install").is_some());
+        assert!(registry.get_by_name("model-routing").is_some());
+    }
+
+    #[test]
+    fn model_routing_skill_parses_correctly() {
+        let skills = built_in_skills();
+        let routing = skills.iter().find(|s| s.name == "model-routing").unwrap();
+        assert!(routing.user_invocable);
+        assert!(!routing.disable_model_invocation);
+        assert_eq!(
+            routing.argument_hint.as_deref(),
+            Some("[what should go where, or the routing error you saw]")
+        );
+        // The trigger words live in the description, the only field the
+        // model's skill listing shows.
+        for trigger in ["Jev", "TypeSafe", "Vercel AI Gateway", "分流", "自动路由"] {
+            assert!(routing.description.contains(trigger), "{trigger}");
+        }
+        for tool in ["Read", "Edit", "AskUserQuestion"] {
+            assert!(routing.allowed_tools.contains(&tool.to_string()), "{tool}");
+        }
+        // The skill edits settings.json by hand, so it has to carry the checks
+        // the /settings rows would have made.
+        for key in [
+            "backend",
+            "routerModel",
+            "classifierModel",
+            "classifierEndpoint",
+            "policy",
+            "AI_GATEWAY_API_KEY",
+            "TYPESAFE_API_KEY",
+            "routerModel must belong to the current provider",
+        ] {
+            assert!(routing.prompt_body.contains(key), "{key}");
+        }
     }
 
     #[test]
