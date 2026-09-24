@@ -348,7 +348,9 @@ impl ShellProcessRegistry {
         let owner = owner_from_context(context, caller)?;
         let mut shells: Vec<Value> = lock(&self.inner.entries)
             .values()
-            .filter(|entry| entry.owner == owner)
+            // Monitors deliver through task notifications; listing them
+            // here invites polling a stream that is already pushed.
+            .filter(|entry| entry.owner == owner && !entry.registration.is_monitor())
             .map(|entry| entry.summary_value())
             .collect();
         shells.sort_by(|left, right| {
@@ -369,6 +371,9 @@ impl ShellProcessRegistry {
         wait_timeout_ms: u64,
     ) -> ToolResult<Value> {
         let entry = self.entry(context, caller, shell_id)?;
+        if entry.registration.is_monitor() {
+            return Err(monitor_output_error(caller, shell_id));
+        }
         let mut changes = entry.changes.subscribe();
         let deadline = Instant::now() + Duration::from_millis(wait_timeout_ms);
 
@@ -1484,6 +1489,21 @@ fn unknown_shell_error(caller: &str, shell_id: &str) -> ToolError {
         tool: ToolId::new(caller),
         reason: format!("unknown shellId `{shell_id}`"),
         error_code: Some(UNKNOWN_SHELL_CODE),
+    }
+}
+
+/// Reading a Monitor through ShellOutput would duplicate its task
+/// notifications, and `wait=true` would park the turn on a stream that
+/// is already pushed, so the refusal says where the events go instead.
+fn monitor_output_error(caller: &str, shell_id: &str) -> ToolError {
+    ToolError::InvalidInput {
+        tool: ToolId::new(caller),
+        reason: format!(
+            "`{shell_id}` is a Monitor: each event already arrives as a task notification \
+             and its exit is announced the same way, so do not poll it. Keep working and \
+             react to the notifications; stop it with TaskStop."
+        ),
+        error_code: Some(INVALID_INPUT_CODE),
     }
 }
 
@@ -2653,6 +2673,46 @@ mod tests {
         assert_eq!(events, vec!["first", "second", "partial"]);
         assert!(!events.iter().any(|event| event.contains("ignored")));
         assert!(lock(&controller.started).is_empty());
+    }
+
+    #[tokio::test]
+    async fn shell_output_neither_lists_nor_reads_monitors() {
+        let _env = crate::test_env::hold_env();
+        let registry = ShellProcessRegistry::new();
+        let controller = Arc::new(RecordingTaskController::default());
+        let context = context("session-a").with_task_runtime_controller(controller.clone());
+        let task_id = registry
+            .spawn_monitor(
+                &context,
+                configured_command(one_line_script()),
+                one_line_script().into(),
+                "events".into(),
+                "shell command (redacted)".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        wait_for_monitor_completion(&controller).await;
+
+        let listed = registry.list(&context, "ShellOutput").unwrap();
+        assert_eq!(listed["shells"], json!([]));
+
+        for wait in [false, true] {
+            match registry
+                .output(&context, "ShellOutput", &task_id, 0, wait, 1_000)
+                .await
+                .unwrap_err()
+            {
+                ToolError::InvalidInput {
+                    reason, error_code, ..
+                } => {
+                    assert!(reason.contains("is a Monitor"), "{reason}");
+                    assert!(reason.contains("task notification"), "{reason}");
+                    assert_eq!(error_code, Some(INVALID_INPUT_CODE));
+                }
+                other => panic!("expected a Monitor refusal, got {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]

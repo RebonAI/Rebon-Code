@@ -62,8 +62,9 @@ pub fn blocked_sleep_refusal(command: &str) -> Option<String> {
     (millis >= MAX_INLINE_SLEEP_MS).then(|| {
         format!(
             "This command sleeps for {:.0}s, which would hold the tool call open doing nothing. \
-             Use the Monitor tool to wait on a condition, or `run_in_background: true` plus \
-             ShellOutput to wait on the process itself.",
+             Use the Monitor tool (load it with ToolSearch) to wait on a condition, or \
+             `run_in_background: true` for the process itself: its completion is announced \
+             automatically.",
             millis as f64 / 1000.0
         )
     })

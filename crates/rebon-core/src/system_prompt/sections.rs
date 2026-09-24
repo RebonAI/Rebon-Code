@@ -494,8 +494,11 @@ pub(super) fn session_specific_guidance_section(
         bullets.push(
             " - Monitor is for selective event streams from external commands or WebSockets \
              whose events could affect your next action. Never wait for Agent completion \
-             through Monitor: completion is already announced automatically. Coarse recurring \
-             full prompts belong in `/loop`; do not use Monitor as a scheduler."
+             through Monitor: completion is already announced automatically. Monitor events and \
+             background shell completions are pushed to you as notifications, so never poll \
+             either with ShellOutput or Sleep; to watch a stream, use Monitor rather than a \
+             background shell. Coarse recurring full prompts belong in `/loop`; do not use \
+             Monitor as a scheduler."
                 .to_string(),
         );
     }

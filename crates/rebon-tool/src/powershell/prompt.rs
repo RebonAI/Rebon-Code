@@ -119,7 +119,10 @@ const EXECUTION_NOTES: &str = "Usage notes:\n\
 the user in the approval prompt.\n\
  - `timeout` is in milliseconds (default 60000, max 600000). Set `run_in_background: true` for \
 a long-running command instead of raising the timeout: the call returns a `shellId` \
-immediately, and ShellOutput / ShellStop read and terminate it.\n\
+immediately and you are notified when it finishes, so keep working instead of polling; \
+ShellOutput / ShellStop read and terminate it. To react to a stream of events or wait for an \
+external condition, load the deferred Monitor tool with ToolSearch instead of polling a \
+background shell with ShellOutput.\n\
  - Environment changes do not persist between calls — each call is a fresh `-NoProfile` \
 process. Anything that must apply to a later command has to be repeated in that command. The \
 one common case worth doing inline is an MSVC environment: import the module and call the \
@@ -162,7 +165,9 @@ pub fn build_model_description(edition: PowerShellEdition) -> String {
          {chaining} Spawned with `-NoProfile -NonInteractive` and no stdin, so interactive \
          cmdlets (`Read-Host`, `Get-Credential`) will fail — pass `-Confirm:$false` to \
          destructive cmdlets. Supports `timeout` in milliseconds (up to 600000) and \
-         `run_in_background`; background calls return a `shellId` for ShellOutput/ShellStop."
+         `run_in_background`; background calls return a `shellId` for ShellOutput/ShellStop \
+         and announce their completion, so do not poll them. For event streams or waiting on \
+         an external condition, load the deferred Monitor tool with ToolSearch."
     )
 }
 

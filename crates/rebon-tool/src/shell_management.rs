@@ -36,7 +36,9 @@ impl Tool for ShellOutputTool {
         "Lists background Bash/PowerShell shells or reads their incremental output. Omit shellId \
          to list shells visible in the current session/agent. With shellId, new text arrives in \
          `output` (stdout) and `stderr`; pass the returned nextCursor to avoid duplicate output. \
-         wait=true waits for new output or process completion."
+         Completion is announced automatically, so do not call this in a loop to wait; \
+         wait=true is only for when you need the next output now and have nothing else to do. \
+         Monitor tasks are not readable here: their events arrive as task notifications."
     }
 
     fn input_schema(&self) -> ToolInputSchema {

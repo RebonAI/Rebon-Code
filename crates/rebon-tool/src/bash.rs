@@ -84,9 +84,11 @@ commands fail.\n\
 /// Describes the `run_in_background` parameter.
 const BASH_BACKGROUND_USAGE_NOTE: &str = " - Use `run_in_background` for long-running commands \
 you want to watch (builds, test suites, dev servers you will read output from) without appending '&'. \
-The call returns a `shellId` immediately. Use ShellOutput to list shells, \
-read incremental output, or wait for new output/completion, and use ShellStop to terminate the \
-process tree. Background shells are killed when the session ends and are not persisted across Rebon \
+The call returns a `shellId` immediately and you are notified when the process finishes, so \
+keep working instead of polling. Use ShellOutput to list shells or read incremental output you \
+need, and use ShellStop to terminate the process tree. To react to a stream of events (log lines, \
+status changes) or wait for an external condition, load the deferred Monitor tool with ToolSearch \
+instead of polling a background shell with ShellOutput. Background shells are killed when the session ends and are not persisted across Rebon \
 restarts. If a process must outlive this session — a server or daemon that will be checked after you \
 finish — do NOT use `run_in_background`; start it detached from a normal foreground call instead, \
 e.g. `nohup <cmd> >/dev/null 2>&1 &` (or `setsid <cmd> >/dev/null 2>&1 &`), then verify it is up.";
@@ -219,8 +221,11 @@ const BASH_MODEL_DESCRIPTION: &str = "Executes a given bash command and returns 
 \n\
 Use this for system commands and terminal operations that require shell execution. Prefer \
 dedicated file/search/edit tools when available. Supports `timeout` in milliseconds (up to \
-600000) and `run_in_background` for long-running commands. Background calls return a `shellId`; \
-use ShellOutput to read output and ShellStop to terminate them.";
+600000) and `run_in_background` for long-running commands. Background calls return a `shellId` \
+and you are notified when they finish, so do not poll them; use ShellOutput only to read output \
+you need and ShellStop to terminate them. To react to a stream of events (log lines, status \
+changes) or wait for an external condition, load the deferred Monitor tool with ToolSearch \
+instead of polling a background shell with ShellOutput.";
 
 impl BashTool {
     pub fn new() -> Self {
@@ -708,6 +713,37 @@ fn validate_parsed_input(input: &BashInput) -> ToolResult<ValidationOutcome> {
     }
 
     Ok(ValidationOutcome::valid())
+}
+
+/// Which interpreter [`configured_shell_command`] hands a command to.
+///
+/// Tools that take a raw command string without being the `Bash` tool
+/// (Monitor) describe their syntax from this, so the model is not left
+/// guessing between POSIX and PowerShell grammar on Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandShell {
+    /// `sh -lc` on Unix.
+    Posix,
+    /// Git-for-Windows `bash -c`.
+    GitBash,
+    /// `powershell.exe -Command`: Windows with no Git Bash.
+    WindowsPowerShell,
+}
+
+/// The interpreter [`shell_command`] resolves to on this machine.
+pub fn command_shell() -> CommandShell {
+    #[cfg(windows)]
+    {
+        if git_bash_available() {
+            CommandShell::GitBash
+        } else {
+            CommandShell::WindowsPowerShell
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        CommandShell::Posix
+    }
 }
 
 /// Resolve the shell binary and arguments for the command.

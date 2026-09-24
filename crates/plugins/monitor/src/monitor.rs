@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use rebon_tool::bash::{configured_shell_command, shell_permission_decision};
+use rebon_tool::bash::{
+    command_shell, configured_shell_command, shell_permission_decision, CommandShell,
+};
 use rebon_tool::monitor::{execution_error, invalid_input, WebSocketTarget};
 use rebon_tool::{MonitorTaskSource, Tool, ToolContext};
 use rebon_tools_core::{
@@ -8,6 +10,7 @@ use rebon_tools_core::{
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::OnceLock;
 use tokio::net::lookup_host;
 use url::Url;
 
@@ -32,11 +35,48 @@ use tokio_tungstenite::tungstenite::{
 const INVALID_INPUT_CODE: i64 = 400;
 const DEFAULT_TIMEOUT_MS: u64 = 600_000;
 
-const DESCRIPTION: &str = "Start a background monitor that streams events from a long-running command or WebSocket. Each stdout line or WebSocket text frame is an event; you keep working and notifications arrive in the chat. Events are asynchronous task notifications, not user replies.\n\
+const DESCRIPTION_INTRO: &str = "Start a background monitor that streams events from a long-running command or WebSocket. Each stdout line or WebSocket text frame is an event; you keep working and notifications arrive in the chat. Events are asynchronous task notifications, not user replies.\n\
 \n\
-Use Monitor only for a selective stream of events that could change what you do next. For a single completion, use a foreground command or Bash run_in_background instead. For recurring full prompts on a coarse schedule, use /loop. Agent completion is already delivered automatically: never use Monitor, Sleep, or TaskList to poll an Agent.\n\
+Use Monitor for a selective stream of events that could change what you do next, or to wait on an external condition (a port answering, a file appearing, a CI status changing). To wait for a process you started yourself to finish, use Bash run_in_background instead. For recurring full prompts on a coarse schedule, use /loop. Agent completion is already delivered automatically: never use Monitor, Sleep, or TaskList to poll an Agent.";
+
+// The command section is chosen per interpreter: a model driving a
+// PowerShell session on Windows otherwise cannot tell which grammar
+// `command` takes, and falls back to writing a script file and running
+// that instead of an inline watcher.
+const POSIX_COMMAND_GUIDE: &str = "Put the whole watcher inline in `command`: pipes, loops and multi-line scripts all work, so never write a script file first. Patterns:\n\
+- Filter a log: tail -n 0 -F app.log | grep --line-buffered -E 'ERROR|FAIL|panicked'\n\
+- Wait for a condition, then end: until curl -sf http://localhost:3000/health >/dev/null; do sleep 2; done; echo ready\n\
+- Report changes from a poll: prev=; while :; do cur=$(<status command> 2>&1 || true); if [ \"$cur\" != \"$prev\" ]; then echo \"$cur\"; prev=$cur; fi; sleep 30; done\n\
 \n\
-Command monitors read stdout only; redirect stderr with 2>&1 when it belongs in the event stream. Every emitted line must be actionable and the producer must flush each line. Noisy monitors are suppressed and may be stopped automatically; restart with a tighter source. The default deadline is 10 minutes. persistent=true removes that deadline for the current session; stop it with TaskStop.";
+Rules: stdout is the event stream (add 2>&1 when stderr matters). grep, sed and awk buffer inside a pipe and delay events by minutes, so use grep --line-buffered, sed -u or awk with fflush(). Match failure signatures as well as success, or a crash looks like silence. In poll loops, tolerate transient failures with || true and sleep 1-5 s for local checks, 30 s or more for remote APIs. Process exit ends the monitor, so an until-loop that echoes once is a one-shot wait.";
+
+const GIT_BASH_NOTE: &str = "`command` runs in Git Bash (bash -c), not PowerShell, in the session's working directory. Use POSIX syntax and forward-slash paths (C:/dir or /c/dir); for a cmdlet, call powershell.exe -NoProfile -Command '...' from inside the script.";
+
+const POSIX_NOTE: &str =
+    "`command` runs in sh -lc (POSIX shell) in the session's working directory.";
+
+const POWERSHELL_COMMAND_GUIDE: &str = "`command` runs in Windows PowerShell (powershell.exe -NoProfile -Command) in the session's working directory; no POSIX shell is installed. Put the whole watcher inline in `command`: pipelines, loops and multi-line scripts all work, so never write a script file first. Patterns:\n\
+- Filter a log: Get-Content app.log -Tail 0 -Wait | Select-String -Pattern 'ERROR|FAIL' | ForEach-Object { $_.Line }\n\
+- Wait for a condition, then end: while (-not (Test-Path out/done.flag)) { Start-Sleep -Seconds 2 }; 'ready'\n\
+- Report changes from a poll: $prev = $null; while ($true) { $cur = try { <status command> 2>&1 | Out-String } catch { \"$_\" }; if ($cur -ne $prev) { $cur.Trim(); $prev = $cur }; Start-Sleep -Seconds 30 }\n\
+\n\
+Rules: the success output stream is the event stream (merge errors with 2>&1 when they matter). Emit plain strings, one per event. Match failure signatures as well as success, or a crash looks like silence. In poll loops, catch transient failures and sleep 1-5 s for local checks, 30 s or more for remote APIs. Process exit ends the monitor, so a loop that prints once and exits is a one-shot wait.";
+
+const DESCRIPTION_OUTRO: &str = "Every emitted line becomes a notification, so emit only actionable lines. Noisy monitors are suppressed and may be stopped automatically; restart with a tighter filter. The default deadline is 10 minutes. persistent=true removes that deadline for the current session; stop it with TaskStop.";
+
+fn description_for(shell: CommandShell) -> String {
+    let command = match shell {
+        CommandShell::Posix => format!("{POSIX_NOTE} {POSIX_COMMAND_GUIDE}"),
+        CommandShell::GitBash => format!("{GIT_BASH_NOTE} {POSIX_COMMAND_GUIDE}"),
+        CommandShell::WindowsPowerShell => POWERSHELL_COMMAND_GUIDE.to_string(),
+    };
+    format!("{DESCRIPTION_INTRO}\n\n{command}\n\n{DESCRIPTION_OUTRO}")
+}
+
+fn tool_description() -> &'static str {
+    static DESCRIPTION: OnceLock<String> = OnceLock::new();
+    DESCRIPTION.get_or_init(|| description_for(command_shell()))
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct MonitorTool;
@@ -66,7 +106,7 @@ impl Tool for MonitorTool {
     }
 
     fn description(&self) -> &str {
-        DESCRIPTION
+        tool_description()
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -75,7 +115,7 @@ impl Tool for MonitorTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "Long-running script whose stdout is the event stream. Each line is one event; process exit ends the monitor. Cannot be combined with ws."
+                    "description": "Inline shell script (may span several lines) whose stdout is the event stream. Each line is one event; process exit ends the monitor. Cannot be combined with ws."
                 },
                 "ws": {
                     "type": "string",
@@ -112,7 +152,7 @@ impl Tool for MonitorTool {
     }
 
     fn search_hint(&self) -> Option<&str> {
-        Some("watch streaming logs websocket events background notifications")
+        Some("watch streaming logs websocket events wait until condition poll status background notifications")
     }
 
     fn is_concurrency_safe(&self, _input: &Value) -> bool {
@@ -249,6 +289,7 @@ fn started_result(
         "description": description,
         "persistent": persistent,
         "timeout_ms": timeout_ms,
+        "note": "Events and the monitor's exit arrive as task notifications. Keep working; do not poll this task with ShellOutput or Sleep. Stop it with TaskStop.",
     })
 }
 
@@ -653,6 +694,52 @@ mod tests {
             "command": "tail -f app.log",
             "description": "application errors"
         })
+    }
+
+    #[test]
+    fn description_names_the_shell_that_runs_the_command() {
+        let git_bash = description_for(CommandShell::GitBash);
+        assert!(git_bash.contains("runs in Git Bash"));
+        assert!(git_bash.contains("not PowerShell"));
+        assert!(git_bash.contains("grep --line-buffered"));
+
+        let posix = description_for(CommandShell::Posix);
+        assert!(posix.contains("sh -lc"));
+        assert!(!posix.contains("PowerShell"));
+
+        let powershell = description_for(CommandShell::WindowsPowerShell);
+        assert!(powershell.contains("runs in Windows PowerShell"));
+        assert!(powershell.contains("Get-Content app.log -Tail 0 -Wait"));
+        assert!(!powershell.contains("grep --line-buffered"));
+
+        for description in [git_bash, posix, powershell] {
+            assert!(description.contains("never write a script file first"));
+            assert!(description.contains("Wait for a condition, then end"));
+            assert!(description.contains("never use Monitor, Sleep, or TaskList to poll an Agent"));
+        }
+    }
+
+    #[test]
+    fn started_result_says_events_are_pushed_not_polled() {
+        let result = started_result(
+            "m1".into(),
+            MonitorTaskSource::Command,
+            "events".into(),
+            false,
+            Some(DEFAULT_TIMEOUT_MS),
+        );
+        let note = result["note"].as_str().unwrap();
+        assert!(note.contains("task notifications"));
+        assert!(note.contains("do not poll"));
+        assert!(note.contains("TaskStop"));
+    }
+
+    #[test]
+    fn description_matches_this_machine() {
+        assert_eq!(
+            MonitorTool.description(),
+            description_for(command_shell()).as_str()
+        );
     }
 
     #[test]
