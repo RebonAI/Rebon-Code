@@ -426,11 +426,20 @@ pub fn is_auto_memory_path(path: &Path, context: &ToolContext) -> bool {
     })
 }
 
+/// Whether `path` lies in a root this session may already write to without
+/// asking: an explicit write scope, or the auto-approved roots (the
+/// scratchpad). Never a git metadata path, even inside such a root — a
+/// scratchpad someone ran `git init` in is a repository whose config the
+/// next unasked `git status` would execute (see
+/// [`crate::path_scope::is_git_metadata_path`]).
 pub fn explicitly_authorized_write_path(path: &Path, context: &ToolContext) -> bool {
     let path = context
         .cwd()
         .map(|cwd| crate::path_scope::resolve_context_path(path, Path::new(cwd), context))
         .unwrap_or_else(|| path.to_path_buf());
+    if crate::path_scope::is_git_metadata_path(&path) {
+        return false;
+    }
     context
         .write_scope_roots()
         .is_some_and(|roots| crate::path_scope::mutation_path_is_within_roots(&path, roots))

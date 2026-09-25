@@ -20,6 +20,31 @@ pub fn resolve_context_path(path: &Path, cwd: &Path, _context: &ToolContext) -> 
     }
 }
 
+/// Whether a write to `path` would change a repository's git metadata:
+/// anything inside a `.git` directory, or a `.git` file itself (a worktree's
+/// pointer at its git directory).
+///
+/// Git runs programs its metadata names — `core.fsmonitor`, `diff.external`,
+/// filter and textconv drivers, hooks — from commands that only read, such as
+/// the `git status` a read-only shell command runs unasked. A write there is
+/// therefore a way to run code, and no shortcut past a prompt may cover it.
+/// Checked on the path as given and as resolved, so a symlink or a `..` that
+/// leads into `.git` cannot hide it; the name is compared without case,
+/// which only ever asks more on a case-sensitive filesystem.
+pub fn is_git_metadata_path(path: &Path) -> bool {
+    [path.to_path_buf(), normalize_for_scope(path)]
+        .iter()
+        .any(|candidate| {
+            candidate.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Normal(name)
+                        if name.to_str().is_some_and(|name| name.eq_ignore_ascii_case(".git"))
+                )
+            })
+        })
+}
+
 /// Every rule a path must pass before a tool may read what is at it: the
 /// session credentials nobody may read, then the roots a sub-agent is confined
 /// to.
@@ -367,6 +392,43 @@ mod tests {
             session_credential_kind_under(Path::new("/config/jobs/bg-1/state.json"), &home),
             Some("a background job record")
         );
+    }
+
+    /// Anything inside `.git`, and a worktree's `.git` file, is git metadata;
+    /// the files beside it that only share the prefix are not.
+    #[test]
+    fn git_metadata_is_the_git_directory_and_the_git_file() {
+        for path in [
+            "/repo/.git/config",
+            "/repo/.git/hooks/pre-commit",
+            "/repo/.git",
+            "/repo/sub/.GIT/info/attributes",
+            ".git/config",
+            "/repo/.git/../.git/config",
+        ] {
+            assert!(is_git_metadata_path(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/repo/.gitignore",
+            "/repo/.gitattributes",
+            "/repo/.gitmodules",
+            "/repo/.github/workflows/ci.yml",
+            "/repo/src/git/config.rs",
+            "/repo/my.git/config",
+        ] {
+            assert!(!is_git_metadata_path(Path::new(path)), "{path}");
+        }
+    }
+
+    /// A symlink that leads into `.git` is a write into `.git`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_into_git_metadata_is_git_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join(".git"), dir.path().join("innocent")).unwrap();
+
+        assert!(is_git_metadata_path(&dir.path().join("innocent/config")));
     }
 
     /// Windows opens `STATE.JSON` and `state.json` as the same file, so the

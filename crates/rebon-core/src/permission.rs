@@ -495,6 +495,7 @@ impl ChannelPermissionBroker {
         if requires_permission_broker_response(tool_name)
             || requires_workflow_review(tool_name)
             || rules.requires_user_decision(tool_name, context).is_some()
+            || edits_git_metadata(tool_name, input, context)
         {
             return AutoModeGateOutcome::Ask;
         }
@@ -952,7 +953,7 @@ pub(crate) async fn resolve_ask_under_mode(
         // File edits only. Everything else falls through exactly as in
         // `default` — the "other operations follow policy" half of the promise.
         PermissionMode::AcceptEdits => {
-            if is_accept_edits_tool(tool_name) {
+            if is_accept_edits_tool(tool_name) && !edits_git_metadata(tool_name, input, context) {
                 tracing::debug!(
                     tool = tool_name,
                     "acceptEdits: running a file edit without a prompt"
@@ -1500,6 +1501,35 @@ fn requires_workflow_review(tool_name: &str) -> bool {
 /// `TodoWrite` never reach here because they resolve to `Allow` on their own.
 fn is_accept_edits_tool(tool_name: &str) -> bool {
     rebon_tool::tool_kind_for_name(tool_name) == ToolKind::FileEdit
+}
+
+/// A file edit aimed at a repository's git metadata — `.git/config`, a hook,
+/// a worktree's `.git` pointer.
+///
+/// Git runs what that metadata names (`core.fsmonitor`, `diff.external`,
+/// filter and textconv drivers, hooks) from commands that only read, and a
+/// read-only `git status` runs without a prompt. So a mode that accepts file
+/// edits on the user's behalf — `acceptEdits`, or auto mode's classifier —
+/// would turn "edit a file" into "run a program" with nobody asked. Such an
+/// edit always reaches the prompt instead; `bypassPermissions` keeps its
+/// contract and runs it. A file edit with no target to read is left to the
+/// tool, whose validation refuses it before any of this is asked.
+fn edits_git_metadata(tool_name: &str, input: &Value, context: &ToolContext) -> bool {
+    if !is_accept_edits_tool(tool_name) {
+        return false;
+    }
+    let Some(target) = rebon_tool::file_target_field_for_name(tool_name)
+        .and_then(|field| input.get(field))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let target = std::path::Path::new(target);
+    let target = match context.cwd() {
+        Some(cwd) if target.is_relative() => std::path::Path::new(cwd).join(target),
+        _ => target.to_path_buf(),
+    };
+    rebon_tool::path_scope::is_git_metadata_path(&target)
 }
 
 fn append_permission_extra_text(value: &mut Value, extra_text: &Option<String>) {
@@ -3259,6 +3289,127 @@ mod tests {
             assert_eq!(result, input);
             assert!(rx.try_recv().is_err(), "tool={tool_name}");
         }
+    }
+
+    /// A file edit into git metadata is a way to run a program: git runs
+    /// what `.git/config` and the hooks name from a `git status` that no
+    /// longer asks. `acceptEdits` does not accept it on the user's behalf.
+    #[tokio::test]
+    async fn accept_edits_prompts_for_an_edit_into_git_metadata() {
+        for (tool_name, field, target) in [
+            ("Write", "file_path", ".git/config"),
+            ("Edit", "file_path", "/repo/.git/hooks/pre-commit"),
+            ("MultiEdit", "file_path", "sub/.GIT/info/attributes"),
+            ("Write", "file_path", "worktree/.git"),
+            ("NotebookEdit", "notebook_path", "/repo/.git/x.ipynb"),
+        ] {
+            let (broker, mut rx) = ChannelPermissionBroker::new("sess-accept");
+            let (hooks, _sink) = hooks_with_mode(PermissionMode::AcceptEdits);
+            broker.set_auto_mode_hooks(Some(hooks));
+            let mut input = json!({ "content": "[core]" });
+            input[field] = json!(target);
+            let decision = PermissionDecision::ask(
+                PermissionRequest::new("Edit file", format!("Edit wants to modify: {target}"))
+                    .with_options(["allow_once", "reject_once"]),
+                Some(input.clone()),
+            );
+            let pending = tokio::spawn({
+                let input = input.clone();
+                async move {
+                    broker
+                        .resolve(
+                            &NamedEchoTool(tool_name),
+                            input,
+                            &ToolContext::new().with_cwd("/repo"),
+                            decision,
+                        )
+                        .await
+                }
+            });
+
+            let query = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{tool_name} {target} must prompt"))
+                .expect("permission receiver should stay open");
+            drop(query.response_tx);
+            assert!(pending.await.unwrap().is_err(), "{tool_name} {target}");
+        }
+    }
+
+    /// Paths that only look like git's are ordinary project files.
+    #[tokio::test]
+    async fn accept_edits_still_runs_edits_beside_git_metadata() {
+        for target in [
+            ".gitignore",
+            ".gitattributes",
+            ".github/workflows/ci.yml",
+            "src/git.rs",
+        ] {
+            let (broker, mut rx) = ChannelPermissionBroker::new("sess-accept");
+            let (hooks, _sink) = hooks_with_mode(PermissionMode::AcceptEdits);
+            broker.set_auto_mode_hooks(Some(hooks));
+            let input = json!({ "file_path": target, "content": "x" });
+            let decision = PermissionDecision::ask(
+                PermissionRequest::new("Edit file", "Edit wants to modify a file"),
+                Some(input.clone()),
+            );
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                broker.resolve(
+                    &NamedEchoTool("Write"),
+                    input.clone(),
+                    &ToolContext::new().with_cwd("/repo"),
+                    decision,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{target} must not wait on a dialog"))
+            .expect("acceptEdits should run the edit");
+
+            assert_eq!(result, input);
+            assert!(rx.try_recv().is_err(), "{target}");
+        }
+    }
+
+    /// Auto mode's classifier does not get to answer for it either: the
+    /// edit goes to the user, and the classifier is never asked.
+    #[tokio::test]
+    async fn auto_mode_prompts_for_an_edit_into_git_metadata() {
+        let (broker, mut rx) = ChannelPermissionBroker::new("sess-auto");
+        let (hooks, sink) = hooks_with_mode(PermissionMode::Auto);
+        broker.set_auto_mode_hooks(Some(hooks));
+        let classifier = Arc::new(RecordingClassifier::new(FixedClassifierResult::Outcome(
+            AutoModeClassifierOutcome::Allow {
+                reason: "Only edits a config file.".to_owned(),
+                stage: AutoModeClassifierStage::Fast,
+            },
+        )));
+        broker.set_auto_mode_classifier(Some(classifier.clone()));
+        let input = json!({ "file_path": "/repo/.git/config", "content": "[core]" });
+        let decision = PermissionDecision::ask(
+            PermissionRequest::new("Write file", "Write wants to overwrite /repo/.git/config"),
+            Some(input.clone()),
+        );
+        let pending = tokio::spawn(async move {
+            broker
+                .resolve(
+                    &NamedEchoTool("Write"),
+                    input,
+                    &ToolContext::new().with_cwd("/repo"),
+                    decision,
+                )
+                .await
+        });
+
+        let query = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("an edit into .git must prompt under auto mode")
+            .expect("permission receiver should stay open");
+        drop(query.response_tx);
+        assert!(pending.await.unwrap().is_err());
+        assert_eq!(classifier.call_count(), 0);
+        assert_eq!(sink.store().lock().unwrap().len(), 0);
     }
 
     /// "Other operations follow policy": a shell call in this mode behaves

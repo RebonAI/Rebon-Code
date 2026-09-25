@@ -113,7 +113,7 @@ impl Tool for WriteTool {
             .and_then(|v| v.as_str())
             .unwrap_or("<unknown>");
 
-        if explicitly_authorized_write_path(Path::new(path), context) {
+        if crate::edit::explicitly_authorized_write_path(Path::new(path), context) {
             return Ok(PermissionDecision::allow(input.clone()));
         }
 
@@ -339,20 +339,6 @@ fn is_auto_memory_path(path: &Path, context: &ToolContext) -> bool {
     context.cwd().is_some_and(|cwd| {
         rebon_session::memory_paths::is_memory_path_for_any_scope(&path.to_string_lossy(), cwd)
     })
-}
-
-fn explicitly_authorized_write_path(path: &Path, context: &ToolContext) -> bool {
-    let path = context
-        .cwd()
-        .map(|cwd| crate::path_scope::resolve_context_path(path, Path::new(cwd), context))
-        .unwrap_or_else(|| path.to_path_buf());
-    context
-        .write_scope_roots()
-        .is_some_and(|roots| crate::path_scope::mutation_path_is_within_roots(&path, roots))
-        || crate::path_scope::mutation_path_is_within_roots(
-            &path,
-            context.auto_approved_write_roots(),
-        )
 }
 
 /// Sub-agent mutation-scope gate for writes. An explicit write scope
@@ -673,6 +659,36 @@ mod tests {
         assert_eq!(decision.behavior, PermissionBehavior::Allow);
         tool().call(input, &ctx).await.unwrap();
         assert_eq!(fs::read_to_string(file).unwrap(), "verified");
+    }
+
+    /// A root the session may write to unasked stops at git metadata: a
+    /// scratchpad that became a repository has a `.git/config` the next
+    /// unasked `git status` would run.
+    #[tokio::test]
+    async fn an_authorized_root_does_not_cover_git_metadata() {
+        let dir = TempDir::new();
+        let scratchpad = dir.path().join("scratchpad");
+        fs::create_dir_all(scratchpad.join(".git")).unwrap();
+        for ctx in [
+            ToolContext::new()
+                .with_cwd(scratchpad.to_string_lossy())
+                .with_auto_approved_write_roots([scratchpad.clone()]),
+            ToolContext::new()
+                .with_cwd(scratchpad.to_string_lossy())
+                .with_write_scope_roots([scratchpad.clone()]),
+        ] {
+            for target in [scratchpad.join(".git/config"), scratchpad.join(".git")] {
+                let input = json!({ "file_path": target.to_string_lossy(), "content": "x" });
+                let decision = tool().check_permissions(&input, &ctx).await.unwrap();
+                assert_eq!(decision.behavior, PermissionBehavior::Ask, "{target:?}");
+            }
+            let input = json!({
+                "file_path": scratchpad.join("notes.txt").to_string_lossy(),
+                "content": "x"
+            });
+            let decision = tool().check_permissions(&input, &ctx).await.unwrap();
+            assert_eq!(decision.behavior, PermissionBehavior::Allow);
+        }
     }
 
     #[tokio::test]
