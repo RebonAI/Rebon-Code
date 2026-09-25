@@ -97,6 +97,12 @@ pub async fn run_acp_server(
     overrides: RuntimeOverride,
     transport: AcpTransport,
 ) -> anyhow::Result<()> {
+    // Here rather than in `build_acp_server`, which `serve` shares: an editor
+    // driving this process picked its model and expects the ordinary tool
+    // set, while `serve` is the user's own page and runs as configured.
+    rebon_harness::kernel_bootstrap::declare_plugin_surface(
+        rebon_harness::kernel_bootstrap::PluginSurface::Plain,
+    );
     let AcpServerParts {
         handler,
         update_rx,
