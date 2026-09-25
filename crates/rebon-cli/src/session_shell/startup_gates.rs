@@ -337,7 +337,8 @@ mod tests {
     fn the_expired_login_notice_names_the_login_that_expired() {
         assert_eq!(
             expired_login_notice(crate::rebon_config::account_login::codex_login()),
-            "Your ChatGPT (Codex) session has expired — run /login to re-authenticate.              Model requests fail until you do."
+            "Your ChatGPT (Codex) session has expired — run /login to re-authenticate. \
+             Model requests fail until you do."
         );
         let copilot =
             crate::rebon_config::account_login(crate::rebon_config::COPILOT_LOGIN_ID).unwrap();
