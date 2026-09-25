@@ -232,10 +232,11 @@ pub fn builtin_command_table() -> Vec<CommandSpec> {
         CommandSpec::new("fast", "Toggle the OpenAI fast service tier")
             .hint("[on|off|status]")
             .surfaces(Surfaces::TUI_ONLY),
-        // `/login` and `/logout` are not here: the OAuth flow they begin and
-        // end belongs to the onboarding plugin — the PKCE exchange, the
-        // loopback listener and the credential write all live there — and
-        // `/login` opens that plugin's wizard.
+        // `/login` and `/logout` are not here: the onboarding plugin
+        // registers them on the seat, because the account logins they
+        // begin and end — the PKCE and device-code flows, the loopback
+        // listener and the credential writes — all live there, and
+        // `/login` opens that plugin's login pane.
         CommandSpec::new("resume", "Resume a previous session")
             .surfaces(Surfaces::TUI_ONLY)
             .kind(Panel),

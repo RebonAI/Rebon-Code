@@ -939,6 +939,8 @@ mod tests {
             "skills",
             "memory",
             "migrate",
+            "login",
+            "logout",
         ] {
             assert!(
                 listed.contains(&command),

@@ -27,6 +27,10 @@
 //!   that reach the wizard cannot drift apart on disk.
 //! * **[`store`]** — the config reads the wizard opens with, in one place
 //!   rather than at each of its six entry points.
+//! * **[`accounts`]** — signing out and reporting status, one answer for
+//!   `/logout`, `rebon logout` and `rebon login --status`.
+//! * **[`cli`]** — `rebon login` / `rebon logout`, parsed before a kernel
+//!   exists (signing in has to work when a session cannot start).
 //! * **[`migrate`]** — the import step's library: what is discoverable under
 //!   `~/.claude` and `~/.codex`, and where each kind has to land for rebon's
 //!   loaders to read it back. A plain recursive copy lands it somewhere they
@@ -59,7 +63,9 @@ use std::sync::Arc;
 use rebon_command_seat::{CommandHandler, CommandSeatService, CommandSpec, COMMAND_SEAT_SERVICE};
 use rebon_kernel::{Context, KernelError, Plugin, PluginDef, PluginHost, PluginKind, PluginMeta};
 
+pub mod accounts;
 pub mod apply;
+pub mod cli;
 pub mod dialog;
 pub mod drive;
 pub mod migrate;
@@ -73,7 +79,7 @@ pub use apply::{
 pub use store::{has_any_provider, load_provider_snapshot, onboarding_open_inputs};
 
 pub use dialog::{
-    ExistingSetupChoice, OAuthView, OnboardingDialogOutcome, OnboardingDialogState,
+    login_outcome, ExistingSetupChoice, OAuthView, OnboardingDialogOutcome, OnboardingDialogState,
     OnboardingOpenInputs, OnboardingStepTransition, PanelStatus, ProviderFormState,
     ProviderPresetSelection, ProviderSnapshot, PROVIDER_FORMATS,
 };
@@ -148,9 +154,36 @@ pub fn migrate_command_spec() -> CommandSpec {
     .kind(rebon_command_seat::CommandKind::Panel)
 }
 
+/// `/login` as the command seat sees it.
+///
+/// Opens the login pane, which lists every account login; `/login <account>`
+/// opens it with that account selected. A `Panel`, like `/onboarding`: the
+/// sign-in needs the dialog stack.
+pub fn login_command_spec() -> CommandSpec {
+    CommandSpec::new("login", "Sign in with a subscription account")
+        .zh_aliases(["登录"])
+        .hint("[account]")
+        .kind(rebon_command_seat::CommandKind::Panel)
+}
+
+/// `/logout` as the command seat sees it.
+///
+/// Signs out of one account login ([`accounts::logout`]): the one named, or
+/// the only one signed in.
+pub fn logout_command_spec() -> CommandSpec {
+    CommandSpec::new("logout", "Sign out of a subscription account")
+        .zh_aliases(["登出", "退出登录"])
+        .hint("[account]")
+}
+
 /// Every command this plugin owns, in registration order.
 pub fn command_specs() -> Vec<CommandSpec> {
-    vec![command_spec(), migrate_command_spec()]
+    vec![
+        command_spec(),
+        migrate_command_spec(),
+        login_command_spec(),
+        logout_command_spec(),
+    ]
 }
 
 pub struct OnboardingPlugin;
@@ -188,7 +221,7 @@ fn make(_: &PluginHost) -> Result<Box<dyn Plugin>, KernelError> {
 /// This crate's one export to the binary's plugin table.
 pub static PLUGIN: PluginDef = PluginDef {
     id: PLUGIN_ID,
-    title: "Setup wizard and Codex login (/onboarding)",
+    title: "Setup wizard and account logins (/onboarding, /login)",
     kind: PluginKind::Feature,
     default_enabled: true,
     factory: make,
@@ -304,15 +337,30 @@ mod tests {
         // local front ends, not over the wire.
         assert_eq!(migrate.spec.surfaces, Surfaces::LOCAL);
 
+        let login = seat.find("login").expect("registered while loaded");
+        assert_eq!(login.owner, PLUGIN_ID);
+        assert_eq!(login.handler.native_id(), Some("login"));
+        assert_eq!(login.spec.kind, CommandKind::Panel);
+        assert_eq!(login.spec.zh_aliases.as_ref(), ["登录".to_string()]);
+        assert_eq!(login.spec.surfaces, Surfaces::LOCAL);
+        let logout = seat.find("logout").expect("registered while loaded");
+        assert_eq!(logout.owner, PLUGIN_ID);
+        assert_eq!(logout.handler.native_id(), Some("logout"));
+        assert_eq!(logout.spec.kind, CommandKind::Native);
+        assert_eq!(
+            logout.spec.zh_aliases.as_ref(),
+            ["登出".to_string(), "退出登录".to_string()]
+        );
+
         registry
             .set_enabled(PLUGIN_ID, false)
             .expect("onboarding is a feature plugin");
-        for name in ["migrate"] {
+        for name in ["migrate", "login", "logout"] {
             assert!(seat.find(name).is_none(), "/{name} outlived the switch");
         }
 
         registry.set_enabled(PLUGIN_ID, true).expect("and back");
-        for name in ["migrate"] {
+        for name in ["migrate", "login", "logout"] {
             assert!(seat.find(name).is_some(), "/{name} did not come back");
         }
     }

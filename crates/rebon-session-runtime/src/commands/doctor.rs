@@ -365,20 +365,24 @@ fn append_provider_credential_rows(
         return;
     }
 
-    if api_key != crate::rebon_config::OPENAI_OAUTH_TOKEN_SENTINEL {
+    let Some(login) = crate::rebon_config::account_login_for_api_key(api_key) else {
         rows.push(DoctorRow::ok(
             "credentials",
             "literal API key configured (value not shown)",
         ));
         return;
-    }
+    };
 
     match crate::rebon_config::resolve_from_dir(config_dir) {
         Ok(Some(resolved)) => match resolved.oauth {
             Some(oauth) => {
                 rows.push(DoctorRow::ok(
                     "credentials",
-                    "OpenAI OAuth credentials loaded from .credentials.json",
+                    if login.is_codex() {
+                        "OpenAI OAuth credentials loaded from .credentials.json".to_string()
+                    } else {
+                        format!("{} login loaded from .credentials.json", login.display_name)
+                    },
                 ));
                 let has_refresh = oauth
                     .refresh_token

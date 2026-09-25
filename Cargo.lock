@@ -3802,6 +3802,7 @@ version = "1.6.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "clap",
  "getrandom 0.2.17",
  "rebon-command-seat",
  "rebon-config",
@@ -3810,7 +3811,10 @@ dependencies = [
  "rebon-picker",
  "rebon-session",
  "rebon-tool",
+ "rebon-types",
  "reqwest",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",

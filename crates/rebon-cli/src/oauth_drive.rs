@@ -1,23 +1,23 @@
-//! The terminal's half of the OpenAI OAuth flow.
+//! The terminal's half of the account logins.
 //!
 //! The order of the phases, what each result means, and what the wizard is
 //! told after each one live in [`rebon_plugin_onboarding::drive`]. What is
 //! left here is the only part of it that needs a terminal: reading crossterm
 //! events while a phase blocks, and turning them into the three answers the
 //! driver asks for — nothing happened, the user gave up, the user submitted a
-//! pasted callback.
+//! pasted callback — plus putting a device login's code on the clipboard.
 //!
 //! That split is not cosmetic. The key handling reads modifier bits and event
 //! kinds (Esc versus anything else, a bracketed paste versus typed
 //! characters) that the plugin has no vocabulary for, while the phase order is
-//! the same on any front end — the desktop app drives the same three phases
-//! from a GPUI event loop.
+//! the same on any front end — the desktop app drives the same phases from a
+//! GPUI event loop.
 //!
 //! Two callers own a terminal and use this: `run_startup_onboarding` (the
 //! blocking pre-session loop) and the in-session runner's `/login` dispatch.
 //! Both already run on a thread that may block, which is what lets the driver
-//! be synchronous on the outside; only the token-exchange POST is async, and
-//! the driver bridges that with the runtime handle passed in.
+//! be synchronous on the outside; the HTTP is async, and the driver bridges
+//! it with the runtime handle passed in.
 
 use std::time::Duration;
 
@@ -35,15 +35,28 @@ pub use drive::Outcome;
 /// listener thread or on a pasted callback.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Drive the full flow, painting through `redraw` and reading this process's
-/// terminal for the user's answers.
-pub fn drive_oauth_flow_blocking(
+/// Drive the login `login_id` names (an id from
+/// `rebon_config::account_login`'s table), painting through `redraw` and
+/// reading this process's terminal for the user's answers.
+pub fn drive_account_login_blocking(
     state: &mut OnboardingDialogState,
     runtime: &Handle,
+    login_id: &str,
     redraw: impl FnMut(&OnboardingDialogState) -> std::io::Result<()>,
 ) -> anyhow::Result<Outcome> {
     let mut host = TerminalOAuthHost { redraw };
-    drive::drive_oauth_flow_blocking(state, runtime, &mut host)
+    drive::drive_account_login_blocking(state, runtime, &mut host, login_id)
+}
+
+/// The login a start outcome names: the ChatGPT login for
+/// [`OnboardingDialogOutcome::StartOpenAIOAuth`], the named one for
+/// [`OnboardingDialogOutcome::StartAccountLogin`], `None` for anything else.
+pub fn login_to_start(outcome: &OnboardingDialogOutcome) -> Option<&'static str> {
+    match outcome {
+        OnboardingDialogOutcome::StartOpenAIOAuth => Some(rebon_config::CODEX_LOGIN_ID),
+        OnboardingDialogOutcome::StartAccountLogin(id) => Some(id),
+        _ => None,
+    }
 }
 
 struct TerminalOAuthHost<R: FnMut(&OnboardingDialogState) -> std::io::Result<()>> {
@@ -91,6 +104,19 @@ where
             _ => DriveInput::Idle,
         })
     }
+
+    /// The system clipboard, not OSC 52: the code is typed into a browser
+    /// on this machine, and a terminal that ignores OSC 52 would leave the
+    /// view claiming a copy that never happened.
+    fn offer_user_code(&mut self, user_code: &str) -> bool {
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(user_code)) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::debug!(error = %err, "device login: clipboard unavailable");
+                false
+            }
+        }
+    }
 }
 
 fn is_press(key: &KeyEvent) -> bool {
@@ -106,5 +132,23 @@ mod tests {
     fn is_press_filters_release_events() {
         let press = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert!(is_press(&press));
+    }
+
+    /// Both start outcomes name their login; nothing else starts one.
+    #[test]
+    fn each_start_outcome_names_its_login() {
+        assert_eq!(
+            login_to_start(&OnboardingDialogOutcome::StartOpenAIOAuth),
+            Some("openai")
+        );
+        assert_eq!(
+            login_to_start(&OnboardingDialogOutcome::StartAccountLogin("copilot")),
+            Some("copilot")
+        );
+        assert_eq!(
+            login_to_start(&OnboardingDialogOutcome::CancelOpenAIOAuth),
+            None
+        );
+        assert_eq!(login_to_start(&OnboardingDialogOutcome::None), None);
     }
 }

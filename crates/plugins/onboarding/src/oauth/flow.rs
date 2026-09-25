@@ -512,6 +512,27 @@ mod tests {
         );
     }
 
+    /// The account-login table's ChatGPT row and this flow's pinned
+    /// constants are one fact: if either moves, this fails.
+    #[test]
+    fn the_account_table_row_is_this_flows_constants() {
+        let codex = rebon_config::account_login::codex_login();
+        let rebon_config::AccountFlow::PkceLoopback {
+            authorize_url,
+            redirect_uri,
+            redirect_port,
+        } = codex.flow
+        else {
+            panic!("the ChatGPT login is a PKCE loopback flow");
+        };
+        assert_eq!(authorize_url, crate::onboarding::OPENAI_AUTHORIZE_URL);
+        assert_eq!(redirect_uri, crate::onboarding::OPENAI_REDIRECT_URI);
+        assert_eq!(redirect_port, OPENAI_REDIRECT_PORT);
+        assert_eq!(codex.client_id, crate::onboarding::OPENAI_CLIENT_ID);
+        assert_eq!(codex.scopes, crate::onboarding::OPENAI_SCOPES);
+        assert_eq!(codex.token_url, OPENAI_TOKEN_URL);
+    }
+
     #[test]
     fn random_32_returns_distinct_bytes_across_calls() {
         // Overwhelmingly probable with 256 bits of entropy; a

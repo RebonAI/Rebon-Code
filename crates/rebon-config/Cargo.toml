@@ -24,8 +24,9 @@ serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
+# The blocking form of an account-login refresh builds its own runtime, the
+# way a model listing does; tokio is already in the graph through reqwest.
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-# Only for the async OAuth-refresh tests.
-tokio.workspace = true

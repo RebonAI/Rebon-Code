@@ -56,6 +56,7 @@ use crate::error::{ModelError, ModelResult};
 use crate::events::{
     ContentBlockDelta, ContentBlockStart, MessageDeltaFields, StreamEvent, StreamEventStream,
 };
+use crate::openai_responses::TokenRefresher;
 use crate::provider::{classify_http_error, ChatProvider, UniversalModelClient};
 use crate::request::CreateMessageRequest;
 use crate::sse::{decode_sse_stream, SseDecoder, SseFrame};
@@ -264,6 +265,11 @@ pub struct OpenAiCompatibleClientConfig {
     /// fields the vendor rejects, reasoning replay and cache protection
     /// (see [`crate::vendor`]).
     pub vendor: ProviderVendor,
+    /// Mints a fresh bearer when the endpoint answers `401`: the request is
+    /// retried once with it. Set for account logins whose request token is
+    /// short-lived (a Copilot session token lasts about half an hour), so a
+    /// long session recovers instead of failing every turn after expiry.
+    pub refresher: Option<Arc<dyn TokenRefresher>>,
 }
 
 impl Default for OpenAiCompatibleClientConfig {
@@ -282,6 +288,7 @@ impl Default for OpenAiCompatibleClientConfig {
             request_scoped_transient_context: true,
             compat: ChatCompletionsCompat::OPENAI,
             vendor: ProviderVendor::Unknown,
+            refresher: None,
         }
     }
 }
@@ -321,12 +328,17 @@ impl OpenAiCompatibleClientConfig {
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatibleProvider {
     config: Arc<OpenAiCompatibleClientConfig>,
+    /// The bearer every request carries. Starts as `config.api_key` and is
+    /// replaced when [`OpenAiCompatibleClientConfig::refresher`] mints a new
+    /// one; shared with sub-agent forks so one refresh serves them all.
+    bearer: Arc<std::sync::Mutex<String>>,
 }
 
 impl OpenAiCompatibleProvider {
     /// Construct from a config.
     pub fn new(config: OpenAiCompatibleClientConfig) -> Self {
         Self {
+            bearer: Arc::new(std::sync::Mutex::new(config.api_key.clone())),
             config: Arc::new(config),
         }
     }
@@ -339,7 +351,9 @@ impl OpenAiCompatibleProvider {
     fn endpoint(&self) -> String {
         let base = self.config.base_url.trim_end_matches('/');
         let last_segment = base.rsplit('/').next().unwrap_or_default();
-        if last_segment
+        if self.config.effective_vendor().api_root_is_unversioned() {
+            format!("{base}/chat/completions")
+        } else if last_segment
             .strip_prefix('v')
             .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()))
         {
@@ -384,25 +398,7 @@ impl ChatProvider for OpenAiCompatibleProvider {
         }
         let body = build_openai_request_body(&request, &config);
         emit_openai_chat_request_shape_trace(&request, &config, &body);
-        let mut http_req = http
-            .post(self.endpoint())
-            .header("Authorization", format!("Bearer {}", config.api_key))
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .json(&body);
-        if let Some(org) = &config.organization {
-            http_req = http_req.header("OpenAI-Organization", org);
-        }
-        for (name, value) in &config.extra_headers {
-            http_req = http_req.header(name, value);
-        }
-        let response = http_req.send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            let retry_after = crate::error::parse_retry_after(response.headers());
-            let text = response.text().await.unwrap_or_default();
-            return Err(classify_http_error(status.as_u16(), text, retry_after));
-        }
+        let response = self.post_chat(http, &config, &body).await?;
 
         let byte_stream = response
             .bytes_stream()
@@ -424,7 +420,67 @@ impl ChatProvider for OpenAiCompatibleProvider {
                 prompt_cache_key,
                 ..self.config.as_ref().clone()
             }),
+            bearer: Arc::clone(&self.bearer),
         }))
+    }
+}
+
+impl OpenAiCompatibleProvider {
+    /// POST one chat-completions request and hand back the successful
+    /// response.
+    ///
+    /// A `401` with a refresher attached mints a new bearer and retries once;
+    /// a second `401`, a refresher that fails, and every other status end
+    /// the call classified as usual. Only `401` refreshes: a `403` says the
+    /// credential is valid but not allowed, which a new token does not fix.
+    async fn post_chat(
+        &self,
+        http: &reqwest::Client,
+        config: &OpenAiCompatibleClientConfig,
+        body: &Value,
+    ) -> ModelResult<reqwest::Response> {
+        let mut refreshed = false;
+        loop {
+            let bearer = self
+                .bearer
+                .lock()
+                .expect("openai-compatible bearer mutex poisoned")
+                .clone();
+            let mut http_req = http
+                .post(self.endpoint())
+                .header("Authorization", format!("Bearer {bearer}"))
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .json(body);
+            if let Some(org) = &config.organization {
+                http_req = http_req.header("OpenAI-Organization", org);
+            }
+            for (name, value) in &config.extra_headers {
+                http_req = http_req.header(name, value);
+            }
+            let response = http_req.send().await?;
+            let status = response.status();
+            if status.is_success() {
+                return Ok(response);
+            }
+            if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
+                if let Some(refresher) = config.refresher.as_ref() {
+                    let fresh = refresher.refresh().await.map_err(|msg| {
+                        ModelError::Unauthorized(format!("token refresh failed: {msg}"))
+                    })?;
+                    *self
+                        .bearer
+                        .lock()
+                        .expect("openai-compatible bearer mutex poisoned") = fresh;
+                    refreshed = true;
+                    tracing::info!("openai-compatible: got 401, refreshed the bearer and retrying");
+                    continue;
+                }
+            }
+            let retry_after = crate::error::parse_retry_after(response.headers());
+            let text = response.text().await.unwrap_or_default();
+            return Err(classify_http_error(status.as_u16(), text, retry_after));
+        }
     }
 }
 
@@ -2661,6 +2717,38 @@ mod tests {
         );
     }
 
+    /// Copilot's chat API has no version segment, so a bare host must not
+    /// grow a `/v1` — while every other bare host still does.
+    #[test]
+    fn copilot_endpoint_hangs_off_the_host_without_a_version() {
+        for base in [
+            "https://api.githubcopilot.com",
+            "https://api.githubcopilot.com/",
+            "https://api.individual.githubcopilot.com",
+        ] {
+            let provider = OpenAiCompatibleProvider::new(
+                OpenAiCompatibleClientConfig::with_base_url(base, "t"),
+            );
+            assert_eq!(
+                provider.endpoint(),
+                format!("{}/chat/completions", base.trim_end_matches('/'))
+            );
+        }
+        // A pin wins over the host, in both directions.
+        let mut pinned =
+            OpenAiCompatibleClientConfig::with_base_url("https://relay.example.com", "t");
+        pinned.vendor = ProviderVendor::GithubCopilot;
+        assert_eq!(
+            OpenAiCompatibleProvider::new(pinned).endpoint(),
+            "https://relay.example.com/chat/completions"
+        );
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleClientConfig::with_base_url(
+            "https://api.x.ai",
+            "t",
+        ));
+        assert_eq!(provider.endpoint(), "https://api.x.ai/v1/chat/completions");
+    }
+
     #[test]
     fn convert_assistant_message_emits_tool_calls_array() {
         let msg = Message {
@@ -2745,6 +2833,190 @@ mod tests {
                 .unwrap();
         });
         (format!("http://{addr}"), task)
+    }
+
+    const DONE_SSE: &str = concat!(
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// Serves one scripted `(status, body)` per connection, in order, and
+    /// records each request's `Authorization` header.
+    async fn start_scripted_server(
+        replies: Vec<(u16, &'static str)>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        tokio::spawn(async move {
+            for (status, body) in replies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let read = tokio::io::AsyncReadExt::read(&mut stream, &mut chunk)
+                        .await
+                        .unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&buffer);
+                    if let Some(head_end) = text.find("\r\n\r\n") {
+                        let length = text[..head_end]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if buffer.len() >= head_end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&buffer).to_string();
+                let auth = text
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("authorization")
+                            .then(|| value.trim().to_string())
+                    })
+                    .unwrap_or_default();
+                recorded.lock().unwrap().push(auth);
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        (format!("http://{addr}/v1"), seen)
+    }
+
+    #[derive(Debug)]
+    struct ScriptedRefresher {
+        calls: std::sync::atomic::AtomicUsize,
+        answer: Result<&'static str, &'static str>,
+    }
+
+    #[async_trait]
+    impl TokenRefresher for ScriptedRefresher {
+        async fn refresh(&self) -> Result<String, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.answer.map(str::to_string).map_err(str::to_string)
+        }
+    }
+
+    fn refreshing_client(
+        base_url: String,
+        answer: Result<&'static str, &'static str>,
+    ) -> (UniversalModelClient, Arc<ScriptedRefresher>) {
+        let refresher = Arc::new(ScriptedRefresher {
+            calls: Default::default(),
+            answer,
+        });
+        let mut config = OpenAiCompatibleClientConfig::with_base_url(base_url, "stale");
+        config.refresher = Some(refresher.clone());
+        (openai_compatible_client(config), refresher)
+    }
+
+    /// The expired-session path: one 401, one refresh, the same request
+    /// again with the new bearer, and the fresh bearer kept for next time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_401_refreshes_the_bearer_and_retries_once() {
+        let (base, seen) =
+            start_scripted_server(vec![(401, "expired"), (200, DONE_SSE), (200, DONE_SSE)]).await;
+        let (client, refresher) = refreshing_client(base, Ok("fresh"));
+
+        client
+            .create_message(CreateMessageRequest::simple("m", "ping"))
+            .await
+            .expect("the retry succeeds");
+        client
+            .create_message(CreateMessageRequest::simple("m", "again"))
+            .await
+            .expect("the next turn reuses the fresh bearer");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["Bearer stale", "Bearer fresh", "Bearer fresh"]
+        );
+        assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A second 401 is the answer, not a reason to loop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_401_ends_the_call_without_another_refresh() {
+        let (base, seen) = start_scripted_server(vec![(401, "no"), (401, "still no")]).await;
+        let (client, refresher) = refreshing_client(base, Ok("fresh"));
+
+        let err = client
+            .create_message(CreateMessageRequest::simple("m", "ping"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ModelError::Unauthorized(_)), "{err:?}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_refresh_is_reported_as_unauthorized() {
+        let (base, seen) = start_scripted_server(vec![(401, "no")]).await;
+        let (client, _refresher) = refreshing_client(base, Err("login required"));
+
+        let err = client
+            .create_message(CreateMessageRequest::simple("m", "ping"))
+            .await
+            .unwrap_err();
+
+        match err {
+            ModelError::Unauthorized(message) => assert!(message.contains("login required")),
+            other => panic!("expected Unauthorized, got {other:?}"),
+        }
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// 403 means "valid but not allowed" (a model the plan does not
+    /// include); a new token would not change the answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_403_does_not_refresh() {
+        let (base, seen) = start_scripted_server(vec![(403, "forbidden")]).await;
+        let (client, refresher) = refreshing_client(base, Ok("fresh"));
+
+        let err = client
+            .create_message(CreateMessageRequest::simple("m", "ping"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ModelError::Unauthorized(_)));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// Without a refresher a 401 is returned as before — no retry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_refresher_a_401_is_returned_unchanged() {
+        let (base, seen) = start_scripted_server(vec![(401, "no")]).await;
+        let client =
+            openai_compatible_client(OpenAiCompatibleClientConfig::with_base_url(base, "k"));
+
+        let err = client
+            .create_message(CreateMessageRequest::simple("m", "ping"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ModelError::Unauthorized(_)));
+        assert_eq!(*seen.lock().unwrap(), vec!["Bearer k"]);
     }
 
     #[tokio::test]

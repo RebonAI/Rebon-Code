@@ -374,6 +374,15 @@ enum Command {
         #[command(subcommand)]
         command: rebon_plugin_remote::cli::RemoteCommand,
     },
+    /// Sign in with a subscription account (ChatGPT, GitHub Copilot).
+    ///
+    /// `rebon login` asks which account, `rebon login copilot` names one,
+    /// and `rebon login --status` shows which are signed in. Works before
+    /// any provider is configured, which is when it is needed.
+    Login(rebon_plugin_onboarding::cli::LoginArgs),
+    /// Sign out of a subscription account. The provider entry it created
+    /// stays, so signing in again restores it.
+    Logout(rebon_plugin_onboarding::cli::LogoutArgs),
     /// Deprecated shell for `rebon-computer-use`. Removed in 0.26.
     ///
     /// The runtime drives a desktop window the user picks; the `ComputerUse`
@@ -1109,6 +1118,8 @@ async fn run_headless_command(command: Command) -> anyhow::Result<()> {
         }
         Command::Plugin { command } => run_plugin_command(command).await,
         Command::Remote { command } => rebon_plugin_remote::cli::run_remote_command(command),
+        Command::Login(args) => rebon_plugin_onboarding::cli::run_login(args).await,
+        Command::Logout(args) => rebon_plugin_onboarding::cli::run_logout(args),
         Command::ComputerUse { args } => {
             sibling_command::forward_to_sibling("computer-use", COMPUTER_USE_SIBLING, args)
         }
@@ -2467,6 +2478,38 @@ mod tests {
                     name: "prod".to_string()
                 }
             })
+        );
+    }
+
+    #[test]
+    fn login_and_logout_parse_as_subcommands() {
+        assert_eq!(
+            Cli::parse_from(["rebon", "login"]).command,
+            Some(Command::Login(rebon_plugin_onboarding::cli::LoginArgs {
+                account: None,
+                status: false,
+            }))
+        );
+        assert_eq!(
+            Cli::parse_from(["rebon", "login", "copilot"]).command,
+            Some(Command::Login(rebon_plugin_onboarding::cli::LoginArgs {
+                account: Some("copilot".to_string()),
+                status: false,
+            }))
+        );
+        assert_eq!(
+            Cli::parse_from(["rebon", "login", "--status"]).command,
+            Some(Command::Login(rebon_plugin_onboarding::cli::LoginArgs {
+                account: None,
+                status: true,
+            }))
+        );
+        assert!(Cli::try_parse_from(["rebon", "login", "copilot", "--status"]).is_err());
+        assert_eq!(
+            Cli::parse_from(["rebon", "logout", "openai"]).command,
+            Some(Command::Logout(rebon_plugin_onboarding::cli::LogoutArgs {
+                account: Some("openai".to_string()),
+            }))
         );
     }
 

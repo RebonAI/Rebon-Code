@@ -92,6 +92,11 @@ pub enum OnboardingDialogOutcome {
     /// User hit Esc in any OAuth sub-view. Runner should drop the
     /// listener / in-flight request and discard the PKCE challenge.
     CancelOpenAIOAuth,
+    /// User picked an account login other than the ChatGPT one (its id in
+    /// `rebon_config::account_login`'s table). Runner should drive it with
+    /// [`crate::drive::drive_account_login_blocking`], which reports each
+    /// phase back through the same `report_oauth_*` methods.
+    StartAccountLogin(&'static str),
     /// User confirmed the Migration step with a set of categories
     /// selected. Runner should run
     /// [`crate::migrate::perform_migration`] against

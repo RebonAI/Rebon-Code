@@ -29,6 +29,6 @@ pub mod state;
 
 pub use outcome::{OnboardingDialogOutcome, OnboardingStepTransition};
 pub use state::{
-    ExistingSetupChoice, OAuthView, OnboardingDialogState, OnboardingOpenInputs, PanelStatus,
-    ProviderFormState, ProviderPresetSelection, ProviderSnapshot, PROVIDER_FORMATS,
+    login_outcome, ExistingSetupChoice, OAuthView, OnboardingDialogState, OnboardingOpenInputs,
+    PanelStatus, ProviderFormState, ProviderPresetSelection, ProviderSnapshot, PROVIDER_FORMATS,
 };

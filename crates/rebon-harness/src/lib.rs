@@ -259,7 +259,7 @@ pub struct RuntimeModel {
     /// scope rather than a process, so it costs a `scope/open` instead of a
     /// spawn.
     ///
-    /// OAuth providers outside the Responses format have no 401-refresh
+    /// OAuth providers on the Anthropic format have no 401-refresh
     /// middleware, so a cached client could never rotate an expired token.
     ///
     /// Never written by hand: [`provider_runtime_cacheable`] is the rule, and
@@ -311,7 +311,7 @@ fn images_endpoint_for(
     rebon_config::is_first_party_openai_route(
         resolved.format,
         &resolved.base_url,
-        resolved.oauth.is_some(),
+        resolved.has_codex_login(),
         resolved.provider_selection.is_external(),
     )
     .then(|| {
@@ -329,7 +329,7 @@ pub fn openai_service_tier_available(resolved: &ResolvedProvider) -> bool {
     rebon_config::openai_service_tier_available(
         resolved.format,
         &resolved.base_url,
-        resolved.oauth.is_some(),
+        resolved.has_codex_login(),
         resolved.provider_selection.is_external(),
     )
 }
@@ -717,14 +717,15 @@ fn build_provider_registry_from_contributions(
 ///   shares the scope. Collapsing the two dialects onto one transport did not
 ///   change this: `LlmRoute` moved the *wire*, and the scope is still per
 ///   client.
-/// * **OAuth outside the Responses format**, which has no 401-refresh
-///   middleware, so a cached client could never rotate an expired token.
+/// * **OAuth on the Anthropic format**, whose client has no 401-refresh
+///   middleware, so a cached client could never rotate an expired token. The
+///   Responses and chat-completions clients both renew on a 401.
 fn provider_runtime_cacheable(
     external_provider: bool,
     oauth: bool,
     format: ProviderFormat,
 ) -> bool {
-    !external_provider && (!oauth || format == ProviderFormat::OpenaiResponses)
+    !external_provider && (!oauth || format != ProviderFormat::Anthropic)
 }
 
 /// Stop the process-wide plugin plane, if this process started one.
@@ -1462,9 +1463,9 @@ fn compact_token_refresher(
 ) -> Option<Arc<dyn TokenRefresher>> {
     let oauth = resolved.oauth.as_ref()?;
     Some(Arc::new(
-        rebon_provider::oauth_refresher::RebonOAuthRefresher::new(
+        rebon_provider::oauth_refresher::RebonOAuthRefresher::for_login(
             config_dir.to_path_buf(),
-            oauth.refresh_token.clone(),
+            oauth,
         ),
     ))
 }
@@ -1591,6 +1592,7 @@ fn build_model_compact_provider(
             config.request_options = resolved.request_options.clone();
             config.model_request_options = resolved.model_request_options.clone();
             config.service_tier = service_tier;
+            config.refresher = compact_token_refresher(config_dir, resolved);
             let client: Arc<dyn ModelClient> = Arc::new(openai_compatible_client(config));
             Some(Arc::new(
                 rebon_api::ModelCompactProvider::new(client, &compact_model)
@@ -3374,6 +3376,70 @@ mod tests {
             compact_model_for_provider("fake-small", "fake-large"),
             "fake-small"
         );
+    }
+
+    /// Which runtimes may be shared across sub-agent spawns: never an external
+    /// client, and an account login only where its client renews a 401.
+    #[test]
+    fn runtime_cacheability_follows_the_401_refresh_middleware() {
+        for format in [
+            ProviderFormat::Openai,
+            ProviderFormat::OpenaiResponses,
+            ProviderFormat::Anthropic,
+        ] {
+            assert!(
+                provider_runtime_cacheable(false, false, format),
+                "{format:?}"
+            );
+            assert!(
+                !provider_runtime_cacheable(true, false, format),
+                "{format:?}"
+            );
+            assert!(
+                !provider_runtime_cacheable(true, true, format),
+                "{format:?}"
+            );
+        }
+        assert!(provider_runtime_cacheable(
+            false,
+            true,
+            ProviderFormat::OpenaiResponses
+        ));
+        assert!(provider_runtime_cacheable(
+            false,
+            true,
+            ProviderFormat::Openai
+        ));
+        assert!(!provider_runtime_cacheable(
+            false,
+            true,
+            ProviderFormat::Anthropic
+        ));
+    }
+
+    /// Regression: another account login on the Codex host gets neither the
+    /// fast tier nor the Images API — both belong to the ChatGPT login.
+    #[test]
+    fn codex_only_features_ignore_other_account_logins() {
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        let copilot = rebon_config::account_login(rebon_config::COPILOT_LOGIN_ID).unwrap();
+        let mut resolved =
+            responses_provider(rebon_config::OPENAI_OAUTH_PROVIDER_BASE_URL.to_string());
+        resolved.oauth = Some(rebon_config::OAuthMeta {
+            provider: copilot,
+            expires_at_ms: None,
+            refresh_token: Some("gho".into()),
+        });
+        assert!(!openai_service_tier_available(&resolved));
+        assert!(images_endpoint_for(config_dir.path(), &resolved).is_none());
+
+        resolved.oauth = Some(rebon_config::OAuthMeta {
+            provider: rebon_config::account_login::codex_login(),
+            expires_at_ms: None,
+            refresh_token: Some("r".into()),
+        });
+        assert!(openai_service_tier_available(&resolved));
+        assert!(images_endpoint_for(config_dir.path(), &resolved).is_some());
     }
 
     fn responses_provider(base_url: String) -> ResolvedProvider {

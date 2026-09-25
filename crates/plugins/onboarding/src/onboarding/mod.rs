@@ -74,6 +74,8 @@
 //! struct from the JSON) and `expires_at_from_response`. Hand-rolled
 //! parser so we don't have to take a serde dep — keeps the crate
 //! dependency-light.
+//! * [`device_code`] — the device authorization grant (RFC 8628): what a
+//! poll answered and how long to wait before the next one.
 //! * [`dialog_state`] — the wizard's step, pane and field vocabulary,
 //! and the login-method picker's options and row grouping.
 //! * [`text_field`] — the single-line text input the wizard's forms use.
@@ -89,6 +91,7 @@
 //! this module names and drives the transitions.
 
 pub mod code_parser;
+pub mod device_code;
 pub mod dialog_state;
 pub mod oauth_url;
 pub mod pkce;

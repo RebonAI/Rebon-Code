@@ -6,8 +6,8 @@
 
 use crate::migrate::{DiscoverySnapshot, ImportCategory, ImportSummary};
 use crate::onboarding::{
-    actionable_login_options, grouped_login_pane_rows, LoginMethodOption, ProviderField,
-    ProviderFormMode, SetupPane, Step, TextField,
+    actionable_login_options, grouped_login_pane_rows, LoginMethodOption, LoginPaneRow,
+    ProviderField, ProviderFormMode, SetupPane, Step, TextField,
 };
 use crate::onboarding::{normalize_single_line_paste, PRESET_ROWS_VISIBLE};
 use rebon_design_system::theme::ThemeName;
@@ -77,6 +77,14 @@ pub enum OAuthView {
         authorize_url: String,
         input: TextField,
         error: Option<String>,
+    },
+    /// A device-code login is waiting for the user to enter `user_code` at
+    /// `verification_uri` and approve. `copied` says the host put the code
+    /// on the clipboard, so the view can say so.
+    DeviceCode {
+        verification_uri: String,
+        user_code: String,
+        copied: bool,
     },
     /// Token-exchange POST in flight.
     Exchanging,
@@ -180,6 +188,10 @@ pub struct OnboardingDialogState {
     /// Esc, by `report_oauth_success`, or by the runner calling
     /// [`OnboardingDialogState::clear_oauth_view`].
     pub oauth_view: Option<OAuthView>,
+    /// Which account login the OAuth sub-view belongs to (an id from
+    /// `rebon_config::account_login`'s table): what the view is titled,
+    /// what the success banner names, and what a retry starts again.
+    pub oauth_login: &'static str,
 
     // Migration step state.
     /// Counts + absolute source paths per category. Computed once
@@ -363,6 +375,20 @@ fn provider_preset_options() -> Vec<ProviderPresetSelection> {
     options
 }
 
+/// What picking login `id` in the picker asks the runner to do: the
+/// ChatGPT login keeps its own outcome, every other one names itself.
+/// `None` for an id the table does not know.
+pub fn login_outcome(id: &str) -> Option<OnboardingDialogOutcome> {
+    let spec = rebon_config::account_logins()
+        .iter()
+        .find(|spec| spec.id == id)?;
+    Some(if spec.is_codex() {
+        OnboardingDialogOutcome::StartOpenAIOAuth
+    } else {
+        OnboardingDialogOutcome::StartAccountLogin(spec.id)
+    })
+}
+
 /// Content rows `render_oauth_view` emits for `view`, used to size the
 /// inline host. Mirrors that method line for line — the OAuth sub-views
 /// are the tallest thing the `/login` dialog shows, so an inline host
@@ -373,6 +399,7 @@ fn oauth_view_content_lines(view: &OAuthView) -> usize {
         OAuthView::StartingBrowser { .. } => 6,
         OAuthView::WaitingCallback { .. } => 7,
         OAuthView::AwaitingPaste { error, .. } => 10 + usize::from(error.is_some()),
+        OAuthView::DeviceCode { copied, .. } => 6 + usize::from(*copied),
         OAuthView::Exchanging => 5,
         OAuthView::Error { .. } => 4,
     }
@@ -436,6 +463,7 @@ impl OnboardingDialogState {
             add_provider_status: PanelStatus::None,
             add_model_status: PanelStatus::None,
             oauth_view: None,
+            oauth_login: rebon_config::CODEX_LOGIN_ID,
             migration_snapshot: DiscoverySnapshot::default(),
             migration_selected: [false; 5],
             migration_focus: 0,
@@ -516,6 +544,7 @@ impl OnboardingDialogState {
             add_provider_status: PanelStatus::None,
             add_model_status: PanelStatus::None,
             oauth_view: None,
+            oauth_login: rebon_config::CODEX_LOGIN_ID,
             migration_snapshot,
             migration_selected,
             migration_focus: 0,
@@ -559,6 +588,7 @@ impl OnboardingDialogState {
             add_provider_status: PanelStatus::None,
             add_model_status: PanelStatus::None,
             oauth_view: None,
+            oauth_login: rebon_config::CODEX_LOGIN_ID,
             migration_snapshot: DiscoverySnapshot::default(),
             migration_selected: [false; 5],
             migration_focus: 0,
@@ -634,6 +664,7 @@ impl OnboardingDialogState {
             add_provider_status: PanelStatus::None,
             add_model_status: PanelStatus::None,
             oauth_view: None,
+            oauth_login: rebon_config::CODEX_LOGIN_ID,
             migration_snapshot,
             migration_selected,
             migration_focus: 0,
@@ -1307,6 +1338,51 @@ impl OnboardingDialogState {
         });
     }
 
+    /// Show the device-code view: the page to open and the code to type.
+    pub fn report_oauth_device_code(
+        &mut self,
+        verification_uri: String,
+        user_code: String,
+        copied: bool,
+    ) {
+        self.oauth_view = Some(OAuthView::DeviceCode {
+            verification_uri,
+            user_code,
+            copied,
+        });
+    }
+
+    /// The account login the sub-view belongs to.
+    pub fn oauth_login_spec(&self) -> &'static rebon_config::AccountLoginSpec {
+        rebon_config::account_login(self.oauth_login)
+            .unwrap_or_else(rebon_config::account_login::codex_login)
+    }
+
+    /// What starting (or retrying) the current login asks the runner to do.
+    pub fn oauth_login_outcome(&self) -> OnboardingDialogOutcome {
+        login_outcome(self.oauth_login_spec().id)
+            .expect("oauth_login_spec answers a row of the table")
+    }
+
+    /// Put the login pane's focus on login `id`'s row, so `/login <account>`
+    /// opens with that account one Enter away. Returns whether the pane
+    /// lists it; the focus is left alone when it does not.
+    pub fn focus_login(&mut self, id: &str) -> bool {
+        let position = grouped_login_pane_rows(&self.login_options)
+            .into_iter()
+            .filter(|row| !matches!(row, LoginPaneRow::Header(_)))
+            .position(|row| {
+                matches!(row, LoginPaneRow::Option(index) if self.login_options[index].value == id)
+            });
+        match position {
+            Some(position) => {
+                self.login_focus = position;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Transition to `Exchanging`. Runner calls this right before it
     /// POSTs the authorization code to the token endpoint.
     pub fn report_oauth_exchanging(&mut self) {
@@ -1325,7 +1401,10 @@ impl OnboardingDialogState {
         self.setup_pane = SetupPane::LoginMethods;
         self.provider_ready = true;
         self.refresh_provider_snapshot(providers);
-        self.add_provider_status = PanelStatus::Ok("OpenAI account connected.".into());
+        self.add_provider_status = PanelStatus::Ok(format!(
+            "{} connected.",
+            self.oauth_login_spec().picker_label
+        ));
         // Mirror the multi-step advance that `AddProvider` does on
         // success — in wizard mode (Theme → Provider → Security)
         // this moves us to Security; in the stand-alone /login
@@ -1385,6 +1464,7 @@ impl OnboardingDialogState {
                 OAuthView::StartingBrowser { .. } => "Esc cancel".to_string(),
                 OAuthView::WaitingCallback { .. } => "Esc cancel".to_string(),
                 OAuthView::AwaitingPaste { .. } => "Enter submit · Esc cancel".to_string(),
+                OAuthView::DeviceCode { .. } => "Esc cancel".to_string(),
                 OAuthView::Exchanging => "…".to_string(),
                 OAuthView::Error { can_retry, .. } => {
                     if *can_retry {
@@ -1437,5 +1517,67 @@ impl OnboardingDialogState {
             Some(Step::Done) => "Enter finish · Left review · Esc close".to_string(),
             None => "Esc close".to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::onboarding::login_row_for_focus;
+
+    fn login_pane() -> OnboardingDialogState {
+        OnboardingDialogState::open_for_login_pane_from(OnboardingOpenInputs::default())
+    }
+
+    /// Every account login can be focused by id, and the focused row is
+    /// the one Enter would start.
+    #[test]
+    fn focus_login_lands_on_each_logins_row() {
+        let mut state = login_pane();
+        for spec in rebon_config::account_logins() {
+            assert!(state.focus_login(spec.id), "{}", spec.id);
+            let LoginPaneRow::Option(index) =
+                login_row_for_focus(&state.login_options, state.login_focus)
+            else {
+                panic!("{} focused a non-option row", spec.id);
+            };
+            assert_eq!(state.login_options[index].value, spec.id);
+        }
+    }
+
+    #[test]
+    fn an_unlisted_login_leaves_the_focus_alone() {
+        let mut state = login_pane();
+        assert!(state.focus_login("copilot"));
+        let before = state.login_focus;
+        assert!(!state.focus_login("gemini"));
+        assert_eq!(state.login_focus, before);
+    }
+
+    /// A fresh pane belongs to the ChatGPT login until a flow names
+    /// another, so a retry with nothing chosen restarts the ChatGPT flow.
+    #[test]
+    fn the_pane_starts_on_the_chatgpt_login() {
+        let state = login_pane();
+        assert!(state.oauth_login_spec().is_codex());
+        assert_eq!(
+            state.oauth_login_outcome(),
+            OnboardingDialogOutcome::StartOpenAIOAuth
+        );
+    }
+
+    /// The device view is sized like the others: its lines, plus one when
+    /// the code was copied.
+    #[test]
+    fn the_device_view_reserves_a_line_for_the_copy_note() {
+        let view = |copied| OAuthView::DeviceCode {
+            verification_uri: "https://github.com/login/device".into(),
+            user_code: "ABCD-1234".into(),
+            copied,
+        };
+        assert_eq!(
+            oauth_view_content_lines(&view(true)),
+            oauth_view_content_lines(&view(false)) + 1
+        );
     }
 }

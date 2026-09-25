@@ -17,6 +17,7 @@
 //! [`flow::exchange_and_persist_blocking`] wraps it in a private runtime for
 //! callers that have no reactor of their own (the GPUI app).
 
+pub mod device;
 pub mod flow;
 pub mod listener;
 
