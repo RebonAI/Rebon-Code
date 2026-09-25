@@ -415,6 +415,10 @@ pub struct ServerState {
     /// reads a cell rather than the record.
     permission_mode_cells:
         Mutex<HashMap<SessionId, Arc<Mutex<rebon_permissions::types::PermissionMode>>>>,
+    /// Per-session publishers told every mode a record takes, after the
+    /// record and its cell have it. See
+    /// [`ServerState::attach_permission_mode_publisher`].
+    permission_mode_publishers: Mutex<HashMap<SessionId, PermissionModePublisher>>,
     active_prompts: Mutex<HashMap<SessionId, PromptGeneration>>,
     /// Per-session count of `session/cancel` notifications received.
     ///
@@ -450,6 +454,23 @@ pub struct ServerState {
     /// Lock order: never take this while holding `sessions`; the claim path
     /// reads `sessions` first, releases it, then takes this.
     session_locks: Mutex<HashMap<SessionId, SessionActiveLock>>,
+}
+
+/// Told the mode a session's record just took. See
+/// [`ServerState::attach_permission_mode_publisher`].
+#[derive(Clone)]
+pub struct PermissionModePublisher(Arc<dyn Fn(&str) + Send + Sync>);
+
+impl PermissionModePublisher {
+    pub fn new(publish: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(publish))
+    }
+}
+
+impl std::fmt::Debug for PermissionModePublisher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PermissionModePublisher")
+    }
 }
 
 /// What a refused claim knows about the process that holds the session.
@@ -500,6 +521,7 @@ impl ServerState {
             ownership_root: OnceLock::new(),
             session_locks: Mutex::new(HashMap::new()),
             permission_mode_cells: Mutex::new(HashMap::new()),
+            permission_mode_publishers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -555,6 +577,38 @@ impl ServerState {
             .lock()
             .expect("permission mode cell map mutex poisoned")
             .insert(sid.to_string(), cell);
+    }
+
+    /// Register who has to hear about a session's mode beyond this process.
+    ///
+    /// The cell keeps the gate in step with the record; nothing kept the
+    /// *host* in step. A background job rebuilds its session from the job
+    /// record every turn, and only a mode set over IPC ever reached that
+    /// record — so a plan the user approved with "auto" was running in plan
+    /// again one turn later, and a plan the model entered was forgotten the
+    /// same way. The publisher is how a tool-driven move gets to wherever
+    /// the host keeps the mode, and to the clients watching it.
+    ///
+    /// Called after the record and the cell have the mode, with no lock
+    /// held, so it may take locks of its own. Last registration for a
+    /// session id wins, as with the cell.
+    pub fn attach_permission_mode_publisher(&self, sid: &str, publisher: PermissionModePublisher) {
+        self.permission_mode_publishers
+            .lock()
+            .expect("permission mode publisher map mutex poisoned")
+            .insert(sid.to_string(), publisher);
+    }
+
+    fn publish_permission_mode(&self, sid: &str, mode: &str) {
+        let publisher = self
+            .permission_mode_publishers
+            .lock()
+            .expect("permission mode publisher map mutex poisoned")
+            .get(sid)
+            .cloned();
+        if let Some(publisher) = publisher {
+            (publisher.0)(mode);
+        }
     }
 
     /// Write `mode` into the session's registered cell, if it has one.
@@ -2031,6 +2085,7 @@ impl ServerState {
         // nothing to shadow.
         if applied {
             self.mirror_permission_mode(sid, mode);
+            self.publish_permission_mode(sid, mode);
         }
         applied
     }
@@ -2522,6 +2577,74 @@ mod tests {
         // And back out again, so the cell tracks rather than latches.
         assert!(s.set_permission_mode(&rec.id, "default"));
         assert_eq!(*cell.lock().unwrap(), PermissionMode::Default);
+    }
+
+    /// A host that rebuilds the session from its own record has to hear a
+    /// tool-driven move, or the next turn is built in the mode the session
+    /// left. The publisher hears it after the cell, so whatever it reads
+    /// back already agrees.
+    #[test]
+    fn a_registered_publisher_hears_every_mode_the_record_takes() {
+        use rebon_permissions::types::PermissionMode;
+
+        let s = ServerState::new();
+        let rec = s.create_session("/tmp/w".into(), Vec::new());
+        let cell = Arc::new(Mutex::new(PermissionMode::Default));
+        s.attach_permission_mode_cell(&rec.id, Arc::clone(&cell));
+        let heard = Arc::new(Mutex::new(Vec::<(String, PermissionMode)>::new()));
+        let publisher_heard = Arc::clone(&heard);
+        let publisher_cell = Arc::clone(&cell);
+        s.attach_permission_mode_publisher(
+            &rec.id,
+            PermissionModePublisher::new(move |mode| {
+                let in_cell = *publisher_cell.lock().unwrap();
+                publisher_heard
+                    .lock()
+                    .unwrap()
+                    .push((mode.to_string(), in_cell));
+            }),
+        );
+
+        assert!(s.set_permission_mode(&rec.id, "plan"));
+        assert!(s.set_permission_mode(&rec.id, "auto"));
+        assert!(!s.set_permission_mode("sess-missing", "default"));
+
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec![
+                ("plan".to_string(), PermissionMode::Plan),
+                ("auto".to_string(), PermissionMode::Auto),
+            ]
+        );
+    }
+
+    /// Another session's publisher stays out of it, and the last one
+    /// registered for a session is the one that hears.
+    #[test]
+    fn a_publisher_hears_only_its_own_session_and_the_latest_wins() {
+        let s = ServerState::new();
+        let first = s.create_session("/tmp/w".into(), Vec::new());
+        let second = s.create_session("/tmp/w".into(), Vec::new());
+        let heard = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stale = Arc::clone(&heard);
+        s.attach_permission_mode_publisher(
+            &first.id,
+            PermissionModePublisher::new(move |mode| {
+                stale.lock().unwrap().push(format!("stale:{mode}"));
+            }),
+        );
+        let live = Arc::clone(&heard);
+        s.attach_permission_mode_publisher(
+            &first.id,
+            PermissionModePublisher::new(move |mode| {
+                live.lock().unwrap().push(format!("live:{mode}"));
+            }),
+        );
+
+        assert!(s.set_permission_mode(&second.id, "plan"));
+        assert!(s.set_permission_mode(&first.id, "acceptEdits"));
+
+        assert_eq!(*heard.lock().unwrap(), vec!["live:acceptEdits".to_string()]);
     }
 
     /// A write that landed on no record has nothing to shadow: mirroring it

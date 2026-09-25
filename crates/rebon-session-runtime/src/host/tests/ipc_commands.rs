@@ -89,6 +89,60 @@ fn background_command_round_trips_through_the_ipc_consumer() {
     ipc.cancel.cancel();
 }
 
+/// A session the way the worker binds one: a record on its own session
+/// table, and the gate's cell registered on it as `build.rs` registers it.
+struct BoundSession {
+    state: Arc<rebon_acp::ServerState>,
+    session_id: String,
+    cell: Arc<Mutex<rebon_permissions::PermissionMode>>,
+}
+
+impl BoundSession {
+    fn new(mode: rebon_permissions::PermissionMode) -> Self {
+        let state = Arc::new(rebon_acp::ServerState::new());
+        let record =
+            state.create_session_with_permission_mode(".".into(), Vec::new(), mode.as_wire());
+        let cell = Arc::new(Mutex::new(mode));
+        state.attach_permission_mode_cell(&record.id, Arc::clone(&cell));
+        Self {
+            state,
+            session_id: record.id,
+            cell,
+        }
+    }
+
+    fn attach(&self, ipc: &BackgroundIpcServer, store: &BackgroundStore, job_id: &str) {
+        ipc.attach_session_permission_mode(
+            store,
+            job_id,
+            crate::host::ipc::server::LiveSessionMode {
+                state: &self.state,
+                session_id: &self.session_id,
+                cell: &self.cell,
+            },
+        );
+    }
+
+    fn cell_mode(&self) -> rebon_permissions::PermissionMode {
+        *self.cell.lock().unwrap()
+    }
+
+    fn record_mode(&self) -> String {
+        self.state
+            .session_permission_mode(&self.session_id)
+            .expect("the record exists")
+    }
+}
+
+fn job_permission_mode(store: &BackgroundStore, job_id: &str) -> Option<String> {
+    store
+        .read_state(job_id)
+        .unwrap()
+        .identity
+        .runtime
+        .permission_mode
+}
+
 #[test]
 fn permission_mode_ipc_updates_the_live_and_next_session_cells() {
     let (_dir, store) = store();
@@ -100,8 +154,8 @@ fn permission_mode_ipc_updates_the_live_and_next_session_cells() {
     install_ipc_owner(&mut state, &ipc);
     store.write_state(&state).unwrap();
 
-    let first = Arc::new(Mutex::new(rebon_permissions::PermissionMode::Default));
-    ipc.attach_permission_mode_cell(Arc::clone(&first));
+    let first = BoundSession::new(rebon_permissions::PermissionMode::Default);
+    first.attach(&ipc, &store, &state.identity.job_id);
     rebon_session_host::send_background_ipc_request(
         &state,
         ipc.port,
@@ -112,16 +166,24 @@ fn permission_mode_ipc_updates_the_live_and_next_session_cells() {
     )
     .unwrap();
     assert_eq!(
-        *first.lock().unwrap(),
+        first.cell_mode(),
         rebon_permissions::PermissionMode::BypassPermissions
+    );
+    // The record is what the plan-mode reminders read; a cell that moved
+    // without it is a gate and a prompt that disagree about the mode.
+    assert_eq!(first.record_mode(), "bypassPermissions");
+    assert_eq!(
+        job_permission_mode(&store, &state.identity.job_id).as_deref(),
+        Some("bypassPermissions")
     );
 
-    let next = Arc::new(Mutex::new(rebon_permissions::PermissionMode::Default));
-    ipc.attach_permission_mode_cell(Arc::clone(&next));
+    let next = BoundSession::new(rebon_permissions::PermissionMode::Default);
+    next.attach(&ipc, &store, &state.identity.job_id);
     assert_eq!(
-        *next.lock().unwrap(),
+        next.cell_mode(),
         rebon_permissions::PermissionMode::BypassPermissions
     );
+    assert_eq!(next.record_mode(), "bypassPermissions");
 
     let error = rebon_session_host::send_background_ipc_request(
         &state,
@@ -139,8 +201,143 @@ fn permission_mode_ipc_updates_the_live_and_next_session_cells() {
         "expected the owner's typed refusal, got: {error}"
     );
     assert_eq!(
-        *next.lock().unwrap(),
+        next.cell_mode(),
         rebon_permissions::PermissionMode::BypassPermissions
+    );
+    ipc.cancel.cancel();
+}
+
+/// `ExitPlanMode` approved into `auto`, or `EnterPlanMode`, moves the
+/// session's record and nothing else. The worker rebuilds the session from
+/// the job record every turn, so a move that stayed in the session was
+/// undone one turn later: the desktop app snapped back into plan mode.
+#[test]
+fn a_mode_the_session_takes_itself_reaches_the_job_and_the_next_turn() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.identity.session_id = Some("sess-tool-mode".into());
+    state.identity.runtime.permission_mode = Some("plan".into());
+    let ipc = start_background_ipc_server(&store, &state.identity.job_id).unwrap();
+    install_ipc_owner(&mut state, &ipc);
+    store.write_state(&state).unwrap();
+    let job_id = state.identity.job_id.clone();
+
+    let turn = BoundSession::new(rebon_permissions::PermissionMode::Plan);
+    turn.attach(&ipc, &store, &job_id);
+    // What the plan-mode plugin does when the approval comes back.
+    assert!(turn.state.set_permission_mode(&turn.session_id, "auto"));
+
+    assert_eq!(
+        job_permission_mode(&store, &job_id).as_deref(),
+        Some("auto")
+    );
+    // The next turn is built from the job record, and comes up in the mode
+    // the last one left.
+    let overrides = store
+        .read_state(&job_id)
+        .unwrap()
+        .identity
+        .runtime
+        .to_runtime_override()
+        .unwrap();
+    assert_eq!(
+        overrides.permission_mode,
+        Some(rebon_permissions::PermissionMode::Auto)
+    );
+
+    // And the other way: entering plan mode is remembered just the same.
+    assert!(turn.state.set_permission_mode(&turn.session_id, "plan"));
+    assert_eq!(
+        job_permission_mode(&store, &job_id).as_deref(),
+        Some("plan")
+    );
+    ipc.cancel.cancel();
+}
+
+/// Every client attached to the job hears a tool-driven move the moment it
+/// happens, the way it hears one another client made.
+#[test]
+fn a_mode_the_session_takes_itself_is_announced_to_clients() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.identity.session_id = Some("sess-tool-mode-status".into());
+    state.identity.runtime.permission_mode = Some("plan".into());
+    let ipc = start_background_ipc_server(&store, &state.identity.job_id).unwrap();
+    install_ipc_owner(&mut state, &ipc);
+    store.write_state(&state).unwrap();
+
+    let turn = BoundSession::new(rebon_permissions::PermissionMode::Plan);
+    turn.attach(&ipc, &store, &state.identity.job_id);
+    assert!(turn
+        .state
+        .set_permission_mode(&turn.session_id, "acceptEdits"));
+    // Saying the same thing twice announces nothing new.
+    assert!(turn
+        .state
+        .set_permission_mode(&turn.session_id, "acceptEdits"));
+
+    let owner = rebon_session_host::OwnerHandle {
+        session_id: "sess-tool-mode-status".into(),
+        job_id: Some(state.identity.job_id.clone()),
+        pid: std::process::id(),
+        port: ipc.port,
+        token: ipc.token.clone(),
+        surface: rebon_session::SessionOwnerSurface::Worker,
+    };
+    // Read on a thread: a stream with nothing published waits for the next
+    // event, and a regression here should fail rather than hang.
+    let (events_tx, events_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stream = owner.subscribe(Some(0)).unwrap();
+        for _ in 0..2 {
+            let _ = events_tx.send(stream.next());
+        }
+    });
+    let next = || {
+        events_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the new mode was published")
+            .expect("the stream stayed open")
+    };
+    assert!(matches!(
+        next(),
+        rebon_session_host::SessionEvent::Hello { .. }
+    ));
+    match next() {
+        rebon_session_host::SessionEvent::Status { snapshot, .. } => {
+            assert_eq!(snapshot.permission_mode.as_deref(), Some("acceptEdits"));
+        }
+        other => panic!("expected the new mode's status, got {other:?}"),
+    }
+    ipc.cancel.cancel();
+}
+
+/// A worker that no longer owns the job must not write its mode into it:
+/// the job belongs to whoever replaced it.
+#[test]
+fn a_superseded_worker_does_not_publish_its_sessions_mode() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.identity.session_id = Some("sess-superseded-mode".into());
+    state.identity.runtime.permission_mode = Some("plan".into());
+    let ipc = start_background_ipc_server(&store, &state.identity.job_id).unwrap();
+    install_ipc_owner(&mut state, &ipc);
+    state.process.ipc_token = Some("replacement-endpoint".into());
+    store.write_state(&state).unwrap();
+
+    let turn = BoundSession::new(rebon_permissions::PermissionMode::Plan);
+    turn.attach(&ipc, &store, &state.identity.job_id);
+    assert!(turn.state.set_permission_mode(&turn.session_id, "auto"));
+
+    assert_eq!(
+        job_permission_mode(&store, &state.identity.job_id).as_deref(),
+        Some("plan")
     );
     ipc.cancel.cancel();
 }
@@ -909,8 +1106,8 @@ fn status_reports_what_the_owner_is_actually_running_under() {
     install_ipc_owner(&mut state, &ipc);
     store.write_state(&state).unwrap();
 
-    let cell = Arc::new(Mutex::new(rebon_permissions::PermissionMode::Plan));
-    ipc.attach_permission_mode_cell(Arc::clone(&cell));
+    let turn = BoundSession::new(rebon_permissions::PermissionMode::Plan);
+    turn.attach(&ipc, &store, &state.identity.job_id);
 
     let snapshot =
         rebon_session_host::request_session_status(&state, ipc.port, ipc.token.clone()).unwrap();
