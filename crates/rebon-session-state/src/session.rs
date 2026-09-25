@@ -353,6 +353,11 @@ pub struct SessionAttachmentState {
     /// result — written before the mode is applied — already told the
     /// model it got what it asked for.
     pub pending_exit_mode_note: Option<String>,
+    /// The mode this session was in when it entered plan mode, while it is
+    /// in plan mode; `None` otherwise. A plan entered from `auto` keeps
+    /// auto's classifier answering its prompts (see
+    /// `rebon_permissions::denial_sink::AutoModeHooks::auto_gates`).
+    pub plan_entered_from: Option<String>,
 }
 
 /// Apply plan-mode transition side effects to a
@@ -375,8 +380,10 @@ pub fn apply_plan_mode_transition_flags(state: &mut SessionAttachmentState, from
         state.needs_plan_mode_exit_attachment = false;
         state.pending_exit_plan_text = None;
         state.pending_exit_mode_note = None;
+        state.plan_entered_from = Some(from.to_string());
     }
     if leaving_plan {
+        state.plan_entered_from = None;
         state.needs_plan_mode_exit_attachment = true;
         state.has_exited_plan_mode = true;
         // Restart the periodic full-reminder cadence, so the refresh
@@ -456,13 +463,14 @@ pub struct ServerState {
     session_locks: Mutex<HashMap<SessionId, SessionActiveLock>>,
 }
 
-/// Told the mode a session's record just took. See
+/// Told the mode a session's record just took, and — while that mode is
+/// plan — the mode plan was entered from. See
 /// [`ServerState::attach_permission_mode_publisher`].
 #[derive(Clone)]
-pub struct PermissionModePublisher(Arc<dyn Fn(&str) + Send + Sync>);
+pub struct PermissionModePublisher(Arc<dyn Fn(&str, Option<&str>) + Send + Sync>);
 
 impl PermissionModePublisher {
-    pub fn new(publish: impl Fn(&str) + Send + Sync + 'static) -> Self {
+    pub fn new(publish: impl Fn(&str, Option<&str>) + Send + Sync + 'static) -> Self {
         Self(Arc::new(publish))
     }
 }
@@ -470,6 +478,62 @@ impl PermissionModePublisher {
 impl std::fmt::Debug for PermissionModePublisher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PermissionModePublisher")
+    }
+}
+
+/// The permission gate's view of one session's mode.
+///
+/// The mode comes from the session's cell when the gate has one — the
+/// surfaces that hold a cell write it directly, and the record mirrors into
+/// it — and from the record otherwise. Where plan mode was entered from only
+/// the record knows.
+pub struct SessionPermissionModeSource {
+    state: Arc<ServerState>,
+    session_id: SessionId,
+    cell: Option<Arc<Mutex<rebon_permissions::types::PermissionMode>>>,
+}
+
+impl SessionPermissionModeSource {
+    /// Read everything from the record. An unknown session reads as
+    /// `default`, never as something more permissive.
+    pub fn record(state: Arc<ServerState>, session_id: impl Into<SessionId>) -> Self {
+        Self {
+            state,
+            session_id: session_id.into(),
+            cell: None,
+        }
+    }
+
+    /// Read the mode from `cell` and the rest from the record.
+    pub fn cell(
+        state: Arc<ServerState>,
+        session_id: impl Into<SessionId>,
+        cell: Arc<Mutex<rebon_permissions::types::PermissionMode>>,
+    ) -> Self {
+        Self {
+            state,
+            session_id: session_id.into(),
+            cell: Some(cell),
+        }
+    }
+}
+
+impl rebon_permissions::denial_sink::PermissionModeProvider for SessionPermissionModeSource {
+    fn current_mode(&self) -> rebon_permissions::types::PermissionMode {
+        match &self.cell {
+            Some(cell) => *cell.lock().expect("mode cell poisoned"),
+            None => self
+                .state
+                .session_permission_mode(&self.session_id)
+                .map(|mode| rebon_permissions::types::PermissionMode::from_wire(&mode))
+                .unwrap_or(rebon_permissions::types::PermissionMode::Default),
+        }
+    }
+
+    fn plan_entered_from(&self) -> Option<rebon_permissions::types::PermissionMode> {
+        self.state
+            .plan_entered_from(&self.session_id)
+            .map(|mode| rebon_permissions::types::PermissionMode::from_wire(&mode))
     }
 }
 
@@ -599,7 +663,7 @@ impl ServerState {
             .insert(sid.to_string(), publisher);
     }
 
-    fn publish_permission_mode(&self, sid: &str, mode: &str) {
+    fn publish_permission_mode(&self, sid: &str, mode: &str, plan_entered_from: Option<&str>) {
         let publisher = self
             .permission_mode_publishers
             .lock()
@@ -607,7 +671,7 @@ impl ServerState {
             .get(sid)
             .cloned();
         if let Some(publisher) = publisher {
-            (publisher.0)(mode);
+            (publisher.0)(mode, plan_entered_from);
         }
     }
 
@@ -2074,20 +2138,50 @@ impl ServerState {
                     let to = mode.to_string();
                     record.permission_mode = to.clone();
                     apply_plan_mode_transition_flags(&mut record.attachment_state, &from, &to);
-                    true
+                    Some(record.attachment_state.plan_entered_from.clone())
                 }
-                None => false,
+                None => None,
             }
         };
         // Outside the session lock, so the two mutexes are never held at
         // once and the cell stays a leaf. Only a mode that actually landed
         // on a record is mirrored: a write to an unknown session changed
         // nothing to shadow.
-        if applied {
-            self.mirror_permission_mode(sid, mode);
-            self.publish_permission_mode(sid, mode);
+        match applied {
+            Some(plan_entered_from) => {
+                self.mirror_permission_mode(sid, mode);
+                self.publish_permission_mode(sid, mode, plan_entered_from.as_deref());
+                true
+            }
+            None => false,
         }
-        applied
+    }
+
+    /// The mode `sid` entered plan mode from, while it is in plan mode.
+    pub fn plan_entered_from(&self, sid: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .expect("session map mutex poisoned")
+            .get(sid)
+            .filter(|record| record.permission_mode == "plan")
+            .and_then(|record| record.attachment_state.plan_entered_from.clone())
+    }
+
+    /// Put back where a rebuilt session entered plan mode from.
+    ///
+    /// A host that rebuilds its session every turn (a background job) brings
+    /// the record back in plan mode by *setting* it, which reads as entering
+    /// plan from `default`; the mode it really came from is something the
+    /// host kept. Ignored unless the record is in plan mode, and never
+    /// published — it restores what was already published.
+    pub fn restore_plan_entered_from(&self, sid: &str, plan_entered_from: Option<&str>) {
+        let mut sessions = self.sessions.lock().expect("session map mutex poisoned");
+        if let Some(record) = sessions
+            .get_mut(sid)
+            .filter(|record| record.permission_mode == "plan")
+        {
+            record.attachment_state.plan_entered_from = plan_entered_from.map(str::to_string);
+        }
     }
 
     /// Update the collaboration mode stored on the session record.
@@ -2596,7 +2690,7 @@ mod tests {
         let publisher_cell = Arc::clone(&cell);
         s.attach_permission_mode_publisher(
             &rec.id,
-            PermissionModePublisher::new(move |mode| {
+            PermissionModePublisher::new(move |mode, _| {
                 let in_cell = *publisher_cell.lock().unwrap();
                 publisher_heard
                     .lock()
@@ -2629,14 +2723,14 @@ mod tests {
         let stale = Arc::clone(&heard);
         s.attach_permission_mode_publisher(
             &first.id,
-            PermissionModePublisher::new(move |mode| {
+            PermissionModePublisher::new(move |mode, _| {
                 stale.lock().unwrap().push(format!("stale:{mode}"));
             }),
         );
         let live = Arc::clone(&heard);
         s.attach_permission_mode_publisher(
             &first.id,
-            PermissionModePublisher::new(move |mode| {
+            PermissionModePublisher::new(move |mode, _| {
                 live.lock().unwrap().push(format!("live:{mode}"));
             }),
         );
@@ -2645,6 +2739,111 @@ mod tests {
         assert!(s.set_permission_mode(&first.id, "acceptEdits"));
 
         assert_eq!(*heard.lock().unwrap(), vec!["live:acceptEdits".to_string()]);
+    }
+
+    /// The record remembers the mode plan was entered from for as long as
+    /// the session stays in plan, and forgets it on the way out.
+    #[test]
+    fn the_record_remembers_where_plan_was_entered_from() {
+        let s = ServerState::new();
+        let rec = s.create_session_with_permission_mode("/tmp/w".into(), Vec::new(), "auto");
+        assert_eq!(s.plan_entered_from(&rec.id), None);
+
+        assert!(s.set_permission_mode(&rec.id, "plan"));
+        assert_eq!(s.plan_entered_from(&rec.id).as_deref(), Some("auto"));
+        // Setting plan again is not entering it again.
+        assert!(s.set_permission_mode(&rec.id, "plan"));
+        assert_eq!(s.plan_entered_from(&rec.id).as_deref(), Some("auto"));
+
+        assert!(s.set_permission_mode(&rec.id, "acceptEdits"));
+        assert_eq!(s.plan_entered_from(&rec.id), None);
+        assert!(s.set_permission_mode(&rec.id, "plan"));
+        assert_eq!(s.plan_entered_from(&rec.id).as_deref(), Some("acceptEdits"));
+        assert_eq!(s.plan_entered_from("sess-missing"), None);
+    }
+
+    /// The publisher hears the origin with the mode, so a host that keeps
+    /// the mode can keep where plan came from beside it.
+    #[test]
+    fn the_publisher_hears_where_plan_was_entered_from() {
+        let s = ServerState::new();
+        let rec = s.create_session_with_permission_mode("/tmp/w".into(), Vec::new(), "auto");
+        let heard = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let publisher_heard = Arc::clone(&heard);
+        s.attach_permission_mode_publisher(
+            &rec.id,
+            PermissionModePublisher::new(move |mode, origin| {
+                publisher_heard
+                    .lock()
+                    .unwrap()
+                    .push((mode.to_string(), origin.map(str::to_string)));
+            }),
+        );
+
+        assert!(s.set_permission_mode(&rec.id, "plan"));
+        assert!(s.set_permission_mode(&rec.id, "default"));
+
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec![
+                ("plan".to_string(), Some("auto".to_string())),
+                ("default".to_string(), None),
+            ]
+        );
+    }
+
+    /// A rebuilt record comes back in plan by being set there, which reads
+    /// as entering it from `default`; the host restores the real origin. A
+    /// record that is not in plan has no origin to restore.
+    #[test]
+    fn a_restored_origin_applies_only_in_plan() {
+        let s = ServerState::new();
+        let planning = s.create_session("/tmp/w".into(), Vec::new());
+        assert!(s.set_permission_mode(&planning.id, "plan"));
+        assert_eq!(
+            s.plan_entered_from(&planning.id).as_deref(),
+            Some("default")
+        );
+
+        s.restore_plan_entered_from(&planning.id, Some("auto"));
+        assert_eq!(s.plan_entered_from(&planning.id).as_deref(), Some("auto"));
+        s.restore_plan_entered_from(&planning.id, None);
+        assert_eq!(s.plan_entered_from(&planning.id), None);
+
+        let editing = s.create_session_with_permission_mode("/tmp/w".into(), Vec::new(), "auto");
+        s.restore_plan_entered_from(&editing.id, Some("bypassPermissions"));
+        assert_eq!(
+            s.get_session(&editing.id)
+                .unwrap()
+                .attachment_state
+                .plan_entered_from,
+            None
+        );
+    }
+
+    /// The gate's source reads the mode from the cell when it has one, and
+    /// the origin from the record either way.
+    #[test]
+    fn the_mode_source_reads_the_cell_and_the_records_origin() {
+        use rebon_permissions::denial_sink::PermissionModeProvider;
+        use rebon_permissions::types::PermissionMode;
+
+        let s = Arc::new(ServerState::new());
+        let rec = s.create_session_with_permission_mode("/tmp/w".into(), Vec::new(), "auto");
+        let cell = Arc::new(Mutex::new(PermissionMode::Auto));
+        s.attach_permission_mode_cell(&rec.id, Arc::clone(&cell));
+        let from_cell = SessionPermissionModeSource::cell(Arc::clone(&s), rec.id.clone(), cell);
+        let from_record = SessionPermissionModeSource::record(Arc::clone(&s), rec.id.clone());
+
+        assert!(s.set_permission_mode(&rec.id, "plan"));
+        for source in [&from_cell, &from_record] {
+            assert_eq!(source.current_mode(), PermissionMode::Plan);
+            assert_eq!(source.plan_entered_from(), Some(PermissionMode::Auto));
+        }
+
+        let unknown = SessionPermissionModeSource::record(Arc::clone(&s), "sess-missing");
+        assert_eq!(unknown.current_mode(), PermissionMode::Default);
+        assert_eq!(unknown.plan_entered_from(), None);
     }
 
     /// A write that landed on no record has nothing to shadow: mirroring it

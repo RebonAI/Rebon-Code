@@ -1842,23 +1842,16 @@ impl EngineQueryExecutor {
                 }
                 // The session record is the ACP path's mode source, and
                 // `set_permission_mode` (what `session/set_config_option`
-                // calls) mutates it in place — so reading through this closure
+                // calls) mutates it in place — so reading through this source
                 // on every dispatch is what makes a mid-session switch apply
                 // to the next tool call.
                 let broker = match self.server_state.clone() {
-                    Some(state) => {
-                        let session_id = session_id.clone();
-                        broker.with_permission_mode(Arc::new(move || {
-                            state
-                                .get_session(&session_id)
-                                .map(|record| {
-                                    rebon_permissions::types::PermissionMode::from_wire(
-                                        &record.permission_mode,
-                                    )
-                                })
-                                .unwrap_or(rebon_permissions::types::PermissionMode::Default)
-                        }))
-                    }
+                    Some(state) => broker.with_permission_mode(Arc::new(
+                        rebon_session_state::SessionPermissionModeSource::record(
+                            state,
+                            session_id.clone(),
+                        ),
+                    )),
                     None => broker,
                 };
                 Arc::new(broker) as Arc<dyn PermissionBroker>

@@ -56,12 +56,15 @@ pub(crate) struct LivePermissionModeState {
     desired: Option<rebon_permissions::PermissionMode>,
 }
 
-/// The parts of a session its permission mode lives in: the record, and the
-/// cell the gate reads beside it.
+/// The parts of a session its permission mode lives in: the record, the cell
+/// the gate reads beside it, and the transcript directory whose sidecar keeps
+/// where plan mode was entered from.
 pub(crate) struct LiveSessionMode<'a> {
     pub(crate) state: &'a Arc<rebon_acp::ServerState>,
     pub(crate) session_id: &'a str,
     pub(crate) cell: &'a Arc<Mutex<rebon_permissions::PermissionMode>>,
+    pub(crate) projects_root: &'a std::path::Path,
+    pub(crate) cwd: &'a str,
 }
 
 impl<'a> LiveSessionMode<'a> {
@@ -70,7 +73,26 @@ impl<'a> LiveSessionMode<'a> {
             state: &session.server_state,
             session_id: &session.session_id,
             cell: &session.engine_half.permission_mode_cell,
+            projects_root: &session.projects_root,
+            cwd: &session.cwd,
         }
+    }
+
+    /// Put back where this rebuilt session entered plan mode from.
+    ///
+    /// The job record brings the session back in plan mode by setting it,
+    /// which reads as entering plan from `default`; the mode it really came
+    /// from is in the sidecar the publisher wrote. Run before the session is
+    /// attached, so a mode a client asked for in between moves on from the
+    /// restored origin.
+    pub(crate) fn restore_plan_entered_from(&self) {
+        let plan_entered_from = rebon_session::load_session_plan_entered_from(
+            self.projects_root,
+            self.cwd,
+            self.session_id,
+        );
+        self.state
+            .restore_plan_entered_from(self.session_id, plan_entered_from.as_deref());
     }
 }
 
@@ -564,11 +586,13 @@ impl BackgroundIpcServer {
     ///
     /// Inward: the cell and the record become what a `SetPermissionMode`
     /// writes, and a mode a client asked for before the session existed
-    /// lands on both. Outward, a publisher on the record: a mode the session takes on its own
-    /// — `ExitPlanMode` approved into `auto`, `EnterPlanMode` — goes to the
-    /// job record and out to every client, exactly as a `SetPermissionMode`
-    /// does. The worker rebuilds the session from that record every turn,
-    /// so a move that stayed in the session was undone one turn later.
+    /// lands on both. Outward, a publisher on the record: a mode the session
+    /// takes on its own — `ExitPlanMode` approved into `auto`,
+    /// `EnterPlanMode` — goes to the job record and out to every client,
+    /// exactly as a `SetPermissionMode` does. The worker rebuilds the session
+    /// from that record every turn, so a move that stayed in the session was
+    /// undone one turn later. Where plan mode was entered from goes to the
+    /// session's sidecar with it, for [`LiveSessionMode::restore_plan_entered_from`].
     pub(crate) fn attach_session_permission_mode(
         &self,
         store: &BackgroundStore,
@@ -579,9 +603,12 @@ impl BackgroundIpcServer {
         let status = self.status_publisher();
         let publisher_store = store.clone();
         let publisher_job_id = job_id.to_string();
+        let projects_root = session.projects_root.to_path_buf();
+        let cwd = session.cwd.to_string();
+        let session_id = session.session_id.to_string();
         session.state.attach_permission_mode_publisher(
             session.session_id,
-            rebon_acp::session::PermissionModePublisher::new(move |mode| {
+            rebon_acp::session::PermissionModePublisher::new(move |mode, plan_entered_from| {
                 match publish_permission_mode_to_job(
                     &publisher_store,
                     &publisher_job_id,
@@ -595,6 +622,17 @@ impl BackgroundIpcServer {
                         mode,
                         "could not publish the session's permission mode to the job state"
                     ),
+                }
+                if let Err(err) = rebon_session::save_session_plan_entered_from(
+                    &projects_root,
+                    &cwd,
+                    &session_id,
+                    plan_entered_from,
+                ) {
+                    tracing::warn!(
+                        %err,
+                        "could not keep where the session entered plan mode from"
+                    );
                 }
             }),
         );

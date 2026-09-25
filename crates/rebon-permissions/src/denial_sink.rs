@@ -49,6 +49,13 @@ pub trait AutoModeDenialSink: Send + Sync {
 /// UI's app state.
 pub trait PermissionModeProvider: Send + Sync {
     fn current_mode(&self) -> PermissionMode;
+
+    /// The mode the session was in when it entered plan mode, while it is
+    /// still there. `None` outside plan mode, and wherever nobody recorded
+    /// it — a plain closure over a mode knows only the mode.
+    fn plan_entered_from(&self) -> Option<PermissionMode> {
+        None
+    }
 }
 
 /// Convenience impl — a boxed closure is always a valid provider.
@@ -151,6 +158,23 @@ impl AutoModeHooks {
         self.current_mode() == PermissionMode::Auto
     }
 
+    /// Whether a call that would prompt under `mode` goes through auto
+    /// mode's gate instead: in auto mode, and in plan mode entered from it.
+    ///
+    /// Plan mode forbids edits by telling the model so, not by a gate; what
+    /// it changes about permissions is only that nothing runs unasked. A
+    /// session that was in auto — the user already said the classifier may
+    /// answer for them — keeps that answer while it plans, rather than
+    /// turning every read the plan needs into a prompt. Plan entered from
+    /// anywhere else prompts as before.
+    pub fn auto_gates(&self, mode: PermissionMode) -> bool {
+        match mode {
+            PermissionMode::Auto => true,
+            PermissionMode::Plan => self.mode.plan_entered_from() == Some(PermissionMode::Auto),
+            _ => false,
+        }
+    }
+
     /// Short-hand — true when the session is in
     /// [`PermissionMode::BypassPermissions`]. The broker skips approval
     /// dialogs outright in that mode; unlike auto it consults neither the
@@ -231,6 +255,58 @@ mod tests {
             assert_eq!(hooks.is_bypass(), expected, "mode={mode:?}");
             assert_eq!(hooks.current_mode(), mode);
         }
+    }
+
+    struct PlanFrom {
+        mode: PermissionMode,
+        entered_from: Option<PermissionMode>,
+    }
+
+    impl PermissionModeProvider for PlanFrom {
+        fn current_mode(&self) -> PermissionMode {
+            self.mode
+        }
+
+        fn plan_entered_from(&self) -> Option<PermissionMode> {
+            self.entered_from
+        }
+    }
+
+    #[test]
+    fn auto_gates_auto_and_plan_entered_from_auto_only() {
+        for (mode, entered_from, expected) in [
+            (PermissionMode::Auto, None, true),
+            (PermissionMode::Plan, Some(PermissionMode::Auto), true),
+            (PermissionMode::Plan, Some(PermissionMode::Default), false),
+            (
+                PermissionMode::Plan,
+                Some(PermissionMode::AcceptEdits),
+                false,
+            ),
+            (PermissionMode::Plan, None, false),
+            (PermissionMode::Default, Some(PermissionMode::Auto), false),
+            (PermissionMode::AcceptEdits, None, false),
+            (PermissionMode::BypassPermissions, None, false),
+            (PermissionMode::DontAsk, None, false),
+        ] {
+            let hooks = AutoModeHooks::new(
+                Arc::new(NullDenialSink),
+                Arc::new(PlanFrom { mode, entered_from }),
+            );
+            assert_eq!(
+                hooks.auto_gates(mode),
+                expected,
+                "mode={mode:?} entered_from={entered_from:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_closure_provider_knows_no_plan_origin() {
+        let provider: Arc<dyn PermissionModeProvider> = Arc::new(|| PermissionMode::Plan);
+        assert_eq!(provider.plan_entered_from(), None);
+        let hooks = AutoModeHooks::new(Arc::new(NullDenialSink), provider);
+        assert!(!hooks.auto_gates(PermissionMode::Plan));
     }
 
     #[test]

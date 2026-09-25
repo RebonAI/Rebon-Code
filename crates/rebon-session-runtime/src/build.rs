@@ -1697,9 +1697,13 @@ fn assemble_session_build(parts: SessionAssemblyParts) -> anyhow::Result<Session
     );
     let auto_mode_hooks = {
         let sink = SharedDenialSink::new(Arc::clone(&auto_mode_denials));
-        let provider_cell = Arc::clone(&permission_mode_cell);
+        // The cell for the mode; the record for where plan was entered from.
         let provider: Arc<dyn PermissionModeProvider> =
-            Arc::new(move || *provider_cell.lock().expect("mode cell poisoned"));
+            Arc::new(rebon_acp::session::SessionPermissionModeSource::cell(
+                Arc::clone(&tui_server_state),
+                session_id.clone(),
+                Arc::clone(&permission_mode_cell),
+            ));
         AutoModeHooks::new(Arc::new(sink), provider).with_verdicts(Arc::clone(&auto_mode_verdicts))
     };
     let (permission_broker, permission_rx) = bound.build_permissions(Some(auto_mode_hooks));
@@ -1810,6 +1814,7 @@ fn assemble_session_build(parts: SessionAssemblyParts) -> anyhow::Result<Session
         auto_mode_denials: auto_mode_denials.clone(),
         auto_mode_verdicts: auto_mode_verdicts.clone(),
         permission_mode_cell: permission_mode_cell.clone(),
+        server_state: Arc::clone(&tui_server_state),
         runtime_model: model.runtime_model.clone(),
         kernel_context_resolver: bound.kernel_scopes.resolver(),
         session_cron_store: session_cron_store.clone(),

@@ -90,37 +90,81 @@ fn background_command_round_trips_through_the_ipc_consumer() {
 }
 
 /// A session the way the worker binds one: a record on its own session
-/// table, and the gate's cell registered on it as `build.rs` registers it.
+/// table, the gate's cell registered on it as `build.rs` registers it, and a
+/// transcript directory for its sidecar.
 struct BoundSession {
     state: Arc<rebon_acp::ServerState>,
     session_id: String,
     cell: Arc<Mutex<rebon_permissions::PermissionMode>>,
+    projects: Arc<tempfile::TempDir>,
+    cwd: String,
 }
 
 impl BoundSession {
     fn new(mode: rebon_permissions::PermissionMode) -> Self {
         let state = Arc::new(rebon_acp::ServerState::new());
-        let record =
-            state.create_session_with_permission_mode(".".into(), Vec::new(), mode.as_wire());
+        let record = state.create_session_with_permission_mode(
+            "/repo/bound".into(),
+            Vec::new(),
+            mode.as_wire(),
+        );
+        Self::bind(
+            state,
+            record.id,
+            mode,
+            Arc::new(tempfile::tempdir().unwrap()),
+        )
+    }
+
+    /// The same session built again for the next turn, the way the worker
+    /// builds it: from the job record's mode, which a fresh record takes by
+    /// being set to it.
+    fn next_turn(&self, mode: rebon_permissions::PermissionMode) -> Self {
+        let state = Arc::new(rebon_acp::ServerState::new());
+        state.restore_empty_session(
+            self.session_id.clone(),
+            self.cwd.clone(),
+            Vec::new(),
+            "default",
+        );
+        assert!(state.set_permission_mode(&self.session_id, mode.as_wire()));
+        Self::bind(
+            state,
+            self.session_id.clone(),
+            mode,
+            Arc::clone(&self.projects),
+        )
+    }
+
+    fn bind(
+        state: Arc<rebon_acp::ServerState>,
+        session_id: String,
+        mode: rebon_permissions::PermissionMode,
+        projects: Arc<tempfile::TempDir>,
+    ) -> Self {
         let cell = Arc::new(Mutex::new(mode));
-        state.attach_permission_mode_cell(&record.id, Arc::clone(&cell));
+        state.attach_permission_mode_cell(&session_id, Arc::clone(&cell));
         Self {
             state,
-            session_id: record.id,
+            session_id,
             cell,
+            projects,
+            cwd: "/repo/bound".into(),
+        }
+    }
+
+    fn live_mode(&self) -> crate::host::ipc::server::LiveSessionMode<'_> {
+        crate::host::ipc::server::LiveSessionMode {
+            state: &self.state,
+            session_id: &self.session_id,
+            cell: &self.cell,
+            projects_root: self.projects.path(),
+            cwd: &self.cwd,
         }
     }
 
     fn attach(&self, ipc: &BackgroundIpcServer, store: &BackgroundStore, job_id: &str) {
-        ipc.attach_session_permission_mode(
-            store,
-            job_id,
-            crate::host::ipc::server::LiveSessionMode {
-                state: &self.state,
-                session_id: &self.session_id,
-                cell: &self.cell,
-            },
-        );
+        ipc.attach_session_permission_mode(store, job_id, self.live_mode());
     }
 
     fn cell_mode(&self) -> rebon_permissions::PermissionMode {
@@ -253,6 +297,53 @@ fn a_mode_the_session_takes_itself_reaches_the_job_and_the_next_turn() {
         job_permission_mode(&store, &job_id).as_deref(),
         Some("plan")
     );
+    ipc.cancel.cancel();
+}
+
+/// A plan entered from auto keeps auto's classifier, so where plan came
+/// from has to outlive the session the worker drops at the end of the turn.
+/// The next turn's record comes back in plan by being set there, which reads
+/// as entering it from `default`; the restore puts the real origin back.
+#[test]
+fn where_plan_was_entered_from_survives_the_next_turns_rebuild() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.identity.session_id = Some("sess-plan-origin".into());
+    state.identity.runtime.permission_mode = Some("auto".into());
+    let ipc = start_background_ipc_server(&store, &state.identity.job_id).unwrap();
+    install_ipc_owner(&mut state, &ipc);
+    store.write_state(&state).unwrap();
+    let job_id = state.identity.job_id.clone();
+
+    let first = BoundSession::new(rebon_permissions::PermissionMode::Auto);
+    first.attach(&ipc, &store, &job_id);
+    // `EnterPlanMode` from auto.
+    assert!(first.state.set_permission_mode(&first.session_id, "plan"));
+    assert_eq!(
+        job_permission_mode(&store, &job_id).as_deref(),
+        Some("plan")
+    );
+
+    let next = first.next_turn(rebon_permissions::PermissionMode::Plan);
+    assert_eq!(
+        next.state.plan_entered_from(&next.session_id).as_deref(),
+        Some("default"),
+        "a rebuilt record reads as entering plan from default"
+    );
+    next.live_mode().restore_plan_entered_from();
+    next.attach(&ipc, &store, &job_id);
+    assert_eq!(
+        next.state.plan_entered_from(&next.session_id).as_deref(),
+        Some("auto")
+    );
+
+    // Leaving plan forgets it, so the turn after that has nothing to restore.
+    assert!(next.state.set_permission_mode(&next.session_id, "default"));
+    let after = next.next_turn(rebon_permissions::PermissionMode::Plan);
+    after.live_mode().restore_plan_entered_from();
+    assert_eq!(after.state.plan_entered_from(&after.session_id), None);
     ipc.cancel.cancel();
 }
 
