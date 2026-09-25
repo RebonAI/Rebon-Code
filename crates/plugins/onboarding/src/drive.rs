@@ -86,6 +86,16 @@ pub trait OAuthHost {
     fn offer_user_code(&mut self, _user_code: &str) -> bool {
         false
     }
+
+    /// Open `url` in the user's browser, best-effort: the view already shows
+    /// the URL, so a browser that does not open costs nothing. The default
+    /// launches the system browser; test hosts record the URL instead, so a
+    /// test run never opens a real page.
+    fn open_in_browser(&mut self, url: &str) {
+        if !oauth_flow::launch_browser(url) {
+            tracing::debug!("could not open the browser; the view shows the URL");
+        }
+    }
 }
 
 /// What happened during one invocation of the driver. The caller maps this to
@@ -180,7 +190,7 @@ fn drive_device_flow_with(
         copied,
     );
     host.redraw(state)?;
-    let _ = oauth_flow::launch_browser(authorization.page_to_open());
+    host.open_in_browser(authorization.page_to_open());
 
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_for_thread = cancel.clone();
@@ -262,7 +272,7 @@ pub fn drive_oauth_flow_blocking(
     host.redraw(state)?;
 
     // ── Phase 2a: browser launch (best-effort) ───────────────────
-    let _ = oauth_flow::launch_browser(&challenge.authorize_url);
+    host.open_in_browser(&challenge.authorize_url);
 
     // ── Phase 2b: collect ────────────────────────────────────────
     let callback = if challenge.port_available {
@@ -450,6 +460,8 @@ mod tests {
                 self.inputs.remove(0)
             })
         }
+
+        fn open_in_browser(&mut self, _url: &str) {}
     }
 
     /// The paste collector hands the host's text to the parser as typed, and
@@ -524,6 +536,7 @@ mod tests {
         inputs: Vec<DriveInput>,
         views: Vec<Option<crate::dialog::OAuthView>>,
         offered: Vec<String>,
+        opened: Vec<String>,
     }
 
     impl OAuthHost for DeviceHost {
@@ -548,6 +561,10 @@ mod tests {
             self.offered.push(user_code.to_string());
             true
         }
+
+        fn open_in_browser(&mut self, url: &str) {
+            self.opened.push(url.to_string());
+        }
     }
 
     /// Code shown (and offered to the clipboard), approval polled, the
@@ -559,6 +576,7 @@ mod tests {
             inputs: Vec::new(),
             views: Vec::new(),
             offered: Vec::new(),
+            opened: Vec::new(),
         };
         let http = Arc::new(ScriptedHttp(std::sync::Mutex::new(vec![
             CODE,
@@ -583,6 +601,11 @@ mod tests {
         assert!(matches!(outcome, Outcome::Success { .. }));
         assert_eq!(finished, vec!["gho_granted".to_string()]);
         assert_eq!(host.offered, vec!["WDJB-MJHT".to_string()]);
+        assert_eq!(
+            host.opened,
+            vec!["https://github.com/login/device".to_string()],
+            "the page goes through the host, which a test records instead of opening"
+        );
         assert!(host.views.iter().any(|view| matches!(
             view,
             Some(crate::dialog::OAuthView::DeviceCode { user_code, copied: true, .. })
@@ -604,6 +627,7 @@ mod tests {
             inputs: vec![DriveInput::Idle, DriveInput::Cancelled],
             views: Vec::new(),
             offered: Vec::new(),
+            opened: Vec::new(),
         };
         let http = Arc::new(ScriptedHttp(std::sync::Mutex::new(vec![CODE])));
         let mut finish = |_tokens: AccountTokens| -> Result<(), DeviceFlowError> {
@@ -640,6 +664,7 @@ mod tests {
                 inputs: Vec::new(),
                 views: Vec::new(),
                 offered: Vec::new(),
+                opened: Vec::new(),
             };
             let http = Arc::new(ScriptedHttp(std::sync::Mutex::new(answers)));
             let mut finish = |_tokens: AccountTokens| {
