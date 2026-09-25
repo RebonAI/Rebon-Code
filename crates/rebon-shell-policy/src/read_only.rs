@@ -45,6 +45,15 @@ fn argv_only_reads(argv: &[String]) -> bool {
     let Some((program, args)) = argv.split_first() else {
         return false;
     };
+    // `/proc/<pid>/environ` is every environment variable of a process,
+    // secrets included — the POSIX spelling of PowerShell's `Env:` drive.
+    // Anything under `/proc` asks, so `grep -r` cannot walk into it either.
+    if args
+        .iter()
+        .any(|arg| arg == "/proc" || arg.starts_with("/proc/"))
+    {
+        return false;
+    }
     match program.as_str() {
         // Print, list or measure what they are given, and have no option
         // that writes a file or runs another program.
@@ -210,6 +219,12 @@ fn powershell_argv_only_reads(argv: &[String]) -> bool {
     let Some(name) = argv.first() else {
         return false;
     };
+    if argv
+        .iter()
+        .any(|word| names_a_non_filesystem_provider(word))
+    {
+        return false;
+    }
     let cmdlet = canonical_cmdlet(name);
     if READ_ONLY_CMDLETS
         .iter()
@@ -225,6 +240,37 @@ fn powershell_argv_only_reads(argv: &[String]) -> bool {
         .iter()
         .any(|word| word.contains('$') || word.starts_with('@'));
     !expands && native_program_only_reads(argv)
+}
+
+/// PowerShell drives that are not a filesystem. The item cmdlets read them
+/// like directories: `Get-ChildItem Env:` lists every environment variable,
+/// API keys included, and `HKLM:` is the registry. Reading one is not the
+/// read the allowlist vouches for.
+const NON_FILESYSTEM_DRIVES: &[&str] = &[
+    "env", "variable", "function", "alias", "cert", "hklm", "hkcu", "wsman",
+];
+
+/// Whether `word` names a non-filesystem provider: one of the drives above,
+/// with or without a path after it and in any case — bare (`Env:`), as a
+/// parameter value (`-Path:Env:X`), in a list (`a,Env:X`) or as a variable
+/// (`$env:KEY`, which is the same drive by another spelling) — or a
+/// provider-qualified path (`Registry::HKEY_…`,
+/// `Microsoft.PowerShell.Core\Registry::…`). A drive letter (`C:`) is one
+/// character and matches none of them.
+fn names_a_non_filesystem_provider(word: &str) -> bool {
+    if word.contains("::") {
+        return true;
+    }
+    let word = word.to_ascii_lowercase();
+    NON_FILESYSTEM_DRIVES.iter().any(|drive| {
+        let needle = format!("{drive}:");
+        word.match_indices(&needle).any(|(at, _)| {
+            word[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|before| !(before.is_ascii_alphanumeric() || before == '_'))
+        })
+    })
 }
 
 /// The POSIX judgment for a native program started from PowerShell, where
@@ -298,6 +344,12 @@ mod tests {
             "awk '{print}' f",
             "xargs cat",
             "env ls",
+            // The environment, secrets included, by any spelling.
+            "env",
+            "printenv",
+            "printenv OPENAI_API_KEY",
+            "cat /proc/self/environ",
+            "grep -r KEY /proc",
             "sudo ls",
             "curl https://example.com",
             "python -c 'print(1)'",
@@ -406,7 +458,7 @@ mod tests {
             "Get-Location",
             "pwd",
             "Test-Path Cargo.toml",
-            "Get-Content $env:USERPROFILE\\notes.txt",
+            "Get-Content $HOME\\notes.txt",
             "Get-ChildItem | Select-Object -First 5",
             "Get-Content log.txt | Select-String error | Measure-Object",
             "Get-ChildItem -Recurse | Sort-Object Length | Format-Table",
@@ -450,6 +502,53 @@ mod tests {
             "",
         ] {
             assert!(!powershell(command), "expected {command:?} to ask");
+        }
+    }
+
+    /// The item cmdlets read every provider, not only the filesystem:
+    /// `Get-ChildItem Env:` is the environment, API keys included, and
+    /// `HKLM:` the registry. A non-filesystem drive or a provider-qualified
+    /// path asks, however it is spelled.
+    #[test]
+    fn a_non_filesystem_provider_asks_in_powershell() {
+        for command in [
+            "Get-ChildItem Env:",
+            "gci env:",
+            "ls ENV:",
+            "Get-Content Env:OPENAI_API_KEY",
+            "Get-Item -Path Env:PATH",
+            "Get-Item -Path:Env:PATH",
+            "Get-Content a.txt,Env:SECRET",
+            "Write-Output $env:OPENAI_API_KEY",
+            "Get-ChildItem Variable:",
+            "Get-ChildItem Function:\\prompt",
+            "Get-ChildItem Alias:",
+            "Get-ChildItem Cert:\\CurrentUser\\My",
+            "Get-ItemProperty HKLM:\\SOFTWARE\\Microsoft",
+            "Get-ChildItem hkcu:\\Software",
+            "Test-Path WSMan:\\localhost",
+            "Resolve-Path Registry::HKEY_LOCAL_MACHINE\\SOFTWARE",
+            "Get-ChildItem Microsoft.PowerShell.Core\\Registry::HKEY_CURRENT_USER",
+            "Get-Location; gci Env:",
+            "git log -1 | Select-Object Env:X",
+        ] {
+            assert!(!powershell(command), "expected {command:?} to ask");
+        }
+    }
+
+    /// A drive letter is a filesystem drive, and a name that merely contains
+    /// a provider's name is not one.
+    #[test]
+    fn a_filesystem_drive_still_runs_in_powershell() {
+        for command in [
+            "Get-ChildItem C:",
+            "Get-ChildItem C:\\repo\\src",
+            "Get-Content d:\\notes\\environment.md",
+            "Test-Path C:\\Windows\\System32",
+            "Get-ChildItem .\\myenv",
+            "Get-Item C:\\repo\\myenv:stream",
+        ] {
+            assert!(powershell(command), "expected {command:?} to be read-only");
         }
     }
 }
