@@ -9827,6 +9827,31 @@ mod tests {
         assert!(ollama.models().is_empty());
     }
 
+    /// Grok has no login a third-party client may use, so it is a key
+    /// preset: xAI's own host and dialect, its key page, and a seeded
+    /// catalogue the listing extends.
+    #[test]
+    fn the_xai_preset_is_grok_with_an_api_key() {
+        let xai = provider_preset_by_id("xai").unwrap();
+        assert_eq!(xai.display_name, "xAI Grok");
+        assert_eq!(xai.vendor, rebon_api::ProviderVendor::Xai);
+        assert_eq!(xai.format, "openai");
+        assert_eq!(xai.base_url, "https://api.x.ai/v1");
+        assert_eq!(xai.api_key_env, "XAI_API_KEY");
+        assert!(xai.api_key_required);
+        assert!(xai.key_url.starts_with("https://console.x.ai/"));
+        assert_eq!(xai.default_model, "grok-4.7");
+        assert!(xai.models().iter().any(|m| m.id == "grok-4.7"));
+        assert_eq!(
+            provider_preset_for_entry(None, "https://api.x.ai/v1").map(|p| p.id),
+            Some("xai")
+        );
+        assert!(
+            crate::account_login::account_login("xai").is_none(),
+            "xAI's device login belongs to its own closed client"
+        );
+    }
+
     #[test]
     fn every_preset_is_well_formed() {
         let mut ids: Vec<&str> = PROVIDER_PRESETS.iter().map(|p| p.id).collect();

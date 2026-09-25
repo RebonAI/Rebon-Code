@@ -290,6 +290,51 @@ pub fn is_account_sentinel(api_key: &str) -> bool {
     api_key.starts_with(ACCOUNT_SENTINEL_PREFIX) || account_login_for_api_key(api_key).is_some()
 }
 
+/// Longest client id [`account_client_id`] accepts from `config.json`.
+/// GitHub's are 20 characters and OAuth app ids elsewhere stay well under
+/// 100; anything longer is a pasted secret or a mistake.
+const MAX_CLIENT_ID_LEN: usize = 128;
+
+/// The client id a device-code login sends: the table's, unless
+/// `config.json` names another under `accountLogins.<id>.clientId` — for an
+/// organisation that registered its own OAuth app, or for when the published
+/// id stops being honoured.
+///
+/// The ChatGPT login always answers the table's: its client id is registered
+/// together with the loopback redirect the flow listens on, so another id
+/// could not complete it. A value that is not a short run of visible ASCII
+/// is ignored rather than sent.
+pub fn account_client_id(config_dir: &Path, spec: &AccountLoginSpec) -> String {
+    if spec.is_codex() {
+        return spec.client_id.to_string();
+    }
+    let configured = read_config_roundtrip(config_dir).ok().and_then(|config| {
+        config
+            .extra
+            .get("accountLogins")?
+            .get(spec.id)?
+            .get("clientId")?
+            .as_str()
+            .map(|id| id.trim().to_string())
+    });
+    match configured {
+        Some(id) if is_plausible_client_id(&id) => id,
+        Some(_) => {
+            tracing::warn!(
+                login = spec.id,
+                "rebon: ignoring accountLogins.{}.clientId: not a client id",
+                spec.id
+            );
+            spec.client_id.to_string()
+        }
+        None => spec.client_id.to_string(),
+    }
+}
+
+fn is_plausible_client_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_CLIENT_ID_LEN && id.bytes().all(|b| b.is_ascii_graphic())
+}
+
 /// One login's tokens, as stored under `oauthAccounts.<id>` (and, for the
 /// ChatGPT login, projected from `openaiOAuth`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]

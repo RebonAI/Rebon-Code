@@ -15,6 +15,8 @@
 //!   against a loopback server (success, revoked, outage), a refresh that
 //!   persists, the startup check routing to it, and a whole login finish
 //!   (exchange, store, upsert, model listing).
+//! * The client id override: the table's by default, a configured one for
+//!   a device login, never for the ChatGPT login or an implausible value.
 //! * Upsert and status.
 
 use std::io::{Read, Write};
@@ -200,6 +202,74 @@ fn sentinels_match_exactly_and_unknown_logins_are_still_sentinels() {
     assert!(is_account_sentinel("$OAUTH:nope"));
     assert!(is_account_sentinel("$OPENAI_OAUTH_TOKEN"));
     assert!(!is_account_sentinel("sk-live"));
+}
+
+// ── Client id override ─────────────────────────────────────────
+
+#[test]
+fn the_table_client_id_is_used_until_config_names_another() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        account_client_id(dir.path(), copilot()),
+        copilot().client_id
+    );
+
+    write_json(
+        &dir.path().join("config.json"),
+        serde_json::json!({
+            "accountLogins": { "copilot": { "clientId": "  Iv1.0123456789abcdef " } }
+        }),
+    );
+    assert_eq!(
+        account_client_id(dir.path(), copilot()),
+        "Iv1.0123456789abcdef"
+    );
+}
+
+/// The ChatGPT login's id is bound to its loopback redirect registration,
+/// and a value that cannot be a client id is not sent.
+#[test]
+fn the_override_skips_the_chatgpt_login_and_implausible_values() {
+    let dir = tempfile::tempdir().unwrap();
+    for value in [
+        serde_json::json!(""),
+        serde_json::json!("has space"),
+        serde_json::json!("x".repeat(129)),
+        serde_json::json!(42),
+    ] {
+        write_json(
+            &dir.path().join("config.json"),
+            serde_json::json!({
+                "accountLogins": {
+                    "openai": { "clientId": "app_other" },
+                    "copilot": { "clientId": value }
+                }
+            }),
+        );
+        assert_eq!(
+            account_client_id(dir.path(), copilot()),
+            copilot().client_id
+        );
+        assert_eq!(
+            account_client_id(dir.path(), codex_login()),
+            crate::OPENAI_OAUTH_CLIENT_ID
+        );
+    }
+}
+
+/// `accountLogins` is a key this crate does not model; a provider write
+/// must carry it through like any other unknown key.
+#[test]
+fn the_override_survives_a_provider_upsert() {
+    let dir = tempfile::tempdir().unwrap();
+    write_json(
+        &dir.path().join("config.json"),
+        serde_json::json!({
+            "accountLogins": { "copilot": { "clientId": "Iv1.custom" } }
+        }),
+    );
+    upsert_account_provider_in(dir.path(), copilot(), None).unwrap();
+    assert_eq!(account_client_id(dir.path(), copilot()), "Iv1.custom");
 }
 
 // ── Storage ────────────────────────────────────────────────────
