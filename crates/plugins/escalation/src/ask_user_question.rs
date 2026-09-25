@@ -12,6 +12,12 @@
 //! the collected answers so downstream dispatch can hand a
 //! well-formed result block back to the model.
 //!
+//! A surface that can take a user message at any time may let the broker
+//! defer the dialog instead ([`rebon_core::deferred_question`]): the call
+//! returns a pending result at once, and `call` runs later, when the user
+//! answers, to produce the same output for a follow-up user message.
+//! Neither description names that mode, so both stay true either way.
+//!
 //! ## Input fields
 //!
 //! * `questions[i].question` — full question text, shown above the chips.
@@ -116,11 +122,13 @@ impl Tool for AskUserQuestionTool {
          - Users will always be able to select \"Other\" to provide custom text input\n\
          - Use multiSelect: true to allow multiple answers to be selected for a question\n\
          - If you recommend a specific option, make that the first option in the list and \
-         add \"(Recommended)\" at the end of the label"
+         add \"(Recommended)\" at the end of the label\n\
+         - The answer may come later: ask as soon as the decision comes up, and if the result \
+         says it is pending, keep going with only the work that does not depend on it"
     }
 
     fn model_description(&self) -> &str {
-        "Asks multiple-choice questions only for unresolved user decisions that block progress. Batch foreseeable questions, stop when answers are sufficient, and never use it for notifications or closing remarks."
+        "Asks multiple-choice questions only for unresolved user decisions that block progress. Batch foreseeable questions, stop when answers are sufficient, and never use it for notifications or closing remarks. Ask early: the answer may arrive later, while you continue with work that does not depend on it."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -774,6 +782,22 @@ mod tests {
         );
         assert!(model_description.contains("stop when answers are sufficient"));
         assert!(model_description.contains("never use it for notifications or closing remarks"));
+    }
+
+    /// The model is told an answer may arrive after the call returns, in
+    /// words that stay true when it arrives at once.
+    #[test]
+    fn prompt_contract_allows_a_late_answer() {
+        let tool = tool();
+        assert!(tool
+            .description()
+            .contains("The answer may come later: ask as soon as the decision comes up"));
+        assert!(tool
+            .description()
+            .contains("keep going with only the work that does not depend on it"));
+        assert!(tool
+            .model_description()
+            .contains("Ask early: the answer may arrive later"));
     }
 
     /// Neither description carries plan-mode vocabulary. This tool ships in
