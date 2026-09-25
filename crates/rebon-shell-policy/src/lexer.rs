@@ -67,6 +67,12 @@ pub struct Grammar {
     /// `&` always stops it: backgrounding is not something a rule can vouch
     /// for.
     pub and_chain_separates: bool,
+    /// Whether `|`, `||` and `;` start a new segment too, instead of stopping
+    /// the scan. Only for a caller that holds *every* segment to the same
+    /// standard on its own terms: a pipe feeds one program's output to the
+    /// next and a list runs the next whatever the last did, so a verdict on
+    /// the first link says nothing about the second. `|&` still stops it.
+    pub list_operators_separate: bool,
     pub double_quote_escape: DoubleQuoteEscape,
     /// Whether `""` produces an empty word. It is a real argument, but the
     /// rule matchers have always dropped it.
@@ -84,6 +90,7 @@ pub const RULE_ARGV: Grammar = Grammar {
     dollar_is_metacharacter: false,
     newline_always_ends_the_scan: false,
     and_chain_separates: true,
+    list_operators_separate: false,
     double_quote_escape: DoubleQuoteEscape::Literal,
     keep_empty_tokens: false,
     word_separator: |ch| ch.is_ascii_whitespace(),
@@ -106,9 +113,23 @@ pub const STATIC_ARGV: Grammar = Grammar {
     dollar_is_metacharacter: true,
     newline_always_ends_the_scan: true,
     and_chain_separates: false,
+    list_operators_separate: false,
     double_quote_escape: DoubleQuoteEscape::Posix,
     keep_empty_tokens: true,
     word_separator: char::is_whitespace,
+};
+
+/// Deciding that a command only reads: every link of a pipeline or a list is
+/// its own argv, judged on its own, and everything [`STATIC_ARGV`] refuses —
+/// expansion, globbing, substitution, redirection — still stops the scan,
+/// because a word that can become another word can become `-delete`. Words
+/// split on ASCII whitespace only, as in [`RULE_ARGV`]: a program name with a
+/// non-breaking space in it is one unknown program, not an allowed one.
+pub const READ_ONLY_ARGV: Grammar = Grammar {
+    and_chain_separates: true,
+    list_operators_separate: true,
+    word_separator: |ch| ch.is_ascii_whitespace(),
+    ..STATIC_ARGV
 };
 
 /// What a permission rule gets to match against.
@@ -149,8 +170,8 @@ enum Quote {
     Double,
 }
 
-/// Split `command` into `&&`-separated segments of words, or say why it could
-/// not be done. A `command` this returns `Ok` for runs exactly the programs
+/// Split `command` into `&&`-separated segments of words (and `|`/`||`/`;`
+/// separated ones, when the grammar allows), or say why it could not be done. A `command` this returns `Ok` for runs exactly the programs
 /// named in the segments with exactly the arguments listed — that is the
 /// property the callers rely on, and it is why every doubtful character is an
 /// `Err` instead of a guess.
@@ -225,6 +246,22 @@ pub fn simple_command_segments(command: &str, grammar: &Grammar) -> Result<Vec<V
                     '"' => {
                         quote = Quote::Double;
                         token_started = true;
+                    }
+                    ';' | '|' if grammar.list_operators_separate => {
+                        if ch == '|' {
+                            match chars.peek() {
+                                Some('&') => return Err(Bail::Metacharacter),
+                                Some('|') => {
+                                    chars.next();
+                                }
+                                _ => {}
+                            }
+                        }
+                        push_word(&mut current, &mut token, &mut token_started, grammar);
+                        if current.is_empty() {
+                            return Err(Bail::EmptySegment);
+                        }
+                        segments.push(std::mem::take(&mut current));
                     }
                     '\n' | '\r' | ';' | '|' | '<' | '>' | '`' => {
                         return Err(Bail::Metacharacter);
@@ -671,6 +708,53 @@ mod tests {
                 "static argv of {command:?}"
             );
         }
+    }
+
+    /// The read-only grammar splits every list operator into its own argv and
+    /// still refuses everything the static grammar refuses.
+    #[test]
+    fn the_read_only_grammar_splits_lists_and_refuses_the_rest() {
+        let split = |command: &str| simple_command_segments(command, &READ_ONLY_ARGV);
+        let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            split("git log | head -5").unwrap(),
+            vec![argv(&["git", "log"]), argv(&["head", "-5"])]
+        );
+        assert_eq!(
+            split("ls && pwd; echo 'a|b' || cat \"x;y\"").unwrap(),
+            vec![
+                argv(&["ls"]),
+                argv(&["pwd"]),
+                argv(&["echo", "a|b"]),
+                argv(&["cat", "x;y"]),
+            ]
+        );
+        for (command, why) in [
+            ("ls |& cat", Bail::Metacharacter),
+            ("ls & pwd", Bail::Metacharacter),
+            ("ls > out", Bail::Metacharacter),
+            ("cat < in", Bail::Metacharacter),
+            ("echo $(id)", Bail::Metacharacter),
+            ("echo `id`", Bail::Metacharacter),
+            ("cat $HOME/x", Bail::Metacharacter),
+            ("ls *.rs", Bail::Metacharacter),
+            ("ls ~/x", Bail::Metacharacter),
+            ("ls\npwd", Bail::Metacharacter),
+            ("(ls)", Bail::Metacharacter),
+            ("ls ;", Bail::EmptySegment),
+            ("| ls", Bail::EmptySegment),
+            ("ls || ", Bail::EmptySegment),
+            ("echo 'open", Bail::Unterminated),
+        ] {
+            assert_eq!(split(command), Err(why), "{command:?}");
+        }
+        // The rule matchers keep refusing a pipe: a rule vouches for one
+        // program, and the knob is off for them.
+        assert_eq!(
+            format!("{:?}", parse_bash_shape("git log | head")),
+            "UnsafeComplex"
+        );
     }
 
     /// The classifier's two token streams are not interchangeable, and the

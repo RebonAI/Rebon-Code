@@ -12,6 +12,7 @@
 
 pub mod lexer;
 pub mod powershell_shape;
+pub mod read_only;
 
 use crate::lexer::{shell_tokens, workflow_push_ansi_c_escape, workflow_shell_tokens};
 use rebon_tools_core::{canonicalize_scope_path, scope_path_starts_with};
