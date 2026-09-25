@@ -914,6 +914,12 @@ fn session_pipeline(
             &mut state.active_prompt,
         );
         reconcile_mid_turn_consumed_queued_submits(app);
+        super::deferred_questions::drain_deferred_question_answers(
+            app,
+            session,
+            handle,
+            &mut state.active_prompt,
+        );
         // Apply any commands the desktop app queued for this session
         // (inject / stop / answer-permission) right after the inbound
         // channels drain, so an injected prompt rides the same downstream

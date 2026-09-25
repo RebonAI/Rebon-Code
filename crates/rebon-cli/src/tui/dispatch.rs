@@ -250,11 +250,18 @@ pub fn enqueue_submit(app: &mut AppState, text: String) {
 }
 
 pub fn enqueue_submit_payload(app: &mut AppState, submit: SubmitPayload) {
+    let mode = app.mode.clone();
+    enqueue_submit_payload_in_mode(app, submit, mode);
+}
+
+/// Queue `submit` under an explicit input mode, for a message nobody typed
+/// at the prompt — the prompt's current mode says nothing about it.
+pub fn enqueue_submit_payload_in_mode(app: &mut AppState, submit: SubmitPayload, mode: String) {
     if app.queued_commands.is_empty() && app.queued_submit_payloads.is_empty() {
         app.queued_auto_drain_paused_after_withdrawal = false;
     }
     app.queued_commands.push(QueuedCommand {
-        mode: app.mode.clone(),
+        mode,
         value: QueuedCommandValue::Text(submit.text.clone()),
     });
     let mut submit = submit;

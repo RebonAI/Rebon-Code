@@ -26,6 +26,7 @@ pub(crate) mod compact_runtime;
 mod console_input_batch;
 mod context_prompts;
 pub(crate) mod custom_status_line;
+pub(crate) mod deferred_questions;
 mod dialog_keys;
 mod event_loop_entry;
 mod footer_navigation;
