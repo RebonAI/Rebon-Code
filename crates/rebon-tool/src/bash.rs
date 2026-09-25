@@ -505,6 +505,19 @@ impl Tool for BashTool {
     }
 }
 
+/// The shell tools' own decision on a command, before any rule or mode.
+///
+/// Three shapes run without asking: a command that only reads (see
+/// `rebon_shell_policy::read_only` — `tool_label` is the tool's name there,
+/// so `Monitor`, which starts a watcher rather than a read, never qualifies),
+/// a `mkdir` and a deletion inside the roots this session already writes to.
+/// A deny rule still wins over all three: the rules broker sees this `Allow`
+/// before any mode does and refuses first.
+///
+/// None of them survives `dangerouslyDisableSandbox`. Asking to leave the
+/// sandbox is asking for more than the command's own verb — a read with the
+/// sandbox's read restrictions lifted is not the read the allowlist vouched
+/// for — so that request keeps its prompt.
 pub fn shell_permission_decision(
     input: &Value,
     command: &str,
@@ -513,7 +526,8 @@ pub fn shell_permission_decision(
     tool_label: &str,
 ) -> PermissionDecision {
     if !disables_sandbox
-        && (mkdir_targets_are_authorized(command, context)
+        && (rebon_shell_policy::read_only::is_read_only_shell_command(tool_label, input)
+            || mkdir_targets_are_authorized(command, context)
             || deletion_targets_are_authorized(input, command, context))
     {
         return PermissionDecision::allow(input.clone());
@@ -1245,6 +1259,78 @@ mod tests {
         let context = ToolContext::new().with_auto_approved_write_roots([scratchpad]);
 
         let decision = tool().check_permissions(&input, &context).await.unwrap();
+
+        assert_eq!(decision.behavior, rebon_tools_core::PermissionBehavior::Ask);
+    }
+
+    /// Exploring is reading, and a prompt per `ls` is what made plan mode
+    /// expensive. The tool's own decision allows a read; whatever mode is on
+    /// sees an `Allow` and never gets to ask.
+    #[tokio::test]
+    async fn check_permissions_allows_a_command_that_only_reads() {
+        for command in [
+            "git status",
+            "git log --oneline -5 | head -3",
+            "ls -la && pwd",
+            "rg -n TODO crates",
+        ] {
+            let input = json!({ "command": command });
+            let decision = tool()
+                .check_permissions(&input, &ToolContext::new())
+                .await
+                .unwrap();
+            assert_eq!(decision, PermissionDecision::allow(input), "{command:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn check_permissions_asks_for_a_read_that_writes_or_expands() {
+        for command in [
+            "git log > log.txt",
+            "cat $(which rebon)",
+            "ls && rm -rf target",
+            "find . -delete",
+            "git commit -m x",
+        ] {
+            let input = json!({ "command": command });
+            let decision = tool()
+                .check_permissions(&input, &ToolContext::new())
+                .await
+                .unwrap();
+            assert_eq!(
+                decision.behavior,
+                rebon_tools_core::PermissionBehavior::Ask,
+                "{command:?}"
+            );
+        }
+    }
+
+    /// Leaving the sandbox is more than the read the allowlist vouched for.
+    #[tokio::test]
+    async fn check_permissions_asks_when_a_read_disables_sandbox() {
+        let input = json!({ "command": "git status", "dangerouslyDisableSandbox": true });
+
+        let decision = tool()
+            .check_permissions(&input, &ToolContext::new())
+            .await
+            .unwrap();
+
+        assert_eq!(decision.behavior, rebon_tools_core::PermissionBehavior::Ask);
+    }
+
+    /// `Monitor` starts a watcher that outlives the call; the read-only
+    /// judgment is about a command that runs and ends.
+    #[test]
+    fn a_monitor_command_is_never_judged_read_only() {
+        let input = json!({ "command": "tail -f log.txt" });
+
+        let decision = shell_permission_decision(
+            &input,
+            "tail -f log.txt",
+            &ToolContext::new(),
+            false,
+            crate::monitor::MONITOR_TOOL_NAME,
+        );
 
         assert_eq!(decision.behavior, rebon_tools_core::PermissionBehavior::Ask);
     }

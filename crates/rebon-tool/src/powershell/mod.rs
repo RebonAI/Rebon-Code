@@ -562,6 +562,51 @@ mod tests {
         PowerShellTool
     }
 
+    // ── which commands run without a prompt ───────────────────────
+
+    #[tokio::test]
+    async fn check_permissions_allows_a_command_that_only_reads() {
+        for command in [
+            "Get-ChildItem -Recurse src",
+            "Get-Content Cargo.toml | Select-String version",
+            "gci | Select-Object -First 5",
+            "git status",
+        ] {
+            let input = json!({ "command": command });
+            let decision = tool()
+                .check_permissions(&input, &ToolContext::new())
+                .await
+                .unwrap();
+            assert_eq!(decision, PermissionDecision::allow(input), "{command:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn check_permissions_asks_for_anything_else() {
+        for (command, disables_sandbox) in [
+            ("Remove-Item x", false),
+            ("Get-ChildItem | Remove-Item", false),
+            ("Get-Content x > y", false),
+            ("Get-ChildItem | ForEach-Object { $_ }", false),
+            ("git $args", false),
+            ("Get-ChildItem", true),
+        ] {
+            let input = json!({
+                "command": command,
+                "dangerouslyDisableSandbox": disables_sandbox,
+            });
+            let decision = tool()
+                .check_permissions(&input, &ToolContext::new())
+                .await
+                .unwrap();
+            assert_eq!(
+                decision.behavior,
+                rebon_tools_core::PermissionBehavior::Ask,
+                "{command:?}"
+            );
+        }
+    }
+
     // ── which passing mode a command gets ─────────────────────────
 
     mod passing_mode {
