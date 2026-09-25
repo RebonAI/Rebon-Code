@@ -27,8 +27,9 @@ pub use rebon_render::tool_output;
 
 pub use session::{
     apply_plan_mode_transition_flags, resolve_session_cwd, PromptGeneration, PromptSessionSnapshot,
-    ReplayFinalizeOutcome, ReplayTranscriptSource, ServerState, SessionAttachmentState,
-    SessionOwner, SessionRecord, TranscriptSweep,
+    PermissionModePublisher, ReplayFinalizeOutcome, ReplayTranscriptSource, ServerState,
+    SessionAttachmentState, SessionOwner, SessionPermissionModeSource, SessionRecord,
+    TranscriptSweep,
 };
 pub use tool_output::{
     extract_locations, tool_result_update_content, trim_raw_output_for_transcript,

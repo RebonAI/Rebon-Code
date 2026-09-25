@@ -1496,7 +1496,9 @@ async fn build_background_session(
     .await?
     .session;
     session.cwd = effective_cwd.clone();
-    ipc.attach_permission_mode_cell(Arc::clone(&session.engine_half.permission_mode_cell));
+    let live_mode = crate::host::ipc::server::LiveSessionMode::of(&session);
+    live_mode.restore_plan_entered_from();
+    ipc.attach_session_permission_mode(store, &state.identity.job_id, live_mode);
     ipc.apply_pending_context_commands(&session);
     let session_id = session.session_id.clone();
     let job_id_for_update = state.identity.job_id.clone();
@@ -2127,7 +2129,11 @@ async fn run_idle_background_commands(
     first: BackgroundCommandRequest,
 ) {
     session.cwd = state.identity.cwd.clone();
-    ipc.attach_permission_mode_cell(Arc::clone(&session.engine_half.permission_mode_cell));
+    ipc.attach_session_permission_mode(
+        store,
+        &state.identity.job_id,
+        crate::host::ipc::server::LiveSessionMode::of(session),
+    );
     // `/mcp` and `/context` report the servers; collect a load that finished
     // while nobody was looking so they report what is actually there.
     if let Some(mcp) = session.engine_half.mcp.as_mut() {

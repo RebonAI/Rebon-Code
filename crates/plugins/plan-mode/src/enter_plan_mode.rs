@@ -9,7 +9,8 @@
 //! `enteredPlanMode: true` in its output so the engine / dispatch layer
 //! can propagate the mode change back to session storage. The user must
 //! approve the switch first, via [`PermissionDecision::ask`] in
-//! [`check_permissions`].
+//! [`check_permissions`] — unless the session is already in plan mode,
+//! where there is no switch to approve.
 //!
 //! The tool refuses to run for teammates and sub-agents: it checks
 //! [`ToolContext::team_identity`] — teammate turns are spawned with a
@@ -123,8 +124,14 @@ impl Tool for EnterPlanModeTool {
     async fn check_permissions(
         &self,
         input: &Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> ToolResult<PermissionDecision> {
+        // Already planning, there is no switch to approve: the call only
+        // hands the workflow back, and a dialog for it is a prompt that
+        // decides nothing.
+        if context.permission_mode().as_deref() == Some("plan") {
+            return Ok(PermissionDecision::allow(input.clone()));
+        }
         Ok(PermissionDecision::ask(
             PermissionRequest::new(
                 "Enter plan mode",
@@ -222,6 +229,24 @@ mod tests {
         assert_eq!(request.title, "Enter plan mode");
         assert!(request.options.iter().any(|o| o == "allow_once"));
         assert!(request.options.iter().any(|o| o == "reject_once"));
+    }
+
+    #[tokio::test]
+    async fn check_permissions_allows_a_call_made_in_plan_mode() {
+        let input = json!({});
+        let decision = tool()
+            .check_permissions(&input, &ToolContext::new().with_permission_mode("plan"))
+            .await
+            .unwrap();
+        assert_eq!(decision, PermissionDecision::allow(input));
+
+        for mode in ["default", "auto", "acceptEdits"] {
+            let decision = tool()
+                .check_permissions(&json!({}), &ToolContext::new().with_permission_mode(mode))
+                .await
+                .unwrap();
+            assert_eq!(decision.behavior, PermissionBehavior::Ask, "{mode}");
+        }
     }
 
     #[test]

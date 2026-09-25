@@ -699,9 +699,13 @@ fn bind_session_record(
                 Some(target_lock)
             }
         };
-        let record = tui_server_state
-            .load_session(&projects_root, resume_id, &cwd, Some(&cwd), Vec::new())
-            .map_err(|e| anyhow::anyhow!("failed to resume session {resume_id}: {}", e.message))?;
+        let record = load_resumed_session_record(
+            tui_server_state,
+            &projects_root,
+            resume_id,
+            &cwd,
+            startup_permission_mode,
+        )?;
         cwd = record.cwd.clone();
         // A transcript with nothing in it has no age: it was created just
         // now, however the epoch reads.
@@ -750,6 +754,31 @@ fn bind_session_record(
         session_active_lock,
         cwd,
     })
+}
+
+/// Load a transcript back into a record that runs in the mode this session
+/// starts in.
+///
+/// `load_session` has no mode to give the record and says `default`, while
+/// the gate's cell starts in `startup_permission_mode`. The two readers then
+/// disagree: a background job, which resumes its own session every turn,
+/// enforced `plan` while the plan-mode reminders — which read the record —
+/// said nothing, so the model went on editing and every edit prompted. The
+/// write goes through `set_permission_mode`, as a mode set on a live session
+/// does, so the plan-mode bookkeeping sees the session enter the mode.
+fn load_resumed_session_record(
+    state: &ServerState,
+    projects_root: &Path,
+    resume_id: &str,
+    cwd: &str,
+    startup_permission_mode: Option<PermissionMode>,
+) -> anyhow::Result<rebon_acp::SessionRecord> {
+    let record = state
+        .load_session(projects_root, resume_id, cwd, Some(cwd), Vec::new())
+        .map_err(|e| anyhow::anyhow!("failed to resume session {resume_id}: {}", e.message))?;
+    let mode = startup_permission_mode.unwrap_or(PermissionMode::Default);
+    state.set_permission_mode(&record.id, mode.as_wire());
+    Ok(record)
 }
 
 /// Every third-party agent this session may reach, and the warm pool
@@ -1668,9 +1697,13 @@ fn assemble_session_build(parts: SessionAssemblyParts) -> anyhow::Result<Session
     );
     let auto_mode_hooks = {
         let sink = SharedDenialSink::new(Arc::clone(&auto_mode_denials));
-        let provider_cell = Arc::clone(&permission_mode_cell);
+        // The cell for the mode; the record for where plan was entered from.
         let provider: Arc<dyn PermissionModeProvider> =
-            Arc::new(move || *provider_cell.lock().expect("mode cell poisoned"));
+            Arc::new(rebon_acp::session::SessionPermissionModeSource::cell(
+                Arc::clone(&tui_server_state),
+                session_id.clone(),
+                Arc::clone(&permission_mode_cell),
+            ));
         AutoModeHooks::new(Arc::new(sink), provider).with_verdicts(Arc::clone(&auto_mode_verdicts))
     };
     let (permission_broker, permission_rx) = bound.build_permissions(Some(auto_mode_hooks));
@@ -1781,6 +1814,7 @@ fn assemble_session_build(parts: SessionAssemblyParts) -> anyhow::Result<Session
         auto_mode_denials: auto_mode_denials.clone(),
         auto_mode_verdicts: auto_mode_verdicts.clone(),
         permission_mode_cell: permission_mode_cell.clone(),
+        server_state: Arc::clone(&tui_server_state),
         runtime_model: model.runtime_model.clone(),
         kernel_context_resolver: bound.kernel_scopes.resolver(),
         session_cron_store: session_cron_store.clone(),
@@ -2211,5 +2245,97 @@ pub fn system_prompt_config_for_engine(
         minimal_system_prompt_override: prompt_overrides.minimal,
         chat_system_prompt_override: prompt_overrides.chat,
         auto_continue_background_agents,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transcript_on_disk(projects_root: &Path, cwd: &str, session_id: &str) {
+        let path = rebon_session::ensure_session_file_path(projects_root, cwd, session_id).unwrap();
+        std::fs::write(
+            path,
+            "{\"type\":\"user\",\"uuid\":\"u1\",\"parentUuid\":null,\
+             \"timestamp\":\"2026-09-25T00:00:00.000Z\",\"message\":null}\n",
+        )
+        .unwrap();
+    }
+
+    /// A resumed record says the mode the session starts in, whatever it is:
+    /// the plan-mode reminders read the record, the gate reads a cell that
+    /// starts in this mode, and the two have to agree from the first call.
+    #[test]
+    fn a_resumed_record_takes_the_mode_the_session_starts_in() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = "/repo/resume-mode";
+        for (index, (startup, expected)) in [
+            (Some(PermissionMode::Plan), "plan"),
+            (Some(PermissionMode::AcceptEdits), "acceptEdits"),
+            (Some(PermissionMode::Auto), "auto"),
+            (None, "default"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session_id = format!("sess-resume-mode-{index}");
+            transcript_on_disk(root.path(), cwd, &session_id);
+            let state = ServerState::new();
+
+            let record =
+                load_resumed_session_record(&state, root.path(), &session_id, cwd, startup)
+                    .unwrap();
+
+            assert_eq!(record.id, session_id);
+            assert_eq!(
+                state.session_permission_mode(&session_id).as_deref(),
+                Some(expected),
+                "startup mode {startup:?}"
+            );
+        }
+    }
+
+    /// Resuming straight into plan mode is entering it: the snapshot the
+    /// plan-mode producer reads must not carry an exit notice from nowhere.
+    #[test]
+    fn resuming_into_plan_leaves_no_pending_exit_notice() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = "/repo/resume-plan";
+        transcript_on_disk(root.path(), cwd, "sess-resume-plan");
+        let state = ServerState::new();
+
+        load_resumed_session_record(
+            &state,
+            root.path(),
+            "sess-resume-plan",
+            cwd,
+            Some(PermissionMode::Plan),
+        )
+        .unwrap();
+
+        let snapshot = state
+            .attachment_session_snapshot("sess-resume-plan")
+            .unwrap();
+        assert_eq!(snapshot.permission_mode, "plan");
+        assert!(!snapshot.attachment_state.needs_plan_mode_exit_attachment);
+        assert!(!snapshot.attachment_state.has_exited_plan_mode);
+    }
+
+    #[test]
+    fn a_missing_transcript_is_still_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let state = ServerState::new();
+
+        let error = load_resumed_session_record(
+            &state,
+            root.path(),
+            "sess-not-there",
+            "/repo/none",
+            Some(PermissionMode::Plan),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("failed to resume session"));
+        assert!(state.session_permission_mode("sess-not-there").is_none());
     }
 }

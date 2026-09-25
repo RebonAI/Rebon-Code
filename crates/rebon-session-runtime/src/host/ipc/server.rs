@@ -47,7 +47,82 @@ pub(crate) struct BackgroundCommandRequest {
 #[derive(Default)]
 pub(crate) struct LivePermissionModeState {
     cell: Option<Arc<Mutex<rebon_permissions::PermissionMode>>>,
+    /// The session record the cell shadows. A mode set over IPC is written
+    /// here as well as into the cell, because the record is what the
+    /// plan-mode reminders read: a cell that says `plan` beside a record
+    /// that says `default` is a gate that prompts for every edit while the
+    /// model is never told it is planning.
+    record: Option<LiveSessionRecord>,
     desired: Option<rebon_permissions::PermissionMode>,
+}
+
+/// The parts of a session its permission mode lives in: the record, the cell
+/// the gate reads beside it, and the transcript directory whose sidecar keeps
+/// where plan mode was entered from.
+pub(crate) struct LiveSessionMode<'a> {
+    pub(crate) state: &'a Arc<rebon_acp::ServerState>,
+    pub(crate) session_id: &'a str,
+    pub(crate) cell: &'a Arc<Mutex<rebon_permissions::PermissionMode>>,
+    pub(crate) projects_root: &'a std::path::Path,
+    pub(crate) cwd: &'a str,
+}
+
+impl<'a> LiveSessionMode<'a> {
+    pub(crate) fn of(session: &'a crate::EngineSession) -> Self {
+        Self {
+            state: &session.server_state,
+            session_id: &session.session_id,
+            cell: &session.engine_half.permission_mode_cell,
+            projects_root: &session.projects_root,
+            cwd: &session.cwd,
+        }
+    }
+
+    /// Put back where this rebuilt session entered plan mode from.
+    ///
+    /// The job record brings the session back in plan mode by setting it,
+    /// which reads as entering plan from `default`; the mode it really came
+    /// from is in the sidecar the publisher wrote. Run before the session is
+    /// attached, so a mode a client asked for in between moves on from the
+    /// restored origin.
+    pub(crate) fn restore_plan_entered_from(&self) {
+        let plan_entered_from = rebon_session::load_session_plan_entered_from(
+            self.projects_root,
+            self.cwd,
+            self.session_id,
+        );
+        self.state
+            .restore_plan_entered_from(self.session_id, plan_entered_from.as_deref());
+    }
+}
+
+#[derive(Clone)]
+struct LiveSessionRecord {
+    state: Arc<rebon_acp::ServerState>,
+    session_id: String,
+}
+
+/// Write the mode now in force into the job record.
+///
+/// The record is where a respawned worker, the next turn's session and every
+/// attached client read the mode from, so a mode that only lived in this
+/// process was lost at the next turn. `Ok(false)` when the record already said
+/// so, which is the caller's cue not to announce a change.
+pub(crate) fn publish_permission_mode_to_job(
+    store: &BackgroundStore,
+    job_id: &str,
+    owner: &BackgroundIpcOwner,
+    mode: &str,
+) -> anyhow::Result<bool> {
+    store.update_state(job_id, |state| {
+        owner.ensure_matches(state)?;
+        if state.identity.runtime.permission_mode.as_deref() == Some(mode) {
+            return Ok(false);
+        }
+        state.identity.runtime.permission_mode = Some(mode.to_string());
+        state.process.updated_at_ms = rebon_session_host::now_ms();
+        Ok(true)
+    })
 }
 
 pub(crate) type SharedLivePermissionModeState = Arc<Mutex<LivePermissionModeState>>;
@@ -507,15 +582,79 @@ impl BackgroundIpcServer {
         *self.stop_gate.lock().expect("poisoned") = Some(gate);
     }
 
-    pub(crate) fn attach_permission_mode_cell(
+    /// Bind this turn's session to the job's permission mode, both ways.
+    ///
+    /// Inward: the cell and the record become what a `SetPermissionMode`
+    /// writes, and a mode a client asked for before the session existed
+    /// lands on both. Outward, a publisher on the record: a mode the session
+    /// takes on its own — `ExitPlanMode` approved into `auto`,
+    /// `EnterPlanMode` — goes to the job record and out to every client,
+    /// exactly as a `SetPermissionMode` does. The worker rebuilds the session
+    /// from that record every turn, so a move that stayed in the session was
+    /// undone one turn later. Where plan mode was entered from goes to the
+    /// session's sidecar with it, for [`LiveSessionMode::restore_plan_entered_from`].
+    pub(crate) fn attach_session_permission_mode(
         &self,
-        cell: Arc<Mutex<rebon_permissions::PermissionMode>>,
+        store: &BackgroundStore,
+        job_id: &str,
+        session: LiveSessionMode<'_>,
     ) {
-        let mut live = self.live_permission_mode.lock().expect("poisoned");
-        if let Some(mode) = live.desired.take() {
+        let owner = self.owner();
+        let status = self.status_publisher();
+        let publisher_store = store.clone();
+        let publisher_job_id = job_id.to_string();
+        let projects_root = session.projects_root.to_path_buf();
+        let cwd = session.cwd.to_string();
+        let session_id = session.session_id.to_string();
+        session.state.attach_permission_mode_publisher(
+            session.session_id,
+            rebon_acp::session::PermissionModePublisher::new(move |mode, plan_entered_from| {
+                match publish_permission_mode_to_job(
+                    &publisher_store,
+                    &publisher_job_id,
+                    &owner,
+                    mode,
+                ) {
+                    Ok(true) => status.publish_now(&publisher_store, &publisher_job_id),
+                    Ok(false) => {}
+                    Err(err) => tracing::warn!(
+                        %err,
+                        mode,
+                        "could not publish the session's permission mode to the job state"
+                    ),
+                }
+                if let Err(err) = rebon_session::save_session_plan_entered_from(
+                    &projects_root,
+                    &cwd,
+                    &session_id,
+                    plan_entered_from,
+                ) {
+                    tracing::warn!(
+                        %err,
+                        "could not keep where the session entered plan mode from"
+                    );
+                }
+            }),
+        );
+        let cell = Arc::clone(session.cell);
+        // Taken out under the lock and applied after it: the record write
+        // runs the publisher above, which reads this state for the status
+        // snapshot.
+        let desired = {
+            let mut live = self.live_permission_mode.lock().expect("poisoned");
+            live.cell = Some(Arc::clone(&cell));
+            live.record = Some(LiveSessionRecord {
+                state: Arc::clone(session.state),
+                session_id: session.session_id.to_string(),
+            });
+            live.desired.take()
+        };
+        if let Some(mode) = desired {
+            session
+                .state
+                .set_permission_mode(session.session_id, mode.as_wire());
             *cell.lock().expect("mode cell poisoned") = mode;
         }
-        live.cell = Some(cell);
     }
 
     /// Publish what this owner's MCP servers look like.
@@ -1739,27 +1878,32 @@ pub(crate) fn handle_background_ipc_request(
                     return Err(request_error(error));
                 }
             };
-            let cell = {
+            let (cell, record) = {
                 let mut live = live_permission_mode.lock().expect("poisoned");
                 live.desired = Some(mode);
-                live.cell.clone()
+                (live.cell.clone(), live.record.clone())
             };
-            if let Some(cell) = cell {
-                *cell.lock().expect("mode cell poisoned") = mode;
-            }
             // Publish the mode that is now in force. Without this it lives
             // only in this worker's memory, and every other client attached
             // to this job keeps displaying whatever it last knew — a UI
             // claiming `default` while the worker enforces `plan`, or worse
             // the other way round. It also means a respawned worker comes
             // back under the mode the user chose, not the one it booted with.
-            if let Err(err) = store.update_state(job_id, |state| {
-                owner.ensure_matches(state)?;
-                state.identity.runtime.permission_mode = Some(mode.as_wire().to_string());
-                state.process.updated_at_ms = rebon_session_host::now_ms();
-                Ok(())
-            }) {
+            // Written before the record below, so the record's own publisher
+            // finds the job already saying so and stays quiet: the reply to
+            // this request announces the change once.
+            if let Err(err) = publish_permission_mode_to_job(store, job_id, owner, mode.as_wire()) {
                 tracing::warn!(%err, "could not publish the permission mode to the job state");
+            }
+            if let Some(record) = record {
+                record
+                    .state
+                    .set_permission_mode(&record.session_id, mode.as_wire());
+            }
+            // The record mirrors into its cell, but only while it still has
+            // the session; a turn that already released it keeps its cell.
+            if let Some(cell) = cell {
+                *cell.lock().expect("mode cell poisoned") = mode;
             }
             Ok(HostReply::default())
         }

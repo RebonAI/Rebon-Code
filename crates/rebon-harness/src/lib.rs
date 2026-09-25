@@ -2507,21 +2507,19 @@ fn apply_session_permission_mode_override(
     }
 }
 
-/// Mode provider backed by the session record: reads
-/// `ServerState::session_permission_mode` on every query so mid-session
-/// changes (ExitPlanMode choosing Auto, `session/set_config_option`) are
-/// visible to the broker immediately. Unknown sessions resolve to
+/// Mode provider backed by the session record: reads it on every query so
+/// mid-session changes (ExitPlanMode choosing Auto,
+/// `session/set_config_option`) are visible to the broker immediately, along
+/// with where plan mode was entered from. Unknown sessions resolve to
 /// `Default` — never more permissive.
 fn session_record_permission_mode_provider(
     server_state: Arc<rebon_acp::ServerState>,
     session_id: String,
 ) -> Arc<dyn rebon_permissions::denial_sink::PermissionModeProvider> {
-    Arc::new(move || {
-        server_state
-            .session_permission_mode(&session_id)
-            .map(|mode| rebon_permissions::PermissionMode::from_wire(&mode))
-            .unwrap_or(rebon_permissions::types::PermissionMode::Default)
-    })
+    Arc::new(rebon_acp::session::SessionPermissionModeSource::record(
+        server_state,
+        session_id,
+    ))
 }
 
 #[cfg(test)]

@@ -495,6 +495,7 @@ impl ChannelPermissionBroker {
         if requires_permission_broker_response(tool_name)
             || requires_workflow_review(tool_name)
             || rules.requires_user_decision(tool_name, context).is_some()
+            || edits_git_metadata(tool_name, input, context)
         {
             return AutoModeGateOutcome::Ask;
         }
@@ -558,7 +559,7 @@ impl ChannelPermissionBroker {
         let result =
             tokio::time::timeout(AUTO_MODE_CLASSIFIER_TIMEOUT, classifier.classify(request)).await;
 
-        if !hooks.is_auto() {
+        if !hooks.auto_gates(hooks.current_mode()) {
             tracing::debug!(
                 tool = tool_name,
                 "auto-mode classifier verdict ignored after permission mode changed"
@@ -831,8 +832,8 @@ fn dont_ask_workflow_deny_reason(tool_name: &str) -> String {
 /// What the active permission mode decides about a call that would otherwise
 /// open an approval prompt.
 pub(crate) enum ModeAskOutcome {
-    /// Run the tool now, with no prompt. `Some` only under auto mode,
-    /// the one mode whose short circuit is a *verdict* worth attributing;
+    /// Run the tool now, with no prompt. `Some` only through auto mode's
+    /// gate, the one short circuit that is a *verdict* worth attributing;
     /// `bypassPermissions` and `acceptEdits` just run.
     Run(Option<AutoModeAllowSource>),
     /// Refuse. `reason` goes back to the model as the tool error.
@@ -952,7 +953,7 @@ pub(crate) async fn resolve_ask_under_mode(
         // File edits only. Everything else falls through exactly as in
         // `default` — the "other operations follow policy" half of the promise.
         PermissionMode::AcceptEdits => {
-            if is_accept_edits_tool(tool_name) {
+            if is_accept_edits_tool(tool_name) && !edits_git_metadata(tool_name, input, context) {
                 tracing::debug!(
                     tool = tool_name,
                     "acceptEdits: running a file edit without a prompt"
@@ -978,27 +979,48 @@ pub(crate) async fn resolve_ask_under_mode(
             if seat_requires_ask {
                 return ModeAskOutcome::Ask;
             }
-            match ChannelPermissionBroker::auto_mode_gate(
-                tool_name, input, context, hooks, classifier, rules,
-            )
-            .await
-            {
-                AutoModeGateOutcome::Run(source) => ModeAskOutcome::Run(Some(source)),
-                AutoModeGateOutcome::Deny { reason, fresh } => {
-                    // Only a first-time denial appends a `/permissions` record;
-                    // a replayed one is already in the store.
-                    if fresh {
-                        let record = build_denial_input(tool_name, context, input, Some(&reason));
-                        let _ = hooks.sink.record(record);
-                    }
-                    ModeAskOutcome::Deny(reason)
-                }
-                AutoModeGateOutcome::Ask => ModeAskOutcome::Ask,
+            ask_through_auto_gate(tool_name, input, context, hooks, classifier, rules).await
+        }
+        // Plan mode entered from auto keeps auto's gate (see
+        // `AutoModeHooks::auto_gates`). What plan forbids still comes from the
+        // prompt, not from here. Without hooks nothing recorded where plan was
+        // entered from, and it prompts like any other plan.
+        PermissionMode::Plan => match hooks.filter(|hooks| hooks.auto_gates(mode)) {
+            Some(hooks) if !seat_requires_ask => {
+                ask_through_auto_gate(tool_name, input, context, hooks, classifier, rules).await
             }
+            _ => ModeAskOutcome::Ask,
+        },
+        PermissionMode::Default | PermissionMode::Bubble => ModeAskOutcome::Ask,
+    }
+}
+
+/// A would-be prompt put to auto mode's gate: run on its verdict, refuse with
+/// a `/permissions` record, or fall through to the prompt.
+async fn ask_through_auto_gate(
+    tool_name: &str,
+    input: &Value,
+    context: &ToolContext,
+    hooks: &AutoModeHooks,
+    classifier: Option<Arc<dyn AutoModeClassifier>>,
+    rules: &PermissionRules,
+) -> ModeAskOutcome {
+    match ChannelPermissionBroker::auto_mode_gate(
+        tool_name, input, context, hooks, classifier, rules,
+    )
+    .await
+    {
+        AutoModeGateOutcome::Run(source) => ModeAskOutcome::Run(Some(source)),
+        AutoModeGateOutcome::Deny { reason, fresh } => {
+            // Only a first-time denial appends a `/permissions` record;
+            // a replayed one is already in the store.
+            if fresh {
+                let record = build_denial_input(tool_name, context, input, Some(&reason));
+                let _ = hooks.sink.record(record);
+            }
+            ModeAskOutcome::Deny(reason)
         }
-        PermissionMode::Default | PermissionMode::Plan | PermissionMode::Bubble => {
-            ModeAskOutcome::Ask
-        }
+        AutoModeGateOutcome::Ask => ModeAskOutcome::Ask,
     }
 }
 
@@ -1125,7 +1147,10 @@ impl PermissionBroker for ChannelPermissionBroker {
             .as_ref()
             .map(|h| h.current_mode())
             .unwrap_or(PermissionMode::Default);
-        let in_auto = mode == PermissionMode::Auto;
+        // Auto mode, or plan mode entered from it: the modes whose prompts the
+        // classifier answers, and so the ones that owe the user a record of
+        // what it refused and a note on what it let through.
+        let in_auto = hooks.as_ref().is_some_and(|h| h.auto_gates(mode));
 
         match decision.behavior {
             PermissionBehavior::Allow => {
@@ -1170,9 +1195,10 @@ impl PermissionBroker for ChannelPermissionBroker {
                 .await
                 {
                     ModeAskOutcome::Run(source) => {
-                        // Auto mode is the only mode that runs a would-be
-                        // dialog on a classifier verdict, so it is the only
-                        // one that owes the user a visible "this was allowed
+                        // Auto mode (and plan mode entered from it) is the
+                        // only mode that runs a would-be dialog on a
+                        // classifier verdict, so it is the only one that owes
+                        // the user a visible "this was allowed
                         // for you" note on the tool row — and the note names
                         // which part of the gate decided, because an
                         // exemption the user granted is not auto mode's call.
@@ -1475,6 +1501,35 @@ fn requires_workflow_review(tool_name: &str) -> bool {
 /// `TodoWrite` never reach here because they resolve to `Allow` on their own.
 fn is_accept_edits_tool(tool_name: &str) -> bool {
     rebon_tool::tool_kind_for_name(tool_name) == ToolKind::FileEdit
+}
+
+/// A file edit aimed at a repository's git metadata — `.git/config`, a hook,
+/// a worktree's `.git` pointer.
+///
+/// Git runs what that metadata names (`core.fsmonitor`, `diff.external`,
+/// filter and textconv drivers, hooks) from commands that only read, and a
+/// read-only `git status` runs without a prompt. So a mode that accepts file
+/// edits on the user's behalf — `acceptEdits`, or auto mode's classifier —
+/// would turn "edit a file" into "run a program" with nobody asked. Such an
+/// edit always reaches the prompt instead; `bypassPermissions` keeps its
+/// contract and runs it. A file edit with no target to read is left to the
+/// tool, whose validation refuses it before any of this is asked.
+fn edits_git_metadata(tool_name: &str, input: &Value, context: &ToolContext) -> bool {
+    if !is_accept_edits_tool(tool_name) {
+        return false;
+    }
+    let Some(target) = rebon_tool::file_target_field_for_name(tool_name)
+        .and_then(|field| input.get(field))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let target = std::path::Path::new(target);
+    let target = match context.cwd() {
+        Some(cwd) if target.is_relative() => std::path::Path::new(cwd).join(target),
+        _ => target.to_path_buf(),
+    };
+    rebon_tool::path_scope::is_git_metadata_path(&target)
 }
 
 fn append_permission_extra_text(value: &mut Value, extra_text: &Option<String>) {
@@ -3236,6 +3291,127 @@ mod tests {
         }
     }
 
+    /// A file edit into git metadata is a way to run a program: git runs
+    /// what `.git/config` and the hooks name from a `git status` that no
+    /// longer asks. `acceptEdits` does not accept it on the user's behalf.
+    #[tokio::test]
+    async fn accept_edits_prompts_for_an_edit_into_git_metadata() {
+        for (tool_name, field, target) in [
+            ("Write", "file_path", ".git/config"),
+            ("Edit", "file_path", "/repo/.git/hooks/pre-commit"),
+            ("MultiEdit", "file_path", "sub/.GIT/info/attributes"),
+            ("Write", "file_path", "worktree/.git"),
+            ("NotebookEdit", "notebook_path", "/repo/.git/x.ipynb"),
+        ] {
+            let (broker, mut rx) = ChannelPermissionBroker::new("sess-accept");
+            let (hooks, _sink) = hooks_with_mode(PermissionMode::AcceptEdits);
+            broker.set_auto_mode_hooks(Some(hooks));
+            let mut input = json!({ "content": "[core]" });
+            input[field] = json!(target);
+            let decision = PermissionDecision::ask(
+                PermissionRequest::new("Edit file", format!("Edit wants to modify: {target}"))
+                    .with_options(["allow_once", "reject_once"]),
+                Some(input.clone()),
+            );
+            let pending = tokio::spawn({
+                let input = input.clone();
+                async move {
+                    broker
+                        .resolve(
+                            &NamedEchoTool(tool_name),
+                            input,
+                            &ToolContext::new().with_cwd("/repo"),
+                            decision,
+                        )
+                        .await
+                }
+            });
+
+            let query = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("{tool_name} {target} must prompt"))
+                .expect("permission receiver should stay open");
+            drop(query.response_tx);
+            assert!(pending.await.unwrap().is_err(), "{tool_name} {target}");
+        }
+    }
+
+    /// Paths that only look like git's are ordinary project files.
+    #[tokio::test]
+    async fn accept_edits_still_runs_edits_beside_git_metadata() {
+        for target in [
+            ".gitignore",
+            ".gitattributes",
+            ".github/workflows/ci.yml",
+            "src/git.rs",
+        ] {
+            let (broker, mut rx) = ChannelPermissionBroker::new("sess-accept");
+            let (hooks, _sink) = hooks_with_mode(PermissionMode::AcceptEdits);
+            broker.set_auto_mode_hooks(Some(hooks));
+            let input = json!({ "file_path": target, "content": "x" });
+            let decision = PermissionDecision::ask(
+                PermissionRequest::new("Edit file", "Edit wants to modify a file"),
+                Some(input.clone()),
+            );
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                broker.resolve(
+                    &NamedEchoTool("Write"),
+                    input.clone(),
+                    &ToolContext::new().with_cwd("/repo"),
+                    decision,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{target} must not wait on a dialog"))
+            .expect("acceptEdits should run the edit");
+
+            assert_eq!(result, input);
+            assert!(rx.try_recv().is_err(), "{target}");
+        }
+    }
+
+    /// Auto mode's classifier does not get to answer for it either: the
+    /// edit goes to the user, and the classifier is never asked.
+    #[tokio::test]
+    async fn auto_mode_prompts_for_an_edit_into_git_metadata() {
+        let (broker, mut rx) = ChannelPermissionBroker::new("sess-auto");
+        let (hooks, sink) = hooks_with_mode(PermissionMode::Auto);
+        broker.set_auto_mode_hooks(Some(hooks));
+        let classifier = Arc::new(RecordingClassifier::new(FixedClassifierResult::Outcome(
+            AutoModeClassifierOutcome::Allow {
+                reason: "Only edits a config file.".to_owned(),
+                stage: AutoModeClassifierStage::Fast,
+            },
+        )));
+        broker.set_auto_mode_classifier(Some(classifier.clone()));
+        let input = json!({ "file_path": "/repo/.git/config", "content": "[core]" });
+        let decision = PermissionDecision::ask(
+            PermissionRequest::new("Write file", "Write wants to overwrite /repo/.git/config"),
+            Some(input.clone()),
+        );
+        let pending = tokio::spawn(async move {
+            broker
+                .resolve(
+                    &NamedEchoTool("Write"),
+                    input,
+                    &ToolContext::new().with_cwd("/repo"),
+                    decision,
+                )
+                .await
+        });
+
+        let query = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("an edit into .git must prompt under auto mode")
+            .expect("permission receiver should stay open");
+        drop(query.response_tx);
+        assert!(pending.await.unwrap().is_err());
+        assert_eq!(classifier.call_count(), 0);
+        assert_eq!(sink.store().lock().unwrap().len(), 0);
+    }
+
     /// "Other operations follow policy": a shell call in this mode behaves
     /// exactly as it does in `default`, dialog and all.
     #[tokio::test]
@@ -3895,6 +4071,203 @@ mod tests {
             .await;
         assert!(matches!(after, Err(ToolError::PermissionDenied { .. })));
         assert_eq!(classifier.call_count(), 2);
+    }
+
+    /// A mode source that knows where plan mode was entered from, as the
+    /// session record does.
+    struct PlanOrigin {
+        mode: PermissionMode,
+        entered_from: Option<PermissionMode>,
+    }
+
+    impl PermissionModeProvider for PlanOrigin {
+        fn current_mode(&self) -> PermissionMode {
+            self.mode
+        }
+
+        fn plan_entered_from(&self) -> Option<PermissionMode> {
+            self.entered_from
+        }
+    }
+
+    fn plan_hooks(entered_from: Option<PermissionMode>) -> (AutoModeHooks, SharedDenialSink) {
+        let sink = SharedDenialSink::new(Arc::new(StdMutex::new(AutoModeDenialStore::default())));
+        let provider: Arc<dyn PermissionModeProvider> = Arc::new(PlanOrigin {
+            mode: PermissionMode::Plan,
+            entered_from,
+        });
+        (AutoModeHooks::new(Arc::new(sink.clone()), provider), sink)
+    }
+
+    /// The user already let the classifier answer for them in auto mode;
+    /// planning does not take that back, so a prompt a plan needs goes to the
+    /// classifier rather than the user.
+    #[tokio::test]
+    async fn plan_entered_from_auto_asks_the_classifier_instead_of_the_user() {
+        let (broker, mut rx) = ChannelPermissionBroker::new("sess-plan-auto");
+        let (hooks, sink) = plan_hooks(Some(PermissionMode::Auto));
+        broker.set_auto_mode_hooks(Some(hooks));
+        let classifier = Arc::new(RecordingClassifier::new(FixedClassifierResult::Outcome(
+            AutoModeClassifierOutcome::Allow {
+                reason: "Inspects the repository.".to_owned(),
+                stage: AutoModeClassifierStage::Fast,
+            },
+        )));
+        broker.set_auto_mode_classifier(Some(classifier.clone()));
+
+        let input = embedded_python_input("print('inspect')");
+        let result = broker
+            .resolve(
+                &BashEchoTool,
+                input.clone(),
+                &ToolContext::new().with_tool_use_id("t-plan-auto"),
+                bash_ask_decision(input.clone()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, input);
+        assert!(
+            rx.try_recv().is_err(),
+            "the classifier answered, not a dialog"
+        );
+        assert_eq!(classifier.call_count(), 1);
+        assert_eq!(sink.store().lock().unwrap().len(), 0);
+    }
+
+    /// A refusal under plan-from-auto is auto mode's refusal: the model is
+    /// told, and `/permissions` keeps a record to approve or retry from.
+    #[tokio::test]
+    async fn plan_entered_from_auto_records_what_the_classifier_refuses() {
+        let (broker, mut rx) = ChannelPermissionBroker::new("sess-plan-auto");
+        let (hooks, sink) = plan_hooks(Some(PermissionMode::Auto));
+        broker.set_auto_mode_hooks(Some(hooks));
+        let classifier = Arc::new(RecordingClassifier::new(FixedClassifierResult::Outcome(
+            AutoModeClassifierOutcome::Block {
+                reason: "Pushes to a shared branch.".to_owned(),
+                category: None,
+            },
+        )));
+        broker.set_auto_mode_classifier(Some(classifier.clone()));
+
+        let input = embedded_python_input("print('push')");
+        let result = broker
+            .resolve(
+                &BashEchoTool,
+                input.clone(),
+                &ToolContext::new().with_tool_use_id("t-plan-block"),
+                bash_ask_decision(input),
+            )
+            .await;
+
+        let Err(ToolError::PermissionDenied { reason, .. }) = result else {
+            panic!("the classifier's block must refuse the call, got {result:?}");
+        };
+        assert!(reason.contains("Pushes to a shared branch"), "{reason}");
+        assert!(rx.try_recv().is_err(), "a refusal is not a dialog");
+        assert_eq!(sink.store().lock().unwrap().len(), 1);
+    }
+
+    /// Plan entered from anywhere but auto — or from nowhere anyone
+    /// recorded — prompts the way plan mode always has, and the classifier
+    /// is never asked.
+    #[tokio::test]
+    async fn plan_entered_from_anywhere_else_still_asks_the_user() {
+        for entered_from in [
+            Some(PermissionMode::Default),
+            Some(PermissionMode::AcceptEdits),
+            None,
+        ] {
+            let (broker, mut rx) = ChannelPermissionBroker::new("sess-plan");
+            let (hooks, _sink) = plan_hooks(entered_from);
+            broker.set_auto_mode_hooks(Some(hooks));
+            let classifier = Arc::new(RecordingClassifier::new(FixedClassifierResult::Outcome(
+                AutoModeClassifierOutcome::Allow {
+                    reason: "unused".to_owned(),
+                    stage: AutoModeClassifierStage::Fast,
+                },
+            )));
+            broker.set_auto_mode_classifier(Some(classifier.clone()));
+
+            let input = embedded_python_input("print('inspect')");
+            let handle = tokio::spawn({
+                let input = input.clone();
+                async move {
+                    broker
+                        .resolve(
+                            &BashEchoTool,
+                            input.clone(),
+                            &ToolContext::new().with_tool_use_id("t-plan"),
+                            bash_ask_decision(input),
+                        )
+                        .await
+                }
+            });
+
+            let query = rx
+                .recv()
+                .await
+                .unwrap_or_else(|| panic!("plan from {entered_from:?} must prompt"));
+            query.response_tx.send(PermissionAnswer::Cancelled).unwrap();
+            assert!(matches!(
+                handle.await.unwrap(),
+                Err(ToolError::PermissionDenied { .. })
+            ));
+            assert_eq!(classifier.call_count(), 0, "from {entered_from:?}");
+        }
+    }
+
+    /// The mode function alone, without a broker: plan from auto routes
+    /// through the gate, plan from default does not.
+    #[tokio::test]
+    async fn resolve_ask_under_plan_follows_where_plan_was_entered_from() {
+        let rules = PermissionRules::default();
+        let input = embedded_python_input("print('inspect')");
+        let context = ToolContext::new();
+        let allow: Arc<dyn AutoModeClassifier> = Arc::new(RecordingClassifier::new(
+            FixedClassifierResult::Outcome(AutoModeClassifierOutcome::Allow {
+                reason: "fine".to_owned(),
+                stage: AutoModeClassifierStage::Fast,
+            }),
+        ));
+
+        let (from_auto, _) = plan_hooks(Some(PermissionMode::Auto));
+        let outcome = resolve_ask_under_mode(
+            PermissionMode::Plan,
+            "Bash",
+            &input,
+            &context,
+            Some(&from_auto),
+            Some(allow.clone()),
+            &rules,
+        )
+        .await;
+        assert!(matches!(outcome, ModeAskOutcome::Run(Some(_))));
+
+        let (from_default, _) = plan_hooks(Some(PermissionMode::Default));
+        let outcome = resolve_ask_under_mode(
+            PermissionMode::Plan,
+            "Bash",
+            &input,
+            &context,
+            Some(&from_default),
+            Some(allow.clone()),
+            &rules,
+        )
+        .await;
+        assert!(matches!(outcome, ModeAskOutcome::Ask));
+
+        let outcome = resolve_ask_under_mode(
+            PermissionMode::Plan,
+            "Bash",
+            &input,
+            &context,
+            None,
+            Some(allow),
+            &rules,
+        )
+        .await;
+        assert!(matches!(outcome, ModeAskOutcome::Ask));
     }
 
     #[tokio::test]

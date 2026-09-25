@@ -2058,6 +2058,39 @@ mod tests {
         assert!(delegate.decisions().is_empty());
     }
 
+    /// The shell tools allow a read on their own, and a user's deny rule on
+    /// that read still wins: the rules broker refuses before the tool's
+    /// `Allow` reaches any mode.
+    #[tokio::test]
+    async fn rules_broker_deny_beats_a_shell_read_the_tool_allowed() {
+        let store = PolicyStore::new();
+        store.deny("Bash(git log:*)", PermissionRuleSource::UserSettings);
+        let delegate = Arc::new(RecordingDelegate::default());
+        let broker = RulesBasedPermissionBroker::new(store, delegate.clone());
+        let tool = rebon_tool::bash::BashTool::new();
+        let ctx = ToolContext::new();
+        let input = json!({ "command": "git log --oneline -5" });
+        let decision = tool.check_permissions(&input, &ctx).await.unwrap();
+        assert_eq!(
+            decision.behavior,
+            PermissionBehavior::Allow,
+            "the tool allows the read on its own"
+        );
+
+        let err = broker
+            .resolve(&tool, input, &ctx, decision)
+            .await
+            .unwrap_err();
+
+        match err {
+            ToolError::PermissionDenied { reason, .. } => {
+                assert!(reason.contains("git log"), "{reason}");
+            }
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+        assert!(delegate.decisions().is_empty());
+    }
+
     // ── Edit → Write alias ──────────────────────────────────────────
 
     #[test]

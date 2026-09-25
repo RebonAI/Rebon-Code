@@ -1018,6 +1018,11 @@ struct SessionMetaFile {
     /// session and starting from nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     acp_session_id: Option<String>,
+    /// The permission mode this session entered plan mode from, kept while
+    /// it is in plan mode by a host that rebuilds the session every turn.
+    /// See [`save_session_plan_entered_from`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan_entered_from: Option<String>,
     #[serde(flatten)]
     extra: serde_json::Map<String, Value>,
 }
@@ -1228,6 +1233,43 @@ pub fn save_session_mode(
     update_session_metadata(projects_root, cwd, session_id, |meta| {
         meta.insert("mode".into(), Value::String(mode.to_string()));
     })
+}
+
+/// Where this session entered plan mode from, as last saved.
+pub fn load_session_plan_entered_from(
+    projects_root: &Path,
+    cwd: &str,
+    session_id: &str,
+) -> Option<String> {
+    load_session_meta(projects_root, cwd, session_id)?.plan_entered_from
+}
+
+/// Remember where this session entered plan mode from; `None` forgets it.
+///
+/// A background job rebuilds its session every turn, and a rebuilt record
+/// comes back in plan mode by being set there — which reads as entering it
+/// from `default`. The mode it really came from decides whether auto mode's
+/// classifier keeps answering while it plans, so it outlives the record here,
+/// beside the rest of what a resume reads back.
+pub fn save_session_plan_entered_from(
+    projects_root: &Path,
+    cwd: &str,
+    session_id: &str,
+    plan_entered_from: Option<&str>,
+) -> std::io::Result<()> {
+    update_session_metadata(
+        projects_root,
+        cwd,
+        session_id,
+        |meta| match plan_entered_from {
+            Some(mode) => {
+                meta.insert("planEnteredFrom".into(), Value::String(mode.to_string()));
+            }
+            None => {
+                meta.remove("planEnteredFrom");
+            }
+        },
+    )
 }
 
 /// Persist whether this session is an internal workflow hidden from Chats.
@@ -6231,6 +6273,34 @@ mod tests {
         assert_eq!(
             load_session_mode(root, "/tmp/repo", "sess-m").as_deref(),
             Some("coordinator")
+        );
+    }
+
+    #[test]
+    fn plan_entered_from_roundtrips_and_forgets_without_touching_the_rest() {
+        let root_dir = temp_projects_root("plan-origin-roundtrip");
+        let root = root_dir.path();
+        assert_eq!(
+            load_session_plan_entered_from(root, "/tmp/repo", "sess-p"),
+            None
+        );
+        save_session_title(root, "/tmp/repo", "sess-p", "Title").expect("save title");
+
+        save_session_plan_entered_from(root, "/tmp/repo", "sess-p", Some("auto"))
+            .expect("save origin");
+        assert_eq!(
+            load_session_plan_entered_from(root, "/tmp/repo", "sess-p").as_deref(),
+            Some("auto")
+        );
+
+        save_session_plan_entered_from(root, "/tmp/repo", "sess-p", None).expect("forget origin");
+        assert_eq!(
+            load_session_plan_entered_from(root, "/tmp/repo", "sess-p"),
+            None
+        );
+        assert_eq!(
+            load_session_title(root, "/tmp/repo", "sess-p").as_deref(),
+            Some("Title")
         );
     }
 

@@ -162,6 +162,9 @@ pub struct SessionRuntimeFactory {
     pub auto_mode_denials: Arc<std::sync::Mutex<AutoModeDenialStore>>,
     pub auto_mode_verdicts: Arc<rebon_permissions::AutoModeVerdictCache>,
     pub permission_mode_cell: Arc<std::sync::Mutex<PermissionMode>>,
+    /// The session table, for what only a record knows about a session's
+    /// mode — where it entered plan mode from.
+    pub server_state: Arc<rebon_acp::ServerState>,
     pub runtime_model: SharedRuntimeModel,
     pub kernel_context_resolver: rebon_core::query::KernelSessionContextResolver,
     pub session_cron_store: Arc<rebon_tool::SessionCronStore>,
@@ -266,9 +269,12 @@ impl SessionRuntimeFactory {
             ChannelPermissionBroker::new(session_id.to_string());
         {
             let sink = SharedDenialSink::new(self.auto_mode_denials.clone());
-            let mode_cell = self.permission_mode_cell.clone();
             let provider: Arc<dyn PermissionModeProvider> =
-                Arc::new(move || *mode_cell.lock().expect("mode cell poisoned"));
+                Arc::new(rebon_acp::session::SessionPermissionModeSource::cell(
+                    Arc::clone(&self.server_state),
+                    session_id,
+                    self.permission_mode_cell.clone(),
+                ));
             permission_broker.set_auto_mode_hooks(Some(
                 AutoModeHooks::new(Arc::new(sink), provider)
                     .with_verdicts(self.auto_mode_verdicts.clone()),

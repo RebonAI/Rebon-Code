@@ -53,9 +53,24 @@ use crate::lexer::BashShape;
 
 /// Parse a PowerShell command into its shape.
 pub fn parse_powershell_shape(command: &str) -> BashShape {
+    match powershell_segments(command, false) {
+        Some(mut segments) => match segments.len() {
+            0 => BashShape::UnsafeComplex,
+            1 => BashShape::Simple(segments.remove(0)),
+            _ => BashShape::SafeAndChain(segments),
+        },
+        None => BashShape::UnsafeComplex,
+    }
+}
+
+/// The argv of every link, or `None` for anything that is not provably a
+/// list of simple commands. `lists_separate` makes `|`, `||` and `;` links
+/// too, as `&&` always is; see
+/// [`crate::lexer::Grammar::list_operators_separate`] for who may ask.
+pub(crate) fn powershell_segments(command: &str, lists_separate: bool) -> Option<Vec<Vec<String>>> {
     let command = command.trim();
     if command.is_empty() {
-        return BashShape::UnsafeComplex;
+        return None;
     }
 
     let mut segments: Vec<Vec<String>> = Vec::new();
@@ -73,7 +88,7 @@ pub fn parse_powershell_shape(command: &str) -> BashShape {
             // after it is a truncated command rather than a token.
             '`' => {
                 let Some(escaped) = characters.get(index + 1) else {
-                    return BashShape::UnsafeComplex;
+                    return None;
                 };
                 token.push(*escaped);
                 token_started = true;
@@ -87,7 +102,7 @@ pub fn parse_powershell_shape(command: &str) -> BashShape {
                 index += 1;
                 loop {
                     match characters.get(index) {
-                        None => return BashShape::UnsafeComplex,
+                        None => return None,
                         Some('\'') if characters.get(index + 1) == Some(&'\'') => {
                             token.push('\'');
                             index += 2;
@@ -111,9 +126,9 @@ pub fn parse_powershell_shape(command: &str) -> BashShape {
                 index += 1;
                 loop {
                     match characters.get(index) {
-                        None => return BashShape::UnsafeComplex,
+                        None => return None,
                         Some('`') => match characters.get(index + 1) {
-                            None => return BashShape::UnsafeComplex,
+                            None => return None,
                             Some(escaped) => {
                                 token.push(*escaped);
                                 index += 2;
@@ -130,7 +145,7 @@ pub fn parse_powershell_shape(command: &str) -> BashShape {
                         // `$(...)` and `@(...)` run arbitrary code inside a
                         // string; there is no argv that describes that.
                         Some('$') | Some('@') if characters.get(index + 1) == Some(&'(') => {
-                            return BashShape::UnsafeComplex
+                            return None
                         }
                         Some(other) => {
                             token.push(*other);
@@ -141,28 +156,30 @@ pub fn parse_powershell_shape(command: &str) -> BashShape {
                 token_started = true;
             }
 
-            // Everything below ends the simple-command shape.
-            '\n' | '\r' | ';' | '|' | '{' | '}' | '(' | ')' | '<' | '>' => {
-                return BashShape::UnsafeComplex
+            ';' | '|' if lists_separate => {
+                if !push_segment(&mut segments, &mut current, &mut token, &mut token_started) {
+                    return None;
+                }
+                let doubled = character == '|' && characters.get(index + 1) == Some(&'|');
+                index += if doubled { 2 } else { 1 };
             }
 
+            // Everything below ends the simple-command shape.
+            '\n' | '\r' | ';' | '|' | '{' | '}' | '(' | ')' | '<' | '>' => return None,
+
             // Sub-expressions, array sub-expressions, and here-strings.
-            '$' | '@' if characters.get(index + 1) == Some(&'(') => {
-                return BashShape::UnsafeComplex
-            }
-            '@' if matches!(characters.get(index + 1), Some('\'') | Some('"')) => {
-                return BashShape::UnsafeComplex
-            }
+            '$' | '@' if characters.get(index + 1) == Some(&'(') => return None,
+            '@' if matches!(characters.get(index + 1), Some('\'') | Some('"')) => return None,
 
             '&' => {
                 if characters.get(index + 1) == Some(&'&') {
                     if !push_segment(&mut segments, &mut current, &mut token, &mut token_started) {
-                        return BashShape::UnsafeComplex;
+                        return None;
                     }
                     index += 2;
                 } else {
                     // A bare `&` is the call operator or a background job.
-                    return BashShape::UnsafeComplex;
+                    return None;
                 }
             }
 
@@ -185,7 +202,7 @@ pub fn parse_powershell_shape(command: &str) -> BashShape {
                     && characters.get(index + 2) == Some(&'%')
                     && !matches!(characters.get(index + 3), Some(next) if !next.is_whitespace())
                 {
-                    return BashShape::UnsafeComplex;
+                    return None;
                 }
                 token.push(character);
                 token_started = true;
@@ -195,14 +212,10 @@ pub fn parse_powershell_shape(command: &str) -> BashShape {
     }
 
     if !push_segment(&mut segments, &mut current, &mut token, &mut token_started) {
-        return BashShape::UnsafeComplex;
+        return None;
     }
 
-    match segments.len() {
-        0 => BashShape::UnsafeComplex,
-        1 => BashShape::Simple(segments.remove(0)),
-        _ => BashShape::SafeAndChain(segments),
-    }
+    Some(segments)
 }
 
 fn push_token(current: &mut Vec<String>, token: &mut String, token_started: &mut bool) {
