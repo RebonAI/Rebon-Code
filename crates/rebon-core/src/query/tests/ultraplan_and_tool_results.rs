@@ -242,6 +242,19 @@ fn ask_user_question_tool_result_uses_specialized_sentence() {
     assert!(!content.contains("{\"answers\""));
 }
 
+/// A deferred question's result tells the model the answer is still coming,
+/// instead of announcing an empty set of answers.
+#[test]
+fn a_pending_ask_user_question_result_is_the_pending_note() {
+    let value = crate::deferred_question::pending_result("toolu_9");
+    let content = compact_tool_result_for_model("AskUserQuestion", None, &value, None);
+    let text = content.to_plain_text();
+    assert!(crate::deferred_question::is_pending_model_text(&text));
+    assert!(text.contains("<question-answer tool_use_id=\"toolu_9\">"));
+    assert!(!text.contains("User has answered"));
+    assert!(!text.contains("\"status\""));
+}
+
 #[test]
 fn ask_user_question_tool_result_includes_preview_and_notes() {
     let value = json!({

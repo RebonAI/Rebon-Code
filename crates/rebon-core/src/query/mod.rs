@@ -105,6 +105,7 @@ use runtime_model::*;
 use session_prompt::*;
 use stream::*;
 use tool_projection::*;
+pub(crate) use formatting::format_ask_user_question_answer_for_transcript;
 pub(crate) use transcript::model_message_for_attachment;
 use transcript::*;
 pub(crate) use turn_control::attachment_repeats_history;
