@@ -1,10 +1,12 @@
-//! The OAuth token refresher an OpenAI Responses provider is built with.
+//! The OAuth token refresher an account-login provider is built with.
 //!
 //! Sits here rather than in the assembly layer because building a provider
 //! client is what needs it, and the registry that builds one is
-//! below the harness. Nothing about it is assembly: it reads
-//! `.credentials.json`, decides whether the access token on disk is still
-//! good, and otherwise drives `rebon_config::force_refresh_openai_token`.
+//! below the harness. Nothing about it is assembly: for the ChatGPT login it
+//! reads `.credentials.json`, decides whether the access token on disk is
+//! still good, and otherwise drives `rebon_config::force_refresh_openai_token`;
+//! for every other login it asks `rebon_config::account_login::refresh_account`,
+//! which knows how that login renews its bearer.
 
 use rebon_api::TokenRefresher;
 use rebon_config::{force_refresh_openai_token, is_token_expired};
@@ -54,17 +56,29 @@ fn choose_disk_oauth_refresh_decision(
 #[derive(Debug)]
 pub struct RebonOAuthRefresher {
     config_dir: std::path::PathBuf,
+    /// Which login the bearer belongs to; decides how it is renewed.
+    login: &'static rebon_config::AccountLoginSpec,
     pub(crate) refresh_token: std::sync::Mutex<Option<String>>,
 }
 
 impl RebonOAuthRefresher {
-    /// Build a refresher for the given config dir, seeded with
-    /// the initial refresh token (pulled from `.credentials.json`
+    /// Build a ChatGPT-login refresher for the given config dir, seeded
+    /// with the initial refresh token (pulled from `.credentials.json`
     /// during provider resolution).
     pub fn new(config_dir: std::path::PathBuf, initial_refresh_token: Option<String>) -> Self {
         Self {
             config_dir,
+            login: rebon_config::account_login::codex_login(),
             refresh_token: std::sync::Mutex::new(initial_refresh_token),
+        }
+    }
+
+    /// Build the refresher for whichever login `oauth` came from.
+    pub fn for_login(config_dir: std::path::PathBuf, oauth: &rebon_config::OAuthMeta) -> Self {
+        Self {
+            config_dir,
+            login: oauth.provider,
+            refresh_token: std::sync::Mutex::new(oauth.refresh_token.clone()),
         }
     }
 }
@@ -72,6 +86,13 @@ impl RebonOAuthRefresher {
 #[async_trait::async_trait]
 impl TokenRefresher for RebonOAuthRefresher {
     async fn refresh(&self) -> Result<String, String> {
+        if !self.login.is_codex() {
+            // Every other login renews from what is on disk; there is no
+            // in-memory refresh token to rotate.
+            return rebon_config::account_login::refresh_account(&self.config_dir, self.login)
+                .await
+                .map_err(|err| format!("{err}"));
+        }
         let disk_decision = rebon_config::read_credentials(&self.config_dir)
             .map(|credentials| {
                 choose_disk_oauth_refresh_decision(credentials.openai_oauth.as_ref())
@@ -136,6 +157,44 @@ impl TokenRefresher for RebonOAuthRefresher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A non-ChatGPT login renews through its own path; with nothing on disk
+    /// that path says to sign in, rather than trying OpenAI's token endpoint
+    /// with whatever stands in the refresh-token slot.
+    #[tokio::test]
+    async fn another_login_renews_through_its_own_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let copilot = rebon_config::account_login(rebon_config::COPILOT_LOGIN_ID).unwrap();
+        let refresher = RebonOAuthRefresher::for_login(
+            temp.path().to_path_buf(),
+            &rebon_config::OAuthMeta {
+                provider: copilot,
+                expires_at_ms: Some(0),
+                refresh_token: Some("gho_account".into()),
+            },
+        );
+        let err = refresher.refresh().await.unwrap_err();
+        assert!(err.contains("rebon login copilot"), "{err}");
+    }
+
+    #[test]
+    fn the_plain_constructor_is_the_chatgpt_login() {
+        let refresher = RebonOAuthRefresher::new(std::path::PathBuf::from("."), None);
+        assert!(refresher.login.is_codex());
+        let codex = RebonOAuthRefresher::for_login(
+            std::path::PathBuf::from("."),
+            &rebon_config::OAuthMeta {
+                provider: rebon_config::account_login::codex_login(),
+                expires_at_ms: None,
+                refresh_token: Some("r".into()),
+            },
+        );
+        assert!(codex.login.is_codex());
+        assert_eq!(
+            *codex.refresh_token.lock().expect("refresh token mutex"),
+            Some("r".into())
+        );
+    }
     #[tokio::test]
     async fn rebon_oauth_refresher_uses_fresh_disk_access_token_and_updates_refresh_token() {
         let temp = tempfile::tempdir().expect("temp dir");

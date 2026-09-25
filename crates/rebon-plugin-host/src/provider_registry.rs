@@ -300,10 +300,11 @@ fn builtin_capabilities(format: ProviderFormat) -> ProviderCapabilities {
 /// provider allowed to receive the local Computer Use tool.
 ///
 /// Resolution replaces the OAuth sentinel with the live access token, so
-/// `oauth.is_some()` is the retained proof that the configured `apiKey` was the
-/// sentinel. The canonical name, Responses format, built-in selection, and
-/// canonical Codex base URL prevent custom compatible and external providers
-/// from inheriting the capability.
+/// `has_codex_login()` is the retained proof that the configured `apiKey` was
+/// the ChatGPT login's sentinel — not merely some account login's. The
+/// canonical name, Responses format, built-in selection, and canonical Codex
+/// base URL prevent custom compatible and external providers from inheriting
+/// the capability.
 pub fn computer_use_enabled_for_provider(
     resolved: &ResolvedProvider,
     capabilities: &ProviderCapabilities,
@@ -315,7 +316,7 @@ pub fn computer_use_enabled_for_provider(
             resolved.provider_selection,
             ProviderSelection::BuiltIn(ProviderFormat::OpenaiResponses)
         )
-        && resolved.oauth.is_some()
+        && resolved.has_codex_login()
         && resolved
             .base_url
             .trim_end_matches('/')
@@ -355,6 +356,16 @@ fn build_builtin_client(
             // client is told who it is talking to rather than handed one
             // DeepSeek-shaped compat flag. See `rebon_api::vendor`.
             config.vendor = resolved.vendor;
+            // An account login's bearer can be short-lived (a Copilot
+            // session lasts half an hour); the client renews it on a 401.
+            config.refresher = resolved.oauth.as_ref().map(|oauth| {
+                Arc::new(
+                    rebon_provider::oauth_refresher::RebonOAuthRefresher::for_login(
+                        context.config_dir.clone(),
+                        oauth,
+                    ),
+                ) as Arc<dyn rebon_api::TokenRefresher>
+            });
             Ok(Arc::new(openai_compatible_client(config)))
         }
         ProviderFormat::OpenaiResponses => {
@@ -372,9 +383,9 @@ fn build_builtin_client(
                 provider
             };
             let provider = if let Some(oauth) = resolved.oauth {
-                let refresher = rebon_provider::oauth_refresher::RebonOAuthRefresher::new(
+                let refresher = rebon_provider::oauth_refresher::RebonOAuthRefresher::for_login(
                     context.config_dir,
-                    oauth.refresh_token,
+                    &oauth,
                 );
                 provider.with_refresher(Arc::new(refresher))
             } else {
@@ -604,6 +615,45 @@ mod tests {
         assert!(!computer_use_enabled_for_provider(
             &oauth_with_custom_base_url,
             &registry.capabilities_for(&oauth_with_custom_base_url.provider_selection)
+        ));
+    }
+
+    /// Regression: an account login other than ChatGPT, dressed as the
+    /// synthetic `openai` entry on the Codex host, is still not the Codex
+    /// login.
+    #[test]
+    fn computer_use_rejects_another_account_login_on_the_codex_host() {
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let config = serde_json::json!({
+            "activeCustomProvider": "openai",
+            "customProviders": [{
+                "name": "openai",
+                "format": "openai-responses",
+                "baseUrl": rebon_config::OPENAI_OAUTH_PROVIDER_BASE_URL,
+                "apiKey": "$OAUTH:copilot",
+                "model": "gpt-test"
+            }]
+        });
+        std::fs::write(
+            config_dir.path().join("config.json"),
+            serde_json::to_vec(&config).expect("serialize config"),
+        )
+        .expect("write config");
+        std::fs::write(
+            config_dir.path().join(".credentials.json"),
+            br#"{"oauthAccounts":{"copilot":{"accessToken":"gho","sessionToken":"s","sessionExpiresAt":4102444800000}}}"#,
+        )
+        .expect("write credentials");
+        let resolved = rebon_config::resolve_from_dir(config_dir.path())
+            .expect("resolve provider")
+            .expect("active provider");
+        assert!(resolved.oauth.is_some());
+        assert!(!resolved.has_codex_login());
+
+        let registry = ProviderRegistry::with_builtins();
+        assert!(!computer_use_enabled_for_provider(
+            &resolved,
+            &registry.capabilities_for(&resolved.provider_selection)
         ));
     }
 

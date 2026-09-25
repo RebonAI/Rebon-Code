@@ -305,11 +305,9 @@ pub(crate) async fn run_credentials_gate(
             crate::rebon_config::check_startup_oauth(config_dir, &oauth).await,
             crate::rebon_config::OAuthStartupState::LoginRequired
         ) {
-            overrides.startup_notices.push(
-                "Your ChatGPT (Codex) session has expired — run /login to re-authenticate. \
-                 Model requests fail until you do."
-                    .to_string(),
-            );
+            overrides
+                .startup_notices
+                .push(expired_login_notice(oauth.provider));
         }
     }
 
@@ -318,4 +316,31 @@ pub(crate) async fn run_credentials_gate(
         "rebon startup: credentials gate completed"
     );
     Ok(startup_provider)
+}
+
+/// The line a session opens with when its login needs signing in again.
+///
+/// The ChatGPT wording is the notice this used to print verbatim.
+fn expired_login_notice(login: &crate::rebon_config::AccountLoginSpec) -> String {
+    format!(
+        "Your {} session has expired — run /login to re-authenticate. \
+         Model requests fail until you do.",
+        login.display_name
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_expired_login_notice_names_the_login_that_expired() {
+        assert_eq!(
+            expired_login_notice(crate::rebon_config::account_login::codex_login()),
+            "Your ChatGPT (Codex) session has expired — run /login to re-authenticate.              Model requests fail until you do."
+        );
+        let copilot =
+            crate::rebon_config::account_login(crate::rebon_config::COPILOT_LOGIN_ID).unwrap();
+        assert!(expired_login_notice(copilot).starts_with("Your GitHub Copilot session"));
+    }
 }
