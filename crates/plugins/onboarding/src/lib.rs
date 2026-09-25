@@ -73,7 +73,7 @@ pub use apply::{
 pub use store::{has_any_provider, load_provider_snapshot, onboarding_open_inputs};
 
 pub use dialog::{
-    ExistingSetupChoice, OAuthView, OnboardingDialogOutcome, OnboardingDialogState,
+    login_outcome, ExistingSetupChoice, OAuthView, OnboardingDialogOutcome, OnboardingDialogState,
     OnboardingOpenInputs, OnboardingStepTransition, PanelStatus, ProviderFormState,
     ProviderPresetSelection, ProviderSnapshot, PROVIDER_FORMATS,
 };

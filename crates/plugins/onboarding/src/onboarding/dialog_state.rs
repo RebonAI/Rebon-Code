@@ -135,13 +135,17 @@ pub struct LoginMethodOption {
     pub secondary_label: &'static str,
 }
 
-/// The login methods the picker offers, in display order.
+/// The login methods the picker offers, in display order: one row per
+/// account login in `rebon_config::account_login`'s table.
 pub fn actionable_login_options() -> Vec<LoginMethodOption> {
-    vec![LoginMethodOption {
-        value: "openai",
-        primary_label: "OpenAI account",
-        secondary_label: "ChatGPT Plus or Pro subscription (via Codex OAuth)",
-    }]
+    rebon_config::account_logins()
+        .iter()
+        .map(|spec| LoginMethodOption {
+            value: spec.id,
+            primary_label: spec.picker_label,
+            secondary_label: spec.description,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,15 +155,24 @@ pub enum LoginPaneRow {
     CustomProviderCta,
 }
 
+/// The heading a login row sits under: its login's group, or "Custom" for
+/// anything the table does not know.
 pub fn login_option_group(value: &str) -> &'static str {
-    match value {
-        "openai" => "OpenAI",
-        _ => "Custom",
-    }
+    rebon_config::account_logins()
+        .iter()
+        .find(|spec| spec.id == value)
+        .map(|spec| spec.group)
+        .unwrap_or("Custom")
 }
 
 pub fn grouped_login_pane_rows(options: &[LoginMethodOption]) -> Vec<LoginPaneRow> {
-    let groups = ["OpenAI", "Custom"];
+    let mut groups: Vec<&'static str> = Vec::new();
+    for spec in rebon_config::account_logins() {
+        if !groups.contains(&spec.group) {
+            groups.push(spec.group);
+        }
+    }
+    groups.push("Custom");
     let mut rows = Vec::new();
 
     for group in groups {
@@ -234,6 +247,9 @@ mod tests {
                 LoginPaneRow::Header("OpenAI"),
                 LoginPaneRow::Option(1),
                 LoginPaneRow::Header(""),
+                LoginPaneRow::Header("GitHub"),
+                LoginPaneRow::Option(2),
+                LoginPaneRow::Header(""),
                 LoginPaneRow::Header("Custom"),
                 LoginPaneRow::Option(0),
                 LoginPaneRow::CustomProviderCta,
@@ -241,29 +257,38 @@ mod tests {
         );
 
         assert_eq!(login_row_for_focus(&options, 0), LoginPaneRow::Option(1));
-        assert_eq!(login_row_for_focus(&options, 1), LoginPaneRow::Option(0));
+        assert_eq!(login_row_for_focus(&options, 1), LoginPaneRow::Option(2));
+        assert_eq!(login_row_for_focus(&options, 2), LoginPaneRow::Option(0));
         assert_eq!(
-            login_row_for_focus(&options, 2),
+            login_row_for_focus(&options, 3),
             LoginPaneRow::CustomProviderCta
         );
     }
 
+    /// The picker is the account-login table, row for row, with the
+    /// ChatGPT row first and worded as it always was.
     #[test]
-    fn the_picker_offers_only_the_openai_login() {
+    fn the_picker_offers_every_account_login_in_table_order() {
         let options = actionable_login_options();
         let values: Vec<&str> = options.iter().map(|option| option.value).collect();
-        assert_eq!(values, vec!["openai"]);
+        assert_eq!(values, vec!["openai", "copilot"]);
         assert_eq!(options[0].primary_label, "OpenAI account");
         assert!(options[0].secondary_label.contains("Codex OAuth"));
+        assert_eq!(options[1].primary_label, "GitHub Copilot account");
         assert_eq!(
             grouped_login_pane_rows(&options),
             vec![
                 LoginPaneRow::Header("OpenAI"),
                 LoginPaneRow::Option(0),
                 LoginPaneRow::Header(""),
+                LoginPaneRow::Header("GitHub"),
+                LoginPaneRow::Option(1),
+                LoginPaneRow::Header(""),
                 LoginPaneRow::Header("Custom"),
                 LoginPaneRow::CustomProviderCta,
             ]
         );
+        assert_eq!(login_option_group("copilot"), "GitHub");
+        assert_eq!(login_option_group("nope"), "Custom");
     }
 }

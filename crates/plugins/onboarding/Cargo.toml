@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "The `onboarding` feature plugin: the first-run setup wizard and the Codex OAuth login. Step dispatch, PKCE, the authorize URL, the loopback callback listener and its paste fallback, token exchange, credential persistence, error classification, the wizard's state machine, the import of Claude Code / Codex skills, agents and commands, and the `/onboarding` command."
+description = "The `onboarding` feature plugin: the first-run setup wizard and the account logins (ChatGPT/Codex, GitHub Copilot). Step dispatch, PKCE, the authorize URL, the loopback callback listener and its paste fallback, the device-code flow, token exchange, credential persistence, error classification, the wizard's state machine, the import of Claude Code / Codex skills, agents and commands, and the `/onboarding` command."
 
 [dependencies]
 # The command seat `/onboarding` registers on, and the spec type it hands over.
@@ -16,6 +16,8 @@ rebon-kernel.workspace = true
 # `hasCompletedOnboarding` flag. This crate never re-decides where the config
 # home is.
 rebon-config.workspace = true
+# Millisecond wall-clock stamps for a device login's token expiry.
+rebon-types.workspace = true
 # The theme names the theme step offers.
 rebon-design-system.workspace = true
 # The theme picker's pure row model, shared with `/theme`.
@@ -32,6 +34,10 @@ sha2 = { workspace = true }
 anyhow = { workspace = true }
 getrandom = { workspace = true }
 reqwest = { workspace = true }
+# The device-code flow's IO half reads two small JSON answers; the decisions
+# in `onboarding/` stay free of it and take the fields already read.
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 webbrowser = { workspace = true }

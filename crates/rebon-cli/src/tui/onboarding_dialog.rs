@@ -298,12 +298,14 @@ fn handle_login_pane_key(
         KeyCode::Enter => match login_row_for_focus(&state.login_options, state.login_focus) {
             LoginPaneRow::Option(option_idx) => {
                 let option_value = state.login_options[option_idx].value;
-                if option_value == "openai" {
-                    OnboardingDialogOutcome::StartOpenAIOAuth
-                } else {
-                    state.add_provider_status =
-                        PanelStatus::Err("This login method is unavailable in this build.".into());
-                    OnboardingDialogOutcome::None
+                match rebon_plugin_onboarding::login_outcome(option_value) {
+                    Some(outcome) => outcome,
+                    None => {
+                        state.add_provider_status = PanelStatus::Err(
+                            "This login method is unavailable in this build.".into(),
+                        );
+                        OnboardingDialogOutcome::None
+                    }
                 }
             }
             LoginPaneRow::CustomProviderCta | LoginPaneRow::Header(_) => {
@@ -576,13 +578,14 @@ fn handle_oauth_key(state: &mut OnboardingDialogState, key: &KeyEvent) -> Onboar
         Some(OAuthView::Error { can_retry, .. }) => {
             if key.code == KeyCode::Enter && *can_retry {
                 state.oauth_view = None;
-                OnboardingDialogOutcome::StartOpenAIOAuth
+                state.oauth_login_outcome()
             } else {
                 OnboardingDialogOutcome::None
             }
         }
         Some(OAuthView::StartingBrowser { .. })
         | Some(OAuthView::WaitingCallback { .. })
+        | Some(OAuthView::DeviceCode { .. })
         | Some(OAuthView::Exchanging)
         | None => OnboardingDialogOutcome::None,
     }
@@ -918,7 +921,10 @@ fn render_provider_step(
     error: Style,
 ) {
     if let Some(view) = &state.oauth_view {
-        render_oauth_view(frame, area, view, normal, dim, accent, focused, error);
+        let login = state.oauth_login_spec();
+        render_oauth_view(
+            frame, area, login, view, normal, dim, accent, focused, error,
+        );
         return;
     }
     match state.setup_pane {
@@ -944,6 +950,7 @@ fn render_provider_step(
 fn render_oauth_view(
     frame: &mut Frame,
     area: Rect,
+    login: &rebon_config::AccountLoginSpec,
     view: &OAuthView,
     normal: Style,
     dim: Style,
@@ -952,7 +959,10 @@ fn render_oauth_view(
     error_style: Style,
 ) {
     let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(Span::styled("OpenAI account login", accent)));
+    lines.push(Line::from(Span::styled(
+        format!("{} login", login.picker_label),
+        accent,
+    )));
     lines.push(Line::from(""));
 
     match view {
@@ -1033,6 +1043,46 @@ fn render_oauth_view(
             if let Some(msg) = error {
                 lines.push(Line::from(Span::styled(msg.clone(), error_style)));
             }
+        }
+        OAuthView::DeviceCode {
+            verification_uri,
+            user_code,
+            copied,
+        } => {
+            lines.push(Line::from(Span::styled(
+                "Open this page in a browser and enter the code:",
+                normal,
+            )));
+            lines.push(Line::from(Span::styled(verification_uri.clone(), normal)));
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  Code: ", dim),
+                Span::styled(user_code.clone(), focused.add_modifier(Modifier::BOLD)),
+            ]));
+            if *copied {
+                lines.push(Line::from(Span::styled("  (copied to the clipboard)", dim)));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Waiting for you to approve… Esc cancels.",
+                dim,
+            )));
+        }
+        OAuthView::Exchanging if !login.is_codex() => {
+            lines.push(Line::from(Span::styled(
+                "Approved. Finishing sign-in…",
+                normal,
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "(checking the subscription and saving the login)",
+                dim,
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "This should take a second or two.",
+                dim,
+            )));
         }
         OAuthView::Exchanging => {
             lines.push(Line::from(Span::styled(
@@ -1245,9 +1295,9 @@ fn render_login_pane(
 
     lines.push(Line::from(""));
     let hint = if state.provider_ready {
-        "Provider ready · Right continues · Enter reconnects OpenAI or opens custom setup."
+        "Provider ready · Right continues · Enter signs in again or opens custom setup."
     } else {
-        "Enter connects OpenAI; \"Add custom provider\" opens the protected setup form."
+        "Enter signs in to the selected account; \"Add custom provider\" opens the protected setup form."
     };
     lines.push(Line::from(Span::styled(hint, dim)));
     if let Some(banner) = status_line(&state.add_provider_status, success, error) {
@@ -2103,7 +2153,10 @@ pub fn run_startup_onboarding(
             } => {
                 apply_add_provider_model(&mut state, &provider_name, &model);
             }
-            OnboardingDialogOutcome::StartOpenAIOAuth => {
+            OnboardingDialogOutcome::StartOpenAIOAuth
+            | OnboardingDialogOutcome::StartAccountLogin(_) => {
+                let login_id =
+                    crate::oauth_drive::login_to_start(&outcome).expect("both arms name a login");
                 let terminal = guard.terminal();
                 let redraw = |s: &OnboardingDialogState| -> std::io::Result<()> {
                     terminal.draw(|frame| {
@@ -2111,9 +2164,10 @@ pub fn run_startup_onboarding(
                     })?;
                     Ok(())
                 };
-                let outcome =
-                    crate::oauth_drive::drive_oauth_flow_blocking(&mut state, &runtime, redraw)?;
-                match outcome {
+                let driven = crate::oauth_drive::drive_account_login_blocking(
+                    &mut state, &runtime, login_id, redraw,
+                )?;
+                match driven {
                     crate::oauth_drive::Outcome::Success { .. } => {
                         provider_added = true;
                         if state.done {
@@ -2253,6 +2307,7 @@ mod tests {
             add_provider_status: PanelStatus::None,
             add_model_status: PanelStatus::None,
             oauth_view: None,
+            oauth_login: rebon_config::CODEX_LOGIN_ID,
             migration_snapshot: DiscoverySnapshot::default(),
             migration_selected: [false; 5],
             migration_focus: 0,
@@ -2644,7 +2699,7 @@ mod tests {
         assert!(rendered.contains("Select a login method:"), "{rendered}");
         assert!(rendered.contains("Add custom provider"), "{rendered}");
         // The last line the pane emits still lands inside the host.
-        assert!(rendered.contains("Enter connects OpenAI"), "{rendered}");
+        assert!(rendered.contains("Enter signs in"), "{rendered}");
     }
 
     /// The OAuth sub-views are the tallest thing `/login` shows. Sizing
@@ -2749,7 +2804,9 @@ mod tests {
             .map(|option| option.value)
             .collect();
 
-        assert_eq!(values, vec!["openai"]);
+        // Exactly the account-login table: no decorative rows for logins
+        // this build cannot run.
+        assert_eq!(values, vec!["openai", "copilot"]);
     }
 
     #[test]
@@ -3598,8 +3655,93 @@ mod tests {
 
         assert_eq!(
             interactive_rows,
-            vec![LoginPaneRow::Option(0), LoginPaneRow::CustomProviderCta]
+            vec![
+                LoginPaneRow::Option(0),
+                LoginPaneRow::Option(1),
+                LoginPaneRow::CustomProviderCta
+            ]
         );
+    }
+
+    /// The Copilot row starts its own login, not the ChatGPT one.
+    #[test]
+    fn enter_on_the_copilot_row_starts_the_copilot_login() {
+        let mut state = state_on_login_pane(false);
+        assert!(state.focus_login("copilot"));
+        let outcome = handle_key(&mut state, &key(KeyCode::Enter));
+        assert_eq!(
+            outcome,
+            OnboardingDialogOutcome::StartAccountLogin("copilot")
+        );
+    }
+
+    /// A retry after a failed device login starts that login again.
+    #[test]
+    fn error_view_retry_restarts_the_login_that_failed() {
+        let mut state = state_in_oauth_view(OAuthView::Error {
+            message: "access_denied".into(),
+            can_retry: true,
+        });
+        state.oauth_login = "copilot";
+        let outcome = handle_key(&mut state, &key(KeyCode::Enter));
+        assert_eq!(
+            outcome,
+            OnboardingDialogOutcome::StartAccountLogin("copilot")
+        );
+    }
+
+    /// The device view is titled for its login, shows the page and the
+    /// code, and fits the inline host with the copy note.
+    #[test]
+    fn the_device_view_shows_the_page_and_the_code() {
+        let mut state = state_on_login_pane(false);
+        state.oauth_login = "copilot";
+        state.report_oauth_device_code(
+            "https://github.com/login/device".into(),
+            "WDJB-MJHT".into(),
+            true,
+        );
+        let rendered = render_at(&state, 100, state.inline_host_desired_height());
+        assert!(
+            rendered.contains("GitHub Copilot account login"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("https://github.com/login/device"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Code: WDJB-MJHT"), "{rendered}");
+        assert!(rendered.contains("copied to the clipboard"), "{rendered}");
+        assert!(rendered.contains("Esc cancels"), "{rendered}");
+        // Keys other than Esc do nothing while the poll runs.
+        assert_eq!(
+            handle_key(&mut state, &key(KeyCode::Enter)),
+            OnboardingDialogOutcome::None
+        );
+        assert_eq!(
+            handle_key(&mut state, &key(KeyCode::Esc)),
+            OnboardingDialogOutcome::CancelOpenAIOAuth
+        );
+        assert!(state.oauth_view.is_none());
+    }
+
+    /// Finishing a device login is not an OpenAI token exchange, and the
+    /// ChatGPT login's wording is unchanged.
+    #[test]
+    fn the_finishing_view_names_what_each_login_does() {
+        let mut state = state_on_login_pane(false);
+        state.report_oauth_exchanging();
+        let rendered = render_at(&state, 100, state.inline_host_desired_height());
+        assert!(rendered.contains("OpenAI account login"), "{rendered}");
+        assert!(
+            rendered.contains("auth.openai.com/oauth/token"),
+            "{rendered}"
+        );
+
+        state.oauth_login = "copilot";
+        let rendered = render_at(&state, 100, state.inline_host_desired_height());
+        assert!(rendered.contains("Finishing sign-in"), "{rendered}");
+        assert!(!rendered.contains("auth.openai.com"), "{rendered}");
     }
 
     #[test]
@@ -3685,6 +3827,7 @@ mod tests {
             add_provider_status: PanelStatus::None,
             add_model_status: PanelStatus::None,
             oauth_view: Some(OAuthView::Exchanging),
+            oauth_login: rebon_config::CODEX_LOGIN_ID,
             migration_snapshot: DiscoverySnapshot::default(),
             migration_selected: [false; 5],
             migration_focus: 0,
@@ -3878,6 +4021,7 @@ mod tests {
             add_provider_status: PanelStatus::None,
             add_model_status: PanelStatus::None,
             oauth_view: None,
+            oauth_login: rebon_config::CODEX_LOGIN_ID,
             migration_snapshot: snap,
             migration_selected: selected,
             migration_focus: 0,
@@ -4033,6 +4177,7 @@ mod tests {
             add_provider_status: PanelStatus::None,
             add_model_status: PanelStatus::None,
             oauth_view: None,
+            oauth_login: rebon_config::CODEX_LOGIN_ID,
             migration_snapshot: DiscoverySnapshot::default(),
             migration_selected: [false; 5],
             migration_focus: 0,

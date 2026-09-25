@@ -1408,7 +1408,10 @@ fn handle_onboarding_dialog_key(
                 apply_add_provider_model(dialog, &provider_name, &model);
             }
         }
-        OnboardingDialogOutcome::StartOpenAIOAuth => {
+        OnboardingDialogOutcome::StartOpenAIOAuth
+        | OnboardingDialogOutcome::StartAccountLogin(_) => {
+            let login_id =
+                crate::oauth_drive::login_to_start(&outcome).expect("both arms name a login");
             // The driver owns the terminal while it blocks, so it has
             // to paint the same slot the frame renderer would: the
             // whole screen in screen mode, the bottom-anchored prompt
@@ -1417,6 +1420,7 @@ fn handle_onboarding_dialog_key(
             let inline_host = app.ui_mode == UiMode::Inline;
             let mut connected = false;
             let mut close_after_success = false;
+            let mut connected_label = "";
             if let Some(dialog) = app.onboarding_dialog.as_mut() {
                 let terminal = guard.terminal();
                 let redraw = |s: &OnboardingDialogState| -> std::io::Result<()> {
@@ -1431,11 +1435,13 @@ fn handle_onboarding_dialog_key(
                     })?;
                     Ok(())
                 };
-                let drive_result =
-                    crate::oauth_drive::drive_oauth_flow_blocking(dialog, handle, redraw);
+                let drive_result = crate::oauth_drive::drive_account_login_blocking(
+                    dialog, handle, login_id, redraw,
+                );
                 match drive_result {
                     Ok(crate::oauth_drive::Outcome::Success { transition }) => {
                         connected = true;
+                        connected_label = dialog.oauth_login_spec().picker_label;
                         if let Some(transition) = transition {
                             fire_onboarding_advanced(session, handle, dialog, transition);
                         }
@@ -1445,8 +1451,8 @@ fn handle_onboarding_dialog_key(
                         // The dedicated login pane has nothing
                         // left to ask once the account is connected.
                         // Leaving it open re-arms Enter on the same
-                        // "OpenAI account" row, which starts another
-                        // browser round-trip — the login loop.
+                        // account row, which starts another browser
+                        // round-trip — the login loop.
                         if dialog.is_login_pane() {
                             close_after_success = true;
                             fire_onboarding_closed(session, handle, dialog, "oauth_success");
@@ -1487,7 +1493,7 @@ fn handle_onboarding_dialog_key(
                         app,
                         "login",
                         &format!(
-                            "OpenAI account connected. Using provider {} · model {}.",
+                            "{connected_label} connected. Using provider {} · model {}.",
                             session.model.provider_name, session.model.name
                         ),
                     );
