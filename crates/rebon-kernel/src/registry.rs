@@ -3,8 +3,10 @@
 //! The kernel knows how to load and unload; the registry knows *which*
 //! plugins should be loaded right now — every [`PluginDef`] the binary
 //! shipped plus every [`DynPluginDef`] the machine turned out to have,
-//! filtered by kind and switches — and moves the kernel to that set. It is
-//! the one mutator: `reconcile`, `reload`, `set_enabled` and
+//! filtered by kind, switches and what the process withholds — and moves the
+//! kernel to that set. It is
+//! the one mutator: `reconcile`, `reload`, `set_enabled`,
+//! [`withhold`](PluginRegistry::withhold) and
 //! [`set_external_defs`](PluginRegistry::set_external_defs) all serialise on
 //! the same lock, and every reconcile bumps a monotone generation that the
 //! emitted [`PluginStateChanged`] events carry.
@@ -119,12 +121,25 @@ pub enum RegistryError {
     UnknownPlugin(String),
     #[error("plugin `{0}` is part of the kernel and cannot be disabled")]
     CoreCannotBeDisabled(String),
+    #[error("plugin `{0}` is withheld from this process and cannot be enabled here")]
+    Withheld(String),
 }
 
 struct Inner {
     generation: u64,
     desired: DesiredSet,
     failed: BTreeMap<String, String>,
+    /// Plugins this process never loads, whatever `desired` says. See
+    /// [`PluginRegistry::withhold`].
+    withheld: BTreeSet<String>,
+}
+
+impl Inner {
+    /// Whether `def` should be loaded now: its switch, unless the process
+    /// withholds it.
+    fn wants(&self, def: &DynPluginDef) -> bool {
+        !self.withheld.contains(&def.id) && self.desired.wants_dyn(def)
+    }
 }
 
 /// Holds the definitions and drives the kernel to the desired set.
@@ -168,6 +183,7 @@ impl PluginRegistry {
                 generation: 0,
                 desired: DesiredSet::new(),
                 failed: BTreeMap::new(),
+                withheld: BTreeSet::new(),
             }),
         })
     }
@@ -282,7 +298,7 @@ impl PluginRegistry {
         let loaded: BTreeSet<String> = self.owned_loaded().into_iter().collect();
         let wanted: BTreeSet<&str> = defs
             .iter()
-            .filter(|def| inner.desired.wants_dyn(def))
+            .filter(|def| inner.wants(def))
             .map(|def| def.id.as_str())
             .collect();
 
@@ -327,11 +343,10 @@ impl PluginRegistry {
         if !ids.iter().any(|u| u == id) {
             ids.push(id.to_string());
         }
-        let desired = inner.desired.clone();
         let to_load: Vec<DynPluginDef> = self
             .defs_snapshot()
             .into_iter()
-            .filter(|def| ids.iter().any(|u| *u == def.id) && desired.wants_dyn(def))
+            .filter(|def| ids.iter().any(|u| *u == def.id) && inner.wants(def))
             .collect();
         self.load_defs(to_load, &mut report);
 
@@ -342,7 +357,8 @@ impl PluginRegistry {
         Ok(report)
     }
 
-    /// Flip one switch and reconcile. Refused for `Core`.
+    /// Flip one switch and reconcile. Refused for `Core`, and refused for a
+    /// withheld plugin when the switch would turn it on.
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<ReconcileReport, RegistryError> {
         let def = self
             .def(id)
@@ -350,9 +366,62 @@ impl PluginRegistry {
         if def.kind == PluginKind::Core && !enabled {
             return Err(RegistryError::CoreCannotBeDisabled(id.to_string()));
         }
+        if enabled && self.is_withheld(id) {
+            return Err(RegistryError::Withheld(id.to_string()));
+        }
         let mut desired = self.desired();
         desired.set(id, Some(enabled));
         Ok(self.reconcile(&desired))
+    }
+
+    /// Keep `ids` unloaded for the rest of this registry's life, whatever
+    /// the switches say, and unload any of them that is loaded now.
+    ///
+    /// For an entry point whose callers must not get a feature the user's
+    /// settings turn on for their own sessions: the switch file is shared by
+    /// every surface, so it cannot say "on, but not here". Withholding is the
+    /// registry's answer because the registry is the one mutator — every
+    /// later `reconcile`, `reload` and settings write asks the same "is it
+    /// wanted" question, and [`set_enabled`](Self::set_enabled) refuses to
+    /// turn one back on, so nothing can load it by another road.
+    ///
+    /// Only unloads; it never loads anything, so calling it on a registry
+    /// nothing has reconciled yet leaves the first reconcile to load the rest.
+    /// Refused, with nothing changed, for an unknown id and for `Core`.
+    pub fn withhold(&self, ids: &[&str]) -> Result<ReconcileReport, RegistryError> {
+        for id in ids {
+            let def = self
+                .def(id)
+                .ok_or_else(|| RegistryError::UnknownPlugin(id.to_string()))?;
+            if def.kind == PluginKind::Core {
+                return Err(RegistryError::CoreCannotBeDisabled(id.to_string()));
+            }
+        }
+        let mut inner = self.inner.lock().unwrap();
+        inner.withheld.extend(ids.iter().map(|id| id.to_string()));
+        inner.generation += 1;
+        let generation = inner.generation;
+        let before = self.states(&inner);
+        let mut report = ReconcileReport {
+            generation,
+            ..Default::default()
+        };
+        let loaded: Vec<String> = self
+            .owned_loaded()
+            .into_iter()
+            .filter(|id| inner.withheld.contains(id))
+            .collect();
+        self.unload_ids(loaded, &mut report);
+        self.record_failures(&mut inner, &report);
+        let after = self.states(&inner);
+        drop(inner);
+        self.emit_transitions(before, after, generation);
+        Ok(report)
+    }
+
+    /// Whether [`withhold`](Self::withhold) keeps `id` out of this process.
+    pub fn is_withheld(&self, id: &str) -> bool {
+        self.inner.lock().unwrap().withheld.contains(id)
     }
 
     /// Every definition with its current state, in definition order.
@@ -780,6 +849,99 @@ mod tests {
         // A switch file that says otherwise is ignored too.
         registry.reconcile(&DesiredSet::new().with("core", false));
         assert_eq!(registry.kernel().plugin_names(), vec!["core"]);
+    }
+
+    /// Withheld before the first reconcile — how an entry point declares it —
+    /// the plugin never loads, however its switch reads, and its neighbours
+    /// load exactly as they would have.
+    #[test]
+    fn a_plugin_withheld_before_boot_never_loads_whatever_the_switches_say() {
+        let defs = [
+            def("core", PluginKind::Core, true, core),
+            def("alpha", PluginKind::Feature, false, alpha),
+            def("beta", PluginKind::Feature, true, beta_needs_alpha),
+        ];
+        let registry = registry(&defs);
+        let report = registry.withhold(&["alpha"]).expect("a feature withholds");
+        assert!(report.unloaded.is_empty(), "nothing was loaded: {report:?}");
+        assert!(
+            registry.kernel().plugin_names().is_empty(),
+            "withholding never loads anything"
+        );
+        assert!(registry.is_withheld("alpha"));
+        assert!(!registry.is_withheld("beta"));
+
+        registry.reconcile(&DesiredSet::new().with("alpha", true));
+        assert!(!registry.kernel().context().has_service("svc-alpha"));
+        assert_eq!(state_of(&registry, "alpha"), PluginState::Disabled);
+        assert_eq!(state_of(&registry, "core"), PluginState::Loaded);
+        // `beta` needs what `alpha` would have provided, so it fails the way
+        // it would with `alpha` switched off — not silently loaded.
+        assert!(matches!(
+            state_of(&registry, "beta"),
+            PluginState::Failed(_)
+        ));
+
+        let err = registry.set_enabled("alpha", true).unwrap_err();
+        assert!(matches!(err, RegistryError::Withheld(ref id) if id == "alpha"));
+        assert!(!registry.kernel().context().has_service("svc-alpha"));
+        // Switching it *off* is still allowed; it only records the switch.
+        registry
+            .set_enabled("alpha", false)
+            .expect("off is harmless");
+
+        registry.reload("alpha").expect("known id");
+        assert!(
+            !registry.kernel().context().has_service("svc-alpha"),
+            "a reload does not bring a withheld plugin back"
+        );
+    }
+
+    /// Withheld after boot, the plugin is taken out now, together with what
+    /// depended on it, and stays out through later reconciles.
+    #[test]
+    fn withholding_a_loaded_plugin_unloads_it_and_its_dependents() {
+        let defs = [
+            def("core", PluginKind::Core, true, core),
+            def("alpha", PluginKind::Feature, true, alpha),
+            def("beta", PluginKind::Feature, true, beta_needs_alpha),
+        ];
+        let registry = registry(&defs);
+        registry.reconcile(&DesiredSet::new());
+        assert_eq!(
+            registry.kernel().plugin_names(),
+            vec!["core", "alpha", "beta"]
+        );
+
+        let report = registry.withhold(&["alpha"]).expect("a feature withholds");
+        let mut unloaded = report.unloaded.clone();
+        unloaded.sort();
+        assert_eq!(unloaded, vec!["alpha", "beta"], "{report:?}");
+        assert_eq!(registry.kernel().plugin_names(), vec!["core"]);
+
+        registry.reconcile(&registry.desired());
+        assert!(!registry.kernel().context().has_service("svc-alpha"));
+        assert!(registry.kernel().context().has_service("svc-core"));
+    }
+
+    #[test]
+    fn withholding_refuses_core_and_unknown_ids_without_changing_anything() {
+        let defs = [
+            def("core", PluginKind::Core, true, core),
+            def("alpha", PluginKind::Feature, true, alpha),
+        ];
+        let registry = registry(&defs);
+        registry.reconcile(&DesiredSet::new());
+
+        let err = registry.withhold(&["alpha", "core"]).unwrap_err();
+        assert!(matches!(err, RegistryError::CoreCannotBeDisabled(ref id) if id == "core"));
+        let err = registry.withhold(&["alpha", "nope"]).unwrap_err();
+        assert!(matches!(err, RegistryError::UnknownPlugin(ref id) if id == "nope"));
+        assert!(
+            !registry.is_withheld("alpha"),
+            "a refused call withholds nothing, not even the valid ids before it"
+        );
+        assert_eq!(registry.kernel().plugin_names(), vec!["core", "alpha"]);
     }
 
     #[test]
