@@ -147,8 +147,8 @@ fn remove_owned_scratchpads(state: &rebon_acp::ServerState) {
 enum AcpConnection {
     /// The process's own stdin and stdout, detached from its standard
     /// handles so a child the server spawns cannot inherit them. On Windows
-    /// a child created while the server's read is parked on the inherited
-    /// stdin pipe waits for that read to finish, which stalled every turn
+    /// a child that inherits the stdin pipe while the server's read is
+    /// parked on it waits for that read to finish, which stalled every turn
     /// that ran `git` until the client wrote again.
     Stdio(rebon_proto::process_stdio::ProcessStdio),
     Tcp {

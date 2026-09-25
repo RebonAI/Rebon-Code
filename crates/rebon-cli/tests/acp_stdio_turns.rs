@@ -4,11 +4,11 @@
 //! stdin and stdout, a provider behind a local HTTP server. Nothing short of
 //! the real process reaches the defect this pins. The in-process ACP tests
 //! hand the server an in-memory pipe, and the one that hung was the process's
-//! own stdin: on Windows a child created while the server's read is parked on
-//! that inherited pipe — `git`, which the system prompt runs every turn —
+//! own stdin: on Windows a child that inherits that pipe while the server's
+//! read is parked on it — `git`, which the system prompt runs every turn —
 //! waits for the read to finish, so the first prompt waited for a client that
-//! was itself waiting for the answer. Every wait below has a deadline, so that regression fails here
-//! instead of hanging the run.
+//! was itself waiting for the answer. Every wait below has a deadline, so that
+//! regression fails here instead of hanging the run.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

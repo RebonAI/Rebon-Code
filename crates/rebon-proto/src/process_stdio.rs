@@ -2,11 +2,13 @@
 //!
 //! A server that speaks a protocol on stdio keeps a read parked on stdin for
 //! as long as the connection is open. On Windows a pipe opened for
-//! synchronous I/O serialises every operation on it, and the standard
-//! handles are inheritable, so a child created while that read is parked —
-//! `git` for the system prompt, a hook, a shell tool — did not get going
-//! until the read completed, which is when the client happened to write its
-//! next message. The turn that needed the child stalled with it: `rebon
+//! synchronous I/O serialises every operation on it, so a child handed that
+//! pipe as its own stdin — which `Command::status` and `Command::spawn` do
+//! unless told otherwise — while the read is parked did not get going until
+//! the read completed, which is when the client happened to write its next
+//! message. (A child given a null or piped stdin was never affected.)
+//! `git` for the system prompt is such a child, and the turn that needed it
+//! stalled with it: `rebon
 //! --acp` answered `session/new` and then never finished a first prompt,
 //! because an editor waits for that answer before it writes anything else.
 //!
