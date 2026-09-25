@@ -16,6 +16,16 @@ serde_json.workspace = true
 tokio.workspace = true
 schemars = { workspace = true, optional = true }
 
+# `process_stdio` points the process's standard handles at the null device.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
 [features]
 # Off by default — see the same feature on `rebon-types`.
 schema = ["dep:schemars", "rebon-types/schema"]

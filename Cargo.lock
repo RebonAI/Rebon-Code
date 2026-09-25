@@ -4071,12 +4071,14 @@ dependencies = [
 name = "rebon-proto"
 version = "1.6.1"
 dependencies = [
+ "libc",
  "rebon-types",
  "schemars",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

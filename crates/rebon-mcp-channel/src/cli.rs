@@ -54,9 +54,15 @@ pub async fn run(
         McpCommand::Serve(args) => {
             let root = std::env::current_dir()
                 .context("rebon mcp serve needs a working directory to confine jobs to")?;
+            // The connection gets its own ends of stdin and stdout before
+            // `exec_start` can launch anything, so no process this server
+            // starts can inherit, block on or write into them. See
+            // `rebon_proto::process_stdio`.
+            let stdio = rebon_proto::process_stdio::take_process_stdio()
+                .context("failed to take stdio for the MCP connection")?;
             serve(
-                tokio::io::stdin(),
-                tokio::io::stdout(),
+                stdio.input,
+                stdio.output,
                 ServeConfig {
                     store,
                     projects_root: rebon_session::default_projects_root(),

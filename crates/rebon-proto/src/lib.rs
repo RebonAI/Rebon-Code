@@ -10,6 +10,8 @@
 //!   Content-Length vs NDJSON framing and yields raw message bodies.
 //! - [`transport`] — async stdio reader / writer built on top of the decoder,
 //!   parameterized over any `AsyncRead`/`AsyncWrite`.
+//! - [`process_stdio`] — the process's own stdin and stdout, detached from
+//!   its standard handles for a server that speaks on them.
 //! - [`types`] — the JSON-RPC 2.0 + ACP data types: initialize, session setup,
 //!   prompt turn, content blocks, permission requests, session updates.
 //! - [`web_api`] — not ACP: the shapes the local server returns from its
@@ -20,6 +22,7 @@
 
 pub mod framing;
 pub mod mcp_channel;
+pub mod process_stdio;
 pub mod transport;
 pub mod types;
 pub mod web_api;

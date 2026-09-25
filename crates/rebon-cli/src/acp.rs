@@ -103,6 +103,15 @@ pub async fn run_acp_server(
     rebon_harness::kernel_bootstrap::declare_plugin_surface(
         rebon_harness::kernel_bootstrap::PluginSurface::Plain,
     );
+    // Before the build: it spawns processes (MCP servers, the plugin plane),
+    // and none of them may inherit the connection's stdin or stdout.
+    let connection = match transport {
+        AcpTransport::Stdio => AcpConnection::Stdio(
+            rebon_proto::process_stdio::take_process_stdio()
+                .context("failed to take stdio for the ACP connection")?,
+        ),
+        AcpTransport::Tcp { host, port } => AcpConnection::Tcp { host, port },
+    };
     let AcpServerParts {
         handler,
         update_rx,
@@ -116,7 +125,7 @@ pub async fn run_acp_server(
     // handler, to clean up after them.
     let state = handler.state().clone();
 
-    let result = serve_acp_transport(transport, handler, update_rx, permission_rx, &engine).await;
+    let result = serve_acp_transport(connection, handler, update_rx, permission_rx, &engine).await;
     remove_owned_scratchpads(&state);
     result
 }
@@ -134,8 +143,22 @@ fn remove_owned_scratchpads(state: &rebon_acp::ServerState) {
     }
 }
 
+/// A transport whose stdio, if it speaks on stdio, has already been taken.
+enum AcpConnection {
+    /// The process's own stdin and stdout, detached from its standard
+    /// handles so a child the server spawns cannot inherit them. On Windows
+    /// a child that inherits the stdin pipe while the server's read is
+    /// parked on it waits for that read to finish, which stalled every turn
+    /// that ran `git` until the client wrote again.
+    Stdio(rebon_proto::process_stdio::ProcessStdio),
+    Tcp {
+        host: String,
+        port: u16,
+    },
+}
+
 async fn serve_acp_transport(
-    transport: AcpTransport,
+    connection: AcpConnection,
     handler: DefaultHandler,
     update_rx: tokio::sync::mpsc::UnboundedReceiver<rebon_proto::types::SessionUpdateParams>,
     permission_rx: tokio::sync::mpsc::UnboundedReceiver<
@@ -143,23 +166,23 @@ async fn serve_acp_transport(
     >,
     engine: &Engine,
 ) -> anyhow::Result<()> {
-    match transport {
-        AcpTransport::Stdio => {
+    match connection {
+        AcpConnection::Stdio(stdio) => {
             tracing::info!(
                 tools = engine.tool_count(),
                 "rebon: starting ACP server on stdio (real harness path)"
             );
 
             serve_with_publishers(
-                tokio::io::stdin(),
-                tokio::io::stdout(),
+                stdio.input,
+                stdio.output,
                 handler,
                 Some(update_rx),
                 Some(permission_rx),
             )
             .await
         }
-        AcpTransport::Tcp { host, port } => {
+        AcpConnection::Tcp { host, port } => {
             let bind_addr = format!("{host}:{port}");
             let mut addrs = bind_addr
                 .to_socket_addrs()
