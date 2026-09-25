@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "The `onboarding` feature plugin: the first-run setup wizard and the account logins (ChatGPT/Codex, GitHub Copilot). Step dispatch, PKCE, the authorize URL, the loopback callback listener and its paste fallback, the device-code flow, token exchange, credential persistence, error classification, the wizard's state machine, the import of Claude Code / Codex skills, agents and commands, and the `/onboarding` command."
+description = "The `onboarding` feature plugin: the first-run setup wizard and the account logins (ChatGPT/Codex, GitHub Copilot). Step dispatch, PKCE, the authorize URL, the loopback callback listener and its paste fallback, the device-code flow, token exchange, credential persistence, error classification, the wizard's state machine, the import of Claude Code / Codex skills, agents and commands, the `/onboarding`, `/migrate`, `/login` and `/logout` commands, and `rebon login` / `rebon logout`."
 
 [dependencies]
 # The command seat `/onboarding` registers on, and the spec type it hands over.
@@ -32,6 +32,9 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 
 anyhow = { workspace = true }
+# `rebon login` / `rebon logout`: parsed before a kernel exists, next to the
+# flows they run (the `rebon remote` pattern).
+clap = { workspace = true }
 getrandom = { workspace = true }
 reqwest = { workspace = true }
 # The device-code flow's IO half reads two small JSON answers; the decisions

@@ -568,6 +568,21 @@ pub(super) fn parse_migrate_command(text: &str) -> bool {
     is_bare_command(text, "migrate")
 }
 
+/// Recognize `/login [account]` or `/logout [account]` (`name` says which):
+/// `Some(None)` bare, `Some(Some(account))` with one account named. More
+/// than one word is not this command, so the line goes on as text.
+pub(super) fn parse_account_command(text: &str, name: &str) -> Option<Option<String>> {
+    let rest = strip_command_prefix(text, name).filter(|rest| name_ends_here(rest))?;
+    let account = rest
+        .trim_start_matches(|c: char| c == ' ' || c == ':')
+        .trim();
+    match account.split_whitespace().count() {
+        0 => Some(None),
+        1 => Some(Some(account.to_string())),
+        _ => None,
+    }
+}
+
 /// Recognize `/exit` or `/quit` in the current prompt input.
 pub(super) fn parse_exit_command(text: &str) -> bool {
     is_bare_command(text, "exit")
@@ -1104,6 +1119,27 @@ mod tests {
         assert_eq!(command_args("/model", "model"), "");
         // A longer word is a different command, not this one with arguments.
         assert_eq!(command_args("/modelling x", "model"), "");
+    }
+
+    #[test]
+    fn login_and_logout_take_at_most_one_account() {
+        for name in ["login", "logout"] {
+            assert_eq!(parse_account_command(&format!("/{name}"), name), Some(None));
+            assert_eq!(
+                parse_account_command(&format!("/{name}  copilot "), name),
+                Some(Some("copilot".to_string()))
+            );
+            assert_eq!(
+                parse_account_command(&format!("/{name}: openai"), name),
+                Some(Some("openai".to_string()))
+            );
+            assert_eq!(
+                parse_account_command(&format!("/{name} copilot now"), name),
+                None
+            );
+            assert_eq!(parse_account_command(&format!("/{name}s"), name), None);
+        }
+        assert_eq!(parse_account_command("/logout", "login"), None);
     }
 
     #[test]

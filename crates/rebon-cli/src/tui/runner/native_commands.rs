@@ -34,15 +34,16 @@ use rebon_dialog::settings_tabs::TabId;
 use rebon_ui_seat::{ids, input as dialog_input, DialogArgs};
 
 use super::commands::{
-    apply_user_new_session, execute_goal_command, execute_statusline_command, parse_agent_command,
-    parse_agent_view_command, parse_agents_command, parse_background_session_command,
-    parse_context_command, parse_cost_command, parse_doctor_command, parse_effort_command,
-    parse_fast_command, parse_goal_command, parse_help_command, parse_memory_command,
-    parse_migrate_command, parse_new_or_clear_command, parse_onboarding_command,
-    parse_profile_command, parse_review_command, parse_run_command, parse_settings_dialog_command,
-    parse_skills_command, parse_status_command, parse_statusline_command, parse_tasks_command,
-    parse_teams_command, parse_theme_command, parse_vim_command, parse_workflows_command,
-    synthesize_review_prompt, GoalCommand, GoalCommandOutcome,
+    apply_user_new_session, execute_goal_command, execute_statusline_command,
+    parse_account_command, parse_agent_command, parse_agent_view_command, parse_agents_command,
+    parse_background_session_command, parse_context_command, parse_cost_command,
+    parse_doctor_command, parse_effort_command, parse_fast_command, parse_goal_command,
+    parse_help_command, parse_memory_command, parse_migrate_command, parse_new_or_clear_command,
+    parse_onboarding_command, parse_profile_command, parse_review_command, parse_run_command,
+    parse_settings_dialog_command, parse_skills_command, parse_status_command,
+    parse_statusline_command, parse_tasks_command, parse_teams_command, parse_theme_command,
+    parse_vim_command, parse_workflows_command, synthesize_review_prompt, GoalCommand,
+    GoalCommandOutcome,
 };
 use super::compact_runtime::{start_manual_compact, CompactStart};
 use super::layout_and_scroll::repin_transcript_to_bottom;
@@ -125,6 +126,8 @@ const NATIVE_COMMAND_IDS: &[&str] = &[
     "hooks",
     "hosted",
     "kernel",
+    "login",
+    "logout",
     "mcp",
     "memory",
     "migrate",
@@ -279,6 +282,8 @@ pub(super) fn native_dispatch(
         "onboarding" => run_onboarding(cx, command),
         "theme" => run_theme(cx, command),
         "migrate" => run_migrate(cx, command),
+        "login" => run_login(cx, command),
+        "logout" => run_logout(cx, command),
         "resume" => run_resume(cx, command),
         "rewind" => run_rewind(cx, command),
         "run" => run_run(cx, command),
@@ -845,6 +850,63 @@ fn run_migrate(cx: Cx<'_>, command: &str) -> Option<bool> {
     app.onboarding_dialog = Some(OnboardingDialogState::open_for_migrate_command());
     open_onboarding_dialog(app, session, handle, "slash_migrate");
     accept(app, session, command);
+    Some(false)
+}
+
+/// Intercept `/login [account]`: open the login pane, which lists every
+/// account login. Naming one opens the pane with that account selected, one
+/// Enter away — the sign-in itself needs the pane's key loop to drive it.
+fn run_login(cx: Cx<'_>, command: &str) -> Option<bool> {
+    let account = parse_account_command(command, "login")?;
+    let (app, session, handle, ..) = cx.split();
+    let mut dialog = OnboardingDialogState::open_for_login_pane();
+    if let Some(name) = account.as_deref() {
+        match rebon_plugin_onboarding::accounts::find_login(name) {
+            Ok(spec) => {
+                dialog.focus_login(spec.id);
+            }
+            Err(message) => {
+                accept(app, session, command);
+                command_result(app, true, &message);
+                return Some(false);
+            }
+        }
+    }
+    app.onboarding_dialog = Some(dialog);
+    open_onboarding_dialog(app, session, handle, "slash_login");
+    accept(app, session, command);
+    Some(false)
+}
+
+/// Intercept `/logout [account]`: sign out of the account named, or of the
+/// only one signed in. The session running now keeps the credential it
+/// already resolved, so when that is the login just removed, say so rather
+/// than let the next turn look like the sign-out did nothing.
+fn run_logout(cx: Cx<'_>, command: &str) -> Option<bool> {
+    let account = parse_account_command(command, "logout")?;
+    let (app, session, ..) = cx.split();
+    accept(app, session, command);
+    let config_dir = crate::rebon_config::config_home_dir();
+    match rebon_plugin_onboarding::accounts::logout(&config_dir, account.as_deref()) {
+        Ok(report) => {
+            let still_held = report.signed_out.is_some_and(|spec| {
+                session
+                    .model
+                    .provider_name
+                    .eq_ignore_ascii_case(spec.provider.name)
+            });
+            let text = if still_held {
+                format!(
+                    "{} This session keeps the credential it already holds until it ends.",
+                    report.message
+                )
+            } else {
+                report.message
+            };
+            feedback(app, "logout", &text);
+        }
+        Err(message) => command_result(app, true, &message),
+    }
     Some(false)
 }
 
