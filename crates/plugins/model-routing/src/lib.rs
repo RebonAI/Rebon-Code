@@ -24,7 +24,7 @@ pub use settings_row::{
     ROUTING_POLICY_OPTION,
 };
 
-pub const PLUGIN_ID: &str = "model-routing";
+pub const PLUGIN_ID: &str = rebon_core::model_routing::MODEL_ROUTING_PLUGIN_ID;
 /// The cheap model that does the classifying, for the text backend.
 pub(crate) const ROUTER_MODEL_SETTING: &str = "routerModel";
 /// The user's own routing policy, which the classifier is told to follow.

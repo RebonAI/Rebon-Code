@@ -120,6 +120,12 @@ pub async fn run(args: ExecArgs) -> anyhow::Result<()> {
     // `REBON_EXECUTION_SURFACE=interactive` opts back out for a run someone
     // is in fact babysitting.
     rebon_tool::set_execution_surface(rebon_tool::ExecutionSurface::Unattended);
+    // And which plugins it runs with, before the session build boots the
+    // kernel: the caller named the model and the tool set, so routing and
+    // Code Mode stay out whatever the user's settings turn on.
+    rebon_harness::kernel_bootstrap::declare_plugin_surface(
+        rebon_harness::kernel_bootstrap::PluginSurface::Plain,
+    );
 
     let json = args.json;
     let gate_policy = {

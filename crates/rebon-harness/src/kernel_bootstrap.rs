@@ -258,6 +258,91 @@ fn apply_legacy_switches(desired: &mut DesiredSet, env: &dyn Fn(&str) -> Option<
     }
 }
 
+/// Which of the plugins the settings switch on an entry point runs with.
+///
+/// `plugins.<id>.enabled` lives in one file that every surface reads, so it
+/// cannot say "on in my terminal, but not for the script that calls me". This
+/// is where an entry point says that for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PluginSurface {
+    /// Whatever the settings say. The terminal, `serve`, the background
+    /// host the desktop app runs its chats on.
+    #[default]
+    Configured,
+    /// An entry point driven by a caller outside Rebon — `rebon exec` (evals,
+    /// scripts, the desktop app's inline rewrite) and the `--acp` server an
+    /// editor drives. The caller named a model and expects that model and the
+    /// ordinary tool set; plugins that re-pick the model or reshape the tool
+    /// set from the user's own settings would change the run under it.
+    Plain,
+}
+
+impl PluginSurface {
+    /// The plugins this surface keeps unloaded, whatever the switches say.
+    ///
+    /// `model-routing` re-picks the provider, model and effort from the first
+    /// prompt, for the session and for every sub-agent. `code-mode` puts
+    /// `run_code` in front of the model (with `defaultOn`, before anyone asked
+    /// for it). Unloading them is the whole switch: the executor, the
+    /// sub-agent spawner and `run_code` each look for their plugin on the
+    /// kernel and do nothing without it. The one effect that outlives the
+    /// plugin — a session routed earlier keeps its routed model — is skipped
+    /// too, because the executor asks the kernel whether routing is withheld
+    /// rather than merely off (`rebon_core::model_routing::routing_withheld`).
+    pub fn withheld(self) -> &'static [&'static str] {
+        match self {
+            Self::Configured => &[],
+            Self::Plain => &[
+                rebon_plugin_model_routing::PLUGIN_ID,
+                rebon_kernel_seats::kernel_code_mode::PLUGIN_ID,
+            ],
+        }
+    }
+}
+
+static DECLARED_PLUGIN_SURFACE: OnceLock<PluginSurface> = OnceLock::new();
+
+/// Declare which plugins this process runs with. Once per process, by the
+/// entry point, before anything boots the kernel.
+///
+/// Declared late, it still holds: whatever it withholds is unloaded from the
+/// live registry at once, and sessions already built lose it with the
+/// plugin. A second, different declaration is ignored with a warning —
+/// withholding is not undone, and a process that serves one surface serves
+/// no other.
+pub fn declare_plugin_surface(surface: PluginSurface) {
+    if DECLARED_PLUGIN_SURFACE.set(surface).is_err() {
+        let declared = declared_plugin_surface();
+        if declared != surface {
+            tracing::warn!(
+                ?declared,
+                ?surface,
+                "kernel: plugin surface already declared"
+            );
+        }
+        return;
+    }
+    if let Some(registry) = rebon_kernel::process_registry() {
+        withhold_for(&registry, surface);
+    }
+}
+
+/// The surface this process declared, [`PluginSurface::Configured`] if none.
+pub fn declared_plugin_surface() -> PluginSurface {
+    DECLARED_PLUGIN_SURFACE.get().copied().unwrap_or_default()
+}
+
+fn withhold_for(registry: &PluginRegistry, surface: PluginSurface) {
+    let withheld = surface.withheld();
+    if withheld.is_empty() {
+        return;
+    }
+    let report = registry
+        .withhold(withheld)
+        .expect("a surface withholds only built-in feature plugins");
+    tracing::info!(?surface, ?withheld, unloaded = ?report.unloaded, "kernel: plugins withheld");
+}
+
 /// The process-wide registry over [`builtin_plugin_defs`]. Booting it is
 /// what [`process_kernel`] does; `/plugins`, the settings switches and
 /// `/kernel reload` all talk to this one instance.
@@ -279,6 +364,9 @@ pub fn process_plugin_registry() -> Arc<PluginRegistry> {
                 config_dir,
             };
             let registry = PluginRegistry::new(kernel.clone(), builtin_plugin_defs(), host);
+            // Before the first reconcile, so a withheld plugin never loads
+            // even for a moment.
+            withhold_for(&registry, declared_plugin_surface());
             let report = registry.reconcile(&desired_from_settings());
             let core_failures: Vec<&(String, String)> = report
                 .failed

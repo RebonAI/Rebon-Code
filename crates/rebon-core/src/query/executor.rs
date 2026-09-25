@@ -4417,8 +4417,13 @@ impl PromptExecutor for EngineQueryExecutor {
         &self,
         mut request: PromptRequest,
     ) -> Result<PromptOutcome, PromptExecutorError> {
-        let routed = if let Some(runtime) = &self.runtime_model {
-            let router = self.engine.upstream_tool_context().and_then(|ctx| {
+        let upstream = self.engine.upstream_tool_context();
+        let routed = if let Some(runtime) = self
+            .runtime_model
+            .as_ref()
+            .filter(|_| !crate::model_routing::routing_withheld(upstream))
+        {
+            let router = upstream.and_then(|ctx| {
                 let router = ctx.get::<crate::model_routing::ModelRoutingService>();
                 if router.is_some() {
                     runtime.bind_routing_notices(&ctx, &request);

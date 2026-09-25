@@ -470,3 +470,106 @@ fn corrupt_metadata_is_reported_and_manual_cas_wins() {
         std::io::ErrorKind::InvalidData
     );
 }
+
+/// A routing plugin that registers nothing: what matters to a resumed session
+/// is whether the process withholds the plugin, not what it provides.
+struct InertRoutingPlugin;
+impl rebon_kernel::Plugin for InertRoutingPlugin {
+    fn meta(&self) -> rebon_kernel::PluginMeta {
+        rebon_kernel::PluginMeta::new(crate::model_routing::MODEL_ROUTING_PLUGIN_ID)
+    }
+    fn apply(&self, _ctx: &rebon_kernel::Context) -> Result<(), rebon_kernel::KernelError> {
+        Ok(())
+    }
+}
+
+/// The session a terminal routed and another surface now resumes: a routed
+/// sidecar on disk, and an executor on a kernel whose routing plugin is off
+/// (by a switch) or withheld (by the entry point).
+async fn resume_routed_session(withheld: bool) -> String {
+    let root = temp_projects_root(if withheld {
+        "routing_resume_withheld"
+    } else {
+        "routing_resume_switched_off"
+    });
+    let routed = SessionModelSelection {
+        provider: Some("mock".into()),
+        model: Some("routed".into()),
+        effort: Some("low".into()),
+        manual_override: false,
+    };
+    assert!(model_selection::claim(root.path(), "work", "resumed").unwrap());
+    assert!(model_selection::compare_exchange(
+        root.path(),
+        "work",
+        "resumed",
+        &SessionModelSelection::default(),
+        &routed,
+    )
+    .unwrap());
+
+    let kernel = rebon_kernel::Kernel::new();
+    let registry = rebon_kernel::PluginRegistry::new(
+        kernel.clone(),
+        &[rebon_kernel::PluginDef {
+            id: crate::model_routing::MODEL_ROUTING_PLUGIN_ID,
+            title: "routing",
+            kind: rebon_kernel::PluginKind::Feature,
+            default_enabled: false,
+            factory: |_| Ok(Box::new(InertRoutingPlugin)),
+        }],
+        rebon_kernel::PluginHost {
+            kernel: kernel.clone(),
+            config_dir: root.path().to_path_buf(),
+        },
+    );
+    if withheld {
+        registry
+            .withhold(&[crate::model_routing::MODEL_ROUTING_PLUGIN_ID])
+            .unwrap();
+    }
+    registry.reconcile(&rebon_kernel::DesiredSet::new());
+
+    let engine = Arc::new(Engine::new());
+    engine.attach_upstream_tool_context(kernel.context().clone());
+    let client = MockModelClient::new();
+    for id in ["resumed", "title", "spare"] {
+        client.push_turn(text_turn(id, "done"));
+    }
+    let executor =
+        EngineQueryExecutor::new(engine, Arc::new(client.clone()), root.path(), "initial")
+            .with_shared_runtime_model(runtime(Arc::new(client.clone())));
+    executor.execute(request("resumed", "work")).await.unwrap();
+
+    // The new session also asks the title model for a title; the turn is the
+    // other request.
+    let turns: Vec<String> = client
+        .captured_requests()
+        .into_iter()
+        .map(|request| request.model)
+        .filter(|model| model != "title")
+        .collect();
+    assert_eq!(turns.len(), 1, "{turns:?}");
+    let model = turns[0].clone();
+    assert_eq!(
+        model_selection::load(root.path(), "work", "resumed").unwrap(),
+        Some(routed),
+        "the sidecar was rewritten"
+    );
+    model
+}
+
+#[tokio::test]
+async fn a_withheld_router_does_not_restore_a_routed_session_and_leaves_its_sidecar() {
+    let model = resume_routed_session(true).await;
+    assert_eq!(
+        model, "initial",
+        "the routed choice overrode the caller's model"
+    );
+}
+
+#[tokio::test]
+async fn a_router_switched_off_still_restores_the_routed_session() {
+    let model = resume_routed_session(false).await;
+    assert_eq!(model, "routed");
+}

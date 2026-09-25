@@ -72,6 +72,19 @@ crate as `crates/rebon-<name>/`, a Rust feature plugin as
   needs `builtin_plugin_defs()` first, and that table names every plugin crate.
   It installs only after assembly is done, so `Some` is never a kernel still
   deciding what to load.
+- **An entry point can withhold plugins the settings turn on.** `rebon exec`
+  and `--acp` call `kernel_bootstrap::declare_plugin_surface(PluginSurface::Plain)`
+  before the boot, and the registry then keeps `model-routing` and `code-mode`
+  unloaded whatever `plugins.<id>.enabled` says: their callers named a model
+  and expect the ordinary tool set. It is `PluginRegistry::withhold` because
+  the registry is the one mutator, so `/kernel enable`, a settings write and a
+  reload all answer to it. `serve` shares the ACP handler but not that entry,
+  and runs as configured, like the terminal and the background host. A new
+  plugin that changes the model or the tool set behind a caller's back joins
+  `PluginSurface::withheld`, not an `if` in the plugin. The set lives on the
+  kernel (`Context::is_plugin_withheld`), so code below the plugins can tell
+  "withheld here" from "switched off": the executor restores a session's
+  routed model when routing is merely off, and not when it is withheld.
 - **Whoever reads the slot is handed the kernel.** Read
   `rebon_kernel::process_registry()` only where you **can prove you run after
   boot**, and handle `None` with that seat's existing fail-closed meaning
