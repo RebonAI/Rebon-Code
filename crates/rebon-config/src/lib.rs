@@ -570,21 +570,25 @@ impl ProviderFormat {
 pub fn openai_service_tier_available(
     format: ProviderFormat,
     base_url: &str,
-    has_oauth: bool,
+    codex_login: bool,
     is_external_provider: bool,
 ) -> bool {
-    is_first_party_openai_route(format, base_url, has_oauth, is_external_provider)
+    is_first_party_openai_route(format, base_url, codex_login, is_external_provider)
 }
 
 /// Whether a built-in OpenAI-format route is OpenAI's own: `api.openai.com`,
-/// or the ChatGPT Codex backend reached with OpenAI OAuth. The features that
-/// talk to OpenAI beyond the model wire — the fast service tier, the Images
-/// API behind `ImageGen` — are offered on exactly these routes; a gateway or
-/// a compatible vendor that merely speaks the format gets neither.
+/// or the ChatGPT Codex backend reached with the ChatGPT login. The features
+/// that talk to OpenAI beyond the model wire — the fast service tier, the
+/// Images API behind `ImageGen` — are offered on exactly these routes; a
+/// gateway or a compatible vendor that merely speaks the format gets neither.
+///
+/// `codex_login` is [`ResolvedProvider::has_codex_login`], not "has any
+/// login": another account login pointed at the Codex host is still not
+/// OpenAI's own route.
 pub fn is_first_party_openai_route(
     format: ProviderFormat,
     base_url: &str,
-    has_oauth: bool,
+    codex_login: bool,
     is_external_provider: bool,
 ) -> bool {
     if is_external_provider
@@ -596,7 +600,7 @@ pub fn is_first_party_openai_route(
         return false;
     }
 
-    let codex_oauth = has_oauth && rebon_api::is_chatgpt_codex_backend(base_url);
+    let codex_oauth = codex_login && rebon_api::is_chatgpt_codex_backend(base_url);
     codex_oauth || is_openai_api_endpoint(format, base_url)
 }
 
@@ -683,21 +687,33 @@ impl UpdatePreferences {
 }
 
 /// OAuth metadata attached to a provider when its api key was
-/// resolved from the `$OPENAI_OAUTH_TOKEN` sentinel.
+/// resolved from an account-login sentinel (`$OPENAI_OAUTH_TOKEN`,
+/// `$OAUTH:<id>`).
 ///
 /// These fields let the caller decide whether a refresh is needed and,
-/// if so, run the refresh POST against
-/// `https://auth.openai.com/oauth/token`.
+/// if so, run the login's refresh ([`account_login::refresh_account`]).
 #[derive(Debug, Clone)]
 pub struct OAuthMeta {
+    /// Which login the bearer came from. The capability gates that belong
+    /// to the ChatGPT login ask this ([`OAuthMeta::is_codex`]) rather than
+    /// "is there any login", which every account login would answer yes.
+    pub provider: &'static account_login::AccountLoginSpec,
     /// Expiry in milliseconds since the Unix epoch. `None` when the
     /// credentials file omitted the field — treated as "already
     /// expired" by [`is_token_expired`].
     pub expires_at_ms: Option<u64>,
     /// Refresh token. `None` when the credentials file omitted it —
     /// refresh is impossible and the caller must surface a login
-    /// request.
+    /// request. For a login whose bearer is exchanged from a long-lived
+    /// account token, that token stands here.
     pub refresh_token: Option<String>,
+}
+
+impl OAuthMeta {
+    /// Whether the bearer came from the ChatGPT (Codex) login.
+    pub fn is_codex(&self) -> bool {
+        self.provider.is_codex()
+    }
 }
 
 /// Fully-resolved provider config ready to be fed into the right
@@ -735,8 +751,8 @@ pub struct ResolvedProvider {
     /// registry-aware external provider id set, or from [`format`] for built-ins.
     pub provider_selection: ProviderSelection,
     /// OAuth metadata. `Some` when the provider's api_key was
-    /// resolved from the `$OPENAI_OAUTH_TOKEN` sentinel; `None`
-    /// for literal API-key providers.
+    /// resolved from an account-login sentinel; `None` for literal
+    /// API-key providers.
     pub oauth: Option<OAuthMeta>,
     /// When `true`, the OpenAI Responses provider uses WebSocket
     /// transport (supports `previous_response_id`).
@@ -754,6 +770,14 @@ pub struct ResolvedProvider {
     /// `"pro"` (gpt-5.6+ pro mode) is recognized downstream; `None`
     /// means standard mode.
     pub reasoning_mode: Option<String>,
+}
+
+impl ResolvedProvider {
+    /// Whether this provider is signed in through the ChatGPT (Codex)
+    /// login — the question every Codex-only capability gate asks.
+    pub fn has_codex_login(&self) -> bool {
+        self.oauth.as_ref().is_some_and(OAuthMeta::is_codex)
+    }
 }
 
 /// Syntactic parse failure for the primary `config.json`.
@@ -1298,6 +1322,14 @@ pub struct Credentials {
         skip_serializing_if = "Option::is_none"
     )]
     pub openai_oauth: Option<OpenAIOAuthTokens>,
+    /// Every other account login's tokens, keyed by login id
+    /// (`oauthAccounts.copilot`). See [`account_login`].
+    #[serde(
+        rename = "oauthAccounts",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub accounts: BTreeMap<String, account_login::AccountTokens>,
     /// Every other top-level key we don't explicitly model. Kept
     /// so rewriting the file (after a token refresh) does not lose
     /// unrelated sibling entries like `claudeAiOauth`.
@@ -1326,6 +1358,7 @@ pub struct OpenAIOAuthTokens {
     pub expires_at: Option<u64>,
 }
 
+pub mod account_login;
 pub mod paths;
 pub mod profile_store;
 pub mod provider_store;
@@ -1359,6 +1392,11 @@ pub(crate) fn store_file_id(name: &str, fallback: &str) -> String {
 pub use paths::generated_images_output_base_in_dir;
 pub use paths::*;
 pub use paths::{agents_json_path, config_json_path, credentials_json_path, home_dir};
+
+pub use account_login::{
+    account_login, account_login_for_api_key, account_logins, AccountFlow, AccountLoginSpec,
+    AccountLoginStatus, AccountTokens, CODEX_LOGIN_ID, COPILOT_LOGIN_ID,
+};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -1459,7 +1497,10 @@ where
 
     let (api_key, oauth) = resolve_api_key(provider, config_dir)?;
 
-    let (extra_headers, request_options) = resolve_provider_options(provider);
+    let (mut extra_headers, request_options) = resolve_provider_options(provider);
+    if let Some(oauth) = &oauth {
+        account_login::merge_account_headers(oauth.provider, &mut extra_headers);
+    }
     let model_request_options = resolve_model_request_options(provider);
     let model_context_windows = resolve_model_context_windows(provider);
     let model_output_token_limits = resolve_model_output_token_limits(provider);
@@ -2380,9 +2421,9 @@ pub fn read_credentials(config_dir: &Path) -> anyhow::Result<Credentials> {
     Ok(credentials)
 }
 
-/// Resolve the provider's `apiKey` field. If it is the
-/// `$OPENAI_OAUTH_TOKEN` sentinel, pull the real token out of
-/// `.credentials.json`; otherwise return the literal value.
+/// Resolve the provider's `apiKey` field. If it is an account-login
+/// sentinel, pull the live bearer out of `.credentials.json`; otherwise
+/// return the literal value.
 ///
 /// On the sentinel path, also returns [`OAuthMeta`] so the caller
 /// (the refresh helper) can decide whether to rotate before
@@ -2391,11 +2432,30 @@ fn resolve_api_key(
     provider: &CustomProvider,
     config_dir: &Path,
 ) -> anyhow::Result<(String, Option<OAuthMeta>)> {
-    if provider.api_key != OPENAI_OAUTH_TOKEN_SENTINEL {
+    let Some(login) = account_login::account_login_for_api_key(&provider.api_key) else {
+        // A `$OAUTH:` sentinel naming no known login is refused rather than
+        // sent to the endpoint as though it were a key.
+        if account_login::is_account_sentinel(&provider.api_key) {
+            anyhow::bail!(
+                "provider `{}` names an unknown account login `{}` — known logins: {}",
+                provider.name,
+                provider.api_key,
+                account_login::account_logins()
+                    .iter()
+                    .map(|spec| spec.id)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         return Ok((provider.api_key.clone(), None));
-    }
+    };
 
     let credentials = read_credentials(config_dir)?;
+    if !login.is_codex() {
+        let (bearer, oauth) =
+            account_login::resolve_account_bearer(login, &credentials, &provider.name)?;
+        return Ok((bearer, Some(oauth)));
+    }
     let Some(tokens) = credentials.openai_oauth else {
         anyhow::bail!(
             "rebon config points at OpenAI OAuth provider `{name}` but \
@@ -2408,6 +2468,7 @@ fn resolve_api_key(
         anyhow::bail!("rebon OpenAI OAuth access token is empty — run `rebon` and `/login`");
     }
     let oauth = OAuthMeta {
+        provider: login,
         expires_at_ms: tokens.expires_at,
         refresh_token: tokens.refresh_token,
     };
@@ -2689,6 +2750,11 @@ pub async fn check_and_refresh_if_needed(
     if !is_token_expired(oauth.expires_at_ms) {
         return Ok(None);
     }
+    if !oauth.is_codex() {
+        return account_login::refresh_account(config_dir, oauth.provider)
+            .await
+            .map(Some);
+    }
     let Some(refresh_token) = oauth.refresh_token.as_deref() else {
         return Err(OAuthRefreshError::unauthorized(
             "rebon OpenAI OAuth access token is expired and no refresh token \
@@ -2764,10 +2830,15 @@ pub fn write_openai_oauth_tokens(
     config_dir: &Path,
     tokens: &OpenAIOAuthTokens,
 ) -> anyhow::Result<()> {
-    let target = credentials_json_path(config_dir);
     let mut credentials = read_credentials(config_dir)?;
     credentials.openai_oauth = Some(tokens.clone());
+    write_credentials(config_dir, &credentials)
+}
 
+/// Write the whole credentials file atomically and privately, then tell
+/// the config observer. Every credentials write ends here.
+fn write_credentials(config_dir: &Path, credentials: &Credentials) -> anyhow::Result<()> {
+    let target = credentials_json_path(config_dir);
     // Ensure the config dir exists before writing; an already-existing
     // directory is fine.
     if let Err(err) = std::fs::create_dir_all(config_dir) {
@@ -2776,7 +2847,7 @@ pub fn write_openai_oauth_tokens(
         )));
     }
 
-    let serialized = serde_json::to_vec_pretty(&credentials)
+    let serialized = serde_json::to_vec_pretty(credentials)
         .map_err(|err| anyhow::anyhow!("failed to serialize updated credentials: {err}"))?;
 
     rebon_session::write_private_file_atomically(&target, &serialized).map_err(|err| {
@@ -2810,8 +2881,15 @@ pub struct CustomProviderInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderSetupCredential {
     Stored,
-    Environment { variable: String, available: bool },
+    Environment {
+        variable: String,
+        available: bool,
+    },
     OpenAiOAuth,
+    /// Signed in through another account login; the id is the login's.
+    AccountLogin {
+        login: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3222,6 +3300,25 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         notes: "",
     },
     ProviderPreset {
+        id: "xai",
+        display_name: "xAI Grok",
+        vendor: V::Xai,
+        region: PresetRegion::Global,
+        // docs.x.ai/docs/guides/chat: OpenAI-compatible at api.x.ai/v1.
+        // xAI's own account login belongs to its closed-source CLI, so the
+        // route a third-party client has is an API key.
+        format: "openai",
+        base_url: "https://api.x.ai/v1",
+        anthropic_base_url: None,
+        default_model: "grok-4.7",
+        api_key_env: "XAI_API_KEY",
+        api_key_required: true,
+        key_url: "https://console.x.ai/team/default/api-keys",
+        docs_url: "https://docs.x.ai/docs/models",
+        description: "Grok 4.7 / 4.6，OpenAI 兼容接口",
+        notes: "",
+    },
+    ProviderPreset {
         id: "ollama",
         display_name: "Ollama",
         vendor: V::Ollama,
@@ -3354,6 +3451,7 @@ fn discover_models_for_provider_in(
     input: &ProviderModelDiscoveryInput,
 ) -> Result<rebon_api::ModelDiscovery, String> {
     let raw_key = input.api_key.trim();
+    let login = account_login::account_login_for_api_key(raw_key);
     let api_key = if raw_key == OPENAI_OAUTH_TOKEN_SENTINEL {
         let credentials = read_credentials(config_dir).map_err(|err| err.to_string())?;
         credentials
@@ -3361,6 +3459,8 @@ fn discover_models_for_provider_in(
             .map(|tokens| tokens.access_token)
             .filter(|token| !token.is_empty())
             .ok_or_else(|| "not signed in to ChatGPT; run /login first".to_string())?
+    } else if let Some(login) = login {
+        account_login_listing_bearer(config_dir, login)?
     } else {
         let resolved = resolve_env_value(raw_key);
         if resolved.is_empty() && !raw_key.is_empty() {
@@ -3369,18 +3469,38 @@ fn discover_models_for_provider_in(
         resolved
     };
     let vendor = rebon_api::ProviderVendor::resolve(input.vendor.as_deref(), &input.base_url);
+    let mut extra_headers: Vec<(String, String)> = input
+        .headers
+        .iter()
+        .map(|(name, value)| (name.clone(), resolve_env_value(value)))
+        .collect();
+    if let Some(login) = login {
+        account_login::merge_account_headers(login, &mut extra_headers);
+    }
     let request = rebon_api::ModelDiscoveryRequest {
         vendor,
         wire: wire_family_for_format(&input.format),
         base_url: input.base_url.trim().to_string(),
         api_key,
-        extra_headers: input
-            .headers
-            .iter()
-            .map(|(name, value)| (name.clone(), resolve_env_value(value)))
-            .collect(),
+        extra_headers,
     };
     rebon_api::discover_models_blocking(&request).map_err(|err| err.to_string())
+}
+
+/// The bearer a model listing sends for a (non-ChatGPT) account login,
+/// renewing an expired one first. Blocking, like the listing itself.
+fn account_login_listing_bearer(
+    config_dir: &Path,
+    login: &'static AccountLoginSpec,
+) -> Result<String, String> {
+    let credentials = read_credentials(config_dir).map_err(|err| err.to_string())?;
+    let (bearer, oauth) = account_login::resolve_account_bearer(login, &credentials, login.id)
+        .map_err(|err| err.to_string())?;
+    if bearer.is_empty() || is_token_expired(oauth.expires_at_ms) {
+        return account_login::refresh_account_blocking(config_dir, login)
+            .map_err(|err| format!("{err:#}"));
+    }
+    Ok(bearer)
 }
 
 /// What `/provider models <name>` did.
@@ -3697,6 +3817,10 @@ where
             for provider in config.custom_providers {
                 let credential = if provider.api_key == OPENAI_OAUTH_TOKEN_SENTINEL {
                     ProviderSetupCredential::OpenAiOAuth
+                } else if let Some(login) =
+                    account_login::account_login_for_api_key(&provider.api_key)
+                {
+                    ProviderSetupCredential::AccountLogin { login: login.id }
                 } else if let Some(variable) = api_key_environment_variable(&provider.api_key) {
                     ProviderSetupCredential::Environment {
                         available: environment_available(variable),
@@ -3910,8 +4034,8 @@ pub fn provider_model_choices(provider: &CustomProviderInfo) -> Vec<ModelChoice>
     for model in &provider.models {
         push(model.clone(), true);
     }
-    if provider.api_key == OPENAI_OAUTH_TOKEN_SENTINEL {
-        for model in OPENAI_OAUTH_PROVIDER_MODELS {
+    if let Some(login) = account_login::account_login_for_api_key(&provider.api_key) {
+        for model in login.provider.models {
             push((*model).to_string(), true);
         }
     }
@@ -8741,6 +8865,7 @@ mod tests {
         let state = check_startup_oauth(
             tmp.path(),
             &OAuthMeta {
+                provider: account_login::codex_login(),
                 expires_at_ms: Some(0),
                 refresh_token: None,
             },
@@ -8757,6 +8882,7 @@ mod tests {
         let state = check_startup_oauth(
             tmp.path(),
             &OAuthMeta {
+                provider: account_login::codex_login(),
                 expires_at_ms: Some(u64::MAX),
                 refresh_token: Some("refresh".into()),
             },
@@ -8774,6 +8900,7 @@ mod tests {
         let err = check_and_refresh_if_needed(
             tmp.path(),
             &OAuthMeta {
+                provider: account_login::codex_login(),
                 expires_at_ms: Some(0),
                 refresh_token: None,
             },
