@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, RwLock};
 
 use crate::disposer::{Disposer, Scope};
 use crate::events::{EventBus, JsonNext, Next};
@@ -8,6 +9,10 @@ use crate::KernelError;
 /// Shared kernel state every context in the tree points at.
 pub(crate) struct Shared {
     pub(crate) events: Arc<EventBus>,
+    /// Plugins this kernel never loads, whatever the switches say. Written
+    /// only by `PluginRegistry::withhold`; kept here rather than in the
+    /// registry so a consumer holding nothing but a context can ask.
+    pub(crate) withheld: RwLock<BTreeSet<String>>,
 }
 
 /// One link in the service-scope chain. Lookups walk from the context's own
@@ -91,6 +96,7 @@ impl Context {
         Self {
             shared: Arc::new(Shared {
                 events: Arc::new(EventBus::default()),
+                withheld: RwLock::new(BTreeSet::new()),
             }),
             services: ServiceLayer::root(),
             scope: Arc::new(Scope::new()),
@@ -330,6 +336,22 @@ impl Context {
     /// undeclared names (existence is information too).
     pub fn has_service(&self, name: &str) -> bool {
         self.allows(name) && self.resolve_layer(name, |_| Some(())).is_some()
+    }
+
+    /// Whether this context's kernel withholds `plugin_id` — keeps it
+    /// unloaded whatever the switches say (`PluginRegistry::withhold`).
+    ///
+    /// A different fact from "the plugin is not loaded", which is also what
+    /// a user switching it off looks like. A consumer that keeps some of a
+    /// plugin's effects alive while the plugin is merely off — state it left
+    /// behind that the session still honours — asks this to tell the two
+    /// apart. Every fork answers for the whole kernel.
+    pub fn is_plugin_withheld(&self, plugin_id: &str) -> bool {
+        self.shared
+            .withheld
+            .read()
+            .expect("withheld plugin set poisoned")
+            .contains(plugin_id)
     }
 
     /// All service names visible from this context (diagnostics). Shadowed

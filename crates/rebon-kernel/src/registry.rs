@@ -129,17 +129,6 @@ struct Inner {
     generation: u64,
     desired: DesiredSet,
     failed: BTreeMap<String, String>,
-    /// Plugins this process never loads, whatever `desired` says. See
-    /// [`PluginRegistry::withhold`].
-    withheld: BTreeSet<String>,
-}
-
-impl Inner {
-    /// Whether `def` should be loaded now: its switch, unless the process
-    /// withholds it.
-    fn wants(&self, def: &DynPluginDef) -> bool {
-        !self.withheld.contains(&def.id) && self.desired.wants_dyn(def)
-    }
 }
 
 /// Holds the definitions and drives the kernel to the desired set.
@@ -183,9 +172,14 @@ impl PluginRegistry {
                 generation: 0,
                 desired: DesiredSet::new(),
                 failed: BTreeMap::new(),
-                withheld: BTreeSet::new(),
             }),
         })
+    }
+
+    /// Whether `def` should be loaded now: its switch, unless the process
+    /// withholds it.
+    fn wants(&self, inner: &Inner, def: &DynPluginDef) -> bool {
+        !self.is_withheld(&def.id) && inner.desired.wants_dyn(def)
     }
 
     pub fn kernel(&self) -> &Arc<Kernel> {
@@ -298,7 +292,7 @@ impl PluginRegistry {
         let loaded: BTreeSet<String> = self.owned_loaded().into_iter().collect();
         let wanted: BTreeSet<&str> = defs
             .iter()
-            .filter(|def| inner.wants(def))
+            .filter(|def| self.wants(&inner, def))
             .map(|def| def.id.as_str())
             .collect();
 
@@ -346,7 +340,7 @@ impl PluginRegistry {
         let to_load: Vec<DynPluginDef> = self
             .defs_snapshot()
             .into_iter()
-            .filter(|def| ids.iter().any(|u| *u == def.id) && inner.wants(def))
+            .filter(|def| ids.iter().any(|u| *u == def.id) && self.wants(&inner, def))
             .collect();
         self.load_defs(to_load, &mut report);
 
@@ -398,7 +392,13 @@ impl PluginRegistry {
             }
         }
         let mut inner = self.inner.lock().unwrap();
-        inner.withheld.extend(ids.iter().map(|id| id.to_string()));
+        self.kernel
+            .context()
+            .shared
+            .withheld
+            .write()
+            .expect("withheld plugin set poisoned")
+            .extend(ids.iter().map(|id| id.to_string()));
         inner.generation += 1;
         let generation = inner.generation;
         let before = self.states(&inner);
@@ -409,7 +409,7 @@ impl PluginRegistry {
         let loaded: Vec<String> = self
             .owned_loaded()
             .into_iter()
-            .filter(|id| inner.withheld.contains(id))
+            .filter(|id| self.is_withheld(id))
             .collect();
         self.unload_ids(loaded, &mut report);
         self.record_failures(&mut inner, &report);
@@ -421,7 +421,7 @@ impl PluginRegistry {
 
     /// Whether [`withhold`](Self::withhold) keeps `id` out of this process.
     pub fn is_withheld(&self, id: &str) -> bool {
-        self.inner.lock().unwrap().withheld.contains(id)
+        self.kernel.context().is_plugin_withheld(id)
     }
 
     /// Every definition with its current state, in definition order.
@@ -870,6 +870,10 @@ mod tests {
         );
         assert!(registry.is_withheld("alpha"));
         assert!(!registry.is_withheld("beta"));
+        // Anyone holding a context of this kernel can ask, down any fork.
+        let session = registry.kernel().context().fork_scoped("session");
+        assert!(session.fork("turn").is_plugin_withheld("alpha"));
+        assert!(!session.is_plugin_withheld("beta"));
 
         registry.reconcile(&DesiredSet::new().with("alpha", true));
         assert!(!registry.kernel().context().has_service("svc-alpha"));
