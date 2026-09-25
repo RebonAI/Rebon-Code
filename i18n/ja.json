@@ -463,7 +463,7 @@
   "app.EditorCopy": "コピー",
   "app.EditorPaste": "貼り付け",
   "app.EditorSelectAll": "すべて選択",
-  "app.LibraryOpenInEditor": "エディターで開く",
+  "app.OpenInEditor": "エディターで開く",
   "app.EditorGoToDefinition": "定義へ移動",
   "app.EditorCodeActions": "コードアクション",
   "app.ExplorerAddFileToChat": "ファイルをチャットに追加",

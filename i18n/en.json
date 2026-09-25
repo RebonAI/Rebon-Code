@@ -463,7 +463,7 @@
   "app.EditorCopy": "Copy",
   "app.EditorPaste": "Paste",
   "app.EditorSelectAll": "Select all",
-  "app.LibraryOpenInEditor": "Open in editor",
+  "app.OpenInEditor": "Open in editor",
   "app.EditorGoToDefinition": "Go to definition",
   "app.EditorCodeActions": "Code actions",
   "app.ExplorerAddFileToChat": "Add file to chat",

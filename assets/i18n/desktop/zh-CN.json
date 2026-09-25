@@ -463,7 +463,7 @@
   "EditorCopy": "复制",
   "EditorPaste": "粘贴",
   "EditorSelectAll": "全选",
-  "LibraryOpenInEditor": "在编辑器中打开",
+  "OpenInEditor": "在编辑器中打开",
   "EditorGoToDefinition": "转到定义",
   "EditorCodeActions": "代码操作",
   "ExplorerAddFileToChat": "将文件添加到对话",

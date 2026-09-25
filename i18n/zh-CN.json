@@ -463,7 +463,7 @@
   "app.EditorCopy": "复制",
   "app.EditorPaste": "粘贴",
   "app.EditorSelectAll": "全选",
-  "app.LibraryOpenInEditor": "在编辑器中打开",
+  "app.OpenInEditor": "在编辑器中打开",
   "app.EditorGoToDefinition": "转到定义",
   "app.EditorCodeActions": "代码操作",
   "app.ExplorerAddFileToChat": "将文件添加到对话",

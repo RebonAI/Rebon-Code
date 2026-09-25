@@ -463,7 +463,7 @@
   "EditorCopy": "Copy",
   "EditorPaste": "Paste",
   "EditorSelectAll": "Select all",
-  "LibraryOpenInEditor": "Open in editor",
+  "OpenInEditor": "Open in editor",
   "EditorGoToDefinition": "Go to definition",
   "EditorCodeActions": "Code actions",
   "ExplorerAddFileToChat": "Add file to chat",

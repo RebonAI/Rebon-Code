@@ -463,7 +463,7 @@
   "EditorCopy": "コピー",
   "EditorPaste": "貼り付け",
   "EditorSelectAll": "すべて選択",
-  "LibraryOpenInEditor": "エディターで開く",
+  "OpenInEditor": "エディターで開く",
   "EditorGoToDefinition": "定義へ移動",
   "EditorCodeActions": "コードアクション",
   "ExplorerAddFileToChat": "ファイルをチャットに追加",
