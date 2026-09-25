@@ -285,7 +285,10 @@ impl PluginSurface {
     /// `run_code` in front of the model (with `defaultOn`, before anyone asked
     /// for it). Unloading them is the whole switch: the executor, the
     /// sub-agent spawner and `run_code` each look for their plugin on the
-    /// kernel and do nothing without it.
+    /// kernel and do nothing without it. The one effect that outlives the
+    /// plugin — a session routed earlier keeps its routed model — is skipped
+    /// too, because the executor asks the kernel whether routing is withheld
+    /// rather than merely off (`rebon_core::model_routing::routing_withheld`).
     pub fn withheld(self) -> &'static [&'static str] {
         match self {
             Self::Configured => &[],

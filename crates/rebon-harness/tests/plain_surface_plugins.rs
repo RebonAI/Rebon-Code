@@ -109,6 +109,9 @@ async fn a_plain_surface_session_gets_neither_routing_nor_run_code() {
             .is_none(),
         "a first prompt here would be routed"
     );
+    // And what the executor asks before restoring a session a terminal
+    // routed earlier: withheld, so a resume runs the model it was handed.
+    assert!(rebon_core::model_routing::routing_withheld(Some(upstream)));
 
     // `defaultOn` did not switch the session on, `/codemode on` cannot, and
     // the tool the session carries is not offered.

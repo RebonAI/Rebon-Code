@@ -7,6 +7,24 @@ use rebon_kernel::Service;
 use crate::query::RuntimeModelConfig;
 
 pub const MODEL_ROUTING_SERVICE: &str = "first-prompt-model-routing";
+/// The id of the plugin that provides [`MODEL_ROUTING_SERVICE`]. Defined here
+/// because the engine has to name it (see [`routing_withheld`]) and cannot
+/// depend on the plugin crate; the plugin takes its id from this constant.
+pub const MODEL_ROUTING_PLUGIN_ID: &str = "model-routing";
+
+/// Whether this process keeps first-prompt routing out altogether — the
+/// entry point withheld the plugin, rather than the user switching it off.
+///
+/// The two differ in what a session already routed keeps. A user who turns
+/// routing off mid-conversation still gets the model the session was routed
+/// onto, from the session's `firstPromptModelRouting` sidecar, so the
+/// conversation does not jump models. An entry point that withheld routing
+/// (`rebon exec`, `--acp`) was handed its model by its caller, so a routed
+/// choice made earlier on another surface is not restored there. The sidecar
+/// is left as it is: going back to the terminal continues where it was.
+pub fn routing_withheld(upstream: Option<&rebon_kernel::Context>) -> bool {
+    upstream.is_some_and(|ctx| ctx.is_plugin_withheld(MODEL_ROUTING_PLUGIN_ID))
+}
 
 pub struct ModelRoutingNotice {
     pub session_id: String,

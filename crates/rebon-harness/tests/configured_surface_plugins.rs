@@ -76,15 +76,18 @@ async fn an_undeclared_surface_runs_routing_and_code_mode_as_configured() {
             .expect("a built-in plugin");
         assert_eq!(state, PluginState::Loaded, "{id}");
     }
+    let upstream = session
+        .engine
+        .upstream_tool_context()
+        .expect("the session scope attached the process kernel");
     assert!(
-        session
-            .engine
-            .upstream_tool_context()
-            .expect("the session scope attached the process kernel")
+        upstream
             .get::<rebon_core::model_routing::ModelRoutingService>()
             .is_some(),
         "the router is not where the executor looks for it"
     );
+    // A resumed session here keeps the model it was routed onto.
+    assert!(!rebon_core::model_routing::routing_withheld(Some(upstream)));
     let status = rebon_kernel_seats::kernel_code_mode::command(&session.kernel_ctx, &[])
         .expect("the session binds Code Mode");
     assert!(
