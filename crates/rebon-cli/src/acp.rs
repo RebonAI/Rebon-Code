@@ -995,6 +995,7 @@ fn acp_session_policy_resolver(
             session_id,
             cwd,
             plugin_hooks.clone(),
+            &rebon_harness::projects_root(),
         )
     })
 }

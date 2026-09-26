@@ -18,6 +18,12 @@
 //!   request (bypass mode). Mirrors the app's `answer_permission` path.
 //! * **Session continuity.** The session id is printed on the first line; pass
 //!   it back via `--resume <id>` to continue the conversation across turns.
+//! * **A store the caller names.** `--ephemeral` writes this run's session
+//!   files to a throwaway root under the temp directory and removes it at
+//!   exit. Nothing reaches `~/.rebon/projects`, so a harness driving `exec` a
+//!   thousand times leaves no thousand sessions to delete by hand — and for
+//!   the same reason the run cannot be resumed, which is why `--ephemeral`
+//!   and `--resume` are refused together.
 
 use anyhow::Context;
 use rebon_agent_core::turn_gate::{TurnCompletionGate, TurnGatePolicy};
@@ -43,6 +49,9 @@ pub struct ExecArgs {
     pub prompt: String,
     pub json: bool,
     pub resume: Option<String>,
+    /// Write this run's session files to a throwaway store, removed when the
+    /// run ends, instead of the user's `~/.rebon/projects`.
+    pub ephemeral: bool,
     pub max_iterations: Option<usize>,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -136,6 +145,19 @@ pub async fn run(args: ExecArgs) -> anyhow::Result<()> {
         policy
     };
 
+    // The throwaway store, made before the session exists so the guard drops
+    // after everything that writes into it does — `_server_state` releases the
+    // session's files when it goes. A root that cannot be deleted is warned
+    // about by the guard and is still not a session in the store this flag
+    // promised not to touch.
+    let ephemeral_store = match args.ephemeral {
+        true => Some(
+            rebon_session::ephemeral_store::EphemeralProjectsRoot::create()
+                .context("failed to create the ephemeral session store")?,
+        ),
+        false => None,
+    };
+
     // Observe every raw QueryEvent and project it onto stdout. The callback runs
     // synchronously inside the executor's single consume loop, so lines are
     // emitted in event order without interleaving.
@@ -167,6 +189,9 @@ pub async fn run(args: ExecArgs) -> anyhow::Result<()> {
         // `rebon exec` has no `--fast`; read the saved setting as before.
         fast_mode: None,
         cwd: None,
+        projects_root: ephemeral_store
+            .as_ref()
+            .map(|store| store.path().to_path_buf()),
         resume_session_id: args.resume,
         max_iterations: args.max_iterations,
         permission_mode: args.permission_mode,

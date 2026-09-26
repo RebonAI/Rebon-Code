@@ -652,6 +652,11 @@ pub struct HarnessOverrides {
     pub fast_mode: Option<bool>,
     /// Working directory for session construction.
     pub cwd: Option<String>,
+    /// The store this session's files go to. `None` is the user's
+    /// `~/.rebon/projects`, which is what every embedder got before the field
+    /// existed; `rebon exec --ephemeral` names a throwaway root here so a run
+    /// leaves no session — and nothing in the chat lists — behind.
+    pub projects_root: Option<PathBuf>,
     /// Session id to resume (loads the on-disk transcript) instead of new.
     pub resume_session_id: Option<String>,
     /// Optional cap for the agentic model/tool loop.
@@ -2197,6 +2202,8 @@ pub struct HeadlessSession {
     /// headless session remains alive.
     pub kernel_scope: rebon_kernel_seats::kernel_services::SessionKernelScopeLease,
     pub session_id: String,
+    /// The store this session's files go to: the user's `~/.rebon/projects`
+    /// unless the caller named another in [`HarnessOverrides::projects_root`].
     pub projects_root: PathBuf,
     pub cwd: String,
     /// The resolved model and provider this session runs on. Shared shape
@@ -2258,6 +2265,7 @@ pub async fn build_headless_session(
         overrides,
         policy_store,
         tool_filter,
+        projects_root: run_projects_root,
         ..
     } = assembly;
     let policy_store = policy_store.expect("headless assembly loads session policy");
@@ -2311,10 +2319,10 @@ pub async fn build_headless_session(
     //    it takes the active lock when it mints or loads one, and refuses a
     //    session another process is writing.
     let server_state = Arc::new(rebon_acp::ServerState::new());
-    server_state.enable_session_ownership(projects_root());
+    server_state.enable_session_ownership(run_projects_root.clone());
     let session_id = if let Some(resume_id) = overrides.resume_session_id.as_deref() {
         server_state
-            .load_session(&projects_root(), resume_id, &cwd, Some(&cwd), Vec::new())
+            .load_session(&run_projects_root, resume_id, &cwd, Some(&cwd), Vec::new())
             .map_err(|e| anyhow::anyhow!("failed to resume session {resume_id}: {}", e.message))?
             .id
     } else {
@@ -2327,7 +2335,7 @@ pub async fn build_headless_session(
     }
     apply_session_permission_mode_override(&server_state, &session_id, overrides.permission_mode);
     let _ = server_state.set_session_mode(&session_id, "normal");
-    let _ = rebon_session::save_session_mode(&projects_root(), &cwd, &session_id, "normal");
+    let _ = rebon_session::save_session_mode(&run_projects_root, &cwd, &session_id, "normal");
     // NOTE: process-global; v1 supports a single live session at a time.
     std::env::set_var("REBON_SESSION_ID", &session_id);
 
@@ -2384,7 +2392,7 @@ pub async fn build_headless_session(
     let executor = EngineQueryExecutor::new(
         engine.clone(),
         client.clone(),
-        projects_root(),
+        run_projects_root.clone(),
         model.clone(),
     )
     .with_system_prompt_config(system_prompt_config)
@@ -2489,7 +2497,7 @@ pub async fn build_headless_session(
         kernel_ctx,
         kernel_scope,
         session_id,
-        projects_root: projects_root(),
+        projects_root: run_projects_root,
         cwd,
         model: session_model,
         policy,

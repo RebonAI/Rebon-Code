@@ -234,6 +234,7 @@ impl SessionRuntimeFactory {
             session_id,
             cwd,
             self.plugin_hooks.clone(),
+            &self.projects_root,
         );
         let sub_agent_spawner = sub_agent_spawner_for_session(SubAgentSpawnerRequest {
             engine: SubAgentRuntimeHandle::new(Arc::downgrade(&self.engine)),

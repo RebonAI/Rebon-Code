@@ -64,6 +64,12 @@ pub struct SessionAssembly {
     pub overrides: HarnessOverrides,
     /// Working directory the session runs in.
     pub cwd: PathBuf,
+    /// The store this session's files go to. Settled here rather than at each
+    /// call site because three later phases derive paths from it — the kernel
+    /// scopes, the executor, and the hook context's transcript path — and a
+    /// second resolution is how one of them keeps writing to the user's store
+    /// while the run claims otherwise.
+    pub projects_root: PathBuf,
     /// Coordinator (worktree / sub-agent) mode for this session.
     pub coordinator_mode: bool,
     /// Whether coordinator workers get their own worktree.
@@ -124,6 +130,13 @@ impl SessionAssembly {
             Some(cwd) => PathBuf::from(cwd),
             None => std::env::current_dir()?,
         };
+        // `None` is the user's `projects/`, which is what every embedder got
+        // before the field existed. A caller that names one (`rebon exec
+        // --ephemeral`) gets a run whose session files land there instead.
+        let store_root = overrides
+            .projects_root
+            .clone()
+            .unwrap_or_else(projects_root);
         // Each surface settles this differently -- the headless harness from
         // the caller's flag, the TUI from the env default and then whatever mode
         // a resumed session was saved under -- so it arrives decided.
@@ -152,6 +165,7 @@ impl SessionAssembly {
         Ok(Self {
             overrides,
             cwd,
+            projects_root: store_root,
             coordinator_mode,
             coordinator_use_worktree: inputs.coordinator_use_worktree,
             policy_store,
@@ -230,11 +244,12 @@ impl RuntimeReady {
     /// later, once it knows the session id, so the gate travels as a token it
     /// cannot mint rather than as a value it would have to keep whole.
     pub fn into_parts(self) -> (SessionAssembly, Arc<Engine>, RuntimeModel, RuntimeResolved) {
+        let store_root = self.tools.assembly.projects_root.clone();
         (
             self.tools.assembly,
             self.tools.engine,
             self.runtime,
-            RuntimeResolved(()),
+            RuntimeResolved(store_root),
         )
     }
 
@@ -259,6 +274,8 @@ pub struct SessionBound {
     pub kernel_scopes: Arc<SessionKernelScopes>,
     /// The runtime switch the auto-mode classifier reads.
     pub runtime_model: rebon_core::query::SharedRuntimeModel,
+    /// The store this session's files go to, the one the assembly settled.
+    pub projects_root: PathBuf,
 }
 
 /// Proof that [`ToolsFixed::resolve_runtime`] ran.
@@ -266,7 +283,11 @@ pub struct SessionBound {
 /// Only [`RuntimeReady::into_parts`] makes one, and only a
 /// [`RuntimeResolved`] binds a session, so no surface can open a kernel scope
 /// or a permission broker against a runtime it never resolved.
-pub struct RuntimeResolved(());
+///
+/// It carries the assembly's store root for the same reason it exists: the
+/// phases that bind a session run hundreds of lines later, and one thing they
+/// must not do is resolve a second root behind the caller's back.
+pub struct RuntimeResolved(PathBuf);
 
 impl RuntimeResolved {
     /// Boot the kernel composition and open this session's scope table.
@@ -287,6 +308,7 @@ impl RuntimeResolved {
         SessionBound,
         Option<rebon_plugin_host::plugin_boot::CompositionRefusal>,
     ) {
+        let store_root = self.0;
         let refusal = rebon_plugin_host::plugin_boot::ensure_process_composition(
             &kernel_bootstrap::process_plugin_registry(),
         )
@@ -295,7 +317,7 @@ impl RuntimeResolved {
             SessionKernelScopes::new(
                 kernel_bootstrap::process_kernel(),
                 engine.clone(),
-                projects_root(),
+                store_root.clone(),
             )
         });
         // Bind all session services before handing the runtime to consumers.
@@ -305,6 +327,7 @@ impl RuntimeResolved {
                 session_id,
                 kernel_scopes,
                 runtime_model,
+                projects_root: store_root,
             },
             refusal,
         )
@@ -374,7 +397,7 @@ impl SessionBound {
         cwd: &str,
         plugin_hooks: Vec<rebon_hooks::IndividualHookConfig>,
     ) -> rebon_core::policy_seat::PolicySources {
-        policy_sources_for_session(&self.session_id, cwd, plugin_hooks)
+        policy_sources_for_session(&self.session_id, cwd, plugin_hooks, &self.projects_root)
     }
 }
 
@@ -386,15 +409,20 @@ impl SessionBound {
 /// the per-session resolver `--acp` and `serve` hand the executor — has to
 /// end up with the same three subscribers, and a second copy of this list is
 /// how one of them silently stops running the user's hooks.
+///
+/// The store root is passed rather than resolved: a hook reads the transcript
+/// path off this context, and an ephemeral run's hooks have to be handed the
+/// path their own session writes to, not the one the user's store would use.
 pub fn policy_sources_for_session(
     session_id: &str,
     cwd: &str,
     plugin_hooks: Vec<rebon_hooks::IndividualHookConfig>,
+    projects_root: &Path,
 ) -> rebon_core::policy_seat::PolicySources {
     let mut sources = rebon_core::policy_seat::PolicySources::default().with_context(
         rebon_core::policy_seat::PolicyContext {
             cwd: cwd.to_string(),
-            transcript_path: rebon_session::transcript_file_path(&projects_root(), cwd, session_id)
+            transcript_path: rebon_session::transcript_file_path(projects_root, cwd, session_id)
                 .to_string_lossy()
                 .to_string(),
             session_id: session_id.to_string(),

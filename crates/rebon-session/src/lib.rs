@@ -23,6 +23,7 @@
 //!   paths must not have to depend on the memory feature to do it.
 
 pub mod config_home;
+pub mod ephemeral_store;
 pub mod file_history;
 pub mod held_lock;
 pub mod memory_paths;

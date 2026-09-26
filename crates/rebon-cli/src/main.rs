@@ -180,7 +180,8 @@ struct Cli {
     #[arg(long = "agent", value_name = "AGENT", requires = "bg")]
     agent: Option<String>,
 
-    /// Working directory for the interactive session or `--bg` job.
+    /// Working directory for the interactive session, the `--bg` job, or the
+    /// `exec` prompt.
     #[arg(long = "cwd", value_name = "DIR", global = true)]
     cwd: Option<PathBuf>,
 
@@ -437,6 +438,12 @@ enum Command {
         /// conversation. The session id is printed on the first output line.
         #[arg(long = "resume", value_name = "ID")]
         resume: Option<String>,
+        /// Run without leaving a session behind: this run's session files go to
+        /// a throwaway store under the temp directory, removed when the run
+        /// ends. Nothing lands in `~/.rebon/projects`, the run never shows up
+        /// in the app's chat lists, and it cannot be resumed afterwards.
+        #[arg(long = "ephemeral", default_value_t = false, conflicts_with = "resume")]
+        ephemeral: bool,
         /// Stop the agentic loop after this many model iterations.
         #[arg(long = "max-iterations", value_name = "N")]
         max_iterations: Option<std::num::NonZeroUsize>,
@@ -1453,6 +1460,7 @@ async fn route_main() -> anyhow::Result<()> {
                     prompt,
                     json,
                     resume,
+                    ephemeral,
                     max_iterations,
                     capability,
                     verify_rounds,
@@ -1463,6 +1471,7 @@ async fn route_main() -> anyhow::Result<()> {
                         prompt: prompt.join(" "),
                         json,
                         resume,
+                        ephemeral,
                         verify_rounds,
                         verify_budget_sec: verify_budget,
                         max_duration_sec: max_duration,
@@ -1881,6 +1890,7 @@ mod tests {
                 prompt: vec!["inspect".to_string(), "the project".to_string()],
                 json: false,
                 resume: None,
+                ephemeral: false,
                 max_iterations: None,
                 capability: AgentCapabilityMode::Normal,
                 verify_rounds: 0,
@@ -1925,6 +1935,7 @@ mod tests {
                 prompt: vec!["inspect".to_string()],
                 json: false,
                 resume: None,
+                ephemeral: false,
                 max_iterations: std::num::NonZeroUsize::new(128),
                 capability: AgentCapabilityMode::Normal,
                 verify_rounds: 0,
@@ -1936,6 +1947,46 @@ mod tests {
         assert!(
             Cli::try_parse_from(["rebon", "exec", "--max-iterations", "0", "inspect",]).is_err()
         );
+    }
+
+    /// `--ephemeral` promises where a run's session files go, and `--resume`
+    /// reads them back — so the pair is refused rather than silently dropping
+    /// one of the two.
+    #[test]
+    fn exec_ephemeral_is_its_own_flag_and_refuses_a_resume() {
+        let ephemeral = Cli::parse_from(["rebon", "exec", "--ephemeral", "inspect"]);
+        assert!(matches!(
+            ephemeral.command,
+            Some(Command::Exec {
+                ephemeral: true,
+                ..
+            })
+        ));
+
+        let default = Cli::parse_from(["rebon", "exec", "inspect"]);
+        assert!(matches!(
+            default.command,
+            Some(Command::Exec {
+                ephemeral: false,
+                ..
+            })
+        ));
+
+        assert!(
+            Cli::try_parse_from(["rebon", "exec", "--ephemeral", "--resume", "abc", "inspect"])
+                .is_err(),
+            "--ephemeral cannot continue the session it refuses to write"
+        );
+    }
+
+    /// `--cwd` is global, so `exec` takes it after its own subcommand: it is
+    /// the working root the run reads and writes under, and therefore the
+    /// project directory its session lands in.
+    #[test]
+    fn exec_reads_the_global_cwd_after_its_own_subcommand() {
+        let cli = Cli::parse_from(["rebon", "exec", "--cwd", "F:/dev/proj", "inspect"]);
+        assert_eq!(cli.cwd, Some(PathBuf::from("F:/dev/proj")));
+        assert!(matches!(cli.command, Some(Command::Exec { .. })));
     }
 
     /// The two ceilings are separate flags because they stop different things:
