@@ -901,7 +901,7 @@
   "SettingsAppearanceSidebarLayout": "サイドバーのレイアウト",
   "SettingsAppearanceSidebarLayoutClassic": "プロジェクト優先",
   "SettingsAppearanceSidebarLayoutCompact": "会話優先",
-  "SettingsAppearanceSidebarLayoutDescription": "会話優先：検索欄と新規作成ボタンを上部に置き、入口を 1 行にまとめ、会話を状態別に並べて完了マークを付けられます。プロジェクト優先：入口を 1 行ずつ並べ、会話は各プロジェクトの下に入れ子で表示します。",
+  "SettingsAppearanceSidebarLayoutDescription": "会話優先：入口を 1 行にまとめ、会話を状態別に並べて完了マークを付けられます。プロジェクト優先：入口を 1 行ずつ並べ、会話は各プロジェクトの下に入れ子で表示します。",
   "SettingsAppearanceSidebarLayoutGroup": "サイドバー",
   "SettingsAppearanceSystemFont": "システム既定",
   "SettingsAppearanceTheme": "外観モード",

@@ -901,7 +901,7 @@
   "app.SettingsAppearanceSidebarLayout": "侧栏布局",
   "app.SettingsAppearanceSidebarLayoutClassic": "项目优先",
   "app.SettingsAppearanceSidebarLayoutCompact": "会话优先",
-  "app.SettingsAppearanceSidebarLayoutDescription": "会话优先：顶部搜索框与新建按钮，入口收进一行，会话按状态平铺并可标记结束；项目优先：入口逐行排列，会话嵌在各自项目下。",
+  "app.SettingsAppearanceSidebarLayoutDescription": "会话优先：入口收进一行，会话按状态平铺并可标记结束；项目优先：入口逐行排列，会话嵌在各自项目下。",
   "app.SettingsAppearanceSidebarLayoutGroup": "侧栏",
   "app.SettingsAppearanceSystemFont": "系统默认",
   "app.SettingsAppearanceTheme": "外观模式",

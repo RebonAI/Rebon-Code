@@ -901,7 +901,7 @@
   "SettingsAppearanceSidebarLayout": "Sidebar layout",
   "SettingsAppearanceSidebarLayoutClassic": "Projects first",
   "SettingsAppearanceSidebarLayoutCompact": "Chats first",
-  "SettingsAppearanceSidebarLayoutDescription": "Chats first: a filter field with a compose button, destinations on one row, and a flat chat list grouped by state that you can mark as finished. Projects first: one row per destination, with chats nested under their project.",
+  "SettingsAppearanceSidebarLayoutDescription": "Chats first: destinations on one row, and a flat chat list grouped by state that you can mark as finished. Projects first: one row per destination, with chats nested under their project.",
   "SettingsAppearanceSidebarLayoutGroup": "Sidebar",
   "SettingsAppearanceSystemFont": "System default",
   "SettingsAppearanceTheme": "Appearance mode",
