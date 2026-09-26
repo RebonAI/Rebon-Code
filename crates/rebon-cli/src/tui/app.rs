@@ -253,6 +253,10 @@ pub struct AppState {
     pub next_command_expansion_id: u64,
     /// Asynchronous local shells and completed feedback awaiting durable replay.
     pub(crate) inline_shell_commands: crate::tui::runner::task_runtime::InlineShellCommands,
+    /// Answers to deferred `AskUserQuestion`s, waiting for the runner to
+    /// turn them into user messages.
+    pub(crate) deferred_question_inbox:
+        crate::tui::runner::deferred_questions::DeferredQuestionInbox,
     /// FIFO submit queue used when Enter is pressed while a prompt is
     /// already in flight.
     pub queued_commands: Vec<QueuedCommand>,
@@ -826,6 +830,7 @@ impl AppState {
             expanding_command: None,
             next_command_expansion_id: 0,
             inline_shell_commands: Default::default(),
+            deferred_question_inbox: Default::default(),
             queued_commands: Vec::new(),
             queued_submit_payloads: Vec::new(),
             deferred_goal_submit_payloads: Vec::new(),

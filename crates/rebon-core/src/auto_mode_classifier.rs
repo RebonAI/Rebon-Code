@@ -645,7 +645,12 @@ pub fn serialize_auto_mode_transcript_as(
                 ContentBlock::ToolResult(tool_result) => {
                     let tool_name = tool_names.get(&tool_result.tool_use_id).map(String::as_str);
                     let content = tool_result.content.to_plain_text();
-                    if tool_name == Some("AskUserQuestion") && !tool_result.is_error {
+                    // A deferred question's placeholder is not the user's
+                    // answer; that arrives later as a user message.
+                    if tool_name == Some("AskUserQuestion")
+                        && !tool_result.is_error
+                        && !crate::deferred_question::is_pending_model_text(&content)
+                    {
                         push_transcript_text(
                             &mut lines,
                             "User: [User answered AskUserQuestion]: ",
@@ -1131,6 +1136,39 @@ mod tests {
         assert!(transcript.contains("User: [User answered AskUserQuestion]: Yes, delete ./cache"));
         assert!(transcript.contains("[Bash]"));
         assert!(transcript.contains("\"outcome\":\"ok\""));
+    }
+
+    /// A deferred question's placeholder result must not read as the user's
+    /// answer: the classifier would otherwise see "User answered" with text
+    /// the user never wrote.
+    #[test]
+    fn a_pending_question_result_is_not_serialized_as_the_users_answer() {
+        let pending = crate::deferred_question::pending_result("ask-2");
+        let pending_text = crate::deferred_question::pending_model_text(&pending)
+            .unwrap()
+            .to_owned();
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse(ToolUseBlock {
+                    id: "ask-2".to_owned(),
+                    name: "AskUserQuestion".to_owned(),
+                    input: serde_json::json!({ "question": "Delete cache?" }),
+                })],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult(ToolResultBlock {
+                    tool_use_id: "ask-2".to_owned(),
+                    content: ToolResultContent::text(pending_text),
+                    is_error: false,
+                })],
+            },
+        ];
+
+        let transcript = serialize_auto_mode_transcript(&messages);
+        assert!(!transcript.contains("[User answered AskUserQuestion]"));
+        assert!(transcript.contains("\"id\":\"ask-2\""));
     }
 
     #[test]

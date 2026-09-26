@@ -352,6 +352,10 @@ pub(super) fn format_bytes(bytes: u64) -> String {
     }
 }
 pub(super) fn format_ask_user_question_result_for_model(value: &Value) -> String {
+    // A deferred question has no answers yet; its result says so instead.
+    if let Some(pending) = crate::deferred_question::pending_model_text(value) {
+        return pending.to_string();
+    }
     let answers_text = value
         .get("answers")
         .and_then(Value::as_object)
@@ -396,7 +400,7 @@ pub(super) fn format_ask_user_question_result_for_model(value: &Value) -> String
     )
 }
 
-pub(super) fn format_ask_user_question_answer_for_transcript(value: &Value) -> Option<String> {
+pub(crate) fn format_ask_user_question_answer_for_transcript(value: &Value) -> Option<String> {
     let answers = value.get("answers").and_then(Value::as_object)?;
     if answers.is_empty() {
         return None;
