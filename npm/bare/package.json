@@ -1,6 +1,6 @@
 {
   "name": "rebon",
-  "version": "1.6.1",
+  "version": "1.7.0",
   "description": "Rebon agent CLI for coding and more. Installs @rebon/cli.",
   "license": "Apache-2.0",
   "repository": {
@@ -19,7 +19,7 @@
     "rebon": "bin/rebon.js"
   },
   "dependencies": {
-    "@rebon/cli": "^1.6.1"
+    "@rebon/cli": "^1.7.0"
   },
   "files": [
     "bin",
