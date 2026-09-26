@@ -194,11 +194,20 @@ async fn an_acp_session_over_stdio_finishes_two_turns() {
 
     let home = tempfile::tempdir().expect("config home");
     let cwd = tempfile::tempdir().expect("cwd");
-    write_config_home(home.path(), port, cwd.path());
+    // The server trusts the directory it finds itself in, and a Unix process
+    // reads its cwd with symlinks resolved: macOS keeps temp directories under
+    // /var, a link to /private/var, so the unresolved spelling is a workspace
+    // the server has never seen. Windows keeps the spelling it was given.
+    let cwd_path = if cfg!(windows) {
+        cwd.path().to_path_buf()
+    } else {
+        std::fs::canonicalize(cwd.path()).expect("resolve the cwd")
+    };
+    write_config_home(home.path(), port, &cwd_path);
 
     let mut child = Command::new(rebon_binary())
         .arg("--acp")
-        .current_dir(cwd.path())
+        .current_dir(&cwd_path)
         .env("REBON_CONFIG_DIR", home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -218,7 +227,7 @@ async fn an_acp_session_over_stdio_finishes_two_turns() {
     client.response(1, "initialize").await;
     client
         .send(json!({"jsonrpc": "2.0", "id": 2, "method": "session/new",
-            "params": {"cwd": cwd.path().to_string_lossy(), "mcpServers": []}}))
+            "params": {"cwd": cwd_path.to_string_lossy(), "mcpServers": []}}))
         .await;
     let created = client.response(2, "session/new").await;
     let session_id = created["result"]["sessionId"]
