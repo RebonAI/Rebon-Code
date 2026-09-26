@@ -414,7 +414,7 @@
   "TitlebarProjectCurrent": "Current",
   "TitlebarOpenFolder": "Open folder…",
   "TitlebarNoProject": "No project",
-  "TitlebarSearchPlaceholder": "Search files, symbols, chats or commands",
+  "TitlebarSearchPlaceholder": "Search chats and files",
   "ExplorerNoProjectTitle": "No project",
   "ExplorerNoProject": "Pick a project to browse its files.",
   "ExplorerEmptyFolder": "This folder is empty",

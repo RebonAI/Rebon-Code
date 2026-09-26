@@ -414,7 +414,7 @@
   "app.TitlebarProjectCurrent": "Current",
   "app.TitlebarOpenFolder": "Open folder…",
   "app.TitlebarNoProject": "No project",
-  "app.TitlebarSearchPlaceholder": "Search files, symbols, chats or commands",
+  "app.TitlebarSearchPlaceholder": "Search chats and files",
   "app.ExplorerNoProjectTitle": "No project",
   "app.ExplorerNoProject": "Pick a project to browse its files.",
   "app.ExplorerEmptyFolder": "This folder is empty",

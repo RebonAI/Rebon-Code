@@ -414,7 +414,7 @@
   "TitlebarProjectCurrent": "現在",
   "TitlebarOpenFolder": "フォルダーを開く…",
   "TitlebarNoProject": "プロジェクト未選択",
-  "TitlebarSearchPlaceholder": "ファイル、シンボル、チャット、コマンドを検索",
+  "TitlebarSearchPlaceholder": "会話とファイルを検索",
   "ExplorerNoProjectTitle": "プロジェクトなし",
   "ExplorerNoProject": "プロジェクトを選ぶとファイルを表示します。",
   "ExplorerEmptyFolder": "このフォルダーは空です",

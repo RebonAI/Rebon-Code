@@ -414,7 +414,7 @@
   "app.TitlebarProjectCurrent": "現在",
   "app.TitlebarOpenFolder": "フォルダーを開く…",
   "app.TitlebarNoProject": "プロジェクト未選択",
-  "app.TitlebarSearchPlaceholder": "ファイル、シンボル、チャット、コマンドを検索",
+  "app.TitlebarSearchPlaceholder": "会話とファイルを検索",
   "app.ExplorerNoProjectTitle": "プロジェクトなし",
   "app.ExplorerNoProject": "プロジェクトを選ぶとファイルを表示します。",
   "app.ExplorerEmptyFolder": "このフォルダーは空です",
