@@ -188,6 +188,11 @@ prompt; nothing needs a restart. Turning the plugin on for the first time needs
 `/kernel enable model-routing` or a restart. The current session has already
 had its one routing attempt.
 
+**Turning it off**: the `Auto model routing` row in `/settings` (or
+`/kernel disable model-routing`) sets `enabled` to `false`. Leaving
+`routerModel` unset does not turn routing off; every new session then reports
+it as skipped.
+
 ## 5. Check it
 
 Have the user start a new session (`/new`) and send a first prompt of each tier,

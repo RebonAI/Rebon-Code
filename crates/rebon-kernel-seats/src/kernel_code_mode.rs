@@ -154,7 +154,7 @@ pub fn code_mode_runtime_reachable() -> bool {
 }
 
 pub const PLUGIN_ID: &str = "code-mode";
-const DEFAULT_ON_SETTING: &str = "defaultOn";
+pub(crate) const DEFAULT_ON_SETTING: &str = "defaultOn";
 
 pub fn default_on_in(config_dir: &std::path::Path, cwd: &std::path::Path) -> bool {
     rebon_config::plugin_settings_in(config_dir, cwd, PLUGIN_ID)

@@ -61,7 +61,7 @@ pub(crate) fn register(ctx: &Context) -> Result<(), KernelError> {
                  TYPESAFE_API_KEY for TypeSafe or AI_GATEWAY_API_KEY for Vercel, independently \
                  of the provider in force.",
             )
-            .in_category("model"),
+            .in_category("experimental"),
         Arc::new(BackendOption {
             settings: PluginSettings::new(ctx, PLUGIN_ID),
         }),
@@ -74,7 +74,7 @@ pub(crate) fn register(ctx: &Context) -> Result<(), KernelError> {
                  Leave empty for jev-latest; use typesafe-ai/jev when routing through Vercel's \
                  TypeSafe-compatible API. This does not change the permission classifier model.",
             )
-            .in_category("model"),
+            .in_category("experimental"),
         Arc::new(ClassifierModelOption {
             settings: PluginSettings::new(ctx, PLUGIN_ID),
         }),
@@ -88,7 +88,7 @@ pub(crate) fn register(ctx: &Context) -> Result<(), KernelError> {
                 rebon_api::typesafe::DEFAULT_ENDPOINT,
                 rebon_api::typesafe::VERCEL_ENDPOINT,
             ))
-            .in_category("model"),
+            .in_category("experimental"),
         Arc::new(ClassifierEndpointOption {
             settings: PluginSettings::new(ctx, PLUGIN_ID),
         }),
@@ -98,11 +98,11 @@ pub(crate) fn register(ctx: &Context) -> Result<(), KernelError> {
         ConfigOptionSpec::select(ROUTER_MODEL_OPTION, "Router model")
             .describe(
                 "The cheap model that picks this session's provider, model and reasoning \
-                 effort on the first real prompt, for the `Prompt` backend. Routing does \
-                 nothing until one is chosen. It can move the task onto another configured \
+                 effort on the first real prompt, for the `Prompt` backend, which skips \
+                 routing until one is chosen. It can move the task onto another configured \
                  provider, so the picker itself has to be a model of the provider in force.",
             )
-            .in_category("model"),
+            .in_category("experimental"),
         Arc::new(RouterModelOption {
             settings: PluginSettings::new(ctx, PLUGIN_ID),
         }),
@@ -115,7 +115,7 @@ pub(crate) fn register(ctx: &Context) -> Result<(), KernelError> {
                  model, and which provider and model to use for them. Written for a model to \
                  read. Left empty, routing falls back to picking the cheapest fit.",
             )
-            .in_category("model"),
+            .in_category("experimental"),
         Arc::new(RoutingPolicyOption {
             settings: PluginSettings::new(ctx, PLUGIN_ID),
         }),
@@ -331,7 +331,11 @@ impl ConfigOptionProvider for RouterModelOption {
         let mut choices = vec![ConfigOptionValue {
             value: UNSET.to_string(),
             name: "Not set".to_string(),
-            description: Some("Routing stays off until a model is chosen.".to_string()),
+            description: Some(
+                "The Prompt backend skips routing until a model is chosen. Turn routing off \
+                 with the Auto model routing row."
+                    .to_string(),
+            ),
         }];
         choices.extend(models.into_iter().map(|model| ConfigOptionValue {
             name: model.clone(),
