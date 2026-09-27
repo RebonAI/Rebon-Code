@@ -516,6 +516,34 @@ fn configured_output_reserve_sets_five_percent_hard_guard() {
     assert_eq!(budgeted_replay_target(Some(&handle), 32_000), Some(353_400));
 }
 
+/// The ChatGPT Codex window as the harness hands it over: 272k of input
+/// widened by the 128k output limit, with the session's own `max_tokens`
+/// at that limit. Compaction fires first, and the hard guard stays behind
+/// it instead of pruning history — and the prompt cache with it — at 80k.
+#[test]
+fn codex_window_keeps_the_hard_guard_behind_compaction() {
+    let handle = PruneLevelHandle::with_model_context_limits(
+        PruneLevel::Conservative,
+        400_000,
+        128_000,
+        std::iter::empty::<(String, u32)>(),
+        std::iter::empty::<(String, u32)>(),
+    );
+    handle
+        .budget
+        .set_auto_compact_token_limit(Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT));
+
+    assert_eq!(handle.budget.auto_compact_threshold(), 244_800);
+    assert_eq!(
+        hard_context_guard_target(Some(&handle), 128_000),
+        Some(258_400)
+    );
+    assert_eq!(
+        budgeted_replay_target(Some(&handle), 128_000),
+        Some(244_800)
+    );
+}
+
 #[test]
 fn hard_context_guard_cache_miss_reason_is_specific() {
     assert_eq!(

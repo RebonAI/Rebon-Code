@@ -986,6 +986,13 @@ async fn resolve_runtime_model_inner(overrides: &HarnessOverrides) -> anyhow::Re
         } else {
             compact_provider
         };
+        let (configured_context_window, model_context_windows) = total_context_windows(
+            &provider_base_url,
+            configured_context_window,
+            configured_output_token_limit,
+            model_context_windows,
+            &model_output_token_limits,
+        );
         let prune_handle = prune_handle_from_env(
             &provider_format,
             provider_vendor,
@@ -1212,6 +1219,36 @@ pub fn prune_handle_from_env(
         .set_auto_compact_token_limit(auto_compact_token_limit_from_env());
 
     handle
+}
+
+/// Configured context windows as the totals the context budget expects.
+///
+/// The budget reads a window as input plus output and takes the output
+/// reserve out of it. The ChatGPT Codex backend advertises the input side
+/// alone — 272k for the GPT-5/6 line, whose 128k of output sits outside
+/// it — so there each window is widened by its model's output limit. Read
+/// as a total it counted the output twice: a 272k/128k model compacted at
+/// 136.8k instead of Codex's 244.8k.
+fn total_context_windows(
+    base_url: &str,
+    configured_window: Option<u32>,
+    configured_output_limit: Option<u32>,
+    model_windows: std::collections::BTreeMap<String, u32>,
+    model_output_limits: &std::collections::BTreeMap<String, u32>,
+) -> (Option<u32>, std::collections::BTreeMap<String, u32>) {
+    if !rebon_api::is_chatgpt_codex_backend(base_url) {
+        return (configured_window, model_windows);
+    }
+    let configured_window =
+        configured_window.map(|window| window.saturating_add(configured_output_limit.unwrap_or(0)));
+    let model_windows = model_windows
+        .into_iter()
+        .map(|(model, window)| {
+            let output = model_output_limits.get(&model).copied().unwrap_or(0);
+            (model, window.saturating_add(output))
+        })
+        .collect();
+    (configured_window, model_windows)
 }
 
 fn auto_compact_token_limit_from_env() -> Option<u32> {
@@ -3726,6 +3763,51 @@ mod tests {
         handle.set_context_window_for_model("gpt-5.6-sol");
         assert_eq!(handle.budget.context_window(), 500_000);
         assert_eq!(handle.budget.output_token_reserve(), 128_000);
+    }
+
+    #[test]
+    fn codex_backend_window_is_input_only() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::new(&["REBON_CONTEXT_WINDOW", "REBON_AUTO_COMPACT_TOKEN_LIMIT"]);
+        std::env::remove_var("REBON_CONTEXT_WINDOW");
+        std::env::remove_var("REBON_AUTO_COMPACT_TOKEN_LIMIT");
+        let build = |base_url: &str| {
+            let output_limits =
+                std::collections::BTreeMap::from([("gpt-6-astra".to_string(), 128_000)]);
+            let (window, windows) = total_context_windows(
+                base_url,
+                Some(272_000),
+                Some(128_000),
+                std::collections::BTreeMap::from([("gpt-6-astra".to_string(), 272_000)]),
+                &output_limits,
+            );
+            prune_handle_from_env(
+                &ProviderFormat::OpenaiResponses,
+                rebon_api::ProviderVendor::OpenAi,
+                "gpt-6-astra",
+                window,
+                Some(128_000),
+                windows,
+                output_limits,
+            )
+        };
+
+        // The subscription backend's 272k is input: the output rides on
+        // top, and compaction lands where Codex's does, before and after a
+        // model switch re-reads the per-model limits.
+        let codex = build("https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(codex.budget.context_window(), 400_000);
+        assert_eq!(codex.budget.output_token_reserve(), 128_000);
+        assert_eq!(codex.budget.input_token_budget(), 272_000);
+        assert_eq!(codex.budget.auto_compact_threshold(), 244_800);
+        codex.set_context_window_for_model("gpt-6-astra");
+        assert_eq!(codex.budget.context_window(), 400_000);
+        assert_eq!(codex.budget.auto_compact_threshold(), 244_800);
+
+        // Everywhere else a window is the total, as configured.
+        let api = build("https://api.openai.com/v1");
+        assert_eq!(api.budget.context_window(), 272_000);
+        assert_eq!(api.budget.auto_compact_threshold(), 136_800);
     }
 
     #[test]
