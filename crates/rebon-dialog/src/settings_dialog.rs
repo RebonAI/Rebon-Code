@@ -68,6 +68,8 @@ pub struct ConfigOptionRow {
     pub current_value: String,
     /// The values it cycles through. Empty for a free-text option.
     pub choices: Vec<ConfigChoice>,
+    /// The group the list shows it under. `None` is the general group.
+    pub category: Option<String>,
 }
 
 impl ConfigOptionRow {
@@ -160,7 +162,8 @@ impl SettingsDialogState {
 
     /// Hand the panel this frame's projection, clamping anything the
     /// panel remembers against it.
-    pub fn set_projection(&mut self, projection: SettingsProjection) {
+    pub fn set_projection(&mut self, mut projection: SettingsProjection) {
+        group_by_category(&mut projection.config);
         self.projection = projection;
         self.sync();
     }
@@ -326,28 +329,34 @@ impl SettingsDialogState {
     }
 
     fn config_list_pane(&self) -> PanelPane {
-        let rows = self
-            .projection
-            .config
-            .iter()
-            .enumerate()
-            .map(|(index, option)| {
-                let selected = index == self.config_selected_index;
-                PanelRow::one(TextSpan::new(
-                    format!(
-                        "{} {}: {}",
-                        if selected { ">" } else { " " },
-                        option.name,
-                        self.value_label(option)
-                    ),
-                    if selected {
-                        RowTone::Focus
-                    } else {
-                        RowTone::Normal
-                    },
-                ))
-            })
-            .collect();
+        let config = &self.projection.config;
+        // A list nobody put into groups is drawn as it always was, rather
+        // than under a lone "General" heading that says nothing.
+        let grouped = config.iter().any(|option| option.category.is_some());
+        let mut rows = Vec::new();
+        for (index, option) in config.iter().enumerate() {
+            let category = option.category.as_deref();
+            if grouped && (index == 0 || config[index - 1].category.as_deref() != category) {
+                if index > 0 {
+                    rows.push(PanelRow::blank());
+                }
+                rows.push(PanelRow::one(TextSpan::strong(category_title(category))));
+            }
+            let selected = index == self.config_selected_index;
+            rows.push(PanelRow::one(TextSpan::new(
+                format!(
+                    "{} {}: {}",
+                    if selected { ">" } else { " " },
+                    option.name,
+                    self.value_label(option)
+                ),
+                if selected {
+                    RowTone::Focus
+                } else {
+                    RowTone::Normal
+                },
+            )));
+        }
         PanelPane {
             title: Some(CONFIG_LIST_TITLE.into()),
             rows,
@@ -438,6 +447,55 @@ impl SettingsDialogState {
     }
 }
 
+/// The category experimental features share. Its group always comes last,
+/// so nothing still being tried out sits among the settings people rely on.
+const EXPERIMENTAL: &str = "experimental";
+
+/// Put options of one category next to each other, keeping the order the
+/// surface handed them in otherwise: groups appear where their first option
+/// did, and options keep their order inside a group. Experimental goes last.
+///
+/// Done to the projection rather than only when drawing, so the selection
+/// index and the rows on screen count the same list.
+fn group_by_category(config: &mut [ConfigOptionRow]) {
+    let mut order: Vec<Option<String>> = Vec::new();
+    for option in config.iter() {
+        if !order.contains(&option.category) {
+            order.push(option.category.clone());
+        }
+    }
+    // Stable, so moving experimental to the end keeps the others in place.
+    order.sort_by_key(|category| category.as_deref() == Some(EXPERIMENTAL));
+    config.sort_by_key(|option| {
+        order
+            .iter()
+            .position(|category| *category == option.category)
+    });
+}
+
+/// The heading a category's group is shown under.
+fn category_title(category: Option<&str>) -> String {
+    match category {
+        None => "General".to_string(),
+        Some("ui") => "Interface".to_string(),
+        Some("mode") => "Mode".to_string(),
+        Some("model") => "Model".to_string(),
+        Some("agent") => "Agent".to_string(),
+        Some("optimization") => "Optimization".to_string(),
+        Some("updates") => "Updates".to_string(),
+        Some(EXPERIMENTAL) => "Experimental".to_string(),
+        // A category added without a title here still gets a readable
+        // heading, from its own id.
+        Some(other) => {
+            let mut chars = other.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect())
+                .unwrap_or_else(|| "General".to_string())
+        }
+    }
+}
+
 /// An [`ACTION_APPLY_CONFIG`] action for one option. It stays open: the
 /// panel remains up so the user can change several settings in a visit.
 fn apply_config(config_id: String, value: String) -> DialogOutcome {
@@ -522,6 +580,7 @@ mod tests {
                 free_text: false,
                 current_value: "screen".into(),
                 choices: vec![choice("screen", "Screen"), choice("inline", "Inline")],
+                category: None,
             },
             ConfigOptionRow {
                 id: "permissions".into(),
@@ -530,6 +589,7 @@ mod tests {
                 free_text: false,
                 current_value: "default".into(),
                 choices: vec![choice("default", "Default"), choice("plan", "Plan")],
+                category: None,
             },
             ConfigOptionRow {
                 id: "title".into(),
@@ -538,6 +598,7 @@ mod tests {
                 free_text: true,
                 current_value: "old".into(),
                 choices: Vec::new(),
+                category: None,
             },
         ]
     }
@@ -729,6 +790,66 @@ mod tests {
         assert_eq!(side.rows[6].spans[0].tone, RowTone::Focus);
         assert_eq!(side.rows[7].text(), "  Inline");
         assert_eq!(side.rows[7].spans[0].tone, RowTone::Dim);
+    }
+
+    /// Options are grouped under a heading per category, in the order the
+    /// categories first appeared, with experimental ones always last — and
+    /// the headings are not something the selection can land on.
+    #[test]
+    fn the_config_list_groups_by_category_with_experimental_last() {
+        let option = |id: &str, category: Option<&str>| ConfigOptionRow {
+            id: id.into(),
+            name: id.into(),
+            current_value: "on".into(),
+            choices: vec![choice("on", "On"), choice("off", "Off")],
+            category: category.map(str::to_string),
+            ..ConfigOptionRow::default()
+        };
+        let mut projection = projection();
+        projection.config = vec![
+            option("a", Some("agent")),
+            option("x", Some(EXPERIMENTAL)),
+            option("m", Some("model")),
+            option("b", Some("agent")),
+            option("g", None),
+            option("y", Some(EXPERIMENTAL)),
+        ];
+        let mut dialog = SettingsDialogState::open(&SettingsDialogOpen {
+            active_tab: 1,
+            projection,
+        });
+
+        let rows: Vec<String> = panel(&dialog)
+            .body
+            .rows
+            .iter()
+            .map(|row| row.text())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                "Agent",
+                "> a: On",
+                "  b: On",
+                "",
+                "Model",
+                "  m: On",
+                "",
+                "General",
+                "  g: On",
+                "",
+                "Experimental",
+                "  x: On",
+                "  y: On",
+            ]
+        );
+
+        // Down steps over the headings: the fourth option is `g`, not a row
+        // that happens to be fourth on screen.
+        for _ in 0..3 {
+            dialog.on_key(DialogKey::Down.into());
+        }
+        assert_eq!(dialog.on_key(DialogKey::Enter.into()), applied("g", "off"));
     }
 
     #[test]

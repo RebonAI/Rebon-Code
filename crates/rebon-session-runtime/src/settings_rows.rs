@@ -230,6 +230,7 @@ fn config_rows(options: &[ConfigOption]) -> Vec<ConfigOptionRow> {
                     label: candidate_label(candidate),
                 })
                 .collect(),
+            category: option.category.clone(),
         })
         .collect()
 }
