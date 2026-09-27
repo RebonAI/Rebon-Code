@@ -187,6 +187,7 @@ pub(super) async fn compact_with_tail_preservation(
                 rebon_api::RemoteCompactV2Provider::new(session.client_arc(), params.model.clone())
                     .with_tools(params.tools.clone())
                     .with_runtime_context(params.runtime_context_message.as_deref())
+                    .with_cache_trace_context(params.cache_trace_context.clone())
                     .with_turn_settings(
                         params.max_tokens,
                         params.thinking.clone(),
@@ -203,7 +204,8 @@ pub(super) async fn compact_with_tail_preservation(
         let provider = Arc::new(
             rebon_api::PrefixAlignedCompactProvider::new(client, params.model.clone())
                 .with_tools(params.tools.clone())
-                .with_runtime_context(params.runtime_context_message.as_deref()),
+                .with_runtime_context(params.runtime_context_message.as_deref())
+                .with_cache_trace_context(params.cache_trace_context.clone()),
         ) as Arc<dyn CompactProvider>;
         if cheapest_first {
             AlignedRung::First(provider)

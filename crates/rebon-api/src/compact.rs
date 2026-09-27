@@ -43,7 +43,7 @@ use crate::context_prune::{
 };
 use crate::error::{ModelError, ModelResult};
 use crate::events::MessageAccumulator;
-use crate::request::{CreateMessageRequest, ReasoningEffort, ThinkingConfig};
+use crate::request::{CacheTraceContext, CreateMessageRequest, ReasoningEffort, ThinkingConfig};
 use crate::types::{ContentBlock, Message, Role, TextBlock};
 use crate::ServiceTierHandle;
 
@@ -372,6 +372,12 @@ pub struct PrefixAlignedCompactProvider {
     /// The virtual runtime-context reminder the engine inserts at
     /// message index 0 of every live request (stable-base mode).
     runtime_context_message: Option<Message>,
+    /// The session's cache routing (`prompt_cache_key` and retention).
+    /// Without it the request falls back to the provider default key,
+    /// which lands on a different cache shard than the prefix the
+    /// session has been warming and, on the Responses websocket, breaks
+    /// the fingerprint that lets the request continue the live chain.
+    cache_trace_context: Option<CacheTraceContext>,
 }
 
 impl PrefixAlignedCompactProvider {
@@ -381,6 +387,7 @@ impl PrefixAlignedCompactProvider {
             model: model.into(),
             tools: Vec::new(),
             runtime_context_message: None,
+            cache_trace_context: None,
         }
     }
 
@@ -396,6 +403,13 @@ impl PrefixAlignedCompactProvider {
         self.runtime_context_message = context
             .filter(|context| !context.is_empty())
             .map(crate::request::runtime_context_message);
+        self
+    }
+
+    /// Route the request through the session's own prompt cache, so the
+    /// compaction call reads the prefix the live turns have warmed.
+    pub fn with_cache_trace_context(mut self, context: Option<CacheTraceContext>) -> Self {
+        self.cache_trace_context = context;
         self
     }
 }
@@ -452,7 +466,7 @@ impl CompactProvider for PrefixAlignedCompactProvider {
             reasoning_summary: None,
             web_search: None,
             context_management: None,
-            cache_trace_context: None,
+            cache_trace_context: self.cache_trace_context.clone(),
             compaction_trigger: false,
         };
 
@@ -514,6 +528,8 @@ pub struct RemoteCompactV2Provider {
     /// The virtual runtime-context reminder the engine inserts at
     /// message index 0 of every live request (stable-base mode).
     runtime_context_message: Option<Message>,
+    /// The session's cache routing; see [`PrefixAlignedCompactProvider`].
+    cache_trace_context: Option<CacheTraceContext>,
     /// Session output budget, mirrored so the request keeps the shape
     /// the backend has been seeing all session.
     max_tokens: u32,
@@ -528,6 +544,7 @@ impl RemoteCompactV2Provider {
             model: model.into(),
             tools: Vec::new(),
             runtime_context_message: None,
+            cache_trace_context: None,
             max_tokens: 8192,
             thinking: None,
             reasoning_effort: None,
@@ -546,6 +563,13 @@ impl RemoteCompactV2Provider {
         self.runtime_context_message = context
             .filter(|context| !context.is_empty())
             .map(crate::request::runtime_context_message);
+        self
+    }
+
+    /// Route the request through the session's own prompt cache, so the
+    /// compaction call reads the prefix the live turns have warmed.
+    pub fn with_cache_trace_context(mut self, context: Option<CacheTraceContext>) -> Self {
+        self.cache_trace_context = context;
         self
     }
 
@@ -627,7 +651,7 @@ impl CompactProvider for RemoteCompactV2Provider {
             reasoning_summary: None,
             web_search: None,
             context_management: None,
-            cache_trace_context: None,
+            cache_trace_context: self.cache_trace_context.clone(),
             compaction_trigger: true,
         };
 
@@ -1634,6 +1658,39 @@ mod tests {
         assert_eq!(&request.messages[1..], &messages[..]);
     }
 
+    fn session_cache_trace() -> CacheTraceContext {
+        CacheTraceContext {
+            prompt_cache_key: Some("rebon-session-key".into()),
+            prompt_cache_retention: Some("session".into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_v2_rides_the_session_prompt_cache_key() {
+        let mock = Arc::new(crate::mock::MockModelClient::new());
+        mock.push_turn(compaction_turn(&["blob"]));
+        let provider = RemoteCompactV2Provider::new(mock.clone(), "gpt-5.3-codex")
+            .with_cache_trace_context(Some(session_cache_trace()));
+
+        provider
+            .compact(
+                &v2_history(),
+                None,
+                1,
+                None,
+                &CompactSummaryOptions::default(),
+            )
+            .await
+            .unwrap();
+
+        // Without the session key the request lands on the provider's
+        // default cache key: a cold shard, and on the websocket a
+        // fingerprint mismatch that forces a full replay.
+        let request = &mock.captured_requests()[0];
+        assert_eq!(request.cache_trace_context, Some(session_cache_trace()));
+    }
+
     #[tokio::test]
     async fn remote_v2_keeps_user_words_the_blob_and_the_tail() {
         let mock = Arc::new(crate::mock::MockModelClient::new());
@@ -1933,7 +1990,8 @@ mod tests {
         };
         let provider = PrefixAlignedCompactProvider::new(mock.clone(), "deepseek-v4-pro")
             .with_tools(vec![tool])
-            .with_runtime_context(Some("cwd: /tmp/project"));
+            .with_runtime_context(Some("cwd: /tmp/project"))
+            .with_cache_trace_context(Some(session_cache_trace()));
         let messages = vec![
             user_msg("one"),
             assistant_msg("two"),
@@ -1955,6 +2013,7 @@ mod tests {
         let captured = mock.captured_requests();
         let request = &captured[0];
         assert_eq!(request.model, "deepseek-v4-pro");
+        assert_eq!(request.cache_trace_context, Some(session_cache_trace()));
         assert_eq!(request.system.as_deref(), Some("base system"));
         assert_eq!(request.tools.len(), 1);
         assert_eq!(
