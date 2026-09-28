@@ -647,3 +647,132 @@ async fn explicit_system_override_with_stable_flag_skips_cache_and_runtime_conte
     };
     assert!(!request_text.contains("<runtime_context>"));
 }
+
+/// The next turn rebuilds its history from the transcript. That replay must
+/// reproduce the previous turn's last request byte for byte — reasoning with
+/// its encrypted content, the tool round, and the attachment injected after
+/// it — or the provider prompt cache misses from the first divergence on.
+#[tokio::test(flavor = "current_thread")]
+async fn next_turn_replay_extends_the_previous_turn_request() {
+    let _guard = env_lock();
+    let _stable_guard = EnvVarGuard::set("REBON_STABLE_BASE_SYSTEM", "1");
+
+    let engine =
+        build_engine_with_tools(vec![
+            Arc::new(RecordingTool::new("Read", json!({"ok": true}))) as Arc<dyn Tool>,
+        ]);
+    let client = MockModelClient::new();
+    let mut first = vec![
+        message_start("msg_1"),
+        StreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlockStart::Thinking {
+                thinking: String::new(),
+                data: Some("encrypted-reasoning".into()),
+            },
+        },
+        StreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentBlockDelta::ThinkingDelta {
+                thinking: "**Planning**".into(),
+            },
+        },
+        StreamEvent::ContentBlockStop { index: 0 },
+    ];
+    let tool = tool_turn("unused", "Read", "call_1", r#"{"file_path":"a.rs"}"#);
+    // Shift the tool_use block from index 0 to index 1.
+    for event in tool.into_iter().skip(1) {
+        first.push(match event {
+            StreamEvent::ContentBlockStart { content_block, .. } => {
+                StreamEvent::ContentBlockStart {
+                    index: 1,
+                    content_block,
+                }
+            }
+            StreamEvent::ContentBlockDelta { delta, .. } => {
+                StreamEvent::ContentBlockDelta { index: 1, delta }
+            }
+            StreamEvent::ContentBlockStop { .. } => StreamEvent::ContentBlockStop { index: 1 },
+            other => other,
+        });
+    }
+    client.push_turn(first);
+    client.push_turn(text_turn("msg_2", "first turn done"));
+    client.push_turn(text_turn("msg_3", "second turn done"));
+    let client_handle = client.clone();
+    let client: Arc<dyn ModelClient> = Arc::new(client);
+
+    let projects_root_dir = temp_projects_root("next_turn_replay_prefix");
+    let projects_root = projects_root_dir.path();
+    let state = Arc::new(rebon_session_state::ServerState::new());
+    let cwd = projects_root.to_string_lossy().to_string();
+    let session = state.create_session(cwd.clone(), Vec::new());
+
+    struct SkillsProducer;
+    struct SkillsPoller(std::sync::atomic::AtomicBool);
+    impl AttachmentPoller for SkillsPoller {
+        fn poll(&self, request: AttachmentPollRequest<'_>) -> Vec<rebon_api::Message> {
+            if request.phase == AttachmentPollPhase::Eager
+                || self.0.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Vec::new();
+            }
+            vec![rebon_api::Message::user_text(
+                "<system-reminder>\nThe following skills are available\n</system-reminder>",
+            )]
+        }
+    }
+    impl crate::attachment_seat::SeatAttachmentProducer for SkillsProducer {
+        fn poller_for_session(
+            &self,
+            _binding: &crate::attachment_seat::SessionAttachmentBinding,
+        ) -> Option<Arc<dyn AttachmentPoller>> {
+            Some(Arc::new(SkillsPoller(Default::default())) as Arc<dyn AttachmentPoller>)
+        }
+    }
+    let kernel = rebon_kernel::Kernel::new();
+    let seat = crate::attachment_seat::AttachmentSeat::new();
+    kernel
+        .context()
+        .provide::<crate::attachment_seat::AttachmentSeatService>(seat.clone())
+        .unwrap();
+    seat.register(
+        kernel.context(),
+        "skills",
+        crate::attachment_seat::Order::Context,
+        Arc::new(SkillsProducer),
+    )
+    .unwrap();
+    let lease = crate::permission::KernelContextLease::unmanaged(kernel.context().clone());
+
+    let executor = EngineQueryExecutor::new(engine, client, projects_root, "mock-model")
+        .with_system_prompt_config(test_system_prompt_config())
+        .with_kernel_context_resolver(Arc::new(move |_session_id| Some(lease.clone())))
+        .with_server_state(state.clone());
+
+    let make_request = |text: &str| {
+        let mut request = basic_prompt_request(&session.id, &cwd);
+        request.prompt = vec![rebon_types::ContentBlock::Text(rebon_types::TextContent {
+            text: text.into(),
+            annotations: None,
+        })];
+        request
+    };
+    executor.execute(make_request("first turn")).await.unwrap();
+    executor.execute(make_request("second turn")).await.unwrap();
+
+    let captured = client_handle.captured_requests();
+    assert_eq!(captured.len(), 3);
+    let previous = &captured[1].messages;
+    let next = &captured[2].messages;
+    for (index, (a, b)) in previous.iter().zip(next.iter()).enumerate() {
+        if a != b {
+            panic!(
+                "diverged at message {index}\nprevious: {}\nnext:     {}",
+                serde_json::to_string(a).unwrap(),
+                serde_json::to_string(b).unwrap()
+            );
+        }
+    }
+    assert!(next.len() > previous.len());
+}

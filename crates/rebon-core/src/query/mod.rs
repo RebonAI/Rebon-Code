@@ -58,8 +58,8 @@ use rebon_types::{
 };
 
 use crate::context_accounting::{
-    estimate_messages_input_tokens, prompt_messages_report, prompt_text_section_report,
-    prompt_tool_metadata_report, PromptCostReport,
+    estimate_message_slice_tokens, estimate_messages_input_tokens, prompt_messages_report,
+    prompt_text_section_report, prompt_tool_metadata_report, PromptCostReport,
 };
 use crate::context_manager::{truncate_messages_for_token_budget, ContextManager};
 use crate::hooks::{HookedPermissionBroker, PreToolUseDecision};
@@ -101,11 +101,11 @@ use parent_context::*;
 pub(crate) use prompt::stable_base_system_enabled;
 use prompt::*;
 // The turn-control plugin owns cross-cutting policy and the public entry point.
+pub(crate) use formatting::format_ask_user_question_answer_for_transcript;
 use runtime_model::*;
 use session_prompt::*;
 use stream::*;
 use tool_projection::*;
-pub(crate) use formatting::format_ask_user_question_answer_for_transcript;
 pub(crate) use transcript::model_message_for_attachment;
 use transcript::*;
 pub(crate) use turn_control::attachment_repeats_history;
@@ -128,7 +128,10 @@ pub use tool_projection::{
 };
 pub use traits::{AttachmentPollPhase, AttachmentPollRequest, AttachmentPoller};
 pub use transcript::visible_runtime_attachment_message;
-pub use transcript::{estimate_transcript_input_tokens, transcript_to_api_messages};
+pub use transcript::{
+    estimate_transcript_input_tokens, transcript_to_api_messages,
+    transcript_to_api_messages_for_model,
+};
 pub use turn_control::run_query;
 
 /// A query's poller paired with the exact session and turn it is serving.

@@ -1235,3 +1235,56 @@ async fn two_turn_sequence_replays_full_history_while_retaining_only_pending_raw
         "disk remains the complete source of truth"
     );
 }
+
+#[test]
+fn replay_keeps_encrypted_reasoning_only_for_the_model_that_produced_it() {
+    let row = |raw: serde_json::Value| rebon_session::TranscriptEntry {
+        entry_type: "assistant".into(),
+        uuid: "a1".into(),
+        parent_uuid: None,
+        timestamp: None,
+        raw,
+    };
+    let served = row(json!({
+        "message": {
+            "role": "assistant",
+            "model": "gpt-6-astra",
+            "content": [
+                {"type": "thinking", "thinking": "**Planning**", "data": "gAAAA-encrypted"}
+            ]
+        }
+    }));
+    // A relay that reports another name than the one requested.
+    let relayed = row(json!({
+        "requestedModel": "gpt-6-astra",
+        "message": {
+            "role": "assistant",
+            "model": "gpt-6-astra-2026-09-01",
+            "content": [
+                {"type": "thinking", "thinking": "**Planning**", "data": "gAAAA-encrypted"}
+            ]
+        }
+    }));
+    let reasoning_data = |entry: &rebon_session::TranscriptEntry, model: Option<&str>| {
+        let messages = transcript_to_api_messages_for_model(std::slice::from_ref(entry), model);
+        match &messages[0].content[0] {
+            ApiContentBlock::Thinking(block) => {
+                assert_eq!(block.thinking, "**Planning**");
+                block.data.clone()
+            }
+            other => panic!("expected thinking block, got {other:?}"),
+        }
+    };
+
+    assert_eq!(
+        reasoning_data(&served, Some("gpt-6-astra")).as_deref(),
+        Some("gAAAA-encrypted")
+    );
+    assert_eq!(
+        reasoning_data(&relayed, Some("gpt-6-astra")).as_deref(),
+        Some("gAAAA-encrypted")
+    );
+    // Opaque to any other model, and to callers that don't say which.
+    assert_eq!(reasoning_data(&served, Some("claude-sonnet-5")), None);
+    assert_eq!(reasoning_data(&served, None), None);
+}

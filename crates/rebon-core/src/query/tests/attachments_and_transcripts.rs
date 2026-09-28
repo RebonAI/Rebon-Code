@@ -685,3 +685,34 @@ fn build_tool_call_title_keeps_general_purpose_agent_label() {
         "Agent: inspect parser"
     );
 }
+
+#[test]
+fn transcript_replay_sends_runtime_attachment_model_text_unwrapped() {
+    let message = visible_runtime_attachment_message(
+        "u-answer-1",
+        "Answered questions:\n- Which box?\n  Answer: the canvas one".to_string(),
+        "<question-answer tool_use_id=\"call_1\">\nAnswered questions:\n</question-answer>"
+            .to_string(),
+    );
+    let live = model_message_for_attachment(&message);
+    let entries = vec![rebon_session::TranscriptEntry {
+        entry_type: "user".into(),
+        uuid: "u-answer-1".into(),
+        parent_uuid: None,
+        timestamp: None,
+        raw: json!({
+            "queuedCommand": true,
+            "runtimeAttachment": true,
+            "message": {
+                "role": "user",
+                "content": visible_message_for_attachment(&message).content,
+            },
+            "modelContent": live.content,
+        }),
+    }];
+
+    let messages = transcript_to_api_messages(&entries);
+
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0], live);
+}

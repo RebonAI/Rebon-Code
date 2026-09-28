@@ -326,6 +326,19 @@ pub(super) async fn append_ask_user_question_answer_message(
 }
 
 pub fn transcript_to_api_messages(entries: &[TranscriptEntry]) -> Vec<ApiMessage> {
+    transcript_to_api_messages_for_model(entries, None)
+}
+
+/// [`transcript_to_api_messages`] for a replay that `reasoning_model` will
+/// receive. An assistant row's encrypted reasoning (`thinking.data`) is
+/// opaque to every model but the one that produced it, so it is kept only on
+/// rows that model served; that keeps the replay byte-identical to the
+/// request the row was live in. Everywhere else it is dropped, and the wire
+/// layer then leaves that reasoning out.
+pub fn transcript_to_api_messages_for_model(
+    entries: &[TranscriptEntry],
+    reasoning_model: Option<&str>,
+) -> Vec<ApiMessage> {
     let mut out: Vec<ApiMessage> = Vec::new();
     for entry in entries {
         let role = match entry.entry_type.as_str() {
@@ -341,7 +354,22 @@ pub fn transcript_to_api_messages(entries: &[TranscriptEntry]) -> Vec<ApiMessage
         {
             continue;
         }
-        let Some(content) = extract_content_blocks_from_entry(&entry.raw) else {
+        let keep_reasoning_data = role == Role::Assistant
+            && reasoning_model.is_some_and(|model| {
+                entry
+                    .raw
+                    .get(REQUESTED_MODEL_ENTRY_KEY)
+                    .or_else(|| {
+                        entry
+                            .raw
+                            .get("message")
+                            .and_then(|message| message.get("model"))
+                    })
+                    .and_then(Value::as_str)
+                    == Some(model)
+            });
+        let Some(content) = extract_content_blocks_from_entry(&entry.raw, keep_reasoning_data)
+        else {
             continue;
         };
         if content.is_empty() {
@@ -591,6 +619,7 @@ pub(super) async fn replay_denial_requests(
 /// has no recognisable content.
 pub(super) fn extract_content_blocks_from_entry(
     raw: &serde_json::Value,
+    keep_reasoning_data: bool,
 ) -> Option<Vec<ApiContentBlock>> {
     if let Some(message) = raw.get("message") {
         if let Some(content) = message.get("content") {
@@ -598,13 +627,20 @@ pub(super) fn extract_content_blocks_from_entry(
                 .get("queuedCommand")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
+            // A runtime attachment reached the model as its own model text,
+            // unwrapped (`model_message_for_attachment`); only a queued user
+            // message gets the "sent while you were working" reminder.
+            let runtime_attachment = raw
+                .get(RUNTIME_ATTACHMENT_ENTRY_KEY)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             let content = if queued_command {
                 raw.get("modelContent").unwrap_or(content)
             } else {
                 content
             };
-            let mut blocks = content_value_to_blocks(content)?;
-            if queued_command {
+            let mut blocks = content_value_to_blocks(content, keep_reasoning_data)?;
+            if queued_command && !runtime_attachment {
                 wrap_queued_user_content_blocks(&mut blocks);
             }
             return Some(blocks);
@@ -619,7 +655,10 @@ pub(super) fn extract_content_blocks_from_entry(
     })
 }
 
-pub(super) fn content_value_to_blocks(value: &serde_json::Value) -> Option<Vec<ApiContentBlock>> {
+pub(super) fn content_value_to_blocks(
+    value: &serde_json::Value,
+    keep_reasoning_data: bool,
+) -> Option<Vec<ApiContentBlock>> {
     match value {
         serde_json::Value::String(s) if !s.is_empty() => {
             Some(vec![ApiContentBlock::Text(TextBlock { text: s.clone() })])
@@ -628,7 +667,7 @@ pub(super) fn content_value_to_blocks(value: &serde_json::Value) -> Option<Vec<A
         serde_json::Value::Array(items) => {
             let mut out: Vec<ApiContentBlock> = Vec::new();
             for item in items {
-                if let Some(block) = content_block_from_value(item) {
+                if let Some(block) = content_block_from_value(item, keep_reasoning_data) {
                     out.push(block);
                 }
             }
@@ -638,7 +677,10 @@ pub(super) fn content_value_to_blocks(value: &serde_json::Value) -> Option<Vec<A
     }
 }
 
-pub(super) fn content_block_from_value(item: &serde_json::Value) -> Option<ApiContentBlock> {
+pub(super) fn content_block_from_value(
+    item: &serde_json::Value,
+    keep_reasoning_data: bool,
+) -> Option<ApiContentBlock> {
     let kind = item.get("type").and_then(|v| v.as_str())?;
     match kind {
         "text" => {
@@ -716,7 +758,13 @@ pub(super) fn content_block_from_value(item: &serde_json::Value) -> Option<ApiCo
             // need it present; deciding what to actually send is the wire
             // layer's job (anthropic `message_to_wire` drops signatureless
             // blocks, `strip_old_thinking_blocks` trims old turns), not the
-            // transcript loader's. The persisted `signature` is preserved.
+            // transcript loader's. The persisted `signature` is preserved,
+            // and so is `data` when the caller vouches for its origin
+            // (`transcript_to_api_messages_for_model`): OpenAI reasoning
+            // carries its encrypted content there, and the Responses wire
+            // drops a reasoning item without it, so a replay that lost it
+            // diverged from the request the turn was live in — a prompt-cache
+            // miss from the first assistant message on.
             let thinking = item
                 .get("thinking")
                 .and_then(|v| v.as_str())
@@ -726,10 +774,14 @@ pub(super) fn content_block_from_value(item: &serde_json::Value) -> Option<ApiCo
                 .get("signature")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            let data = keep_reasoning_data
+                .then(|| item.get("data").and_then(|v| v.as_str()))
+                .flatten()
+                .map(str::to_string);
             Some(ApiContentBlock::Thinking(rebon_api::ThinkingBlock {
                 thinking,
                 signature,
-                data: None,
+                data,
             }))
         }
         "redacted_thinking" => {
@@ -843,6 +895,13 @@ pub(super) const LOCAL_QUEUED_USER_MARKER_PREFIX: &str = "<rebon-queued-user-inp
 pub(super) const LOCAL_QUEUED_MODEL_TEXT_MARKER_PREFIX: &str = "<rebon-queued-user-model-text>\n";
 const VISIBLE_RUNTIME_ATTACHMENT_MARKER_PREFIX: &str = "<rebon-visible-runtime-attachment uuid=\"";
 const VISIBLE_RUNTIME_MODEL_TEXT_MARKER_PREFIX: &str = "<rebon-visible-runtime-model-text>\n";
+/// Transcript flag on a queued row written for a visible runtime attachment,
+/// so replay sends its model text exactly as the live request did.
+pub(super) const RUNTIME_ATTACHMENT_ENTRY_KEY: &str = "runtimeAttachment";
+/// Transcript field on an assistant row naming the model it was requested
+/// from, written only when the provider reported a different one; otherwise
+/// `message.model` is both.
+pub(super) const REQUESTED_MODEL_ENTRY_KEY: &str = "requestedModel";
 
 pub fn visible_runtime_attachment_message(
     uuid: &str,
@@ -877,6 +936,16 @@ pub(super) fn local_user_uuid_from_attachment(message: &ApiMessage) -> Option<St
             })
         }
         _ => None,
+    })
+}
+
+pub(super) fn is_visible_runtime_attachment(message: &ApiMessage) -> bool {
+    message.content.iter().any(|block| {
+        matches!(
+            block,
+            ApiContentBlock::Text(text)
+                if text.text.starts_with(VISIBLE_RUNTIME_ATTACHMENT_MARKER_PREFIX)
+        )
     })
 }
 

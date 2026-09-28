@@ -1,6 +1,12 @@
 use super::*;
 
 const REPLAY_PROTECTED_TURNS: usize = 10;
+/// Replay keeps the whole normalized history until it outgrows every context
+/// window a provider offers. Below that, what has to go is the model budget's
+/// call (`truncate_replay_window_for_budget`); cutting by message count here
+/// dropped tool output from sessions far under their window and cold-started
+/// the prompt cache every time the boundary jumped.
+const REPLAY_RETAIN_MAX_TOKENS: u64 = 1_000_000;
 const MAX_REPLAY_WINDOWS: usize = 32;
 const MAX_REPLAY_CONFLICT_RETRIES: usize = 3;
 
@@ -25,6 +31,9 @@ pub(super) struct ReplayWindow {
     title_conversation_text: Option<String>,
     has_anchored_minimal_anchor: bool,
     has_assistant_turn: bool,
+    /// The model this projection kept encrypted reasoning for; a turn on any
+    /// other model rebuilds rather than reuse it.
+    reasoning_model: Option<String>,
     projection: Vec<ApiMessage>,
 }
 
@@ -37,6 +46,15 @@ impl ReplayWindow {
             (messages.len() >= 3).then(|| rebon_api::extract_conversation_text(&messages));
         let has_anchored_minimal_anchor = history_has_anchored_minimal_anchor(&messages);
         let has_assistant_turn = history_has_assistant_turn(&messages);
+        let projection = if estimate_message_slice_tokens(&messages) <= REPLAY_RETAIN_MAX_TOKENS {
+            messages
+        } else {
+            // Only an oversized session is cut here. The cache-stable variant
+            // is load-bearing: this projection is rebuilt every turn, and a
+            // per-turn sliding boundary would shift the whole model-visible
+            // prefix each request.
+            rebon_api::auto_compact_truncate_cache_stable(messages, REPLAY_PROTECTED_TURNS)
+        };
         Self {
             cwd: source.cwd.clone(),
             incarnation: source.incarnation,
@@ -45,14 +63,8 @@ impl ReplayWindow {
             title_conversation_text,
             has_anchored_minimal_anchor,
             has_assistant_turn,
-            // The cache-stable variant is load-bearing here: this projection is
-            // rebuilt every turn, and a per-turn sliding boundary would shift
-            // the whole model-visible prefix each request, busting provider
-            // prompt caches for app, background and ACP sessions past ~10 turns.
-            projection: rebon_api::auto_compact_truncate_cache_stable(
-                messages,
-                REPLAY_PROTECTED_TURNS,
-            ),
+            reasoning_model: None,
+            projection,
         }
     }
 
@@ -625,12 +637,24 @@ impl ReplayWindowStore {
         self.clear_resume_summary(session_id);
     }
 
+    #[cfg(test)]
     pub(super) fn project_resume_summary(
         &self,
         projects_root: &std::path::Path,
         cwd: &str,
         session_id: &str,
         raw: &[rebon_session::TranscriptEntry],
+    ) -> Result<Option<Vec<ApiMessage>>, String> {
+        self.project_resume_summary_for_model(projects_root, cwd, session_id, raw, None)
+    }
+
+    fn project_resume_summary_for_model(
+        &self,
+        projects_root: &std::path::Path,
+        cwd: &str,
+        session_id: &str,
+        raw: &[rebon_session::TranscriptEntry],
+        reasoning_model: Option<&str>,
     ) -> Result<Option<Vec<ApiMessage>>, String> {
         let baseline = self
             .resume_summaries
@@ -639,7 +663,13 @@ impl ReplayWindowStore {
             .get(session_id)
             .cloned();
         let Some(baseline) = baseline else {
-            return Ok(self.project_persisted_resume_summary(projects_root, cwd, session_id, raw));
+            return Ok(self.project_persisted_resume_summary(
+                projects_root,
+                cwd,
+                session_id,
+                raw,
+                reasoning_model,
+            ));
         };
         let Some(anchor_index) = raw
             .iter()
@@ -657,7 +687,10 @@ impl ReplayWindowStore {
             ));
         }
         let mut projection = baseline.projection;
-        projection.extend(transcript_to_api_messages(&raw[anchor_index + 1..]));
+        projection.extend(transcript_to_api_messages_for_model(
+            &raw[anchor_index + 1..],
+            reasoning_model,
+        ));
         rebon_api::ensure_tool_result_pairing(&mut projection);
         Ok(Some(projection))
     }
@@ -688,6 +721,7 @@ impl ReplayWindowStore {
         cwd: &str,
         session_id: &str,
         raw: &[rebon_session::TranscriptEntry],
+        reasoning_model: Option<&str>,
     ) -> Option<Vec<ApiMessage>> {
         let path = compact_baseline_path(projects_root, cwd, session_id);
         let persisted = read_compact_baseline(&path)?;
@@ -719,7 +753,10 @@ impl ReplayWindowStore {
             );
 
         let mut projection = persisted.projection;
-        projection.extend(transcript_to_api_messages(&raw[anchor_index + 1..]));
+        projection.extend(transcript_to_api_messages_for_model(
+            &raw[anchor_index + 1..],
+            reasoning_model,
+        ));
         rebon_api::ensure_tool_result_pairing(&mut projection);
         Some(projection)
     }
@@ -742,13 +779,26 @@ impl ReplayWindowStore {
             .is_some_and(|window| window.has_assistant_turn)
     }
 
+    #[cfg(test)]
     pub(super) fn history_for(
         &self,
         state: &ServerState,
         projects_root: &std::path::Path,
         session_id: &str,
     ) -> Result<(Vec<ApiMessage>, Option<String>, Option<String>), PromptExecutorError> {
-        self.history_for_after_each_take(state, projects_root, session_id, |_| {})
+        self.history_for_model(state, projects_root, session_id, None)
+    }
+
+    /// [`Self::history_for`] for a turn on `reasoning_model`, which gets back
+    /// the encrypted reasoning it produced earlier in the session.
+    pub(super) fn history_for_model(
+        &self,
+        state: &ServerState,
+        projects_root: &std::path::Path,
+        session_id: &str,
+        reasoning_model: Option<&str>,
+    ) -> Result<(Vec<ApiMessage>, Option<String>, Option<String>), PromptExecutorError> {
+        self.history_for_after_each_take(state, projects_root, session_id, reasoning_model, |_| {})
     }
 
     #[cfg(test)]
@@ -763,7 +813,7 @@ impl ReplayWindowStore {
         F: FnOnce(),
     {
         let mut after_take = Some(after_take);
-        self.history_for_after_each_take(state, projects_root, session_id, |_| {
+        self.history_for_after_each_take(state, projects_root, session_id, None, |_| {
             if let Some(after_take) = after_take.take() {
                 after_take();
             }
@@ -775,6 +825,7 @@ impl ReplayWindowStore {
         state: &ServerState,
         projects_root: &std::path::Path,
         session_id: &str,
+        reasoning_model: Option<&str>,
         mut after_take: F,
     ) -> Result<(Vec<ApiMessage>, Option<String>, Option<String>), PromptExecutorError>
     where
@@ -808,7 +859,10 @@ impl ReplayWindowStore {
                     let rendered = windows
                         .windows
                         .get(session_id)
-                        .filter(|window| window.matches(&source))
+                        .filter(|window| {
+                            window.matches(&source)
+                                && window.reasoning_model.as_deref() == reasoning_model
+                        })
                         .map(|window| {
                             (
                                 window.render(),
@@ -858,19 +912,25 @@ impl ReplayWindowStore {
             // and global tool-pair repair. Finalization verifies the same source
             // revision before either the projection or its parent may escape.
             let last_raw_uuid = raw.last().map(|entry| entry.uuid.clone());
-            let canonical = transcript_to_api_messages(&raw);
+            let canonical = transcript_to_api_messages_for_model(&raw, reasoning_model);
             let canonical_has_anchored_minimal_anchor =
                 history_has_anchored_minimal_anchor(&canonical);
             let canonical_has_assistant_turn = history_has_assistant_turn(&canonical);
-            let normalized =
-                match self.project_resume_summary(projects_root, &source.cwd, session_id, &raw) {
-                    Ok(Some(projected)) => projected,
-                    Ok(None) => canonical,
-                    Err(message) => return Err(failed_replay(state, source, message)),
-                };
+            let normalized = match self.project_resume_summary_for_model(
+                projects_root,
+                &source.cwd,
+                session_id,
+                &raw,
+                reasoning_model,
+            ) {
+                Ok(Some(projected)) => projected,
+                Ok(None) => canonical,
+                Err(message) => return Err(failed_replay(state, source, message)),
+            };
             let mut window = ReplayWindow::from_normalized(&source, normalized);
             window.has_anchored_minimal_anchor = canonical_has_anchored_minimal_anchor;
             window.has_assistant_turn = canonical_has_assistant_turn;
+            window.reasoning_model = reasoning_model.map(str::to_string);
             window.last_raw_uuid = last_raw_uuid.clone();
             let rendered = window.render();
             let title_conversation_text = window.title_conversation_text.clone();
@@ -1294,28 +1354,63 @@ mod tests {
             .is_none());
     }
 
+    /// Turn pairs whose user text is large enough that a few hundred of them
+    /// outgrow `REPLAY_RETAIN_MAX_TOKENS`.
+    fn oversized_turns(turns: usize) -> Vec<ApiMessage> {
+        (0..turns)
+            .flat_map(|turn| {
+                [
+                    text_message(Role::User, format!("user-{turn}-{}", "x".repeat(20_000))),
+                    text_message(Role::Assistant, format!("assistant-{turn}")),
+                ]
+            })
+            .collect()
+    }
+
     #[test]
-    fn normalized_window_matches_phase_one_reference_and_retains_only_projection() {
+    fn window_under_budget_retains_full_history() {
         let mut messages = Vec::new();
         for turn in 0..500 {
             messages.push(text_message(Role::User, format!("user-{turn}")));
             messages.push(text_message(Role::Assistant, format!("assistant-{turn}")));
         }
+        let window = ReplayWindow::from_normalized(&source(1), messages.clone());
+        assert_eq!(window.render(), messages);
+    }
+
+    #[test]
+    fn replay_keeps_tool_output_past_twenty_messages() {
+        // A tool-heavy agent turn: 27 tool round-trips put the history well
+        // past the old 20-message window while staying far under any model
+        // budget. Every tool result must survive the next turn's rebuild.
+        let mut messages = vec![text_message(Role::User, "fix the editor bugs")];
+        for call in 0..27 {
+            let id = format!("call-{call}");
+            messages.push(tool_use_message(&id));
+            messages.push(tool_result_message(&id, false));
+        }
+        messages.push(text_message(Role::Assistant, "done"));
+        let window = ReplayWindow::from_normalized(&source(1), messages.clone());
+        assert_eq!(window.render(), messages);
+    }
+
+    #[test]
+    fn oversized_window_falls_back_to_cache_stable_cut() {
+        let messages = oversized_turns(250);
+        assert!(estimate_message_slice_tokens(&messages) > REPLAY_RETAIN_MAX_TOKENS);
         let expected = rebon_api::auto_compact_truncate_cache_stable(messages.clone(), 10);
         let window = ReplayWindow::from_normalized(&source(1), messages);
         assert_eq!(window.render(), expected);
-        // 1000 messages sit exactly on a quantum boundary, so the projection is
+        // 500 messages sit exactly on a quantum boundary, so the projection is
         // preserved-user + compaction-summary + one 20-message window at most.
-        // This fixture has no execution row.
         assert!(window.projection.len() <= 24);
     }
 
     #[test]
     fn replay_projection_prefix_stays_stable_while_turns_append() {
-        // Simulates the per-turn rebuild: within a quantum band the previous
-        // projection must be a byte-identical prefix of the next one, so
-        // provider prompt caches keep hitting as the session grows; the
-        // boundary may move only in whole-window jumps.
+        // Simulates the per-turn rebuild: the previous projection must be a
+        // byte-identical prefix of the next one, so provider prompt caches
+        // keep hitting as the session grows.
         let build = |turns: usize| {
             let mut messages = Vec::new();
             for turn in 0..turns {
@@ -1336,8 +1431,28 @@ mod tests {
             }
             previous = current;
         }
+        assert_eq!(jumps, 0, "a history under budget must only ever append");
+    }
+
+    #[test]
+    fn oversized_projection_boundary_moves_in_whole_windows() {
+        let build = |turns: usize| {
+            ReplayWindow::from_normalized(&source(1), oversized_turns(turns)).render()
+        };
+
+        let mut previous = build(230);
+        let mut jumps = 0usize;
+        for turns in 231..=260 {
+            let current = build(turns);
+            let extends_previous =
+                current.len() >= previous.len() && current[..previous.len()] == previous[..];
+            if !extends_previous {
+                jumps += 1;
+            }
+            previous = current;
+        }
         // 30 appended turn-pairs with a 10-turn protected window cross the
-        // quantum boundary exactly three times (at 40, 50, and 60 turns).
+        // quantum boundary exactly three times (at 240, 250, and 260 turns).
         assert_eq!(
             jumps, 3,
             "boundary must move in whole-window steps, not per turn"
@@ -1364,9 +1479,9 @@ mod tests {
                 ));
             }
 
-            let expected = rebon_api::auto_compact_truncate_cache_stable(messages.clone(), 10);
-            let actual = ReplayWindow::from_normalized(&source(seed as u64), messages).render();
-            assert_eq!(actual, expected, "projection mismatch for seed {seed}");
+            let actual =
+                ReplayWindow::from_normalized(&source(seed as u64), messages.clone()).render();
+            assert_eq!(actual, messages, "projection mismatch for seed {seed}");
         }
     }
 
@@ -1404,9 +1519,8 @@ mod tests {
         let normalized = transcript_to_api_messages(&entries);
         assert_eq!(normalized.len(), 3, "tool orphan repair adds a user result");
         assert!(normalized.iter().all(|message| !message.content.is_empty()));
-        let expected = rebon_api::auto_compact_truncate_cache_stable(normalized.clone(), 10);
-        let actual = ReplayWindow::from_normalized(&source(1), normalized).render();
-        assert_eq!(actual, expected);
+        let actual = ReplayWindow::from_normalized(&source(1), normalized.clone()).render();
+        assert_eq!(actual, normalized);
     }
 
     #[test]
@@ -1825,21 +1939,13 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_retained_projection_does_not_grow_with_session_length() {
+    fn oversized_retained_projection_does_not_grow_with_session_length() {
         fn build(turns: usize) -> ReplayWindow {
-            let messages = (0..turns)
-                .flat_map(|turn| {
-                    [
-                        text_message(Role::User, format!("user-{turn}-{}", "x".repeat(400))),
-                        text_message(Role::Assistant, format!("assistant-{turn}")),
-                    ]
-                })
-                .collect();
-            ReplayWindow::from_normalized(&source(turns as u64), messages)
+            ReplayWindow::from_normalized(&source(turns as u64), oversized_turns(turns))
         }
 
-        let medium = build(500);
-        let long = build(5_000);
+        let medium = build(260);
+        let long = build(520);
         assert_eq!(medium.projection.len(), long.projection.len());
         let medium_bytes = serde_json::to_vec(&medium.projection).unwrap().len();
         let long_bytes = serde_json::to_vec(&long.projection).unwrap().len();
@@ -1875,11 +1981,6 @@ mod tests {
         assert_eq!(
             window.title_conversation_text.as_deref(),
             Some(expected.as_str())
-        );
-        assert_ne!(
-            window.title_conversation_text.as_deref(),
-            Some(rebon_api::extract_conversation_text(&window.projection).as_str()),
-            "compacted synthetic summaries must not feed title generation"
         );
     }
 
@@ -2459,7 +2560,7 @@ mod tests {
 
         let mut attempts = Vec::new();
         let (history, next_parent, _) = ReplayWindowStore::default()
-            .history_for_after_each_take(&state, root.path(), session_id, |attempt| {
+            .history_for_after_each_take(&state, root.path(), session_id, None, |attempt| {
                 attempts.push(attempt);
                 if attempt == 0 {
                     state.push_transcript_entries(
@@ -2488,7 +2589,7 @@ mod tests {
 
         let mut attempts = Vec::new();
         let (history, next_parent, _) = store
-            .history_for_after_each_take(&state, root.path(), session_id, |attempt| {
+            .history_for_after_each_take(&state, root.path(), session_id, None, |attempt| {
                 attempts.push(attempt);
                 match attempt {
                     0 => state.push_transcript_entries(
@@ -2555,7 +2656,7 @@ mod tests {
         let mut parent = "D".to_string();
         let mut attempts = Vec::new();
         let err = ReplayWindowStore::default()
-            .history_for_after_each_take(&state, root.path(), session_id, |attempt| {
+            .history_for_after_each_take(&state, root.path(), session_id, None, |attempt| {
                 attempts.push(attempt);
                 let uuid = format!("R-{attempt}");
                 state.push_transcript_entries(

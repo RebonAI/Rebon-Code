@@ -1927,6 +1927,7 @@ impl EngineQueryExecutor {
     fn acquire_turn_history(
         &self,
         session_id: &str,
+        model: &str,
         client: &Arc<dyn ModelClient>,
     ) -> Result<TurnHistory, PromptExecutorError> {
         // Acquire the engine-owned bounded replay projection. The ACP handoff
@@ -1939,9 +1940,12 @@ impl EngineQueryExecutor {
         anchored_minimal_history_anchor,
     ): (Vec<ApiMessage>, Option<String>, Option<String>, bool) =
         if let Some(state) = &self.server_state {
-            let replay =
-                self.replay_windows
-                    .history_for(state, &self.projects_root, &session_id)?;
+            let replay = self.replay_windows.history_for_model(
+                state,
+                &self.projects_root,
+                &session_id,
+                Some(model),
+            )?;
             let has_anchor = self.replay_windows.has_anchored_minimal_anchor(&session_id);
             (replay.0, replay.1, replay.2, has_anchor)
         } else {
@@ -2452,7 +2456,7 @@ impl TurnEventLoop<'_> {
             // Served ≠ requested — a dated snapshot alias, or a
             // relay routing to a different backend. Keep both so
             // transcript readers can tell them apart.
-            assistant_payload["requestedModel"] = serde_json::json!(model.as_str());
+            assistant_payload[REQUESTED_MODEL_ENTRY_KEY] = serde_json::json!(model.as_str());
         }
         let assistant_write_entry = TranscriptWriteEntry::new("assistant", assistant_payload)
             .with_uuid(assistant_uuid.clone())
@@ -2771,6 +2775,9 @@ impl TurnEventLoop<'_> {
                 if model_message.content != visible_message.content {
                     payload["modelContent"] = serde_json::to_value(&model_message.content)
                         .unwrap_or(serde_json::json!([]));
+                }
+                if is_visible_runtime_attachment(&message) {
+                    payload[RUNTIME_ATTACHMENT_ENTRY_KEY] = serde_json::Value::Bool(true);
                 }
                 if !image_paste_ids.is_empty() {
                     payload["imagePasteIds"] = serde_json::json!(image_paste_ids.clone());
@@ -4538,7 +4545,7 @@ impl PromptExecutor for EngineQueryExecutor {
             anchored_minimal_bootstrap,
             anchored_minimal_clamped_budget,
             ..
-        } = self.acquire_turn_history(&session_id, &client)?;
+        } = self.acquire_turn_history(&session_id, &model, &client)?;
 
         let TurnPrompt {
             user_text,
