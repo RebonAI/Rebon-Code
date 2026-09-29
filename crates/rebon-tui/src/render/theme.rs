@@ -14,6 +14,10 @@ pub struct RenderTheme {
     pub system_error: Style,
     pub thinking: Style,
     pub tool_header: Style,
+    /// Gutter dot of a tool call that finished cleanly.
+    pub tool_success: Style,
+    /// Gutter spinner of a tool call that is still running.
+    pub tool_running: Style,
     pub tool_result_error: Style,
     pub streaming: Style,
     pub unknown: Style,
@@ -48,6 +52,8 @@ impl RenderTheme {
             system_error: Style::new(),
             thinking: Style::new(),
             tool_header: Style::new(),
+            tool_success: Style::new(),
+            tool_running: Style::new(),
             tool_result_error: Style::new(),
             streaming: Style::new(),
             unknown: Style::new(),
@@ -92,6 +98,10 @@ impl RenderTheme {
             // Tool name: the default text color, bold (no specific theme
             // color).
             tool_header: Style::new().add_modifier(Modifier::BOLD),
+            // A finished call's dot turns green, so a run of tool calls reads
+            // as a checklist; a running one spins in the brand accent.
+            tool_success: Style::new().fg(parse_theme_color(t.success)),
+            tool_running: Style::new().fg(parse_theme_color(t.rebon)),
             tool_result_error: Style::new().fg(parse_theme_color(t.error)),
             // Streaming dot: the terminal's default color — no explicit
             // fg is set. An explicit `Rgb(255,255,255)` gets collapsed to
@@ -133,3 +143,17 @@ impl Default for RenderTheme {
 /// `"ansi256(n)"`, `"ansi:name"`) into a ratatui `Color`; the one
 /// implementation lives in `rebon-message-tui`.
 pub use rebon_message_tui::parse_theme_color;
+
+/// A chip: `token`'s colour for the text, on a pale wash of the same hue
+/// over the terminal background — the pill a status badge sits on. The ANSI
+/// palettes, whose named colours have no RGB to wash, keep plain text.
+pub fn chip_style(token: &str) -> Style {
+    use rebon_design_system::theme::{is_dark, mix, surface_base};
+    let fg = parse_theme_color(token);
+    let Color::Rgb(r, g, b) = fg else {
+        return Style::new().fg(fg);
+    };
+    let base = surface_base();
+    let (wr, wg, wb) = mix(base, (r, g, b), if is_dark(base) { 0.22 } else { 0.14 });
+    Style::new().fg(fg).bg(Color::Rgb(wr, wg, wb))
+}

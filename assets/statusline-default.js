@@ -38,11 +38,13 @@ function pct(value) {
   return value === null ? '?' : trim(value) + '%';
 }
 
-function bar(value, width) {
+function bar(value, width, fill) {
   value = num(value);
-  if (value === null) return '▱'.repeat(width);
+  // Only the filled part carries the pressure colour; the empty track stays
+  // quiet so the meter reads as a level, not as a second bar.
+  if (value === null) return color('▱'.repeat(width), c.dim);
   const filled = Math.round(clamp(value / 100, 0, 1) * width);
-  return '▰'.repeat(filled) + '▱'.repeat(width - filled);
+  return color('▰'.repeat(filled), fill) + color('▱'.repeat(width - filled), c.dim);
 }
 
 function clip(text, max) {
@@ -55,16 +57,19 @@ function terminalColumns(payload) {
   return columns !== null && columns > 0 ? columns : 120;
 }
 
+// Colour is reserved for state: how full the context is and how well the
+// cache is hitting. Everything else is the terminal's own foreground, with the
+// icons and secondary figures dimmed, so the line holds on a light background
+// as well as a dark one and a warning is the one thing that stands out. The
+// standard (not bright) hues are the ones terminal schemes tune for contrast
+// on both.
 const c = {
   reset: '\x1b[0m',
   dim: '\x1b[2m',
   bold: '\x1b[1m',
-  green: '\x1b[92m',
-  yellow: '\x1b[93m',
-  red: '\x1b[91m',
-  cyan: '\x1b[96m',
-  blue: '\x1b[94m',
-  magenta: '\x1b[95m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  red: '\x1b[31m',
   gray: '\x1b[90m',
 };
 
@@ -141,13 +146,15 @@ const columns = terminalColumns(payload);
 const compact = isHeader || columns < 100;
 const modelText = compact ? clip(model, 14) : clip(model, 22);
 const usedColor = usageColor(used);
-const meter = color(bar(used, compact ? 8 : 12), usedColor);
+const meter = bar(used, compact ? 8 : 12, usedColor);
 
-// Each metric owns a hue. That hue is what separates one section from the
-// next — no glyph divider needed. Bright icon + solid value = the anchor,
-// dim same-hue = the secondary detail.
+// Icon dim, value in the body tone, detail dim: the icons label the sections
+// and a quiet dot separates them.
+function icon(unicode, name) {
+  return color(glyph(unicode, name), c.dim);
+}
 const cacheText = cacheTotal > 0
-  ? `${color(fmt(cacheTotal), c.cyan + c.bold)} ${color('↺ ' + fmt(cacheReadHit) + ' ⊘ ' + fmt(cacheWriteMiss), c.cyan + c.dim)}`
+  ? `${fmt(cacheTotal)} ${color('↺ ' + fmt(cacheReadHit) + ' ⊘ ' + fmt(cacheWriteMiss), c.dim)}`
   : color('—', c.dim);
 
 // A section that has no number behind it is dropped, not printed with `?`: the
@@ -160,49 +167,50 @@ const sections = isHeader ? [] : [`${statusMark(used, isApp, glyph)} ${color(mod
 
 if (used !== null) {
   sections.push(compact
-    ? `${color(glyph('◷', 'clock'), c.blue + c.bold)} ${meter} ${color(pct(used), usedColor + c.bold)}`
-    : `${color(glyph('◷', 'clock'), c.blue + c.bold)} ${meter} ${color(pct(used), usedColor + c.bold)} ${color(fmt(inputTokens) + '/' + fmt(windowSize), c.blue + c.dim)}`);
+    ? `${icon('◷', 'clock')} ${meter} ${color(pct(used), usedColor + c.bold)}`
+    : `${icon('◷', 'clock')} ${meter} ${color(pct(used), usedColor + c.bold)} ${color(fmt(inputTokens) + '/' + fmt(windowSize), c.dim)}`);
 } else if (inputTokens) {
   // No window size to divide by — the absolute context carried is still worth
   // showing, just without a meter that would have to guess at a denominator.
-  sections.push(`${color(glyph('◷', 'clock'), c.blue + c.bold)} ${color(fmt(inputTokens), c.blue + c.bold)}`);
+  sections.push(`${icon('◷', 'clock')} ${fmt(inputTokens)}`);
 }
 
 if (remainingTokens !== null) {
   sections.push(compact
-    ? `${color(glyph('⇣', 'chev-d'), c.green + c.bold)} ${color(fmt(remainingTokens), c.green + c.bold)}`
-    : `${color(glyph('⇣', 'chev-d'), c.green + c.bold)} ${color(fmt(remainingTokens), c.green + c.bold)} ${color(pct(remaining), c.green + c.dim)}`);
+    ? `${icon('⇣', 'chev-d')} ${fmt(remainingTokens)}`
+    : `${icon('⇣', 'chev-d')} ${fmt(remainingTokens)} ${color(pct(remaining), c.dim)}`);
 }
 
 if (totalOutputTokens) {
   sections.push(compact
-    ? `${color(glyph('↗', 'send'), c.magenta + c.bold)} ${color(fmt(totalOutputTokens), c.magenta + c.bold)}`
-    : `${color(glyph('↗', 'send'), c.magenta + c.bold)} ${color(fmt(totalOutputTokens), c.magenta + c.bold)} ${color('(' + fmt(lastOutputTokens) + ')', c.magenta + c.dim)}`);
+    ? `${icon('↗', 'send')} ${fmt(totalOutputTokens)}`
+    : `${icon('↗', 'send')} ${fmt(totalOutputTokens)} ${color('(' + fmt(lastOutputTokens) + ')', c.dim)}`);
 }
 
 sections.push(
   isHeader
     // Just the volume the cache saw; the hit/miss split below is the detail the
     // header has no room for and the message footnote already carries.
-    ? `${color(glyph('◆', 'bolt'), c.cyan + c.bold)} ${color(cacheTotal > 0 ? fmt(cacheTotal) : '—', c.cyan + c.bold)}`
-    : `${color(glyph('◆', 'bolt'), c.cyan + c.bold)} ${cacheText}`,
+    ? `${icon('◆', 'bolt')} ${cacheTotal > 0 ? fmt(cacheTotal) : color('—', c.dim)}`
+    : `${icon('◆', 'bolt')} ${cacheText}`,
 );
 
-// Cache hit-rate is just one more colored block (green good / yellow low),
-// flowing inline. No right-alignment, so it never depends on guessing the
-// exact terminal width and never gets pushed off-screen or wrapped.
-const rateHue = cacheRate === null ? c.gray : cacheRate >= 50 ? c.green : c.yellow;
-sections.push(`${color(glyph('◎', 'target'), rateHue + c.bold)} ${color(pct(cacheRate), rateHue + c.bold)}`);
+// Cache hit-rate is the other state worth a colour: green while the cache is
+// earning its keep, yellow once it is not. No right-alignment, so it never
+// depends on guessing the exact terminal width.
+const rateHue = cacheRate === null ? c.dim : cacheRate >= 50 ? c.green : c.yellow;
+sections.push(`${icon('◎', 'target')} ${color(pct(cacheRate), rateHue)}`);
 
 // Lifetime billing closes the line: it is the one figure that only grows, so it
 // belongs after the per-turn blocks rather than competing with them.
 if (lifetimeTokens) {
-  sections.push(`${color(glyph('Σ', 'book'), c.gray + c.bold)} ${color(fmt(lifetimeTokens), c.gray)}`);
+  sections.push(`${icon('Σ', 'book')} ${color(fmt(lifetimeTokens), c.dim)}`);
 }
 
-// Spacing (not a divider) carries the eye between the colored blocks.
-const gap = compact ? '  ' : '   ';
-const line = sections.join(gap);
+// A dim dot between sections: with the hues gone, spacing alone ran the
+// figures together.
+const gap = color(' · ', c.dim);
+const line = sections.join(compact ? gap : ' ' + gap + ' ');
 
 return line;
 }

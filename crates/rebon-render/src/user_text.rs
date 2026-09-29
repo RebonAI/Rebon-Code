@@ -21,6 +21,17 @@ pub const USER_PROMPT_FOLD_TAIL_LINES: usize = 10;
 /// Minimum line count before a plain user prompt is folded.
 pub const USER_PROMPT_FOLD_THRESHOLD_LINES: usize = 24;
 
+/// Rows on screen past which a prompt folds, for the width-aware fold.
+/// Tighter than the line-count fold: a delegated task brief of a dozen long
+/// paragraphs runs to 20-odd rows and read as a wall on every resume.
+pub const USER_PROMPT_FOLD_THRESHOLD_ROWS: usize = 16;
+
+/// Rows kept above the fold by the width-aware fold.
+pub const USER_PROMPT_FOLD_HEAD_ROWS: usize = 8;
+
+/// Rows kept below the fold by the width-aware fold.
+pub const USER_PROMPT_FOLD_TAIL_ROWS: usize = 4;
+
 /// Fallback separator width for non-widget render paths.
 pub const USER_PROMPT_FOLD_DEFAULT_WIDTH: usize = 120;
 
@@ -268,20 +279,88 @@ pub fn project_user_prompt_display_lines(
     if verbose || lines.len() < USER_PROMPT_FOLD_THRESHOLD_LINES {
         return lines.into_iter().map(UserPromptDisplayLine::Text).collect();
     }
+    fold_prompt_lines(
+        lines,
+        USER_PROMPT_FOLD_HEAD_LINES,
+        USER_PROMPT_FOLD_TAIL_LINES,
+    )
+}
 
-    let hidden_line_count = lines
-        .len()
-        .saturating_sub(USER_PROMPT_FOLD_HEAD_LINES + USER_PROMPT_FOLD_TAIL_LINES);
+/// [`project_user_prompt_display_lines`] for a prompt painted `width`
+/// columns wide: the fold counts the rows the prompt takes on screen, so a
+/// few very long lines — a delegated task brief — fold like many short ones.
+/// A prompt that stays unfolded comes back as its source lines.
+pub fn project_user_prompt_display_lines_for_width(
+    text: &str,
+    verbose: bool,
+    is_transcript_mode: bool,
+    width: usize,
+) -> Vec<UserPromptDisplayLine> {
+    if verbose {
+        return project_user_prompt_display_lines(text, verbose, is_transcript_mode);
+    }
+    let rows = text
+        .lines()
+        .flat_map(|line| wrap_prompt_line(line, width))
+        .collect::<Vec<_>>();
+    if rows.len() <= USER_PROMPT_FOLD_THRESHOLD_ROWS {
+        return text
+            .lines()
+            .map(|line| UserPromptDisplayLine::Text(line.to_owned()))
+            .collect();
+    }
+    fold_prompt_lines(rows, USER_PROMPT_FOLD_HEAD_ROWS, USER_PROMPT_FOLD_TAIL_ROWS)
+}
+
+/// Word-wrap one prompt line to `width` columns; a word wider than a row,
+/// or a run of CJK with no spaces, breaks between characters.
+fn wrap_prompt_line(line: &str, width: usize) -> Vec<String> {
+    use rebon_width::WidthStr;
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_width = 0usize;
+    for word in line.split_inclusive(' ') {
+        let word_width = word.trim_end().width();
+        if row_width > 0 && row_width + word_width > width {
+            rows.push(std::mem::take(&mut row).trim_end().to_owned());
+            row_width = 0;
+        }
+        if word_width > width || (row_width == 0 && word.width() > width) {
+            for ch in word.chars() {
+                let ch_width = ch.to_string().width();
+                if row_width > 0 && row_width + ch_width > width {
+                    rows.push(std::mem::take(&mut row).trim_end().to_owned());
+                    row_width = 0;
+                }
+                row.push(ch);
+                row_width += ch_width;
+            }
+        } else {
+            row.push_str(word);
+            row_width += word.width();
+        }
+    }
+    let row = row.trim_end();
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row.to_owned());
+    }
+    rows
+}
+
+/// Keep `head` lines and `tail` lines of `lines` around a hidden-count
+/// separator.
+fn fold_prompt_lines(lines: Vec<String>, head: usize, tail: usize) -> Vec<UserPromptDisplayLine> {
+    let hidden_line_count = lines.len().saturating_sub(head + tail);
     if hidden_line_count == 0 {
         return lines.into_iter().map(UserPromptDisplayLine::Text).collect();
     }
 
-    let mut display_lines =
-        Vec::with_capacity(USER_PROMPT_FOLD_HEAD_LINES + 2 + USER_PROMPT_FOLD_TAIL_LINES);
+    let mut display_lines = Vec::with_capacity(head + 2 + tail);
     display_lines.extend(
         lines
             .iter()
-            .take(USER_PROMPT_FOLD_HEAD_LINES)
+            .take(head)
             .cloned()
             .map(UserPromptDisplayLine::Text),
     );
@@ -290,7 +369,7 @@ pub fn project_user_prompt_display_lines(
     display_lines.extend(
         lines
             .iter()
-            .skip(lines.len() - USER_PROMPT_FOLD_TAIL_LINES)
+            .skip(lines.len() - tail)
             .cloned()
             .map(UserPromptDisplayLine::Text),
     );
@@ -321,6 +400,65 @@ pub fn format_user_prompt_hidden_separator(hidden_line_count: usize, width: usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn width_aware_fold_counts_rows_on_screen() {
+        // Ten source lines of long prose: under the line-count threshold,
+        // but 30 rows at 40 columns.
+        let paragraph = "word ".repeat(24);
+        let text = vec![paragraph.trim_end(); 10].join(
+            "
+",
+        );
+        assert!(project_user_prompt_display_lines(&text, false, false)
+            .iter()
+            .all(|line| matches!(line, UserPromptDisplayLine::Text(_))));
+
+        let folded = project_user_prompt_display_lines_for_width(&text, false, false, 40);
+        assert_eq!(
+            folded.len(),
+            USER_PROMPT_FOLD_HEAD_ROWS + 2 + USER_PROMPT_FOLD_TAIL_ROWS
+        );
+        assert_eq!(
+            folded[USER_PROMPT_FOLD_HEAD_ROWS],
+            UserPromptDisplayLine::HiddenSeparator {
+                hidden_line_count: 30 - USER_PROMPT_FOLD_HEAD_ROWS - USER_PROMPT_FOLD_TAIL_ROWS
+            }
+        );
+        for line in &folded {
+            if let UserPromptDisplayLine::Text(row) = line {
+                assert!(rebon_width::WidthStr::width(row.as_str()) <= 40, "{row:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn width_aware_fold_leaves_short_prompts_and_verbose_alone() {
+        let text = "one
+two
+three";
+        assert_eq!(
+            project_user_prompt_display_lines_for_width(text, false, false, 40),
+            project_user_prompt_display_lines(text, false, false)
+        );
+        let long = vec!["x"; 40].join(
+            "
+",
+        );
+        assert_eq!(
+            project_user_prompt_display_lines_for_width(&long, true, false, 40).len(),
+            40
+        );
+    }
+
+    #[test]
+    fn prompt_rows_break_cjk_runs_between_characters() {
+        let rows = wrap_prompt_line("这是一段没有空格的很长中文文本用来测试折行", 10);
+        assert!(rows.len() > 1, "{rows:?}");
+        assert!(rows
+            .iter()
+            .all(|row| rebon_width::WidthStr::width(row.as_str()) <= 10));
+    }
 
     fn input(text: &str) -> UserTextInput {
         UserTextInput {

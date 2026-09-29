@@ -29,7 +29,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use rebon_design_system::theme::get_theme;
 use rebon_picker::theme_picker;
@@ -720,23 +720,22 @@ pub fn render(state: &OnboardingDialogState, frame: &mut Frame, area: Rect) {
     let success = Style::default().fg(parse_theme_color(ds.success));
     let error = Style::default().fg(parse_theme_color(ds.error));
 
+    let area = onboarding_card_rect(state, area);
     frame.render_widget(Clear, area);
 
-    let step_label = state.current_step().map(|s| s.label()).unwrap_or("done");
-    let step_num = state.current_step_index + 1;
-    let total = state.steps.len();
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border)
-        .title(Span::styled(
-            format!(
-                " {} ({step_num}/{total}) — {step_label} ",
-                state.dialog_title
-            ),
-            title_style,
-        ));
+        .title(Span::styled(onboarding_title(state), title_style));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    // One column of air on each side of the content.
+    let inner = Rect {
+        x: inner.x.saturating_add(ONBOARDING_PAD_X).min(inner.right()),
+        width: inner.width.saturating_sub(2 * ONBOARDING_PAD_X),
+        ..inner
+    };
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -817,9 +816,65 @@ pub fn render(state: &OnboardingDialogState, frame: &mut Frame, area: Rect) {
 
     let footer = state.footer_text();
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(footer, dim))),
+        Paragraph::new(rebon_tui::dialog_view::key_hint_line(&footer, normal, dim)),
         sections[2],
     );
+}
+
+/// Columns of padding inside the card, on each side.
+const ONBOARDING_PAD_X: u16 = 1;
+/// Widest the card grows.
+const ONBOARDING_MAX_WIDTH: u16 = 96;
+
+/// `Setup guide (2/6) — theme`, or just the dialog's name when it is a
+/// single step (the `/theme` picker), where "(1/1)" says nothing.
+fn onboarding_title(state: &OnboardingDialogState) -> String {
+    let total = state.steps.len();
+    if total <= 1 {
+        return format!(" {} ", state.dialog_title);
+    }
+    let step_label = state.current_step().map(|s| s.label()).unwrap_or("done");
+    let step_num = state.current_step_index + 1;
+    format!(
+        " {} ({step_num}/{total}) — {step_label} ",
+        state.dialog_title
+    )
+}
+
+/// Rows the current step's body needs, for the steps whose content is fixed.
+/// Steps that grow with their data (providers, migration, results) keep the
+/// whole area.
+fn onboarding_step_height(state: &OnboardingDialogState) -> Option<u16> {
+    let rows = match state.current_step()? {
+        // Title, subtitle, blank, one row per theme, blank, hint.
+        Step::Theme => 3 + state.theme_options.len() + 2,
+        // Title, subtitle, blank, then label, description, blank per mode.
+        Step::UiMode => 3 + 2 * 3,
+        _ => return None,
+    };
+    Some(rows.min(u16::MAX as usize) as u16)
+}
+
+/// The card the dialog is drawn in: no wider than a comfortable measure, and
+/// for fixed-content steps no taller than its content, centred in `area`. A
+/// six-line theme list inside a frame that filled the whole screen read as
+/// something that had failed to load.
+fn onboarding_card_rect(state: &OnboardingDialogState, area: Rect) -> Rect {
+    let width = area.width.min(ONBOARDING_MAX_WIDTH);
+    let height = match onboarding_step_height(state) {
+        Some(body) => {
+            let welcome = if state.show_welcome { 2 } else { 0 };
+            // Frame (2) + welcome + body + a blank row + footer.
+            (2 + welcome + body + 2).min(area.height)
+        }
+        None => area.height,
+    };
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
 }
 
 fn render_theme_step(
@@ -840,7 +895,7 @@ fn render_theme_step(
 
     for (idx, (label, _)) in state.theme_options.iter().enumerate() {
         let is_focused = idx == state.theme_focus;
-        let prefix = if is_focused { "> " } else { "  " };
+        let prefix = if is_focused { "❯ " } else { "  " };
         let style = if is_focused { focused } else { normal };
         lines.push(Line::from(vec![
             Span::styled(prefix, style),
@@ -893,7 +948,7 @@ fn render_ui_mode_step(
     ] {
         let is_focused = state.ui_mode == mode;
         let style = if is_focused { focused } else { normal };
-        let prefix = if is_focused { "> " } else { "  " };
+        let prefix = if is_focused { "❯ " } else { "  " };
         lines.push(Line::from(vec![
             Span::styled(prefix, style),
             Span::styled(format!("{index}. {label}"), style),
@@ -3029,6 +3084,90 @@ mod tests {
     }
 
     #[test]
+    fn fixed_steps_shrink_to_their_content_and_centre() {
+        let mut state = state_on_login_pane(false);
+        state.steps = vec![Step::Theme, Step::UiMode, Step::Provider];
+        state.current_step_index = 0;
+        state.show_welcome = false;
+        let area = Rect::new(0, 0, 140, 50);
+
+        let theme = onboarding_card_rect(&state, area);
+        let body = 3 + state.theme_options.len() as u16 + 2;
+        assert_eq!(theme.height, 2 + body + 2);
+        assert_eq!(theme.width, ONBOARDING_MAX_WIDTH);
+        assert_eq!(theme.x, (140 - ONBOARDING_MAX_WIDTH) / 2);
+        assert_eq!(theme.y, (50 - theme.height) / 2);
+
+        state.show_welcome = true;
+        assert_eq!(onboarding_card_rect(&state, area).height, 2 + 2 + body + 2);
+
+        state.current_step_index = 1;
+        assert_eq!(onboarding_card_rect(&state, area).height, 2 + 2 + 9 + 2);
+
+        // Data-sized steps keep the whole height.
+        state.current_step_index = 2;
+        let provider = onboarding_card_rect(&state, area);
+        assert_eq!((provider.y, provider.height), (0, 50));
+
+        // A short terminal clamps instead of overflowing.
+        state.current_step_index = 0;
+        let short = onboarding_card_rect(&state, Rect::new(0, 0, 60, 6));
+        assert_eq!((short.width, short.height), (60, 6));
+    }
+
+    #[test]
+    fn single_step_dialogs_drop_the_step_counter() {
+        let mut state = state_on_login_pane(false);
+        state.steps = vec![Step::Theme];
+        state.current_step_index = 0;
+        let title = onboarding_title(&state);
+        assert!(!title.contains("(1/1)"), "{title}");
+        assert_eq!(title, format!(" {} ", state.dialog_title));
+
+        state.steps = vec![Step::Theme, Step::UiMode];
+        let title = onboarding_title(&state);
+        assert!(title.contains("(1/2)"), "{title}");
+        assert!(title.contains(Step::Theme.label()), "{title}");
+    }
+
+    #[test]
+    fn theme_step_card_renders_rounded_and_padded() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut state = state_on_login_pane(false);
+        state.steps = vec![Step::Theme];
+        state.current_step_index = 0;
+        state.show_welcome = false;
+        state.theme_options = theme_picker::build_options(false)
+            .into_iter()
+            .map(|option| (option.label, option.value))
+            .collect();
+        state.theme_focus = 0;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|frame| render(&state, frame, frame.area()))
+            .unwrap();
+        let rows = (0..40)
+            .map(|y| {
+                (0..120)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let top = rows.iter().position(|row| row.contains('╭')).expect("top");
+        let bottom = rows
+            .iter()
+            .position(|row| row.contains('╰'))
+            .expect("bottom");
+        assert!(
+            top > 0 && bottom < 39,
+            "card should not fill the screen: {rows:?}"
+        );
+        assert!(rows.iter().any(|row| row.contains("│ ❯ 1. ")), "{rows:?}");
+    }
+
+    #[test]
     fn ui_mode_step_renders_both_options_and_current_selection() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -3052,7 +3191,7 @@ mod tests {
 
         assert!(rendered.contains("Choose how Rebon uses your terminal"));
         assert!(rendered.contains("1. Screen"));
-        assert!(rendered.contains("> 2. Inline"));
+        assert!(rendered.contains("❯ 2. Inline"));
         assert!(rendered.contains("/settings"));
     }
 

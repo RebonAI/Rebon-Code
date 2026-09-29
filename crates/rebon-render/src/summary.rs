@@ -21,7 +21,7 @@ pub const SUMMARY_MAX_CHARS: usize = 200;
 /// Keys whose values are file paths and should never be truncated —
 /// a truncated path loses its most important prefix.
 fn is_path_key(key: &str) -> bool {
-    matches!(key, "file_path" | "path")
+    matches!(key, "file_path" | "path" | "notebook_path")
 }
 
 pub fn format_sleep_duration_ms(ms: u64) -> String {
@@ -156,7 +156,18 @@ pub fn streaming_tool_summary(tool_name: &str, map: &HashMap<String, Value>) -> 
 
     match rebon_tools_core::primary_display_params(tool_name) {
         Some(keys) => {
-            let parts: Vec<String> = keys.iter().filter_map(|k| get_val(map, k)).collect();
+            let parts: Vec<String> = keys
+                .iter()
+                .filter_map(|k| {
+                    let value = get_val(map, k)?;
+                    // Paths inside the session's directory read relative to it.
+                    Some(if is_path_key(k) {
+                        crate::display_path::display_path(&value).into_owned()
+                    } else {
+                        value
+                    })
+                })
+                .collect();
             parts.join(", ")
         }
         None => compact_json_map(map),

@@ -1128,10 +1128,16 @@ mod tests {
             committed_rows,
             88,
         );
-        assert_eq!(expected_insert_height, 2);
+        // The code line between its panel's half-row edges, then the
+        // paragraph after the block.
+        assert_eq!(expected_insert_height, 4);
+        // Full height: the commit exactly fills the rows above the viewport.
         terminal
-            .shrink_inline_viewport_keeping_top_for_insert_before(8, expected_insert_height)
-            .expect("reserve two rows for the pending commit");
+            .shrink_inline_viewport_keeping_top_for_insert_before(
+                10 - expected_insert_height,
+                expected_insert_height,
+            )
+            .expect("reserve rows for the pending commit");
 
         flush_inline_commits(
             &mut terminal,

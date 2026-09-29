@@ -767,7 +767,10 @@ fn flush_sealed_prefix(
         && prefix_end == state.overlay.blocks.len()
     {
         if let Some(StreamingContentBlock::Text(text)) = state.overlay.blocks.last() {
-            match text.rfind('\n') {
+            match text
+                .rfind('\n')
+                .and_then(|cut| cut_outside_pipe_table(text, cut))
+            {
                 Some(cut) if !text[..cut].trim().is_empty() => {
                     live_text_remainder = Some(text[cut + 1..].to_string());
                 }
@@ -821,6 +824,37 @@ fn flush_sealed_prefix(
         first_chunk_is_continuation,
         |idx| format!("partial-{counter}-{idx}"),
     );
+}
+
+/// Move a live-text cut back so it never lands inside a pipe table.
+///
+/// The two halves of a cut render as independent markdown documents. A table
+/// split between them loses its header on one side — the header alone is
+/// dropped and the body rows print as literal `|` text — so the cut moves to
+/// the newline before the table's first row. `None` when the table starts the
+/// text: the whole block is held until the table is finished.
+///
+/// A cut inside an open code fence is left where it is; the fence is closed
+/// and re-opened across it, and `|` lines in code are not a table.
+fn cut_outside_pipe_table(text: &str, cut: usize) -> Option<usize> {
+    if rebon_render::open_fence_at_end(&text[..cut]).is_some() {
+        return Some(cut);
+    }
+    let mut end = cut;
+    let mut table_start = None;
+    loop {
+        let line_start = text[..end].rfind('\n').map_or(0, |nl| nl + 1);
+        let line = text[line_start..end].trim_start_matches(' ');
+        if !line.starts_with('|') {
+            break;
+        }
+        table_start = Some(line_start);
+        if line_start == 0 {
+            return None;
+        }
+        end = line_start - 1;
+    }
+    Some(table_start.map_or(cut, |start| start - 1))
 }
 
 /// Apply an action to the state in place.
@@ -1245,6 +1279,83 @@ mod tests {
             s.overlay.combined_streaming_text().as_deref(),
             Some("partial")
         );
+    }
+
+    fn overflow_flush(text: &str) -> AppState {
+        let mut s = AppState::new();
+        reducer(&mut s, Action::AppendStreamingText(text.into()));
+        reducer(
+            &mut s,
+            Action::FlushSealedPrefix {
+                commit_timestamp: "t".into(),
+                policy: SealedPrefixFlushPolicy::DrainClosedStableAndLiveText,
+            },
+        );
+        s
+    }
+
+    fn committed_text(s: &AppState) -> Vec<String> {
+        s.transcript
+            .rows()
+            .iter()
+            .filter_map(|row| match row {
+                Message::Assistant(a) => match &a.message.content[0] {
+                    AssistantContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn overflow_flush_never_splits_a_pipe_table() {
+        let s = overflow_flush("intro\n\n| h1 | h2 |\n| --- | --- |\n| a | b |\n| c");
+        assert_eq!(committed_text(&s), vec!["intro\n".to_string()]);
+        assert_eq!(
+            s.overlay.combined_streaming_text().as_deref(),
+            Some("| h1 | h2 |\n| --- | --- |\n| a | b |\n| c")
+        );
+    }
+
+    #[test]
+    fn overflow_flush_holds_a_table_that_starts_the_text() {
+        let s = overflow_flush("| h1 | h2 |\n| --- | --- |\n| a | b |\n| c");
+        assert!(committed_text(&s).is_empty());
+        assert_eq!(
+            s.overlay.combined_streaming_text().as_deref(),
+            Some("| h1 | h2 |\n| --- | --- |\n| a | b |\n| c")
+        );
+    }
+
+    #[test]
+    fn overflow_flush_cuts_after_a_finished_table() {
+        let s = overflow_flush("| h |\n| - |\n| a |\n\nafter the table\npartial");
+        assert_eq!(
+            committed_text(&s),
+            vec!["| h |\n| - |\n| a |\n\nafter the table".to_string()]
+        );
+        assert_eq!(
+            s.overlay.combined_streaming_text().as_deref(),
+            Some("partial")
+        );
+    }
+
+    #[test]
+    fn pipe_lines_inside_a_code_fence_are_not_a_table() {
+        let text = "```\n| not | a table |\n| x |\npartial";
+        let cut = text.rfind('\n').unwrap();
+        assert_eq!(cut_outside_pipe_table(text, cut), Some(cut));
+    }
+
+    #[test]
+    fn cut_outside_pipe_table_walks_back_over_indented_rows() {
+        let text = "para\n  | h |\n  | - |\n  | a";
+        let cut = text.rfind('\n').unwrap();
+        assert_eq!(cut_outside_pipe_table(text, cut), Some(4));
+        let plain = "one\ntwo\nthree";
+        let cut = plain.rfind('\n').unwrap();
+        assert_eq!(cut_outside_pipe_table(plain, cut), Some(cut));
     }
 
     #[test]

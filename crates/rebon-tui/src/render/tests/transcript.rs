@@ -56,8 +56,9 @@ fn inline_pending_terminal_tool_cluster_renders_as_bounded_collapsed_live_tail()
             && !rows.iter().any(|row| row.contains("Grep (needle)")),
         "compact live tail should not expose raw per-tool rows: {rows:?}"
     );
+    // Five rows of content plus the prompt card's two half-row edges.
     assert!(
-        result.total_lines <= 5,
+        result.total_lines <= 7,
         "collapsed live tail should stay bounded, got {} lines and rows {rows:?}",
         result.total_lines
     );
@@ -472,7 +473,7 @@ fn streaming_text_and_finalized_committed_text_render_same_normalized_rows() {
     assert_eq!(streaming_rows, committed_rows);
     let joined = streaming_rows.join("\n");
     assert!(joined.contains("Header"), "heading missing: {joined:?}");
-    assert!(joined.contains("- first item"), "list missing: {joined:?}");
+    assert!(joined.contains("• first item"), "list missing: {joined:?}");
     assert!(
         joined.contains("bold") && joined.contains("em"),
         "emphasis text missing: {joined:?}"
@@ -586,7 +587,7 @@ fn streaming_text_cache_handles_incremental_markdown_deltas() {
         joined.contains("bold markdown"),
         "bold text missing: {joined:?}"
     );
-    assert!(joined.contains("- first item"), "list missing: {joined:?}");
+    assert!(joined.contains("• first item"), "list missing: {joined:?}");
     assert!(
         !joined.contains("**bold**"),
         "markdown marker leaked after incremental cache reuse: {joined:?}"
@@ -885,4 +886,46 @@ fn streaming_overlay_partial_scroll_matches_full_render_slice() {
         trim_blank_boundaries(actual),
         "partial overlay scratch paint must match the full render slice"
     );
+}
+
+/// A blank line inside a fenced code block is one row on screen, the same one
+/// row the height measurement counts; painting it as two clipped the end of
+/// the message.
+#[test]
+fn blank_code_lines_are_one_row_and_do_not_clip_the_tail() {
+    let theme = RenderTheme::plain();
+    let mut state = AppState::new();
+    reducer(
+        &mut state,
+        Action::AppendStreamingText("```rust\na\n\nb\n\n\nc\n```\ntail".into()),
+    );
+    reducer(
+        &mut state,
+        Action::FinalizeTurn {
+            commit_uuid: "a1".into(),
+            commit_timestamp: "t".into(),
+        },
+    );
+    let mut buf = new_buf(40, 12);
+    render_transcript(
+        &state,
+        Rect::new(0, 0, 40, 12),
+        &mut buf,
+        &theme,
+        0,
+        ToolOutputVerbosity::Compact,
+        0,
+        None,
+    );
+    let rows: Vec<String> = (0..12).map(|y| row_text(&buf, y)).collect();
+    let content: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
+    // The first code row also carries the language against its right edge.
+    let a = content
+        .iter()
+        .position(|row| row.starts_with('a'))
+        .expect("a");
+    assert_eq!(&content[a + 1..a + 6], ["", "b", "", "", "c"], "{rows:?}");
+    // The panel's bottom edge, then the paragraph after the block.
+    assert!(content[a + 6].chars().all(|ch| ch == '▀'), "{rows:?}");
+    assert_eq!(content[a + 7], "tail", "{rows:?}");
 }

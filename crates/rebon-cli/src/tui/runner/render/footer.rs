@@ -1,5 +1,36 @@
 use super::*;
 
+/// The colour a non-default permission mode is announced in, shared by the
+/// footer and the status-line prefix. Each mode keeps its own hue — plan is
+/// the calm teal, the edit-accepting modes the palette's auto-accept violet,
+/// and the modes that skip the prompt entirely read as a warning — and every
+/// hue comes from the palette, so it holds on light and dark backgrounds
+/// alike (a fixed ANSI yellow all but vanished on a light one).
+pub(in crate::tui::runner) fn permission_mode_style(
+    mode: rebon_permissions::PermissionMode,
+) -> Style {
+    Style::default()
+        .fg(parse_theme_color(permission_mode_token(mode)))
+        .add_modifier(Modifier::BOLD)
+}
+
+/// The palette token a permission mode is announced in.
+fn permission_mode_token(mode: rebon_permissions::PermissionMode) -> &'static str {
+    use rebon_permissions::PermissionMode;
+    let ds = rebon_design_system::theme::get_active_theme();
+    match mode {
+        PermissionMode::Plan => ds.planMode,
+        PermissionMode::AcceptEdits | PermissionMode::Auto => ds.autoAccept,
+        PermissionMode::BypassPermissions | PermissionMode::DontAsk => ds.error,
+        PermissionMode::Default | PermissionMode::Bubble => ds.inactive,
+    }
+}
+
+/// [`permission_mode_style`] as a footer chip: the mode's hue on a wash of it.
+fn permission_mode_chip(mode: rebon_permissions::PermissionMode) -> Style {
+    rebon_tui::chip_style(permission_mode_token(mode)).add_modifier(Modifier::BOLD)
+}
+
 pub(in crate::tui::runner) fn render_footer(
     frame: &mut Frame,
     area: Rect,
@@ -21,26 +52,35 @@ pub(in crate::tui::runner) fn render_footer(
             rebon_permissions::PermissionMode::Auto => "Auto",
             _ => rebon_permissions::permission_mode_short_title(app.permission_mode),
         };
-        let ds_mode = rebon_design_system::theme::get_active_theme();
-        let mode_color = match app.permission_mode {
-            rebon_permissions::PermissionMode::Plan => parse_theme_color(ds_mode.planMode),
-            _ => parse_theme_color(ds_mode.chromeYellow),
-        };
         let padded_sym = rebon_width::pad_wide_symbol(sym);
+        // The mode sits on a chip of its own hue; the cycling hint recedes
+        // beside it rather than sharing the chip.
         priority_spans.push(Span::styled(
-            format!(" {padded_sym} {label} (shift+tab to cycle) "),
-            Style::default().fg(mode_color),
+            format!(" {padded_sym} {label} "),
+            permission_mode_chip(app.permission_mode),
+        ));
+        priority_spans.push(Span::styled(
+            "(shift+tab to cycle) ",
+            Style::default().fg(parse_theme_color(
+                rebon_design_system::theme::get_active_theme().inactive,
+            )),
         ));
     }
 
     let ds_footer = rebon_design_system::theme::get_active_theme();
+    // Status badges are chips: text in the badge's hue on a wash of it.
+    // Warm badges take `warning`, not `chromeYellow` — tuned per palette,
+    // it stays legible where the bright yellow washed out on light ones.
+    let warm_chip = rebon_tui::chip_style(ds_footer.warning);
+    let brand_chip = rebon_tui::chip_style(ds_footer.rebon);
+    let plan_chip = rebon_tui::chip_style(ds_footer.planMode);
     let snapshots = app.task_snapshots();
     use rebon_tui::promptinput::footer_navigation::FooterItem;
 
     if let Some(label) =
         rebon_plugin_tasks::ui::tasks_view::background_tasks_footer_label(&snapshots)
     {
-        let mut tasks_style = Style::default().fg(parse_theme_color(ds_footer.chromeYellow));
+        let mut tasks_style = warm_chip;
         if tasks_footer_is_selected(app) {
             tasks_style = tasks_style
                 .add_modifier(Modifier::REVERSED)
@@ -54,18 +94,17 @@ pub(in crate::tui::runner) fn render_footer(
     // Pill / scroll indicator driven by zones + unseen divider.
     if zones.show_pill {
         let display = new_messages_pill::project_pill(zones.pill_count, false);
+        left_spans.push(Span::raw(" "));
         left_spans.push(Span::styled(
             format!(" {} {} ", display.arrow, display.label),
-            Style::default().fg(parse_theme_color(ds_footer.professionalBlue)),
+            brand_chip,
         ));
     }
 
     let queue_len = visible_queue_len(app);
     if queue_len > 0 {
-        left_spans.push(Span::styled(
-            format!(" queue: {queue_len} "),
-            Style::default().fg(parse_theme_color(ds_footer.chromeYellow)),
-        ));
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(format!(" queue: {queue_len} "), warm_chip));
     }
 
     // Ultraplan phase is rendered as a top-right header chip
@@ -84,12 +123,13 @@ pub(in crate::tui::runner) fn render_footer(
             false,
         );
         if let Some(ts) = team_display {
-            let mut team_style = Style::default().fg(parse_theme_color(ds_footer.planMode));
+            let mut team_style = plan_chip;
             if teams_selected {
                 team_style = team_style
                     .add_modifier(Modifier::REVERSED)
                     .add_modifier(Modifier::BOLD);
             }
+            left_spans.push(Span::raw(" "));
             left_spans.push(Span::styled(format!(" {} ", ts.text), team_style));
         }
     }
@@ -99,20 +139,22 @@ pub(in crate::tui::runner) fn render_footer(
     let _cost_formatter = format_cost_default; // tracked for when API cost is plumbed
 
     if let Some(label) = rebon_plugin_tasks::ui::tasks_view::workflows_footer_label(&snapshots) {
-        let mut workflows_style = Style::default().fg(parse_theme_color(ds_footer.planMode));
+        let mut workflows_style = plan_chip;
         if app.footer_selection == Some(FooterItem::Workflows) {
             workflows_style = workflows_style
                 .add_modifier(Modifier::REVERSED)
                 .add_modifier(Modifier::BOLD);
         }
+        left_spans.push(Span::raw(" "));
         left_spans.push(Span::styled(format!(" {label} "), workflows_style));
     }
 
     if app.rc_status.is_visible() {
-        let mut style = Style::default().fg(parse_theme_color(ds_footer.professionalBlue));
+        let mut style = brand_chip;
         if app.footer_selection == Some(FooterItem::Bridge) {
             style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
         }
+        left_spans.push(Span::raw(" "));
         left_spans.push(Span::styled(" Bridge ", style));
     }
 
@@ -267,6 +309,44 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mode_style_tests {
+    use super::*;
+    use rebon_permissions::PermissionMode;
+
+    #[test]
+    fn each_mode_keeps_its_own_palette_hue() {
+        let ds = rebon_design_system::theme::get_active_theme();
+        let fg = |mode| permission_mode_style(mode).fg;
+        assert_eq!(
+            fg(PermissionMode::Plan),
+            Some(parse_theme_color(ds.planMode))
+        );
+        assert_eq!(
+            fg(PermissionMode::AcceptEdits),
+            Some(parse_theme_color(ds.autoAccept))
+        );
+        assert_eq!(
+            fg(PermissionMode::Auto),
+            Some(parse_theme_color(ds.autoAccept))
+        );
+        assert_eq!(
+            fg(PermissionMode::BypassPermissions),
+            Some(parse_theme_color(ds.error))
+        );
+        assert_eq!(
+            fg(PermissionMode::DontAsk),
+            Some(parse_theme_color(ds.error))
+        );
+        for mode in [PermissionMode::Plan, PermissionMode::Auto] {
+            let style = permission_mode_style(mode);
+            assert!(style.add_modifier.contains(Modifier::BOLD));
+            // Never a fixed ANSI colour tuned for one background.
+            assert!(!matches!(style.fg, Some(Color::Yellow)));
         }
     }
 }

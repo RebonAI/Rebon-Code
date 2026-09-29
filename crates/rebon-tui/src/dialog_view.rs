@@ -16,13 +16,14 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use rebon_dialog::host::{DialogStack, StackKey};
 use rebon_dialog::model::{
     DialogKey, KeyPress, ListAccent, ListView, OutlineView, PanelPane, PanelRow, PanelSplit,
     PanelTab, PanelView, RowTone, SearchView, TextSpan, ViewSpec,
 };
+use rebon_width::WidthStr;
 
 use crate::render::parse_theme_color;
 
@@ -429,6 +430,7 @@ pub fn render_list_view(frame: &mut Frame, area: Rect, view: &ListView) {
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border)
         .title(Span::styled(view.title.clone(), title_style));
     let inner = block.inner(area);
@@ -442,7 +444,10 @@ pub fn render_list_view(frame: &mut Frame, area: Rect, view: &ListView) {
         lines.push(Line::from(Span::styled(header.clone(), dim)));
     }
 
-    for (index, row) in visible_range(view, inner.height) {
+    let visible: Vec<_> = visible_range(view, inner.height).collect();
+    let detail_column = list_detail_column(visible.iter().map(|(_, row)| *row), inner.width);
+    let band = Style::default().bg(parse_theme_color(ds.messageActionsBackground));
+    for (index, row) in visible {
         let is_selected = index == view.selected;
         let marker = if is_selected { "❯ " } else { "  " };
         let label_style = if is_selected { accent } else { normal };
@@ -453,15 +458,31 @@ pub fn render_list_view(frame: &mut Frame, area: Rect, view: &ListView) {
                 if checked { ok } else { dim },
             ));
         }
-        if let Some(prefix) = &row.prefix {
-            spans.push(Span::styled(prefix.clone(), label_style));
+        let prefix = row.prefix.as_deref().unwrap_or("");
+        if !prefix.is_empty() {
+            spans.push(Span::styled(prefix.to_string(), label_style));
         }
-        spans.push(Span::styled(row.label.clone(), label_style));
-        if let Some(detail) = &row.detail {
-            spans.push(Span::styled(
-                detail.clone(),
-                if is_selected { detail_selected } else { dim },
-            ));
+        match (&row.detail, detail_column) {
+            (Some(detail), Some(column)) => {
+                // Details line up in one column, so a list of models or
+                // providers reads as a table rather than a run-on string.
+                let label = row.label.trim_end();
+                let used = prefix.width() + label.width();
+                spans.push(Span::styled(label.to_string(), label_style));
+                spans.push(Span::raw(" ".repeat(column.saturating_sub(used) + 2)));
+                spans.push(Span::styled(
+                    detail.trim_start().to_string(),
+                    if is_selected { detail_selected } else { dim },
+                ));
+            }
+            (Some(detail), None) => {
+                spans.push(Span::styled(row.label.clone(), label_style));
+                spans.push(Span::styled(
+                    detail.clone(),
+                    if is_selected { detail_selected } else { dim },
+                ));
+            }
+            (None, _) => spans.push(Span::styled(row.label.clone(), label_style)),
         }
         if let Some(badge) = &row.badge {
             spans.push(Span::styled(
@@ -469,14 +490,62 @@ pub fn render_list_view(frame: &mut Frame, area: Rect, view: &ListView) {
                 if badge.bold { ok_bold } else { ok },
             ));
         }
+        if is_selected {
+            // A soft band across the whole row marks the selection without
+            // shouting; the accent pointer and weight do the rest.
+            let used: usize = spans.iter().map(|span| span.content.width()).sum();
+            spans.push(Span::raw(
+                " ".repeat((inner.width as usize).saturating_sub(used)),
+            ));
+            spans = spans
+                .into_iter()
+                .map(|span| {
+                    let style = span.style.patch(band);
+                    span.style(style)
+                })
+                .collect();
+        }
         lines.push(Line::from(spans));
     }
 
     lines.push(Line::from(""));
     for footer in &view.footer {
-        lines.push(Line::from(Span::styled(footer.clone(), dim)));
+        lines.push(key_hint_line(footer, normal, dim));
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The column details start at: the widest `prefix + label` among rows that
+/// carry a detail, so the details align. Capped so a long label cannot push
+/// every detail off the row; `None` when no row has a detail.
+fn list_detail_column<'a>(
+    rows: impl Iterator<Item = &'a rebon_dialog::model::ListRow>,
+    width: u16,
+) -> Option<usize> {
+    let widest = rows
+        .filter(|row| row.detail.is_some())
+        .map(|row| row.prefix.as_deref().unwrap_or("").width() + row.label.trim_end().width())
+        .max()?;
+    Some(widest.min(width as usize * 3 / 5))
+}
+
+/// A `key action · key action` hint with each key in the body tone and the
+/// rest receding. The key is the first word of each part.
+pub fn key_hint_line(hint: &str, key: Style, dim: Style) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (idx, part) in hint.split(" · ").enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled(" · ", dim));
+        }
+        match part.split_once(' ') {
+            Some((k, action)) if !k.is_empty() => {
+                spans.push(Span::styled(k.to_string(), key));
+                spans.push(Span::styled(format!(" {action}"), dim));
+            }
+            _ => spans.push(Span::styled(part.to_string(), dim)),
+        }
+    }
+    Line::from(spans)
 }
 
 /// The rows to paint, paired with their index in `view.rows`.

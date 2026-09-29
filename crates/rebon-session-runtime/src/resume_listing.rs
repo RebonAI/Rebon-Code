@@ -189,8 +189,15 @@ fn hydrate_entry(
     let title = candidate
         .cached_title
         .filter(|title| !title.trim().is_empty())
-        .or_else(|| rebon_session::load_session_title(projects_root, &transcript_cwd, &session_id))
-        .unwrap_or_else(|| derive_title(projects_root, &transcript_cwd, &session_id));
+        .or_else(|| rebon_session::load_session_title(projects_root, &transcript_cwd, &session_id));
+    // Neither a transcript nor a title: the session never took a prompt.
+    // It is the blank session a TUI opens at startup and leaves behind
+    // when the user resumes another, still in this process's session map;
+    // listed, it showed as a bare id with no size and nothing to resume.
+    if metadata.is_none() && title.is_none() {
+        return None;
+    }
+    let title = title.unwrap_or_else(|| derive_title(projects_root, &transcript_cwd, &session_id));
 
     Some(SessionEntry {
         session_id,
@@ -604,6 +611,11 @@ mod tests {
         let server_state = rebon_acp::ServerState::new();
         let active = server_state.create_session(cwd.to_string(), Vec::new());
         let stopped = server_state.create_session(cwd.to_string(), Vec::new());
+        for session in [&active, &stopped] {
+            let transcript =
+                rebon_session::ensure_session_file_path(root.path(), cwd, &session.id).unwrap();
+            std::fs::write(transcript, b"{}\n").unwrap();
+        }
         let _active_lock =
             rebon_session::try_acquire_session_active_lock(root.path(), cwd, &active.id)
                 .unwrap()
@@ -617,6 +629,34 @@ mod tests {
 
         assert!(!ids.contains(&active.id.as_str()));
         assert!(ids.contains(&stopped.id.as_str()));
+    }
+
+    /// Resuming away from a fresh session leaves it in this process's
+    /// session map with no transcript and no title; it used to be listed as
+    /// a bare id prefix with no size. A session with either is kept.
+    #[test]
+    fn open_hides_a_session_that_never_took_a_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = "/tmp/resume-blank-filter";
+        let server_state = rebon_acp::ServerState::new();
+        let blank = server_state.create_session(cwd.to_string(), Vec::new());
+        let with_transcript = server_state.create_session(cwd.to_string(), Vec::new());
+        let transcript =
+            rebon_session::ensure_session_file_path(root.path(), cwd, &with_transcript.id).unwrap();
+        std::fs::write(transcript, b"{}\n").unwrap();
+        let titled = server_state.create_session(cwd.to_string(), Vec::new());
+        rebon_session::save_session_title(root.path(), cwd, &titled.id, "Named but unsaved")
+            .unwrap();
+
+        let entries = discover_entries(root.path(), cwd, &server_state, "current").unwrap();
+        let ids = entries
+            .iter()
+            .map(|entry| entry.session_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(!ids.contains(&blank.id.as_str()), "{ids:?}");
+        assert!(ids.contains(&with_transcript.id.as_str()), "{ids:?}");
+        assert!(ids.contains(&titled.id.as_str()), "{ids:?}");
     }
 
     fn test_runtime_fields() -> rebon_session_host::BackgroundRuntimeFields {

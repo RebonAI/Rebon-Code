@@ -3,10 +3,10 @@
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self, Event, KeyCode};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use rebon_design_system::theme::get_active_theme;
 use rebon_dialog::common::DialogColor;
 use rebon_dialog::dev_channels::{self, ChannelEntryInput, DevChannelsAction, DevChannelsValue};
@@ -286,7 +286,7 @@ fn run_select_dialog(
 
     loop {
         guard.terminal().draw(|frame| {
-            let area = centered_rect(frame.area(), 88, 72);
+            let area = frame.area();
             render_dialog(
                 frame,
                 area,
@@ -340,7 +340,7 @@ fn run_multi_select_dialog(
 
     loop {
         guard.terminal().draw(|frame| {
-            let area = centered_rect(frame.area(), 88, 72);
+            let area = frame.area();
             render_multi_select_dialog(
                 frame,
                 area,
@@ -386,6 +386,178 @@ fn run_multi_select_dialog(
     }
 }
 
+/// The palette a startup dialog draws with.
+struct DialogStyles {
+    background: Style,
+    border: Style,
+    title: Style,
+    headline: Style,
+    normal: Style,
+    dim: Style,
+    focused: Style,
+    key: Style,
+}
+
+impl DialogStyles {
+    fn for_color(color: DialogColor) -> Self {
+        let ds = get_active_theme();
+        let dialog_bg = parse_theme_color(ds.inverseText);
+        let background = Style::default().bg(dialog_bg);
+        let fg = |key: &str| background.fg(parse_theme_color(key));
+        let border_color = match color {
+            DialogColor::Warning => ds.warning,
+            DialogColor::Error => ds.error,
+            DialogColor::Permission => ds.permission,
+            DialogColor::Success => ds.success,
+            DialogColor::Default => ds.subtle,
+        };
+        Self {
+            background,
+            border: fg(border_color),
+            title: fg(border_color).add_modifier(Modifier::BOLD),
+            headline: fg(ds.text).add_modifier(Modifier::BOLD),
+            normal: fg(ds.text),
+            dim: fg(ds.inactive),
+            focused: fg(ds.suggestion).add_modifier(Modifier::BOLD),
+            key: fg(ds.text),
+        }
+    }
+}
+
+/// How a body line reads. Dialog bodies are plain strings, so the tone comes
+/// from the line itself: a `> ` lead-in is the headline, a question or a
+/// "detected:" summary is what the user is being asked about, and everything
+/// else is supporting detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyTone {
+    Headline,
+    Normal,
+    Dim,
+}
+
+fn body_tone(line: &str) -> (BodyTone, &str) {
+    if let Some(rest) = line.strip_prefix("> ") {
+        return (BodyTone::Headline, rest);
+    }
+    let trimmed = line.trim_end();
+    if trimmed.contains("detected:") || trimmed == "Choose an option:" || trimmed.ends_with('?') {
+        (BodyTone::Normal, line)
+    } else {
+        (BodyTone::Dim, line)
+    }
+}
+
+/// Horizontal padding between the frame and the content.
+const DIALOG_PAD_X: u16 = 2;
+/// Vertical padding between the frame and the content.
+const DIALOG_PAD_Y: u16 = 1;
+const DIALOG_MIN_WIDTH: u16 = 52;
+const DIALOG_MAX_WIDTH: u16 = 84;
+
+/// A startup dialog sized to what it says: as wide as its longest line (within
+/// a readable measure) and exactly as tall as its content, centred in `area`.
+/// Filling most of the screen with an empty frame made a two-line question look
+/// like something had failed to load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DialogLayout {
+    frame: Rect,
+    body: Rect,
+    options: Rect,
+    footer: Rect,
+    body_rows: Vec<(BodyTone, String)>,
+}
+
+fn dialog_layout(
+    area: Rect,
+    body_lines: &[String],
+    option_widths: impl Iterator<Item = usize>,
+    option_count: usize,
+    footer: &str,
+) -> DialogLayout {
+    let chrome_x = 2 + 2 * DIALOG_PAD_X;
+    let body_width = body_lines
+        .iter()
+        .flat_map(|line| line.split('\n'))
+        .map(|line| rebon_width::str_width(body_tone(line).1))
+        .max()
+        .unwrap_or(0);
+    let options_width = option_widths.map(|w| w + 2).max().unwrap_or(0);
+    let wanted = body_width
+        .max(options_width)
+        .max(rebon_width::str_width(footer))
+        .min(u16::MAX as usize) as u16;
+    let width = wanted
+        .saturating_add(chrome_x)
+        .clamp(DIALOG_MIN_WIDTH, DIALOG_MAX_WIDTH)
+        .min(area.width);
+    let text_width = width.saturating_sub(chrome_x) as usize;
+
+    let mut body_rows = Vec::new();
+    for line in body_lines {
+        let (tone, text) = body_tone(line);
+        for row in wrap_lines(text, text_width) {
+            body_rows.push((tone, row));
+        }
+    }
+    // Trailing blank rows would only pad the gap above the options.
+    while body_rows.last().is_some_and(|(_, row)| row.is_empty()) {
+        body_rows.pop();
+    }
+
+    let option_count = option_count.min(u16::MAX as usize) as u16;
+    let body_height = body_rows.len() as u16;
+    let gap = u16::from(body_height > 0);
+    let footer_height = if footer.is_empty() { 0 } else { 2 };
+    let content = body_height + gap + option_count + footer_height;
+    let height = (content + 2 + 2 * DIALOG_PAD_Y).min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let frame = Rect::new(x, y, width, height);
+
+    let inner = Rect::new(
+        x + 1 + DIALOG_PAD_X,
+        y + 1 + DIALOG_PAD_Y,
+        width.saturating_sub(2 + 2 * DIALOG_PAD_X),
+        height.saturating_sub(2 + 2 * DIALOG_PAD_Y),
+    );
+    // Options and the footer are what the user acts on, so when the terminal
+    // is too short the body gives way first.
+    let reserved = option_count + footer_height + gap;
+    let body_height = body_height.min(inner.height.saturating_sub(reserved));
+    let options_height = option_count.min(inner.height.saturating_sub(body_height + gap));
+    let body = Rect::new(inner.x, inner.y, inner.width, body_height);
+    let options = Rect::new(
+        inner.x,
+        inner.y + body_height + gap,
+        inner.width,
+        options_height,
+    );
+    let footer_y = options.bottom() + 1;
+    let footer = if footer_height > 0 && footer_y < inner.bottom() {
+        Rect::new(inner.x, footer_y, inner.width, 1)
+    } else {
+        Rect::new(inner.x, inner.bottom(), inner.width, 0)
+    };
+    DialogLayout {
+        frame,
+        body,
+        options,
+        footer,
+        body_rows,
+    }
+}
+
+fn render_dialog_frame(frame: &mut ratatui::Frame, rect: Rect, title: &str, styles: &DialogStyles) {
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .style(styles.background)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(styles.border)
+        .title(Span::styled(format!(" {title} "), styles.title));
+    frame.render_widget(block, rect);
+}
+
 fn render_dialog(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -396,57 +568,22 @@ fn render_dialog(
     footer: Option<&str>,
     selected: usize,
 ) {
-    let ds = get_active_theme();
-    let dialog_bg = parse_theme_color(ds.inverseText);
-    let border_color = match color {
-        DialogColor::Warning => ds.warning,
-        DialogColor::Error => ds.error,
-        DialogColor::Permission => ds.permission,
-        DialogColor::Success => ds.success,
-        DialogColor::Default => ds.subtle,
-    };
-    let border = Style::default()
-        .fg(parse_theme_color(border_color))
-        .bg(dialog_bg);
-    let title_style = border.add_modifier(Modifier::BOLD);
-    let dim = Style::default()
-        .fg(parse_theme_color(ds.inactive))
-        .bg(dialog_bg);
-    let normal = Style::default()
-        .fg(parse_theme_color(ds.text))
-        .bg(dialog_bg);
-    let focused = Style::default()
-        .fg(parse_theme_color(ds.suggestion))
-        .bg(dialog_bg)
-        .add_modifier(Modifier::BOLD);
-
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .style(Style::default().bg(dialog_bg))
-        .borders(Borders::ALL)
-        .border_style(border)
-        .title(Span::styled(format!(" {title} "), title_style));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.width == 0 || inner.height == 0 {
+    let styles = DialogStyles::for_color(color);
+    let footer = footer.unwrap_or("↑/↓ to choose · Enter to confirm · Esc to cancel");
+    let layout = dialog_layout(
+        area,
+        body_lines,
+        options.iter().map(|o| rebon_width::str_width(o)),
+        options.len(),
+        footer,
+    );
+    if layout.frame.width < 4 || layout.frame.height < 3 {
         return;
     }
-
-    let body_height = inner.height.saturating_sub(options.len() as u16 + 2);
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(body_height.max(1)),
-            Constraint::Length(options.len() as u16),
-            Constraint::Length(footer.map(|_| 1).unwrap_or(0) as u16),
-        ])
-        .split(inner);
-
-    render_body(frame, sections[0], body_lines, normal, dim);
-    render_options(frame, sections[1], options, selected, focused, normal);
-    if let Some(footer) = footer {
-        render_footer(frame, sections[2], footer, dim);
-    }
+    render_dialog_frame(frame, layout.frame, title, &styles);
+    render_body(frame, layout.body, &layout.body_rows, &styles);
+    render_options(frame, layout.options, options, selected, &styles);
+    render_footer(frame, layout.footer, footer, &styles);
 }
 
 fn render_multi_select_dialog(
@@ -460,118 +597,74 @@ fn render_multi_select_dialog(
     focused: usize,
     selected_values: &[String],
 ) {
-    let ds = get_active_theme();
-    let dialog_bg = parse_theme_color(ds.inverseText);
-    let border_color = match color {
-        DialogColor::Warning => ds.warning,
-        DialogColor::Error => ds.error,
-        DialogColor::Permission => ds.permission,
-        DialogColor::Success => ds.success,
-        DialogColor::Default => ds.subtle,
-    };
-    let border = Style::default()
-        .fg(parse_theme_color(border_color))
-        .bg(dialog_bg);
-    let title_style = border.add_modifier(Modifier::BOLD);
-    let dim = Style::default()
-        .fg(parse_theme_color(ds.inactive))
-        .bg(dialog_bg);
-    let normal = Style::default()
-        .fg(parse_theme_color(ds.text))
-        .bg(dialog_bg);
-    let focused_style = Style::default()
-        .fg(parse_theme_color(ds.suggestion))
-        .bg(dialog_bg)
-        .add_modifier(Modifier::BOLD);
-
-    frame.render_widget(Clear, area);
-    let block = Block::default()
-        .style(Style::default().bg(dialog_bg))
-        .borders(Borders::ALL)
-        .border_style(border)
-        .title(Span::styled(format!(" {title} "), title_style));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.width == 0 || inner.height == 0 {
+    let styles = DialogStyles::for_color(color);
+    let footer = footer.unwrap_or("Space to toggle · Enter to confirm · Esc to cancel");
+    let layout = dialog_layout(
+        area,
+        body_lines,
+        options.iter().map(|o| rebon_width::str_width(o) + 4),
+        options.len(),
+        footer,
+    );
+    if layout.frame.width < 4 || layout.frame.height < 3 {
         return;
     }
+    render_dialog_frame(frame, layout.frame, title, &styles);
+    render_body(frame, layout.body, &layout.body_rows, &styles);
 
-    let body_height = inner.height.saturating_sub(options.len() as u16 + 2);
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(body_height.max(1)),
-            Constraint::Length(options.len() as u16),
-            Constraint::Length(footer.map(|_| 1).unwrap_or(0) as u16),
-        ])
-        .split(inner);
-
-    render_body(frame, sections[0], body_lines, normal, dim);
-
+    let rows = layout.options;
     for (idx, option) in options.iter().enumerate() {
-        if idx as u16 >= sections[1].height {
+        if idx as u16 >= rows.height {
             break;
         }
         let checked = selected_values.iter().any(|value| value == option);
-        let indicator = if checked { "[x]" } else { "[ ]" };
-        let style = if idx == focused {
-            focused_style
+        let is_focused = idx == focused;
+        let pointer = if is_focused { "❯ " } else { "  " };
+        let text_style = if is_focused {
+            styles.focused
         } else {
-            normal
+            styles.normal
         };
-        let row_area = Rect::new(
-            sections[1].x,
-            sections[1].y + idx as u16,
-            sections[1].width,
-            1,
-        );
+        let (indicator, indicator_style) = if checked {
+            ("[x]", styles.focused)
+        } else {
+            ("[ ]", styles.dim)
+        };
+        let row_area = Rect::new(rows.x, rows.y + idx as u16, rows.width, 1);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(indicator.to_string(), style),
-                Span::raw(" "),
+                Span::styled(pointer, styles.focused),
+                Span::styled(indicator, indicator_style),
+                Span::styled(" ", styles.background),
                 Span::styled(
-                    truncate_to_width(option, sections[1].width.saturating_sub(4) as usize),
-                    style,
+                    truncate_to_width(option, rows.width.saturating_sub(6) as usize),
+                    text_style,
                 ),
             ])),
             row_area,
         );
     }
 
-    if let Some(footer) = footer {
-        render_footer(frame, sections[2], footer, dim);
-    }
+    render_footer(frame, layout.footer, footer, &styles);
 }
 
 fn render_body(
     frame: &mut ratatui::Frame,
     area: Rect,
-    body_lines: &[String],
-    normal: Style,
-    dim: Style,
+    rows: &[(BodyTone, String)],
+    styles: &DialogStyles,
 ) {
-    let mut y = area.y;
-    for line in body_lines {
-        if y >= area.bottom() {
-            break;
-        }
-        let wrapped = wrap_lines(line, area.width as usize);
-        for row in wrapped {
-            if y >= area.bottom() {
-                break;
-            }
-            let row_area = Rect::new(area.x, y, area.width, 1);
-            let style = if line.contains("detected:") || line == "Choose an option:" {
-                normal.add_modifier(Modifier::BOLD)
-            } else {
-                dim
-            };
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(row, style))),
-                row_area,
-            );
-            y += 1;
-        }
+    for (offset, (tone, row)) in rows.iter().enumerate().take(area.height as usize) {
+        let style = match tone {
+            BodyTone::Headline => styles.headline,
+            BodyTone::Normal => styles.normal,
+            BodyTone::Dim => styles.dim,
+        };
+        let row_area = Rect::new(area.x, area.y + offset as u16, area.width, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(row.clone(), style))),
+            row_area,
+        );
     }
 }
 
@@ -580,20 +673,22 @@ fn render_options(
     area: Rect,
     options: &[String],
     selected: usize,
-    focused: Style,
-    normal: Style,
+    styles: &DialogStyles,
 ) {
     for (idx, option) in options.iter().enumerate() {
         if idx as u16 >= area.height {
             break;
         }
         let is_selected = idx == selected;
-        let style = if is_selected { focused } else { normal };
-        let prefix = if is_selected { ">" } else { " " };
+        let (prefix, style) = if is_selected {
+            ("❯ ", styles.focused)
+        } else {
+            ("  ", styles.normal)
+        };
         let row_area = Rect::new(area.x, area.y + idx as u16, area.width, 1);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled(format!("{prefix} "), style),
+                Span::styled(prefix, styles.focused),
                 Span::styled(
                     truncate_to_width(option, area.width.saturating_sub(2) as usize),
                     style,
@@ -604,37 +699,27 @@ fn render_options(
     }
 }
 
-fn render_footer(frame: &mut ratatui::Frame, area: Rect, footer: &str, dim: Style) {
-    if area.height == 0 {
+/// Render a `key action · key action` hint with the keys in the body tone and
+/// the rest receding, so the controls can be read at a glance.
+fn render_footer(frame: &mut ratatui::Frame, area: Rect, footer: &str, styles: &DialogStyles) {
+    if area.height == 0 || area.width == 0 {
         return;
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            truncate_to_width(footer, area.width as usize),
-            dim,
-        ))),
-        area,
-    );
-}
-
-fn centered_rect(area: Rect, width_percent: u16, height_percent: u16) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - height_percent) / 2),
-            Constraint::Percentage(height_percent),
-            Constraint::Percentage((100 - height_percent) / 2),
-        ])
-        .split(area);
-    let horizontal = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - width_percent) / 2),
-            Constraint::Percentage(width_percent),
-            Constraint::Percentage((100 - width_percent) / 2),
-        ])
-        .split(vertical[1]);
-    horizontal[1]
+    let footer = truncate_to_width(footer, area.width as usize);
+    let mut spans = Vec::new();
+    for (idx, part) in footer.split(" · ").enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled(" · ", styles.dim));
+        }
+        match part.split_once(" to ") {
+            Some((key, action)) if !key.is_empty() && key.len() <= 12 => {
+                spans.push(Span::styled(key.to_string(), styles.key));
+                spans.push(Span::styled(format!(" to {action}"), styles.dim));
+            }
+            _ => spans.push(Span::styled(part.to_string(), styles.dim)),
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn wrap_lines(text: &str, width: usize) -> Vec<String> {
@@ -661,12 +746,223 @@ fn wrap_lines(text: &str, width: usize) -> Vec<String> {
                 current.push(' ');
                 used += 1;
             }
-            current.push_str(word);
-            used += word_width;
+            // A word wider than the row (a long path, a URL) is broken at
+            // the column instead of being clipped by the frame.
+            for ch in word.chars() {
+                let ch_width = rebon_width::terminal_char_width(ch);
+                if used + ch_width > width && !current.is_empty() {
+                    rows.push(std::mem::take(&mut current));
+                    used = 0;
+                }
+                current.push(ch);
+                used += ch_width;
+            }
         }
         if !current.is_empty() {
             rows.push(current);
         }
     }
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    const LONG_CWD: &str = r"C:\Users\bon\AppData\Local\Temp\claude\F--dev-sandbox-v2-reboncode\e45fe615-eddb-40f8-abea-45a2c99c150d\scratchpad\demo";
+
+    fn trust_body(cwd: &str) -> Vec<String> {
+        vec![
+            format!("> You are in {cwd}"),
+            String::new(),
+            "Do you trust the contents of this directory?".to_string(),
+            "Working with untrusted contents comes with higher risk of prompt injection."
+                .to_string(),
+        ]
+    }
+
+    fn trust_options() -> Vec<String> {
+        vec![
+            "Yes, I trust this folder".to_string(),
+            "No, exit".to_string(),
+        ]
+    }
+
+    fn layout_for(area: Rect, body: &[String], options: &[String], footer: &str) -> DialogLayout {
+        dialog_layout(
+            area,
+            body,
+            options.iter().map(|o| rebon_width::str_width(o)),
+            options.len(),
+            footer,
+        )
+    }
+
+    fn render_rows(width: u16, height: u16, body: &[String], selected: usize) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_dialog(
+                    frame,
+                    frame.area(),
+                    "Trust Directory",
+                    DialogColor::Warning,
+                    body,
+                    &trust_options(),
+                    None,
+                    selected,
+                )
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn body_tone_reads_the_line_itself() {
+        assert_eq!(
+            body_tone(r"> You are in D:\x"),
+            (BodyTone::Headline, r"You are in D:\x")
+        );
+        assert_eq!(
+            body_tone("Do you trust the contents of this directory?").0,
+            BodyTone::Normal
+        );
+        assert_eq!(
+            body_tone("2 invalid settings file(s) detected:").0,
+            BodyTone::Normal
+        );
+        assert_eq!(body_tone("Choose an option:").0, BodyTone::Normal);
+        assert_eq!(body_tone("Reset writes a safe default.").0, BodyTone::Dim);
+        assert_eq!(body_tone("").0, BodyTone::Dim);
+    }
+
+    #[test]
+    fn dialog_is_sized_to_its_content_and_centred() {
+        let area = Rect::new(0, 0, 120, 40);
+        let footer = "↑/↓ to choose · Enter to confirm · Esc to cancel";
+        let layout = layout_for(
+            area,
+            &trust_body(r"D:\own\MyVault"),
+            &trust_options(),
+            footer,
+        );
+
+        // 4 body rows, a gap, 2 options, a gap and the footer, inside a
+        // 1-row pad and the frame.
+        assert_eq!(layout.body_rows.len(), 4);
+        assert_eq!(layout.frame.height, 2 + 2 * DIALOG_PAD_Y + 4 + 1 + 2 + 2);
+        // Wide enough for the longest line, and no wider.
+        let longest = rebon_width::str_width(&trust_body("")[3]) as u16;
+        assert_eq!(layout.frame.width, longest + 2 + 2 * DIALOG_PAD_X);
+        assert_eq!(layout.frame.x, (120 - layout.frame.width) / 2);
+        assert_eq!(layout.frame.y, (40 - layout.frame.height) / 2);
+        assert_eq!(layout.options.height, 2);
+        assert_eq!(layout.footer.height, 1);
+        assert_eq!(layout.footer.y, layout.options.bottom() + 1);
+    }
+
+    #[test]
+    fn dialog_width_stays_within_the_reading_measure() {
+        let area = Rect::new(0, 0, 200, 40);
+        let short = layout_for(area, &["> Hi".to_string()], &["Ok".to_string()], "");
+        assert_eq!(short.frame.width, DIALOG_MIN_WIDTH);
+        let long = layout_for(area, &trust_body(LONG_CWD), &trust_options(), "");
+        assert_eq!(long.frame.width, DIALOG_MAX_WIDTH);
+        let narrow = layout_for(
+            Rect::new(0, 0, 40, 40),
+            &trust_body(LONG_CWD),
+            &trust_options(),
+            "",
+        );
+        assert_eq!(narrow.frame.width, 40);
+    }
+
+    #[test]
+    fn a_long_directory_wraps_instead_of_being_clipped() {
+        let layout = layout_for(
+            Rect::new(0, 0, 120, 40),
+            &trust_body(LONG_CWD),
+            &trust_options(),
+            "",
+        );
+        let text_width = layout.body.width as usize;
+        let headline: String = layout
+            .body_rows
+            .iter()
+            .filter(|(tone, _)| *tone == BodyTone::Headline)
+            .map(|(_, row)| row.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            headline
+                .replace(' ', "")
+                .contains(&LONG_CWD.replace(' ', "")),
+            "{headline}"
+        );
+        for (_, row) in &layout.body_rows {
+            assert!(
+                rebon_width::str_width(row) <= text_width,
+                "{row:?} > {text_width}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_terminal_squeezes_the_body_before_the_options() {
+        let area = Rect::new(0, 0, 80, 9);
+        let footer = "Enter to confirm";
+        let layout = layout_for(area, &trust_body(LONG_CWD), &trust_options(), footer);
+        assert_eq!(layout.frame.height, 9);
+        assert_eq!(layout.options.height, 2);
+        assert!(layout.body.height < layout.body_rows.len() as u16);
+        assert!(layout.options.bottom() <= layout.frame.bottom() - 1 - DIALOG_PAD_Y);
+    }
+
+    #[test]
+    fn wrap_lines_breaks_words_wider_than_the_row() {
+        assert_eq!(wrap_lines("abcdefgh", 3), vec!["abc", "def", "gh"]);
+        assert_eq!(
+            wrap_lines(r"go to C:\abcdef", 6),
+            vec!["go to", r"C:\abc", "def"]
+        );
+        assert_eq!(wrap_lines("你好世界", 5), vec!["你好", "世界"]);
+        assert_eq!(wrap_lines("a\n\nb", 4), vec!["a", "", "b"]);
+        assert!(wrap_lines("anything", 0).is_empty());
+    }
+
+    #[test]
+    fn trust_dialog_renders_a_rounded_frame_with_a_pointer_and_key_hints() {
+        let rows = render_rows(100, 24, &trust_body(r"D:\own\MyVault"), 0);
+        let text = rows.join("\n");
+        assert!(
+            rows.iter().any(|row| row.contains("╭ Trust Directory ─")),
+            "{text}"
+        );
+        assert!(rows.iter().any(|row| row.contains('╰')), "{text}");
+        assert!(text.contains(r"You are in D:\own\MyVault"), "{text}");
+        assert!(!text.contains("> You are in"), "{text}");
+        assert!(text.contains("❯ Yes, I trust this folder"), "{text}");
+        assert!(text.contains("  No, exit"), "{text}");
+        assert!(text.contains("Enter to confirm"), "{text}");
+        // Content-sized: the frame does not reach the top or bottom rows.
+        assert!(!rows[0].contains('╭') && !rows[23].contains('╰'), "{text}");
+
+        let second = render_rows(100, 24, &trust_body(r"D:\own\MyVault"), 1).join("\n");
+        assert!(second.contains("❯ No, exit"), "{second}");
+    }
+
+    #[test]
+    fn dialog_renders_nothing_in_a_degenerate_area() {
+        let rows = render_rows(3, 2, &trust_body(r"D:\x"), 0);
+        assert!(rows.iter().all(|row| row.trim().is_empty()), "{rows:?}");
+    }
 }

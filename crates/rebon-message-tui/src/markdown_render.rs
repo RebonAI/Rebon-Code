@@ -63,7 +63,7 @@ pub use rebon_math::{
 use rebon_render::{
     scan_math_fragments, strip_prompt_xml_tags,
     table_layout::{compute_available_width, compute_column_widths, MIN_COLUMN_WIDTH},
-    table_render::{render_horizontal_table, CellLines, TableInput},
+    table_render::{render_vertical_format, try_render_horizontal_table, CellLines, TableInput},
     Alignment as TableAlignment, MathDelimiter, MathDisplayMode, MathFragment,
 };
 use rebon_width::WidthStr;
@@ -216,6 +216,19 @@ pub struct MarkdownTheme {
     pub heading_h2: Style,
     /// Style for the `│` blockquote gutter.
     pub blockquote_bar: Style,
+    /// Keywords inside highlighted code blocks.
+    pub code_keyword: Style,
+    /// String literals inside highlighted code blocks.
+    pub code_string: Style,
+    /// Numeric literals inside highlighted code blocks.
+    pub code_number: Style,
+    /// Comments inside highlighted code blocks.
+    pub code_comment: Style,
+    /// Panel painted behind fenced code blocks, edge to edge; `None` leaves
+    /// code blocks unboxed (plain output, tests).
+    pub code_panel: Option<Color>,
+    /// Whether inline code gets a one-column pad each side of its chip.
+    pub inline_code_pad: bool,
 }
 
 impl MarkdownTheme {
@@ -223,20 +236,37 @@ impl MarkdownTheme {
     /// theme's `text`/`dim` so markdown spans inherit the surrounding
     /// message palette; adds markdown-specific modifiers on top.
     pub fn from_messages(theme: &MessagesRenderTheme) -> Self {
+        let palette = rebon_design_system::theme::get_active_theme();
+        let code_syntax = |key: &str| {
+            theme
+                .text
+                .fg(crate::projection_render::parse_theme_color(key))
+        };
+        let code_panel = crate::projection_render::parse_theme_color(palette.codeBlockBackground);
+        let inline_code_chip =
+            crate::projection_render::parse_theme_color(palette.inlineCodeBackground);
         Self {
             text: theme.text,
             dim: theme.dim,
             strong: theme.text.add_modifier(Modifier::BOLD),
             emphasis: theme.text.add_modifier(Modifier::ITALIC),
             link: theme.accent.add_modifier(Modifier::UNDERLINED),
-            code: theme.accent,
+            code: theme.accent.bg(inline_code_chip),
             code_block: theme.text,
-            heading: theme
-                .text
-                .add_modifier(Modifier::BOLD)
-                .add_modifier(Modifier::UNDERLINED),
-            heading_h2: theme.text.add_modifier(Modifier::BOLD),
+            // Headings carry the brand colour: weight alone barely set them
+            // apart from body text.
+            heading: theme.accent.add_modifier(Modifier::BOLD),
+            heading_h2: theme.accent.add_modifier(Modifier::BOLD),
             blockquote_bar: theme.dim,
+            // Syntax colours come from the active palette so they are tuned
+            // for its background: the fixed xterm indices this replaced were
+            // picked for a dark terminal and washed out on a light one.
+            code_keyword: code_syntax(palette.codeKeyword).add_modifier(Modifier::BOLD),
+            code_string: code_syntax(palette.codeString),
+            code_number: code_syntax(palette.codeNumber),
+            code_comment: code_syntax(palette.codeComment).add_modifier(Modifier::ITALIC),
+            code_panel: Some(code_panel),
+            inline_code_pad: true,
         }
     }
 
@@ -257,8 +287,222 @@ impl MarkdownTheme {
                 .add_modifier(Modifier::UNDERLINED),
             heading_h2: Style::new().add_modifier(Modifier::BOLD),
             blockquote_bar: Style::new(),
+            code_keyword: Style::new()
+                .bg(Color::Indexed(236))
+                .fg(Color::Indexed(111))
+                .add_modifier(Modifier::BOLD),
+            code_string: Style::new().bg(Color::Indexed(236)).fg(Color::Indexed(114)),
+            code_number: Style::new().bg(Color::Indexed(236)).fg(Color::Indexed(179)),
+            code_comment: Style::new().bg(Color::Indexed(236)).fg(Color::Indexed(244)),
+            code_panel: None,
+            inline_code_pad: false,
         }
     }
+}
+
+/// Marker for an unordered list item.
+pub const LIST_BULLET: &str = "•";
+
+/// Glyph a horizontal rule is drawn with.
+const RULE_GLYPH: &str = "─";
+
+/// Widest a horizontal rule grows.
+const RULE_MAX_WIDTH: usize = 72;
+
+/// Columns of panel between a code block's edges and its code.
+const CODE_PANEL_INSET: usize = 2;
+
+/// Lower half-block: the panel's top padding, sitting on the row above.
+const CODE_PANEL_TOP_EDGE: &str = "▄";
+
+/// Upper half-block: the panel's bottom padding, on the row below.
+const CODE_PANEL_BOTTOM_EDGE: &str = "▀";
+
+/// Break styled spans into rows no wider than `width` display columns,
+/// splitting inside a span where needed. Always returns at least one row.
+fn split_spans_at_width(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
+    let width = width.max(1);
+    let mut rows = vec![Vec::new()];
+    let mut used = 0usize;
+    for span in spans {
+        let style = span.style;
+        let mut piece = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = display_width(grapheme);
+            if used > 0 && used + grapheme_width > width {
+                if !piece.is_empty() {
+                    rows.last_mut()
+                        .expect("rows starts non-empty")
+                        .push(Span::styled(std::mem::take(&mut piece), style));
+                }
+                rows.push(Vec::new());
+                used = 0;
+            }
+            piece.push_str(grapheme);
+            used += grapheme_width;
+        }
+        if !piece.is_empty() {
+            rows.last_mut()
+                .expect("rows starts non-empty")
+                .push(Span::styled(piece, style));
+        }
+    }
+    rows
+}
+
+/// Split one styled line into rows no wider than `width`, breaking at
+/// whitespace where possible and inside a word only when the word alone is
+/// wider than a row. Every row after the first starts with `continuation`
+/// (the hanging indent). The whitespace a row breaks at is dropped, so rows
+/// never end in a trailing space the painter would wrap onto its own row.
+fn wrap_with_hanging_indent(
+    spans: Vec<Span<'static>>,
+    width: usize,
+    first_prefix_width: usize,
+    continuation: &[Span<'static>],
+) -> Vec<Line<'static>> {
+    let continuation_width: usize = continuation
+        .iter()
+        .map(|span| rebon_width::str_width(&span.content))
+        .sum();
+    let total: usize = spans
+        .iter()
+        .map(|span| rebon_width::str_width(&span.content))
+        .sum();
+    // Too narrow to hang anything, or it already fits: leave it whole.
+    if total <= width || width <= continuation_width + 1 {
+        return vec![Line::from(spans)];
+    }
+
+    struct Rows {
+        rows: Vec<Vec<Span<'static>>>,
+        used: usize,
+        /// Columns the current row's prefix (bar, indent, marker) takes.
+        prefix: usize,
+    }
+    impl Rows {
+        /// Whether the current row holds anything past its prefix.
+        fn has_content(&self) -> bool {
+            self.used > self.prefix
+        }
+        fn push(&mut self, text: &str, style: Style, width: usize) {
+            self.used += width;
+            let row = self.rows.last_mut().expect("at least one row");
+            match row.last_mut() {
+                Some(last) if last.style == style => last.content.to_mut().push_str(text),
+                _ => row.push(Span::styled(text.to_string(), style)),
+            }
+        }
+        fn break_row(&mut self, continuation: &[Span<'static>], continuation_width: usize) {
+            // The row ends at the break: drop the whitespace it ended on,
+            // but never eat into the row's own prefix.
+            let mut spare = self.used.saturating_sub(self.prefix);
+            let row = self.rows.last_mut().expect("at least one row");
+            while spare > 0 {
+                let Some(last) = row.last_mut() else { break };
+                let trimmed = last.content.trim_end_matches(' ').len();
+                let removable = (last.content.len() - trimmed).min(spare);
+                if removable == 0 {
+                    break;
+                }
+                let keep = last.content.len() - removable;
+                last.content.to_mut().truncate(keep);
+                spare -= removable;
+                if last.content.is_empty() {
+                    row.pop();
+                } else {
+                    break;
+                }
+            }
+            self.rows.push(continuation.to_vec());
+            self.used = continuation_width;
+            self.prefix = continuation_width;
+        }
+    }
+
+    let mut rows = Rows {
+        rows: vec![Vec::new()],
+        used: 0,
+        prefix: first_prefix_width,
+    };
+    // The leading spans (bar, indent, marker) belong to the first row as-is.
+    for span in spans {
+        let style = span.style;
+        for token in wrap_tokens(&span.content) {
+            let token_width = rebon_width::str_width(token);
+            let is_space = token.chars().all(char::is_whitespace);
+            if rows.used + token_width <= width {
+                rows.push(token, style, token_width);
+                continue;
+            }
+            if is_space {
+                // Break here and drop the space.
+                if rows.has_content() {
+                    rows.break_row(continuation, continuation_width);
+                }
+                continue;
+            }
+            if rows.has_content() {
+                rows.break_row(continuation, continuation_width);
+            }
+            if rows.used + token_width <= width {
+                rows.push(token, style, token_width);
+                continue;
+            }
+            // A single word wider than a row: break it at the column.
+            for ch in token.chars() {
+                let ch_width = rebon_width::terminal_char_width(ch);
+                if rows.used + ch_width > width && rows.has_content() {
+                    rows.break_row(continuation, continuation_width);
+                }
+                let mut buf = [0u8; 4];
+                rows.push(ch.encode_utf8(&mut buf), style, ch_width);
+            }
+        }
+    }
+    rows.rows.into_iter().map(Line::from).collect()
+}
+
+/// Wrap one styled line to `width` columns, breaking at whitespace and
+/// inside a word only when the word alone is wider than a row. Styles carry
+/// across the break; the whitespace a row breaks at is dropped. For surfaces
+/// that paint without a wrapping widget and must count the rows they draw.
+pub fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![line];
+    }
+    wrap_with_hanging_indent(line.spans, width, 0, &[])
+}
+
+/// Break text into wrap units: runs of whitespace, runs of narrow
+/// non-space characters (words), and single wide characters, which CJK text
+/// may break between.
+fn wrap_tokens(text: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut start = 0;
+    let mut kind: Option<u8> = None;
+    for (idx, ch) in text.char_indices() {
+        let this = if ch.is_whitespace() {
+            0
+        } else if rebon_width::terminal_char_width(ch) > 1 {
+            2
+        } else {
+            1
+        };
+        match kind {
+            Some(prev) if prev == this && this != 2 => {}
+            Some(_) => {
+                tokens.push(&text[start..idx]);
+                start = idx;
+            }
+            None => {}
+        }
+        kind = Some(this);
+    }
+    if start < text.len() {
+        tokens.push(&text[start..]);
+    }
+    tokens
 }
 
 /// Blockquote gutter glyph, repeated once per nesting level before every
@@ -298,11 +542,13 @@ pub fn render_markdown_annotated_with_options(
     theme: &MarkdownTheme,
     render_options: MarkdownRenderOptions,
 ) -> RenderedMarkdown {
-    render_markdown_annotated_with_width_and_options(
-        src,
+    let stripped = strip_prompt_xml_tags(src);
+    render_markdown_with_layout(
+        &stripped,
         theme,
         DEFAULT_MARKDOWN_TERMINAL_WIDTH,
         render_options,
+        ListLayout::Unwrapped,
     )
 }
 
@@ -395,12 +641,24 @@ pub fn render_markdown_blocks_annotated_with_options(
     theme: &MarkdownTheme,
     render_options: MarkdownRenderOptions,
 ) -> RenderedMarkdown {
-    render_markdown_blocks_annotated_with_width_and_options(
+    render_markdown_with_layout(
         src,
         theme,
         DEFAULT_MARKDOWN_TERMINAL_WIDTH,
         render_options,
+        ListLayout::Unwrapped,
     )
+}
+
+/// How list items are laid out relative to the render width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListLayout {
+    /// Emit each item as one logical line and let the painter wrap it. Used
+    /// when the caller did not say how wide the text will be painted.
+    Unwrapped,
+    /// Wrap items at the render width with a hanging indent, so continuation
+    /// rows line up under the item text instead of under the bullet.
+    Hanging,
 }
 
 /// Width-aware variant of [`render_markdown_blocks`].
@@ -449,11 +707,30 @@ pub fn render_markdown_blocks_annotated_with_width(
 }
 
 /// Render already-stripped Markdown at `terminal_width` with explicit options.
+///
+/// `terminal_width` must be the width the text is painted at: list items are
+/// wrapped to it with a hanging indent.
 pub fn render_markdown_blocks_annotated_with_width_and_options(
     src: &str,
     theme: &MarkdownTheme,
     terminal_width: usize,
     render_options: MarkdownRenderOptions,
+) -> RenderedMarkdown {
+    render_markdown_with_layout(
+        src,
+        theme,
+        terminal_width,
+        render_options,
+        ListLayout::Hanging,
+    )
+}
+
+fn render_markdown_with_layout(
+    src: &str,
+    theme: &MarkdownTheme,
+    terminal_width: usize,
+    render_options: MarkdownRenderOptions,
+    list_layout: ListLayout,
 ) -> RenderedMarkdown {
     if src.is_empty() {
         return RenderedMarkdown::default();
@@ -491,6 +768,7 @@ pub fn render_markdown_blocks_annotated_with_width_and_options(
         literal_math_ranges.clone(),
         math_fragments,
     );
+    renderer.list_layout = list_layout;
     let mut emitted_literal_ranges = vec![false; literal_math_ranges.len()];
     for (event, range) in events {
         let literal = literal_math_ranges.iter().enumerate().find(|(_, literal)| {
@@ -793,6 +1071,9 @@ struct Renderer {
     code_block_language: Option<String>,
     /// True when the current code-block line already has styled spans.
     code_block_line_has_content: bool,
+    /// Rows emitted so far by the open code block when it is drawn on a
+    /// panel; `None` outside one, or for a block drawn bare.
+    code_panel_rows: Option<usize>,
     /// True between `Start(Table)` and `End(Table)`.
     in_table: bool,
     /// Alignment markers from the current markdown table.
@@ -804,6 +1085,13 @@ struct Renderer {
     /// Once an unclosed/invalid `$` starts in a table cell, preserve the
     /// remainder of that cell with code styling.
     table_literal_math: bool,
+    /// Whether list items are wrapped here with a hanging indent.
+    list_layout: ListLayout,
+    /// Column where the text of each open list item starts, innermost last.
+    item_indents: Vec<usize>,
+    /// True when `current` begins with a list marker, i.e. it is the first
+    /// row of an item rather than a continuation of one.
+    line_has_marker: bool,
 }
 
 impl Renderer {
@@ -833,6 +1121,7 @@ impl Renderer {
             in_code_block: false,
             code_block_language: None,
             code_block_line_has_content: false,
+            code_panel_rows: None,
             active_link: None,
             has_emitted_block: false,
             suppress_next_block_separator: false,
@@ -844,6 +1133,9 @@ impl Renderer {
             table_current_row: None,
             table_current_cell: None,
             table_literal_math: false,
+            list_layout: ListLayout::Unwrapped,
+            item_indents: Vec::new(),
+            line_has_marker: false,
         }
     }
 
@@ -881,7 +1173,14 @@ impl Renderer {
                 } else {
                     self.theme.code
                 };
-                self.push_span(code.to_string(), style);
+                // A column of chip either side, so the tint frames the code
+                // rather than stopping flush against its first glyph.
+                let content = if self.theme.inline_code_pad && self.active_link.is_none() {
+                    format!(" {code} ")
+                } else {
+                    code.to_string()
+                };
+                self.push_span(content, style);
             }
             Event::Html(html) | Event::InlineHtml(html) => {
                 // Strip common wrapper tags we don't render; drop raw
@@ -958,6 +1257,15 @@ impl Renderer {
                 };
                 self.code_block_line_has_content = false;
                 self.inline_stack.push(InlineFrame::CodeBlock);
+                // Quotes and list items prefix their rows, which the panel's
+                // edge-to-edge rows do not account for; those stay bare.
+                if self.theme.code_panel.is_some()
+                    && self.blockquote_depth == 0
+                    && self.item_indents.is_empty()
+                {
+                    self.code_panel_rows = Some(0);
+                    self.push_code_panel_edge(CODE_PANEL_TOP_EDGE);
+                }
             }
             Tag::HtmlBlock => {
                 self.open_block();
@@ -1031,6 +1339,9 @@ impl Renderer {
                 if self.code_block_line_has_content || !self.current.is_empty() {
                     self.flush_code_block_line();
                 }
+                if self.code_panel_rows.take().is_some() {
+                    self.push_code_panel_edge(CODE_PANEL_BOTTOM_EDGE);
+                }
                 self.in_code_block = false;
                 self.code_block_language = None;
                 self.code_block_line_has_content = false;
@@ -1056,6 +1367,7 @@ impl Renderer {
                 if let Some(Some(ref mut n)) = self.list_stack.last_mut() {
                     *n += 1;
                 }
+                self.item_indents.pop();
             }
             TagEnd::FootnoteDefinition => self.close_block(),
             TagEnd::DefinitionList
@@ -1169,12 +1481,16 @@ impl Renderer {
         }
         let depth = self.list_stack.len().saturating_sub(1);
         let indent = "  ".repeat(depth);
-        let marker = match self.list_stack.last().copied() {
-            Some(Some(n)) => format!("{n}. "),
-            Some(None) => "- ".to_string(),
-            None => String::new(),
+        let (marker, style) = match self.list_stack.last().copied() {
+            Some(Some(n)) => (format!("{n}. "), self.theme.text),
+            // The bullet is punctuation, not content: it steps back so the
+            // item text is what the eye reads.
+            Some(None) => (format!("{LIST_BULLET} "), self.theme.dim),
+            None => (String::new(), self.theme.text),
         };
-        self.pending_list_marker = Some(Span::styled(format!("{indent}{marker}"), self.theme.text));
+        let marker = format!("{indent}{marker}");
+        self.item_indents.push(rebon_width::str_width(&marker));
+        self.pending_list_marker = Some(Span::styled(marker, style));
     }
 
     fn flush_pending_list_marker(&mut self) {
@@ -1188,13 +1504,22 @@ impl Renderer {
                 break;
             }
             self.current.push(marker);
+            self.line_has_marker = true;
         }
     }
 
     fn push_rule(&mut self) {
         self.open_block();
+        // A thin full-measure rule instead of the literal `---`, capped so a
+        // wide terminal does not turn a section break into a wall.
+        let prefix = self.blockquote_depth * rebon_width::str_width(BLOCKQUOTE_BAR)
+            + self.item_indents.last().copied().unwrap_or(0);
+        let width = self
+            .terminal_width
+            .saturating_sub(prefix)
+            .clamp(3, RULE_MAX_WIDTH);
         self.current
-            .push(Span::styled("---".to_string(), self.theme.dim));
+            .push(Span::styled(RULE_GLYPH.repeat(width), self.theme.dim));
         self.flush_line();
         self.has_emitted_block = true;
     }
@@ -1455,12 +1780,75 @@ impl Renderer {
                 self.theme.code_block,
             )));
             self.line_hyperlinks.push(Vec::new());
+            self.panel_last_code_line();
             return;
         }
         if !self.current.is_empty() {
             self.flush_line();
+            self.panel_last_code_line();
         }
         self.code_block_line_has_content = false;
+    }
+
+    /// Move the code line just emitted onto the block's panel: inset by
+    /// [`CODE_PANEL_INSET`], tinted to the right edge, hard-wrapped inside
+    /// the panel so a long line cannot leave the tint behind, and — on the
+    /// block's first row — the language set against the right edge.
+    fn panel_last_code_line(&mut self) {
+        let (Some(panel), Some(rows)) = (self.theme.code_panel, self.code_panel_rows) else {
+            return;
+        };
+        let Some(line) = self.lines.pop() else {
+            return;
+        };
+        self.line_hyperlinks.pop();
+        let width = self.terminal_width;
+        let inner = width.saturating_sub(CODE_PANEL_INSET * 2).max(1);
+        let tint = Style::default().bg(panel);
+        let spans = line
+            .spans
+            .into_iter()
+            .map(|span| {
+                let style = span.style.bg(panel);
+                Span::styled(span.content.into_owned(), style)
+            })
+            .collect::<Vec<_>>();
+        for (index, mut row) in split_spans_at_width(spans, inner).into_iter().enumerate() {
+            let mut used = CODE_PANEL_INSET
+                + row
+                    .iter()
+                    .map(|span| display_width(&span.content))
+                    .sum::<usize>();
+            row.insert(0, Span::styled(" ".repeat(CODE_PANEL_INSET), tint));
+            if rows == 0 && index == 0 {
+                if let Some(language) = self.code_block_language.as_deref() {
+                    let label_width = display_width(language);
+                    if used + 2 + label_width + CODE_PANEL_INSET <= width {
+                        let gap = width - CODE_PANEL_INSET - label_width - used;
+                        row.push(Span::styled(" ".repeat(gap), tint));
+                        row.push(Span::styled(language.to_string(), self.theme.dim.bg(panel)));
+                        used += gap + label_width;
+                    }
+                }
+            }
+            row.push(Span::styled(" ".repeat(width.saturating_sub(used)), tint));
+            self.lines.push(Line::from(row));
+            self.line_hyperlinks.push(Vec::new());
+        }
+        self.code_panel_rows = Some(rows + 1);
+    }
+
+    /// A half-row of panel above or below a code block: half-block glyphs in
+    /// the panel colour give it padding without spending two full rows.
+    fn push_code_panel_edge(&mut self, glyph: &str) {
+        let Some(panel) = self.theme.code_panel else {
+            return;
+        };
+        self.lines.push(Line::from(Span::styled(
+            glyph.repeat(self.terminal_width),
+            Style::default().fg(panel),
+        )));
+        self.line_hyperlinks.push(Vec::new());
     }
 
     fn push_span(&mut self, content: String, base: Style) {
@@ -1537,16 +1925,58 @@ impl Renderer {
     fn flush_line(&mut self) {
         let mut spans = std::mem::take(&mut self.current);
         let line = self.lines.len();
-        let prefix_bytes = if self.blockquote_depth > 0 {
-            // Prepend the blockquote bar once per depth.
-            let prefix = BLOCKQUOTE_BAR.repeat(self.blockquote_depth);
-            let prefix_bytes = prefix.len();
-            let bar = Span::styled(prefix, self.theme.blockquote_bar);
-            spans.insert(0, bar);
-            prefix_bytes
+        let has_marker = std::mem::take(&mut self.line_has_marker);
+        let wraps_here =
+            self.list_layout == ListLayout::Hanging && !self.in_code_block && !self.in_table;
+        let indent = if wraps_here {
+            self.item_indents.last().copied().unwrap_or(0)
         } else {
             0
         };
+        // List items hang under their text and quotes keep their bar on
+        // every wrapped row; plain paragraphs are left to the painter.
+        let hanging = (wraps_here && (indent > 0 || self.blockquote_depth > 0)).then_some(indent);
+        // A soft break or a second paragraph inside an item continues under
+        // the item text, not back at the bullet.
+        let mut prefix_bytes = 0;
+        if indent > 0 && wraps_here && !has_marker && !spans.is_empty() {
+            spans.insert(0, Span::raw(" ".repeat(indent)));
+            prefix_bytes += indent;
+        }
+        let bar_prefix =
+            (self.blockquote_depth > 0).then(|| BLOCKQUOTE_BAR.repeat(self.blockquote_depth));
+        if let Some(prefix) = &bar_prefix {
+            // Prepend the blockquote bar once per depth.
+            prefix_bytes += prefix.len();
+            spans.insert(0, Span::styled(prefix.clone(), self.theme.blockquote_bar));
+        }
+        if let Some(indent) = hanging {
+            // Only lines with no link or formula ranges are re-wrapped here;
+            // those keep their single-line byte addressing and are wrapped by
+            // the painter instead.
+            if self.current_hyperlinks.is_empty() && self.current_formula_ranges.is_empty() {
+                let mut continuation = Vec::new();
+                if let Some(prefix) = &bar_prefix {
+                    continuation.push(Span::styled(prefix.clone(), self.theme.blockquote_bar));
+                }
+                if indent > 0 {
+                    continuation.push(Span::raw(" ".repeat(indent)));
+                }
+                // The first row's prefix is the bar plus either the marker
+                // or the continuation indent, which are the same width.
+                let first_prefix = bar_prefix.as_deref().map_or(0, rebon_width::str_width) + indent;
+                for row in wrap_with_hanging_indent(
+                    spans,
+                    self.terminal_width,
+                    first_prefix,
+                    &continuation,
+                ) {
+                    self.lines.push(row);
+                    self.line_hyperlinks.push(Vec::new());
+                }
+                return;
+            }
+        }
         let ranges = std::mem::take(&mut self.current_hyperlinks)
             .into_iter()
             .map(|range| HyperlinkRange {
@@ -1772,7 +2202,7 @@ impl Renderer {
                 lines: wrap_marked_table_cell(
                     cell,
                     &mut table_annotations,
-                    *width,
+                    WrapWidths::uniform(*width),
                     layout.needs_hard_wrap,
                 ),
             })
@@ -1786,7 +2216,7 @@ impl Renderer {
                         lines: wrap_marked_table_cell(
                             cell,
                             &mut table_annotations,
-                            *width,
+                            WrapWidths::uniform(*width),
                             layout.needs_hard_wrap,
                         ),
                     })
@@ -1794,7 +2224,32 @@ impl Renderer {
             })
             .collect::<Vec<_>>();
         let table = TableInput::new(wrapped_header, wrapped_rows, align, layout);
-        let rendered = render_horizontal_table(&table, self.terminal_width);
+        let header_rows = table
+            .header
+            .iter()
+            .map(|cell| cell.lines.len().max(1))
+            .max()
+            .unwrap_or(1);
+        let (rendered, is_grid) = match try_render_horizontal_table(&table, self.terminal_width) {
+            Some(rendered) => (rendered, true),
+            None => {
+                // The grid does not fit, so each row goes out as `label: value`
+                // pairs. The cells above were wrapped to the grid's narrow
+                // columns; the pairs span the full width, so wrap them again.
+                table_annotations.clear();
+                let vertical = vertical_table_input(
+                    &header,
+                    &body_rows,
+                    table,
+                    &mut table_annotations,
+                    self.terminal_width,
+                );
+                (
+                    render_vertical_format(&vertical, self.terminal_width),
+                    false,
+                )
+            }
+        };
         debug_assert!(
             rendered
                 .lines
@@ -1806,9 +2261,9 @@ impl Renderer {
         let style = self.theme.text;
         let mut active_annotations = Vec::new();
         let mut ansi_bold = false;
-        for line in rendered.lines {
+        for (row, line) in rendered.lines.into_iter().enumerate() {
             let line_index = self.lines.len();
-            let (line, hyperlinks) = render_marked_table_line(
+            let (mut line, hyperlinks) = render_marked_table_line(
                 &line,
                 style,
                 &table_annotations,
@@ -1816,6 +2271,15 @@ impl Renderer {
                 &mut ansi_bold,
                 line_index,
             );
+            // The grid's header rows (between the top border and the first
+            // rule) sit on the code-panel tint, in bold, like a header bar.
+            if let Some(panel) = self.theme.code_panel.filter(|_| is_grid) {
+                if (1..=header_rows).contains(&row) {
+                    for span in &mut line.spans {
+                        span.style = span.style.bg(panel).add_modifier(Modifier::BOLD);
+                    }
+                }
+            }
             self.lines.push(line);
             self.line_hyperlinks.push(hyperlinks);
         }
@@ -1873,14 +2337,89 @@ const TABLE_MARKER_END: char = '\u{200c}';
 const TABLE_MARKER_ZERO: char = '\u{fe00}';
 const TABLE_MARKER_ONE: char = '\u{fe01}';
 
+/// Narrowest value column a vertical table row wraps to, however long its
+/// label: past this the value would come out a few characters per line.
+const MIN_VERTICAL_VALUE_WIDTH: usize = 12;
+
+/// Re-wrap a table's cells for [`render_vertical_format`]. Each header cell
+/// becomes one unwrapped label; each value wraps to the room left beside
+/// `label: ` on its first line and beside the two-column indent below it.
+fn vertical_table_input(
+    header: &[TableCell],
+    rows: &[Vec<TableCell>],
+    grid: TableInput,
+    registry: &mut Vec<TableMarkerAnnotation>,
+    width: usize,
+) -> TableInput {
+    let labels = header
+        .iter()
+        .map(|cell| CellLines {
+            lines: wrap_marked_table_cell(cell, registry, WrapWidths::uniform(usize::MAX), false),
+        })
+        .collect::<Vec<_>>();
+    let label_widths = labels
+        .iter()
+        .enumerate()
+        .map(|(idx, label)| match label.lines.first() {
+            Some(line) if !line.is_empty() => display_width(line),
+            _ => display_width(&format!("Column {}", idx + 1)),
+        })
+        .collect::<Vec<_>>();
+    let rows = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .zip(&label_widths)
+                .map(|(cell, label_width)| {
+                    let widths = WrapWidths {
+                        first: width
+                            .saturating_sub(label_width + 2)
+                            .max(MIN_VERTICAL_VALUE_WIDTH),
+                        rest: width.saturating_sub(2).max(MIN_VERTICAL_VALUE_WIDTH),
+                    };
+                    CellLines {
+                        lines: wrap_marked_table_cell(cell, registry, widths, false),
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    TableInput {
+        header: labels,
+        rows,
+        ..grid
+    }
+}
+
+/// Wrap width for the first output line of a cell and for every line after.
+#[derive(Debug, Clone, Copy)]
+struct WrapWidths {
+    first: usize,
+    rest: usize,
+}
+
+impl WrapWidths {
+    fn uniform(width: usize) -> Self {
+        Self {
+            first: width,
+            rest: width,
+        }
+    }
+
+    /// Width of the output line at `index`.
+    fn at(self, index: usize) -> usize {
+        if index == 0 { self.first } else { self.rest }.max(1)
+    }
+}
+
 fn wrap_marked_table_cell(
     cell: &TableCell,
     registry: &mut Vec<TableMarkerAnnotation>,
-    width: usize,
+    widths: WrapWidths,
     hard: bool,
 ) -> Vec<String> {
     let marked = mark_table_cell(cell, registry);
-    let mut lines = wrap_table_cell(&marked, width, hard);
+    let mut lines = wrap_table_cell(&marked, widths, hard);
     let mut active = Vec::new();
     for line in &mut lines {
         let active_at_start = active.clone();
@@ -2172,8 +2711,9 @@ fn table_column_cells<'a>(
     })
 }
 
-fn wrap_table_cell(text: &str, width: usize, hard: bool) -> Vec<String> {
-    let width = width.max(1);
+/// Wrap `text` line by line; `widths` is indexed by output line, so a first
+/// line that shares its row with a label can be narrower than the rest.
+fn wrap_table_cell(text: &str, widths: WrapWidths, hard: bool) -> Vec<String> {
     if text.is_empty() {
         return vec![String::new()];
     }
@@ -2184,9 +2724,9 @@ fn wrap_table_cell(text: &str, width: usize, hard: bool) -> Vec<String> {
             continue;
         }
         if hard {
-            wrap_hard(physical, width, &mut out);
+            wrap_hard(physical, widths, &mut out);
         } else {
-            wrap_words(physical, width, &mut out);
+            wrap_words(physical, widths, &mut out);
         }
     }
     if out.is_empty() {
@@ -2195,29 +2735,29 @@ fn wrap_table_cell(text: &str, width: usize, hard: bool) -> Vec<String> {
     out
 }
 
-fn wrap_words(text: &str, width: usize, out: &mut Vec<String>) {
+fn wrap_words(text: &str, widths: WrapWidths, out: &mut Vec<String>) {
     let mut line = String::new();
     let mut line_width = 0usize;
     for word in text.split_whitespace() {
         let word_width = display_width(word);
         if line.is_empty() {
-            if word_width > width {
-                wrap_hard(word, width, out);
+            if word_width > widths.at(out.len()) {
+                wrap_hard(word, widths, out);
             } else {
                 line.push_str(word);
                 line_width = word_width;
             }
             continue;
         }
-        if line_width + 1 + word_width <= width {
+        if line_width + 1 + word_width <= widths.at(out.len()) {
             line.push(' ');
             line.push_str(word);
             line_width += 1 + word_width;
         } else {
             out.push(std::mem::take(&mut line));
             line_width = 0;
-            if word_width > width {
-                wrap_hard(word, width, out);
+            if word_width > widths.at(out.len()) {
+                wrap_hard(word, widths, out);
             } else {
                 line.push_str(word);
                 line_width = word_width;
@@ -2229,12 +2769,12 @@ fn wrap_words(text: &str, width: usize, out: &mut Vec<String>) {
     }
 }
 
-fn wrap_hard(text: &str, width: usize, out: &mut Vec<String>) {
+fn wrap_hard(text: &str, widths: WrapWidths, out: &mut Vec<String>) {
     let mut line = String::new();
     let mut line_width = 0usize;
     for grapheme in text.graphemes(true) {
         let w = display_width(grapheme);
-        if line_width > 0 && line_width + w > width {
+        if line_width > 0 && line_width + w > widths.at(out.len()) {
             out.push(std::mem::take(&mut line));
             line_width = 0;
         }
@@ -2538,20 +3078,12 @@ fn highlight_code_line(
         let (byte_idx, ch) = chars[idx];
         if let Some(comment) = comment_prefix_at(line, byte_idx, language) {
             let _ = comment;
-            push_code_span(
-                &mut spans,
-                &line[byte_idx..],
-                theme.code_block.fg(Color::Indexed(244)),
-            );
+            push_code_span(&mut spans, &line[byte_idx..], theme.code_comment);
             break;
         }
         if ch == '"' || ch == '\'' || ch == '`' {
             let end = quoted_end(line, byte_idx, ch);
-            push_code_span(
-                &mut spans,
-                &line[byte_idx..end],
-                theme.code_block.fg(Color::Indexed(114)),
-            );
+            push_code_span(&mut spans, &line[byte_idx..end], theme.code_string);
             idx = char_index_at_or_after(&chars, end);
             continue;
         }
@@ -2559,11 +3091,7 @@ fn highlight_code_line(
             let end = scan_while(line, byte_idx, |c| {
                 c.is_ascii_alphanumeric() || matches!(c, '.' | '_')
             });
-            push_code_span(
-                &mut spans,
-                &line[byte_idx..end],
-                theme.code_block.fg(Color::Indexed(179)),
-            );
+            push_code_span(&mut spans, &line[byte_idx..end], theme.code_number);
             idx = char_index_at_or_after(&chars, end);
             continue;
         }
@@ -2571,10 +3099,7 @@ fn highlight_code_line(
             let end = scan_while(line, byte_idx, is_ident_continue);
             let token = &line[byte_idx..end];
             let style = if is_keyword(token, language) {
-                theme
-                    .code_block
-                    .fg(Color::Indexed(111))
-                    .add_modifier(Modifier::BOLD)
+                theme.code_keyword
             } else {
                 theme.code_block
             };
@@ -2911,6 +3436,58 @@ fn blockquote_kind_label(kind: BlockQuoteKind) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn code_block_sits_on_an_edge_to_edge_panel_with_its_language() {
+        let panel = Color::Rgb(1, 2, 3);
+        let theme = MarkdownTheme {
+            code_panel: Some(panel),
+            ..MarkdownTheme::plain()
+        };
+        let text = render_markdown_with_width(
+            "```rust
+let x = 1;
+```",
+            &theme,
+            30,
+        );
+        let lines = plain_lines(&text);
+        assert_eq!(lines[0], "▄".repeat(30));
+        assert_eq!(lines[1].chars().count(), 30, "{lines:?}");
+        assert!(lines[1].starts_with("  let x = 1;"), "{lines:?}");
+        assert!(lines[1].ends_with("rust  "), "{lines:?}");
+        assert_eq!(lines[2], "▀".repeat(30));
+        // Every cell of a code row is on the panel.
+        assert!(text.lines[1]
+            .spans
+            .iter()
+            .all(|span| span.style.bg == Some(panel)));
+    }
+
+    #[test]
+    fn long_code_lines_wrap_inside_the_panel() {
+        let theme = MarkdownTheme {
+            code_panel: Some(Color::Rgb(1, 2, 3)),
+            ..MarkdownTheme::plain()
+        };
+        let long = "x".repeat(40);
+        let text = render_markdown_with_width(
+            &format!(
+                "```
+{long}
+```"
+            ),
+            &theme,
+            20,
+        );
+        let lines = plain_lines(&text);
+        // 40 columns of code in a 16-column interior: three panel rows.
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert!(
+            lines[1..4].iter().all(|line| line.chars().count() == 20),
+            "{lines:?}"
+        );
+    }
+
     fn plain_lines(text: &Text<'static>) -> Vec<String> {
         text.lines
             .iter()
@@ -3045,12 +3622,34 @@ mod tests {
     }
 
     #[test]
-    fn unordered_list_renders_dash_markers() {
+    fn unordered_list_renders_bullet_markers() {
         let text = render_markdown("- one\n- two", &MarkdownTheme::plain());
         assert_eq!(
             plain_lines(&text),
-            vec!["- one".to_string(), "- two".to_string()]
+            vec!["• one".to_string(), "• two".to_string()]
         );
+    }
+
+    #[test]
+    fn unordered_bullet_recedes_into_the_dim_style() {
+        let theme = MarkdownTheme {
+            dim: Style::new().fg(Color::Gray),
+            ..MarkdownTheme::plain()
+        };
+        let text = render_markdown("- one", &theme);
+        let bullet = text.lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains('•'))
+            .expect("bullet span");
+        assert_eq!(bullet.style.fg, Some(Color::Gray));
+        let ordered = render_markdown("1. one", &theme);
+        let number = ordered.lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("1."))
+            .expect("number span");
+        assert_ne!(number.style.fg, Some(Color::Gray));
     }
 
     #[test]
@@ -3102,9 +3701,9 @@ mod tests {
     fn nested_list_indents_with_two_spaces_per_level() {
         let text = render_markdown("- a\n  - b\n    - c", &MarkdownTheme::plain());
         let lines = plain_lines(&text);
-        assert!(lines.iter().any(|l| l == "- a"));
-        assert!(lines.iter().any(|l| l == "  - b"));
-        assert!(lines.iter().any(|l| l == "    - c"));
+        assert!(lines.iter().any(|l| l == "• a"));
+        assert!(lines.iter().any(|l| l == "  • b"));
+        assert!(lines.iter().any(|l| l == "    • c"));
     }
 
     #[test]
@@ -3207,10 +3806,162 @@ mod tests {
     }
 
     #[test]
-    fn hr_rule_emits_dashes() {
+    fn hr_rule_draws_a_thin_line_to_the_measure() {
         let text = render_markdown("before\n\n---\n\nafter", &MarkdownTheme::plain());
         let lines = plain_lines(&text);
-        assert!(lines.iter().any(|l| l == "---"));
+        // Default width 80, capped at the rule's own maximum.
+        assert!(
+            lines.iter().any(|l| l == &"─".repeat(RULE_MAX_WIDTH)),
+            "{lines:?}"
+        );
+
+        let narrow = render_markdown_blocks_with_width(
+            "before\n\n---\n\nafter",
+            &MarkdownTheme::plain(),
+            20,
+        );
+        assert!(plain_lines(&narrow).iter().any(|l| l == &"─".repeat(20)));
+
+        let quoted =
+            render_markdown_blocks_with_width("> a\n>\n> ---", &MarkdownTheme::plain(), 20);
+        let rule = plain_lines(&quoted)
+            .into_iter()
+            .find(|l| l.contains('─'))
+            .expect("rule inside quote");
+        assert_eq!(rebon_width::str_width(&rule), 20, "{rule:?}");
+    }
+
+    fn hanging(src: &str, width: usize) -> Vec<String> {
+        plain_lines(&render_markdown_blocks_with_width(
+            src,
+            &MarkdownTheme::plain(),
+            width,
+        ))
+    }
+
+    #[test]
+    fn wrapped_list_items_hang_under_the_item_text() {
+        let lines = hanging("- alpha beta gamma delta epsilon", 16);
+        assert_eq!(lines, vec!["• alpha beta", "  gamma delta", "  epsilon"]);
+        let numbered = hanging("1. alpha beta gamma delta", 14);
+        assert_eq!(numbered, vec!["1. alpha beta", "   gamma delta"]);
+        let nested = hanging("- a\n  - one two three four", 12);
+        assert_eq!(nested, vec!["• a", "  • one two", "    three", "    four"]);
+        for line in hanging("- alpha beta gamma delta epsilon", 16) {
+            assert!(rebon_width::str_width(&line) <= 16, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn soft_breaks_inside_an_item_continue_under_its_text() {
+        assert_eq!(
+            hanging("- first line\n  second line", 40),
+            vec!["• first line", "  second line"]
+        );
+        assert_eq!(
+            hanging("1. first\n   second", 40),
+            vec!["1. first", "   second"]
+        );
+    }
+
+    #[test]
+    fn hanging_wrap_breaks_cjk_between_characters_and_long_words_at_the_column() {
+        let cjk = hanging("- 这是一个很长的中文列表项需要换行", 14);
+        assert_eq!(cjk[0], "• 这是一个很长");
+        assert!(cjk[1].starts_with("  "), "{cjk:?}");
+        for line in &cjk {
+            assert!(rebon_width::str_width(line) <= 14, "{line:?}");
+        }
+        let long = hanging("- abcdefghijklmnopqrstuvwxyz", 10);
+        assert_eq!(long, vec!["• abcdefgh", "  ijklmnop", "  qrstuvwx", "  yz"]);
+    }
+
+    #[test]
+    fn hanging_wrap_keeps_styles_and_skips_lines_with_links() {
+        let theme = MarkdownTheme {
+            strong: Style::new().add_modifier(Modifier::BOLD),
+            ..MarkdownTheme::plain()
+        };
+        let text = render_markdown_blocks_with_width("- plain **bold words here** end", &theme, 14);
+        let bold_rows = text
+            .lines
+            .iter()
+            .filter(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.style.add_modifier.contains(Modifier::BOLD))
+            })
+            .count();
+        assert!(
+            bold_rows >= 2,
+            "bold run should survive the split: {:?}",
+            plain_lines(&text)
+        );
+
+        // A line carrying a hyperlink keeps its single-line addressing; the
+        // painter wraps it.
+        let linked = render_markdown_blocks_annotated_with_width(
+            "- see [the docs](https://example.com) for more detail",
+            &MarkdownTheme::plain(),
+            16,
+        );
+        assert_eq!(linked.text.lines.len(), 1);
+        assert_eq!(linked.hyperlinks.len(), 1);
+    }
+
+    #[test]
+    fn wrapped_quotes_keep_their_bar_on_every_row() {
+        let lines = hanging("> alpha beta gamma delta epsilon", 16);
+        assert_eq!(lines, vec!["│ alpha beta", "│ gamma delta", "│ epsilon"]);
+        let nested = hanging("> > one two three four", 12);
+        assert_eq!(nested, vec!["│ │ one two", "│ │ three", "│ │ four"]);
+        let quoted_list = hanging("> - one two three four five", 14);
+        assert_eq!(
+            quoted_list,
+            vec!["│ • one two", "│   three four", "│   five"]
+        );
+        // Plain paragraphs are still wrapped by the painter.
+        assert_eq!(hanging("alpha beta gamma delta epsilon", 16).len(), 1);
+    }
+
+    #[test]
+    fn wrap_styled_line_breaks_at_words_and_keeps_styles() {
+        let bold = Style::new().add_modifier(Modifier::BOLD);
+        let line = Line::from(vec![
+            Span::raw("alpha "),
+            Span::styled("beta gamma", bold),
+            Span::raw(" delta"),
+        ]);
+        let rows = wrap_styled_line(line, 11);
+        let text: Vec<String> = rows
+            .iter()
+            .map(|row| row.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(text, vec!["alpha beta", "gamma delta"]);
+        assert!(rows[1].spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(wrap_styled_line(Line::from("short"), 20).len(), 1);
+        assert_eq!(wrap_styled_line(Line::from("anything"), 0).len(), 1);
+        let cjk = wrap_styled_line(Line::from("一二三四五六"), 5);
+        assert_eq!(cjk.len(), 3);
+    }
+
+    #[test]
+    fn width_less_renders_leave_list_items_unwrapped() {
+        let long = format!("- {}", "word ".repeat(40));
+        let text = render_markdown(&long, &MarkdownTheme::plain());
+        assert_eq!(text.lines.len(), 1);
+    }
+
+    #[test]
+    fn code_blocks_inside_lists_are_not_rewrapped() {
+        let src = "- item\n\n  ```\n  let very_long_identifier_name = 1;\n  ```";
+        let lines = hanging(src, 16);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("let very_long_identifier_name = 1;")),
+            "{lines:?}"
+        );
     }
 
     #[test]
@@ -3374,7 +4125,12 @@ mod tests {
             }],
             ..TableCell::default()
         };
-        let marker_lines = wrap_marked_table_cell(&marker_cell, &mut marker_registry, 8, true);
+        let marker_lines = wrap_marked_table_cell(
+            &marker_cell,
+            &mut marker_registry,
+            WrapWidths::uniform(8),
+            true,
+        );
         assert!(marker_lines.len() > 1, "{marker_lines:?}");
         assert!(
             marker_lines.iter().all(|line| {
@@ -3443,6 +4199,37 @@ mod tests {
             .any(|l| l.contains("│") && l.contains("1") && l.contains("2")));
     }
 
+    #[test]
+    fn vertical_table_fallback_wraps_rows_to_the_full_width() {
+        // Six columns of prose do not fit a 100-column grid, so the rows
+        // fall back to `label: value` pairs. Those pairs used to reuse the
+        // cells as wrapped for the grid's ~12-column slots: the value came
+        // out a few characters per line and the `建议` label was cut to `建`.
+        let src = "\
+| file:line | 用途 | client | 频率 | 建议 | 一行理由 |
+|---|---|---|---|---|---|
+| plugins/model-routing/src/lib.rs:418 | prompt backend 的模型路由分类 | 当前会话的隔离 fork，同 provider/订阅，可选不同 routerModel（同文件 :382-421） | 首个用户 prompt，一次/session（rebon-core/src/query/model_routing.rs:140-178） | own stable key | 分类 system 包含候选目录 |";
+        let width = 100;
+        let text = render_markdown_with_width(src, &MarkdownTheme::plain(), width);
+        let lines = plain_lines(&text);
+
+        assert!(!lines.iter().any(|l| l.starts_with('┌')), "{lines:#?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "用途: prompt backend 的模型路由分类"),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "建议: own stable key"),
+            "{lines:#?}"
+        );
+        assert!(
+            lines.iter().all(|l| display_width(l) <= width),
+            "{lines:#?}"
+        );
+    }
+
     // ---------------------------------------------------------------
     // classification table — one source of truth for
     // "does renderer produce the expected plain-text shape".
@@ -3458,10 +4245,13 @@ mod tests {
             ("`c`", &["c"]),
             ("# H1", &["H1"]),
             ("## H2", &["H2"]),
-            ("- a\n- b", &["- a", "- b"]),
+            ("- a\n- b", &["• a", "• b"]),
             ("1. a\n2. b", &["1. a", "2. b"]),
             ("> quoted", &["│ quoted"]),
-            ("---", &["---"]),
+            (
+                "---",
+                &["────────────────────────────────────────────────────────────────────────"],
+            ),
             ("para1\n\npara2", &["para1", "", "para2"]),
         ];
         for (input, expected) in cases {
@@ -3758,6 +4548,52 @@ mod tests {
         assert!(theme.strong.add_modifier.contains(Modifier::BOLD));
         assert!(theme.emphasis.add_modifier.contains(Modifier::ITALIC));
         assert!(theme.heading.add_modifier.contains(Modifier::BOLD));
-        assert!(theme.heading.add_modifier.contains(Modifier::UNDERLINED));
+        // Headings carry the brand colour instead of an underline.
+        assert_eq!(theme.heading.fg, messages.accent.fg);
+        assert!(!theme.heading.add_modifier.contains(Modifier::UNDERLINED));
+    }
+}
+
+#[cfg(test)]
+mod syntax_palette_tests {
+    use super::*;
+
+    #[test]
+    fn code_syntax_colours_come_from_the_active_palette() {
+        let palette = rebon_design_system::theme::get_active_theme();
+        let theme = MarkdownTheme::from_messages(&MessagesRenderTheme::plain());
+        let parse = crate::projection_render::parse_theme_color;
+        assert_eq!(theme.code_keyword.fg, Some(parse(palette.codeKeyword)));
+        assert!(theme.code_keyword.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(theme.code_string.fg, Some(parse(palette.codeString)));
+        assert_eq!(theme.code_number.fg, Some(parse(palette.codeNumber)));
+        assert_eq!(theme.code_comment.fg, Some(parse(palette.codeComment)));
+        assert!(theme.code_comment.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn highlighter_uses_the_theme_syntax_styles() {
+        let theme = MarkdownTheme {
+            code_keyword: Style::new().fg(Color::Magenta),
+            code_string: Style::new().fg(Color::Green),
+            code_number: Style::new().fg(Color::Yellow),
+            code_comment: Style::new().fg(Color::DarkGray),
+            ..MarkdownTheme::plain()
+        };
+        let spans = highlight_code_line("let s = \"x\"; // 42 note", Some("rust"), &theme);
+        let style_of = |needle: &str| {
+            spans
+                .iter()
+                .find(|span| span.content.contains(needle))
+                .map(|span| span.style.fg)
+                .unwrap_or_else(|| panic!("no span with {needle:?}"))
+        };
+        assert_eq!(style_of("let"), Some(Color::Magenta));
+        assert_eq!(style_of("\"x\""), Some(Color::Green));
+        assert_eq!(style_of("// 42 note"), Some(Color::DarkGray));
+        let number = highlight_code_line("x = 42", Some("rust"), &theme);
+        assert!(number
+            .iter()
+            .any(|span| span.content == "42" && span.style.fg == Some(Color::Yellow)));
     }
 }

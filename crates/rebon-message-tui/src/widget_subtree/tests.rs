@@ -266,11 +266,11 @@ fn assistant_text_body_widget_renders_markdown_headings_and_lists() {
         "heading text missing: {rendered:?}"
     );
     assert!(
-        rendered.iter().any(|line| line.contains("- first")),
+        rendered.iter().any(|line| line.contains("• first")),
         "list bullet not rendered: {rendered:?}"
     );
     assert!(
-        rendered.iter().any(|line| line.contains("- second")),
+        rendered.iter().any(|line| line.contains("• second")),
         "second list bullet not rendered: {rendered:?}"
     );
     // Emphasis markers are consumed by the lexer — the span text

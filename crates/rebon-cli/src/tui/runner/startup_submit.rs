@@ -205,6 +205,7 @@ mod tests {
         ));
         let mut app = AppState::new();
         app.cwd = cwd.clone();
+        rebon_render::display_path::set_display_root(Some(&app.cwd));
         app.input = "hello worker".into();
         app.cursor_offset = app.input.len();
 
@@ -248,6 +249,7 @@ mod tests {
         ));
         let mut app = AppState::new();
         app.cwd = cwd;
+        rebon_render::display_path::set_display_root(Some(&app.cwd));
         app.input = "/help".into();
         app.cursor_offset = app.input.len();
 

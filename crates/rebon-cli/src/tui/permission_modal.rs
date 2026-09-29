@@ -63,6 +63,68 @@ pub enum PermissionKind {
     /// ProfileSwitch / ProfileSave — show what the model is proposing to
     /// change, field by field, before any of it happens.
     Profile(ProfileProposal),
+    /// Edit / Write — show the diff the call will apply instead of its raw
+    /// arguments. Answers exactly like [`PermissionKind::Generic`].
+    FileChange(FileChangePreview),
+}
+
+/// A file edit or write that is waiting for permission, kept as the texts
+/// its diff is drawn from so the rows can be laid out at any width.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileChangePreview {
+    /// The path as shown: relative to the session directory when inside it.
+    pub path: String,
+    /// What the call does to the file: `Update`, `Create` or `Overwrite`.
+    pub verb: &'static str,
+    /// The text being replaced; `None` for a write.
+    pub old_text: Option<String>,
+    /// The replacement text, or the whole new file for a write.
+    pub new_text: String,
+    /// The file as it is on disk now, for real line numbers and context.
+    pub original: Option<String>,
+}
+
+/// Most diff rows a permission preview shows before summarising the rest.
+const FILE_CHANGE_PREVIEW_MAX_ROWS: usize = 16;
+
+/// The body of a file-change prompt as the rows it paints: what happens to
+/// which file, the diff, and the question. Render and height measurement
+/// both come here, so they cannot disagree.
+fn file_change_rows(preview: &FileChangePreview, width: u16) -> Vec<Line<'static>> {
+    let ds = rebon_design_system::theme::get_active_theme();
+    let dim = Style::default().fg(parse_theme_color(ds.inactive));
+    let text = Style::default().fg(parse_theme_color(ds.text));
+    let mut rows = vec![Line::from(vec![
+        Span::raw(" "),
+        Span::styled(preview.verb, text.add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled(preview.path.clone(), text),
+    ])];
+    rows.extend(rebon_tui::render::diff_rows::file_change_diff_rows(
+        preview.old_text.as_deref(),
+        &preview.new_text,
+        preview.original.as_deref(),
+        width,
+        FILE_CHANGE_PREVIEW_MAX_ROWS,
+        dim.add_modifier(Modifier::ITALIC),
+    ));
+    rows.push(Line::default());
+    let file_name = preview
+        .path
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&preview.path);
+    let question = match preview.verb {
+        "Create" => format!("Do you want to create {file_name}?"),
+        "Overwrite" => format!("Do you want to overwrite {file_name}?"),
+        _ => format!("Do you want to make this edit to {file_name}?"),
+    };
+    let question_width = usize::from(width.saturating_sub(2)).max(1);
+    for line in wrap_display_columns(&question, question_width) {
+        rows.push(Line::from(vec![Span::raw(" "), Span::styled(line, text)]));
+    }
+    rows
 }
 
 /// Local workflow-review graph state used by the permission modal.
@@ -829,6 +891,7 @@ pub fn render_permission_inline_with_cursor(
     let ds = rebon_design_system::theme::get_active_theme();
     let styles = PermissionInlineStyles {
         border: Style::default().fg(map_theme_color(chrome.border_color)),
+        rule: Style::default().fg(parse_theme_color(ds.subtle)),
         title: Style::default()
             .fg(map_theme_color(chrome.title.color))
             .add_modifier(Modifier::BOLD),
@@ -871,13 +934,8 @@ pub fn render_permission_inline_with_cursor(
             all_lines.push(Line::from(""));
         }
         PermissionKind::ExitPlanMode { plan } => {
-            // Render ExitPlanMode: show the full plan text, then options.
-            for line in plan.lines() {
-                all_lines.push(Line::from(vec![
-                    Span::raw(pad),
-                    Span::raw(line.to_string()),
-                ]));
-            }
+            // Render ExitPlanMode: show the plan as markdown, then options.
+            all_lines.extend(plan_display_lines(plan, area.width));
             all_lines.push(Line::from(""));
             // When the plan + chrome is taller than the visible area the view
             // scrolls (PageUp/PageDown · j/k · Ctrl+Home/End — routed by
@@ -903,6 +961,11 @@ pub fn render_permission_inline_with_cursor(
         }
         PermissionKind::WorkflowReview(review) => {
             render_workflow_review_lines(view, review, &mut all_lines);
+        }
+        PermissionKind::FileChange(preview) => {
+            all_lines.extend(file_change_rows(preview, area.width));
+            all_lines.push(Line::from(""));
+            render_standard_options(view, &mut all_lines);
         }
         PermissionKind::EnterPlanMode | PermissionKind::Generic => {
             // Generic / EnterPlanMode: summary + options.
@@ -952,6 +1015,8 @@ pub fn render_permission_inline_with_cursor(
 #[derive(Debug, Clone, Copy)]
 struct PermissionInlineStyles {
     border: Style,
+    /// The rule that runs on from the title.
+    rule: Style,
     title: Style,
     inactive: Style,
     /// The highlighted row: whichever option the cursor is on.
@@ -1054,15 +1119,17 @@ fn push_permission_heading_lines<'a>(
         }
         all_lines.push(Line::from(heading_spans));
     } else {
+        // The title carries the colour; the rule that runs out from it stays
+        // quiet so the question, not the line, is what the eye lands on.
         let title_text = format!(" {} ", view.title);
-        let title_len = title_text.len();
-        let rule_remaining = (width as usize).saturating_sub(title_len + 1);
+        let title_width = WidthStr::width(title_text.as_str());
+        let rule_remaining = (width as usize).saturating_sub(title_width + 2);
         let mut border_spans = vec![
-            Span::styled("─", styles.border),
+            Span::styled("──", styles.border),
             Span::styled(title_text, styles.title),
         ];
         if rule_remaining > 0 {
-            border_spans.push(Span::styled("─".repeat(rule_remaining), styles.border));
+            border_spans.push(Span::styled("─".repeat(rule_remaining), styles.rule));
         }
         all_lines.push(Line::from(border_spans));
     }
@@ -1375,8 +1442,7 @@ fn render_workflow_review_lines<'a>(
     let detail_box_width = left_width + 3 + rule_width;
     let dim = Style::default().fg(parse_theme_color(ds.inactive));
     let focused_style = Style::default()
-        .fg(parse_theme_color(ds.inverseText))
-        .bg(parse_theme_color(ds.text))
+        .fg(parse_theme_color(ds.suggestion))
         .add_modifier(Modifier::BOLD);
     let focused_idx = (!review.actions_focused).then_some(review.focused_node);
     for row in &rows {
@@ -1384,7 +1450,11 @@ fn render_workflow_review_lines<'a>(
             WorkflowReviewRow::Full(idx) => {
                 let node = &review.graph.nodes[*idx];
                 let focused = focused_idx == Some(*idx);
-                let prefix = if focused { " › " } else { "   " };
+                let prefix = if focused {
+                    OPTION_POINTER
+                } else {
+                    OPTION_GUTTER
+                };
                 let modified = if node.modified { " *" } else { "" };
                 let readonly = if node.editable { "" } else { " (read-only)" };
                 let style = if focused {
@@ -1634,6 +1704,24 @@ fn wrap_display_columns(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// The plan an ExitPlanMode prompt asks the user to approve, as the rows it
+/// paints: rendered as markdown (the model writes it as markdown, and raw
+/// backticks and dashes made it read like source) and wrapped to the width
+/// behind a one-column pad. The body is a plain paragraph with no wrapping of
+/// its own, so these are exactly the rows drawn — render and height
+/// measurement both come here.
+fn plan_display_lines(plan: &str, width: u16) -> Vec<Line<'static>> {
+    let content_width = usize::from(width.saturating_sub(2)).max(1);
+    rebon_tui::render::markdown_rows::markdown_rows(plan, content_width)
+        .into_iter()
+        .map(|row| {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(row.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn permission_summary_rows(summary: &str, width: u16) -> Vec<String> {
     let content_width = usize::from(width.saturating_sub(1)).max(1);
     summary
@@ -1857,22 +1945,17 @@ fn option_line<'a>(
     is_selected: bool,
 ) -> Line<'a> {
     let ds = rebon_design_system::theme::get_active_theme();
-    let prefix = if is_selected { " › " } else { "   " };
-    let style = if is_selected {
-        Style::default()
-            .fg(parse_theme_color(ds.inverseText))
-            .bg(parse_theme_color(ds.text))
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(option_color(option.kind))
-    };
+    let (prefix, style) = option_row_style(is_selected);
     let mut label = option.label.clone();
     let note_visible = is_selected && (view.extra_text_focused || !view.extra_text.is_empty());
     if note_visible {
         label.push_str(", ");
         label.push_str(&view.extra_text);
     }
-    let mut spans = vec![Span::styled(format!("{prefix}{label}"), style)];
+    let mut spans = vec![
+        Span::styled(prefix, pointer_style()),
+        Span::styled(label, style),
+    ];
     if note_visible && view.extra_text.is_empty() {
         spans.push(Span::styled(
             "<type note>",
@@ -1882,10 +1965,66 @@ fn option_line<'a>(
     Line::from(spans)
 }
 
+/// The pointer drawn before the focused option or node.
+const OPTION_POINTER: &str = " ❯ ";
+/// The same width, for every other row.
+const OPTION_GUTTER: &str = "   ";
+
+fn pointer_style() -> Style {
+    let ds = rebon_design_system::theme::get_active_theme();
+    Style::default()
+        .fg(parse_theme_color(ds.suggestion))
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Gutter and label style for an option row. The focused row is marked by
+/// the accent pointer and weight rather than an inverted bar, and every
+/// option shares one neutral tone: colour-coding "allow" green and "reject"
+/// red made a four-option prompt look like a traffic light and pulled the eye
+/// to the wrong row.
+fn option_row_style(is_selected: bool) -> (&'static str, Style) {
+    let ds = rebon_design_system::theme::get_active_theme();
+    if is_selected {
+        (
+            OPTION_POINTER,
+            Style::default()
+                .fg(parse_theme_color(ds.text))
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            OPTION_GUTTER,
+            Style::default().fg(parse_theme_color(ds.text)),
+        )
+    }
+}
+
+/// `key: action · key: action` hints with the keys in the body tone and the
+/// actions receding.
+fn key_hint_spans(hint: &'static str) -> Vec<Span<'static>> {
+    let ds = rebon_design_system::theme::get_active_theme();
+    let key = Style::default().fg(parse_theme_color(ds.text));
+    let dim = Style::default().fg(parse_theme_color(ds.inactive));
+    let mut spans = Vec::new();
+    for (idx, part) in hint.split(" · ").enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled(" · ", dim));
+        }
+        match part.split_once(": ") {
+            Some((k, action)) => {
+                spans.push(Span::styled(k, key));
+                spans.push(Span::styled(": ", dim));
+                spans.push(Span::styled(action, dim));
+            }
+            None => spans.push(Span::styled(part, dim)),
+        }
+    }
+    spans
+}
+
 fn render_standard_options<'a>(view: &PermissionModalView, all_lines: &mut Vec<Line<'a>>) {
     let options = &view.options;
     let selected = view.selected;
-    let ds = rebon_design_system::theme::get_active_theme();
     if options.is_empty() {
         all_lines.push(Line::from(vec![
             Span::raw(" "),
@@ -1898,13 +2037,11 @@ fn render_standard_options<'a>(view: &PermissionModalView, all_lines: &mut Vec<L
     }
 
     all_lines.push(Line::from(""));
-    all_lines.push(Line::from(vec![
-        Span::raw(" "),
-        Span::styled(
-            "Tab: append text · Enter: submit · ↑/↓: choose option · Esc: cancel",
-            Style::default().fg(parse_theme_color(ds.inactive)),
-        ),
-    ]));
+    let mut hint = vec![Span::raw(" ")];
+    hint.extend(key_hint_spans(
+        "Tab: append text · Enter: submit · ↑/↓: choose option · Esc: cancel",
+    ));
+    all_lines.push(Line::from(hint));
 }
 
 fn permission_body_line_count(view: &PermissionModalView, width: u16) -> u16 {
@@ -1959,7 +2096,7 @@ fn permission_body_line_count(view: &PermissionModalView, width: u16) -> u16 {
             }
         }
         PermissionKind::ExitPlanMode { plan } => {
-            let plan_lines = plan.lines().count().min(u16::MAX as usize) as u16;
+            let plan_lines = plan_display_lines(plan, width).len().min(u16::MAX as usize) as u16;
             let option_lines = view.options.len().max(1).min(u16::MAX as usize) as u16;
             // plan + blank + prompt + blank + options + blank + hint
             plan_lines.saturating_add(5).saturating_add(option_lines)
@@ -2052,6 +2189,14 @@ fn permission_body_line_count(view: &PermissionModalView, width: u16) -> u16 {
                 .saturating_add(option_lines)
                 .saturating_add(7)
         }
+        PermissionKind::FileChange(preview) => {
+            let body = file_change_rows(preview, width)
+                .len()
+                .min(u16::MAX as usize) as u16;
+            let option_lines = view.options.len().max(1).min(u16::MAX as usize) as u16;
+            // body + blank + options + blank + hint
+            body.saturating_add(option_lines).saturating_add(3)
+        }
         _ => {
             let summary_lines = permission_summary_rows(&view.summary, width)
                 .len()
@@ -2072,16 +2217,6 @@ fn map_theme_color(color: ThemeColor) -> Color {
         ThemeColor::Success => parse_theme_color(ds.success),
         ThemeColor::Warning => parse_theme_color(ds.warning),
         ThemeColor::Error => parse_theme_color(ds.error),
-    }
-}
-
-fn option_color(kind: PermissionOptionKind) -> Color {
-    let ds = rebon_design_system::theme::get_active_theme();
-    match kind {
-        PermissionOptionKind::AllowOnce => parse_theme_color(ds.success),
-        PermissionOptionKind::AllowAlways => parse_theme_color(ds.suggestion),
-        PermissionOptionKind::RejectOnce => parse_theme_color(ds.warning),
-        PermissionOptionKind::RejectAlways => parse_theme_color(ds.error),
     }
 }
 
@@ -3525,5 +3660,237 @@ mod tests {
         );
         let measured = measure_permission_inline(&pending.view, 60);
         assert_eq!(painted, measured - 2);
+    }
+}
+
+#[cfg(test)]
+mod style_tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+
+    fn view(title: &str, selected: usize) -> PermissionModalView {
+        PermissionModalView {
+            query_id: 1,
+            tool_call_id: "tool-1".into(),
+            title: title.into(),
+            summary: "Run tests".into(),
+            options: vec![
+                PermissionOptionView {
+                    option_id: "allow".into(),
+                    label: "Allow once".into(),
+                    kind: PermissionOptionKind::AllowOnce,
+                },
+                PermissionOptionView {
+                    option_id: "always".into(),
+                    label: "Allow always".into(),
+                    kind: PermissionOptionKind::AllowAlways,
+                },
+                PermissionOptionView {
+                    option_id: "reject".into(),
+                    label: "No, chat with this".into(),
+                    kind: PermissionOptionKind::RejectOnce,
+                },
+            ],
+            selected,
+            extra_text: String::new(),
+            extra_text_focused: false,
+            kind: PermissionKind::Generic,
+        }
+    }
+
+    fn render(view: &PermissionModalView, width: u16) -> Buffer {
+        let height = measure_permission_inline(view, width);
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        render_permission_inline(view, area, &mut buf, 0);
+        buf
+    }
+
+    fn row(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect::<String>()
+    }
+
+    fn row_containing(buf: &Buffer, needle: &str) -> u16 {
+        (0..buf.area.height)
+            .find(|y| row(buf, *y).contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}"))
+    }
+
+    #[test]
+    fn heading_rule_fills_the_width_for_wide_titles() {
+        for title in ["Allow Edit?", "允许编辑文件？"] {
+            let buf = render(&view(title, 0), 40);
+            let y = row_containing(&buf, "──");
+            let text = row(&buf, y);
+            // Wide glyphs leave a blank continuation cell behind them.
+            assert!(
+                text.replace(' ', "").contains(&title.replace(' ', "")),
+                "{text:?}"
+            );
+            // The rule reaches the last column: a byte count would stop it
+            // short for CJK titles.
+            assert_eq!(buf[(38, y)].symbol(), "─", "{text:?}");
+            assert_eq!(buf[(39, y)].symbol(), "─", "{text:?}");
+        }
+    }
+
+    #[test]
+    fn heading_title_carries_the_colour_and_the_rule_stays_quiet() {
+        let ds = rebon_design_system::theme::get_active_theme();
+        let buf = render(&view("Allow Edit?", 0), 40);
+        let y = row_containing(&buf, "Allow Edit?");
+        let title_x = row(&buf, y).find("Allow").unwrap() as u16;
+        assert_eq!(buf[(title_x, y)].fg, parse_theme_color(ds.permission));
+        assert!(buf[(title_x, y)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(39, y)].fg, parse_theme_color(ds.subtle));
+    }
+
+    #[test]
+    fn focused_option_gets_the_accent_pointer_not_an_inverted_bar() {
+        let ds = rebon_design_system::theme::get_active_theme();
+        let buf = render(&view("Allow Edit?", 1), 40);
+        let focused = row_containing(&buf, "Allow always");
+        let text = row(&buf, focused);
+        assert!(text.starts_with(" ❯ Allow always"), "{text:?}");
+        let pointer = buf[(1, focused)].clone();
+        assert_eq!(pointer.fg, parse_theme_color(ds.suggestion));
+        let label = buf[(3, focused)].clone();
+        assert_eq!(label.fg, parse_theme_color(ds.text));
+        assert!(label.modifier.contains(Modifier::BOLD));
+        assert_eq!(label.bg, Color::Reset);
+
+        for other in ["Allow once", "No, chat with this"] {
+            let y = row_containing(&buf, other);
+            let text = row(&buf, y);
+            assert!(text.starts_with(&format!("   {other}")), "{text:?}");
+            // Every option shares one tone; no traffic-light colouring.
+            assert_eq!(buf[(3, y)].fg, parse_theme_color(ds.text), "{other}");
+            assert!(!buf[(3, y)].modifier.contains(Modifier::BOLD), "{other}");
+        }
+    }
+
+    #[test]
+    fn key_hints_split_keys_from_actions() {
+        let ds = rebon_design_system::theme::get_active_theme();
+        let spans = key_hint_spans("Enter: submit · Esc: cancel");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "Enter: submit · Esc: cancel");
+        let key = spans.iter().find(|s| s.content == "Enter").unwrap();
+        assert_eq!(key.style.fg, Some(parse_theme_color(ds.text)));
+        let action = spans.iter().find(|s| s.content == "submit").unwrap();
+        assert_eq!(action.style.fg, Some(parse_theme_color(ds.inactive)));
+        let bare = key_hint_spans("scroll with PgUp");
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].style.fg, Some(parse_theme_color(ds.inactive)));
+    }
+
+    #[test]
+    fn exit_plan_renders_markdown_wrapped_and_measured_exactly() {
+        let plan = "## 改动\n\n- `src/lib.rs:7`: `verb.len()` → `verb.chars().count()`，这一条写得足够长以便在窄终端里必须折行显示。\n- run **cargo test**";
+        let mut v = view("Plan ready for review", 0);
+        v.kind = PermissionKind::ExitPlanMode {
+            plan: plan.to_string(),
+        };
+        for width in [30u16, 50, 90] {
+            let height = measure_permission_inline(&v, width);
+            let area = Rect::new(0, 0, width, height + 10);
+            let mut buf = Buffer::empty(area);
+            let painted = render_permission_inline(&v, area, &mut buf, 0);
+            assert_eq!(painted, height, "width {width}");
+            let text: Vec<String> = (0..painted).map(|y| row(&buf, y)).collect();
+            let joined = text.join("\n");
+            assert!(!joined.contains('`'), "{joined}");
+            assert!(!joined.contains("**"), "{joined}");
+            assert!(joined.contains('•'), "{joined}");
+            // Nothing is clipped at the right edge: the long item wraps.
+            assert!(
+                joined
+                    .replace([' ', '\n'], "")
+                    .contains("窄终端里必须折行显示"),
+                "{joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_change_prompt_shows_the_diff_not_the_arguments() {
+        let mut v = view("Allow Edit?", 0);
+        v.kind = PermissionKind::FileChange(FileChangePreview {
+            path: "src/lib.rs".into(),
+            verb: "Update",
+            old_text: Some("    verb.len() + 4".into()),
+            new_text: "    verb.chars().count() + 4".into(),
+            original: Some("fn a() {}\n\npub fn w() -> usize {\n    verb.len() + 4\n}\n".into()),
+        });
+        for width in [40u16, 80, 120] {
+            let height = measure_permission_inline(&v, width);
+            let area = Rect::new(0, 0, width, height + 8);
+            let mut buf = Buffer::empty(area);
+            let painted = render_permission_inline(&v, area, &mut buf, 0);
+            assert_eq!(painted, height, "width {width}");
+            let text: Vec<String> = (0..painted).map(|y| row(&buf, y)).collect();
+            let joined = text.join("\n");
+            assert!(joined.contains(" Update src/lib.rs"), "{joined}");
+            assert!(
+                text.iter()
+                    .any(|r| r.contains("4 -") && r.contains("verb.len()")),
+                "{joined}"
+            );
+            assert!(
+                text.iter()
+                    .any(|r| r.contains("4 +") && r.contains("verb.chars()")),
+                "{joined}"
+            );
+            assert!(
+                joined
+                    .replace(['\n', ' '], "")
+                    .contains("Doyouwanttomakethiseditto"),
+                "{joined}"
+            );
+            assert!(!joined.contains("old_string"), "{joined}");
+            assert!(joined.contains("Allow once"), "{joined}");
+        }
+    }
+
+    #[test]
+    fn file_change_questions_follow_the_verb() {
+        for (verb, question) in [
+            ("Create", "Do you want to create notes.md?"),
+            ("Overwrite", "Do you want to overwrite notes.md?"),
+        ] {
+            let preview = FileChangePreview {
+                path: "docs/notes.md".into(),
+                verb,
+                old_text: None,
+                new_text: "hello\n".into(),
+                original: None,
+            };
+            let rows = file_change_rows(&preview, 60);
+            let last: String = rows
+                .last()
+                .unwrap()
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert_eq!(last.trim(), question);
+        }
+    }
+
+    #[test]
+    fn restyling_keeps_the_measured_height() {
+        // Render and measure must agree, or the options fall off the bottom.
+        for width in [30u16, 40, 80, 120] {
+            for selected in 0..3 {
+                let v = view("Allow Edit?", selected);
+                let height = measure_permission_inline(&v, width);
+                let area = Rect::new(0, 0, width, height + 5);
+                let mut buf = Buffer::empty(area);
+                let painted = render_permission_inline(&v, area, &mut buf, 0);
+                assert_eq!(painted, height, "width {width} selected {selected}");
+            }
+        }
     }
 }

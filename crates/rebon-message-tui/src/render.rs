@@ -572,7 +572,7 @@ fn render_assistant_block(
             AssistantBlockProjection::RedactedThinking { hidden, .. },
         ) => {
             if !hidden {
-                lines.extend(prefixed_lines("·", "[redacted thinking]", theme.hint));
+                lines.extend(prefixed_lines("·", "[redacted thinking]", theme.assistant));
             }
         }
         (
@@ -594,9 +594,9 @@ fn render_assistant_block(
                     compact_preview: false,
                     show_expand_hint: false,
                 }),
-                &child_theme(theme),
+                &crate::widget_subtree::thinking_child_theme_for(theme),
             );
-            lines.extend(prefixed_child_lines("·", child, theme.hint));
+            lines.extend(prefixed_child_lines("·", child, theme.assistant));
         }
         (
             AssistantContentBlock::ConnectorText { connector_text },

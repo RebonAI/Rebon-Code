@@ -197,6 +197,20 @@ pub fn child_theme_for(theme: &MessageRenderTheme) -> MessagesRenderTheme {
     }
 }
 
+/// Derive the child theme for reasoning. Thinking is the working-out, not the
+/// answer, so it steps back into the secondary tone and italics, and the reply
+/// that follows is what reads as the voice of the turn.
+pub fn thinking_child_theme_for(theme: &MessageRenderTheme) -> MessagesRenderTheme {
+    let text = theme.assistant.add_modifier(Modifier::ITALIC);
+    MessagesRenderTheme {
+        text,
+        dim: theme.assistant,
+        error: theme.error,
+        warning: theme.hint,
+        accent: text.add_modifier(Modifier::BOLD),
+    }
+}
+
 /// Derive the assistant text/connector child theme with the dedicated markdown
 /// accent while leaving tool-subtree accents unchanged.
 pub(crate) fn assistant_text_child_theme_for(theme: &MessageRenderTheme) -> MessagesRenderTheme {
@@ -304,4 +318,28 @@ fn rule_line(
         Span::styled(format!(" {label} "), label_style),
         Span::styled("─".repeat(tail), rule_style),
     ])
+}
+
+#[cfg(test)]
+mod thinking_theme_tests {
+    use super::*;
+    use ratatui::style::Color;
+
+    #[test]
+    fn thinking_recedes_behind_the_answer() {
+        let parent = MessageRenderTheme {
+            assistant: Style::new().fg(Color::Gray),
+            assistant_text: Style::new().fg(Color::White),
+            hint: Style::new().fg(Color::Yellow),
+            ..MessageRenderTheme::plain()
+        };
+        let thinking = thinking_child_theme_for(&parent);
+        assert_eq!(thinking.text.fg, Some(Color::Gray));
+        assert!(thinking.text.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(thinking.dim.fg, Some(Color::Gray));
+        assert!(thinking.accent.add_modifier.contains(Modifier::BOLD));
+        assert!(thinking.accent.add_modifier.contains(Modifier::ITALIC));
+        // The answer keeps the body colour.
+        assert_eq!(child_theme_for(&parent).text.fg, Some(Color::White));
+    }
 }

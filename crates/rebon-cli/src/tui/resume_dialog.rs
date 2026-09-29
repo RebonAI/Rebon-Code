@@ -10,13 +10,14 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use rebon_customselect::{
     NavigationAction, NavigationProps, NavigationState, OptionWithDescription,
 };
 use rebon_design_system::theme::get_active_theme;
 use rebon_tui::parse_theme_color;
+use rebon_width::WidthStr;
 
 use crate::session::resume_listing::SessionEntry;
 use crate::tui::dialog_support::format_relative_age;
@@ -548,6 +549,7 @@ impl ResumeDialogState {
         frame.render_widget(Clear, area);
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(border)
             .title(Span::styled(format!(" {TITLE} "), title_style));
         let inner = block.inner(area);
@@ -671,7 +673,8 @@ impl ResumeDialogState {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
-                Constraint::Min(4),
+                Constraint::Length(1),
+                Constraint::Min(3),
                 Constraint::Length(1),
             ])
             .split(inner);
@@ -690,26 +693,38 @@ impl ResumeDialogState {
         };
         frame.render_widget(Paragraph::new(query_line), sections[0]);
 
-        // Session list.
-        self.render_list(frame, sections[1], selected, normal, dim);
+        // A quiet rule separates the filter from the results; a second box
+        // inside the first only added noise.
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─".repeat(sections[1].width as usize),
+                border,
+            ))),
+            sections[1],
+        );
 
-        // Footer.
+        // Session list.
+        self.render_list(frame, sections[2], selected, normal, dim);
+
+        // Footer: keys in the body tone, actions receding.
         let count = self.filtered.len();
         let total = self.entries.len();
         let mut footer = vec![
-            Span::styled(" Enter ", selected),
-            Span::styled(self.enter_verb(), dim),
-            Span::styled(" · Esc ", selected),
-            Span::styled("close", dim),
-            Span::styled(" · Ctrl+C ", selected),
-            Span::styled("copy id", dim),
+            Span::styled(" Enter", normal),
+            Span::styled(format!(" {}", self.enter_verb()), dim),
+            Span::styled(" · ", dim),
+            Span::styled("Esc", normal),
+            Span::styled(" close", dim),
+            Span::styled(" · ", dim),
+            Span::styled("Ctrl+C", normal),
+            Span::styled(" copy id", dim),
             Span::styled(format!("  ({count}/{total} sessions)"), dim),
         ];
         if self.is_loading_more() {
             footer.push(Span::styled(" loading more…", dim));
         }
         let footer = Line::from(footer);
-        frame.render_widget(Paragraph::new(footer), sections[2]);
+        frame.render_widget(Paragraph::new(footer), sections[3]);
     }
 
     fn render_mode_choice(
@@ -880,11 +895,9 @@ impl ResumeDialogState {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        let block = Block::default().borders(Borders::ALL).border_style(dim);
-        let inner = block.inner(area);
+        let inner = area;
         self.visible_option_count
             .set(Some(inner.height.max(1) as usize));
-        frame.render_widget(block, area);
 
         if self.filtered.is_empty() {
             let message = if self.entries.is_empty() {
@@ -921,20 +934,61 @@ impl ResumeDialogState {
                 continue;
             };
             let is_focused = focused.as_ref() == Some(session_id);
-            let style = if is_focused { selected } else { normal };
-            let prefix = if is_focused { ">" } else { " " };
-            let label = build_row_label(entry);
-            let line = Line::from(vec![
-                Span::styled(format!("{prefix} "), style),
-                Span::styled(
-                    truncate_to_width(&label, inner.width.saturating_sub(2) as usize),
-                    style,
-                ),
-            ]);
+            let line = session_row_line(entry, is_focused, inner.width, selected, normal, dim);
             let row_area = Rect::new(inner.x, inner.y + idx as u16, inner.width, 1);
             frame.render_widget(Paragraph::new(line), row_area);
         }
     }
+}
+
+/// One session row: pointer, age and size in the secondary tone, the
+/// joinable badge in the success colour, and the title in the body tone. The
+/// focused row carries the accent pointer, a bold title and a soft band.
+fn session_row_line(
+    entry: &SessionEntry,
+    is_focused: bool,
+    width: u16,
+    selected: Style,
+    normal: Style,
+    dim: Style,
+) -> Line<'static> {
+    let ds = get_active_theme();
+    let band = if is_focused {
+        Style::default().bg(parse_theme_color(ds.messageActionsBackground))
+    } else {
+        Style::default()
+    };
+    let pointer = if is_focused { "❯ " } else { "  " };
+    let meta = format!(
+        "{:>6}  {:>9}  ",
+        format_relative_age(entry.created_at_ms),
+        format_jsonl_size(entry.jsonl_bytes)
+    );
+    let badge = if entry.joinable {
+        "active · joinable  "
+    } else {
+        ""
+    };
+    let title_style = if is_focused {
+        normal.add_modifier(Modifier::BOLD)
+    } else {
+        normal
+    };
+    let used = 2 + meta.width() + badge.width();
+    let title = truncate_to_width(&entry.title, (width as usize).saturating_sub(used));
+    let fill = (width as usize).saturating_sub(used + title.width());
+    Line::from(vec![
+        Span::styled(pointer, selected.patch(band)),
+        Span::styled(meta, dim.patch(band)),
+        Span::styled(
+            badge,
+            Style::default()
+                .fg(parse_theme_color(ds.success))
+                .patch(band),
+        ),
+        Span::styled(title, title_style.patch(band)),
+        Span::styled(" ".repeat(fill), band),
+    ])
 }
 
 fn build_row_label(entry: &SessionEntry) -> String {
@@ -1372,12 +1426,14 @@ mod tests {
             .draw(|frame| state.render(frame, Rect::new(0, 0, 80, 9)))
             .unwrap();
 
-        assert_eq!(state.visible_option_count.get(), Some(3));
-        for _ in 0..3 {
+        // 9 rows: frame (2), filter, rule and footer leave 4 for sessions.
+        assert_eq!(state.visible_option_count.get(), Some(4));
+        for _ in 0..4 {
             state.handle_key(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
         let nav = state.nav.as_ref().unwrap();
-        assert_eq!(nav.focused_index(), 4);
+        assert_eq!(nav.focused_index(), 5);
+        // The window scrolled just enough to keep the focus on its last row.
         assert_eq!(nav.visible_from_index(), 1);
     }
 }

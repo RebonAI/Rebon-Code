@@ -1,7 +1,7 @@
 //! Inline 会话顶部的 Rebon banner；开始输出前，配置变化直接替换当前 banner。
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 use rebon_permissions::PermissionMode;
@@ -187,15 +187,14 @@ impl InlineStartupBanner {
     }
 
     fn render_narrow(&self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
-        let value_style = Style::default();
-        let fast_style = Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD);
+        let palette = BannerPalette::active();
+        let value_style = palette.value;
+        let fast_style = palette.fast;
         let mut spans = vec![
-            Span::styled("Rebon", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" · "),
+            Span::styled("Rebon", palette.brand),
+            Span::styled(" · ", palette.rule),
             Span::styled(self.provider_display().to_string(), value_style),
-            Span::raw(" · "),
+            Span::styled(" · ", palette.rule),
             Span::styled(self.model_display().to_string(), value_style),
         ];
         if self.fast_mode {
@@ -206,25 +205,21 @@ impl InlineStartupBanner {
     }
 
     fn render_compact(&self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
-        let theme = rebon_design_system::theme::get_active_theme();
-        let rebon = parse_theme_color(theme.rebon);
-        let brand_strong = parse_theme_color(theme.rebonShimmer);
-        let border_style = Style::default().fg(brand_strong);
-        let brand_style = Style::default().fg(rebon).add_modifier(Modifier::BOLD);
-        let key_style = Style::default().fg(rebon);
-        let value_style = Style::default().fg(Color::Rgb(230, 230, 230));
-        let fast_style = Style::default()
-            .fg(Color::Rgb(105, 220, 135))
-            .add_modifier(Modifier::BOLD);
+        let palette = BannerPalette::active();
+        let key_style = palette.key;
+        let value_style = palette.value;
+        let fast_style = palette.fast;
 
         let block = Block::default()
             .borders(Borders::ALL)
             .border_set(ratatui::symbols::border::ROUNDED)
-            .border_style(border_style)
+            .border_style(palette.border)
             .title(Line::from(vec![
                 Span::raw(" "),
-                Span::styled("Rebon", brand_style),
-                Span::raw(" · "),
+                Span::styled(BRAND_GLYPH, palette.glyph),
+                Span::raw(" "),
+                Span::styled("Rebon", palette.brand),
+                Span::styled(" · ", palette.rule),
                 Span::styled(self.mode_display(), value_style),
                 Span::raw(" "),
             ]));
@@ -247,7 +242,10 @@ impl InlineStartupBanner {
             kv_line("provider", self.provider_display(), key_style, value_style),
             kv_line(
                 "directory",
-                self.directory_display(),
+                shorten_directory(
+                    self.directory_display(),
+                    (padded.width as usize).saturating_sub(KEY_COLUMN),
+                ),
                 key_style,
                 value_style,
             ),
@@ -260,26 +258,23 @@ impl InlineStartupBanner {
             width: area.width.min(Self::MAX_FULL_WIDTH),
             ..area
         };
-        let theme = rebon_design_system::theme::get_active_theme();
-        let rebon = parse_theme_color(theme.rebon);
-        let brand_strong = parse_theme_color(theme.rebonShimmer);
-        let border_style = Style::default().fg(brand_strong);
-        let brand_style = Style::default().fg(rebon).add_modifier(Modifier::BOLD);
-        let title_muted = Style::default().fg(Color::Rgb(160, 148, 140));
-        let key_style = Style::default().fg(rebon).add_modifier(Modifier::BOLD);
-        let readable_style = Style::default().fg(Color::Rgb(135, 135, 150));
-        let command_style = Style::default().fg(Color::Rgb(120, 130, 245));
-        let fast_style = Style::default()
-            .fg(Color::Rgb(105, 220, 135))
-            .add_modifier(Modifier::BOLD);
+        let palette = BannerPalette::active();
+        let title_muted = palette.muted;
+        let key_style = palette.key;
+        let heading_style = palette.heading;
+        let readable_style = palette.value;
+        let command_style = palette.command;
+        let fast_style = palette.fast;
 
         let block = Block::default()
             .borders(Borders::ALL)
             .border_set(ratatui::symbols::border::ROUNDED)
-            .border_style(border_style)
+            .border_style(palette.border)
             .title(Line::from(vec![
                 Span::raw(" "),
-                Span::styled("Rebon", brand_style),
+                Span::styled(BRAND_GLYPH, palette.glyph),
+                Span::raw(" "),
+                Span::styled("Rebon", palette.brand),
                 Span::styled(format!(" v{} ", env!("CARGO_PKG_VERSION")), title_muted),
             ]));
         let inner = block.inner(area);
@@ -306,7 +301,7 @@ impl InlineStartupBanner {
             .split(padded);
 
         Paragraph::new(vec![
-            Line::from(Span::styled("Session", key_style)),
+            Line::from(Span::styled("Session", heading_style)),
             mode_line(
                 self.mode_display(),
                 &self.effort_display,
@@ -329,7 +324,10 @@ impl InlineStartupBanner {
             ),
             kv_line(
                 "directory",
-                self.directory_display(),
+                shorten_directory(
+                    self.directory_display(),
+                    (left_width as usize).saturating_sub(KEY_COLUMN),
+                ),
                 key_style,
                 readable_style,
             ),
@@ -339,27 +337,27 @@ impl InlineStartupBanner {
         let separator_text = if gap_width >= 3 { " │ " } else { "│" };
         Paragraph::new(
             (0..5)
-                .map(|_| Line::from(Span::styled(separator_text, title_muted)))
+                .map(|_| Line::from(Span::styled(separator_text, palette.rule)))
                 .collect::<Vec<_>>(),
         )
         .render(chunks[1], buf);
 
         Paragraph::new(vec![
-            Line::from(Span::styled("Quick actions", key_style)),
-            action_line("/ceo", "manager-lead agents", command_style, readable_style),
+            Line::from(Span::styled("Quick actions", heading_style)),
+            action_line("/ceo", "manager-lead agents", command_style, title_muted),
             action_line(
                 "/ultrawork",
                 "workflow orchestration",
                 command_style,
-                readable_style,
+                title_muted,
             ),
             action_line(
                 "/ultraplan",
                 "parallel read+plan",
                 command_style,
-                readable_style,
+                title_muted,
             ),
-            action_line("/goal", "loop until done", command_style, readable_style),
+            action_line("/goal", "loop until done", command_style, title_muted),
         ])
         .render(chunks[2], buf);
     }
@@ -434,6 +432,110 @@ impl PageBanner {
     }
 }
 
+/// The mark set before the product name in the boxed banner variants.
+const BRAND_GLYPH: &str = "✻";
+
+/// Width of the key column in the banner's key/value rows.
+const KEY_COLUMN: usize = 11;
+
+/// The banner's styles, all drawn from the active palette so the light and
+/// dark themes stay legible: labels in the secondary tone, values in the body
+/// text colour, and the brand accent only on the name and on the commands a
+/// user can type.
+#[derive(Debug, Clone, Copy)]
+struct BannerPalette {
+    border: Style,
+    glyph: Style,
+    brand: Style,
+    heading: Style,
+    key: Style,
+    value: Style,
+    muted: Style,
+    rule: Style,
+    command: Style,
+    fast: Style,
+}
+
+impl BannerPalette {
+    fn active() -> Self {
+        let theme = rebon_design_system::theme::get_active_theme();
+        let fg = |key: &str| Style::default().fg(parse_theme_color(key));
+        Self {
+            border: fg(theme.rebonShimmer),
+            glyph: fg(theme.rebon),
+            brand: fg(theme.rebon).add_modifier(Modifier::BOLD),
+            heading: fg(theme.text).add_modifier(Modifier::BOLD),
+            key: fg(theme.inactive),
+            value: fg(theme.text),
+            muted: fg(theme.inactive),
+            rule: fg(theme.subtle),
+            command: fg(theme.suggestion),
+            fast: fg(theme.success).add_modifier(Modifier::BOLD),
+        }
+    }
+}
+
+/// Fit a directory into `max_width` columns without losing the part that
+/// identifies it: the home directory folds to `~`, then the middle of the
+/// path gives way (`C:\…\scratchpad\demo`), because the root says where you
+/// are and the last components say what you are in.
+fn shorten_directory(path: &str, max_width: usize) -> String {
+    let home = std::env::var("USERPROFILE")
+        .ok()
+        .or_else(|| std::env::var("HOME").ok());
+    shorten_directory_with_home(path, max_width, home.as_deref())
+}
+
+fn shorten_directory_with_home(path: &str, max_width: usize, home: Option<&str>) -> String {
+    use rebon_width::{str_width, truncate_to_ellipsis};
+
+    let path = fold_home(path, home);
+    if str_width(&path) <= max_width {
+        return path;
+    }
+    let sep = if path.contains('\\') { '\\' } else { '/' };
+    let parts: Vec<&str> = path.split(sep).collect();
+    if parts.len() >= 3 {
+        let head = parts[0];
+        // Keep as many trailing components as fit after `head/…/`.
+        let mut kept = 0;
+        let mut tail_width = 0;
+        for part in parts[1..].iter().rev() {
+            let next = tail_width + str_width(part) + 1;
+            if str_width(head) + 2 + next > max_width {
+                break;
+            }
+            tail_width = next;
+            kept += 1;
+        }
+        if kept > 0 {
+            let tail = parts[parts.len() - kept..].join(&sep.to_string());
+            return format!("{head}{sep}…{sep}{tail}");
+        }
+    }
+    truncate_to_ellipsis(&path, max_width)
+}
+
+fn fold_home(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home.map(|h| h.trim_end_matches(['/', '\\'])) else {
+        return path.to_string();
+    };
+    if home.is_empty() || path.len() < home.len() || !path.is_char_boundary(home.len()) {
+        return path.to_string();
+    }
+    let (prefix, rest) = path.split_at(home.len());
+    let same_prefix = if cfg!(windows) {
+        prefix.eq_ignore_ascii_case(home)
+    } else {
+        prefix == home
+    };
+    if same_prefix && (rest.is_empty() || rest.starts_with(['/', '\\'])) {
+        format!("~{rest}")
+    } else {
+        path.to_string()
+    }
+}
+
 fn mode_line<'a>(
     mode: &'a str,
     effort: &'a str,
@@ -442,11 +544,11 @@ fn mode_line<'a>(
     muted_style: Style,
 ) -> Line<'a> {
     let mut spans = vec![
-        Span::styled(format!("{:<11}", "mode:"), key_style),
+        Span::styled(format!("{:<KEY_COLUMN$}", "mode"), key_style),
         Span::styled(mode, value_style),
     ];
     if !effort.is_empty() {
-        spans.push(Span::styled("  ·  ", muted_style));
+        spans.push(Span::styled(" · ", muted_style));
         spans.push(Span::styled(effort, value_style));
     }
     Line::from(spans)
@@ -454,12 +556,12 @@ fn mode_line<'a>(
 
 fn kv_line<'a>(
     key: &'static str,
-    value: &'a str,
+    value: impl Into<std::borrow::Cow<'a, str>>,
     key_style: Style,
     value_style: Style,
 ) -> Line<'a> {
     Line::from(vec![
-        Span::styled(format!("{:<11}", format!("{key}:")), key_style),
+        Span::styled(format!("{key:<KEY_COLUMN$}"), key_style),
         Span::styled(value, value_style),
     ])
 }
@@ -472,7 +574,7 @@ fn kv_model_line<'a>(
     fast_style: Style,
 ) -> Line<'a> {
     let mut spans = vec![
-        Span::styled(format!("{:<11}", "model:"), key_style),
+        Span::styled(format!("{:<KEY_COLUMN$}", "model"), key_style),
         Span::styled(model, value_style),
     ];
     if fast_mode {
@@ -752,22 +854,20 @@ mod tests {
         banner.render(buf.area, &mut buf);
         let rendered = buffer_text(&buf);
 
+        assert!(rendered.contains("╭ ✻ Rebon v"), "{rendered}");
         assert!(rendered.contains("Session"), "{rendered}");
-        assert!(rendered.contains("mode:"), "{rendered}");
-        assert!(rendered.contains("normal"), "{rendered}");
+        assert!(rendered.contains("mode       normal"), "{rendered}");
         assert!(!rendered.contains("Rebon Agent"), "{rendered}");
         assert!(rendered.contains("│ Quick actions"), "{rendered}");
-        assert!(rendered.contains("model:"), "{rendered}");
-        assert!(rendered.contains("gpt-5.5"), "{rendered}");
-        assert!(rendered.contains("provider:"), "{rendered}");
-        assert!(rendered.contains("openai"), "{rendered}");
-        assert!(rendered.contains("directory:"), "{rendered}");
+        assert!(rendered.contains("model      gpt-5.5"), "{rendered}");
+        assert!(rendered.contains("provider   openai"), "{rendered}");
+        assert!(rendered.contains("directory  "), "{rendered}");
         assert!(rendered.contains("D:\\own\\MyVault"), "{rendered}");
         assert!(rendered.contains("/ceo"), "{rendered}");
         assert!(rendered.contains("/ultrawork"), "{rendered}");
         assert!(rendered.contains("/ultraplan"), "{rendered}");
         assert!(rendered.contains("/goal"), "{rendered}");
-        assert!(rendered.contains("thinking xhigh"), "{rendered}");
+        assert!(rendered.contains("normal · thinking xhigh"), "{rendered}");
         assert!(!rendered.contains("[Fast]"), "{rendered}");
         assert!(!rendered.contains("ctx"), "{rendered}");
     }
@@ -826,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_startup_banner_full_layout_model_value_matches_action_description_style() {
+    fn inline_startup_banner_full_layout_ranks_values_over_labels_and_descriptions() {
         let banner = InlineStartupBanner {
             provider: "openai".to_string(),
             model: "gpt-5.5".to_string(),
@@ -839,13 +939,109 @@ mod tests {
 
         banner.render(buf.area, &mut buf);
 
+        let theme = rebon_design_system::theme::get_active_theme();
         let model_cell = cell_at_text(&buf, "gpt-5.5").expect("model value should render");
+        let label_cell = cell_at_text(&buf, "provider").expect("label should render");
         let action_desc_cell = cell_at_text(&buf, "manager-lead agents")
             .expect("quick action description should render");
         let command_cell = cell_at_text(&buf, "/ceo").expect("command token should render");
+        let heading_cell = cell_at_text(&buf, "Session").expect("heading should render");
 
-        assert_eq!(model_cell.style(), action_desc_cell.style());
-        assert_ne!(model_cell.style(), command_cell.style());
+        assert_eq!(model_cell.fg, parse_theme_color(theme.text));
+        assert_eq!(label_cell.fg, parse_theme_color(theme.inactive));
+        assert_eq!(action_desc_cell.fg, parse_theme_color(theme.inactive));
+        assert_eq!(command_cell.fg, parse_theme_color(theme.suggestion));
+        assert_eq!(heading_cell.fg, parse_theme_color(theme.text));
+        assert!(heading_cell.modifier.contains(Modifier::BOLD));
+        assert!(!label_cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn inline_startup_banner_uses_only_palette_colours_in_every_layout() {
+        // A literal colour would be tuned for one background and unreadable
+        // on the other; every cell must come from the active palette.
+        let theme = rebon_design_system::theme::get_active_theme();
+        let palette: Vec<ratatui::style::Color> = [
+            theme.rebon,
+            theme.rebonShimmer,
+            theme.text,
+            theme.inactive,
+            theme.subtle,
+            theme.suggestion,
+            theme.success,
+        ]
+        .into_iter()
+        .map(parse_theme_color)
+        .chain([ratatui::style::Color::Reset])
+        .collect();
+        let banner = InlineStartupBanner {
+            provider: "openai".to_string(),
+            model: "gpt-5.5".to_string(),
+            fast_mode: true,
+            directory: "D:\\own\\MyVault".to_string(),
+            mode: "normal".to_string(),
+            effort_display: "thinking high".to_string(),
+        };
+        for (width, height) in [(120, 7), (45, 5), (20, 1)] {
+            let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, width, height));
+            banner.render(buf.area, &mut buf);
+            for cell in buf.content() {
+                assert!(
+                    palette.contains(&cell.fg),
+                    "{width}x{height}: {:?} on {:?} is not a palette colour",
+                    cell.fg,
+                    cell.symbol()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shorten_directory_keeps_short_paths_and_folds_home() {
+        assert_eq!(
+            shorten_directory_with_home("D:\\own\\MyVault", 40, None),
+            "D:\\own\\MyVault"
+        );
+        assert_eq!(
+            shorten_directory_with_home("C:\\Users\\bon\\code\\app", 40, Some("C:\\Users\\bon")),
+            "~\\code\\app"
+        );
+        assert_eq!(
+            shorten_directory_with_home("/home/bon", 40, Some("/home/bon/")),
+            "~"
+        );
+        // A sibling that merely shares the prefix is not inside home.
+        assert_eq!(
+            shorten_directory_with_home("/home/bonnie/app", 40, Some("/home/bon")),
+            "/home/bonnie/app"
+        );
+    }
+
+    #[test]
+    fn shorten_directory_drops_the_middle_before_the_ends() {
+        let path = "C:\\Users\\bon\\AppData\\Local\\Temp\\scratchpad\\demo";
+        let short = shorten_directory_with_home(path, 26, None);
+        assert_eq!(short, "C:\\…\\Temp\\scratchpad\\demo");
+        assert!(rebon_width::str_width(&short) <= 26);
+
+        let unix = shorten_directory_with_home("/srv/projects/acme/services/api", 20, None);
+        assert_eq!(unix, "/…/acme/services/api");
+    }
+
+    #[test]
+    fn shorten_directory_falls_back_to_an_end_ellipsis() {
+        // A single long component has no middle to drop.
+        let short = shorten_directory_with_home("averyveryverylongdirectoryname", 10, None);
+        assert_eq!(short, "averyvery…");
+        assert_eq!(shorten_directory_with_home("C:\\a\\b", 0, None), "");
+        for width in 0..40 {
+            let short = shorten_directory_with_home(
+                "C:\\Users\\bon\\AppData\\Local\\Temp\\scratchpad\\demo",
+                width,
+                None,
+            );
+            assert!(rebon_width::str_width(&short) <= width, "{width}: {short}");
+        }
     }
 
     #[test]
@@ -870,9 +1066,9 @@ mod tests {
         assert_eq!(InlineStartupBanner::height_for_width(20), 1);
         assert_eq!(InlineStartupBanner::height_for_width(45), 5);
         assert_eq!(InlineStartupBanner::height_for_width(80), 7);
-        assert!(rendered.contains("model:"), "{rendered}");
-        assert!(rendered.contains("provider:"), "{rendered}");
-        assert!(rendered.contains("directory:"), "{rendered}");
+        assert!(rendered.contains("model      gpt-5.5"), "{rendered}");
+        assert!(rendered.contains("provider   openai"), "{rendered}");
+        assert!(rendered.contains("directory  D:"), "{rendered}");
         assert!(rendered.contains("[Fast]"), "{rendered}");
         assert!(!rendered.contains("Quick actions"), "{rendered}");
     }

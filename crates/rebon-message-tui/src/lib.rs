@@ -53,10 +53,10 @@ pub use markdown_render::{
     render_markdown_blocks_annotated_with_width_and_options, render_markdown_blocks_with_options,
     render_markdown_blocks_with_width, render_markdown_blocks_with_width_and_options,
     render_markdown_with_options, render_markdown_with_width,
-    render_markdown_with_width_and_options, FormulaAsset, FormulaBitmap, FormulaDisplayMode,
-    FormulaRange, HyperlinkRange, MarkdownRenderOptions, MarkdownTheme, RenderedFormula,
-    RenderedMarkdown, BLOCKQUOTE_BAR, DEFAULT_MARKDOWN_TERMINAL_WIDTH, MAX_FORMULA_BITMAP_PIXELS,
-    MAX_FORMULA_SOURCE_BYTES, MAX_FORMULA_TERMINAL_ROWS,
+    render_markdown_with_width_and_options, wrap_styled_line, FormulaAsset, FormulaBitmap,
+    FormulaDisplayMode, FormulaRange, HyperlinkRange, MarkdownRenderOptions, MarkdownTheme,
+    RenderedFormula, RenderedMarkdown, BLOCKQUOTE_BAR, DEFAULT_MARKDOWN_TERMINAL_WIDTH,
+    MAX_FORMULA_BITMAP_PIXELS, MAX_FORMULA_SOURCE_BYTES, MAX_FORMULA_TERMINAL_ROWS,
 };
 pub use projection_render::{
     fold_separator_style, parse_theme_color, render_assistant_text_projection,

@@ -7,7 +7,7 @@
 //!
 //! ## What lives here
 //!
-//! * [`theme`] — the six palettes (69 keys each), [`theme::ThemeName`],
+//! * [`theme`] — the six palettes (73 keys each), [`theme::ThemeName`],
 //!   [`theme::ThemeSetting`], the [`theme::get_theme`] resolver, and the
 //!   process-wide active-theme slot.
 //! * [`color`] — raw color literals versus theme keys, and the four raw

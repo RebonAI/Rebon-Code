@@ -15,15 +15,80 @@ pub(super) fn tool_gutter_glyph(
     }
 }
 
+/// The gutter colour carries the call's outcome: red when it failed, the
+/// brand accent while it runs, green once it is done.
 pub(super) fn tool_gutter_style(
     theme: &RenderTheme,
     is_failed: bool,
-    _is_in_progress: bool,
+    is_in_progress: bool,
 ) -> Style {
     if is_failed {
         tool_status_style(theme, ToolCallStatus::Failed)
+    } else if is_in_progress {
+        theme.tool_running
     } else {
-        theme.assistant_prefix
+        theme.tool_success
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use ratatui::style::{Color, Style};
+
+    use super::super::RenderTheme;
+    use super::{tool_gutter_glyph, tool_gutter_style};
+
+    fn theme() -> RenderTheme {
+        RenderTheme {
+            tool_success: Style::new().fg(Color::Green),
+            tool_running: Style::new().fg(Color::Blue),
+            system_error: Style::new().fg(Color::Red),
+            assistant_prefix: Style::new().fg(Color::Gray),
+            ..RenderTheme::plain()
+        }
+    }
+
+    #[test]
+    fn gutter_colour_carries_the_outcome() {
+        let theme = theme();
+        assert_eq!(
+            tool_gutter_style(&theme, false, false).fg,
+            Some(Color::Green)
+        );
+        assert_eq!(tool_gutter_style(&theme, false, true).fg, Some(Color::Blue));
+        // Failure wins over "still running".
+        assert_eq!(tool_gutter_style(&theme, true, true).fg, Some(Color::Red));
+        assert_eq!(tool_gutter_style(&theme, true, false).fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn only_a_running_call_spins() {
+        let theme = theme();
+        assert_eq!(tool_gutter_glyph(&theme, false, false), "●");
+        assert_eq!(tool_gutter_glyph(&theme, true, true), "●");
+        assert_ne!(tool_gutter_glyph(&theme, false, true), "●");
+    }
+
+    #[test]
+    fn styled_theme_maps_success_and_running_to_the_palette() {
+        use rebon_design_system::theme::{get_theme, ThemeName};
+        for name in [ThemeName::Light, ThemeName::Dark, ThemeName::DarkAnsi] {
+            let palette = get_theme(name);
+            let theme = RenderTheme::from_theme_name(name);
+            assert_eq!(
+                theme.tool_success.fg,
+                Some(super::super::parse_theme_color(palette.success)),
+                "{name:?}"
+            );
+            assert_eq!(
+                theme.tool_running.fg,
+                Some(super::super::parse_theme_color(palette.rebon)),
+                "{name:?}"
+            );
+        }
+        let plain = RenderTheme::plain();
+        assert_eq!(plain.tool_success, Style::new());
+        assert_eq!(plain.tool_running, Style::new());
     }
 }
 

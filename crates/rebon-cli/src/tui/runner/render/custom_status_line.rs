@@ -7,6 +7,9 @@ use rebon_width::WidthStr;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::tui::app::AppState;
+use rebon_tui::parse_theme_color;
+
+use super::footer::permission_mode_style;
 use crate::tui::runner::custom_status_line::{
     padded_status_line_lines, status_line_background_tasks_prefix, status_line_permission_prefix,
     STATUS_LINE_MAX_LINES,
@@ -83,10 +86,14 @@ fn status_line_rows(app: &AppState, width: u16) -> Vec<Line<'static>> {
 fn status_line_prefix_spans(app: &AppState) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if let Some(prefix) = status_line_permission_prefix(app) {
-        spans.push(Span::styled(prefix, Style::default().fg(Color::Yellow)));
+        spans.push(Span::styled(
+            prefix,
+            permission_mode_style(app.permission_mode),
+        ));
     }
     if let Some(prefix) = status_line_background_tasks_prefix(app) {
-        let mut style = Style::default().fg(Color::Yellow);
+        let ds = rebon_design_system::theme::get_active_theme();
+        let mut style = Style::default().fg(parse_theme_color(ds.suggestion));
         if super::tasks_footer_is_selected(app) {
             style = style
                 .add_modifier(Modifier::REVERSED)

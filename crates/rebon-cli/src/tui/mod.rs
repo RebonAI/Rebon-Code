@@ -48,6 +48,7 @@ pub mod slash_picker;
 pub mod spinner_verbs;
 pub mod startup_dialog;
 pub mod terminal;
+pub mod terminal_background;
 pub mod ui_registry;
 pub mod ultraplan_widget;
 pub mod update;
@@ -58,6 +59,7 @@ fn apply_saved_theme_for_startup_dialogs() {
         .and_then(|theme| rebon_design_system::theme::ThemeName::from_str(&theme))
         .unwrap_or_default();
     rebon_design_system::theme::set_active_theme(theme_name);
+    terminal_background::apply();
 }
 
 /// How a startup resume request names the session to reopen.

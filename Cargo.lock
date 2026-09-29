@@ -3181,6 +3181,7 @@ dependencies = [
  "unicode-segmentation",
  "webbrowser",
  "winapi",
+ "windows-sys 0.52.0",
  "winresource",
 ]
 

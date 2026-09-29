@@ -420,6 +420,7 @@ pub fn project_collapsed_read_search(
         bash_count,
     );
     let hint_lines = compute_incoming_hint(input)
+        .map(|hint| crate::display_path::display_path(&hint).into_owned())
         .map(|hint| split_hint_lines(&hint, &compute_shell_progress_suffix(input)))
         .unwrap_or_default();
     let hook_summary = input.hook_total_ms.filter(|ms| *ms > 0).map(|ms| {

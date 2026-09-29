@@ -63,12 +63,22 @@ fn user_prompt_paints_message_background_only_under_content() {
         ToolOutputVerbosity::Verbose,
     );
 
+    // Row 0 is the message margin. The card's half-row edges (rows 1 and
+    // 3) are drawn in the card colour on the terminal's own background;
+    // only the text row between them is filled.
+    let card = Color::Rgb(240, 240, 240);
     assert_eq!(buf[(0, 0)].bg, Color::Reset);
-    assert_eq!(buf[(0, 1)].bg, Color::Rgb(240, 240, 240));
-    assert_eq!(buf[(2, 1)].bg, Color::Rgb(240, 240, 240));
-    assert_eq!(buf[(39, 1)].bg, Color::Rgb(240, 240, 240));
-    assert_eq!(buf[(0, 2)].bg, Color::Reset);
-    assert_eq!(buf[(2, 2)].bg, Color::Reset);
+    assert_eq!(buf[(0, 0)].symbol(), " ");
+    for (y, glyph) in [(1, "▄"), (3, "▀")] {
+        for x in [0, 39] {
+            assert_eq!(buf[(x, y)].symbol(), glyph);
+            assert_eq!(buf[(x, y)].fg, card);
+            assert_eq!(buf[(x, y)].bg, Color::Reset);
+        }
+    }
+    assert_eq!(buf[(0, 2)].bg, card);
+    assert_eq!(buf[(2, 2)].bg, card);
+    assert_eq!(buf[(39, 2)].bg, card);
 
     rebon_design_system::theme::set_active_theme(rebon_design_system::theme::ThemeName::Dark);
 }

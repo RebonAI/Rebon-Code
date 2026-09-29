@@ -158,6 +158,18 @@ pub struct Theme {
     pub rainbow_blue_shimmer: &'static str,
     pub rainbow_indigo_shimmer: &'static str,
     pub rainbow_violet_shimmer: &'static str,
+    /// Keywords in highlighted code blocks.
+    pub codeKeyword: &'static str,
+    /// String and character literals in highlighted code blocks.
+    pub codeString: &'static str,
+    /// Numeric literals in highlighted code blocks.
+    pub codeNumber: &'static str,
+    /// Comments in highlighted code blocks.
+    pub codeComment: &'static str,
+    /// Panel behind fenced code blocks.
+    pub codeBlockBackground: &'static str,
+    /// Chip behind inline code spans.
+    pub inlineCodeBackground: &'static str,
 }
 
 impl Theme {
@@ -237,6 +249,12 @@ impl Theme {
             "rainbow_blue_shimmer" => self.rainbow_blue_shimmer,
             "rainbow_indigo_shimmer" => self.rainbow_indigo_shimmer,
             "rainbow_violet_shimmer" => self.rainbow_violet_shimmer,
+            "codeKeyword" => self.codeKeyword,
+            "codeString" => self.codeString,
+            "codeNumber" => self.codeNumber,
+            "codeComment" => self.codeComment,
+            "codeBlockBackground" => self.codeBlockBackground,
+            "inlineCodeBackground" => self.inlineCodeBackground,
             _ => return None,
         };
         Some(v)
@@ -315,6 +333,12 @@ pub const LIGHT_THEME: Theme = Theme {
     rainbow_blue_shimmer: "rgb(180,205,240)",
     rainbow_indigo_shimmer: "rgb(195,180,230)",
     rainbow_violet_shimmer: "rgb(230,180,210)",
+    codeKeyword: "rgb(166,38,164)",
+    codeString: "rgb(64,140,63)",
+    codeNumber: "rgb(152,104,1)",
+    codeComment: "rgb(128,131,138)",
+    codeBlockBackground: "rgb(246,246,246)",
+    inlineCodeBackground: "rgb(236,236,238)",
 };
 
 /// The `dark` palette: RGB literals tuned for a dark background.
@@ -389,6 +413,12 @@ pub const DARK_THEME: Theme = Theme {
     rainbow_blue_shimmer: "rgb(180,205,240)",
     rainbow_indigo_shimmer: "rgb(195,180,230)",
     rainbow_violet_shimmer: "rgb(230,180,210)",
+    codeKeyword: "rgb(198,120,221)",
+    codeString: "rgb(152,195,121)",
+    codeNumber: "rgb(209,154,102)",
+    codeComment: "rgb(127,132,142)",
+    codeBlockBackground: "rgb(36,36,38)",
+    inlineCodeBackground: "rgb(58,58,62)",
 };
 
 /// The `light-daltonized` palette: light mode with reds and greens pulled
@@ -464,6 +494,12 @@ pub const LIGHT_DALTONIZED_THEME: Theme = Theme {
     rainbow_blue_shimmer: "rgb(180,205,240)",
     rainbow_indigo_shimmer: "rgb(195,180,230)",
     rainbow_violet_shimmer: "rgb(230,180,210)",
+    codeKeyword: "rgb(166,38,164)",
+    codeString: "rgb(0,110,170)",
+    codeNumber: "rgb(152,104,1)",
+    codeComment: "rgb(128,131,138)",
+    codeBlockBackground: "rgb(246,246,246)",
+    inlineCodeBackground: "rgb(236,236,238)",
 };
 
 /// The `dark-daltonized` palette: dark mode with reds and greens pulled
@@ -539,6 +575,12 @@ pub const DARK_DALTONIZED_THEME: Theme = Theme {
     rainbow_blue_shimmer: "rgb(180,205,240)",
     rainbow_indigo_shimmer: "rgb(195,180,230)",
     rainbow_violet_shimmer: "rgb(230,180,210)",
+    codeKeyword: "rgb(198,120,221)",
+    codeString: "rgb(97,175,239)",
+    codeNumber: "rgb(209,154,102)",
+    codeComment: "rgb(127,132,142)",
+    codeBlockBackground: "rgb(36,36,38)",
+    inlineCodeBackground: "rgb(58,58,62)",
 };
 
 /// The `light-ansi` palette: named ANSI colors only, for terminals without
@@ -614,6 +656,12 @@ pub const LIGHT_ANSI_THEME: Theme = Theme {
     rainbow_blue_shimmer: "ansi:cyanBright",
     rainbow_indigo_shimmer: "ansi:blueBright",
     rainbow_violet_shimmer: "ansi:magentaBright",
+    codeKeyword: "ansi:magenta",
+    codeString: "ansi:green",
+    codeNumber: "ansi:yellow",
+    codeComment: "ansi:blackBright",
+    codeBlockBackground: "ansi:white",
+    inlineCodeBackground: "ansi:white",
 };
 
 /// The `dark-ansi` palette: named ANSI colors, with `professionalBlue` as
@@ -689,6 +737,12 @@ pub const DARK_ANSI_THEME: Theme = Theme {
     rainbow_blue_shimmer: "ansi:cyanBright",
     rainbow_indigo_shimmer: "ansi:blueBright",
     rainbow_violet_shimmer: "ansi:magentaBright",
+    codeKeyword: "ansi:magentaBright",
+    codeString: "ansi:greenBright",
+    codeNumber: "ansi:yellowBright",
+    codeComment: "ansi:blackBright",
+    codeBlockBackground: "ansi:blackBright",
+    inlineCodeBackground: "ansi:blackBright",
 };
 
 /// The palette for `name`.
@@ -696,7 +750,24 @@ pub const DARK_ANSI_THEME: Theme = Theme {
 /// There is deliberately no error case: `ThemeName` has exactly six
 /// variants, so every input is covered. Code that wants a fallback asks
 /// [`ThemeName::default`], which is `Dark`.
+///
+/// With the terminal's background known (see [`set_terminal_background`]),
+/// the panel tokens of the RGB palettes are shades of that background.
 pub fn get_theme(name: ThemeName) -> Theme {
+    let mut theme = builtin_theme(name);
+    if !matches!(name, ThemeName::LightAnsi | ThemeName::DarkAnsi) {
+        if let Some(surfaces) = *TERMINAL_SURFACES
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            surfaces.apply(&mut theme);
+        }
+    }
+    theme
+}
+
+/// The palette for `name` exactly as shipped, before any terminal tint.
+fn builtin_theme(name: ThemeName) -> Theme {
     match name {
         ThemeName::Light => LIGHT_THEME,
         ThemeName::LightAnsi => LIGHT_ANSI_THEME,
@@ -756,6 +827,141 @@ pub fn active_theme_name() -> ThemeName {
 /// in render paths that were not handed a theme.
 pub fn get_active_theme() -> Theme {
     get_theme(active_theme_name())
+}
+
+/// Panel colours blended from the terminal's own background.
+///
+/// The palettes' fixed greys are tuned for a white or near-black terminal;
+/// on a tinted one (Solarized's cream, a blue-black) a grey panel reads as
+/// a smudge. A shade of the real background keeps its hue.
+static TERMINAL_SURFACES: std::sync::RwLock<Option<Surfaces>> = std::sync::RwLock::new(None);
+
+#[derive(Debug, Clone, Copy)]
+struct Surfaces {
+    background: (u8, u8, u8),
+    user_message: &'static str,
+    user_message_hover: &'static str,
+    selection_band: &'static str,
+    code_block: &'static str,
+    inline_code: &'static str,
+    bash_message: &'static str,
+    memory: &'static str,
+    diff_added: &'static str,
+    diff_removed: &'static str,
+    diff_added_dimmed: &'static str,
+    diff_removed_dimmed: &'static str,
+    diff_added_word: &'static str,
+    diff_removed_word: &'static str,
+}
+
+impl Surfaces {
+    fn apply(&self, theme: &mut Theme) {
+        theme.userMessageBackground = self.user_message;
+        theme.userMessageBackgroundHover = self.user_message_hover;
+        theme.messageActionsBackground = self.selection_band;
+        theme.codeBlockBackground = self.code_block;
+        theme.inlineCodeBackground = self.inline_code;
+        theme.bashMessageBackgroundColor = self.bash_message;
+        theme.memoryBackgroundColor = self.memory;
+        theme.diffAdded = self.diff_added;
+        theme.diffRemoved = self.diff_removed;
+        theme.diffAddedDimmed = self.diff_added_dimmed;
+        theme.diffRemovedDimmed = self.diff_removed_dimmed;
+        theme.diffAddedWord = self.diff_added_word;
+        theme.diffRemovedWord = self.diff_removed_word;
+    }
+
+    fn from_background(background: (u8, u8, u8)) -> Self {
+        let dark = is_dark(background);
+        // Light terminals darken toward black and dark ones lighten toward
+        // white; dark ones need a larger step for the same visible contrast.
+        let toward = if dark { (255, 255, 255) } else { (0, 0, 0) };
+        let shade = |light: f32, dark_amount: f32| {
+            leak_rgb(mix(
+                background,
+                toward,
+                if dark { dark_amount } else { light },
+            ))
+        };
+        // Tinted surfaces lean toward a hue instead of grey: the selection
+        // band toward the brand blue, diff rows toward green and red.
+        let tint = |hue: (u8, u8, u8), light: f32, dark_amount: f32| {
+            leak_rgb(mix(background, hue, if dark { dark_amount } else { light }))
+        };
+        let accent = if dark {
+            (106, 155, 204)
+        } else {
+            (70, 117, 164)
+        };
+        let green = if dark { (63, 185, 80) } else { (46, 160, 67) };
+        let red = if dark { (248, 81, 73) } else { (207, 34, 46) };
+        Self {
+            background,
+            user_message: shade(0.05, 0.08),
+            user_message_hover: shade(0.025, 0.12),
+            selection_band: tint(accent, 0.13, 0.24),
+            code_block: shade(0.035, 0.05),
+            inline_code: shade(0.075, 0.11),
+            bash_message: tint((166, 38, 164), 0.05, 0.10),
+            memory: tint((9, 151, 179), 0.08, 0.12),
+            diff_added: tint(green, 0.12, 0.18),
+            diff_removed: tint(red, 0.10, 0.16),
+            diff_added_dimmed: tint(green, 0.06, 0.09),
+            diff_removed_dimmed: tint(red, 0.05, 0.08),
+            diff_added_word: tint(green, 0.30, 0.40),
+            diff_removed_word: tint(red, 0.26, 0.35),
+        }
+    }
+}
+
+/// Record the terminal's background colour, or forget it with `None`.
+/// The panel tokens follow it from the next [`get_active_theme`] call.
+pub fn set_terminal_background(rgb: Option<(u8, u8, u8)>) {
+    let surfaces = rgb.map(Surfaces::from_background);
+    *TERMINAL_SURFACES
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = surfaces;
+}
+
+/// The colour panels and chips are tinted over: the terminal's background
+/// when known, else what the active palette assumes (white for the light
+/// palettes, near-black for the dark ones).
+pub fn surface_base() -> (u8, u8, u8) {
+    let known = *TERMINAL_SURFACES
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    known
+        .map(|surfaces| surfaces.background)
+        .unwrap_or_else(|| match active_theme_name() {
+            ThemeName::Light | ThemeName::LightDaltonized | ThemeName::LightAnsi => (255, 255, 255),
+            ThemeName::Dark | ThemeName::DarkDaltonized | ThemeName::DarkAnsi => (24, 24, 27),
+        })
+}
+
+/// Whether `rgb` is a dark colour (a dark terminal background, say).
+pub fn is_dark(rgb: (u8, u8, u8)) -> bool {
+    relative_luminance(rgb) < 0.4
+}
+
+/// `amount` (0–1) of the way from `from` to `to`.
+pub fn mix(from: (u8, u8, u8), to: (u8, u8, u8), amount: f32) -> (u8, u8, u8) {
+    let channel =
+        |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * amount).round() as u8;
+    (
+        channel(from.0, to.0),
+        channel(from.1, to.1),
+        channel(from.2, to.2),
+    )
+}
+
+fn relative_luminance((r, g, b): (u8, u8, u8)) -> f32 {
+    (0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)) / 255.0
+}
+
+/// Theme tokens are `&'static str`; a surface is computed once per detected
+/// background, so leaking the handful of strings is bounded.
+fn leak_rgb((r, g, b): (u8, u8, u8)) -> &'static str {
+    Box::leak(format!("rgb({r},{g},{b})").into_boxed_str())
 }
 
 #[cfg(test)]
@@ -1057,5 +1263,76 @@ mod tests {
                 "field `{k}` is not dispatchable via lookup()"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod code_syntax_key_tests {
+    use super::*;
+
+    #[test]
+    fn every_palette_defines_the_code_syntax_keys() {
+        for (name, kind) in THEME_NAMES {
+            let theme = get_theme(*kind);
+            for key in ["codeKeyword", "codeString", "codeNumber", "codeComment"] {
+                let value = theme.lookup(key).unwrap_or_else(|| panic!("{name}: {key}"));
+                assert!(
+                    value.starts_with("rgb(") || value.starts_with("ansi:"),
+                    "{name}: {key} = {value}"
+                );
+            }
+            // Four distinct roles need four distinct colours.
+            let mut values = [
+                theme.codeKeyword,
+                theme.codeString,
+                theme.codeNumber,
+                theme.codeComment,
+            ];
+            values.sort_unstable();
+            values
+                .windows(2)
+                .for_each(|w| assert_ne!(w[0], w[1], "{name}"));
+        }
+    }
+
+    #[test]
+    fn ansi_palettes_keep_code_syntax_to_the_sixteen_colours() {
+        for kind in [ThemeName::LightAnsi, ThemeName::DarkAnsi] {
+            let theme = get_theme(kind);
+            for value in [
+                theme.codeKeyword,
+                theme.codeString,
+                theme.codeNumber,
+                theme.codeComment,
+            ] {
+                assert!(value.starts_with("ansi:"), "{kind:?}: {value}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_surface_tests {
+    use super::*;
+
+    #[test]
+    fn light_backgrounds_darken_keeping_their_hue() {
+        // Solarized Light's cream: the card is a shade of cream, not grey.
+        let surfaces = Surfaces::from_background((253, 246, 227));
+        assert_eq!(surfaces.user_message, "rgb(240,234,216)");
+        assert_eq!(surfaces.code_block, "rgb(244,237,219)");
+    }
+
+    #[test]
+    fn dark_backgrounds_lighten() {
+        let surfaces = Surfaces::from_background((24, 24, 27));
+        assert_eq!(surfaces.user_message, "rgb(42,42,45)");
+    }
+
+    #[test]
+    fn diff_rows_lean_toward_their_hue() {
+        let surfaces = Surfaces::from_background((255, 255, 255));
+        assert_eq!(surfaces.diff_added, "rgb(230,244,232)");
+        assert_eq!(surfaces.diff_removed, "rgb(250,233,234)");
     }
 }

@@ -35,10 +35,10 @@ fn ask_user_answers_of(user: &rebon_render::UserMessage) -> Option<Vec<AnsweredQ
 use crate::{
     render_message, render_metadata_line,
     widget_subtree::{
-        assistant_text_child_theme_for, child_theme_for, AssistantTextBodyWidget,
-        AssistantThinkingBodyWidget, AssistantToolUseBodyWidget, AttachmentBodyWidget,
-        MessageBodyKind, SystemTextBodyWidget, UserAskAnswersBodyWidget, UserTextBodyWidget,
-        UserTextPlanBodyWidget, UserToolResultBodyWidget,
+        assistant_text_child_theme_for, child_theme_for, thinking_child_theme_for,
+        AssistantTextBodyWidget, AssistantThinkingBodyWidget, AssistantToolUseBodyWidget,
+        AttachmentBodyWidget, MessageBodyKind, SystemTextBodyWidget, UserAskAnswersBodyWidget,
+        UserTextBodyWidget, UserTextPlanBodyWidget, UserToolResultBodyWidget,
     },
     MessageRenderTheme,
 };
@@ -568,8 +568,8 @@ fn build_single_assistant_block(
         ) => Some(MessageBodyKind::AssistantThinking(
             AssistantThinkingBodyWidget::redacted_placeholder(
                 add_margin,
-                child_theme_for(theme),
-                theme.hint,
+                thinking_child_theme_for(theme),
+                theme.assistant,
             ),
         )),
         (
@@ -589,8 +589,8 @@ fn build_single_assistant_block(
                 hide_in_transcript,
                 input.compact_thinking_preview,
                 input.show_thinking_expand_hint,
-                child_theme_for(theme),
-                theme.hint,
+                thinking_child_theme_for(theme),
+                theme.assistant,
             ),
         )),
         (_, AssistantBlockProjection::Null) => None,
@@ -751,16 +751,20 @@ mod tests {
         let widget =
             RenderedMessageWidget::new(&input, &MessageRenderTheme::plain(), 50, None, None);
 
-        assert_eq!(widget.height(50), 22);
-        let mut buf = buffer(50, 22);
-        widget.render(Rect::new(0, 0, 50, 22), &mut buf);
-        assert_eq!(line(&buf, 0), "❯ line 1");
-        assert_eq!(line(&buf, 9), "  line 10");
-        assert!(line(&buf, 10).starts_with("  ──── (26 lines hidden) ─"));
-        assert_eq!(line(&buf, 10).chars().count(), 50);
-        assert_eq!(line(&buf, 11), "");
-        assert_eq!(line(&buf, 12), "  line 37");
-        assert_eq!(line(&buf, 21), "  line 46");
+        // Eight rows above the fold, four below, on a card with a half-row
+        // edge above and below.
+        assert_eq!(widget.height(50), 16);
+        let mut buf = buffer(50, 16);
+        widget.render(Rect::new(0, 0, 50, 16), &mut buf);
+        assert_eq!(line(&buf, 0), "▄".repeat(50));
+        assert_eq!(line(&buf, 1), "❯ line 1");
+        assert_eq!(line(&buf, 8), "  line 8");
+        assert!(line(&buf, 9).starts_with("  ──── (34 lines hidden) ─"));
+        assert_eq!(line(&buf, 9).chars().count(), 50);
+        assert_eq!(line(&buf, 10), "");
+        assert_eq!(line(&buf, 11), "  line 43");
+        assert_eq!(line(&buf, 14), "  line 46");
+        assert_eq!(line(&buf, 15), "▀".repeat(50));
     }
 
     #[test]
@@ -959,17 +963,18 @@ mod tests {
                 });
         assert!(widget.border.is_some());
         let height = widget.height(20);
-        // Body "USR hi" inside 18-col inner width → 1 row + 2 border lines.
-        assert_eq!(height, 3);
+        // Body "❯ hi" inside 18-col inner width → 1 row, a half-row card
+        // edge above and below it, and 2 border lines.
+        assert_eq!(height, 5);
 
-        let mut buf = buffer(20, 4);
-        widget.render(Rect::new(0, 0, 20, 4), &mut buf);
+        let mut buf = buffer(20, 5);
+        widget.render(Rect::new(0, 0, 20, 5), &mut buf);
         // Top border should contain the title.
         assert!(line(&buf, 0).contains("Selected"));
-        // Middle row should contain the USR prefix and body.
-        assert!((1..3).any(|y| line(&buf, y).contains("❯ hi")));
+        // A middle row should contain the prompt glyph and body.
+        assert!((1..4).any(|y| line(&buf, y).contains("❯ hi")));
         // Bottom border should be visible too.
-        assert!(!line(&buf, 2).is_empty());
+        assert!(!line(&buf, 4).is_empty());
     }
 
     #[test]
@@ -1736,7 +1741,8 @@ mod tests {
         assert_eq!(layers[1].area, Rect::new(3, 3, 36, 1));
         assert_eq!(layers[0].hyperlinks[0].target, "https://one.test");
         assert_eq!(layers[1].hyperlinks[0].target, "https://two.test");
-        assert!(line(&buf, 1).starts_with("│● code one"));
+        // Inline code sits on a chip padded a column each side.
+        assert!(line(&buf, 1).starts_with("│●  code  one"));
         assert!(line(&buf, 3).starts_with("│● visit https://two.test."));
         assert_eq!(
             buf[(3, 1)].style().fg,

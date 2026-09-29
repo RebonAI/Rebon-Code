@@ -1228,6 +1228,9 @@ pub(in crate::tui::runner) fn inline_picker_area_below_first(
     inline_picker_area_with_preference(prompt_area, parent_area, desired_height, true)
 }
 
+/// Widest a prompt picker overlay grows.
+const PICKER_MAX_WIDTH: u16 = 100;
+
 fn inline_picker_area_with_preference(
     prompt_area: Rect,
     parent_area: Rect,
@@ -1239,7 +1242,13 @@ fn inline_picker_area_with_preference(
     }
     let x = prompt_area.x.saturating_add(1).max(parent_area.x);
     let max_width = parent_area.right().saturating_sub(x);
-    let width = prompt_area.width.min(60).min(max_width);
+    // Sit inside the prompt frame's side borders, and stop growing once rows
+    // are wide enough for a name, a readable description and a tag.
+    let width = prompt_area
+        .width
+        .saturating_sub(2)
+        .min(PICKER_MAX_WIDTH)
+        .min(max_width);
     if width < 3 {
         return None;
     }

@@ -32,7 +32,7 @@ use rebon_render::{
 use rebon_render::{
     format_user_prompt_hidden_separator, project_assistant_text_message,
     project_assistant_thinking_message, project_assistant_tool_use, project_attachment_message,
-    project_user_prompt_display_lines, project_user_text, project_user_tool_result,
+    project_user_prompt_display_lines_for_width, project_user_text, project_user_tool_result,
     AssistantMarkdownDisplay, AssistantTextMessageInput, AssistantTextMessageProjection,
     AssistantThinkingMessageInput, AssistantThinkingMessageProjection, AssistantToolDefinition,
     AssistantToolRenderOutputs, AssistantToolSecondaryDisplay, AssistantToolUseInput,
@@ -70,7 +70,7 @@ use layout::{
     split_gutter,
 };
 pub(crate) use shared::assistant_text_child_theme_for;
-pub use shared::{accent_theme, child_theme_for};
+pub use shared::{accent_theme, child_theme_for, thinking_child_theme_for};
 use shared::{bordered_text_block, BodyRow, BorderedBlock, BorderedBlockBody, RuledBlock};
 
 /// Spinner glyphs cycled through when an animated row is unresolved.
@@ -803,8 +803,14 @@ impl UserTextBodyWidget {
         let content_width = width.saturating_sub(GUTTER_WIDTH).max(1);
         let text =
             render_user_text_projection_for_width(&self.projection, &self.theme, content_width);
+        let card_edges = if is_prompt_card(&self.projection) {
+            2
+        } else {
+            0
+        };
         measure_text_height(&text, content_width)
             .max(1)
+            .saturating_add(card_edges)
             .saturating_add(u16::from(self.add_margin))
     }
 
@@ -817,18 +823,26 @@ impl UserTextBodyWidget {
             label_style,
             add_margin,
         } = self;
-        let paint_background = matches!(&projection, UserTextProjection::Prompt { .. });
+        let paint_background = is_prompt_card(&projection);
         let (gutter_area, content_area) = split_gutter(area);
         if content_area.width == 0 || content_area.height == 0 {
             return;
         }
-        let y = if add_margin {
+        let bottom = content_area.y.saturating_add(content_area.height);
+        let mut y = if add_margin {
             content_area.y.saturating_add(1)
         } else {
             content_area.y
         };
-        if y >= content_area.y.saturating_add(content_area.height) {
+        if y >= bottom {
             return;
+        }
+        if paint_background {
+            paint_user_card_edge(area.x, y, area.width, USER_CARD_TOP_EDGE, buf);
+            y = y.saturating_add(1);
+            if y >= bottom {
+                return;
+            }
         }
         let text = render_user_text_projection_for_width(&projection, &theme, content_area.width);
         let text_height = measure_text_height(&text, content_area.width).max(1);
@@ -866,6 +880,34 @@ impl UserTextBodyWidget {
             );
         }
         paint_text_into(render_area, buf, text);
+        let edge_y = y.saturating_add(text_height);
+        if paint_background && edge_y < bottom {
+            paint_user_card_edge(area.x, edge_y, area.width, USER_CARD_BOTTOM_EDGE, buf);
+        }
+    }
+}
+
+/// Lower half-block: the prompt card's top padding, on the row above it.
+const USER_CARD_TOP_EDGE: &str = "▄";
+
+/// Upper half-block: the prompt card's bottom padding, on the row below it.
+const USER_CARD_BOTTOM_EDGE: &str = "▀";
+
+/// A prompt the user typed sits on a card; teammate and plan rows do not.
+fn is_prompt_card(projection: &UserTextProjection) -> bool {
+    matches!(projection, UserTextProjection::Prompt { .. })
+}
+
+/// Half a row of card above or below the prompt: half-block glyphs in the
+/// card colour pad it without spending two full rows.
+fn paint_user_card_edge(x: u16, y: u16, width: u16, glyph: &str, buf: &mut Buffer) {
+    let ds = theme::get_active_theme();
+    let card = parse_theme_color(ds.userMessageBackground);
+    for col in x..x.saturating_add(width) {
+        if let Some(cell) = buf.cell_mut((col, y)) {
+            cell.set_symbol(glyph);
+            cell.set_fg(card);
+        }
     }
 }
 
@@ -894,18 +936,23 @@ fn render_user_text_projection_for_width(
             is_transcript_mode,
             ..
         } => Text::from(
-            project_user_prompt_display_lines(text, *verbose, *is_transcript_mode)
-                .into_iter()
-                .map(|line| match line {
-                    UserPromptDisplayLine::Text(line) => Line::from(Span::styled(line, theme.text)),
-                    UserPromptDisplayLine::HiddenSeparator { hidden_line_count } => {
-                        Line::from(Span::styled(
-                            format_user_prompt_hidden_separator(hidden_line_count, width as usize),
-                            fold_separator_style(),
-                        ))
-                    }
-                })
-                .collect::<Vec<_>>(),
+            project_user_prompt_display_lines_for_width(
+                text,
+                *verbose,
+                *is_transcript_mode,
+                width as usize,
+            )
+            .into_iter()
+            .map(|line| match line {
+                UserPromptDisplayLine::Text(line) => Line::from(Span::styled(line, theme.text)),
+                UserPromptDisplayLine::HiddenSeparator { hidden_line_count } => {
+                    Line::from(Span::styled(
+                        format_user_prompt_hidden_separator(hidden_line_count, width as usize),
+                        fold_separator_style(),
+                    ))
+                }
+            })
+            .collect::<Vec<_>>(),
         ),
         _ => render_user_text_projection(projection, theme),
     }

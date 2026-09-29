@@ -5044,13 +5044,14 @@ fn committed_agent_after_hidden_thinking_has_single_gap_and_selectable_output() 
     let rows = all_rows(&buf);
     let user_row = row_y_containing(&rows, "summarize this");
     let agent_row = row_y_containing(&rows, "Explore: inspect render path");
+    // The prompt card's bottom edge, then the one-row gap.
     assert_eq!(
         agent_row,
-        user_row + 2,
+        user_row + 3,
         "hidden thinking left more than the normal one-row transcript gap: {rows:?}"
     );
     assert!(
-        rows[user_row + 1].trim().is_empty(),
+        rows[user_row + 2].trim().is_empty(),
         "normal inter-message gap missing: {rows:?}"
     );
     assert!(

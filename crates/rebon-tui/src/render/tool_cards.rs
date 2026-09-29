@@ -277,10 +277,13 @@ pub(super) fn render_edit_tool(
     } else {
         file_path
     };
+    // The label reads relative to the session directory; the hyperlink
+    // behind it keeps the absolute path.
+    let header_path_label = rebon_render::display_path::display_path(header_file_path);
     let header_text = if header_file_path.is_empty() {
         op_label.to_string()
     } else {
-        format!("{op_label}({header_file_path})")
+        format!("{op_label}({header_path_label})")
     };
     let tool_name_style = tool_name_style(theme);
     let tool_summary_style = theme.assistant_prefix;
@@ -293,7 +296,7 @@ pub(super) fn render_edit_tool(
             Span::styled(
                 hyperlink_path_label(
                     header_file_path,
-                    header_file_path.to_string(),
+                    header_path_label.to_string(),
                     theme.supports_hyperlinks,
                 ),
                 tool_summary_style,
@@ -303,11 +306,7 @@ pub(super) fn render_edit_tool(
     };
 
     // Render the header with gutter.
-    let gutter_style = if is_failed {
-        tool_status_style(theme, ToolCallStatus::Failed)
-    } else {
-        theme.assistant_prefix
-    };
+    let gutter_style = tool_gutter_style(theme, is_failed, is_in_progress);
     let gutter_glyph = tool_gutter_glyph(theme, is_failed, is_in_progress);
     let render_header_line = if theme.supports_hyperlinks {
         strip_osc8_from_lines(&[header_line.clone()])

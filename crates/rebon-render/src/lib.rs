@@ -126,11 +126,11 @@ pub mod activity_runs;
 pub mod advisor;
 pub mod agent;
 #[deny(missing_docs)]
+pub mod ask_user_answers;
+#[deny(missing_docs)]
 pub mod assistant_text;
 #[deny(missing_docs)]
 pub mod assistant_tool_use;
-#[deny(missing_docs)]
-pub mod ask_user_answers;
 #[deny(missing_docs)]
 pub mod attachment;
 pub mod auto_mode_note;
@@ -151,6 +151,7 @@ pub mod detect;
 pub mod diagnostics;
 pub mod diff;
 pub mod diff_fallback;
+pub mod display_path;
 #[deny(missing_docs)]
 pub mod fallback;
 pub mod fence;
@@ -438,7 +439,7 @@ pub use system_text::{
 pub use table_layout::{compute_column_widths, ColumnLayout};
 pub use table_render::{
     render_border_line, render_horizontal_table, render_row_lines, render_vertical_format,
-    BorderKind, RenderedTable, TableInput,
+    try_render_horizontal_table, BorderKind, RenderedTable, TableInput,
 };
 pub use teammate_messages::{
     parse_teammate_messages, project_teammate_message_content, project_user_teammate_messages,
@@ -490,10 +491,10 @@ pub use user_prompt::{
     TRUNCATE_HEAD_CHARS, TRUNCATE_TAIL_CHARS,
 };
 pub use user_text::{
-    format_user_prompt_hidden_separator, project_user_prompt_display_lines, project_user_text,
-    UserPromptDisplayLine, UserTextInput, UserTextProjection, NO_CONTENT_MESSAGE,
-    USER_PROMPT_FOLD_DEFAULT_WIDTH, USER_PROMPT_FOLD_HEAD_LINES, USER_PROMPT_FOLD_TAIL_LINES,
-    USER_PROMPT_FOLD_THRESHOLD_LINES,
+    format_user_prompt_hidden_separator, project_user_prompt_display_lines,
+    project_user_prompt_display_lines_for_width, project_user_text, UserPromptDisplayLine,
+    UserTextInput, UserTextProjection, NO_CONTENT_MESSAGE, USER_PROMPT_FOLD_DEFAULT_WIDTH,
+    USER_PROMPT_FOLD_HEAD_LINES, USER_PROMPT_FOLD_TAIL_LINES, USER_PROMPT_FOLD_THRESHOLD_LINES,
 };
 pub use workflow_body::{workflow_body_lines, workflow_tool_summary};
 pub use wrappers::{

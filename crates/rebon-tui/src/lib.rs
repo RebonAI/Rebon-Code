@@ -125,7 +125,7 @@ pub use message::{
     UserToolResultBlock,
 };
 pub use render::{
-    parse_theme_color, render_message, render_streaming_overlay, render_transcript,
+    chip_style, parse_theme_color, render_message, render_streaming_overlay, render_transcript,
     render_transcript_cached, render_transcript_cached_with_running_hints,
     trailing_collapsible_tool_run_start, LiveAgentToolActivity, LiveAgentToolStatus,
     MathDisplayMode, MathGraphicsProtocol, RenderTheme, ToolOutputVerbosity,

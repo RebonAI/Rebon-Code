@@ -81,7 +81,7 @@ pub(in crate::tui::runner) fn render_prompt_surface(
     let input_has_mode_prefix = app.input.starts_with('!');
     let is_bash = app.mode == "bash" || input_has_mode_prefix;
     let is_help = app.help_open;
-    let (border_style, title) = prompt_chrome(
+    let (border_style, title) = prompt_chrome_line(
         is_loading,
         is_bash,
         is_help,
@@ -92,11 +92,9 @@ pub(in crate::tui::runner) fn render_prompt_surface(
     );
     let mut block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(border_style)
-        .title(Span::styled(
-            title,
-            border_style.add_modifier(Modifier::BOLD),
-        ));
+        .title(title);
     let mut deferred_hint = None;
     if let Some(hint) = app.idle_prompt_top_hint() {
         let text = format!(" {} ", hint.text);
@@ -259,15 +257,15 @@ pub(in crate::tui::runner) fn render_prompt_surface(
     }
 }
 
+/// Informational hints sit quietly in the frame; only a warning earns weight.
 pub(in crate::tui::runner) fn prompt_top_hint_style(tone: PromptTopHintTone) -> Style {
     let ds = rebon_design_system::theme::get_active_theme();
-    let color = match tone {
-        PromptTopHintTone::Info => ds.rebon,
-        PromptTopHintTone::Warning => ds.warning,
-    };
-    Style::default()
-        .fg(parse_theme_color(color))
-        .add_modifier(Modifier::BOLD)
+    match tone {
+        PromptTopHintTone::Info => Style::default().fg(parse_theme_color(ds.inactive)),
+        PromptTopHintTone::Warning => Style::default()
+            .fg(parse_theme_color(ds.warning))
+            .add_modifier(Modifier::BOLD),
+    }
 }
 
 fn render_prompt_mode_badge(frame: &mut Frame, area: Rect, badge: PromptModeBadge) {
@@ -284,11 +282,28 @@ fn render_prompt_mode_badge(frame: &mut Frame, area: Rect, badge: PromptModeBadg
     Paragraph::new(Span::styled(
         badge.label,
         Style::default()
-            .fg(Color::White)
+            .fg(badge_foreground(badge.background))
             .bg(badge.background)
             .add_modifier(Modifier::BOLD),
     ))
     .render(badge_area, frame.buffer_mut());
+}
+
+/// Black or white, whichever reads on `background`. A fixed white label
+/// disappears on the light palettes' yellow.
+pub(in crate::tui::runner) fn badge_foreground(background: Color) -> Color {
+    match background {
+        Color::Rgb(r, g, b) => {
+            let luma = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
+            if luma > 150.0 {
+                Color::Black
+            } else {
+                Color::White
+            }
+        }
+        Color::Yellow | Color::LightYellow | Color::LightGreen | Color::LightCyan => Color::Black,
+        _ => Color::White,
+    }
 }
 
 fn render_prompt_top_right_text_before_badge(
@@ -322,9 +337,12 @@ fn render_prompt_top_right_text_before_badge(
 /// Returns `(border_style, title)` for the prompt frame based on
 /// loading state and prompt mode (`bash`) / help overlay state.
 ///
-/// When loading, a random spinner verb from `spinner_verbs`
-/// is shown with an animated spinner glyph from `rebon-spinner`.
-pub(in crate::tui::runner) fn prompt_chrome(
+/// When loading, a random spinner verb from `spinner_verbs` is shown with an
+/// animated spinner glyph from `rebon-spinner`. The title is layered: the
+/// glyph and verb carry the brand accent, while elapsed time, retry progress
+/// and the token count recede into the secondary tone so the eye lands on
+/// what the agent is doing, not on the counters.
+pub(in crate::tui::runner) fn prompt_chrome_line(
     is_loading: bool,
     is_bash: bool,
     is_help: bool,
@@ -332,55 +350,72 @@ pub(in crate::tui::runner) fn prompt_chrome(
     spinner_verb: &str,
     retry_info: Option<rebon_api::RetryProgress>,
     token_count: u32,
-) -> (Style, String) {
+) -> (Style, Line<'static>) {
     let ds = rebon_design_system::theme::get_active_theme();
     if is_loading {
         let glyph = rebon_spinner::glyph_for_frame(
             rebon_spinner::GlyphPlatform::Other,
             elapsed_ms / 80, // ~12.5 fps cycle
         );
-        // Format elapsed time using rebon-shell's duration formatter.
-        let duration_str = format_duration(
-            elapsed_ms,
-            DurationFormatOptions {
-                hide_trailing_zeros: true,
-                most_significant_only: true,
-            },
-        );
-        // Show retry progress when the middleware is retrying a failed
-        // request (e.g. "Retry 2/10").
-        let retry_suffix = match retry_info {
-            Some(p) => format!(" ({})", p),
-            None => String::new(),
-        };
-        // Show the running token count when reported by the model.
-        let token_suffix = if token_count > 0 {
-            format!(" · {} tokens", fmt_tokens(token_count))
-        } else {
-            String::new()
-        };
-        let title = if elapsed_ms >= 1000 {
-            format!(" {glyph} {spinner_verb}…{retry_suffix} {duration_str}{token_suffix} ")
-        } else {
-            format!(" {glyph} {spinner_verb}…{retry_suffix}{token_suffix} ")
-        };
-        return (Style::default().fg(parse_theme_color(ds.rebon)), title);
+        let accent = Style::default().fg(parse_theme_color(ds.rebon));
+        let secondary = Style::default().fg(parse_theme_color(ds.inactive));
+        let mut spans = vec![
+            Span::raw(" "),
+            Span::styled(
+                glyph.to_string(),
+                Style::default().fg(parse_theme_color(ds.rebonShimmer)),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("{spinner_verb}…"),
+                accent.add_modifier(Modifier::BOLD),
+            ),
+        ];
+        // Retry progress when the middleware is retrying a failed request
+        // (e.g. "Retry 2/10") is the one counter that is news, so it keeps
+        // the warning tone.
+        if let Some(progress) = retry_info {
+            spans.push(Span::styled(
+                format!(" ({progress})"),
+                Style::default().fg(parse_theme_color(ds.warning)),
+            ));
+        }
+        if elapsed_ms >= 1000 {
+            let duration_str = format_duration(
+                elapsed_ms,
+                DurationFormatOptions {
+                    hide_trailing_zeros: true,
+                    most_significant_only: true,
+                },
+            );
+            spans.push(Span::styled(format!(" · {duration_str}"), secondary));
+        }
+        if token_count > 0 {
+            spans.push(Span::styled(
+                format!(" · {} tokens", fmt_tokens(token_count)),
+                secondary,
+            ));
+        }
+        spans.push(Span::raw(" "));
+        return (accent, Line::from(spans));
     }
     if is_bash {
+        let style = Style::default().fg(parse_theme_color(ds.bashBorder));
         return (
-            Style::default().fg(parse_theme_color(ds.bashBorder)),
-            String::from(" bash "),
+            style,
+            Line::from(Span::styled(" bash ", style.add_modifier(Modifier::BOLD))),
         );
     }
     if is_help {
+        let style = Style::default().fg(parse_theme_color(ds.suggestion));
         return (
-            Style::default().fg(parse_theme_color(ds.suggestion)),
-            String::from(" help "),
+            style,
+            Line::from(Span::styled(" help ", style.add_modifier(Modifier::BOLD))),
         );
     }
     (
         Style::default().fg(parse_theme_color(ds.promptBorder)),
-        String::new(),
+        Line::default(),
     )
 }
 
@@ -391,24 +426,92 @@ mod tests {
     // Both compare against the same get_active_theme() lookup the code under
     // test performs, so they hold under any process-wide active theme.
 
-    #[test]
-    fn loading_spinner_line_uses_the_brand_accent_not_warning_yellow() {
-        let ds = rebon_design_system::theme::get_active_theme();
-        let (style, title) = prompt_chrome(true, false, false, 2_000, "Computing", None, 0);
-        assert_eq!(style.fg, Some(parse_theme_color(ds.rebon)));
-        assert!(title.contains("Computing…"));
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn span_with<'a>(line: &'a Line<'_>, needle: &str) -> &'a Span<'a> {
+        line.spans
+            .iter()
+            .find(|s| s.content.contains(needle))
+            .unwrap_or_else(|| panic!("no span containing {needle:?} in {:?}", line_text(line)))
     }
 
     #[test]
-    fn top_hint_tones_map_info_to_brand_and_keep_warning_yellow() {
+    fn loading_spinner_line_uses_the_brand_accent_not_warning_yellow() {
         let ds = rebon_design_system::theme::get_active_theme();
+        let (style, title) = prompt_chrome_line(true, false, false, 2_000, "Computing", None, 0);
+        assert_eq!(style.fg, Some(parse_theme_color(ds.rebon)));
+        let verb = span_with(&title, "Computing…");
+        assert_eq!(verb.style.fg, Some(parse_theme_color(ds.rebon)));
+        assert!(verb.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn loading_counters_recede_into_the_secondary_tone() {
+        let ds = rebon_design_system::theme::get_active_theme();
+        let (_, title) = prompt_chrome_line(true, false, false, 19_000, "Mustering", None, 721);
         assert_eq!(
-            prompt_top_hint_style(PromptTopHintTone::Info).fg,
-            Some(parse_theme_color(ds.rebon))
+            line_text(&title).trim_end(),
+            format!(" {} Mustering… · 19s · 721 tokens", {
+                rebon_spinner::glyph_for_frame(rebon_spinner::GlyphPlatform::Other, 19_000 / 80)
+            })
         );
-        assert_eq!(
-            prompt_top_hint_style(PromptTopHintTone::Warning).fg,
-            Some(parse_theme_color(ds.warning))
-        );
+        for needle in [" · 19s", " · 721 tokens"] {
+            let span = span_with(&title, needle);
+            assert_eq!(
+                span.style.fg,
+                Some(parse_theme_color(ds.inactive)),
+                "{needle}"
+            );
+            assert!(
+                !span.style.add_modifier.contains(Modifier::BOLD),
+                "{needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn loading_title_omits_the_clock_under_a_second_and_the_count_at_zero() {
+        let (_, title) = prompt_chrome_line(true, false, false, 400, "Computing", None, 0);
+        let text = line_text(&title);
+        assert!(text.ends_with("Computing… "), "{text:?}");
+        assert!(!text.contains('·'), "{text:?}");
+    }
+
+    #[test]
+    fn idle_bash_and_help_titles() {
+        let ds = rebon_design_system::theme::get_active_theme();
+        let (idle, title) = prompt_chrome_line(false, false, false, 0, "", None, 0);
+        assert_eq!(idle.fg, Some(parse_theme_color(ds.promptBorder)));
+        assert!(title.spans.is_empty());
+
+        let (bash, title) = prompt_chrome_line(false, true, false, 0, "", None, 0);
+        assert_eq!(bash.fg, Some(parse_theme_color(ds.bashBorder)));
+        assert_eq!(line_text(&title), " bash ");
+
+        let (help, title) = prompt_chrome_line(false, false, true, 0, "", None, 0);
+        assert_eq!(help.fg, Some(parse_theme_color(ds.suggestion)));
+        assert_eq!(line_text(&title), " help ");
+    }
+
+    #[test]
+    fn top_hint_tones_keep_info_quiet_and_warning_loud() {
+        let ds = rebon_design_system::theme::get_active_theme();
+        let info = prompt_top_hint_style(PromptTopHintTone::Info);
+        assert_eq!(info.fg, Some(parse_theme_color(ds.inactive)));
+        assert!(!info.add_modifier.contains(Modifier::BOLD));
+        let warning = prompt_top_hint_style(PromptTopHintTone::Warning);
+        assert_eq!(warning.fg, Some(parse_theme_color(ds.warning)));
+        assert!(warning.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn badge_foreground_reads_on_light_and_dark_fills() {
+        assert_eq!(badge_foreground(Color::Rgb(251, 188, 4)), Color::Black);
+        assert_eq!(badge_foreground(Color::Rgb(0, 102, 102)), Color::White);
+        assert_eq!(badge_foreground(Color::Rgb(72, 150, 140)), Color::White);
+        assert_eq!(badge_foreground(Color::Yellow), Color::Black);
+        assert_eq!(badge_foreground(Color::Blue), Color::White);
     }
 }

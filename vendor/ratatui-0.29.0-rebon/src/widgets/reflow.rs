@@ -162,7 +162,14 @@ where
         }
 
         // append remaining text parts
-        if pending_line.is_empty()
+        //
+        // rebon: a whitespace-only line is emptied by trimming, so it needs
+        // an explicit blank row. Without trimming the whitespace itself is
+        // pushed below and already is that row; pushing both painted one
+        // blank source line as two rows, while every height measurement
+        // counted one, so the tail of the text was clipped.
+        if self.trim
+            && pending_line.is_empty()
             && self.pending_word.is_empty()
             && !self.pending_whitespace.is_empty()
         {

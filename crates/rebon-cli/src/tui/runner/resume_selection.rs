@@ -89,6 +89,7 @@ pub(super) fn apply_remote_background_selection(
         app.streaming_token_count = 0;
         app.usage_mut().clear_last_turn();
         app.cwd = target.cwd.clone();
+        rebon_render::display_path::set_display_root(Some(&app.cwd));
         app.session_title = record.title.clone();
         app.prompt_completion_status = None;
         app.background_agent_tool_tasks.clear();
@@ -693,6 +694,7 @@ pub(super) fn commit_prepared_resume(
 
     // Only this path adopts the resumed session's directory as the screen's.
     app.cwd = storage_cwd.clone();
+    rebon_render::display_path::set_display_root(Some(&app.cwd));
     let projects_root = prepared.state_projects_root();
     let count = land_resumed_session(
         app,

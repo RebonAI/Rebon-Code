@@ -128,6 +128,52 @@ fn send_ultraplan_gate_rejection(
     app.pending_permission_view = None;
 }
 
+/// Largest file read from disk to give a permission preview its context.
+const FILE_CHANGE_CONTEXT_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// What an Edit or Write call is about to do, read from its input and the file
+/// as it is now. `None` when the input is not shaped like one, and the prompt
+/// falls back to listing the arguments.
+fn file_change_preview(
+    tool_name: &str,
+    input: Option<&serde_json::Value>,
+) -> Option<crate::tui::permission_modal::FileChangePreview> {
+    let input = input?;
+    let file_path = input.get("file_path")?.as_str()?.trim();
+    if file_path.is_empty() {
+        return None;
+    }
+    let original = std::fs::metadata(file_path)
+        .ok()
+        .filter(|meta| meta.is_file() && meta.len() <= FILE_CHANGE_CONTEXT_MAX_BYTES)
+        .and_then(|_| std::fs::read_to_string(file_path).ok());
+    let path = rebon_render::display_path::display_path(file_path).into_owned();
+    match tool_name {
+        "Edit" => Some(crate::tui::permission_modal::FileChangePreview {
+            path,
+            verb: "Update",
+            old_text: Some(input.get("old_string")?.as_str()?.to_string()),
+            new_text: input.get("new_string")?.as_str()?.to_string(),
+            original,
+        }),
+        "Write" => {
+            let content = input.get("content")?.as_str()?.to_string();
+            Some(crate::tui::permission_modal::FileChangePreview {
+                path,
+                verb: if original.is_some() {
+                    "Overwrite"
+                } else {
+                    "Create"
+                },
+                old_text: original.clone(),
+                new_text: content,
+                original,
+            })
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn build_pending_permission(
     app: &AppState,
     outbound: OutboundPermissionQuery,
@@ -193,6 +239,9 @@ pub(super) fn build_pending_permission(
             .and_then(ProfileProposal::from_permission_metadata)
             .map(PermissionKind::Profile)
             .unwrap_or(PermissionKind::Generic),
+        "Edit" | "Write" => file_change_preview(&tool_name, outbound.tool_input.as_ref())
+            .map(PermissionKind::FileChange)
+            .unwrap_or(PermissionKind::Generic),
         _ => PermissionKind::Generic,
     };
 
@@ -240,6 +289,10 @@ pub(super) fn build_pending_permission(
                     }
                 },
             ),
+        ),
+        PermissionKind::FileChange(preview) => (
+            permission_title(&tool_name),
+            format!("{} {}", preview.verb, preview.path),
         ),
         PermissionKind::Generic => {
             let display_tool_name = if tool_name == "InvokeDeferredTool" {
@@ -3826,5 +3879,57 @@ mod tests {
             .and_then(|status| status.context.as_ref())
             .map(|context| context.execution_cards.len());
         assert_eq!(status_cards, Some(1));
+    }
+}
+
+#[cfg(test)]
+mod file_change_preview_tests {
+    use super::file_change_preview;
+    use serde_json::json;
+
+    #[test]
+    fn an_edit_carries_the_file_for_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lib.rs");
+        std::fs::write(&file, "a\nb\nlet x = 1;\n").unwrap();
+        let input = json!({
+            "file_path": file.to_string_lossy(),
+            "old_string": "let x = 1;",
+            "new_string": "let x = 2;",
+        });
+        let preview = file_change_preview("Edit", Some(&input)).expect("preview");
+        assert_eq!(preview.verb, "Update");
+        assert_eq!(preview.old_text.as_deref(), Some("let x = 1;"));
+        assert_eq!(preview.new_text, "let x = 2;");
+        assert_eq!(preview.original.as_deref(), Some("a\nb\nlet x = 1;\n"));
+    }
+
+    #[test]
+    fn a_write_creates_or_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("new.md");
+        let input = json!({"file_path": fresh.to_string_lossy(), "content": "hi\n"});
+        let preview = file_change_preview("Write", Some(&input)).expect("create");
+        assert_eq!(preview.verb, "Create");
+        assert!(preview.old_text.is_none() && preview.original.is_none());
+
+        let existing = dir.path().join("old.md");
+        std::fs::write(&existing, "before\n").unwrap();
+        let input = json!({"file_path": existing.to_string_lossy(), "content": "after\n"});
+        let preview = file_change_preview("Write", Some(&input)).expect("overwrite");
+        assert_eq!(preview.verb, "Overwrite");
+        assert_eq!(preview.old_text.as_deref(), Some("before\n"));
+        assert_eq!(preview.new_text, "after\n");
+    }
+
+    #[test]
+    fn malformed_input_falls_back_to_the_generic_prompt() {
+        assert!(file_change_preview("Edit", None).is_none());
+        assert!(file_change_preview("Edit", Some(&json!({"file_path": "x"}))).is_none());
+        assert!(file_change_preview("Edit", Some(&json!({"file_path": "  "}))).is_none());
+        assert!(file_change_preview("Write", Some(&json!({"content": "x"}))).is_none());
+        assert!(
+            file_change_preview("Bash", Some(&json!({"file_path": "x", "content": "y"}))).is_none()
+        );
     }
 }

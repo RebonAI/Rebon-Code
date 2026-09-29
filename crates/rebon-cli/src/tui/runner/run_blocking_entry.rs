@@ -137,6 +137,7 @@ pub(super) fn install_session(
     app.mid_turn_queued_submit_poller = Some(session.engine_half.runtime.mid_turn_queue.clone());
     session.math_rendering_mode = options.math_rendering;
     app.cwd = session.cwd.clone();
+    rebon_render::display_path::set_display_root(Some(&app.cwd));
     sync_current_session_title(app, session);
     if let Some(intent) = startup_resume {
         app.resume_dialog = Some(match intent {
@@ -427,6 +428,7 @@ pub fn run_blocking(
         .and_then(|s| ThemeName::from_str(&s))
         .unwrap_or(ThemeName::Dark);
     rebon_design_system::theme::set_active_theme(theme_name);
+    crate::tui::terminal_background::apply();
     let mut theme = RenderTheme {
         supports_hyperlinks: terminal_supports_hyperlinks(),
         math_display: terminal_math_display_mode(ui_config.math_rendering, ui_config.mode),
@@ -642,6 +644,7 @@ fn prepare_runner_app(
             ui_config.status_line.clone(),
         );
     app.cwd = slot.cwd().to_string();
+    rebon_render::display_path::set_display_root(Some(&app.cwd));
     // Populate built-in slash commands so the picker activates on "/".
     // The ACP server path populates these via session/new; the local
     // TUI path bypasses the server, so we seed them directly.

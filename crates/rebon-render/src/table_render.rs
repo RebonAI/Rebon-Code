@@ -240,6 +240,21 @@ pub fn render_row_lines(
 /// `terminal_width - SAFETY_MARGIN`, the function returns
 /// [`render_vertical_format`]'s output instead.
 pub fn render_horizontal_table(table: &TableInput, terminal_width: usize) -> RenderedTable {
+    try_render_horizontal_table(table, terminal_width)
+        .unwrap_or_else(|| render_vertical_format(table, terminal_width))
+}
+
+/// [`render_horizontal_table`] without the vertical fallback: `None` when
+/// the grid would be too tall or too wide.
+///
+/// The cells were wrapped to the grid's column widths, which are far
+/// narrower than the full-width `label: value` rows of the vertical format;
+/// a caller that owns the wrapping uses this to learn it must re-wrap the
+/// cells before calling [`render_vertical_format`].
+pub fn try_render_horizontal_table(
+    table: &TableInput,
+    terminal_width: usize,
+) -> Option<RenderedTable> {
     // Pre-flight: if any row would wrap to more than MAX_ROW_LINES,
     // vertical format is used instead. Callers usually check this
     // first, but the check is repeated here.
@@ -252,7 +267,7 @@ pub fn render_horizontal_table(table: &TableInput, terminal_width: usize) -> Ren
         .unwrap_or(0);
     let max_row = header_max.max(body_max).max(1);
     if max_row > MAX_ROW_LINES {
-        return render_vertical_format(table, terminal_width);
+        return None;
     }
 
     let mut lines = Vec::new();
@@ -286,10 +301,10 @@ pub fn render_horizontal_table(table: &TableInput, terminal_width: usize) -> Ren
         .max()
         .unwrap_or(0);
     if max_line_width > terminal_width.saturating_sub(SAFETY_MARGIN) {
-        return render_vertical_format(table, terminal_width);
+        return None;
     }
 
-    RenderedTable { lines }
+    Some(RenderedTable { lines })
 }
 
 /// Render the table in vertical (key-value) format.

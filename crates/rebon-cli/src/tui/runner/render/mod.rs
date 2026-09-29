@@ -6,7 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 use ratatui::Frame;
 use rebon_width::WidthStr;
 
@@ -1508,7 +1508,8 @@ mod tests {
         let rows = render_full_inline_frame_rows(app, 24, 0);
 
         assert!(
-            rows.iter().any(|row| row.contains("Login (1/1)")),
+            // A single-step dialog is titled by name alone, without "(1/1)".
+            rows.iter().any(|row| row.contains("╭ Login ")),
             "login dialog title should render inline: {rows:?}"
         );
         assert!(
@@ -1542,7 +1543,7 @@ mod tests {
         let rows = render_inline_rows_in_area(open_app, area, 0);
         let prompt_border_rows = rows
             .iter()
-            .filter(|row| row.contains('┌') || row.contains('└'))
+            .filter(|row| row.contains('╭') || row.contains('╰'))
             .count() as u16;
 
         assert_eq!(
@@ -1606,7 +1607,7 @@ mod tests {
             .expect("resume dialog title should render");
         let bottom = rows
             .iter()
-            .rposition(|row| row.contains('┘'))
+            .rposition(|row| row.contains('╯'))
             .expect("resume dialog bottom border should render");
 
         assert!(bottom + 1 - top >= 30, "rows: {rows:?}");
@@ -1625,7 +1626,7 @@ mod tests {
             .expect("resume dialog title should render");
         let bottom = rows
             .iter()
-            .rposition(|row| row.contains('┘'))
+            .rposition(|row| row.contains('╯'))
             .expect("resume dialog bottom border should render");
 
         assert!(
@@ -2555,7 +2556,7 @@ mod tests {
             "permission surface should replace prompt input content: {rows:?}"
         );
         assert!(
-            rows.iter().all(|row| !row.contains('┌')),
+            rows.iter().all(|row| !row.contains('╭')),
             "permission surface should not leave the prompt top border behind: {rows:?}"
         );
     }
@@ -2579,11 +2580,11 @@ mod tests {
             "loading prompt should keep the normal input glyph: {rows:?}"
         );
         assert!(
-            rows.iter().any(|row| row.contains('┌')),
+            rows.iter().any(|row| row.contains('╭')),
             "prompt top border should render during waiting/loading: {rows:?}"
         );
         assert!(
-            rows.iter().any(|row| row.contains('└')),
+            rows.iter().any(|row| row.contains('╰')),
             "prompt bottom border should render during waiting/loading: {rows:?}"
         );
         assert!(
@@ -2801,7 +2802,7 @@ mod tests {
             "transcript content should render: {rows:?}"
         );
         assert!(
-            rows.iter().any(|row| row.contains('┌')),
+            rows.iter().any(|row| row.contains('╭')),
             "prompt border should be preserved: {rows:?}"
         );
     }
@@ -2824,7 +2825,7 @@ mod tests {
         );
         assert!(
             rows.iter()
-                .filter(|row| row.contains('┌') || row.contains('└'))
+                .filter(|row| row.contains('╭') || row.contains('╰'))
                 .count()
                 >= 2,
             "prompt should have both top and bottom border: {rows:?}"
@@ -3079,8 +3080,9 @@ mod tests {
         let user_y = row_y_containing(&semantic, "Explore");
         let assistant_y = row_y_containing(&semantic, "只 读 梳 理");
 
-        assert_eq!(assistant_y, user_y + 2, "{semantic:?}");
-        assert!(semantic[user_y + 1].trim().is_empty(), "{semantic:?}");
+        // The prompt card's bottom edge, then the one blank row.
+        assert_eq!(assistant_y, user_y + 3, "{semantic:?}");
+        assert!(semantic[user_y + 2].trim().is_empty(), "{semantic:?}");
     }
 
     #[test]
@@ -3107,7 +3109,8 @@ mod tests {
         let second_tool_y = row_y_containing(&semantic, "read");
         let final_text_y = row_y_containing(&semantic, "两 块");
 
-        assert_eq!(first_text_y, user_y + 2, "{semantic:?}");
+        // The prompt card's bottom edge sits between it and the gap.
+        assert_eq!(first_text_y, user_y + 3, "{semantic:?}");
         assert_eq!(first_tool_y, first_text_y + 2, "{semantic:?}");
         assert_eq!(second_text_y, first_tool_y + 2, "{semantic:?}");
         assert_eq!(second_tool_y, second_text_y + 2, "{semantic:?}");
@@ -3424,7 +3427,7 @@ mod tests {
 
         let rows = render_full_inline_frame_rows(app, 12, 0);
         let task_y = row_y_containing(&rows, "Inline task visible");
-        let prompt_y = row_y_containing(&rows, "┌");
+        let prompt_y = row_y_containing(&rows, "╭");
 
         assert!(
             task_y < prompt_y,
@@ -3478,7 +3481,7 @@ mod tests {
 
         let rows = render_full_inline_frame_rows(app, 12, 0);
         let activity_y = row_y_containing(&rows, "Activity:");
-        let prompt_y = row_y_containing(&rows, "┌");
+        let prompt_y = row_y_containing(&rows, "╭");
 
         assert_eq!(
             activity_y + 1,
@@ -3515,11 +3518,12 @@ mod tests {
             rows.iter().any(|row| row.contains("Coordinator Mode")),
             "inline prompt should show coordinator badge: {rows:?}"
         );
-        assert_eq!(cell.fg, Color::White);
         assert!(
             cell.bg != Color::Reset,
             "badge should set a background color"
         );
+        // The label picks whichever of black or white reads on the fill.
+        assert_eq!(cell.fg, badge_foreground(cell.bg));
     }
 
     #[test]
@@ -3551,7 +3555,7 @@ mod tests {
         let verification_y = row_y_containing(&rows, "@verify-final-app-stability");
 
         assert!(
-            rows[..footer_y].iter().any(|row| row.contains('┌')),
+            rows[..footer_y].iter().any(|row| row.contains('╭')),
             "prompt should render above footer: {rows:?}"
         );
         assert!(
