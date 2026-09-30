@@ -282,6 +282,47 @@ fn delivered_only_moves_forward() {
 }
 
 #[test]
+fn handoffs_say_who_got_what_and_how() {
+    let (_dir, store, group) = pair();
+    let planner = key("rebon", "s1");
+    let coder = key("claude-code", "c1");
+    let first = store
+        .append(&group.id, &planner, note("coder", "first"))
+        .unwrap();
+    let pending = crate::deliver::pending(&store, &coder).unwrap();
+    assert!(crate::deliver::delivered(
+        &store,
+        &coder,
+        &pending,
+        Via::Hook
+    ));
+    let second = store
+        .append(&group.id, &planner, note("coder", "second"))
+        .unwrap();
+    // Reading the inbox covers both, but only the second reached it there.
+    store.inbox(&group.id, &coder, true).unwrap();
+
+    let handoffs = store.handoffs(&group.id).unwrap();
+    let seen: Vec<(Via, &str, Vec<u64>)> = handoffs
+        .iter()
+        .map(|handoff| (handoff.via, handoff.alias.as_str(), handoff.seqs.clone()))
+        .collect();
+    assert!(seen.contains(&(Via::Hook, "coder", pending_seqs(&pending))));
+    assert!(pending_seqs(&pending).contains(&first.seq));
+    assert_eq!(seen.last(), Some(&(Via::Inbox, "coder", vec![second.seq])));
+
+    // A stranger's handoff is not recorded.
+    store
+        .record_handoff(&group.id, &key("codex", "x9"), Via::Terminal, vec![1])
+        .unwrap();
+    assert_eq!(store.handoffs(&group.id).unwrap().len(), handoffs.len());
+}
+
+fn pending_seqs(pending: &crate::deliver::Pending) -> Vec<u64> {
+    pending.entries.iter().map(|entry| entry.seq).collect()
+}
+
+#[test]
 fn ids_that_could_leave_the_root_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let store = GroupStore::new(dir.path());

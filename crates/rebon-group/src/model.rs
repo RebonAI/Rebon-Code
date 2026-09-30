@@ -144,6 +144,47 @@ impl Entry {
 /// The address every member reads.
 pub const ALL: &str = "all";
 
+/// Entries reaching a member, and by which way. One line of
+/// `deliveries.jsonl`: the log says what was said, this says who has been
+/// handed it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Handoff {
+    pub at_ms: u64,
+    pub agent: String,
+    pub session_id: String,
+    /// The member's alias when it was handed them.
+    pub alias: String,
+    pub via: Via,
+    /// The entries handed over, by seq.
+    pub seqs: Vec<u64>,
+}
+
+/// The ways an entry reaches a member (RFC-0009 §8, §15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Via {
+    /// Attached to the member's next turn by the `groups` plugin (Rebon).
+    Attachment,
+    /// Added as context by the group hook (Claude Code, Codex).
+    Hook,
+    /// Typed into the member's terminal by the app, which starts a turn.
+    Terminal,
+    /// Read by the member from its inbox, nothing having pushed it.
+    Inbox,
+}
+
+impl Via {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Attachment => "attachment",
+            Self::Hook => "hook",
+            Self::Terminal => "terminal",
+            Self::Inbox => "inbox",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {

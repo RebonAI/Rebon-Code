@@ -16,11 +16,12 @@ use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Entry, EntryKind, Group, Member, MemberKey, Warmth, ALL};
+use crate::model::{Entry, EntryKind, Group, Handoff, Member, MemberKey, Via, Warmth, ALL};
 
 const GROUP_FILE: &str = "group.json";
 const LOG_FILE: &str = "log.jsonl";
 const CURSORS_FILE: &str = "cursors.json";
+const DELIVERIES_FILE: &str = "deliveries.jsonl";
 const MEMORY_FILE: &str = "MEMORY.md";
 const LOCK_FILE: &str = "lock";
 
@@ -397,6 +398,15 @@ impl GroupStore {
                 .into_iter()
                 .filter(|entry| entry.seq > cursor.read && entry.is_for(&me.alias))
                 .collect();
+            if advance {
+                // What nothing pushed first reached it here.
+                let seqs: Vec<u64> = entries
+                    .iter()
+                    .map(|entry| entry.seq)
+                    .filter(|seq| *seq > cursor.delivered)
+                    .collect();
+                append_handoff(&dir, key, &me.alias, Via::Inbox, seqs)?;
+            }
             if advance && file.last_seq > cursor.read {
                 cursors.insert(
                     key.as_string(),
@@ -427,6 +437,32 @@ impl GroupStore {
             cursor.delivered = seq;
             write_json(&dir.join(CURSORS_FILE), &cursors)
         })
+    }
+
+    /// Records that `seqs` reached `key` by `via`. Nothing is written for an
+    /// empty list, or for a session that is not a member.
+    pub fn record_handoff(&self, id: &str, key: &MemberKey, via: Via, seqs: Vec<u64>) -> Result<()> {
+        check_id(id)?;
+        self.with_lock(id, || {
+            let dir = self.dir(id);
+            let file = read_group_file(&dir.join(GROUP_FILE))?;
+            match file.group.member(key) {
+                Some(me) => append_handoff(&dir, key, &me.alias, via, seqs),
+                None => Ok(()),
+            }
+        })
+    }
+
+    /// Every handoff, oldest first.
+    pub fn handoffs(&self, id: &str) -> Result<Vec<Handoff>> {
+        check_id(id)?;
+        self.with_lock(id, || read_lines(&self.dir(id).join(DELIVERIES_FILE)))
+    }
+
+    /// Every member's cursor, keyed as [`MemberKey::as_string`].
+    pub fn cursors(&self, id: &str) -> Result<BTreeMap<String, Cursor>> {
+        check_id(id)?;
+        self.with_lock(id, || read_cursors(&self.dir(id)))
     }
 
     /// The group's memory as it stands: memory entries, less the ones a
@@ -546,11 +582,43 @@ fn read_cursors(dir: &Path) -> Result<BTreeMap<String, Cursor>> {
     }
 }
 
-/// The log, in order. A line that does not parse — the tail of a write cut
-/// off by a crash — is skipped rather than failing every reader after it.
+fn append_handoff(dir: &Path, key: &MemberKey, alias: &str, via: Via, seqs: Vec<u64>) -> Result<()> {
+    if seqs.is_empty() {
+        return Ok(());
+    }
+    let handoff = Handoff {
+        at_ms: now_ms(),
+        agent: key.agent.clone(),
+        session_id: key.session_id.clone(),
+        alias: alias.to_string(),
+        via,
+        seqs,
+    };
+    let path = dir.join(DELIVERIES_FILE);
+    let mut line = serde_json::to_string(&handoff)?;
+    line.push('\n');
+    if path.exists() && ends_mid_line(&path)? {
+        line.insert(0, '\n');
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.write_all(line.as_bytes())
+        .with_context(|| format!("failed to append to {}", path.display()))
+}
+
+/// The log, in order.
 fn read_log(dir: &Path) -> Result<Vec<Entry>> {
-    let path = dir.join(LOG_FILE);
-    let file = match File::open(&path) {
+    read_lines(&dir.join(LOG_FILE))
+}
+
+/// A JSON-lines file, in order. A line that does not parse — the tail of a
+/// write cut off by a crash — is skipped rather than failing every reader
+/// after it.
+fn read_lines<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
+    let file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
@@ -563,7 +631,7 @@ fn read_log(dir: &Path) -> Result<Vec<Entry>> {
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(entry) = serde_json::from_str::<Entry>(&line) {
+        if let Ok(entry) = serde_json::from_str::<T>(&line) {
             entries.push(entry);
         }
     }

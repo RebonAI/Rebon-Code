@@ -43,7 +43,7 @@ pub mod tools;
 pub mod warmth;
 
 pub use identity::{AgentKind, Caller};
-pub use model::{Delivery, Entry, EntryKind, Group, Member, Warmth};
+pub use model::{Delivery, Entry, EntryKind, Group, Handoff, Member, Via, Warmth};
 pub use store::GroupStore;
 
 /// Where groups live under a config home.

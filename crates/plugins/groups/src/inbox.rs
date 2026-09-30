@@ -28,7 +28,7 @@ use rebon_core::query::{
 };
 use rebon_group::deliver;
 use rebon_group::identity::AgentKind;
-use rebon_group::model::MemberKey;
+use rebon_group::model::{MemberKey, Via};
 use rebon_group::{render, Entry, Group, GroupStore};
 
 /// The seat entry: a poller for every session, which answers nothing while
@@ -80,7 +80,7 @@ impl AttachmentPoller for GroupInboxPoller {
         let Some(pending) = deliver::pending(&self.store, &self.member) else {
             return Vec::new();
         };
-        if !deliver::delivered(&self.store, &self.member, &pending) {
+        if !deliver::delivered(&self.store, &self.member, &pending, Via::Attachment) {
             return Vec::new();
         }
         group_inbox(&pending.group, &pending.entries)

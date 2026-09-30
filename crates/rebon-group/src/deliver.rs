@@ -15,7 +15,7 @@
 
 use serde_json::{json, Value};
 
-use crate::model::{Delivery, Entry, Group, MemberKey};
+use crate::model::{Delivery, Entry, Group, MemberKey, Via};
 use crate::store::GroupStore;
 
 /// What a member has not been handed yet.
@@ -51,11 +51,19 @@ pub fn pending(store: &GroupStore, member: &MemberKey) -> Option<Pending> {
     })
 }
 
-/// Marks `pending` delivered to `member`.
-pub fn delivered(store: &GroupStore, member: &MemberKey, pending: &Pending) -> bool {
-    store
+/// Marks `pending` delivered to `member` by `via`, and records the handoff.
+pub fn delivered(store: &GroupStore, member: &MemberKey, pending: &Pending, via: Via) -> bool {
+    if store
         .mark_delivered(&pending.group.id, member, pending.through)
-        .is_ok()
+        .is_err()
+    {
+        return false;
+    }
+    let seqs = pending.entries.iter().map(|entry| entry.seq).collect();
+    // The cursor has moved; a record that failed to write loses the
+    // timeline a line, not the member its news.
+    let _ = store.record_handoff(&pending.group.id, member, via, seqs);
+    true
 }
 
 /// The hook events that can carry context into the model.
@@ -83,7 +91,7 @@ pub fn hook_output(store: &GroupStore, agent: &str, input: &Value) -> Option<Val
     let text = crate::render::reminder(&pending.group, &pending.entries);
     // Moved past what was looked at even when none of it was ours, so the
     // next event does not read it again.
-    if !delivered(store, &member, &pending) {
+    if !delivered(store, &member, &pending, Via::Hook) {
         return None;
     }
     Some(json!({
