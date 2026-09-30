@@ -2500,6 +2500,11 @@ pub async fn build_headless_session(
     // real sessions once a JS plugin registers them.
     let executor =
         executor.with_plugin_tools(session_plugin_tools as Arc<dyn rebon_tool::PluginToolProvider>);
+    // Plugin seats — prompt sections (memory, model-prompt), plan mode and
+    // the attachment producers (group inbox, mailbox) — resolve through the
+    // kernel context, as they do under the TUI and ACP. Without it a
+    // headless run silently had none of them.
+    let executor = executor.with_kernel_context_resolver(bound.kernel_scopes.resolver());
     // Web provider router: stateless — consults the process
     // web seat at call time, so an unconfigured deployment stays on the
     // builtin WebSearch/WebFetch path bit for bit.
