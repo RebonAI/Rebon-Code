@@ -62,9 +62,10 @@ tracing.workspace = true
 # Exposes the fixtures and test-only helpers that `rebon-cli` needs for the
 # command tests that stayed with the terminal (they build an `AppState`, so
 # they cannot live here). Off by default; nothing in a release build reaches it.
-test-support = []
+test-support = ["rebon-tool/test-support"]
 
 [dev-dependencies]
+rebon-tool = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 # One reaper test names the node sidecar to prove it is not reaped.
 rebon-node-runtime.workspace = true
