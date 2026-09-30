@@ -3289,6 +3289,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rebon-group"
+version = "1.7.4"
+dependencies = [
+ "anyhow",
+ "fs2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "rebon-harness"
 version = "1.7.4"
 dependencies = [
@@ -3440,6 +3452,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fs2",
+ "rebon-group",
  "rebon-proto",
  "rebon-session",
  "rebon-session-host",

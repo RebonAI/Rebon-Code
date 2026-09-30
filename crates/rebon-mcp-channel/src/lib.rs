@@ -49,6 +49,7 @@ mod ledger;
 mod push;
 mod result;
 mod server;
+mod groups;
 mod sessions;
 mod tools;
 mod watch;

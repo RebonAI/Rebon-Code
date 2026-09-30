@@ -19,6 +19,7 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
+use crate::groups::GroupDesk;
 use crate::jobs::{Desk, JobRequest, PermitRequest, ReplyRequest, ResultRequest, StartRequest};
 use crate::push::Update;
 use crate::server::Outbox;
@@ -187,6 +188,7 @@ pub(crate) fn list(channel: bool, probe: bool) -> Value {
             "annotations": { "readOnlyHint": true, "openWorldHint": false }
         }),
     ];
+    tools.extend(GroupDesk::list());
     if probe {
         tools.push(json!({
             "name": CHANNEL_PROBE,
@@ -202,6 +204,7 @@ pub(crate) fn list(channel: bool, probe: bool) -> Value {
 pub(crate) async fn call(
     desk: &Arc<Desk>,
     sessions: &Arc<SessionReader>,
+    groups: &Arc<GroupDesk>,
     outbox: &Outbox,
     probe: bool,
     params: Value,
@@ -216,6 +219,13 @@ pub(crate) async fn call(
         Some(arguments) => arguments.clone(),
     };
     let outcome = match name.as_str() {
+        group_tool if GroupDesk::offers(group_tool) => {
+            let groups = Arc::clone(groups);
+            tokio::task::spawn_blocking(move || groups.call(&name, arguments))
+                .await
+                .map_err(|error| anyhow::anyhow!("the operation did not finish: {error}"))
+                .and_then(|outcome| outcome)
+        }
         EXEC_START => {
             run(desk, arguments, |desk, request: StartRequest| {
                 desk.start(request, rebon_types::wall_clock_ms())
@@ -267,8 +277,8 @@ pub(crate) async fn call(
         CHANNEL_PROBE if probe => probe_channel(desk, outbox),
         other => Err(anyhow::anyhow!(
             "unknown tool `{other}`; this server offers {EXEC_START}, {JOB_STATUS}, \
-             {JOB_RESULT}, {JOB_CANCEL}, {JOB_REPLY}, {JOB_PERMIT}, {SESSIONS_LIST} and \
-             {SESSION_READ}"
+             {JOB_RESULT}, {JOB_CANCEL}, {JOB_REPLY}, {JOB_PERMIT}, {SESSIONS_LIST}, \
+             {SESSION_READ} and the group_* tools"
         )),
     };
     match outcome {
@@ -346,7 +356,14 @@ mod tests {
                 JOB_REPLY,
                 JOB_PERMIT,
                 SESSIONS_LIST,
-                SESSION_READ
+                SESSION_READ,
+                rebon_group::tools::GROUP_INFO,
+                rebon_group::tools::GROUP_JOIN,
+                rebon_group::tools::GROUP_LEAVE,
+                rebon_group::tools::GROUP_SEND,
+                rebon_group::tools::GROUP_INBOX,
+                rebon_group::tools::GROUP_REMEMBER,
+                rebon_group::tools::GROUP_RECALL,
             ]
         );
         assert!(names(&super::list(true, true)).contains(&CHANNEL_PROBE.to_string()));

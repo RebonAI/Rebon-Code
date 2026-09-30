@@ -72,6 +72,10 @@ pub async fn run(
                     store,
                     projects_root: rebon_session::default_projects_root(),
                     claude_config_dir: crate::sessions::claude_config_dir_from_env(),
+                    groups_root: rebon_group::default_root(
+                        &rebon_session::default_config_home_dir(),
+                    ),
+                    caller: rebon_group::identity::detect(),
                     root,
                     rebon_exe,
                     launch_gate,

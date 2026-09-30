@@ -56,6 +56,8 @@ impl World {
             store: self.store.clone(),
             projects_root: self.projects_root.clone(),
             claude_config_dir: Some(self.claude_home.clone()),
+            groups_root: self.root.parent().unwrap().join("groups"),
+            caller: None,
             root: self.root.clone(),
             rebon_exe: PathBuf::from("./__rebon-mcp-test-must-not-spawn__"),
             launch_gate: Arc::new(|_| Ok(())),
@@ -726,4 +728,74 @@ async fn protocol_errors_are_answered_and_the_connection_survives() {
     let (is_error, unknown_tool) = client.call("job_list", json!({})).await;
     assert!(is_error, "{unknown_tool}");
     client.close().await;
+}
+
+/// Two agents, each with its own server over the same config home, work as
+/// a group: one makes it by joining, asks the other for work, reads the
+/// reply. The second server could not tell whose it was and is told on join.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_agents_talk_through_a_group_over_their_own_servers() {
+    let world = World::new();
+    let mut planner_config = world.config(dead_owner(), false, false);
+    planner_config.caller = Some(rebon_group::Caller {
+        agent: "rebon".into(),
+        session_id: "k7m2q-4xr9t".into(),
+    });
+    let (mut planner, _) = Client::handshake(planner_config).await;
+    let (mut coder, _) = Client::handshake(world.config(dead_owner(), false, false)).await;
+
+    let (is_error, joined) = planner
+        .call(
+            "group_join",
+            json!({ "group": "refactor", "alias": "planner" }),
+        )
+        .await;
+    assert!(!is_error, "{joined}");
+
+    let (is_error, refused) = coder
+        .call("group_join", json!({ "group": "refactor" }))
+        .await;
+    assert!(is_error, "an unknown session cannot join: {refused}");
+    let (is_error, joined) = coder
+        .call(
+            "group_join",
+            json!({ "group": "refactor", "alias": "coder", "agent": "claude-code", "session_id": "aa38901a" }),
+        )
+        .await;
+    assert!(!is_error, "{joined}");
+
+    let (_, sent) = planner
+        .call(
+            "group_send",
+            json!({ "to": "coder", "kind": "request", "text": "add the error-branch tests" }),
+        )
+        .await;
+    let request_id = sent["request_id"].as_str().unwrap().to_string();
+
+    let (_, inbox) = coder.call("group_inbox", json!({})).await;
+    let request = inbox["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "request")
+        .expect("the request reached the coder")
+        .clone();
+    assert_eq!(request["id"], request_id);
+
+    let (is_error, _) = coder
+        .call(
+            "group_send",
+            json!({ "to": "planner", "kind": "reply", "re": request_id, "text": "done" }),
+        )
+        .await;
+    assert!(!is_error);
+    let (_, inbox) = planner.call("group_inbox", json!({})).await;
+    assert!(inbox["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["kind"] == "reply" && entry["text"] == "done"));
+
+    planner.close().await;
+    coder.close().await;
 }

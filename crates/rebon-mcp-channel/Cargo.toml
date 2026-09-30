@@ -23,6 +23,8 @@ rebon-tool.workspace = true
 # The `\\?\` rule for a canonicalized cwd. Already in the graph likewise.
 rebon-tools-core.workspace = true
 rebon-types.workspace = true
+# The agent-group tools and the store behind them (RFC-0009).
+rebon-group.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "rebon-group"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Agent groups (RFC-0009): a log several agents in one project share — notes, requests and replies, and the group's own memory — with a read cursor per member, and the tools that work it. Host-neutral: `rebon mcp serve` offers the tools to any MCP client, and a Rebon session is meant to get them from a plugin; both wrap this crate."
+
+[dependencies]
+anyhow.workspace = true
+# One exclusive lock per group, the job store's convention.
+fs2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The parent process's image name, to tell whose MCP server this is when a
+# process carries both agents' session variables.
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
+
+[dev-dependencies]
+tempfile = "3"
