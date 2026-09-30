@@ -4158,14 +4158,15 @@ mod tests {
         }
 
         fn drain(&mut self) {
+            let area = self.terminal.size().unwrap();
             assert!(
                 super::super::render::inline_live_content_overflows_viewport(
                     &self.app,
                     &mut rebon_tui::RenderTheme::plain(),
                     super::super::render::InlineViewportHeightInput {
-                        width: 80,
-                        terminal_height: 12,
-                        base_height: 12,
+                        width: area.width,
+                        terminal_height: area.height,
+                        base_height: area.height,
                         committed_rows: self.runtime.commit_cursor.committed_row_count(),
                         elapsed_ms: 0,
                     },
@@ -4293,9 +4294,9 @@ mod tests {
         fixture.update(rebon_types::SessionUpdate::ThinkingDelta {
             text: "still thinking\n".repeat(48),
         });
-        // A tall prompt squeezes even the collapsed tool group out of the
-        // available transcript area, as in the production overflow path.
-        fixture.app.input = "draft\n".repeat(12);
+        // 输入框高度有上限；缩短终端才能让折叠工具簇也触发 overflow。
+        fixture.terminal.backend_mut().resize(80, 4);
+        fixture.terminal.autoresize().unwrap();
         let before = fixture.runtime.commit_cursor.committed_row_count();
         fixture.drain();
         assert!(fixture.runtime.commit_cursor.committed_row_count() > before);
