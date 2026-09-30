@@ -933,7 +933,11 @@ impl OpenAiResponsesProvider {
     }
 
     /// Build a WebSocket handshake request with the current auth headers.
-    fn build_ws_request(&self, access_token: &str) -> ModelResult<tungstenite::http::Request<()>> {
+    fn build_ws_request(
+        &self,
+        access_token: &str,
+        codex_session: Option<&str>,
+    ) -> ModelResult<tungstenite::http::Request<()>> {
         use tungstenite::client::IntoClientRequest;
 
         let mut ws_request = self
@@ -959,6 +963,19 @@ impl OpenAiResponsesProvider {
         if let Ok(val) = RESPONSES_WEBSOCKETS_BETA.parse() {
             ws_request.headers_mut().insert("openai-beta", val);
         }
+        // The same session routing the HTTP path sends. A socket's requests
+        // all reach the replica it was opened on, so within one connection
+        // the prefix cache holds either way; it is each new connection — a
+        // new process, or a reconnect after the server closed an idle
+        // socket — that without these lands on whichever replica is free,
+        // and starts its turn with a fraction of the cached prefix, or none.
+        if let Some(session) = codex_session {
+            for name in ["session-id", "thread-id", "x-client-request-id"] {
+                if let Ok(value) = session.parse() {
+                    ws_request.headers_mut().insert(name, value);
+                }
+            }
+        }
         for (name, value) in &self.config.extra_headers {
             if let (Ok(hn), Ok(hv)) = (
                 name.parse::<tungstenite::http::HeaderName>(),
@@ -972,12 +989,12 @@ impl OpenAiResponsesProvider {
 
     /// Establish a new WebSocket connection wrapped in a [`WsPump`]
     /// that handles ping/pong in a background task.
-    async fn connect_ws(&self) -> ModelResult<WsPump> {
+    async fn connect_ws(&self, codex_session: Option<&str>) -> ModelResult<WsPump> {
         let (mut access_token, has_refresher) = self.snapshot_auth();
         let mut refreshed_after_unauthorized = false;
 
         loop {
-            let ws_request = self.build_ws_request(&access_token)?;
+            let ws_request = self.build_ws_request(&access_token, codex_session)?;
             let connect_result = tokio_tungstenite::connect_async(ws_request).await;
             let (ws_stream, _response) = match connect_result {
                 Ok(ok) => ok,
@@ -1154,9 +1171,16 @@ impl OpenAiResponsesProvider {
         // backend would fail visibly and only the *next* request
         // would benefit from the session-wide fallback flag.
         {
+            let codex_session = is_codex.then(|| {
+                request
+                    .cache_trace_context
+                    .as_ref()
+                    .and_then(|trace| trace.prompt_cache_key.as_deref())
+                    .unwrap_or(&self.prompt_cache_key)
+            });
             let mut guard = self.ws_conn.lock().await;
             if guard.is_none() {
-                match self.connect_ws().await {
+                match self.connect_ws(codex_session).await {
                     Ok(ws) => *guard = Some(ws),
                     Err(e) => {
                         // `connect_ws` sets `http_fallback_active`
@@ -3425,7 +3449,10 @@ async fn drive_ws_turn_once(
     }
 
     if guard.is_none() {
-        match provider.connect_ws().await {
+        match provider
+            .connect_ws(is_codex.then_some(effective_prompt_cache_key))
+            .await
+        {
             Ok(ws) => *guard = Some(ws),
             Err(e) => return Err(e),
         }
@@ -5154,7 +5181,7 @@ mod tests {
         let provider = OpenAiResponsesProvider::new(config).with_refresher(refresher.clone());
 
         let ws = provider
-            .connect_ws()
+            .connect_ws(None)
             .await
             .expect("second handshake succeeds");
         drop(ws);
@@ -5184,7 +5211,7 @@ mod tests {
         config.use_websocket = true;
         let provider = OpenAiResponsesProvider::new(config).with_refresher(refresher.clone());
 
-        let err = match provider.connect_ws().await {
+        let err = match provider.connect_ws(None).await {
             Ok(_) => panic!("second unauthorized handshake should fail without another retry"),
             Err(err) => err,
         };
@@ -6511,7 +6538,7 @@ mod tests {
     #[test]
     fn build_ws_request_sets_responses_websockets_beta_header() {
         let provider = OpenAiResponsesProvider::new(ws_test_config());
-        let req = provider.build_ws_request("sk-test").unwrap();
+        let req = provider.build_ws_request("sk-test", None).unwrap();
         assert_eq!(
             req.headers()
                 .get("openai-beta")
@@ -6522,6 +6549,23 @@ mod tests {
     }
 
     #[test]
+    fn build_ws_request_routes_a_codex_session_like_the_http_path() {
+        let provider = OpenAiResponsesProvider::new(ws_test_config());
+        let req = provider
+            .build_ws_request("sk-test", Some("rebon-session-abc"))
+            .unwrap();
+        for name in ["session-id", "thread-id", "x-client-request-id"] {
+            assert_eq!(
+                req.headers().get(name).and_then(|v| v.to_str().ok()),
+                Some("rebon-session-abc"),
+                "{name}"
+            );
+        }
+        let plain = provider.build_ws_request("sk-test", None).unwrap();
+        assert!(plain.headers().get("session-id").is_none());
+    }
+
+    #[test]
     fn build_ws_request_extra_headers_override_beta() {
         let mut config = ws_test_config();
         config.extra_headers = vec![(
@@ -6529,7 +6573,7 @@ mod tests {
             "responses_websockets=2099-01-01".into(),
         )];
         let provider = OpenAiResponsesProvider::new(config);
-        let req = provider.build_ws_request("sk-test").unwrap();
+        let req = provider.build_ws_request("sk-test", None).unwrap();
         assert_eq!(
             req.headers()
                 .get("openai-beta")
