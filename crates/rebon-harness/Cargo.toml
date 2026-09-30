@@ -21,6 +21,7 @@ rebon-plugin-web.workspace = true
 rebon-plugin-monitor.workspace = true
 rebon-plugin-memory.workspace = true
 rebon-plugin-notebook.workspace = true
+rebon-plugin-groups.workspace = true
 rebon-plugin-structured-output.workspace = true
 rebon-plugin-profile.workspace = true
 rebon-plugin-computer-use.workspace = true

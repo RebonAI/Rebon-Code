@@ -205,6 +205,7 @@ pub fn builtin_plugin_defs() -> &'static [PluginDef] {
         rebon_plugin_escalation::PLUGIN,
         rebon_plugin_mcp::PLUGIN,
         rebon_plugin_tasks::PLUGIN,
+        rebon_plugin_groups::PLUGIN,
         rebon_plugin_plan_mode::PLUGIN,
         rebon_plugin_agents::PLUGIN,
         rebon_plugin_workflow::PLUGIN,

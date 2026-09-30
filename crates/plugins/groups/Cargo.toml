@@ -1,0 +1,24 @@
+[package]
+name = "rebon-plugin-groups"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The agent-group feature plugin (RFC-0009): the group tools on a Rebon session's tool seat, and the session's share of the group log delivered as an attachment between rounds."
+
+[dependencies]
+rebon-kernel.workspace = true
+rebon-core.workspace = true
+rebon-tool.workspace = true
+rebon-tools-core.workspace = true
+rebon-api.workspace = true
+# The group store and the tools themselves; this crate only seats them.
+rebon-group.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt"] }

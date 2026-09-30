@@ -35,6 +35,19 @@ impl GroupDesk {
         tools::specs().iter().any(|spec| spec.name == name)
     }
 
+    /// Whether this server offers the group tools at all. Not to a Rebon
+    /// session: its `groups` plugin already gave it the same tools, run as
+    /// itself, and a second copy under the MCP prefix would only be a way to
+    /// get them wrong. A Rebon session with that plugin off is out of groups.
+    pub(crate) fn offered(&self) -> bool {
+        !self
+            .caller
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|caller| caller.agent == rebon_group::identity::AgentKind::REBON)
+    }
+
     /// The group tools as `tools/list` entries.
     pub(crate) fn list() -> Vec<Value> {
         tools::specs()
@@ -64,6 +77,9 @@ impl GroupDesk {
         arguments: Value,
         meta: Option<&Value>,
     ) -> anyhow::Result<Value> {
+        if !self.offered() {
+            anyhow::bail!("a Rebon session has the group tools as its own (the groups plugin)");
+        }
         let mut caller = self
             .caller
             .lock()

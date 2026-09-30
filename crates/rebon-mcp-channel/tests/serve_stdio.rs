@@ -738,8 +738,8 @@ async fn two_agents_talk_through_a_group_over_their_own_servers() {
     let world = World::new();
     let mut planner_config = world.config(dead_owner(), false, false);
     planner_config.caller = Some(rebon_group::Caller {
-        agent: "rebon".into(),
-        session_id: "k7m2q-4xr9t".into(),
+        agent: "grok".into(),
+        session_id: "grok-7f3a".into(),
     });
     let (mut planner, _) = Client::handshake(planner_config).await;
     let (mut coder, _) = Client::handshake(world.config(dead_owner(), false, false)).await;
@@ -825,4 +825,32 @@ async fn a_codex_thread_named_on_the_call_is_the_caller() {
     let (is_error, info) = codex.call("group_info", json!({})).await;
     assert!(!is_error && info["in_group"] == json!(true), "{info}");
     codex.close().await;
+}
+
+/// A Rebon session has the group tools from its own plugin; the copy this
+/// server would add under the MCP prefix is left out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebon_session_gets_no_second_copy_of_the_group_tools() {
+    let world = World::new();
+    let mut config = world.config(dead_owner(), false, false);
+    config.caller = Some(rebon_group::Caller {
+        agent: "rebon".into(),
+        session_id: "k7m2q-4xr9t".into(),
+    });
+    let (mut rebon, _) = Client::handshake(config).await;
+    let listed = rebon.request("tools/list", json!({})).await;
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"sessions_list"), "{names:?}");
+    assert!(
+        !names.iter().any(|name| name.starts_with("group_")),
+        "{names:?}"
+    );
+    let (is_error, _) = rebon.call("group_info", json!({})).await;
+    assert!(is_error);
+    rebon.close().await;
 }

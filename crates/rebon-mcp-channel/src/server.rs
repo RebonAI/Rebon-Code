@@ -175,7 +175,10 @@ where
                     let _ = outbox.send(respond(&request, json!({})));
                 }
                 "tools/list" => {
-                    let _ = outbox.send(respond(&request, tools::list(channel, probe)));
+                    let _ = outbox.send(respond(
+                        &request,
+                        tools::list(channel, probe, groups.offered()),
+                    ));
                 }
                 "tools/call" => {
                     // A client that never says `initialized` still gets its

@@ -35,7 +35,9 @@ pub(crate) const SESSIONS_LIST: &str = "sessions_list";
 pub(crate) const SESSION_READ: &str = "session_read";
 pub(crate) const CHANNEL_PROBE: &str = "channel_probe";
 
-pub(crate) fn list(channel: bool, probe: bool) -> Value {
+/// `groups`: offer the group tools (not to a Rebon session, see
+/// [`GroupDesk::offered`]).
+pub(crate) fn list(channel: bool, probe: bool, groups: bool) -> Value {
     let arrival = if channel {
         "When it finishes, or stops to wait for an answer, a <channel source=\"rebon\"> \
          message with its job_id arrives on its own; do not poll while waiting for one. If \
@@ -188,7 +190,9 @@ pub(crate) fn list(channel: bool, probe: bool) -> Value {
             "annotations": { "readOnlyHint": true, "openWorldHint": false }
         }),
     ];
-    tools.extend(GroupDesk::list());
+    if groups {
+        tools.extend(GroupDesk::list());
+    }
     if probe {
         tools.push(json!({
             "name": CHANNEL_PROBE,
@@ -346,7 +350,7 @@ mod tests {
 
     #[test]
     fn the_surface_is_the_frozen_set_and_the_probe_only_on_request() {
-        let list = list(true, false);
+        let list = list(true, false, true);
         assert_eq!(
             names(&list),
             vec![
@@ -367,7 +371,7 @@ mod tests {
                 rebon_group::tools::GROUP_RECALL,
             ]
         );
-        assert!(names(&super::list(true, true)).contains(&CHANNEL_PROBE.to_string()));
+        assert!(names(&super::list(true, true, true)).contains(&CHANNEL_PROBE.to_string()));
         assert!(
             !names(&list).iter().any(|name| name.starts_with("job_list")),
             "no job_list: the CLI lists jobs, pushes keep the client's list"
@@ -375,7 +379,7 @@ mod tests {
     }
 
     fn tool(name: &str) -> Value {
-        list(true, false)["tools"]
+        list(true, false, true)["tools"]
             .as_array()
             .unwrap()
             .iter()
@@ -416,12 +420,12 @@ mod tests {
 
     #[test]
     fn every_schema_is_closed_and_ids_are_the_only_handle_on_a_result() {
-        for tool in list(true, true)["tools"].as_array().unwrap() {
+        for tool in list(true, true, true)["tools"].as_array().unwrap() {
             let schema = &tool["inputSchema"];
             assert_eq!(schema["type"], "object", "{}", tool["name"]);
             assert_eq!(schema["additionalProperties"], false, "{}", tool["name"]);
         }
-        let result = list(true, false)["tools"]
+        let result = list(true, false, true)["tools"]
             .as_array()
             .unwrap()
             .iter()
@@ -440,7 +444,7 @@ mod tests {
     #[test]
     fn exec_start_says_how_the_outcome_arrives_in_each_mode() {
         let describe = |channel| {
-            list(channel, false)["tools"][0]["description"]
+            list(channel, false, true)["tools"][0]["description"]
                 .as_str()
                 .unwrap()
                 .to_string()

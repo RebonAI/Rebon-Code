@@ -6,6 +6,7 @@ members = [
     "crates/plugins/cron",
     "crates/plugins/escalation",
     "crates/plugins/lsp-mcp",
+    "crates/plugins/groups",
     "crates/plugins/model-prompt",
     "crates/plugins/model-routing",
     "crates/plugins/node-host",
@@ -189,6 +190,7 @@ rebon-plugin-cron = { path = "crates/plugins/cron" }
 rebon-plugin-web = { path = "crates/plugins/web" }
 rebon-plugin-monitor = { path = "crates/plugins/monitor" }
 rebon-plugin-memory = { path = "crates/plugins/memory" }
+rebon-plugin-groups = { path = "crates/plugins/groups" }
 rebon-plugin-notebook = { path = "crates/plugins/notebook" }
 rebon-plugin-structured-output = { path = "crates/plugins/structured-output" }
 rebon-plugin-profile = { path = "crates/plugins/profile" }

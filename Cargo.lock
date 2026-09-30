@@ -3322,6 +3322,7 @@ dependencies = [
  "rebon-plugin-computer-use",
  "rebon-plugin-cron",
  "rebon-plugin-escalation",
+ "rebon-plugin-groups",
  "rebon-plugin-host",
  "rebon-plugin-image-gen",
  "rebon-plugin-mcp",
@@ -3615,6 +3616,23 @@ dependencies = [
  "rebon-tools-core",
  "rebon-types",
  "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "rebon-plugin-groups"
+version = "1.7.4"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "rebon-api",
+ "rebon-core",
+ "rebon-group",
+ "rebon-kernel",
+ "rebon-tool",
+ "rebon-tools-core",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
