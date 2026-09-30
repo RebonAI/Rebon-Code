@@ -89,3 +89,47 @@ pub async fn run(
         }
     }
 }
+
+/// `rebon group …`: agent groups (RFC-0009) from outside a session.
+#[derive(Debug, clap::Subcommand, PartialEq, Eq)]
+pub enum GroupCommand {
+    /// Print what this session's agent group wrote to it, as hook context.
+    ///
+    /// Run by Claude Code or Codex as a command hook on UserPromptSubmit,
+    /// SessionStart and PostToolUse, with the hook's JSON on stdin. It prints
+    /// `{"hookSpecificOutput": {"additionalContext": …}}` when there is
+    /// something new, and nothing otherwise; it never fails the hook.
+    Hook(HookArgs),
+}
+
+#[derive(Debug, clap::Args, PartialEq, Eq)]
+pub struct HookArgs {
+    /// The agent running the hook: claude-code or codex.
+    #[arg(long)]
+    pub agent: String,
+}
+
+/// Run a `rebon group` subcommand.
+pub fn run_group(command: GroupCommand) -> anyhow::Result<()> {
+    match command {
+        GroupCommand::Hook(args) => {
+            use std::io::Read;
+            // A hook that errors shows up in the agent's session; one that
+            // has nothing to say must say nothing, whatever went wrong.
+            let mut input = String::new();
+            if std::io::stdin().read_to_string(&mut input).is_err() {
+                return Ok(());
+            }
+            let Ok(input) = serde_json::from_str::<serde_json::Value>(&input) else {
+                return Ok(());
+            };
+            let store = rebon_group::GroupStore::new(rebon_group::default_root(
+                &rebon_session::default_config_home_dir(),
+            ));
+            if let Some(output) = rebon_group::deliver::hook_output(&store, &args.agent, &input) {
+                println!("{output}");
+            }
+            Ok(())
+        }
+    }
+}

@@ -357,6 +357,13 @@ enum Command {
         #[command(subcommand)]
         command: rebon_mcp_channel::cli::McpCommand,
     },
+    /// Agent groups: several agents in one project sharing notes, requests
+    /// and a memory. `rebon group hook` is what Claude Code and Codex run to
+    /// hear from their group.
+    Group {
+        #[command(subcommand)]
+        command: rebon_mcp_channel::cli::GroupCommand,
+    },
     /// Remote Control: serve this machine's Rebon sessions to an RC server.
     ///
     /// `rebon rc login` binds the machine, `rebon rc serve` registers it and
@@ -1121,6 +1128,7 @@ async fn run_headless_command(command: Command) -> anyhow::Result<()> {
             )
             .await
         }
+        Command::Group { command } => rebon_mcp_channel::cli::run_group(command),
         Command::BrowserMcp { args } => {
             sibling_command::forward_to_sibling("browser-mcp", BROWSER_MCP_SIBLING, args)
         }

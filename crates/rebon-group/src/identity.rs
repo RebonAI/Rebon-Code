@@ -87,11 +87,13 @@ const SESSION_VARS: &[SessionVar] = &[
 
 /// The session a tool call says it comes from, when the agent puts it on the
 /// call rather than in the environment. Codex scrubs its MCP servers'
-/// environment but sends `_meta["x-codex-turn-metadata"]` with the thread
-/// on every `tools/call` (codex-rs `core/src/mcp_tool_call.rs`).
+/// environment but sends `_meta["x-codex-turn-metadata"]` on every
+/// `tools/call` (codex-rs `core/src/mcp_tool_call.rs`). Its `session_id` is
+/// what Codex's hooks are given too, so a member found here is the one a
+/// hook finds; a sub-agent's thread shares its parent's session.
 pub fn from_call_meta(meta: &serde_json::Value) -> Option<Caller> {
     let codex = meta.get("x-codex-turn-metadata")?;
-    let id = ["thread_id", "session_id"]
+    let id = ["session_id", "thread_id"]
         .iter()
         .find_map(|key| codex.get(*key).and_then(serde_json::Value::as_str))
         .map(str::trim)
@@ -327,7 +329,14 @@ mod tests {
         });
         let caller = from_call_meta(&meta).unwrap();
         assert_eq!(caller.agent, AgentKind::CODEX);
-        assert_eq!(caller.session_id, "019a-thread");
+        assert_eq!(caller.session_id, "s-9");
+        // A call that names only its thread is that thread.
+        let thread_only =
+            serde_json::json!({ "x-codex-turn-metadata": { "thread_id": "019a-thread" } });
+        assert_eq!(
+            from_call_meta(&thread_only).unwrap().session_id,
+            "019a-thread"
+        );
         assert_eq!(
             from_call_meta(&serde_json::json!({ "progressToken": 1 })),
             None

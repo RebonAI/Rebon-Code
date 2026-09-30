@@ -23,15 +23,24 @@
 //!   the agent started it with.
 //! - [`tools`] — the tool schemas and what each call does, as JSON in and
 //!   JSON out, for whichever host offers them.
+//! - [`deliver`] — what a member has not been handed yet, and the hook
+//!   channel end to end.
+//! - [`render`] — how pending entries read in an attachment, a hook's
+//!   context or a terminal.
+//! - [`warmth`] — whether a member can be woken cheaply, from its agent's
+//!   own session files.
 //!
 //! Host-neutral on purpose: this crate knows nothing of MCP or of the
 //! engine. `rebon mcp serve` wraps [`tools`] for any MCP client; a Rebon
 //! session is meant to get the same tools from a feature plugin.
 
+pub mod deliver;
 pub mod identity;
 pub mod model;
+pub mod render;
 pub mod store;
 pub mod tools;
+pub mod warmth;
 
 pub use identity::{AgentKind, Caller};
 pub use model::{Delivery, Entry, EntryKind, Group, Member, Warmth};
