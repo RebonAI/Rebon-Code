@@ -144,6 +144,19 @@ impl Entry {
 /// The address every member reads.
 pub const ALL: &str = "all";
 
+/// The person the agents work for, as a sender and as an address. Not a
+/// member: what they write is posted from the desktop app, and what an agent
+/// sends them (a reply to their request, most often) is for them to read
+/// there. No member can take it as an alias.
+pub const USER: &str = "user";
+
+impl Entry {
+    /// Written by the person rather than by an agent.
+    pub fn is_from_user(&self) -> bool {
+        self.from.eq_ignore_ascii_case(USER)
+    }
+}
+
 /// Entries reaching a member, and by which way. One line of
 /// `deliveries.jsonl`: the log says what was said, this says who has been
 /// handed it.

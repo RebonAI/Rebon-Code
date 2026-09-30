@@ -322,7 +322,10 @@ fn handoffs_say_who_got_what_and_how() {
 fn a_group_can_be_renamed_but_not_onto_a_sibling() {
     let (_dir, store, group) = pair();
     let other = store.create("docs", "/work/app").unwrap();
-    assert!(store.rename(&group.id, "Docs").is_err(), "names are per project");
+    assert!(
+        store.rename(&group.id, "Docs").is_err(),
+        "names are per project"
+    );
     assert!(store.rename(&group.id, "  ").is_err());
     let renamed = store.rename(&group.id, "parser rewrite").unwrap();
     assert_eq!(renamed.name, "parser rewrite");
@@ -368,4 +371,101 @@ fn directories_compare_by_spelling() {
     assert!(dir_is_within("C:/work/app/src", "C:\\work\\app"));
     assert!(!dir_is_within("C:/work/application", "C:/work/app"));
     assert!(same_dir("\\\\?\\C:\\work", "C:/work"));
+}
+
+#[test]
+fn the_user_posts_without_joining_and_members_answer_them() {
+    let (_dir, store, group) = pair();
+    // Nobody can pass as the user.
+    assert!(store
+        .join(&group.id, member("codex", "x1", "User"))
+        .is_err());
+    let request = Draft {
+        kind: EntryKind::Request,
+        to: Some("coder".into()),
+        re: None,
+        supersedes: None,
+        text: "fix the login bug".into(),
+    };
+    let posted = store.post_as_user(&group.id, request).unwrap();
+    assert!(posted.is_from_user());
+    let rid = posted.id.clone().unwrap();
+    assert_eq!(rid, format!("r{}", posted.seq));
+    // The user writes to members, not to themselves, and only asks or tells.
+    assert!(store
+        .post_as_user(&group.id, note("user", "hi me"))
+        .is_err());
+    assert!(store
+        .post_as_user(&group.id, memory("a fact", None))
+        .is_err());
+    assert!(store.post_as_user(&group.id, note("all", "  ")).is_err());
+
+    let coder = store
+        .inbox(&group.id, &key("claude-code", "c1"), true)
+        .unwrap();
+    assert_eq!(coder.entries.len(), 1);
+    assert!(coder.entries[0].is_from_user());
+
+    // A member answers the user; no member reads that answer.
+    let reply = Draft {
+        kind: EntryKind::Reply,
+        to: Some("user".into()),
+        re: Some(rid),
+        supersedes: None,
+        text: "fixed".into(),
+    };
+    store
+        .append(&group.id, &key("claude-code", "c1"), reply)
+        .unwrap();
+    let planner = store.inbox(&group.id, &key("rebon", "s1"), true).unwrap();
+    assert!(planner
+        .entries
+        .iter()
+        .all(|entry| entry.to.as_deref() != Some("user")));
+}
+
+#[test]
+fn a_member_brought_in_before_its_session_had_an_id_takes_the_id_later() {
+    let (_dir, store, group) = pair();
+    store
+        .join(&group.id, member("codex", "starting-1", "tester"))
+        .unwrap();
+    store
+        .append(&group.id, &key("rebon", "s1"), note("tester", "hi"))
+        .unwrap();
+    store
+        .mark_delivered(&group.id, &key("codex", "starting-1"), 3)
+        .unwrap();
+    store
+        .record_handoff(
+            &group.id,
+            &key("codex", "starting-1"),
+            Via::Terminal,
+            vec![3],
+        )
+        .unwrap();
+    let renamed = store
+        .rekey_member(&group.id, &key("codex", "starting-1"), "019c-thread")
+        .unwrap();
+    let member = renamed.member(&key("codex", "019c-thread")).unwrap();
+    let handoffs = store.handoffs(&group.id).unwrap();
+    assert!(handoffs
+        .iter()
+        .any(|handoff| handoff.session_id == "019c-thread" && handoff.seqs == vec![3]));
+    assert!(!handoffs
+        .iter()
+        .any(|handoff| handoff.session_id == "starting-1"));
+    assert_eq!(member.alias, "tester");
+    assert!(renamed.member(&key("codex", "starting-1")).is_none());
+    assert_eq!(
+        store
+            .cursor(&group.id, &key("codex", "019c-thread"))
+            .unwrap()
+            .delivered,
+        3
+    );
+    // A session already in a group cannot be given to another member.
+    assert!(store
+        .rekey_member(&group.id, &key("claude-code", "c1"), "c1")
+        .is_err());
 }

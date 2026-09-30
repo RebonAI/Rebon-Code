@@ -94,11 +94,11 @@ pub fn specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: GROUP_SEND,
-            description: "Write to your agent group. kind note (default) tells, request asks a member to do something and returns a request id, reply answers a request (name it in re). to is a member's alias or all. Sending never waits: an answer arrives later in the recipient's reply, which you read with group_inbox. Keep it short — the others read it in their own context.",
+            description: "Write to your agent group. kind note (default) tells, request asks a member to do something and returns a request id, reply answers a request (name it in re). to is a member's alias, all, or user. Sending never waits: an answer arrives later in the recipient's reply, which you read with group_inbox. Keep it short — the others read it in their own context.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "to": { "type": "string", "description": "A member's alias, or all." },
+                    "to": { "type": "string", "description": "A member's alias, all, or user (the person you work for, who reads the group in the desktop app)." },
                     "text": { "type": "string" },
                     "kind": { "type": "string", "enum": ["note", "request", "reply"], "description": "Default note." },
                     "re": { "type": "string", "description": "For a reply: the request id it answers (e.g. r12)." }

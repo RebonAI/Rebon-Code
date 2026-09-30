@@ -16,7 +16,7 @@ use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Entry, EntryKind, Group, Handoff, Member, MemberKey, Via, Warmth, ALL};
+use crate::model::{Entry, EntryKind, Group, Handoff, Member, MemberKey, Via, Warmth, ALL, USER};
 
 const GROUP_FILE: &str = "group.json";
 const LOG_FILE: &str = "log.jsonl";
@@ -222,7 +222,7 @@ impl GroupStore {
             );
         }
         let alias = member.alias.trim().to_string();
-        if alias.is_empty() || alias.eq_ignore_ascii_case(ALL) {
+        if alias.is_empty() || alias.eq_ignore_ascii_case(ALL) || alias.eq_ignore_ascii_case(USER) {
             bail!("`{alias}` cannot be an alias");
         }
         self.with_lock(id, || {
@@ -293,6 +293,55 @@ impl GroupStore {
         })
     }
 
+    /// Gives a member the session id it turned out to have: one the app
+    /// brought in before its agent had named the session (Codex names a
+    /// thread only once it has written it). Its alias, its place in the log
+    /// and its cursors carry over.
+    pub fn rekey_member(&self, id: &str, key: &MemberKey, session_id: &str) -> Result<Group> {
+        check_id(id)?;
+        let new_key = MemberKey {
+            agent: key.agent.clone(),
+            session_id: session_id.to_string(),
+        };
+        if let Some(other) = self.group_of(&new_key)? {
+            bail!("session {session_id} is already in group `{}`", other.name);
+        }
+        self.with_lock(id, || {
+            let dir = self.dir(id);
+            let path = dir.join(GROUP_FILE);
+            let mut file = read_group_file(&path)?;
+            let Some(member) = file.group.members.iter_mut().find(|m| m.key() == *key) else {
+                bail!("not a member of this group");
+            };
+            member.session_id = session_id.to_string();
+            write_json(&path, &file)?;
+            let mut cursors = read_cursors(&dir)?;
+            if let Some(cursor) = cursors.remove(&key.as_string()) {
+                cursors.insert(new_key.as_string(), cursor);
+                write_json(&dir.join(CURSORS_FILE), &cursors)?;
+            }
+            // What it was handed under the old id was handed to it.
+            let deliveries = dir.join(DELIVERIES_FILE);
+            let mut handoffs: Vec<Handoff> = read_lines(&deliveries)?;
+            let mut moved = false;
+            for handoff in handoffs.iter_mut().filter(|handoff| {
+                handoff.agent == key.agent && handoff.session_id == key.session_id
+            }) {
+                handoff.session_id = session_id.to_string();
+                moved = true;
+            }
+            if moved {
+                let mut text = String::new();
+                for handoff in &handoffs {
+                    text.push_str(&serde_json::to_string(handoff)?);
+                    text.push('\n');
+                }
+                write_text(&deliveries, &text)?;
+            }
+            Ok(file.group)
+        })
+    }
+
     /// Changes one member's record in place — its role, how it is reached.
     /// Its key and alias stay what they are.
     pub fn update_member(
@@ -335,14 +384,7 @@ impl GroupStore {
                     file.group.name
                 );
             };
-            if let Some(to) = draft.to.as_deref() {
-                if !to.eq_ignore_ascii_case(ALL) && file.group.member_by_alias(to).is_none() {
-                    bail!(
-                        "no member called `{to}`; members are {}",
-                        aliases(&file.group)
-                    );
-                }
-            }
+            check_recipient(&file.group, draft.to.as_deref(), true)?;
             if draft.kind == EntryKind::Reply && draft.re.is_none() {
                 bail!("a reply names the request it answers (`re`)");
             }
@@ -355,6 +397,27 @@ impl GroupStore {
                     &render_memory(&file.group, &memory),
                 )?;
             }
+            Ok(entry)
+        })
+    }
+
+    /// Writes `draft` to the log as the user ([`USER`]): a note, or a request
+    /// a member's reply will name. Posted from the desktop app, so no member
+    /// key stands behind it.
+    pub fn post_as_user(&self, id: &str, draft: Draft) -> Result<Entry> {
+        check_id(id)?;
+        if !matches!(draft.kind, EntryKind::Note | EntryKind::Request) {
+            bail!("the user posts notes and requests");
+        }
+        if draft.text.trim().is_empty() {
+            bail!("nothing to post");
+        }
+        self.with_lock(id, || {
+            let path = self.dir(id).join(GROUP_FILE);
+            let mut file = read_group_file(&path)?;
+            check_recipient(&file.group, draft.to.as_deref(), false)?;
+            let entry = self.append_locked(id, &mut file, USER, draft)?;
+            write_json(&path, &file)?;
             Ok(entry)
         })
     }
@@ -483,7 +546,13 @@ impl GroupStore {
 
     /// Records that `seqs` reached `key` by `via`. Nothing is written for an
     /// empty list, or for a session that is not a member.
-    pub fn record_handoff(&self, id: &str, key: &MemberKey, via: Via, seqs: Vec<u64>) -> Result<()> {
+    pub fn record_handoff(
+        &self,
+        id: &str,
+        key: &MemberKey,
+        via: Via,
+        seqs: Vec<u64>,
+    ) -> Result<()> {
         check_id(id)?;
         self.with_lock(id, || {
             let dir = self.dir(id);
@@ -566,6 +635,21 @@ fn render_memory(group: &Group, memory: &[Entry]) -> String {
     text
 }
 
+/// A recipient is a member's alias, `all`, or — for what an agent sends —
+/// the user.
+fn check_recipient(group: &Group, to: Option<&str>, user_allowed: bool) -> Result<()> {
+    let Some(to) = to else {
+        return Ok(());
+    };
+    if to.eq_ignore_ascii_case(ALL)
+        || (user_allowed && to.eq_ignore_ascii_case(USER))
+        || group.member_by_alias(to).is_some()
+    {
+        return Ok(());
+    }
+    bail!("no member called `{to}`; members are {}", aliases(group))
+}
+
 fn aliases(group: &Group) -> String {
     let names: Vec<&str> = group.members.iter().map(|m| m.alias.as_str()).collect();
     if names.is_empty() {
@@ -624,7 +708,13 @@ fn read_cursors(dir: &Path) -> Result<BTreeMap<String, Cursor>> {
     }
 }
 
-fn append_handoff(dir: &Path, key: &MemberKey, alias: &str, via: Via, seqs: Vec<u64>) -> Result<()> {
+fn append_handoff(
+    dir: &Path,
+    key: &MemberKey,
+    alias: &str,
+    via: Via,
+    seqs: Vec<u64>,
+) -> Result<()> {
     if seqs.is_empty() {
         return Ok(());
     }
