@@ -4280,8 +4280,14 @@ mod tests {
                 status: rebon_types::ToolCallStatus::Completed,
                 content: None,
                 locations: None,
-                raw_input: Some(serde_json::json!({"file_path": format!("file-{n}.rs")})),
-                raw_output: Some(serde_json::json!("TOOL-BODY")),
+                raw_input: Some(std::collections::HashMap::from([(
+                    "file_path".into(),
+                    serde_json::json!(format!("file-{n}.rs")),
+                )])),
+                raw_output: Some(std::collections::HashMap::from([(
+                    "output".into(),
+                    serde_json::json!("TOOL-BODY"),
+                )])),
             });
         }
         fixture.update(rebon_types::SessionUpdate::ThinkingDelta {
