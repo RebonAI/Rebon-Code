@@ -321,13 +321,14 @@ pub struct RemoteBackgroundAttachment {
     /// next user turn is on disk — or when a rewind removes the turn's
     /// boundary from the file.
     pub(crate) last_settled_turn: Option<SettledTurnProjection>,
-    /// Local `partial-*` rows that belong to settled turns. They stand for
-    /// covered persisted entries permanently, so the merge keeps them
-    /// forever. An *unsettled* slab is kept only while its turn is watched
-    /// live — a turn that falls to the splice drops its slabs like any
-    /// other projection, or the slab and the persisted row it duplicates
-    /// would both stay on screen.
+    /// Local rows made immutable by a turn settle or an inline commit.
+    /// The merge must retain their identities even on a splice fallback.
     pub(crate) settled_local_row_uuids: std::collections::HashSet<String>,
+    /// Incrementally printed row uuid -> owning user turn. Unlike whole-turn
+    /// coverage, these rows cover only their own blocks; replay subtracts
+    /// those blocks and keeps any unseen persisted suffix. Empty until an
+    /// inline frame actually commits, and dropped with the attachment.
+    pub(crate) inline_committed_row_turns: std::collections::HashMap<String, String>,
     /// Whether the turn in flight is still provably watched live (the
     /// projection contained the file at the last refresh that could tell).
     /// The handoff settle consults it: a turn that fell to the splice must
@@ -686,6 +687,7 @@ impl RemoteBackgroundAttachment {
             covered_persisted_uuids: std::collections::HashSet::new(),
             last_settled_turn: None,
             settled_local_row_uuids: std::collections::HashSet::new(),
+            inline_committed_row_turns: std::collections::HashMap::new(),
             current_turn_watched: false,
             terminal_transcript_synced: matches!(
                 status,

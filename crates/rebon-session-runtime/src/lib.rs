@@ -47,6 +47,7 @@ pub mod rebon_config;
 pub mod ripgrep;
 pub mod session_handoff;
 pub mod task_notification_poller;
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_env;
 pub mod ui_config;
 

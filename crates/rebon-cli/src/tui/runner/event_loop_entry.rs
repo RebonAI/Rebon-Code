@@ -839,6 +839,15 @@ fn background_pipeline(
     // `stashed_or_queued` check above.
     if !state.paste_burst.has_pending() {
         render_pass(guard, app, theme, slot, state, &frame_inputs)?;
+        if state.ui_mode == UiMode::Inline && app.agent_view.is_none() {
+            if let Some(remote) = slot
+                .session_mut()
+                .and_then(|session| session.remote_background_attachment.as_mut())
+            {
+                let committed = state.inline_runtime.commit_cursor.committed_row_count();
+                remote.note_inline_committed_rows(&app.rebon_tui.transcript.rows()[..committed]);
+            }
+        }
     }
     Ok(PhaseFlow::Continue)
 }
@@ -3116,14 +3125,19 @@ pub(super) fn remote_attachment_live_prefix(
     rows: &[rebon_tui::Message],
 ) -> Option<usize> {
     let remote = remote?;
-    // A splice fallback can replace an unsettled streaming slab with a
-    // persisted row. Keep every such slab out of immutable scrollback even
-    // when a later persisted row makes it non-trailing; otherwise the commit
-    // cursor sees its `partial-*` key disappear and reprints the suffix.
-    let unsettled_streaming_start = rows.iter().position(|row| {
-        row.uuid().is_some_and(|uuid| {
-            uuid.starts_with("partial-") && !remote.settled_local_row_uuids.contains(uuid)
+    // A watched turn may release its sealed slabs before settle. The frame
+    // records the rows actually printed, and replay subtracts their blocks
+    // instead of replacing their identities on a later splice fallback.
+    let streaming_start = remote.inline_streaming_prefix_start(rows);
+    let row_is_immutable = |index: usize| {
+        rows[index].uuid().is_some_and(|uuid| {
+            remote.settled_local_row_uuids.contains(uuid)
+                || (uuid.starts_with("partial-")
+                    && streaming_start.is_some_and(|start| index >= start))
         })
+    };
+    let unsettled_streaming_start = rows.iter().enumerate().position(|(index, row)| {
+        row.uuid().is_some_and(|uuid| uuid.starts_with("partial-")) && !row_is_immutable(index)
     });
     let mut persisted_end = rows.len();
     while persisted_end > 0 {
@@ -3134,7 +3148,7 @@ pub(super) fn remote_attachment_live_prefix(
         // region forever — the whole session stopped reaching scrollback.
         let row_is_local = rows[persisted_end - 1].uuid().is_some_and(|uuid| {
             !remote.persisted_transcript_uuids.contains(uuid)
-                && !remote.settled_local_row_uuids.contains(uuid)
+                && !row_is_immutable(persisted_end - 1)
         });
         if !row_is_local {
             break;
@@ -3144,6 +3158,7 @@ pub(super) fn remote_attachment_live_prefix(
 
     let mutable_suffix_start = if remote.inline_transcript_tail_is_mutable() {
         rebon_tui::trailing_collapsible_tool_run_start(&rows[..persisted_end], true)
+            .and_then(|start| (start..persisted_end).find(|index| !row_is_immutable(*index)))
             .or((persisted_end < rows.len()).then_some(persisted_end))
     } else {
         // Local-only rows can be repositioned by every future remote replay,

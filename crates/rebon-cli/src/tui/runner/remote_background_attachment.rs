@@ -1249,6 +1249,15 @@ fn commit_watched_turn_locally(
             commit_timestamp: rebon_types::format_system_time_iso_ms(std::time::SystemTime::now()),
         },
     );
+    if remote
+        .inline_committed_row_turns
+        .values()
+        .any(|user| user == &user_uuid)
+    {
+        // The final tail joins the same immutable representation. Retain its
+        // block coverage too if late persistence later forces a splice.
+        remote.note_inline_committed_rows(app.rebon_tui.transcript.rows());
+    }
     let settled_rows = app
         .rebon_tui
         .transcript
@@ -1407,9 +1416,35 @@ fn refresh_remote_transcript(
             .as_ref()
             .map(|remote| remote.persisted_transcript_uuids.clone())
             .unwrap_or_default();
+        let incremental_turns = session
+            .remote_background_attachment
+            .as_ref()
+            .map(|remote| {
+                remote
+                    .inline_committed_row_turns
+                    .values()
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .map(|user_uuid| {
+                        (
+                            user_uuid.clone(),
+                            persisted_remote_turn(&loaded_transcript, user_uuid),
+                        )
+                    })
+                    .collect::<std::collections::HashMap<_, _>>()
+            })
+            .unwrap_or_default();
         let mut refreshed = rebon_tui::AppState::default();
         let background_agent_tool_tasks =
             replay_transcript_entries_with_agent_tasks(&mut refreshed, loaded_transcript);
+        let mut persisted_rows = refreshed.transcript.rows().to_vec();
+        if let Some(remote) = session.remote_background_attachment.as_ref() {
+            remote.subtract_inline_committed_rows(
+                &incremental_turns,
+                app.rebon_tui.transcript.rows(),
+                &mut persisted_rows,
+            );
+        }
         let empty_covered = HashSet::new();
         let covered_persisted_uuids = session
             .remote_background_attachment
@@ -1436,7 +1471,7 @@ fn refresh_remote_transcript(
             .map(|remote| &remote.settled_local_row_uuids)
             .unwrap_or(&empty_settled);
         let rows = merge_local_system_rows(
-            refreshed.transcript.rows().to_vec(),
+            persisted_rows,
             app.rebon_tui.transcript.rows(),
             &previous_persisted_uuids,
             MergeStreamingContext {
@@ -4031,6 +4066,403 @@ mod tests {
             1,
             "the tool result must be committed exactly once: {settled:?}"
         );
+    }
+
+    struct HostedOverflow {
+        app: AppState,
+        session: crate::tui::wiring::TuiEngineSession,
+        terminal: ratatui::Terminal<ratatui::backend::TestBackend>,
+        runtime: super::super::inline_commit_cursor::InlineRuntimeState,
+        path: std::path::PathBuf,
+        entries: Vec<serde_json::Value>,
+    }
+
+    impl HostedOverflow {
+        fn new() -> Self {
+            let mut session = super::super::test_support::make_test_tui_session();
+            session.remote_background_attachment = Some(
+                crate::background::RemoteBackgroundAttachment::without_worker(
+                    "bg-overflow".into(),
+                    "sess-overflow".into(),
+                    ".".into(),
+                    rebon_session_host::BackgroundJobStatus::Running,
+                    0,
+                ),
+            );
+            let path = rebon_session::ensure_session_file_path(
+                &rebon_session::default_projects_root(),
+                ".",
+                "sess-overflow",
+            )
+            .unwrap();
+            let mut fixture = Self {
+                app: AppState::new(),
+                session,
+                terminal: ratatui::Terminal::with_options(
+                    ratatui::backend::TestBackend::new(80, 12),
+                    ratatui::TerminalOptions {
+                        viewport: ratatui::Viewport::Inline(12),
+                    },
+                )
+                .unwrap(),
+                runtime: super::super::inline_commit_cursor::InlineRuntimeState::default(),
+                path,
+                entries: Vec::new(),
+            };
+            fixture.app.ui_mode = crate::ui_config::UiMode::Inline;
+            fixture.app.is_loading = true;
+            fixture.persist("user", "user-overflow", serde_json::json!("prompt"));
+            fixture.refresh(false);
+            fixture.flush();
+            fixture
+        }
+
+        fn persist(&mut self, role: &str, uuid: &str, content: serde_json::Value) {
+            let parent = self.entries.last().and_then(|entry| entry["uuid"].as_str());
+            self.entries.push(serde_json::json!({
+                "type": role,
+                "uuid": uuid,
+                "parentUuid": parent,
+                "timestamp": "2026-09-05T00:00:00.000Z",
+                "message": {"role": role, "content": content},
+            }));
+            let body = self
+                .entries
+                .iter()
+                .map(|entry| entry.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            std::fs::write(&self.path, body).unwrap();
+        }
+
+        fn update(&mut self, update: rebon_types::SessionUpdate) {
+            super::project_remote_update(
+                &mut self.app,
+                &mut self.session,
+                rebon_types::SessionUpdateParams {
+                    session_id: "sess-overflow".into(),
+                    update,
+                },
+                false,
+            );
+        }
+
+        fn text(&mut self, text: &str) {
+            self.update(rebon_types::SessionUpdate::AgentMessageChunk {
+                content: rebon_types::ContentBlock::Text(rebon_types::TextContent {
+                    text: text.into(),
+                    annotations: None,
+                }),
+            });
+        }
+
+        fn drain(&mut self) {
+            let area = self.terminal.size().unwrap();
+            assert!(
+                super::super::render::inline_live_content_overflows_viewport(
+                    &self.app,
+                    &mut rebon_tui::RenderTheme::plain(),
+                    super::super::render::InlineViewportHeightInput {
+                        width: area.width,
+                        terminal_height: area.height,
+                        base_height: area.height,
+                        committed_rows: self.runtime.commit_cursor.committed_row_count(),
+                        elapsed_ms: 0,
+                    },
+                )
+            );
+            crate::tui::update::force_drain_overlay_sealed_prefix(&mut self.app);
+            self.flush();
+        }
+
+        fn flush(&mut self) {
+            let remote = self.session.remote_background_attachment.as_mut().unwrap();
+            let pinned = super::super::event_loop_entry::remote_attachment_live_prefix(
+                Some(remote),
+                self.app.rebon_tui.transcript.rows(),
+            )
+            .unwrap_or(self.app.rebon_tui.transcript.len());
+            super::super::inline_commit_cursor::flush_inline_commits(
+                &mut self.terminal,
+                &mut self.app,
+                &rebon_tui::RenderTheme::plain(),
+                &mut self.runtime,
+                pinned,
+            )
+            .unwrap();
+            // The runner records successful frame commits before it accepts
+            // another owner update, including a gap or a turn handoff.
+            let committed = self.runtime.commit_cursor.committed_row_count();
+            self.session
+                .remote_background_attachment
+                .as_mut()
+                .unwrap()
+                .note_inline_committed_rows(&self.app.rebon_tui.transcript.rows()[..committed]);
+        }
+
+        fn refresh(&mut self, terminal: bool) {
+            assert!(super::refresh_remote_transcript(
+                &mut self.app,
+                &mut self.session,
+                terminal
+            ));
+        }
+
+        fn output(&self) -> String {
+            self.terminal
+                .backend()
+                .scrollback()
+                .content
+                .iter()
+                .chain(self.terminal.backend().buffer().content.iter())
+                .map(|cell| cell.symbol())
+                .collect()
+        }
+    }
+
+    fn overflow_paragraphs(start: usize, end: usize) -> String {
+        (start..end)
+            .map(|n| format!("PARAGRAPH-{n:03} body\n\n"))
+            .collect()
+    }
+
+    #[test]
+    fn hosted_overflow_paragraphs_advance_cursor_and_native_scrollback() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("hosted-overflow");
+        let mut fixture = HostedOverflow::new();
+        let mut committed = fixture.runtime.commit_cursor.committed_row_count();
+        for start in [0, 24, 48] {
+            fixture.text(&overflow_paragraphs(start, start + 24));
+            fixture.drain();
+            let next = fixture.runtime.commit_cursor.committed_row_count();
+            assert!(
+                next > committed,
+                "hosted overflow must commit before turn settle"
+            );
+            committed = next;
+            let scrollback = fixture
+                .terminal
+                .backend()
+                .scrollback()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(scrollback.contains(&format!("PARAGRAPH-{start:03}")));
+        }
+        for n in 0..72 {
+            assert_eq!(
+                fixture
+                    .output()
+                    .matches(&format!("PARAGRAPH-{n:03}"))
+                    .count(),
+                1
+            );
+        }
+        assert!(fixture
+            .session
+            .remote_background_attachment
+            .as_ref()
+            .unwrap()
+            .last_settled_turn
+            .is_none());
+    }
+
+    #[test]
+    fn hosted_overflow_completed_tools_commit_while_thinking_stays_live() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("hosted-tools");
+        let mut fixture = HostedOverflow::new();
+        for n in 0..12 {
+            fixture.update(rebon_types::SessionUpdate::ToolCall {
+                tool_call_id: format!("read-{n}"),
+                title: "Read".into(),
+                kind: rebon_types::ToolKind::Read,
+                status: rebon_types::ToolCallStatus::Completed,
+                content: None,
+                locations: None,
+                raw_input: Some(std::collections::HashMap::from([(
+                    "file_path".into(),
+                    serde_json::json!(format!("file-{n}.rs")),
+                )])),
+                raw_output: Some(std::collections::HashMap::from([(
+                    "output".into(),
+                    serde_json::json!("TOOL-BODY"),
+                )])),
+            });
+        }
+        fixture.update(rebon_types::SessionUpdate::ThinkingDelta {
+            text: "still thinking\n".repeat(48),
+        });
+        // 输入框高度有上限；缩短终端才能让折叠工具簇也触发 overflow。
+        fixture.terminal.backend_mut().resize(80, 4);
+        fixture.terminal.autoresize().unwrap();
+        let before = fixture.runtime.commit_cursor.committed_row_count();
+        fixture.drain();
+        assert!(fixture.runtime.commit_cursor.committed_row_count() > before);
+        assert_eq!(fixture.app.rebon_tui.overlay.tool_use_count(), 0);
+        assert!(fixture
+            .app
+            .rebon_tui
+            .overlay
+            .blocks
+            .iter()
+            .any(|block| matches!(
+                block, rebon_tui::StreamingContentBlock::Thinking(t) if t.is_streaming
+            )));
+        assert!(
+            fixture.output().contains("Read 12 files"),
+            "{}",
+            fixture.output()
+        );
+        let output = fixture.output();
+        fixture.flush();
+        assert_eq!(
+            fixture.output(),
+            output,
+            "idle frames must not print the cluster again"
+        );
+        let mut blocks = (0..12)
+            .map(|n| {
+                serde_json::json!({
+                    "type": "tool_use", "id": format!("read-{n}"), "name": "Read",
+                    "input": {"file_path": format!("file-{n}.rs")},
+                })
+            })
+            .collect::<Vec<_>>();
+        blocks.push(serde_json::json!({"type": "text", "text": "TOOL-TURN-TAIL"}));
+        fixture.persist("assistant", "a-tools", serde_json::json!(blocks));
+        fixture.refresh(true);
+        fixture.flush();
+        assert_eq!(fixture.output().matches("Read 12 files").count(), 1);
+        assert_eq!(fixture.output().matches("TOOL-TURN-TAIL").count(), 1);
+    }
+
+    #[test]
+    fn hosted_overflow_incremental_prefix_survives_catchup_splice_and_settle() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("hosted-reconcile");
+        for gap in [false, true] {
+            let mut fixture = HostedOverflow::new();
+            let head = overflow_paragraphs(0, 24);
+            fixture.text(&head);
+            fixture.drain();
+            let committed = fixture.runtime.commit_cursor.committed_row_count();
+            assert!(
+                committed > 1,
+                "the regression requires an actual incremental commit"
+            );
+            let prefix = fixture.app.rebon_tui.transcript.rows()[..committed].to_vec();
+            fixture.persist(
+                "assistant",
+                "a-head",
+                serde_json::json!([
+                    {"type": "text", "text": head}
+                ]),
+            );
+            fixture.refresh(false);
+            fixture.flush();
+            assert_eq!(
+                &fixture.app.rebon_tui.transcript.rows()[..committed],
+                &prefix
+            );
+
+            let tail = "UNSEEN-TAIL final answer";
+            if gap {
+                // The file has content the delivered stream never contained:
+                // coverage must fail and the authoritative splice must run.
+                super::clear_remote_turn_projection(
+                    fixture
+                        .session
+                        .remote_background_attachment
+                        .as_mut()
+                        .unwrap(),
+                );
+            } else {
+                fixture.text(tail);
+            }
+            fixture.persist(
+                "assistant",
+                "a-tail",
+                serde_json::json!([
+                    {"type": "text", "text": tail}
+                ]),
+            );
+            fixture.refresh(true);
+            fixture.flush();
+            assert_eq!(
+                &fixture.app.rebon_tui.transcript.rows()[..committed],
+                &prefix
+            );
+            let output = fixture.output();
+            for n in 0..24 {
+                assert_eq!(
+                    output.matches(&format!("PARAGRAPH-{n:03}")).count(),
+                    1,
+                    "gap={gap}"
+                );
+            }
+            assert_eq!(output.matches("UNSEEN-TAIL").count(), 1, "gap={gap}");
+            fixture.refresh(true);
+            fixture.flush();
+            assert_eq!(fixture.output(), output, "repeated settle must be inert");
+            fixture.persist(
+                "assistant",
+                "a-late",
+                serde_json::json!([
+                    {"type": "text", "text": "LATE-PERSISTED-TAIL"}
+                ]),
+            );
+            fixture.refresh(true);
+            fixture.flush();
+            assert_eq!(fixture.output().matches("UNSEEN-TAIL").count(), 1);
+            assert_eq!(fixture.output().matches("PARAGRAPH-000").count(), 1);
+            assert_eq!(fixture.output().matches("LATE-PERSISTED-TAIL").count(), 1);
+        }
+    }
+
+    #[test]
+    fn hosted_overflow_splice_preserves_gaps_inside_a_persisted_entry() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("hosted-entry-gap");
+        let mut fixture = HostedOverflow::new();
+        let first = overflow_paragraphs(0, 24);
+        let second = overflow_paragraphs(24, 48);
+        fixture.text(&first);
+        fixture.drain();
+        fixture.text(&second);
+        fixture.drain();
+        let committed = fixture.runtime.commit_cursor.committed_row_count();
+        assert!(committed > 1);
+        let prefix = fixture.app.rebon_tui.transcript.rows()[..committed].to_vec();
+        fixture.persist(
+            "assistant",
+            "a-gap",
+            serde_json::json!([
+                {"type": "text", "text": format!("{first}MISSING-MIDDLE\n{second}MISSING-END")}
+            ]),
+        );
+        fixture.refresh(true);
+        fixture.flush();
+        assert_eq!(
+            &fixture.app.rebon_tui.transcript.rows()[..committed],
+            &prefix
+        );
+        let output = fixture.output();
+        for n in 0..48 {
+            assert_eq!(output.matches(&format!("PARAGRAPH-{n:03}")).count(), 1);
+        }
+        assert_eq!(output.matches("MISSING-MIDDLE").count(), 1);
+        assert_eq!(output.matches("MISSING-END").count(), 1);
+        assert!(
+            !fixture
+                .session
+                .remote_background_attachment
+                .as_ref()
+                .unwrap()
+                .current_turn_watched
+        );
+        fixture.refresh(true);
+        fixture.flush();
+        assert_eq!(fixture.output(), output);
     }
 
     /// Regression for RFC-0004 §16.24: a persisted row can arrive in front

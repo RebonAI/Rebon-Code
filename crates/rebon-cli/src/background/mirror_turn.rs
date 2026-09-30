@@ -275,6 +275,9 @@ pub(crate) fn prune_stale_coverage(
     remote
         .covered_persisted_uuids
         .retain(|uuid| persisted_uuids.contains(uuid));
+    remote
+        .inline_committed_row_turns
+        .retain(|_, user_uuid| persisted_uuids.contains(user_uuid));
     if remote
         .last_settled_turn
         .as_ref()
@@ -313,10 +316,237 @@ pub(crate) fn cover_settled_turn_entries(
         remote
             .covered_persisted_uuids
             .extend(turn.assistant_uuids.iter().cloned());
+        if turn.next_user_found {
+            // The closed, fully covered turn now needs only entry coverage,
+            // not another block walk on every later refresh of the session.
+            remote
+                .inline_committed_row_turns
+                .retain(|_, user| user != &settled.user_uuid);
+        }
+    } else if remote
+        .inline_committed_row_turns
+        .values()
+        .any(|user| user == &settled.user_uuid)
+    {
+        // A late entry can extend an already covered uuid. Incremental
+        // coverage can keep its printed blocks without hiding the new tail.
+        for uuid in &turn.assistant_uuids {
+            remote.covered_persisted_uuids.remove(uuid);
+        }
     }
     if turn.next_user_found {
         remote.last_settled_turn = None;
     }
+}
+
+impl crate::background::RemoteBackgroundAttachment {
+    /// Only a watched, not-yet-spliced turn can hand sealed slabs to inline.
+    /// The overlay's open blocks are not transcript rows and stay repaintable.
+    pub(crate) fn inline_streaming_prefix_start(
+        &self,
+        rows: &[rebon_tui::Message],
+    ) -> Option<usize> {
+        if !self.current_turn_watched || !self.awaiting_overlay_absorption {
+            return None;
+        }
+        let user_uuid = self.current_turn_user_uuid.as_deref()?;
+        let start = rows.iter().position(|row| row.uuid() == Some(user_uuid))? + 1;
+        if rows[start..].iter().any(|row| {
+            matches!(row, rebon_tui::Message::User(_))
+                || (matches!(row, rebon_tui::Message::Assistant(_))
+                    && !row_is_local_stream_commit(row))
+        }) {
+            return None;
+        }
+        Some(start)
+    }
+
+    /// Record only what insert_before actually accepted, before another owner
+    /// update can clear the projection or hand the turn to the splice.
+    pub(crate) fn note_inline_committed_rows(&mut self, rows: &[rebon_tui::Message]) {
+        let Some(start) = self.inline_streaming_prefix_start(rows) else {
+            return;
+        };
+        let user_uuid = self
+            .current_turn_user_uuid
+            .as_ref()
+            .expect("watched turn boundary");
+        for row in &rows[start..] {
+            if row_is_local_stream_commit(row) {
+                let uuid = row.uuid().expect("stream slab uuid");
+                if !self.settled_local_row_uuids.contains(uuid) {
+                    self.inline_committed_row_turns
+                        .insert(uuid.to_string(), user_uuid.clone());
+                    self.settled_local_row_uuids.insert(uuid.to_string());
+                }
+            }
+        }
+    }
+
+    /// Reconcile at block granularity, not entry granularity: a persisted
+    /// entry may contain both the printed prefix and a tail the stream lost.
+    /// Recompute from the full replay on every refresh so neither catch-up
+    /// nor a later settle can consume the same coverage twice.
+    pub(crate) fn subtract_inline_committed_rows(
+        &self,
+        turns: &std::collections::HashMap<String, PersistedRemoteTurn>,
+        current_rows: &[rebon_tui::Message],
+        persisted_rows: &mut Vec<rebon_tui::Message>,
+    ) {
+        use rebon_tui::AssistantContentBlock as Block;
+
+        for (user_uuid, turn) in turns {
+            let user_uuid = user_uuid.as_str();
+            let uuids: HashSet<&str> = turn.assistant_uuids.iter().map(String::as_str).collect();
+            let mut texts = Vec::new();
+            let mut thinking = Vec::new();
+            let mut tools = HashSet::new();
+            for row in current_rows {
+                if row
+                    .uuid()
+                    .and_then(|uuid| self.inline_committed_row_turns.get(uuid))
+                    .map(String::as_str)
+                    != Some(user_uuid)
+                {
+                    continue;
+                }
+                if let rebon_tui::Message::Assistant(assistant) = row {
+                    for block in &assistant.message.content {
+                        match block {
+                            Block::Text(text) => texts.push(text.text.as_str()),
+                            Block::Thinking(text) => thinking.push(text.thinking.as_str()),
+                            Block::ToolUse(tool) => {
+                                tools.insert(tool.id.as_str());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let mut persisted_text = String::new();
+            let mut persisted_thinking = String::new();
+            for row in persisted_rows.iter() {
+                if let rebon_tui::Message::Assistant(assistant) = row {
+                    if uuids.contains(assistant.uuid.as_str()) {
+                        for block in &assistant.message.content {
+                            match block {
+                                Block::Text(text) => persisted_text.push_str(&text.text),
+                                Block::Thinking(text) => {
+                                    persisted_thinking.push_str(&text.thinking)
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            let text_ranges = streamed_ranges(&persisted_text, &texts);
+            let thinking_ranges = streamed_thinking_ranges(&persisted_thinking, &thinking);
+            let mut text_offset = 0;
+            let mut thinking_offset = 0;
+            persisted_rows.retain_mut(|row| {
+                let rebon_tui::Message::Assistant(assistant) = row else {
+                    return true;
+                };
+                if !uuids.contains(assistant.uuid.as_str()) {
+                    return true;
+                }
+                assistant.message.content.retain_mut(|block| match block {
+                    Block::Text(text) => {
+                        retain_unprinted_text(&mut text.text, &mut text_offset, &text_ranges)
+                    }
+                    Block::Thinking(text) => retain_unprinted_text(
+                        &mut text.thinking,
+                        &mut thinking_offset,
+                        &thinking_ranges,
+                    ),
+                    Block::ToolUse(tool) => !tools.contains(tool.id.as_str()),
+                    _ => true,
+                });
+                !assistant.message.content.is_empty()
+            });
+        }
+    }
+}
+
+/// Match ordered streamed slabs across persisted block/entry boundaries.
+/// Missing deltas may leave authoritative text between matches: keep it.
+/// A file still behind a slab covers only the matching prefix it contains.
+fn streamed_ranges(persisted: &str, slabs: &[&str]) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    for slab in slabs.iter().copied().filter(|slab| !slab.is_empty()) {
+        let rest = &persisted[offset..];
+        if let Some(start) = rest.find(slab) {
+            let start = offset + start;
+            offset = start + slab.len();
+            ranges.push(start..offset);
+        } else {
+            let matched = rest
+                .chars()
+                .zip(slab.chars())
+                .take_while(|(left, right)| left == right)
+                .map(|(ch, _)| ch.len_utf8())
+                .sum::<usize>();
+            if matched > 0 {
+                ranges.push(offset..offset + matched);
+            }
+            // Never claim unmatched content or search a later slab ahead of
+            // one the file has not finished yet.
+            break;
+        }
+    }
+    ranges
+}
+
+/// Providers may join reasoning parts with different whitespace on disk.
+/// Compare reasoning without that whitespace, but retain original byte ranges
+/// so any unprinted thinking still has exactly the persisted presentation.
+fn streamed_thinking_ranges(persisted: &str, slabs: &[&str]) -> Vec<std::ops::Range<usize>> {
+    let mut normalized = String::new();
+    let mut offsets = Vec::new();
+    for (offset, ch) in persisted
+        .char_indices()
+        .filter(|(_, ch)| !ch.is_whitespace())
+    {
+        normalized.push(ch);
+        offsets.extend(offset..offset + ch.len_utf8());
+    }
+    let slabs = slabs
+        .iter()
+        .map(|slab| {
+            slab.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let slabs = slabs.iter().map(String::as_str).collect::<Vec<_>>();
+    streamed_ranges(&normalized, &slabs)
+        .into_iter()
+        .map(|range| offsets[range.start]..offsets[range.end - 1] + 1)
+        .collect()
+}
+
+fn retain_unprinted_text(
+    text: &mut String,
+    offset: &mut usize,
+    ranges: &[std::ops::Range<usize>],
+) -> bool {
+    let end = *offset + text.len();
+    let mut kept = String::new();
+    let mut cursor = *offset;
+    for range in ranges
+        .iter()
+        .filter(|range| range.end > *offset && range.start < end)
+    {
+        let start = range.start.max(*offset);
+        kept.push_str(&text[cursor - *offset..start - *offset]);
+        cursor = range.end.min(end);
+    }
+    kept.push_str(&text[cursor - *offset..]);
+    *offset = end;
+    *text = kept;
+    !text.trim().is_empty()
 }
 
 /// Rebuild the transcript around what is on screen already.
@@ -333,8 +563,8 @@ pub(crate) fn cover_settled_turn_entries(
 ///
 /// Two exceptions keep a watched turn from printing twice. A local
 /// `partial-*` row is kept while it stands for persisted content: forever
-/// once its turn settled, and provisionally while its turn is still
-/// watched live. A turn that falls to the splice drops its unsettled slabs
+/// once printed inline or settled, and provisionally while its turn is
+/// still watched live. A turn that falls to the splice drops unprinted slabs
 /// like any other projection — keeping them beside the persisted rows they
 /// duplicate would be two prints of the same content in the store. And a
 /// persisted row in `skipped_persisted_uuids` is content local rows
@@ -345,8 +575,8 @@ pub(crate) struct MergeStreamingContext<'a> {
     /// Persisted entry uuids that must not splice in as new rows: covered
     /// by settled local rows, or withheld while their turn still streams.
     pub(crate) skipped_persisted_uuids: &'a std::collections::HashSet<String>,
-    /// Local `partial-*` rows that belong to settled turns and stand for
-    /// covered entries permanently.
+    /// Local `partial-*` rows made immutable by inline commits or settle.
+    /// Incremental coverage is subtracted from replay before this merge.
     pub(crate) settled_local_row_uuids: &'a std::collections::HashSet<String>,
     /// Whether unsettled `partial-*` rows survive this refresh — true only
     /// while the turn they stream for is watched live.
@@ -837,6 +1067,31 @@ mod tests {
             image_paste_ids: None,
             plan_content: None,
         })
+    }
+
+    #[test]
+    fn incremental_text_coverage_crosses_unicode_blocks_without_losing_gaps() {
+        let ranges = streamed_ranges("甲乙missing丙丁tail", &["甲乙", "丙丁"]);
+        let mut blocks = [
+            "甲".to_string(),
+            "乙missing丙".to_string(),
+            "丁tail".to_string(),
+        ];
+        let mut offset = 0;
+        for block in &mut blocks {
+            retain_unprinted_text(block, &mut offset, &ranges);
+        }
+        assert_eq!(blocks.concat(), "missingtail");
+        assert_eq!(streamed_ranges("甲乙", &["甲乙丙"]), vec![0..6]);
+        assert!(streamed_ranges("unseen", &["different"]).is_empty());
+    }
+
+    #[test]
+    fn incremental_thinking_coverage_keeps_unseen_rejoined_tail() {
+        let mut thinking = "甲\n\n乙\n新思路".to_string();
+        let ranges = streamed_thinking_ranges(&thinking, &["甲乙"]);
+        assert!(retain_unprinted_text(&mut thinking, &mut 0, &ranges));
+        assert_eq!(thinking, "\n新思路");
     }
 
     #[test]
