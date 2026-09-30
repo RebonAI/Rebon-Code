@@ -313,6 +313,8 @@ impl RuntimeResolved {
             &kernel_bootstrap::process_plugin_registry(),
         )
         .await;
+        // worker 续轮复用 scope，但 Engine 每轮重建，不能依赖首次创建 scope 的绑定副作用。
+        engine.attach_upstream_tool_context(kernel_bootstrap::process_kernel().context().clone());
         let kernel_scopes = existing_kernel_scopes.unwrap_or_else(|| {
             SessionKernelScopes::new(
                 kernel_bootstrap::process_kernel(),
@@ -439,4 +441,103 @@ pub fn policy_sources_for_session(
         rebon_core::turn_hook::Order::NORMAL,
         Arc::new(rebon_core::hooks::SettingsHookSubscriber::new().with_plugin_hooks(plugin_hooks)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rebon_core::query::{RuntimeModelConfig, SharedRuntimeModel};
+    use rebon_tool::tasks::test_support::TestConfigHome;
+
+    fn config_home(prefix: &str) -> TestConfigHome {
+        let home = TestConfigHome::new(prefix);
+        rebon_session::write_file_atomically(&home.path().join("config.json"), b"{}")
+            .expect("隔离测试配置可写");
+        home
+    }
+
+    async fn bind(
+        engine: &Arc<Engine>,
+        root: &Path,
+        scopes: Option<Arc<SessionKernelScopes>>,
+    ) -> SessionBound {
+        let runtime = SharedRuntimeModel::new(RuntimeModelConfig {
+            provider_name: "mock".into(),
+            client: Arc::new(rebon_api::mock::MockModelClient::new()),
+            model: "mock".into(),
+            model_profiles: Default::default(),
+            title_model: "mock".into(),
+            model_marketing_name: None,
+            knowledge_cutoff: None,
+            prune_level: None,
+            compact_provider: None,
+            compact_fallback_provider: None,
+            context_management: None,
+            reasoning_mode: None,
+        });
+        let (bound, refusal) = RuntimeResolved(root.to_path_buf())
+            .bind_session(engine, runtime, "group-member".into(), scopes)
+            .await;
+        assert!(refusal.is_none(), "插件初始化被拒绝：{refusal:?}");
+        bound
+    }
+
+    fn assert_group_tools_are_discoverable(engine: &Engine) {
+        let snapshots = engine.tool_snapshots();
+        let index = engine.build_tool_search_index();
+        for name in ["group_send", "group_remember"] {
+            assert!(snapshots.iter().any(|tool| tool.name == name), "{name}");
+            assert_eq!(index.select(&[name]).0.len(), 1, "{name}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fresh_session_exposes_process_group_tools() {
+        let _home = config_home("fresh-session-tools");
+        let root = tempfile::tempdir().expect("测试目录可创建");
+        let engine = Arc::new(Engine::with_builtin_tools());
+        let _bound = bind(&engine, root.path(), None).await;
+        assert_group_tools_are_discoverable(&engine);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reused_session_scopes_bind_each_new_engine_to_process_tools() {
+        let _home = config_home("reused-session-tools");
+        let root = tempfile::tempdir().expect("测试目录可创建");
+        let first = Arc::new(Engine::with_builtin_tools());
+        let bound = bind(&first, root.path(), None).await;
+        let scopes = bound.kernel_scopes.clone();
+        let generation = scopes.acquire("group-member").generation();
+        assert_group_tools_are_discoverable(&first);
+        drop(bound);
+        for _ in 0..3 {
+            let engine = Arc::new(Engine::with_builtin_tools());
+            assert!(!Arc::ptr_eq(&first, &engine));
+            let bound = bind(&engine, root.path(), Some(scopes.clone())).await;
+            assert!(Arc::ptr_eq(&scopes, &bound.kernel_scopes));
+            let lease = bound.kernel_scopes.acquire("group-member");
+            assert_eq!(lease.generation(), generation);
+            let resolver = engine.scoped_tool_resolver(Some(lease.into_engine_lease()), &[], None);
+            for name in ["group_send", "group_remember"] {
+                assert!(resolver.resolve(name, None).expect("工具可解析").is_some());
+            }
+            assert_group_tools_are_discoverable(&engine);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reused_session_group_tools_still_obey_visibility_filters() {
+        let _home = config_home("reused-session-tool-filter");
+        let root = tempfile::tempdir().expect("测试目录可创建");
+        let first = Arc::new(Engine::with_builtin_tools());
+        let bound = bind(&first, root.path(), None).await;
+        let engine = Arc::new(Engine::with_builtin_tools());
+        let _bound = bind(&engine, root.path(), Some(bound.kernel_scopes)).await;
+        let filter = ToolFilter::allow_only(["group_send"]);
+        let index = engine.build_filtered_tool_search_index(&filter);
+        assert_eq!(index.select(&["group_send"]).0.len(), 1);
+        assert!(index.select(&["group_remember"]).0.is_empty());
+        let denied = engine.build_filtered_tool_search_index(&ToolFilter::deny_all());
+        assert!(denied.select(&["group_send"]).0.is_empty());
+    }
 }
