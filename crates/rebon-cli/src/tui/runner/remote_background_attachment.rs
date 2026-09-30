@@ -1249,6 +1249,15 @@ fn commit_watched_turn_locally(
             commit_timestamp: rebon_types::format_system_time_iso_ms(std::time::SystemTime::now()),
         },
     );
+    if remote
+        .inline_committed_row_turns
+        .values()
+        .any(|user| user == &user_uuid)
+    {
+        // The final tail joins the same immutable representation. Retain its
+        // block coverage too if late persistence later forces a splice.
+        remote.note_inline_committed_rows(app.rebon_tui.transcript.rows());
+    }
     let settled_rows = app
         .rebon_tui
         .transcript
@@ -1407,9 +1416,35 @@ fn refresh_remote_transcript(
             .as_ref()
             .map(|remote| remote.persisted_transcript_uuids.clone())
             .unwrap_or_default();
+        let incremental_turns = session
+            .remote_background_attachment
+            .as_ref()
+            .map(|remote| {
+                remote
+                    .inline_committed_row_turns
+                    .values()
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .map(|user_uuid| {
+                        (
+                            user_uuid.clone(),
+                            persisted_remote_turn(&loaded_transcript, user_uuid),
+                        )
+                    })
+                    .collect::<std::collections::HashMap<_, _>>()
+            })
+            .unwrap_or_default();
         let mut refreshed = rebon_tui::AppState::default();
         let background_agent_tool_tasks =
             replay_transcript_entries_with_agent_tasks(&mut refreshed, loaded_transcript);
+        let mut persisted_rows = refreshed.transcript.rows().to_vec();
+        if let Some(remote) = session.remote_background_attachment.as_ref() {
+            remote.subtract_inline_committed_rows(
+                &incremental_turns,
+                app.rebon_tui.transcript.rows(),
+                &mut persisted_rows,
+            );
+        }
         let empty_covered = HashSet::new();
         let covered_persisted_uuids = session
             .remote_background_attachment
@@ -1436,7 +1471,7 @@ fn refresh_remote_transcript(
             .map(|remote| &remote.settled_local_row_uuids)
             .unwrap_or(&empty_settled);
         let rows = merge_local_system_rows(
-            refreshed.transcript.rows().to_vec(),
+            persisted_rows,
             app.rebon_tui.transcript.rows(),
             &previous_persisted_uuids,
             MergeStreamingContext {
@@ -4155,6 +4190,14 @@ mod tests {
                 pinned,
             )
             .unwrap();
+            // The runner records successful frame commits before it accepts
+            // another owner update, including a gap or a turn handoff.
+            let committed = self.runtime.commit_cursor.committed_row_count();
+            self.session
+                .remote_background_attachment
+                .as_mut()
+                .unwrap()
+                .note_inline_committed_rows(&self.app.rebon_tui.transcript.rows()[..committed]);
         }
 
         fn refresh(&mut self, terminal: bool) {
@@ -4272,6 +4315,20 @@ mod tests {
             output,
             "idle frames must not print the cluster again"
         );
+        let mut blocks = (0..12)
+            .map(|n| {
+                serde_json::json!({
+                    "type": "tool_use", "id": format!("read-{n}"), "name": "Read",
+                    "input": {"file_path": format!("file-{n}.rs")},
+                })
+            })
+            .collect::<Vec<_>>();
+        blocks.push(serde_json::json!({"type": "text", "text": "TOOL-TURN-TAIL"}));
+        fixture.persist("assistant", "a-tools", serde_json::json!(blocks));
+        fixture.refresh(true);
+        fixture.flush();
+        assert_eq!(fixture.output().matches("Read 12 files").count(), 1);
+        assert_eq!(fixture.output().matches("TOOL-TURN-TAIL").count(), 1);
     }
 
     #[test]
@@ -4341,7 +4398,64 @@ mod tests {
             fixture.refresh(true);
             fixture.flush();
             assert_eq!(fixture.output(), output, "repeated settle must be inert");
+            fixture.persist(
+                "assistant",
+                "a-late",
+                serde_json::json!([
+                    {"type": "text", "text": "LATE-PERSISTED-TAIL"}
+                ]),
+            );
+            fixture.refresh(true);
+            fixture.flush();
+            assert_eq!(fixture.output().matches("UNSEEN-TAIL").count(), 1);
+            assert_eq!(fixture.output().matches("PARAGRAPH-000").count(), 1);
+            assert_eq!(fixture.output().matches("LATE-PERSISTED-TAIL").count(), 1);
         }
+    }
+
+    #[test]
+    fn hosted_overflow_splice_preserves_gaps_inside_a_persisted_entry() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("hosted-entry-gap");
+        let mut fixture = HostedOverflow::new();
+        let first = overflow_paragraphs(0, 24);
+        let second = overflow_paragraphs(24, 48);
+        fixture.text(&first);
+        fixture.drain();
+        fixture.text(&second);
+        fixture.drain();
+        let committed = fixture.runtime.commit_cursor.committed_row_count();
+        assert!(committed > 1);
+        let prefix = fixture.app.rebon_tui.transcript.rows()[..committed].to_vec();
+        fixture.persist(
+            "assistant",
+            "a-gap",
+            serde_json::json!([
+                {"type": "text", "text": format!("{first}MISSING-MIDDLE\n{second}MISSING-END")}
+            ]),
+        );
+        fixture.refresh(true);
+        fixture.flush();
+        assert_eq!(
+            &fixture.app.rebon_tui.transcript.rows()[..committed],
+            &prefix
+        );
+        let output = fixture.output();
+        for n in 0..48 {
+            assert_eq!(output.matches(&format!("PARAGRAPH-{n:03}")).count(), 1);
+        }
+        assert_eq!(output.matches("MISSING-MIDDLE").count(), 1);
+        assert_eq!(output.matches("MISSING-END").count(), 1);
+        assert!(
+            !fixture
+                .session
+                .remote_background_attachment
+                .as_ref()
+                .unwrap()
+                .current_turn_watched
+        );
+        fixture.refresh(true);
+        fixture.flush();
+        assert_eq!(fixture.output(), output);
     }
 
     /// Regression for RFC-0004 §16.24: a persisted row can arrive in front
