@@ -22,6 +22,7 @@ struct World {
     _dir: tempfile::TempDir,
     store: BackgroundStore,
     projects_root: PathBuf,
+    claude_home: PathBuf,
     root: PathBuf,
 }
 
@@ -44,6 +45,7 @@ impl World {
         Self {
             store,
             projects_root: home.join("projects"),
+            claude_home: dir.path().join("claude"),
             root,
             _dir: dir,
         }
@@ -53,6 +55,7 @@ impl World {
         ServeConfig {
             store: self.store.clone(),
             projects_root: self.projects_root.clone(),
+            claude_config_dir: Some(self.claude_home.clone()),
             root: self.root.clone(),
             rebon_exe: PathBuf::from("./__rebon-mcp-test-must-not-spawn__"),
             launch_gate: Arc::new(|_| Ok(())),
@@ -559,6 +562,142 @@ async fn the_probe_pushes_its_nonce_at_once() {
     let (is_error, refused) = plain.call("channel_probe", json!({})).await;
     assert!(is_error, "no probe without --probe: {refused}");
     plain.close().await;
+}
+
+/// Other agents' conversations over the wire: one Rebon session and one
+/// Claude Code session in the project, listed together and each read, with
+/// refusals coming back as tool errors the model can read.
+#[tokio::test(flavor = "multi_thread")]
+async fn other_agents_sessions_are_listed_and_read_over_the_connection() {
+    let world = World::new();
+    // The server scopes everything to its canonical root, and both agents
+    // file a project under the path they were started in.
+    let root = rebon_tools_core::strip_windows_verbatim_prefix(
+        std::fs::canonicalize(&world.root).unwrap(),
+    );
+    let cwd = root.to_string_lossy().to_string();
+    let rebon_path =
+        rebon_session::ensure_session_file_path(&world.projects_root, &cwd, "abcde-fghij").unwrap();
+    std::fs::write(
+        &rebon_path,
+        [
+            json!({"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-09-01T00:00:00.000Z","message":{"role":"user","content":"rename the config key"}}),
+            json!({"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-09-01T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Renamed it."}]}}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n"),
+    )
+    .unwrap();
+    let claude_id = "0c8f6d1e-3b1a-4f7e-9a51-2d6c4e8b7a90";
+    let claude_dir = world
+        .claude_home
+        .join("projects")
+        .join(rebon_session::sanitize_path(&cwd));
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    let claude_path = claude_dir.join(format!("{claude_id}.jsonl"));
+    std::fs::write(
+        &claude_path,
+        [
+            json!({"type":"user","uuid":"c1","parentUuid":null,"timestamp":"2026-09-02T00:00:00.000Z","sessionId":claude_id,"message":{"role":"user","content":"why does the build fail?"}}),
+            json!({"type":"assistant","uuid":"c2","parentUuid":"c1","timestamp":"2026-09-02T00:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"A missing feature flag."}]}}),
+            json!({"type":"ai-title","aiTitle":"Build failure","sessionId":claude_id}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n"),
+    )
+    .unwrap();
+    let at = |ms: u64| std::time::UNIX_EPOCH + Duration::from_millis(ms);
+    let touch = |path: &Path, ms: u64| {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(at(ms))
+            .unwrap();
+    };
+    touch(&rebon_path, 1_780_000_000_000);
+    touch(&claude_path, 1_790_000_000_000);
+
+    let (mut client, _) =
+        Client::handshake(world.config(LedgerOwner::this_process(), true, false)).await;
+    let tools = client.request("tools/list", json!({})).await;
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"sessions_list") && names.contains(&"session_read"));
+
+    let (is_error, listed) = client.call("sessions_list", json!({})).await;
+    assert!(!is_error, "{listed}");
+    let rows: Vec<(&str, &str, &str)> = listed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["session_id"].as_str().unwrap(),
+                row["agent"].as_str().unwrap(),
+                row["title"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (claude_id, "claude-code", "Build failure"),
+            ("abcde-fghij", "rebon", "rename the config key"),
+        ],
+        "newest first, each titled"
+    );
+
+    let (is_error, read) = client
+        .call("session_read", json!({ "session_id": claude_id }))
+        .await;
+    assert!(!is_error, "{read}");
+    assert_eq!(read["agent"], "claude-code");
+    assert_eq!(
+        read["text"],
+        "### user\nwhy does the build fail?\n\n### assistant\nA missing feature flag."
+    );
+    assert_eq!(read["next_cursor"], "c2");
+    let (_, again) = client
+        .call(
+            "session_read",
+            json!({ "session_id": claude_id, "after": "c2" }),
+        )
+        .await;
+    assert_eq!(again["entries"], 0, "{again}");
+
+    let (is_error, rebon) = client
+        .call("session_read", json!({ "session_id": "abcde-fghij" }))
+        .await;
+    assert!(!is_error, "{rebon}");
+    assert_eq!(rebon["agent"], "rebon");
+    assert!(rebon["text"].as_str().unwrap().contains("Renamed it."));
+
+    let (is_error, refused) = client
+        .call("session_read", json!({ "session_id": "../secrets" }))
+        .await;
+    assert!(is_error, "{refused}");
+    let elsewhere = tempfile::tempdir().unwrap();
+    let (is_error, refused) = client
+        .call(
+            "sessions_list",
+            json!({ "cwd": elsewhere.path().to_string_lossy() }),
+        )
+        .await;
+    assert!(is_error);
+    assert!(
+        refused["error"].as_str().unwrap().contains("outside"),
+        "{refused}"
+    );
+    client.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1,5 +1,6 @@
 //! `rebon mcp serve`: Rebon's background jobs as an MCP server, with the
-//! outcome pushed back over the MCP channel extension.
+//! outcome pushed back over the MCP channel extension — and, read-only, the
+//! conversations other agents have had in the same project.
 //!
 //! ```text
 //! MCP client ──spawns──▶ rebon mcp serve        (stdio, this crate)
@@ -33,6 +34,9 @@
 //! - `push` — what a push says (fixed templates), and the throttle.
 //! - `watch` — when to look.
 //! - `result` — the result file.
+//! - `sessions` — other agents' conversations in the project (Rebon's and
+//!   Claude Code's): where they are, what each is called, and how one reads
+//!   as text. Read-only, and apart from the jobs: it touches no job state.
 //! - `server` / `tools` — the JSON-RPC connection and the tool schemas.
 //!
 //! An endpoint, like the terminal and the desktop app: it depends on
@@ -45,6 +49,7 @@ mod ledger;
 mod push;
 mod result;
 mod server;
+mod sessions;
 mod tools;
 mod watch;
 

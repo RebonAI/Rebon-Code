@@ -2,10 +2,13 @@
 //! `tools/call` becomes a [`Desk`] operation.
 //!
 //! Frozen at the RFC-0007 §6.2 set plus `job_permit` (§9.4: a job parked on
-//! a permission prompt must be answerable from the client, G4). There is no
-//! `job_list` on purpose — the client learns about jobs from their pushes and
-//! from the ids `exec_start` returned; listing every job is the CLI's job.
-//! `channel_probe` exists only under `--probe`, for one-off fact finding.
+//! a permission prompt must be answerable from the client, G4), plus the two
+//! read-only session tools, `sessions_list` and `session_read`, which let a
+//! client read the conversations other agents — Rebon, Claude Code — have had
+//! in this project. There is no `job_list` on purpose — the client learns
+//! about jobs from their pushes and from the ids `exec_start` returned;
+//! listing every job is the CLI's job. `channel_probe` exists only under
+//! `--probe`, for one-off fact finding.
 //!
 //! A call never fails at the protocol level: a refused or failed operation
 //! comes back as an `isError` result the model can read, because some clients
@@ -19,6 +22,7 @@ use serde_json::{json, Value};
 use crate::jobs::{Desk, JobRequest, PermitRequest, ReplyRequest, ResultRequest, StartRequest};
 use crate::push::Update;
 use crate::server::Outbox;
+use crate::sessions::{ListRequest, ReadRequest, SessionReader};
 
 pub(crate) const EXEC_START: &str = "exec_start";
 pub(crate) const JOB_STATUS: &str = "job_status";
@@ -26,6 +30,8 @@ pub(crate) const JOB_RESULT: &str = "job_result";
 pub(crate) const JOB_CANCEL: &str = "job_cancel";
 pub(crate) const JOB_REPLY: &str = "job_reply";
 pub(crate) const JOB_PERMIT: &str = "job_permit";
+pub(crate) const SESSIONS_LIST: &str = "sessions_list";
+pub(crate) const SESSION_READ: &str = "session_read";
 pub(crate) const CHANNEL_PROBE: &str = "channel_probe";
 
 pub(crate) fn list(channel: bool, probe: bool) -> Value {
@@ -149,6 +155,37 @@ pub(crate) fn list(channel: bool, probe: bool) -> Value {
             },
             "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true }
         }),
+        json!({
+            "name": SESSIONS_LIST,
+            "description": "List the conversations other agents have had in this project on this machine — Rebon sessions and Claude Code sessions — newest first. Each row has the session_id, agent (rebon or claude-code), title, cwd, updated_at and size_bytes; `more` is true when there are more than `limit`. Read-only: these are other agents' conversations, listed so you can read one with session_read.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "cwd": { "type": "string", "description": "The project directory whose conversations to list: this server's root (the default) or a directory inside it." },
+                    "agent": { "type": "string", "enum": ["rebon", "claude-code", "all"], "description": "Whose conversations to list; default all." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "How many to return, newest first; default 20." }
+                },
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false }
+        }),
+        json!({
+            "name": SESSION_READ,
+            "description": "Read another agent's conversation on this machine — a Rebon or Claude Code session from sessions_list — as text: user and assistant messages in full, each tool call as one line (→ Bash: <command>) with a short excerpt of its result (← …, marked error when it failed); thinking is left out. Read-only. Conversations can be long: without `after` you get the latest part that fits in max_chars (truncated: true when earlier messages were left out). To follow a conversation as it goes on, pass the returned next_cursor as `after` next time and get only what was said since. If it was rewound past that cursor, cursor_reset is true and you get its latest part again.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string", "description": "The session_id sessions_list returned." },
+                    "agent": { "type": "string", "enum": ["rebon", "claude-code"], "description": "Whose session it is. Default: a UUID is looked up as Claude Code's, then Rebon's; anything else as Rebon's." },
+                    "cwd": { "type": "string", "description": "The project directory the session belongs to: this server's root (the default) or a directory inside it." },
+                    "after": { "type": "string", "description": "The next_cursor a previous session_read returned: only what came after it is returned." },
+                    "max_chars": { "type": "integer", "minimum": 1000, "maximum": 100000, "description": "Roughly how much text to return; default 20000." }
+                },
+                "required": ["session_id"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false }
+        }),
     ];
     if probe {
         tools.push(json!({
@@ -162,7 +199,13 @@ pub(crate) fn list(channel: bool, probe: bool) -> Value {
 }
 
 /// Run one `tools/call`. `params` is the request's params object.
-pub(crate) async fn call(desk: &Arc<Desk>, outbox: &Outbox, probe: bool, params: Value) -> Value {
+pub(crate) async fn call(
+    desk: &Arc<Desk>,
+    sessions: &Arc<SessionReader>,
+    outbox: &Outbox,
+    probe: bool,
+    params: Value,
+) -> Value {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -209,10 +252,23 @@ pub(crate) async fn call(desk: &Arc<Desk>, outbox: &Outbox, probe: bool, params:
             })
             .await
         }
+        SESSIONS_LIST => {
+            run(sessions, arguments, |sessions, request: ListRequest| {
+                sessions.list(request)
+            })
+            .await
+        }
+        SESSION_READ => {
+            run(sessions, arguments, |sessions, request: ReadRequest| {
+                sessions.read(request)
+            })
+            .await
+        }
         CHANNEL_PROBE if probe => probe_channel(desk, outbox),
         other => Err(anyhow::anyhow!(
             "unknown tool `{other}`; this server offers {EXEC_START}, {JOB_STATUS}, \
-             {JOB_RESULT}, {JOB_CANCEL}, {JOB_REPLY} and {JOB_PERMIT}"
+             {JOB_RESULT}, {JOB_CANCEL}, {JOB_REPLY}, {JOB_PERMIT}, {SESSIONS_LIST} and \
+             {SESSION_READ}"
         )),
     };
     match outcome {
@@ -222,16 +278,18 @@ pub(crate) async fn call(desk: &Arc<Desk>, outbox: &Outbox, probe: bool, params:
 }
 
 /// Parse the arguments, then run `operation` on the blocking pool: every
-/// desk operation takes file locks, and some wait on a worker.
-async fn run<T, F>(desk: &Arc<Desk>, arguments: Value, operation: F) -> anyhow::Result<Value>
+/// desk operation takes file locks, some wait on a worker, and a session
+/// read parses a transcript that can run to megabytes.
+async fn run<S, T, F>(target: &Arc<S>, arguments: Value, operation: F) -> anyhow::Result<Value>
 where
+    S: Send + Sync + 'static,
     T: DeserializeOwned + Send + 'static,
-    F: FnOnce(&Desk, T) -> anyhow::Result<Value> + Send + 'static,
+    F: FnOnce(&S, T) -> anyhow::Result<Value> + Send + 'static,
 {
     let request: T = serde_json::from_value(arguments)
         .map_err(|error| anyhow::anyhow!("invalid arguments: {error}"))?;
-    let desk = Arc::clone(desk);
-    tokio::task::spawn_blocking(move || operation(&desk, request))
+    let target = Arc::clone(target);
+    tokio::task::spawn_blocking(move || operation(&target, request))
         .await
         .map_err(|error| anyhow::anyhow!("the operation did not finish: {error}"))?
 }
@@ -280,12 +338,61 @@ mod tests {
         let list = list(true, false);
         assert_eq!(
             names(&list),
-            vec![EXEC_START, JOB_STATUS, JOB_RESULT, JOB_CANCEL, JOB_REPLY, JOB_PERMIT]
+            vec![
+                EXEC_START,
+                JOB_STATUS,
+                JOB_RESULT,
+                JOB_CANCEL,
+                JOB_REPLY,
+                JOB_PERMIT,
+                SESSIONS_LIST,
+                SESSION_READ
+            ]
         );
         assert!(names(&super::list(true, true)).contains(&CHANNEL_PROBE.to_string()));
         assert!(
-            !names(&list).iter().any(|name| name.contains("list")),
+            !names(&list).iter().any(|name| name.starts_with("job_list")),
             "no job_list: the CLI lists jobs, pushes keep the client's list"
+        );
+    }
+
+    fn tool(name: &str) -> Value {
+        list(true, false)["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn the_session_tools_are_read_only_and_take_ids_never_paths() {
+        for name in [SESSIONS_LIST, SESSION_READ] {
+            let tool = tool(name);
+            assert_eq!(tool["annotations"]["readOnlyHint"], true, "{name}");
+            let properties = tool["inputSchema"]["properties"].as_object().unwrap();
+            assert!(
+                properties
+                    .keys()
+                    .all(|key| !key.contains("path") && key != "file"),
+                "{name} must not take a path: {properties:?}"
+            );
+            let description = tool["description"].as_str().unwrap();
+            assert!(description.contains("Read-only"), "{name}: {description}");
+            assert!(description.contains("other agents") || description.contains("another agent"));
+        }
+        let read = tool(SESSION_READ);
+        assert_eq!(read["inputSchema"]["required"], json!(["session_id"]));
+        let description = read["description"].as_str().unwrap();
+        assert!(description.contains("next_cursor") && description.contains("`after`"));
+        assert_eq!(
+            read["inputSchema"]["properties"]["agent"]["enum"],
+            json!(["rebon", "claude-code"])
+        );
+        assert_eq!(
+            tool(SESSIONS_LIST)["inputSchema"]["properties"]["agent"]["enum"],
+            json!(["rebon", "claude-code", "all"])
         );
     }
 

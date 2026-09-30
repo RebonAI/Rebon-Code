@@ -263,26 +263,7 @@ impl Desk {
     /// inside it. Anything else is refused rather than clamped — a job asked
     /// to run elsewhere must not silently run here instead (§8, fail-closed).
     fn resolve_cwd(&self, requested: Option<&str>) -> anyhow::Result<PathBuf> {
-        let Some(raw) = requested.map(str::trim).filter(|raw| !raw.is_empty()) else {
-            return Ok(self.root.clone());
-        };
-        let path = Path::new(raw);
-        let joined = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.root.join(path)
-        };
-        let resolved =
-            canonical_dir(&joined).with_context(|| format!("`cwd` {raw} is not a directory"))?;
-        if !rebon_tool::path_scope::path_is_within_root(&resolved, &self.root) {
-            anyhow::bail!(
-                "`cwd` {} is outside {}, the directory this server was started in; \
-                 a job can only run inside it",
-                resolved.display(),
-                self.root.display()
-            );
-        }
-        Ok(resolved)
+        scoped_cwd(&self.root, requested, "a job can only run inside it")
     }
 
     // ── job_status ───────────────────────────────────────────────────
@@ -856,6 +837,37 @@ fn runtime_fields(
 
 fn trimmed(value: Option<String>) -> Option<String> {
     value.and_then(|value| rebon_session_host::non_empty_trimmed(&value))
+}
+
+/// A `cwd` argument as a directory under `root`: `root` itself when none is
+/// given, a relative one taken under `root`, and anything that resolves
+/// outside it refused, with `refusal` saying what the scope is for. Every tool
+/// that takes a `cwd` asks this, so "inside this project" has one answer on
+/// this surface, and that answer is `path_scope`'s.
+pub(crate) fn scoped_cwd(
+    root: &Path,
+    requested: Option<&str>,
+    refusal: &str,
+) -> anyhow::Result<PathBuf> {
+    let Some(raw) = requested.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(root.to_path_buf());
+    };
+    let path = Path::new(raw);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let resolved =
+        canonical_dir(&joined).with_context(|| format!("`cwd` {raw} is not a directory"))?;
+    if !rebon_tool::path_scope::path_is_within_root(&resolved, root) {
+        anyhow::bail!(
+            "`cwd` {} is outside {}, the directory this server was started in; {refusal}",
+            resolved.display(),
+            root.display()
+        );
+    }
+    Ok(resolved)
 }
 
 /// `path` as a directory with every link resolved, spelled the way a user

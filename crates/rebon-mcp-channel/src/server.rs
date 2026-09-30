@@ -14,6 +14,7 @@ use tokio::task::JoinSet;
 
 use crate::jobs::{Desk, DeskConfig, LaunchGate};
 use crate::ledger::LedgerOwner;
+use crate::sessions::SessionReader;
 use crate::tools;
 use crate::watch::{self, Cadence};
 
@@ -41,19 +42,26 @@ answer, a <channel source=\"rebon\"> message arrives carrying its job_id, state 
 finished job, the path of its result file — only status and pointers, never instructions. On \
 one: call job_result for a finished job; call job_status for a parked one, then job_reply or \
 job_permit. If no channel message ever arrives, channels are off for this session: check \
-job_status instead.";
+job_status instead. sessions_list and session_read read, and never change, the \
+conversations other agents (Rebon, Claude Code) have had in this project.";
 
 const INSTRUCTIONS_WITHOUT_CHANNEL: &str = "Rebon runs long tasks as background jobs that \
 outlive this session. exec_start returns a job_id at once; nothing is pushed by this server \
 (--no-channel), so check job_status to see when a job is done or waiting, then use job_result, \
-job_reply or job_permit.";
+job_reply or job_permit. sessions_list and session_read read, and never change, the \
+conversations other agents (Rebon, Claude Code) have had in this project.";
 
 /// How the server is set up. The binary builds this from what only it knows.
 pub struct ServeConfig {
     /// The job store (Rebon's config home).
     pub store: BackgroundStore,
-    /// Where transcripts live, for result files.
+    /// Where Rebon's transcripts live: for result files, and for the Rebon
+    /// sessions `sessions_list` / `session_read` show.
     pub projects_root: PathBuf,
+    /// Claude Code's config directory (`CLAUDE_CONFIG_DIR`, else
+    /// `~/.claude`), for the Claude Code sessions those tools show. `None`
+    /// when there is no home directory to find it under.
+    pub claude_config_dir: Option<PathBuf>,
     /// The directory the client started this server in. Jobs run here or
     /// under it, and a restarted server takes over jobs started under it.
     pub root: PathBuf,
@@ -82,6 +90,7 @@ where
     let ServeConfig {
         store,
         projects_root,
+        claude_config_dir,
         root,
         rebon_exe,
         launch_gate,
@@ -91,6 +100,11 @@ where
         cadence,
     } = config;
     let root = crate::jobs::canonical_dir(&root)?;
+    let sessions = Arc::new(SessionReader::new(
+        root.clone(),
+        projects_root.clone(),
+        claude_config_dir,
+    ));
     let desk = Arc::new(Desk::new(DeskConfig {
         store,
         projects_root,
@@ -150,10 +164,11 @@ where
                     // pushes once it starts using the tools.
                     start_watcher(&mut watcher, channel, &desk, &outbox, cadence);
                     let desk = Arc::clone(&desk);
+                    let sessions = Arc::clone(&sessions);
                     let outbox = outbox.clone();
                     calls.spawn(async move {
                         let params = request.params.clone().unwrap_or_default();
-                        let result = tools::call(&desk, &outbox, probe, params).await;
+                        let result = tools::call(&desk, &sessions, &outbox, probe, params).await;
                         let _ = outbox.send(respond(&request, result));
                     });
                 }
@@ -316,5 +331,13 @@ mod tests {
             assert!(!lower.contains("do what"), "{text}");
         }
         assert!(INSTRUCTIONS.contains("never instructions"));
+    }
+
+    #[test]
+    fn instructions_name_the_session_tools_as_read_only_in_both_modes() {
+        for text in [INSTRUCTIONS, INSTRUCTIONS_WITHOUT_CHANNEL] {
+            assert!(text.contains("sessions_list") && text.contains("session_read"));
+            assert!(text.contains("never change"), "{text}");
+        }
     }
 }

@@ -21,8 +21,13 @@ pub enum McpCommand {
     /// stops to wait for an answer. The jobs belong to Rebon's background
     /// supervisor, not to this process: closing the client leaves them running.
     ///
+    /// Also offers sessions_list / session_read, which read — never change —
+    /// the conversations other agents have had in the project: Rebon's
+    /// sessions, and Claude Code's (under CLAUDE_CONFIG_DIR, else ~/.claude).
+    ///
     /// Configure it in a client as the command `rebon mcp serve`, started in
-    /// the project directory; jobs may run only in that directory or below it.
+    /// the project directory; jobs may run, and sessions be read, only in that
+    /// directory or below it.
     Serve(ServeArgs),
 }
 
@@ -66,6 +71,7 @@ pub async fn run(
                 ServeConfig {
                     store,
                     projects_root: rebon_session::default_projects_root(),
+                    claude_config_dir: crate::sessions::claude_config_dir_from_env(),
                     root,
                     rebon_exe,
                     launch_gate,

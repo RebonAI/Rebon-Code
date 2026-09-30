@@ -5,14 +5,15 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "`rebon mcp serve`: Rebon's background jobs as an MCP server — start, inspect, answer and cancel a job, and push its outcome back to the client over the MCP channel extension. An endpoint, like the terminal and the desktop app: it drives the session host and owns no job."
+description = "`rebon mcp serve`: Rebon's background jobs as an MCP server — start, inspect, answer and cancel a job, and push its outcome back to the client over the MCP channel extension — plus read-only access to the conversations other agents (Rebon, Claude Code) have had in the project. An endpoint, like the terminal and the desktop app: it drives the session host and owns no job."
 
 [dependencies]
 # The job record, the store transactions over it, and the launch / reply /
 # stop / answer paths every other endpoint uses. This crate is a session-host
 # client and nothing else.
 rebon-session-host.workspace = true
-# The transcript a finished job's result is read from.
+# The transcript a finished job's result is read from, and the one parser
+# and chain walk the session tools read other agents' conversations with.
 rebon-session.workspace = true
 # JSON-RPC framing and the channel wire contract the host half reads.
 rebon-proto.workspace = true

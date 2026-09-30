@@ -24,7 +24,8 @@ rebon-proto.workspace = true
 rebon-session.workspace = true
 rebon-session-host.workspace = true
 rebon-session-runtime.workspace = true
-# `rebon mcp serve`: the background jobs as an MCP server.
+# `rebon mcp serve`: the background jobs as an MCP server, and other agents'
+# conversations in the project, read-only.
 rebon-mcp-channel.workspace = true
 # `rebon rc`: the Remote Control runner.
 rebon-rc-runner.workspace = true

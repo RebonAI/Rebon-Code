@@ -351,7 +351,8 @@ enum Command {
     },
     /// Serve Rebon's background jobs to an MCP client (Claude Code and
     /// others): start a job, read its result, answer it, stop it — with the
-    /// outcome pushed back over the MCP channel extension.
+    /// outcome pushed back over the MCP channel extension. Also lets the
+    /// client read, never change, other agents' conversations in the project.
     Mcp {
         #[command(subcommand)]
         command: rebon_mcp_channel::cli::McpCommand,
