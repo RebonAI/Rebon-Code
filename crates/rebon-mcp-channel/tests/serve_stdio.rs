@@ -799,3 +799,30 @@ async fn two_agents_talk_through_a_group_over_their_own_servers() {
     planner.close().await;
     coder.close().await;
 }
+
+/// Codex keeps its session out of its servers' environment and names the
+/// thread on each call instead: that is enough to join and write.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codex_thread_named_on_the_call_is_the_caller() {
+    let world = World::new();
+    let (mut codex, _) = Client::handshake(world.config(dead_owner(), false, false)).await;
+    let response = codex
+        .request(
+            "tools/call",
+            json!({
+                "name": "group_join",
+                "arguments": { "group": "review" },
+                "_meta": { "x-codex-turn-metadata": { "thread_id": "019a-thread", "turn_id": "t1" } }
+            }),
+        )
+        .await;
+    let result = &response["result"];
+    assert_ne!(result["isError"], json!(true), "{response}");
+    let joined: Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(joined["you"], "codex-019a");
+    // Later calls without the meta are still that thread.
+    let (is_error, info) = codex.call("group_info", json!({})).await;
+    assert!(!is_error && info["in_group"] == json!(true), "{info}");
+    codex.close().await;
+}

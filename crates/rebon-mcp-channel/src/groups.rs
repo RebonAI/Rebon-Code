@@ -54,11 +54,23 @@ impl GroupDesk {
     }
 
     /// Runs one group tool. Blocking: it takes the group's file lock.
-    pub(crate) fn call(&self, name: &str, arguments: Value) -> anyhow::Result<Value> {
+    ///
+    /// `meta` is the call's `_meta`: an agent that keeps its session out of
+    /// its servers' environment may name it there (Codex does), and then
+    /// that is who is calling.
+    pub(crate) fn call(
+        &self,
+        name: &str,
+        arguments: Value,
+        meta: Option<&Value>,
+    ) -> anyhow::Result<Value> {
         let mut caller = self
             .caller
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if caller.is_none() {
+            *caller = meta.and_then(rebon_group::identity::from_call_meta);
+        }
         tools::call(
             &mut ToolContext {
                 store: &self.store,

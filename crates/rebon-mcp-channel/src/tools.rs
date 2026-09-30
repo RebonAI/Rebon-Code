@@ -221,7 +221,8 @@ pub(crate) async fn call(
     let outcome = match name.as_str() {
         group_tool if GroupDesk::offers(group_tool) => {
             let groups = Arc::clone(groups);
-            tokio::task::spawn_blocking(move || groups.call(&name, arguments))
+            let meta = params.get("_meta").cloned();
+            tokio::task::spawn_blocking(move || groups.call(&name, arguments, meta.as_ref()))
                 .await
                 .map_err(|error| anyhow::anyhow!("the operation did not finish: {error}"))
                 .and_then(|outcome| outcome)

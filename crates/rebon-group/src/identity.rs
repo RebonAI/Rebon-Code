@@ -6,6 +6,12 @@
 //!
 //! - Rebon sets `REBON_SESSION_ID` when a session starts or resumes.
 //! - Claude Code sets `CLAUDE_CODE_SESSION_ID` (and `CLAUDE_PID`, its pid).
+//! - Grok Build sets `GROK_SESSION_ID`.
+//!
+//! Codex scrubs its servers' environment instead and names the thread on
+//! each call ([`from_call_meta`]). DeepSeek Harness strips every `DSH_*`
+//! variable from its MCP children and sends nothing on the call, so a dsh
+//! session says who it is on `group_join`.
 //!
 //! A process can carry more than one of them: Rebon started from Claude
 //! Code's shell inherits Claude Code's variables and adds its own, and the
@@ -25,6 +31,11 @@ pub struct AgentKind;
 impl AgentKind {
     pub const REBON: &'static str = "rebon";
     pub const CLAUDE_CODE: &'static str = "claude-code";
+    pub const CODEX: &'static str = "codex";
+    pub const GROK: &'static str = "grok";
+    pub const OPENCODE: &'static str = "opencode";
+    /// DeepSeek Harness.
+    pub const DSH: &'static str = "dsh";
 }
 
 /// The session a server serves: which program, and its session id.
@@ -65,7 +76,31 @@ const SESSION_VARS: &[SessionVar] = &[
         var: "CLAUDE_CODE_SESSION_ID",
         image: &["claude"],
     },
+    // Grok Build gives its stdio MCP servers the session id and strips a
+    // spoofed one (xai-grok-mcp `servers.rs`).
+    SessionVar {
+        agent: AgentKind::GROK,
+        var: "GROK_SESSION_ID",
+        image: &["grok"],
+    },
 ];
+
+/// The session a tool call says it comes from, when the agent puts it on the
+/// call rather than in the environment. Codex scrubs its MCP servers'
+/// environment but sends `_meta["x-codex-turn-metadata"]` with the thread
+/// on every `tools/call` (codex-rs `core/src/mcp_tool_call.rs`).
+pub fn from_call_meta(meta: &serde_json::Value) -> Option<Caller> {
+    let codex = meta.get("x-codex-turn-metadata")?;
+    let id = ["thread_id", "session_id"]
+        .iter()
+        .find_map(|key| codex.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
+    Some(Caller {
+        agent: AgentKind::CODEX.to_string(),
+        session_id: id.to_string(),
+    })
+}
 
 /// The process that started this one.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -277,6 +312,26 @@ mod tests {
         // Neither the image nor the pid: the table's order.
         let caller = resolve(&both, Some(&parent(7, "node.exe"))).unwrap();
         assert_eq!(caller.agent, AgentKind::REBON);
+    }
+
+    #[test]
+    fn grok_builds_variable_names_a_grok_session() {
+        let caller = resolve(&env(&[("GROK_SESSION_ID", "g-1")]), None).unwrap();
+        assert_eq!(caller.agent, AgentKind::GROK);
+    }
+
+    #[test]
+    fn codex_names_its_thread_on_the_call() {
+        let meta = serde_json::json!({
+            "x-codex-turn-metadata": { "session_id": "s-9", "thread_id": "019a-thread", "turn_id": "t" }
+        });
+        let caller = from_call_meta(&meta).unwrap();
+        assert_eq!(caller.agent, AgentKind::CODEX);
+        assert_eq!(caller.session_id, "019a-thread");
+        assert_eq!(
+            from_call_meta(&serde_json::json!({ "progressToken": 1 })),
+            None
+        );
     }
 
     #[test]
