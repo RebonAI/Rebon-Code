@@ -156,6 +156,48 @@ impl GroupStore {
         }))
     }
 
+    /// Renames the group. A project still has one group of a name.
+    pub fn rename(&self, id: &str, name: &str) -> Result<Group> {
+        check_id(id)?;
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("a group needs a name");
+        }
+        let cwd = self.load(id)?.cwd;
+        if let Some(other) = self.find(&cwd, name)? {
+            if other.id != id {
+                bail!("this project already has a group named `{name}`");
+            }
+        }
+        self.with_lock(id, || {
+            let dir = self.dir(id);
+            let path = dir.join(GROUP_FILE);
+            let mut file = read_group_file(&path)?;
+            file.group.name = name.to_string();
+            write_json(&path, &file)?;
+            let memory = effective_memory(read_log(&dir)?);
+            write_text(&dir.join(MEMORY_FILE), &render_memory(&file.group, &memory))?;
+            Ok(file.group)
+        })
+    }
+
+    /// Deletes the group: its members, log, cursors and memory. The sessions
+    /// that were in it are untouched; they are simply in no group.
+    ///
+    /// `group.json` goes first, under the lock, so every reader stops seeing
+    /// the group at once; the rest of the directory is removed after, and a
+    /// file another process still holds open only delays that.
+    pub fn delete(&self, id: &str) -> Result<()> {
+        check_id(id)?;
+        let dir = self.dir(id);
+        self.with_lock(id, || {
+            std::fs::remove_file(dir.join(GROUP_FILE))
+                .with_context(|| format!("failed to remove {}", dir.join(GROUP_FILE).display()))
+        })?;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// The group `key` is in. A session is in at most one.
     pub fn group_of(&self, key: &MemberKey) -> Result<Option<Group>> {
         Ok(self

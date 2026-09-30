@@ -318,6 +318,37 @@ fn handoffs_say_who_got_what_and_how() {
     assert_eq!(store.handoffs(&group.id).unwrap().len(), handoffs.len());
 }
 
+#[test]
+fn a_group_can_be_renamed_but_not_onto_a_sibling() {
+    let (_dir, store, group) = pair();
+    let other = store.create("docs", "/work/app").unwrap();
+    assert!(store.rename(&group.id, "Docs").is_err(), "names are per project");
+    assert!(store.rename(&group.id, "  ").is_err());
+    let renamed = store.rename(&group.id, "parser rewrite").unwrap();
+    assert_eq!(renamed.name, "parser rewrite");
+    assert_eq!(renamed.members.len(), 2, "members stay");
+    assert_eq!(store.load(&group.id).unwrap().name, "parser rewrite");
+    assert!(std::fs::read_to_string(store.memory_path(&group.id))
+        .unwrap()
+        .starts_with("# parser rewrite"));
+    // Renaming to its own name, in another case, is fine.
+    store.rename(&other.id, "DOCS").unwrap();
+}
+
+#[test]
+fn a_deleted_group_is_gone_and_its_members_are_free() {
+    let (_dir, store, group) = pair();
+    let coder = key("claude-code", "c1");
+    store.delete(&group.id).unwrap();
+    assert!(store.list().unwrap().is_empty());
+    assert!(store.group_of(&coder).unwrap().is_none());
+    assert!(crate::deliver::pending(&store, &coder).is_none());
+    let next = store.create("refactor", "/work/app").unwrap();
+    store
+        .join(&next.id, member("claude-code", "c1", "coder"))
+        .unwrap();
+}
+
 fn pending_seqs(pending: &crate::deliver::Pending) -> Vec<u64> {
     pending.entries.iter().map(|entry| entry.seq).collect()
 }
