@@ -6,12 +6,12 @@
 //! take this lock — the tests that mutate the environment and the tests
 //! that shell out while it is intact.
 
-use std::sync::{Mutex, MutexGuard};
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+use std::sync::MutexGuard;
 
 pub fn lock_env() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+    rebon_tool::env_test_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
 }
 
 #[cfg(test)]
