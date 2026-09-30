@@ -386,6 +386,9 @@ mod tests {
         assert_eq!(value["b"], serde_json::json!([1, 2]));
     }
 
+    // Windows Terminal and its paths exist only on Windows; elsewhere `Path`
+    // reads `C:\…` as one relative component and nothing here applies.
+    #[cfg(windows)]
     #[test]
     fn install_kind_picks_the_settings_file() {
         let local = Path::new(r"C:\Users\u\AppData\Local");
