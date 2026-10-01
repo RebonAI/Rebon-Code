@@ -1193,13 +1193,15 @@ impl EngineQueryExecutor {
     /// turns) at 4096 tokens, and a tool call bigger than that could never be
     /// emitted at all.
     fn default_max_tokens(&self, handle: Option<&PruneLevelHandle>) -> u32 {
-        self.max_tokens
+        let max_tokens = self
+            .max_tokens
             .or_else(|| {
                 handle
                     .map(|handle| handle.budget.output_token_reserve())
                     .filter(|limit| *limit > 0)
             })
-            .unwrap_or(FALLBACK_MAX_TOKENS)
+            .unwrap_or(FALLBACK_MAX_TOKENS);
+        cap_max_tokens_for_model(max_tokens, handle)
     }
 
     /// Override the iteration cap for agentic loops.
@@ -4007,9 +4009,12 @@ impl EngineQueryExecutor {
         if let Some(handle) = &frame.prune_level {
             handle.set_context_window_for_model(&frame.model);
         }
-        let configured_max_tokens = frame
-            .per_turn_max_tokens
-            .unwrap_or_else(|| self.default_max_tokens(frame.prune_level.as_ref()));
+        let configured_max_tokens = cap_max_tokens_for_model(
+            frame
+                .per_turn_max_tokens
+                .unwrap_or_else(|| self.default_max_tokens(frame.prune_level.as_ref())),
+            frame.prune_level.as_ref(),
+        );
         let max_tokens = match frame
             .anchored_minimal_clamped_budget
             .then(anchored_minimal_bootstrap_max_tokens)

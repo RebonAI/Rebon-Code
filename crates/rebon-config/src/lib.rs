@@ -2243,7 +2243,28 @@ pub fn resolve_model_context_window(
     if model.is_empty() {
         return None;
     }
-    provider.and_then(|provider| provider.model_context_windows.get(model).copied())
+    provider
+        .and_then(|provider| provider.model_context_windows.get(model).copied())
+        .or_else(|| {
+            let row = rebon_api::model_table::model(
+                provider.and_then(|provider| rebon_api::model_table::provider_id(provider.vendor)),
+                model,
+            )?;
+            let limit = if provider
+                .is_some_and(|provider| rebon_api::is_chatgpt_codex_backend(&provider.base_url))
+            {
+                row.limit.input.or_else(|| {
+                    row.limit.context.map(|total| {
+                        total.saturating_sub(
+                            resolve_model_output_token_limit(provider, model).unwrap_or(0),
+                        )
+                    })
+                })
+            } else {
+                row.limit.context
+            };
+            limit.filter(|limit| *limit > 0)
+        })
 }
 
 pub fn resolve_model_output_token_limit(
@@ -2254,7 +2275,40 @@ pub fn resolve_model_output_token_limit(
     if model.is_empty() {
         return None;
     }
-    provider.and_then(|provider| provider.model_output_token_limits.get(model).copied())
+    provider
+        .and_then(|provider| provider.model_output_token_limits.get(model).copied())
+        .or_else(|| {
+            rebon_api::model_table::model(
+                provider.and_then(|provider| rebon_api::model_table::provider_id(provider.vendor)),
+                model,
+            )?
+            .limit
+            .output
+            .filter(|limit| *limit > 0)
+        })
+}
+
+pub fn resolve_model_context_limits(
+    provider: &ResolvedProvider,
+) -> (BTreeMap<String, u32>, BTreeMap<String, u32>) {
+    let models = rebon_api::model_table::models_for_vendor(provider.vendor)
+        .into_iter()
+        .map(|model| model.id)
+        .chain(provider.model_context_windows.keys().cloned())
+        .chain(provider.model_output_token_limits.keys().cloned())
+        .chain(std::iter::once(provider.model.clone()))
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut windows = BTreeMap::new();
+    let mut outputs = BTreeMap::new();
+    for model in models {
+        if let Some(window) = resolve_model_context_window(Some(provider), &model) {
+            windows.insert(model.clone(), window);
+        }
+        if let Some(output) = resolve_model_output_token_limit(Some(provider), &model) {
+            outputs.insert(model, output);
+        }
+    }
+    (windows, outputs)
 }
 
 fn provider_options_to_request_options(options: &ProviderOptions) -> OpenAiRequestOptions {
@@ -3942,6 +3996,35 @@ pub fn ensure_model_table_installed() {
     ONCE.get_or_init(|| {
         install_cached_model_table();
     });
+}
+
+pub async fn ensure_model_limits_available(config_dir: &Path, provider: &ResolvedProvider) {
+    ensure_model_table_installed();
+    if resolve_model_context_window(Some(provider), &provider.model).is_some()
+        && resolve_model_output_token_limit(Some(provider), &provider.model).is_some()
+    {
+        return;
+    }
+    // 未收录的私有模型或离线环境不能让每次组装 runtime 都重新等待网络。
+    // 自动刷新失败保留到进程退出；用户仍可通过 /model refresh 更新同一份表。
+    static REFRESH: tokio::sync::OnceCell<Result<usize, String>> =
+        tokio::sync::OnceCell::const_new();
+    REFRESH
+        .get_or_init(|| async {
+            let result = match rebon_api::model_table::fetch_table(
+                &rebon_api::model_table::table_url(),
+            )
+            .await
+            {
+                Ok(json) => save_model_table_in(config_dir, &json).map_err(|err| err.to_string()),
+                Err(err) => Err(err.to_string()),
+            };
+            if let Err(error) = &result {
+                tracing::warn!(%error, "model table refresh failed; retaining cached or embedded limits");
+            }
+            result
+        })
+        .await;
 }
 
 /// Install the cached table over the embedded snapshot, if one is there.
@@ -8543,6 +8626,63 @@ mod tests {
     }
 
     #[test]
+    fn model_table_limits_fill_missing_provider_limits() {
+        assert_eq!(
+            resolve_model_context_window(None, "gpt-6-sol"),
+            Some(1_050_000)
+        );
+        assert_eq!(
+            resolve_model_output_token_limit(None, "gpt-6-sol"),
+            Some(128_000)
+        );
+        assert_eq!(
+            resolve_model_context_window(None, "unlisted-private-model"),
+            None
+        );
+        assert_eq!(
+            resolve_model_output_token_limit(None, "unlisted-private-model"),
+            None
+        );
+    }
+
+    #[test]
+    fn model_table_limits_preserve_overrides_and_codex_input_semantics() {
+        let tmp = TempDir::new().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"activeCustomProvider":"openai","customProviders":[
+                {"name":"openai","format":"openai","baseUrl":"https://api.openai.com/v1",
+                 "apiKey":"sk-test","model":"gpt-6-sol","models":[
+                    {"id":"gpt-6-sol","contextWindow":500000},
+                    {"id":"gpt-6-astra","contextWindow":272000,"maxOutputTokens":64000}
+                 ]}
+            ]}"#,
+        );
+        let mut provider = resolve_from_dir(tmp.path()).unwrap().unwrap();
+        let (windows, outputs) = resolve_model_context_limits(&provider);
+        assert_eq!(windows["gpt-6-sol"], 500_000);
+        assert_eq!(outputs["gpt-6-sol"], 128_000);
+        assert_eq!(windows["gpt-6-astra"], 272_000);
+        assert_eq!(outputs["gpt-6-astra"], 64_000);
+
+        provider.model_context_windows.clear();
+        provider.model_output_token_limits.clear();
+        assert_eq!(
+            resolve_model_context_window(Some(&provider), "gpt-6-sol"),
+            Some(1_050_000)
+        );
+        provider.base_url = "https://chatgpt.com/backend-api/codex".into();
+        assert_eq!(
+            resolve_model_context_window(Some(&provider), "gpt-6-sol"),
+            Some(922_000)
+        );
+        assert_eq!(
+            resolve_model_output_token_limit(Some(&provider), "gpt-6-sol"),
+            Some(128_000)
+        );
+    }
+
+    #[test]
     fn model_options_parse_for_string_object_and_map_shapes() {
         let tmp = TempDir::new().unwrap();
         write_config(
@@ -10570,8 +10710,10 @@ mod tests {
     /// reads it back. Both halves are one line each and neither has a
     /// failure the caller sees, which is exactly how a cache goes stale
     /// unnoticed — so the round trip is checked here.
-    #[test]
-    fn a_refreshed_model_table_survives_the_cache_round_trip() {
+    #[tokio::test]
+    async fn a_refreshed_model_table_survives_the_cache_round_trip() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let tmp = TempDir::new().unwrap();
         let table = r#"{
           "source": "https://reboncode.ai/api/models",
@@ -10582,7 +10724,32 @@ mod tests {
               "modes": {"fast": {"service_tier": "priority"}}}
           }}}
         }"#;
-        assert_eq!(save_model_table_in(tmp.path(), table).unwrap(), 1);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/models", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let count = stream.read(&mut request).await.unwrap();
+            assert!(std::str::from_utf8(&request[..count])
+                .unwrap()
+                .starts_with("GET /models "));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{table}",
+                table.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let downloaded = rebon_api::model_table::fetch_table(&url).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(save_model_table_in(tmp.path(), &downloaded).unwrap(), 1);
+        assert_eq!(
+            resolve_model_context_window(None, "gpt-7-nova"),
+            Some(2_000_000)
+        );
+        assert_eq!(
+            resolve_model_output_token_limit(None, "gpt-7-nova"),
+            Some(128_000)
+        );
         assert!(model_table_cache_path_in(tmp.path()).is_file());
 
         rebon_api::model_table::clear_overlay();

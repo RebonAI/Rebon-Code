@@ -1,6 +1,5 @@
 use super::*;
 
-pub(super) const HARD_CONTEXT_GUARD_BUFFER_TOKENS: u32 = 64_000;
 pub(super) const HARD_CONTEXT_GUARD_PCT: u32 = 95;
 pub(super) const MIN_CONTEXT_BUDGET_TOKENS: u32 = 8_000;
 pub(super) const REPLAY_MAX_TAIL_MESSAGES: usize = 20;
@@ -8,20 +7,30 @@ pub(super) const REPLAY_MIN_TAIL_MESSAGES: usize = 1;
 pub(super) const OVERFLOW_RETRY_MAX_TAIL_MESSAGES: usize = 8;
 pub(super) const OVERFLOW_RETRY_MIN_TAIL_MESSAGES: usize = 1;
 
+pub(super) fn cap_max_tokens_for_model(max_tokens: u32, handle: Option<&PruneLevelHandle>) -> u32 {
+    let Some(handle) = handle else {
+        return max_tokens;
+    };
+    let output_limit = handle.budget.output_token_reserve();
+    // 未知输出上限时保留至少半个窗口给输入，避免 effort 预算吞掉整段历史。
+    let output_limit = if output_limit > 0 {
+        output_limit
+    } else {
+        handle.budget.context_window() / 2
+    };
+    max_tokens.min(output_limit)
+}
+
 pub(super) fn hard_context_guard_target(
     handle: Option<&PruneLevelHandle>,
     max_tokens: u32,
 ) -> Option<u32> {
     let handle = handle?;
-    let reserve = max_tokens
+    let reserve = cap_max_tokens_for_model(max_tokens, Some(handle))
         .max(handle.budget.output_token_reserve())
         .max(rebon_api::FLOOR_OUTPUT_TOKENS);
     let input_budget = handle.budget.context_window().saturating_sub(reserve);
-    let target = if handle.budget.output_token_reserve() > 0 {
-        input_budget.saturating_mul(HARD_CONTEXT_GUARD_PCT) / 100
-    } else {
-        input_budget.saturating_sub(HARD_CONTEXT_GUARD_BUFFER_TOKENS)
-    };
+    let target = input_budget.saturating_mul(HARD_CONTEXT_GUARD_PCT) / 100;
     Some(target.max(MIN_CONTEXT_BUDGET_TOKENS))
 }
 
@@ -249,7 +258,7 @@ pub(super) async fn compact_with_tail_preservation(
 }
 
 pub(super) fn mid_turn_compact_guard_target(handle: &PruneLevelHandle, max_tokens: u32) -> u32 {
-    let reserve = max_tokens
+    let reserve = cap_max_tokens_for_model(max_tokens, Some(handle))
         .max(handle.budget.output_token_reserve())
         .max(rebon_api::FLOOR_OUTPUT_TOKENS);
     let hard_input_limit = handle.budget.context_window().saturating_sub(reserve);

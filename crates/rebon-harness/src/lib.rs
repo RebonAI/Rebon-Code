@@ -920,7 +920,7 @@ async fn resolve_runtime_model_inner(overrides: &HarnessOverrides) -> anyhow::Re
         );
         // The fast-mode gate reads the model table, so a refreshed one has
         // to be in place before the first request is built.
-        rebon_config::ensure_model_table_installed();
+        rebon_config::ensure_model_limits_available(&config_dir, &resolved).await;
         let service_tier = ServiceTierHandle::new(
             overrides
                 .fast_mode
@@ -947,8 +947,8 @@ async fn resolve_runtime_model_inner(overrides: &HarnessOverrides) -> anyhow::Re
             rebon_config::resolve_model_context_window(Some(&resolved), &model);
         let configured_output_token_limit =
             rebon_config::resolve_model_output_token_limit(Some(&resolved), &model);
-        let model_context_windows = resolved.model_context_windows.clone();
-        let model_output_token_limits = resolved.model_output_token_limits.clone();
+        let (model_context_windows, model_output_token_limits) =
+            rebon_config::resolve_model_context_limits(&resolved);
         let provider_vendor = resolved.vendor;
         let reasoning_mode = parse_provider_reasoning_mode(resolved.reasoning_mode.as_deref());
         let computer_use = rebon_plugin_host::provider_registry::computer_use_enabled_for_provider(
@@ -1280,7 +1280,11 @@ fn prune_handle_from_model_config(
     model_context_windows: impl IntoIterator<Item = (String, u32)>,
     model_output_token_limits: impl IntoIterator<Item = (String, u32)>,
 ) -> PruneLevelHandle {
-    let output_token_reserve = configured_output_token_limit.unwrap_or(0);
+    let configured_context_window = configured_context_window
+        .or_else(|| rebon_config::resolve_model_context_window(None, model));
+    let output_token_reserve = configured_output_token_limit
+        .or_else(|| rebon_config::resolve_model_output_token_limit(None, model))
+        .unwrap_or(0);
     if let Some(window) = configured_context_window {
         tracing::info!(
             context_window = window,

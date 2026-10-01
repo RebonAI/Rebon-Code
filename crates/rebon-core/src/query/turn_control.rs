@@ -880,6 +880,7 @@ async fn compact_before_request(
     skip_auto_compact: &mut bool,
     pending_cache_miss_reason: &mut CacheMissReason,
 ) -> PreTurnCompactFlow {
+    params.max_tokens = cap_max_tokens_for_model(params.max_tokens, params.prune_level.as_ref());
     let (manual_compact_requested, manual_compact_instructions) = params
         .prune_level
         .as_ref()
@@ -922,46 +923,25 @@ async fn compact_before_request(
     let estimated_input_tokens = next_request_input_estimate(&manager, &params);
     let mut cache_miss_reason =
         std::mem::replace(&mut (*pending_cache_miss_reason), CacheMissReason::None);
-    if let Some(target_tokens) =
-        hard_context_guard_target(params.prune_level.as_ref(), params.max_tokens)
-    {
-        if estimated_input_tokens > target_tokens {
-            let history_target_tokens =
-                history_target_for_request_budget(&manager, &params, target_tokens);
-            let report = manager.truncate_for_token_budget(
-                history_target_tokens,
-                REPLAY_MAX_TAIL_MESSAGES,
-                min_tail_messages_preserving_runtime_context(
-                    manager.messages(),
-                    REPLAY_MIN_TAIL_MESSAGES,
-                ),
-            );
-            if report.changed() {
-                tracing::info!(
-                    before_tokens = report.before_tokens,
-                    after_tokens = report.after_tokens,
-                    before_messages = report.before_messages,
-                    after_messages = report.after_messages,
-                    target_tokens = history_target_tokens,
-                    request_target_tokens = target_tokens,
-                    "turn_control: hard context guard pruned history before request"
-                );
-                session.invalidate_continuation();
-                cache_miss_reason = CacheMissReason::HardContextGuardTruncated;
-                report_estimated_usage_after_compact(&manager, &params);
-            }
-        }
-    }
-    let estimated_input_tokens = next_request_input_estimate(&manager, &params);
+    let hard_guard_target =
+        hard_context_guard_target(params.prune_level.as_ref(), params.max_tokens);
+    let exceeds_hard_guard =
+        hard_guard_target.is_some_and(|target| estimated_input_tokens > target);
     let pre_turn_budget_tokens = params
         .prune_level
         .as_ref()
         .map(|handle| std::cmp::max(estimated_input_tokens, handle.budget.last_input_tokens()));
-    let pre_turn_auto_compact = iteration == 0
+    // 硬裁剪会丢失摘要需要的原文；即使自动阈值较高，也先在同一次请求前尝试摘要。
+    let pre_turn_auto_compact = (iteration == 0 || exceeds_hard_guard)
         && !*skip_auto_compact
         && params.prune_level.as_ref().is_some_and(|handle| {
-            pre_turn_budget_tokens
-                .is_some_and(|tokens| handle.budget.should_auto_compact_for_tokens(tokens))
+            let tokens = pre_turn_budget_tokens.unwrap_or_default();
+            let tokens = if exceeds_hard_guard {
+                tokens.max(handle.budget.auto_compact_threshold())
+            } else {
+                tokens
+            };
+            handle.budget.should_auto_compact_for_tokens(tokens)
         });
     if pre_turn_auto_compact {
         let msg_count = manager.len();
@@ -1008,10 +988,40 @@ async fn compact_before_request(
                     "turn_control: pre-turn compaction did not reduce estimated tokens, skipping auto-compact next iteration"
                 );
             }
+            report_estimated_usage_after_compact(&manager, &params);
+        }
+    }
+    let estimated_input_tokens = next_request_input_estimate(&manager, &params);
+    if let Some(target_tokens) = hard_guard_target {
+        if estimated_input_tokens > target_tokens {
+            let history_target_tokens =
+                history_target_for_request_budget(&manager, &params, target_tokens);
+            let report = manager.truncate_for_token_budget(
+                history_target_tokens,
+                REPLAY_MAX_TAIL_MESSAGES,
+                min_tail_messages_preserving_runtime_context(
+                    manager.messages(),
+                    REPLAY_MIN_TAIL_MESSAGES,
+                ),
+            );
+            if report.changed() {
+                tracing::info!(
+                    before_tokens = report.before_tokens,
+                    after_tokens = report.after_tokens,
+                    before_messages = report.before_messages,
+                    after_messages = report.after_messages,
+                    target_tokens = history_target_tokens,
+                    request_target_tokens = target_tokens,
+                    "turn_control: hard context guard pruned history before request"
+                );
+                session.invalidate_continuation();
+                cache_miss_reason = CacheMissReason::HardContextGuardTruncated;
+                report_estimated_usage_after_compact(&manager, &params);
+            }
         }
     }
     PreTurnCompactFlow::Ran {
-        estimated_input_tokens,
+        estimated_input_tokens: next_request_input_estimate(&manager, &params),
         cache_miss_reason,
     }
 }
@@ -1849,6 +1859,138 @@ pub(super) async fn dispatch_tool_use(
         }
     }
 }
+#[cfg(test)]
+mod pre_turn_compact_tests {
+    use super::*;
+    use rebon_api::{ContentBlockStart, MockModelClient, PruneLevel};
+
+    fn params_and_manager() -> (QueryParams, ContextManager) {
+        let params = QueryParams {
+            max_tokens: 128_000,
+            prune_level: Some(PruneLevelHandle::with_context_window(
+                PruneLevel::Conservative,
+                128_000,
+            )),
+            ..QueryParams::new("mock", Vec::new())
+        };
+        let mut messages = vec![ApiMessage::user_text("x".repeat(300_000))];
+        for _ in 0..5 {
+            messages.push(ApiMessage::assistant_text("answer"));
+            messages.push(ApiMessage::user_text("request"));
+        }
+        (params, ContextManager::new(None, messages))
+    }
+
+    #[tokio::test]
+    async fn pre_turn_hard_guard_respects_disabled_cooldown_and_skip() {
+        for gate in ["disabled", "cooldown", "skip"] {
+            let (mut params, mut manager) = params_and_manager();
+            let handle = params.prune_level.as_ref().unwrap();
+            let mut skip = gate == "skip";
+            if gate == "disabled" {
+                handle.budget.set_auto_compact_enabled(false);
+            }
+            if gate == "cooldown" {
+                for _ in 0..10 {
+                    handle.budget.record_compact_failure();
+                }
+            }
+            let target = hard_context_guard_target(Some(handle), params.max_tokens).unwrap();
+            assert!(next_request_input_estimate(&manager, &params) > target);
+            let mock = MockModelClient::new();
+            let session = SessionHandle::new(Arc::new(mock.clone()));
+            let (raw_tx, _rx) = mpsc::unbounded_channel();
+            let tx = QueryEventSender::new(raw_tx, &params.turn_hooks);
+            let mut pending = CacheMissReason::None;
+            let result = compact_before_request(
+                &mut manager,
+                &mut params,
+                &session,
+                &tx,
+                0,
+                &mut skip,
+                &mut pending,
+            )
+            .await;
+            let PreTurnCompactFlow::Ran {
+                estimated_input_tokens,
+                cache_miss_reason,
+            } = result
+            else {
+                panic!("pre-turn hard guard must not restart the loop");
+            };
+            assert!(mock.captured_requests().is_empty(), "{gate}");
+            assert_eq!(
+                cache_miss_reason,
+                CacheMissReason::HardContextGuardTruncated
+            );
+            assert_eq!(
+                estimated_input_tokens,
+                next_request_input_estimate(&manager, &params)
+            );
+            assert!(estimated_input_tokens <= target);
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_turn_hard_guard_recomputes_estimate_after_summary_in_any_iteration() {
+        for iteration in [0, 1] {
+            let (mut params, mut manager) = params_and_manager();
+            let before = next_request_input_estimate(&manager, &params);
+            let mock = MockModelClient::new();
+            mock.push_turn(vec![
+                StreamEvent::ContentBlockStart {
+                    index: 0,
+                    content_block: ContentBlockStart::Text {
+                        text: "summary of old evidence".into(),
+                    },
+                },
+                StreamEvent::ContentBlockStop { index: 0 },
+                StreamEvent::MessageStop,
+            ]);
+            let session = SessionHandle::new(Arc::new(mock.clone()));
+            let (raw_tx, _rx) = mpsc::unbounded_channel();
+            let tx = QueryEventSender::new(raw_tx, &params.turn_hooks);
+            let mut skip = false;
+            let mut pending = CacheMissReason::None;
+            let result = compact_before_request(
+                &mut manager,
+                &mut params,
+                &session,
+                &tx,
+                iteration,
+                &mut skip,
+                &mut pending,
+            )
+            .await;
+            let PreTurnCompactFlow::Ran {
+                estimated_input_tokens,
+                cache_miss_reason,
+            } = result
+            else {
+                panic!("pre-turn summary must not restart the loop");
+            };
+            assert_eq!(mock.captured_requests().len(), 1);
+            assert_eq!(cache_miss_reason, CacheMissReason::CompactReplacedMessages);
+            assert_eq!(
+                estimated_input_tokens,
+                next_request_input_estimate(&manager, &params)
+            );
+            assert!(estimated_input_tokens < before);
+            assert_eq!(
+                params
+                    .prune_level
+                    .as_ref()
+                    .unwrap()
+                    .budget
+                    .last_input_tokens(),
+                estimated_input_tokens
+            );
+            assert!(!skip);
+        }
+    }
+}
+
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;

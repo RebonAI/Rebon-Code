@@ -545,6 +545,282 @@ fn codex_window_keeps_the_hard_guard_behind_compaction() {
 }
 
 #[test]
+fn unknown_output_limit_does_not_subtract_a_second_output_reserve() {
+    let handle = PruneLevelHandle::with_context_window(PruneLevel::Conservative, 128_000);
+    assert_eq!(
+        hard_context_guard_target(Some(&handle), 64_000),
+        Some(60_800)
+    );
+    assert_eq!(budgeted_replay_target(Some(&handle), 64_000), Some(60_800));
+}
+
+#[test]
+fn output_cap_policy_preserves_small_caps_and_only_halves_unknown_limits() {
+    for (output_limit, requested, expected) in [
+        (0, 128_000, 64_000),
+        (0, 4_096, 4_096),
+        (16_000, 128_000, 16_000),
+        (16_000, 4_096, 4_096),
+        (100_000, 128_000, 100_000),
+    ] {
+        let handle = PruneLevelHandle::with_model_context_limits(
+            PruneLevel::Conservative,
+            128_000,
+            output_limit,
+            std::iter::empty::<(String, u32)>(),
+            std::iter::empty::<(String, u32)>(),
+        );
+        assert_eq!(cap_max_tokens_for_model(requested, Some(&handle)), expected);
+        assert_eq!(cap_max_tokens_for_model(requested, None), requested);
+        assert_eq!(
+            hard_context_guard_target(Some(&handle), requested),
+            hard_context_guard_target(Some(&handle), expected)
+        );
+    }
+    assert_eq!(hard_context_guard_target(None, 128_000), None);
+}
+
+#[tokio::test]
+async fn output_cap_policy_clamps_high_and_xhigh_defaults_and_explicit_requests() {
+    for output_limit in [0, 16_000] {
+        for effort in [
+            rebon_types::ReasoningEffort::High,
+            rebon_types::ReasoningEffort::XHigh,
+        ] {
+            let requested = rebon_api::effort::resolve_thinking_from_effort(
+                Some(effort),
+                rebon_types::effort_indicator::EffortProviderKind::OpenAi,
+            )
+            .max_tokens
+            .unwrap();
+            for explicit_request in [false, true] {
+                let handle = PruneLevelHandle::with_model_context_limits(
+                    PruneLevel::Conservative,
+                    128_000,
+                    output_limit,
+                    std::iter::empty::<(String, u32)>(),
+                    std::iter::empty::<(String, u32)>(),
+                );
+                let expected = if output_limit == 0 {
+                    64_000
+                } else {
+                    output_limit
+                };
+                let sent = sent_max_tokens(
+                    "context-output-cap",
+                    "mock-model",
+                    |executor| {
+                        executor
+                            .with_prune_level(handle.clone())
+                            .with_max_tokens(if explicit_request { 4_096 } else { requested })
+                    },
+                    explicit_request.then_some(requested),
+                )
+                .await;
+                assert_eq!(sent, expected);
+                assert_eq!(
+                    hard_context_guard_target(Some(&handle), sent),
+                    Some((128_000 - expected) * 95 / 100)
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn output_cap_policy_keeps_explicit_budgets_without_a_handle() {
+    for explicit_request in [false, true] {
+        let sent = sent_max_tokens(
+            "context-output-cap-no-handle",
+            "mock-model",
+            |executor| executor.with_max_tokens(128_000),
+            explicit_request.then_some(96_000),
+        )
+        .await;
+        assert_eq!(sent, if explicit_request { 96_000 } else { 128_000 });
+    }
+}
+
+fn hard_guard_history(old_chars: usize, recent_chars: usize) -> Vec<ApiMessage> {
+    let mut messages = vec![
+        ApiMessage::user_text(format!("old evidence {}", "x".repeat(old_chars))),
+        ApiMessage::assistant_text("old answer"),
+    ];
+    for _ in 0..4 {
+        messages.push(ApiMessage::user_text("recent request"));
+        messages.push(ApiMessage::assistant_text("y".repeat(recent_chars)));
+    }
+    messages.push(ApiMessage::user_text("current tail"));
+    messages
+}
+
+fn hard_guard_params(output_limit: u32, old_chars: usize, recent_chars: usize) -> QueryParams {
+    QueryParams {
+        max_tokens: 128_000,
+        max_iterations: 1,
+        prune_level: Some(PruneLevelHandle::with_model_context_limits(
+            PruneLevel::Conservative,
+            128_000,
+            output_limit,
+            std::iter::empty::<(String, u32)>(),
+            std::iter::empty::<(String, u32)>(),
+        )),
+        tools: vec![ApiTool {
+            name: "Read".into(),
+            description: "schema ".repeat(5_000),
+            input_schema: json!({"type": "object"}),
+        }],
+        ..QueryParams::new("mock", hard_guard_history(old_chars, recent_chars))
+    }
+}
+
+#[tokio::test]
+async fn hard_guard_keeps_history_with_large_schema_below_the_input_budget() {
+    let mock = MockModelClient::new();
+    mock.push_turn(text_turn("turn", "done"));
+    let params = hard_guard_params(0, 80_000, 1);
+    let original = params.messages.clone();
+    let target = hard_context_guard_target(params.prune_level.as_ref(), params.max_tokens).unwrap();
+    let manager = ContextManager::new(params.system.clone(), original.clone());
+    assert!(next_request_input_estimate(&manager, &params) < target);
+    let mut rx = run_query(
+        Arc::new(Engine::new()),
+        SessionHandle::new(Arc::new(mock.clone())),
+        params,
+        ToolContext::new(),
+        CancelToken::new(),
+    );
+    let events = drain(&mut rx).await;
+    assert!(matches!(events.last(), Some(QueryEvent::Done { .. })));
+    let captured = mock.captured_requests();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].max_tokens, 64_000);
+    assert_eq!(captured[0].messages, original);
+}
+
+#[tokio::test]
+async fn pre_turn_hard_guard_summarizes_before_pruning_known_and_unknown_output() {
+    let _env = env_lock();
+    let _trace_env = EnvVarGuard::set("REBON_CACHE_TRACE", "1");
+    for output_limit in [0, 64_000] {
+        let mock = MockModelClient::new();
+        mock.push_turn(text_turn("summary", "preserved old evidence"));
+        mock.push_turn(text_turn("turn", "done"));
+        let (seat, observations) = cache_trace_recording_seat();
+        let params = hard_guard_params(output_limit, 300_000, 1).with_turn_hook_seat(seat);
+        let handle = params.prune_level.as_ref().unwrap();
+        let manager = ContextManager::new(params.system.clone(), params.messages.clone());
+        let before_tokens = next_request_input_estimate(&manager, &params);
+        assert!(
+            before_tokens > hard_context_guard_target(Some(handle), params.max_tokens).unwrap()
+        );
+        if output_limit == 0 {
+            assert!(before_tokens < handle.budget.auto_compact_threshold());
+        }
+        let original_prefix = params.messages[..params.messages.len() - 1].to_vec();
+        let mut rx = run_query(
+            Arc::new(Engine::new()),
+            SessionHandle::new(Arc::new(mock.clone())),
+            params,
+            ToolContext::new(),
+            CancelToken::new(),
+        );
+        let events = drain(&mut rx).await;
+        assert!(matches!(events.last(), Some(QueryEvent::Done { .. })));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            QueryEvent::CompactingFinished {
+                used_model: true,
+                ..
+            }
+        )));
+        let captured = mock.captured_requests();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            &captured[0].messages[..original_prefix.len()],
+            original_prefix.as_slice()
+        );
+        let texts = text_message_texts(&captured[1].messages);
+        assert!(texts
+            .iter()
+            .any(|text| text.contains("preserved old evidence")));
+        assert_eq!(texts.last(), Some(&"current tail"));
+        assert!(observations
+            .lock()
+            .expect("cache trace observations poisoned")
+            .iter()
+            .any(|observation| matches!(
+                observation,
+                CacheTraceObservation::Request {
+                    cache_miss_reason: CacheMissReason::CompactReplacedMessages,
+                    ..
+                }
+            )));
+    }
+}
+
+#[tokio::test]
+async fn pre_turn_hard_guard_falls_back_when_summary_fails_or_still_exceeds_budget() {
+    let _env = env_lock();
+    let _trace_env = EnvVarGuard::set("REBON_CACHE_TRACE", "1");
+    for summary_succeeds in [false, true] {
+        let mock = MockModelClient::new();
+        if summary_succeeds {
+            mock.push_turn(text_turn("summary", "preserved old evidence"));
+        } else {
+            mock.push_error(ModelError::BadRequest("summary unavailable".into()));
+        }
+        mock.push_turn(text_turn("turn", "done"));
+        let (seat, observations) = cache_trace_recording_seat();
+        let params = hard_guard_params(0, 300_000, 80_000).with_turn_hook_seat(seat);
+        let budget_params = params.clone();
+        let original_prefix = params.messages[..params.messages.len() - 1].to_vec();
+        let target =
+            hard_context_guard_target(params.prune_level.as_ref(), params.max_tokens).unwrap();
+        let mut rx = run_query(
+            Arc::new(Engine::new()),
+            SessionHandle::new(Arc::new(mock.clone())),
+            params,
+            ToolContext::new(),
+            CancelToken::new(),
+        );
+        let events = drain(&mut rx).await;
+        assert!(matches!(events.last(), Some(QueryEvent::Done { .. })));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, QueryEvent::CompactingStarted { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(event, QueryEvent::CompactingFinished { used_model, .. } if *used_model == summary_succeeds)));
+        let captured = mock.captured_requests();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            &captured[0].messages[..original_prefix.len()],
+            original_prefix.as_slice()
+        );
+        let manager = ContextManager::new(captured[1].system.clone(), captured[1].messages.clone());
+        assert!(next_request_input_estimate(&manager, &budget_params) <= target);
+        assert_eq!(
+            text_message_texts(&captured[1].messages).last(),
+            Some(&"current tail")
+        );
+        assert!(observations
+            .lock()
+            .expect("cache trace observations poisoned")
+            .iter()
+            .any(|observation| matches!(
+                observation,
+                CacheTraceObservation::Request {
+                    cache_miss_reason: CacheMissReason::HardContextGuardTruncated,
+                    ..
+                }
+            )));
+    }
+}
+
+#[test]
 fn hard_context_guard_cache_miss_reason_is_specific() {
     assert_eq!(
         CacheMissReason::HardContextGuardTruncated.as_str(),
