@@ -282,6 +282,39 @@ fn delivered_only_moves_forward() {
 }
 
 #[test]
+fn memory_and_delivery_cursors_advance_atomically_and_never_regress() {
+    let (_dir, store, group) = pair();
+    let coder = key("claude-code", "c1");
+    let initial = store.cursor(&group.id, &coder).unwrap();
+    store
+        .mark_context(&group.id, &coder, initial.delivered + 10, true, 7)
+        .unwrap();
+    store
+        .mark_context(&group.id, &coder, initial.delivered + 2, false, 3)
+        .unwrap();
+    let cursor = store.cursor(&group.id, &coder).unwrap();
+    assert_eq!(cursor.delivered, initial.delivered + 10);
+    assert_eq!(cursor.read, initial.read);
+    assert!(cursor.briefed);
+    assert_eq!(cursor.memory, 7);
+    store
+        .mark_delivered(&group.id, &coder, initial.delivered + 12)
+        .unwrap();
+    let terminal = store.cursor(&group.id, &coder).unwrap();
+    assert_eq!(terminal.memory, 7);
+    assert!(terminal.briefed);
+}
+
+#[test]
+fn legacy_cursors_need_a_memory_briefing() {
+    let cursor: Cursor = serde_json::from_str(r#"{"delivered":50,"read":40}"#).unwrap();
+    assert!(!cursor.briefed);
+    assert_eq!(cursor.memory, 0);
+    assert_eq!(cursor.delivered, 50);
+    assert_eq!(cursor.read, 40);
+}
+
+#[test]
 fn handoffs_say_who_got_what_and_how() {
     let (_dir, store, group) = pair();
     let planner = key("rebon", "s1");

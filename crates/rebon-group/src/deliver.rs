@@ -1,10 +1,19 @@
 //! Handing a member what the group wrote to it.
 //!
 //! [`pending`] is the one read every channel starts from: the entries after
-//! the member's `delivered` cursor that are its to hear. The channel shows
-//! them ([`crate::render`]) and then moves the cursor past everything it
-//! looked at, so the next delivery, by whatever channel, starts after it.
-//! What was delivered stays unread: `group_inbox` still has it in full.
+//! the member's `delivered` cursor that are its to hear, and the memory its
+//! context has not had. The channel shows them ([`crate::render`]) and then
+//! moves the cursors past everything it looked at, so the next delivery, by
+//! whatever channel, starts after it. What was delivered stays unread:
+//! `group_inbox` still has it in full.
+//!
+//! **Memory has its own cursor.** A member's context learns the group's
+//! memory whole once — the briefing, on its first delivery after joining
+//! and again whenever its agent starts a fresh context — and fact by fact
+//! after that. Only the channels that put [`crate::render::context`] into
+//! the model ([`Via::Hook`], [`Via::Attachment`]) move it: the app typing a
+//! request into a terminal moves `delivered` past facts it never showed,
+//! and they still reach the member by the next hook or attachment.
 //!
 //! [`hook_output`] is the hook channel end to end, for `rebon group hook`:
 //! Claude Code and Codex run a command on their `UserPromptSubmit`,
@@ -15,22 +24,46 @@
 
 use serde_json::{json, Value};
 
-use crate::model::{Delivery, Entry, Group, MemberKey, Via};
+use crate::model::{Delivery, Entry, EntryKind, Group, MemberKey, Via};
 use crate::store::GroupStore;
 
 /// What a member has not been handed yet.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pending {
     pub group: Group,
-    /// The entries for this member, oldest first.
+    /// The member's alias.
+    pub alias: String,
+    /// The entries for this member, oldest first. Memory is not among them:
+    /// it is in `memory`.
     pub entries: Vec<Entry>,
     /// The last seq looked at, the member's or not: where `delivered` moves.
     pub through: u64,
+    /// Its context has not had the briefing: [`crate::render::context`]
+    /// opens with it, and `memory` is the whole memory.
+    pub brief: bool,
+    /// Memory facts its context has not had, oldest first: all of them with
+    /// `brief`, else the ones others recorded since.
+    pub memory: Vec<Entry>,
+    /// The newest memory fact looked at: where the memory cursor moves.
+    pub memory_through: u64,
 }
 
-/// The member's undelivered entries, or `None` when it is in no group, is
-/// pull-only, or has nothing new.
+impl Pending {
+    /// Nothing to show: moving the cursors is all a delivery would do.
+    pub fn is_empty(&self) -> bool {
+        !self.brief && self.entries.is_empty() && self.memory.is_empty()
+    }
+}
+
+/// The member's undelivered entries and memory, or `None` when it is in no
+/// group, is pull-only, or has nothing new.
 pub fn pending(store: &GroupStore, member: &MemberKey) -> Option<Pending> {
+    pending_with(store, member, false)
+}
+
+/// [`pending`], for a context that has just been emptied or replaced
+/// (`fresh`) — cleared, compacted — and so needs the briefing again.
+pub fn pending_with(store: &GroupStore, member: &MemberKey, fresh: bool) -> Option<Pending> {
     let group = store.group_of(member).ok()??;
     let me = group.member(member)?;
     if me.delivery == Delivery::PullOnly {
@@ -39,27 +72,67 @@ pub fn pending(store: &GroupStore, member: &MemberKey) -> Option<Pending> {
     let alias = me.alias.clone();
     let cursor = store.cursor(&group.id, member).ok()?;
     let after = store.entries_after(&group.id, cursor.delivered).ok()?;
-    let through = after.last()?.seq;
-    let entries = after
+    let through = after.last().map_or(cursor.delivered, |entry| entry.seq);
+    let entries: Vec<Entry> = after
         .into_iter()
-        .filter(|entry| entry.is_for(&alias))
+        .filter(|entry| entry.kind != EntryKind::Memory && entry.is_for(&alias))
         .collect();
-    Some(Pending {
+    let brief = fresh || !cursor.briefed;
+    let facts = store.memory(&group.id).ok()?;
+    // The newest fact is never superseded, so the newest effective fact is
+    // the newest one recorded.
+    let memory_through = facts
+        .last()
+        .map_or(cursor.memory, |fact| fact.seq.max(cursor.memory));
+    let memory: Vec<Entry> = if brief {
+        facts
+    } else {
+        facts
+            .into_iter()
+            .filter(|fact| fact.seq > cursor.memory && !fact.from.eq_ignore_ascii_case(&alias))
+            .collect()
+    };
+    let pending = Pending {
         group,
+        alias,
         entries,
         through,
-    })
+        brief,
+        memory,
+        memory_through,
+    };
+    if pending.is_empty() && through == cursor.delivered && memory_through == cursor.memory {
+        return None;
+    }
+    Some(pending)
 }
 
 /// Marks `pending` delivered to `member` by `via`, and records the handoff.
+///
+/// [`Via::Hook`] and [`Via::Attachment`] say the member's context got
+/// [`crate::render::context`] of it — the briefing and the memory as well as
+/// the entries — so they move the memory cursor too; the other channels
+/// move only `delivered`.
 pub fn delivered(store: &GroupStore, member: &MemberKey, pending: &Pending, via: Via) -> bool {
+    let context = matches!(via, Via::Hook | Via::Attachment);
     if store
-        .mark_delivered(&pending.group.id, member, pending.through)
+        .mark_context(
+            &pending.group.id,
+            member,
+            pending.through,
+            context && pending.brief,
+            if context { pending.memory_through } else { 0 },
+        )
         .is_err()
     {
         return false;
     }
-    let seqs = pending.entries.iter().map(|entry| entry.seq).collect();
+    let mut seqs: Vec<u64> = pending.entries.iter().map(|entry| entry.seq).collect();
+    if context {
+        seqs.extend(pending.memory.iter().map(|fact| fact.seq));
+        seqs.sort_unstable();
+        seqs.dedup();
+    }
     // The cursor has moved; a record that failed to write loses the
     // timeline a line, not the member its news.
     let _ = store.record_handoff(&pending.group.id, member, via, seqs);
@@ -68,6 +141,10 @@ pub fn delivered(store: &GroupStore, member: &MemberKey, pending: &Pending, via:
 
 /// The hook events that can carry context into the model.
 const CONTEXT_EVENTS: &[&str] = &["UserPromptSubmit", "SessionStart", "PostToolUse"];
+
+/// `SessionStart` sources after which the context no longer holds what
+/// the group told it.
+const FRESH_SOURCES: &[&str] = &["clear", "compact", "resume"];
 
 /// What `rebon group hook --agent <agent>` prints for one hook `input` (the
 /// JSON the agent passes on stdin), or `None` to print nothing. The shape is
@@ -87,8 +164,13 @@ pub fn hook_output(store: &GroupStore, agent: &str, input: &Value) -> Option<Val
         agent: agent.to_string(),
         session_id: session_id.to_string(),
     };
-    let pending = pending(store, &member)?;
-    let text = crate::render::reminder(&pending.group, &pending.entries);
+    let fresh = event == "SessionStart"
+        && input
+            .get("source")
+            .and_then(Value::as_str)
+            .is_some_and(|source| FRESH_SOURCES.contains(&source));
+    let pending = pending_with(store, &member, fresh)?;
+    let text = crate::render::context(&pending);
     // Moved past what was looked at even when none of it was ours, so the
     // next event does not read it again.
     if !delivered(store, &member, &pending, Via::Hook) {
@@ -153,6 +235,86 @@ mod tests {
 
     fn input(event: &str) -> Value {
         json!({ "session_id": "aa38", "hook_event_name": event, "cwd": "/w", "prompt": "hi" })
+    }
+
+    fn remember(store: &GroupStore, group: &str, text: &str, supersedes: Option<u64>) -> Entry {
+        store
+            .append(
+                group,
+                &member("rebon", "s1", "planner", Delivery::Auto).key(),
+                Draft {
+                    kind: EntryKind::Memory,
+                    to: None,
+                    re: None,
+                    supersedes,
+                    text: text.into(),
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn terminal_delivery_does_not_consume_shared_memory() {
+        let (_dir, store, group) = setup(Delivery::Auto);
+        remember(&store, &group, "shared-api-v2", None);
+        let key = member("claude-code", "aa38", "coder", Delivery::Auto).key();
+        let batch = pending(&store, &key).unwrap();
+        assert!(delivered(&store, &key, &batch, Via::Terminal));
+        let output = hook_output(&store, "claude-code", &input("UserPromptSubmit"))
+            .expect("终端派活不能吞掉尚未注入的共享记忆");
+        assert!(output.to_string().contains("shared-api-v2"));
+        assert!(hook_output(&store, "claude-code", &input("PostToolUse")).is_none());
+    }
+
+    #[test]
+    fn a_new_member_receives_effective_memory_before_its_join() {
+        let (_dir, store, group) = setup(Delivery::Auto);
+        let old = remember(&store, &group, "obsolete-api-v1", None);
+        remember(&store, &group, "shared-api-v2", Some(old.seq));
+        store
+            .join(&group, member("codex", "new", "reviewer", Delivery::Auto))
+            .unwrap();
+        let output = hook_output(
+            &store,
+            "codex",
+            &json!({
+                "session_id": "new", "hook_event_name": "SessionStart"
+            }),
+        )
+        .expect("入组前的有效记忆必须交给新成员");
+        let text = output.to_string();
+        assert!(text.contains("shared-api-v2"));
+        assert!(!text.contains("obsolete-api-v1"));
+        assert!(text.contains("group_remember"));
+    }
+
+    #[test]
+    fn compacted_context_receives_shared_memory_again() {
+        let (_dir, store, group) = setup(Delivery::Auto);
+        remember(&store, &group, "shared-api-v2", None);
+        hook_output(&store, "claude-code", &input("UserPromptSubmit")).unwrap();
+        for source in ["clear", "compact", "resume"] {
+            let output = hook_output(
+                &store,
+                "claude-code",
+                &json!({
+                    "session_id": "aa38", "hook_event_name": "SessionStart", "source": source
+                }),
+            )
+            .expect("恢复上下文时必须重新提供共享记忆");
+            assert!(output.to_string().contains("shared-api-v2"));
+        }
+    }
+
+    #[test]
+    fn reading_inbox_does_not_consume_memory_context() {
+        let (_dir, store, group) = setup(Delivery::Auto);
+        remember(&store, &group, "shared-api-v2", None);
+        let key = member("claude-code", "aa38", "coder", Delivery::Auto).key();
+        store.inbox(&group, &key, true).unwrap();
+        let output = hook_output(&store, "claude-code", &input("PostToolUse"))
+            .expect("收件箱游标不应控制记忆注入");
+        assert!(output.to_string().contains("shared-api-v2"));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! One attachment, `group_inbox`: the entries of the session's group written
 //! to it (or to all) since the last delivery, one line each, as a
 //! system-reminder at the end of the history. It sits on the
-//! `attachment-producers` seat at [`Order::Mailbox`] beside the teammate
+//! `attachment-producers` seat at [`rebon_core::attachment_seat::Order::Mailbox`] beside the teammate
 //! mailbox — traffic from outside the session — so it is read after
 //! everything that describes the session's own state.
 //!
@@ -18,8 +18,11 @@
 //! lines and moves the member's `delivered` cursor; `group_inbox` still has
 //! them in full and moves `read`. A long request the model wants to act on
 //! is one tool call away.
+//!
+//! 每个新回合补齐当前有效记忆，避免恢复或压缩后只剩已投递游标；
+//! 回合内仅追加增量，不改变已有的缓存前缀。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rebon_api::Message as ApiMessage;
 use rebon_core::attachment_seat::{SeatAttachmentProducer, SessionAttachmentBinding};
@@ -29,7 +32,7 @@ use rebon_core::query::{
 use rebon_group::deliver;
 use rebon_group::identity::AgentKind;
 use rebon_group::model::{MemberKey, Via};
-use rebon_group::{render, Entry, Group, GroupStore};
+use rebon_group::GroupStore;
 
 /// The seat entry: a poller for every session, which answers nothing while
 /// the session is in no group.
@@ -48,24 +51,29 @@ impl SeatAttachmentProducer for GroupInboxProducer {
         &self,
         binding: &SessionAttachmentBinding,
     ) -> Option<Arc<dyn AttachmentPoller>> {
-        Some(Arc::new(GroupInboxPoller {
-            store: self.store.clone(),
-            member: MemberKey {
+        Some(Arc::new(GroupInboxPoller::new(
+            self.store.clone(),
+            MemberKey {
                 agent: AgentKind::REBON.to_string(),
                 session_id: binding.session_id.clone(),
             },
-        }))
+        )))
     }
 }
 
 pub struct GroupInboxPoller {
     store: GroupStore,
     member: MemberKey,
+    briefed_turn: Mutex<Option<String>>,
 }
 
 impl GroupInboxPoller {
     pub fn new(store: GroupStore, member: MemberKey) -> Self {
-        Self { store, member }
+        Self {
+            store,
+            member,
+            briefed_turn: Mutex::new(None),
+        }
     }
 }
 
@@ -77,29 +85,35 @@ impl AttachmentPoller for GroupInboxPoller {
         if request.session_id != self.member.session_id {
             return Vec::new();
         }
-        let Some(pending) = deliver::pending(&self.store, &self.member) else {
+        let mut briefed = self
+            .briefed_turn
+            .lock()
+            .expect("group briefed turn poisoned");
+        let fresh = briefed.as_deref() != Some(request.turn_id);
+        let Some(pending) = deliver::pending_with(&self.store, &self.member, fresh) else {
             return Vec::new();
         };
+        let messages = group_inbox(&pending, request.turn_id);
         if !deliver::delivered(&self.store, &self.member, &pending, Via::Attachment) {
             return Vec::new();
         }
-        group_inbox(&pending.group, &pending.entries)
+        *briefed = Some(request.turn_id.to_string());
+        messages
     }
 }
 
-/// `group_inbox` attachment for `entries`, or nothing when there are none.
-pub fn group_inbox(group: &Group, entries: &[Entry]) -> Vec<ApiMessage> {
-    let Some(model_text) = render::reminder(group, entries) else {
+/// 群组消息与有效记忆共用附件，只有真正注入上下文后才推进记忆游标。
+pub fn group_inbox(pending: &deliver::Pending, turn_id: &str) -> Vec<ApiMessage> {
+    let Some(model_text) = rebon_group::render::context(pending) else {
         return Vec::new();
     };
     let uuid = format!(
-        "u-group-attachment-{}-{}",
-        group.id,
-        entries.last().map_or(0, |entry| entry.seq)
+        "u-group-attachment-{turn_id}-{}-{}-{}",
+        pending.group.id, pending.through, pending.memory_through
     );
     vec![visible_runtime_attachment_message(
         &uuid,
-        render::label(group, entries),
+        rebon_group::render::context_label(pending),
         model_text,
     )]
 }
@@ -110,7 +124,7 @@ mod tests {
     use rebon_api::ContentBlock;
     use rebon_core::query::AttachmentPollPhase;
     use rebon_group::store::Draft;
-    use rebon_group::{Delivery, EntryKind, Member};
+    use rebon_group::{render, Delivery, EntryKind, Member};
 
     fn member(agent: &str, session_id: &str, alias: &str) -> Member {
         Member {
@@ -248,6 +262,62 @@ mod tests {
         );
         let _ = poll(&a, "s1");
         assert!(poll(&a, "s1").is_empty());
+    }
+
+    #[test]
+    fn shared_memory_survives_terminal_delivery_and_a_new_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GroupStore::new(dir.path());
+        let group = store.create("g", "/w").unwrap();
+        store.join(&group.id, member("rebon", "s1", "a")).unwrap();
+        store.join(&group.id, member("rebon", "s2", "b")).unwrap();
+        send(
+            &store,
+            &group.id,
+            &key("rebon", "s2"),
+            "all",
+            EntryKind::Memory,
+            "shared-api-v2",
+        );
+        let me = key("rebon", "s1");
+        let pending = deliver::pending(&store, &me).unwrap();
+        assert!(deliver::delivered(&store, &me, &pending, Via::Terminal));
+        let poller = GroupInboxPoller::new(store.clone(), me);
+        assert!(model_text(&poll(&poller, "s1")).contains("shared-api-v2"));
+        assert!(poll(&poller, "s1").is_empty());
+        let next = poller.poll(AttachmentPollRequest::new(
+            "s1",
+            "next-turn",
+            0,
+            AttachmentPollPhase::Eager,
+        ));
+        assert!(model_text(&next).contains("shared-api-v2"));
+        let rebuilt = GroupInboxPoller::new(store, key("rebon", "s1"));
+        assert!(model_text(&poll(&rebuilt, "s1")).contains("shared-api-v2"));
+    }
+
+    #[test]
+    fn a_late_joiner_gets_memory_and_pull_only_stays_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GroupStore::new(dir.path());
+        let group = store.create("g", "/w").unwrap();
+        store.join(&group.id, member("rebon", "s2", "b")).unwrap();
+        send(
+            &store,
+            &group.id,
+            &key("rebon", "s2"),
+            "all",
+            EntryKind::Memory,
+            "before-join",
+        );
+        store.join(&group.id, member("rebon", "s1", "a")).unwrap();
+        let poller = GroupInboxPoller::new(store.clone(), key("rebon", "s1"));
+        assert!(model_text(&poll(&poller, "s1")).contains("before-join"));
+        let mut pull = member("rebon", "s3", "c");
+        pull.delivery = Delivery::PullOnly;
+        store.join(&group.id, pull).unwrap();
+        let poller = GroupInboxPoller::new(store, key("rebon", "s3"));
+        assert!(poll(&poller, "s3").is_empty());
     }
 
     #[test]

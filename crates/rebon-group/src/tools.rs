@@ -182,7 +182,9 @@ fn membership(ctx: &ToolContext<'_>) -> Result<(Caller, Group)> {
     };
     match ctx.store.group_of(&caller.key())? {
         Some(group) => Ok((caller, group)),
-        None => bail!("this session is in no group; use group_info to see this project's groups and group_join to join one"),
+        None => bail!(
+            "this session is in no group; use group_info to see this project's groups and group_join to join one"
+        ),
     }
 }
 
@@ -314,6 +316,7 @@ fn join(ctx: &mut ToolContext<'_>, args: JoinArgs) -> Result<Value> {
         "you": me.alias,
         "members": group.members.iter().map(member_json).collect::<Vec<_>>(),
         "memory": memory.iter().map(memory_json).collect::<Vec<_>>(),
+        "memory_guide": crate::render::MEMORY_GUIDE,
         "note": FROM_OTHERS,
     }))
 }

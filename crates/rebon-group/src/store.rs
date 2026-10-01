@@ -39,6 +39,16 @@ pub struct Cursor {
     pub delivered: u64,
     /// The last entry it read from its inbox.
     pub read: u64,
+    /// Whether its context has had the group's briefing: who is in it, how
+    /// the memory is kept, and the memory as it stood. A new member has
+    /// not; a hook that starts a fresh context asks for it again anyway.
+    #[serde(default)]
+    pub briefed: bool,
+    /// The last memory fact its context was handed in full. Kept apart from
+    /// `delivered`, which a channel that only names a request (the app
+    /// typing into a terminal) moves past facts it never showed.
+    #[serde(default)]
+    pub memory: u64,
 }
 
 /// An entry before it has a place in the log.
@@ -129,7 +139,7 @@ impl GroupStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("failed to list {}", self.root.display()))
+                    .with_context(|| format!("failed to list {}", self.root.display()));
             }
         };
         let mut groups: Vec<Group> = entries
@@ -256,6 +266,7 @@ impl GroupStore {
                 Cursor {
                     delivered: entry.seq,
                     read: entry.seq,
+                    ..Cursor::default()
                 },
             );
             write_json(&self.dir(id).join(CURSORS_FILE), &cursors)?;
@@ -518,6 +529,7 @@ impl GroupStore {
                     Cursor {
                         read: file.last_seq,
                         delivered: cursor.delivered.max(file.last_seq),
+                        ..cursor
                     },
                 );
                 write_json(&dir.join(CURSORS_FILE), &cursors)?;
@@ -531,15 +543,33 @@ impl GroupStore {
 
     /// Records that everything up to `seq` has been pushed to `key`.
     pub fn mark_delivered(&self, id: &str, key: &MemberKey, seq: u64) -> Result<()> {
+        self.mark_context(id, key, seq, false, 0)
+    }
+
+    // 消息与记忆游标必须同一事务更新，避免半次投递丢失上下文。
+    pub(crate) fn mark_context(
+        &self,
+        id: &str,
+        key: &MemberKey,
+        through: u64,
+        briefed: bool,
+        memory: u64,
+    ) -> Result<()> {
         check_id(id)?;
         self.with_lock(id, || {
             let dir = self.dir(id);
             let mut cursors = read_cursors(&dir)?;
             let cursor = cursors.entry(key.as_string()).or_default();
-            if seq <= cursor.delivered {
+            let next = Cursor {
+                delivered: cursor.delivered.max(through),
+                briefed: cursor.briefed || briefed,
+                memory: cursor.memory.max(memory),
+                ..*cursor
+            };
+            if next == *cursor {
                 return Ok(());
             }
-            cursor.delivered = seq;
+            *cursor = next;
             write_json(&dir.join(CURSORS_FILE), &cursors)
         })
     }
@@ -618,7 +648,8 @@ fn effective_memory(entries: Vec<Entry>) -> Vec<Entry> {
 
 fn render_memory(group: &Group, memory: &[Entry]) -> String {
     let mut text = format!(
-        "# {} — group memory\n\nKept by Rebon from the group's log; edits here are overwritten.\n\n",
+        "# {} — group memory\n\nKept by Rebon from the group's log. Do not edit: this file is \
+         rebuilt on every change. Add or correct a fact with the group_remember tool.\n\n",
         group.name
     );
     if memory.is_empty() {
@@ -754,7 +785,7 @@ fn read_lines<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
-            return Err(error).with_context(|| format!("failed to open {}", path.display()))
+            return Err(error).with_context(|| format!("failed to open {}", path.display()));
         }
     };
     let mut entries = Vec::new();
