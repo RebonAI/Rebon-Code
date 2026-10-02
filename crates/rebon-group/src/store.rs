@@ -217,10 +217,17 @@ impl GroupStore {
     }
 
     /// Adds `member` to the group and logs it. Joining a group it is already
-    /// in returns that membership unchanged; being in another group, or
-    /// asking for an alias someone else has, is refused.
+    /// in returns that membership unchanged; being in another group, asking
+    /// for an alias someone else has, or being an agent program switched out
+    /// of groups ([`crate::agents`]) is refused.
     pub fn join(&self, id: &str, member: Member) -> Result<(Group, Option<Entry>)> {
         check_id(id)?;
+        if !self.agent_policy()?.allows(&member.agent) {
+            bail!(
+                "{} is switched out of agent groups (Rebon desktop: Settings > Groups)",
+                member.agent
+            );
+        }
         let key = member.key();
         if let Some(other) = self.group_of(&key)? {
             if other.id == id {
@@ -818,7 +825,7 @@ fn ends_mid_line(path: &Path) -> Result<bool> {
 
 /// Writes through a temporary file and a rename, so a reader never sees
 /// half a file.
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_text(path, &serde_json::to_string_pretty(value)?)
 }
 

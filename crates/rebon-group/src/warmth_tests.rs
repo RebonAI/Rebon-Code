@@ -169,3 +169,78 @@ fn an_agent_whose_files_are_unknown_or_missing_is_unknown() {
         assert_eq!(state(&activity, &Warmth::default(), now()), State::Unknown);
     }
 }
+
+#[test]
+fn session_path_finds_each_agents_own_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let rebon = dir.path().join("rebon/projects/F--app/k7m2q.jsonl");
+    let claude = dir.path().join("claude/projects/C--work-app/aa38.jsonl");
+    let codex = dir
+        .path()
+        .join("codex/sessions/2026/09/30/rollout-2026-09-30T10-00-00-019a-77.jsonl");
+    let grok = dir.path().join("grok/sessions/enc-cwd/g-1");
+    for file in [&rebon, &claude, &codex] {
+        write(file, "");
+    }
+    write(&grok.join("signals.json"), "{}");
+
+    let homes = homes(dir.path());
+    assert_eq!(session_path(&homes, AgentKind::REBON, "k7m2q"), Some(rebon));
+    assert_eq!(
+        session_path(&homes, AgentKind::CLAUDE_CODE, "aa38"),
+        Some(claude)
+    );
+    assert_eq!(
+        session_path(&homes, AgentKind::CODEX, "019a-77"),
+        Some(codex)
+    );
+    assert_eq!(session_path(&homes, AgentKind::GROK, "g-1"), Some(grok));
+}
+
+#[test]
+fn session_path_finds_nothing_unknown_missing_or_escaping() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        &dir.path().join("claude/projects/C--work-app/aa38.jsonl"),
+        "",
+    );
+    let homes = homes(dir.path());
+    for (agent, id) in [
+        ("opencode", "aa38"),
+        (AgentKind::CLAUDE_CODE, "missing"),
+        (AgentKind::CLAUDE_CODE, "../escape"),
+        // Claude Code's transcript is not Codex's, nor Rebon's.
+        (AgentKind::CODEX, "aa38"),
+        (AgentKind::REBON, "aa38"),
+    ] {
+        assert_eq!(session_path(&homes, agent, id), None, "{agent} {id}");
+    }
+    assert_eq!(
+        session_path(&Homes::default(), AgentKind::CLAUDE_CODE, "aa38"),
+        None
+    );
+}
+
+#[test]
+fn knows_exactly_the_agents_session_path_looks_for() {
+    let dir = tempfile::tempdir().unwrap();
+    for (agent, file) in [
+        (AgentKind::REBON, "rebon/projects/p/s.jsonl"),
+        (AgentKind::CLAUDE_CODE, "claude/projects/p/s.jsonl"),
+        (
+            AgentKind::CODEX,
+            "codex/sessions/2026/10/02/rollout-t-s.jsonl",
+        ),
+        (AgentKind::GROK, "grok/sessions/p/s/signals.json"),
+    ] {
+        write(&dir.path().join(file), "");
+        assert!(knows(agent), "{agent}");
+        assert!(
+            session_path(&homes(dir.path()), agent, "s").is_some(),
+            "{agent}"
+        );
+    }
+    for agent in [AgentKind::OPENCODE, AgentKind::DSH, "some-new-cli"] {
+        assert!(!knows(agent), "{agent}");
+    }
+}

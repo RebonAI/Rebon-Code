@@ -19,6 +19,7 @@
 //! log is the agent's own tool call.
 //!
 //! - [`store`] — the files and the lock.
+//! - [`agents`] — which agent programs may join at all.
 //! - [`identity`] — which session a server belongs to, from the environment
 //!   the agent started it with.
 //! - [`tools`] — the tool schemas and what each call does, as JSON in and
@@ -34,6 +35,7 @@
 //! engine. `rebon mcp serve` wraps [`tools`] for any MCP client; a Rebon
 //! session is meant to get the same tools from a feature plugin.
 
+pub mod agents;
 pub mod deliver;
 pub mod identity;
 pub mod model;
@@ -42,6 +44,7 @@ pub mod store;
 pub mod tools;
 pub mod warmth;
 
+pub use agents::AgentPolicy;
 pub use identity::{AgentKind, Caller};
 pub use model::{Delivery, Entry, EntryKind, Group, Handoff, Member, Via, Warmth};
 pub use store::GroupStore;

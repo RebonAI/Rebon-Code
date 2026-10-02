@@ -39,13 +39,23 @@ impl GroupDesk {
     /// session: its `groups` plugin already gave it the same tools, run as
     /// itself, and a second copy under the MCP prefix would only be a way to
     /// get them wrong. A Rebon session with that plugin off is out of groups.
+    ///
+    /// Nor to an agent program switched out of groups (`agents.json`), or to
+    /// anyone while that file cannot be read. A caller not yet known gets the
+    /// tools, and `group_join` refuses it if its program is switched out.
     pub(crate) fn offered(&self) -> bool {
-        !self
+        let caller = self
             .caller
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(|caller| caller.agent == rebon_group::identity::AgentKind::REBON)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(caller) = caller.as_ref() else {
+            return true;
+        };
+        caller.agent != rebon_group::identity::AgentKind::REBON
+            && self
+                .store
+                .agent_policy()
+                .is_ok_and(|policy| policy.allows(&caller.agent))
     }
 
     /// The group tools as `tools/list` entries.
@@ -78,7 +88,9 @@ impl GroupDesk {
         meta: Option<&Value>,
     ) -> anyhow::Result<Value> {
         if !self.offered() {
-            anyhow::bail!("a Rebon session has the group tools as its own (the groups plugin)");
+            anyhow::bail!(
+                "this session is not offered the group tools: a Rebon session has its own                  (the groups plugin), and an agent program switched out of groups                  (Rebon desktop: Settings > Groups) has none"
+            );
         }
         let mut caller = self
             .caller
@@ -96,5 +108,72 @@ impl GroupDesk {
             name,
             arguments,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rebon_group::identity::AgentKind;
+
+    fn desk(dir: &Path, agent: Option<&str>) -> GroupDesk {
+        GroupDesk::new(
+            GroupStore::new(dir.join("groups")),
+            dir,
+            agent.map(|agent| Caller {
+                agent: agent.to_string(),
+                session_id: "s1".to_string(),
+            }),
+        )
+    }
+
+    #[test]
+    fn the_tools_follow_each_agents_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(desk(dir.path(), Some(AgentKind::CODEX)).offered());
+        assert!(desk(dir.path(), Some(AgentKind::CLAUDE_CODE)).offered());
+
+        GroupStore::new(dir.path().join("groups"))
+            .set_agent_allowed(AgentKind::CODEX, false)
+            .unwrap();
+        let codex = desk(dir.path(), Some(AgentKind::CODEX));
+        assert!(!codex.offered());
+        let refused = codex
+            .call(rebon_group::tools::GROUP_INFO, json!({}), None)
+            .unwrap_err();
+        assert!(refused.to_string().contains("switched out"), "{refused:#}");
+        assert!(desk(dir.path(), Some(AgentKind::CLAUDE_CODE)).offered());
+    }
+
+    #[test]
+    fn a_rebon_session_never_gets_the_mcp_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!desk(dir.path(), Some(AgentKind::REBON)).offered());
+    }
+
+    #[test]
+    fn an_unknown_caller_is_offered_and_its_join_is_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        GroupStore::new(dir.path().join("groups"))
+            .set_agent_allowed(AgentKind::CODEX, false)
+            .unwrap();
+        let unknown = desk(dir.path(), None);
+        assert!(unknown.offered());
+        let refused = unknown
+            .call(
+                rebon_group::tools::GROUP_JOIN,
+                json!({ "group": "g", "agent": AgentKind::CODEX, "session_id": "x1" }),
+                None,
+            )
+            .unwrap_err();
+        assert!(refused.to_string().contains("switched out"), "{refused:#}");
+    }
+
+    #[test]
+    fn a_damaged_switch_file_offers_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("groups")).unwrap();
+        std::fs::write(dir.path().join("groups/agents.json"), "nope").unwrap();
+        assert!(!desk(dir.path(), Some(AgentKind::CLAUDE_CODE)).offered());
     }
 }

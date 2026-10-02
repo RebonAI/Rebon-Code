@@ -96,32 +96,51 @@ pub enum State {
     Unknown,
 }
 
-/// Reads the session `session_id` of `agent`.
-pub fn activity(homes: &Homes, agent: &str, session_id: &str) -> Activity {
-    let found = match agent {
+/// Whether the table above says where `agent` keeps its sessions.
+pub fn knows(agent: &str) -> bool {
+    matches!(
+        agent,
+        AgentKind::REBON | AgentKind::CLAUDE_CODE | AgentKind::CODEX | AgentKind::GROK
+    )
+}
+
+/// Where the session `session_id` of `agent` is kept, by the table above:
+/// a transcript file, or Grok Build's session directory. `None` for an
+/// agent the table does not know or a session that is not there.
+pub fn session_path(homes: &Homes, agent: &str, session_id: &str) -> Option<PathBuf> {
+    match agent {
         AgentKind::REBON => homes
             .rebon_projects
             .as_deref()
-            .and_then(|root| find_transcript(root, session_id))
-            .map(|path| transcript_activity(&path, false)),
+            .and_then(|root| find_transcript(root, session_id)),
         AgentKind::CLAUDE_CODE => homes
             .claude
             .as_deref()
-            .and_then(|root| find_transcript(&root.join("projects"), session_id))
-            .map(|path| transcript_activity(&path, true)),
+            .and_then(|root| find_transcript(&root.join("projects"), session_id)),
         AgentKind::CODEX => homes
             .codex
             .as_deref()
-            .and_then(|root| find_rollout(&root.join("sessions"), session_id))
-            .map(|path| rollout_activity(&path)),
+            .and_then(|root| find_rollout(&root.join("sessions"), session_id)),
         AgentKind::GROK => homes
             .grok
             .as_deref()
-            .and_then(|root| find_grok_session(&root.join("sessions"), session_id))
-            .map(|dir| grok_activity(&dir)),
+            .and_then(|root| find_grok_session(&root.join("sessions"), session_id)),
         _ => None,
+    }
+}
+
+/// Reads the session `session_id` of `agent`.
+pub fn activity(homes: &Homes, agent: &str, session_id: &str) -> Activity {
+    let Some(path) = session_path(homes, agent, session_id) else {
+        return Activity::default();
     };
-    found.unwrap_or_default()
+    match agent {
+        AgentKind::REBON => transcript_activity(&path, false),
+        AgentKind::CLAUDE_CODE => transcript_activity(&path, true),
+        AgentKind::CODEX => rollout_activity(&path),
+        AgentKind::GROK => grok_activity(&path),
+        _ => unreachable!("session_path finds nothing for an agent it does not know"),
+    }
 }
 
 /// How `activity` stands against the group's thresholds at `now_ms`.
