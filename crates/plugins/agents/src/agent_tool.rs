@@ -143,8 +143,8 @@ impl AgentTool {
              name merely to label a one-off search, review, verification, or implementation; omit \
              `name` for ordinary one-shot work. The first named call creates a session teammate, \
              and later calls with the same name dispatch new work to that teammate. Named \
-             teammates run in the background by default and report completion automatically; set \
-             `run_in_background` to false only when the Agent call itself must block for the \
+             teammates run in the background by default; completion delivery follows the session-specific \
+             guidance. Set `run_in_background` to false only when the Agent call itself must block for the \
              handoff. Named teammates use the execution boundary fixed by their teammate/session: \
              never combine `name` with per-call `cwd`, `allowed_roots`, `isolation`, or \
              `allowed_tools`; omit `name` when those settings are required.\n\
@@ -182,15 +182,17 @@ impl AgentTool {
              run_in_background parameter. Named teammates and external ACP agents run in the \
              background by default when this parameter is omitted. Before invoking an external \
              ACP agent, first send the user a short visible status message explaining what you \
-             are delegating and that it will continue in the background. When an agent runs in \
-             the background, you will be automatically notified when it completes; do NOT sleep, \
-             poll, or proactively check on its progress. Continue with other work or respond to \
-             the user instead.\n\
+             are delegating and that it will continue in the background. Follow session-specific \
+             guidance for completion delivery and whether it can start another turn. Do NOT sleep, \
+             poll, or proactively check on progress. Continue independent work, then yield a waiting \
+             update rather than final delivery; retain responsibility for results and verification. \
+             Without automatic continuation, choose foreground one-shot work or execute directly \
+             for necessary dependencies instead of putting the critical path in the background.\n\
              - Foreground vs background: One-shot local agents use foreground by default; named \
              teammates and external ACP agents use background by default. Keep a one-shot Explore \
              agent in the foreground when you need its findings before proceeding. Do not force a \
-             named teammate into the foreground merely to wait for its result; completion is \
-             delivered automatically.\n\
+             named teammate into the foreground merely to wait for its result; completion delivery \
+             follows session-specific guidance. Choose a feasible execution mode before teammate reuse.\n\
              - Clearly tell the agent whether you expect it to write code or just to do research \
              (search, file reads, web fetches, etc.), since it is not aware of the user's intent\n\
              - If the agent description mentions that it should be used proactively, then you \
@@ -244,7 +246,7 @@ impl AgentTool {
              </example>"
         );
         let model_description = format!(
-            "Launch specialized sub-agents for complex tasks. Use subagent_type for a matching role; omit for general-purpose. `provider`, `model`, and `modelProfile` are optional routing overrides. Normally omit them to inherit the selected agent definition and current session/provider defaults; set them only when intentionally targeting exact configured identifiers. Do not specify both `model` and `modelProfile`. A named local agent is a reusable session teammate: the first call creates it, and later calls with the same name dispatch follow-up work while preserving its context. Set `name` only when that accumulated context is likely to be reused; do not name one-off searches, reviews, verifications, or implementations merely to label them. Named teammates use the execution boundary fixed by their teammate/session: never combine `name` with per-call `cwd`, `allowed_roots`, `isolation`, or `allowed_tools`. Concurrent/background write agents are auto-isolated in runtime-created worktrees and merged back serially; named teammates cannot be concurrent writers. Named teammates default to background and report completion automatically; omit `run_in_background` unless the Agent call itself must block for the handoff. Omit name for a one-shot sub-agent. Prefer a relevant teammate from the current roster for context-heavy work. Use SendMessage only to supplement or correct work already in progress. One-shot local agents default to foreground; named teammates and external ACP agents default to background. Before invoking an external ACP agent, first send the user a short visible status message describing the delegation. Keep one-shot Explore agents in the foreground when their findings determine your next step; do not force named Explore teammates foreground merely to wait for them.\n\nAvailable agent types:\n{agent_lines}"
+            "Launch specialized sub-agents for complex tasks. Use subagent_type for a matching role; omit for general-purpose. `provider`, `model`, and `modelProfile` are optional routing overrides. Normally omit them to inherit the selected agent definition and current session/provider defaults; set them only when intentionally targeting exact configured identifiers. Do not specify both `model` and `modelProfile`. A named local agent is a reusable session teammate: the first call creates it, and later calls with the same name dispatch follow-up work while preserving its context. Set `name` only when that accumulated context is likely to be reused; do not name one-off searches, reviews, verifications, or implementations merely to label them. Named teammates use the execution boundary fixed by their teammate/session: never combine `name` with per-call `cwd`, `allowed_roots`, `isolation`, or `allowed_tools`. Concurrent/background write agents are auto-isolated in runtime-created worktrees and merged back serially; named teammates cannot be concurrent writers. Named teammates default to background; completion delivery and automatic continuation follow session-specific guidance; omit `run_in_background` unless the Agent call itself must block for the handoff. Omit name for a one-shot sub-agent. Choose a feasible execution mode before teammate reuse. Among feasible options, prefer relevant context from the current roster. Without automatic continuation, use foreground one-shot work or execute directly for necessary dependencies. Use SendMessage only to supplement or correct work already in progress. One-shot local agents default to foreground; named teammates and external ACP agents default to background. Before invoking an external ACP agent, first send the user a short visible status message describing the delegation. Keep one-shot Explore agents in the foreground when their findings determine your next step; do not force named Explore teammates foreground merely to wait for them. Yielding is not final delivery: retain responsibility for results and verification, following the user's latest pause, cancellation, or scope change.\n\nAvailable agent types:\n{agent_lines}"
         );
         Self {
             description,
@@ -603,7 +605,7 @@ impl Tool for AgentTool {
                 },
                 "run_in_background": {
                     "type": "boolean",
-                    "description": "One-shot local agents default to foreground; named teammates and external ACP agents default to background. Keep one-shot Explore agents in the foreground when their findings determine your next step. Omit this field for named teammates unless the Agent call itself must block for the handoff."
+                    "description": "One-shot local agents default to foreground; named teammates and external ACP agents default to background. Keep one-shot Explore agents in the foreground when their findings determine your next step. Omit this field for named teammates unless the Agent call itself must block for the handoff. Follow session-specific guidance for automatic continuation; without it, use foreground one-shot work or execute directly for necessary dependencies."
                 },
                 "isolation": {
                     "type": "string",
@@ -2525,6 +2527,43 @@ mod tests {
         assert!(background_description.contains("named teammates"));
         assert!(background_description.contains("external ACP agents default to background"));
         assert!(background_description.contains("one-shot Explore agents"));
+    }
+
+    #[test]
+    fn agent_descriptions_follow_session_completion_capabilities() {
+        let tool = AgentTool::new();
+        for description in [tool.description(), tool.model_description()] {
+            assert!(description.contains("session-specific guidance"));
+            assert!(!description.contains("report completion automatically"));
+            assert!(!description.contains("you will be automatically notified"));
+            assert!(description.contains("Without automatic continuation"));
+        }
+    }
+
+    #[test]
+    fn agent_descriptions_choose_mode_before_reuse_and_retain_delivery() {
+        let tool = AgentTool::new();
+        for description in [tool.description(), tool.model_description()] {
+            assert!(description.contains("Choose a feasible execution mode before teammate reuse"));
+            assert!(description.contains("retain responsibility for results and verification"));
+        }
+        assert!(tool
+            .model_description()
+            .contains("Yielding is not final delivery"));
+        assert!(tool
+            .model_description()
+            .contains("latest pause, cancellation, or scope change"));
+    }
+
+    #[test]
+    fn background_schema_does_not_assume_automatic_continuation() {
+        let schema = AgentTool::new().input_schema();
+        let description = schema["properties"]["run_in_background"]["description"]
+            .as_str()
+            .expect("background description");
+        assert!(description.contains("Follow session-specific guidance for automatic continuation"));
+        assert!(description
+            .contains("foreground one-shot work or execute directly for necessary dependencies"));
     }
 
     #[test]

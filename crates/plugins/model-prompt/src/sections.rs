@@ -38,12 +38,18 @@ over lengthy explanations. Code and tool calls are exempt from this guidance.";
 pub fn astra_working() -> String {
     let mut lines = vec!["# Working in this session".to_string()];
     lines.push(
-        "- In one line between tool calls, explain your current action and its purpose."
+        "- Explain actions at the start, meaningful milestones, changes of plan, or real blockers. \
+Do not narrate each routine tool call; keep execution moving."
             .to_string(),
     );
     lines.push(
-        "- End with a self-contained answer stating what changed, what you checked and \
-how you checked it, and what remains to be done."
+        "- Distinguish completion, pause, waiting, and blockage using the task decision order. \
+Summarize the deliverable and actual checks only after completion; report blockage only when \
+all remaining necessary work is blocked and no executable work or running necessary dependency \
+remains. Honor a pause or cancellation without calling it completion. Waiting may end a model \
+turn, not the task: give only a brief progress update and retain responsibility. Do executable \
+authorized follow-up before replying, including updating the current deliverable; never finish \
+with \"analyzed but not updated\" when the update is clear. Do not manufacture a remaining-work section."
             .to_string(),
     );
     lines.push(

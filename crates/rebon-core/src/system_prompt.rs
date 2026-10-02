@@ -1124,6 +1124,8 @@ mod tests {
     fn using_tools_keeps_optional_tool_gates_and_task_priority() {
         let task_only = using_tools_section(&["TaskCreate".into()]);
         assert!(task_only.contains("Use TaskCreate to divide up and manage the work"));
+        assert!(task_only.contains("simple questions and single-step actions need no task list"));
+        assert!(task_only.contains("delegation and starting a check do not mean completion"));
         let both = using_tools_section(&["TodoWrite".into(), "TaskCreate".into()]);
         assert!(both.contains("Use TodoWrite to divide up and manage the work"));
         assert!(!both.contains("Use TaskCreate"));
@@ -1194,7 +1196,13 @@ mod tests {
     fn background_shell_guidance_follows_whether_the_frontend_can_wake_the_model() {
         let tools = ["Bash".to_string()];
         let wakes = session_specific_guidance_section(&tools, &[], true).unwrap();
-        assert!(wakes.contains("end your turn instead of waiting on it"), "{wakes}");
+        assert!(
+            wakes.contains("end your turn instead of waiting on it"),
+            "{wakes}"
+        );
+        assert!(wakes.contains("do not issue a final delivery summary"));
+        assert!(wakes.contains("Starting a command is not a passing check"));
+        assert!(wakes.contains("honor the user's latest pause, cancellation, or scope change"));
         assert!(!wakes.contains("cannot wake you"), "{wakes}");
 
         let cannot = session_specific_guidance_section(&tools, &[], false).unwrap();
@@ -1829,20 +1837,21 @@ mod tests {
             "Choose a specialized agent through Agent when its description fits the task"
         ));
         assert!(prompt.contains("subagent_type=Explore"));
-        assert!(prompt.contains("scope of codebase exploration is unknown"));
+        assert!(prompt.contains("Choose direct lookup or delegation by search scope"));
         assert!(prompt.contains("default for a one-shot Explore agent is foreground execution"));
         assert!(prompt.contains("Named Explore teammates instead operate asynchronously"));
         assert!(prompt.contains("Leave `run_in_background` unset for them too"));
         assert!(prompt.contains("`name` must never be paired with per-call `cwd`"));
         assert!(prompt.contains("Named teammates default to background execution"));
-        assert!(prompt.contains("never set `run_in_background` to false just to wait"));
+        assert!(prompt.contains("Never set `run_in_background` to false just to wait"));
         assert!(prompt.contains("`allowed_roots`, `isolation`, or `allowed_tools`"));
         assert!(prompt.contains("`name` and `team_name` and use a one-shot sub-agent instead"));
         assert!(prompt.contains("Waiting on a background agent must never involve Sleep, polling, or repeated progress checks"));
         assert!(prompt.contains("completion automatically produces an event that opens a new turn"));
-        assert!(prompt.contains("End your current turn immediately"));
-        assert!(prompt.contains("do not prolong the session or keep the provider cache alive"));
-        assert!(prompt.contains("no more than one inexpensive, targeted probe"));
+        assert!(prompt.contains("end your current turn without a final delivery summary"));
+        assert!(prompt.contains("Do not prolong the session or keep the provider cache alive"));
+        assert!(prompt.contains("Do not force delegation after one missed probe"));
+        assert!(!prompt.contains("no more than one inexpensive, targeted probe"));
         assert!(!prompt.contains("more than 3 queries"));
     }
 
@@ -1938,6 +1947,10 @@ mod tests {
         );
         assert!(section.contains("A one-off search, review, verification, or implementation must not receive a name merely as a label"));
         assert!(section.contains("leave `name` out for ordinary one-shot delegation"));
+        let mode = section.find("Choose a feasible execution mode").unwrap();
+        let reuse = section.find("check the present teammate roster").unwrap();
+        assert!(mode < reuse);
+        assert!(section.contains("do not put the critical path into a background-only teammate"));
     }
 
     #[test]
@@ -1970,6 +1983,12 @@ mod tests {
         assert!(!manual.contains("opens a new turn"));
         assert!(manual.contains("notifications appear at the beginning of your next turn"));
         assert!(manual.contains("must never involve Sleep, polling"));
+        assert!(manual.contains("Choose a foreground one-shot agent or work directly"));
+        assert!(manual.contains("another user message is needed to resume"));
+        assert!(!manual.contains("without asking the user to say continue"));
+        assert!(auto.contains("Yielding is not completion"));
+        assert!(auto.contains("honor the user's latest pause, cancellation, or scope change"));
+        assert!(auto.contains("otherwise resume without asking the user to say continue"));
     }
 
     #[test]
@@ -2040,6 +2059,60 @@ mod tests {
     // at first glance, but the *point* of this layer is that the
     // wording is pinned verbatim — silent edits
     // here would be the bug, not the assertion.
+
+    #[test]
+    fn doing_tasks_continues_until_deliverable_is_complete() {
+        let section = doing_tasks_section(None);
+        for required in [
+            "Complete the requested deliverable end to end",
+            "Explaining unfinished work does not replace doing it",
+            "update that deliverable and check the result",
+            "A local blocker does not stop independent work",
+            "Do not turn executable work into a user to-do list",
+        ] {
+            assert!(
+                section.contains(required),
+                "missing closure rule: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn doing_tasks_orders_stop_conditions_before_final_delivery() {
+        let section = doing_tasks_section(None);
+        let steps = [
+            "1. Honor the user's latest pause, cancellation, or scope change",
+            "2. Check scope and authorization",
+            "3. Execute remaining authorized work",
+            "4. If only running dependencies remain",
+            "5. Report a blocker only when unfinished necessary work remains",
+            "6. Deliver the final result when the request and necessary checks are complete",
+        ];
+        let positions: Vec<_> = steps
+            .iter()
+            .map(|step| {
+                section
+                    .find(step)
+                    .unwrap_or_else(|| panic!("missing step: {step}"))
+            })
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(section.contains("neither executable work nor a running necessary dependency"));
+    }
+
+    #[test]
+    fn doing_tasks_revalidates_changed_inputs_without_inventing_more_work() {
+        let section = doing_tasks_section(None);
+        for required in [
+            "Choose the minimum sufficient checks once the change scope is understood",
+            "Rerun affected checks when later edits invalidate their results",
+            "Do not invent optional checks or unrequested publishing as unfinished work",
+            "read-only analysis does not authorize implementation",
+            "does not grant permission to commit, push, publish, or perform destructive actions",
+        ] {
+            assert!(section.contains(required), "missing boundary: {required}");
+        }
+    }
 
     #[test]
     fn doing_tasks_has_verify_before_complete_bullet() {

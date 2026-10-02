@@ -184,10 +184,10 @@ fn astra_gets_the_base_plus_the_working_addendum_at_the_end() {
     assert!(!with.contains("`run_code`"));
     for prompt in [&without, &with] {
         assert!(prompt.contains(
-            "In one line between tool calls, explain your current action and its purpose"
+            "Explain actions at the start, meaningful milestones, changes of plan, or real blockers"
         ));
         assert!(prompt.contains(
-            "what changed, what you checked and how you checked it, and what remains to be done"
+            "Distinguish completion, pause, waiting, and blockage using the task decision order"
         ));
         assert!(prompt.contains("a conflict between the user's request and a skill file or REBON.md instruction causes you to stop"));
         assert!(prompt.contains("identify that file and quote the sentence responsible"));
@@ -197,6 +197,31 @@ fn astra_gets_the_base_plus_the_working_addendum_at_the_end() {
     let efficiency = with.find("\n\n# Output efficiency\n").unwrap();
     let addendum = with.find("\n\n# Working in this session\n").unwrap();
     assert!(tone < efficiency && efficiency < addendum);
+}
+
+#[test]
+fn astra_does_not_turn_waiting_into_final_delivery() {
+    let prompt = sections::astra_working();
+    assert!(prompt.contains("Waiting may end a model turn, not the task"));
+    assert!(prompt.contains("all remaining necessary work is blocked"));
+    assert!(prompt.contains("no executable work or running necessary dependency remains"));
+    assert!(!prompt.contains("what remains to be done"));
+}
+
+#[test]
+fn astra_finishes_clear_follow_up_but_honors_user_control() {
+    let prompt = sections::astra_working();
+    assert!(prompt.contains("Honor a pause or cancellation without calling it completion"));
+    assert!(prompt.contains("including updating the current deliverable"));
+    assert!(prompt.contains("Do not manufacture a remaining-work section"));
+}
+
+#[test]
+fn astra_reports_milestones_instead_of_every_tool_call() {
+    let prompt = sections::astra_working();
+    assert!(prompt.contains("meaningful milestones"));
+    assert!(prompt.contains("Do not narrate each routine tool call"));
+    assert!(!prompt.contains("In one line between tool calls"));
 }
 
 /// With the plugin switched off every model loses the two sections, and

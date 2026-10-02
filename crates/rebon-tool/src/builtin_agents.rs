@@ -498,9 +498,10 @@ const EXPLORE_WHEN_TO_USE: &str = "\
 Fast read-only search agent for locating code. Use it to find files by pattern \
 (eg. \"src/components/**/*.tsx\"), grep for symbols or keywords (eg. \"API \
 endpoints\"), or answer \"where is X defined / which files reference Y.\" Prefer \
-this over running multiple Glob/Grep/Read calls yourself when the file set is \
-unknown or the task will need more than 2-3 searches; use direct Glob/Grep/Read \
-only for exact known files, symbols, error messages, or a small known file set. \
+this for cross-module tracing, substantial evidence gathering, or independent \
+parallel research. Use direct Glob/Grep/Read for small, well-bounded questions \
+that a few targeted searches can resolve; do not force delegation after one \
+missed probe or a fixed query count. \
 When calling, specify search breadth: \"quick\" for a single targeted lookup, \
 \"medium\" for moderate exploration, or \"very thorough\" to search across \
 multiple locations and naming conventions.";
@@ -537,7 +538,7 @@ Final response requirements:
 - Report findings directly and concisely
 - Do NOT ask follow-up questions
 - Do NOT offer optional next steps, future work, or phrases such as if you want, if you'd like, or I can next
-- If the investigation is incomplete, state the limitation plainly without asking permission to continue
+- Complete the assigned search with the available read-only tools before reporting. An untried lookup is not a blocker. If a real access or evidence limit prevents completion, state that specific limitation without asking permission to continue
 
 NOTE: You are meant to be a fast agent that returns output as quickly as possible. In order to achieve this you must:
 - Make efficient use of the tools that you have at your disposal: be smart about how you search for files and implementations
@@ -656,11 +657,32 @@ mod tests {
     fn explore_when_to_use_routes_unknown_scope_codebase_search() {
         let def = explore_agent_def();
         assert!(def.when_to_use.contains("Fast read-only search agent"));
-        assert!(def.when_to_use.contains("file set is unknown"));
+        assert!(def.when_to_use.contains("cross-module tracing"));
         assert!(def
             .when_to_use
-            .contains("use direct Glob/Grep/Read only for exact known files"));
+            .contains("Use direct Glob/Grep/Read for small, well-bounded questions"));
         assert!(def.when_to_use.contains("very thorough"));
+    }
+
+    #[test]
+    fn explore_delegation_has_no_fixed_query_count_gate() {
+        let def = explore_agent_def();
+        assert!(def
+            .when_to_use
+            .contains("do not force delegation after one missed probe or a fixed query count"));
+        assert!(!def.when_to_use.contains("more than 2-3 searches"));
+    }
+
+    #[test]
+    fn explore_finishes_available_research_before_reporting_a_limit() {
+        let def = explore_agent_def();
+        assert!(def
+            .system_prompt
+            .contains("Complete the assigned search with the available read-only tools"));
+        assert!(def
+            .system_prompt
+            .contains("An untried lookup is not a blocker"));
+        assert!(def.system_prompt.contains("real access or evidence limit"));
     }
 
     #[test]
