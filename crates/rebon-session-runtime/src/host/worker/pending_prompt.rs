@@ -539,25 +539,26 @@ impl PendingPromptTranscriptState {
     }
 }
 
+/// Whether a user row starts a new turn. Rows the runtime writes into a
+/// running turn do not: meta and context rows, rows only shown in the
+/// transcript, and runtime attachments — the group entries a plugin hands a
+/// member mid-turn, which are queued rows like a typed message but arrive
+/// inside the turn and are answered by it.
 pub(crate) fn transcript_user_entry_is_turn_boundary(
     entry: &rebon_session::TranscriptEntry,
 ) -> bool {
+    let flag = |key: &str| {
+        entry
+            .raw
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
     if entry.entry_type != "user"
-        || entry
-            .raw
-            .get("isMeta")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        || entry
-            .raw
-            .get("runtimeContext")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        || entry
-            .raw
-            .get("isVisibleInTranscriptOnly")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
+        || flag("isMeta")
+        || flag("runtimeContext")
+        || flag("isVisibleInTranscriptOnly")
+        || flag("runtimeAttachment")
     {
         return false;
     }

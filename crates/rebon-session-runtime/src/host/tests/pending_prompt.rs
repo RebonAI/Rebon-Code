@@ -845,6 +845,115 @@ fn pending_prompt_transcript_state_persists_missing_tool_results_once() {
     assert!(interrupted_tool_result_entry(&resumed).is_none());
 }
 
+/// A group member's background turn: the `groups` plugin hands it new group
+/// entries mid-turn as runtime attachments, written as queued user rows. They
+/// are part of the turn they arrived in, not the start of another, so the
+/// turn's last answer still completes the claimed prompt.
+#[test]
+fn pending_prompt_transcript_state_reads_past_mid_turn_runtime_attachments() {
+    let prompt_id = "pp-group-request";
+    let user = rebon_session::finalize_transcript_entry(
+        &rebon_session::TranscriptWriteEntry::new(
+            "user",
+            serde_json::json!({"message": {"role": "user", "content": "(r4) do the work"}}),
+        )
+        .with_uuid(prompt_id),
+    );
+    let attachment = |uuid: &str, parent: &str| {
+        rebon_session::finalize_transcript_entry(
+            &rebon_session::TranscriptWriteEntry::new(
+                "user",
+                serde_json::json!({
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Group g: 1 new — Cleo"}]
+                    },
+                    "modelContent": [{"type": "text", "text": "<system-reminder>…</system-reminder>"}],
+                    "queuedCommand": true,
+                    "runtimeAttachment": true
+                }),
+            )
+            .with_uuid(uuid)
+            .with_parent(parent),
+        )
+    };
+    let tool_use = rebon_session::finalize_transcript_entry(
+        &rebon_session::TranscriptWriteEntry::new(
+            "assistant",
+            serde_json::json!({
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "tool-1", "name": "Read", "input": {}}],
+                    "stop_reason": "tool_use"
+                }
+            }),
+        )
+        .with_uuid("a-tool-use")
+        .with_parent("u-group-attachment-1"),
+    );
+    let tool_result = rebon_session::finalize_transcript_entry(
+        &rebon_session::TranscriptWriteEntry::new(
+            "user",
+            serde_json::json!({
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"}]
+                }
+            }),
+        )
+        .with_uuid("u-tool-result")
+        .with_parent("a-tool-use"),
+    );
+    let terminal = rebon_session::finalize_transcript_entry(
+        &rebon_session::TranscriptWriteEntry::new(
+            "assistant",
+            serde_json::json!({
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "reported to the group"}],
+                    "stop_reason": "end_turn"
+                }
+            }),
+        )
+        .with_uuid("a-terminal")
+        .with_parent("u-group-attachment-2"),
+    );
+
+    // Right after the prompt, and again between a tool result and the answer.
+    let partial = vec![
+        user,
+        attachment("u-group-attachment-1", prompt_id),
+        tool_use,
+        tool_result,
+        attachment("u-group-attachment-2", "u-tool-result"),
+    ];
+    assert_eq!(
+        pending_prompt_transcript_state_in_messages(&partial, prompt_id),
+        PendingPromptTranscriptState::ResumeSavedUser,
+        "a turn the attachments interrupt is still unfinished"
+    );
+    let mut completed = partial;
+    completed.push(terminal);
+    assert_eq!(
+        pending_prompt_transcript_state_in_messages(&completed, prompt_id),
+        PendingPromptTranscriptState::Completed
+    );
+
+    // A queued message the user typed is still a turn of its own.
+    let typed = rebon_session::finalize_transcript_entry(
+        &rebon_session::TranscriptWriteEntry::new(
+            "user",
+            serde_json::json!({
+                "message": {"role": "user", "content": "also check the docs"},
+                "queuedCommand": true
+            }),
+        )
+        .with_uuid("u-typed")
+        .with_parent(prompt_id),
+    );
+    assert!(transcript_user_entry_is_turn_boundary(&typed));
+}
+
 #[test]
 fn pending_prompt_transcript_state_ignores_prompt_on_noncanonical_branch() {
     let prompt = rebon_session::finalize_transcript_entry(
