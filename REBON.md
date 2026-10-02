@@ -365,9 +365,13 @@ rebon-tools-core.  rebon-types ─▶ rebon-tools-core; rebon-session ─▶ bot
 
 ## Conventions that are load-bearing
 
-- **Tests are not optional per change.** Every Rust change ships with a
-  coverage matrix, not just a happy-path test. A change with only one or two
-  tests is not done.
+- **Tests are not optional per change.** Cover the changed behavior and its
+  risks, including applicable normal, boundary and failure paths, not just
+  the happy path. Test count follows the scenarios; existing tests count
+  toward coverage, and one or two tests are not inherently insufficient.
+  Explain requirement-to-test coverage for complex or cross-module changes;
+  simple changes do not need a separate coverage-matrix file. Run the relevant
+  tests and inspect their results before claiming verification passed.
 - **Keep mobile golden baselines in sync.** Any mobile UI change that affects
   golden rendering must update the corresponding images, then verify the
   targeted golden tests without `--update-goldens` and run the full mobile
@@ -535,11 +539,15 @@ the number is what a raise then negotiates with. Read the change instead.
   re-exports and multi-line `use {...}`, so treat it as a lead only.
 - A serde compatibility variant (an enum variant kept to read old files) is not
   dead code by reference count.
-- Run `cargo check --all-targets` before deleting any symbol; looking at
-  warnings from the bin target alone will delete code the tests use. To tell
-  whether something is test-only: `cargo check` reports it and `cargo check
-  --tests` does not. `touch` the file first, or cargo's cache will hand you a
-  convincing zero-warning run.
+- Before deleting a symbol, run `cargo check -p <crate> --all-targets` for
+  the affected crate and inspect references and code, including tests and
+  examples; bin-target warnings alone do not prove a symbol is unused. Check
+  affected dependents for cross-crate symbols or shared contracts, expanding
+  to the workspace when needed. Compare normal and test checks for the
+  affected crate when judging test-only use; absence of warnings is not
+  evidence of no references. Re-run the affected checks after deletion. The
+  internal/external reference, compatibility-variant and code-reading rules
+  still apply.
 - A claim of "no references anywhere" ships with the grep command and its
   output.
 - Remove `#[allow(dead_code)]` and let the compiler report. Delete along the
@@ -583,10 +591,15 @@ the number is what a raise then negotiates with. Read the change instead.
 - Fixing a defect starts with a test that fails before the fix.
 - Tests do not depend on mtime ordering, line endings, the current directory,
   or a real repository's git history.
-- When a timing-sensitive test fails, run it three times on its own before
-  attributing the failure; the standard is the same machine and the same
-  `--exact --nocapture` command, run once on a clean HEAD and once with the
-  patch.
+- When a timing-sensitive test fails, read the failure and related code
+  first. To attribute it to flakiness or the patch, run it three times alone
+  with the same `--exact --nocapture` command on the same machine, comparing
+  an isolated clean baseline with the patched version; one passing rerun
+  does not prove flakiness. Never checkout, reset or overwrite uncommitted
+  work for a baseline check. If the patch clearly caused the failure, fix
+  it and re-test rather than repeating unrelated attribution checks. When
+  baseline comparison is impossible, retain uncertainty instead of claiming
+  the failure is pre-existing.
 - A `#[tokio::test]` that touches subprocesses or the plugin plane uses
   `flavor = "multi_thread"`, and a test that started the plugin plane ends with
   `plane.shutdown().await`. A test that reads or writes environment variables
