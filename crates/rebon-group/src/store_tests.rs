@@ -458,6 +458,48 @@ fn the_user_posts_without_joining_and_members_answer_them() {
 }
 
 #[test]
+fn the_users_seen_mark_moves_forward_within_the_log_and_apart_from_members() {
+    let (dir, store, group) = pair();
+    let user_read = || {
+        store
+            .cursors(&group.id)
+            .unwrap()
+            .get(USER)
+            .map(|cursor| cursor.read)
+    };
+    // Nothing is written before the user has looked.
+    assert_eq!(user_read(), None);
+    let last = store
+        .post_as_user(&group.id, note("all", "status?"))
+        .unwrap()
+        .seq;
+
+    store.mark_user_seen(&group.id, last).unwrap();
+    assert_eq!(user_read(), Some(last));
+    // An older view's mark does not move it back.
+    store.mark_user_seen(&group.id, 1).unwrap();
+    assert_eq!(user_read(), Some(last));
+    // A mark past the log's end stops at the end.
+    store.mark_user_seen(&group.id, last + 50).unwrap();
+    assert_eq!(user_read(), Some(last));
+
+    // Standing still writes nothing: the file keeps a spelling the store
+    // would not have written.
+    let cursors = dir.path().join("groups").join(&group.id).join(CURSORS_FILE);
+    let compact = serde_json::to_string(&store.cursors(&group.id).unwrap()).unwrap();
+    std::fs::write(&cursors, &compact).unwrap();
+    store.mark_user_seen(&group.id, last).unwrap();
+    assert_eq!(std::fs::read_to_string(&cursors).unwrap(), compact);
+
+    // The members' cursors are untouched, and the user is no member.
+    let coder = store
+        .inbox(&group.id, &key("claude-code", "c1"), false)
+        .unwrap();
+    assert_eq!(coder.entries.len(), 1);
+    assert!(store.mark_user_seen("../escape", 1).is_err());
+}
+
+#[test]
 fn a_member_brought_in_before_its_session_had_an_id_takes_the_id_later() {
     let (_dir, store, group) = pair();
     store

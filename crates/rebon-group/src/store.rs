@@ -647,10 +647,32 @@ impl GroupStore {
         self.with_lock(id, || read_lines(&self.dir(id).join(DELIVERIES_FILE)))
     }
 
-    /// Every member's cursor, keyed as [`MemberKey::as_string`].
+    /// Every member's cursor, keyed as [`MemberKey::as_string`], and the
+    /// user's under [`USER`] once they have looked (see
+    /// [`Self::mark_user_seen`]). A member key always has a `:`, so the two
+    /// never meet.
     pub fn cursors(&self, id: &str) -> Result<BTreeMap<String, Cursor>> {
         check_id(id)?;
         self.with_lock(id, || read_cursors(&self.dir(id)))
+    }
+
+    /// Records that the user has seen the log up to `seq`: the group view
+    /// showed it to them. It only moves forward and never past the log's
+    /// end, and nothing is written when it stands still.
+    pub fn mark_user_seen(&self, id: &str, seq: u64) -> Result<()> {
+        check_id(id)?;
+        self.with_lock(id, || {
+            let dir = self.dir(id);
+            let last_seq = read_group_file(&dir.join(GROUP_FILE))?.last_seq;
+            let mut cursors = read_cursors(&dir)?;
+            let cursor = cursors.entry(USER.to_string()).or_default();
+            let read = cursor.read.max(seq.min(last_seq));
+            if read == cursor.read {
+                return Ok(());
+            }
+            cursor.read = read;
+            write_json(&dir.join(CURSORS_FILE), &cursors)
+        })
     }
 
     /// The group's memory as it stands: memory entries, less the ones a
