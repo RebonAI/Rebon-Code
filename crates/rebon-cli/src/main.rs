@@ -435,9 +435,12 @@ enum Command {
     ///
     /// Example: `rebon exec --json --model gpt-5.4 "what is the weather in Beijing?"`
     Exec {
-        /// The prompt text to send (all trailing words are joined).
-        #[arg(value_name = "PROMPT", num_args = 1.., trailing_var_arg = true)]
+        /// 要发送的提示词文本（所有尾随词以空格连接），与 --prompt-file 互斥。
+        #[arg(value_name = "PROMPT", num_args = 1.., trailing_var_arg = true, required_unless_present = "prompt_file")]
         prompt: Vec<String>,
+        /// 从 UTF-8 文件读取提示词（支持 BOM）；使用 - 从 stdin 读取。
+        #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
+        prompt_file: Option<PathBuf>,
         /// Emit machine-readable JSONL events on stdout (one object per line).
         /// Without it, a compact human-readable trace is printed instead.
         #[arg(long = "json", default_value_t = false)]
@@ -1409,14 +1412,6 @@ async fn async_main() -> anyhow::Result<()> {
 async fn route_main() -> anyhow::Result<()> {
     let startup_started = std::time::Instant::now();
     let mut cli = Cli::parse();
-    // Runs before any route can touch `config.json`: the seeding rule keys off
-    // "config exists but has no flag", so a first run must still look like a
-    // first run here.
-    rebon_config::migrate_claude_codex_fallback_default();
-    // Provider definitions move to `~/.rebon/providers/` here, before any
-    // route resolves one. Reversible and non-fatal: a failure leaves
-    // `config.json` authoritative.
-    rebon_config::migrate_providers_to_store();
     let route = classify_cli_startup(&cli)?;
     let cwd_scope = match cli.cwd.as_ref() {
         Some(cwd) => {
@@ -1429,6 +1424,23 @@ async fn route_main() -> anyhow::Result<()> {
         }
         None => None,
     };
+    let exec_prompt = match cli.command.as_ref() {
+        Some(Command::Exec {
+            prompt,
+            prompt_file,
+            json,
+            ..
+        }) => Some(exec::prepare_prompt(prompt, prompt_file.as_deref(), *json)?),
+        _ => None,
+    };
+    // Runs before any route can touch `config.json`: the seeding rule keys off
+    // "config exists but has no flag", so a first run must still look like a
+    // first run here.
+    rebon_config::migrate_claude_codex_fallback_default();
+    // Provider definitions move to `~/.rebon/providers/` here, before any
+    // route resolves one. Reversible and non-fatal: a failure leaves
+    // `config.json` authoritative.
+    rebon_config::migrate_providers_to_store();
     match route {
         StartupRoute::AgentView => {
             init_tracing(true);
@@ -1466,7 +1478,8 @@ async fn route_main() -> anyhow::Result<()> {
             );
             match command {
                 Command::Exec {
-                    prompt,
+                    prompt: _,
+                    prompt_file: _,
                     json,
                     resume,
                     ephemeral,
@@ -1477,7 +1490,7 @@ async fn route_main() -> anyhow::Result<()> {
                     max_duration,
                 } => {
                     return exec::run(exec::ExecArgs {
-                        prompt: prompt.join(" "),
+                        prompt: exec_prompt.expect("exec input was resolved before startup"),
                         json,
                         resume,
                         ephemeral,
@@ -1880,6 +1893,68 @@ mod tests {
     }
 
     #[test]
+    fn exec_prompt_file_parses_paths_and_stdin() {
+        for path in ["prompt.txt", "提示词 with spaces.txt", "-"] {
+            let cli = Cli::try_parse_from(["rebon", "exec", "--prompt-file", path]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Exec { prompt, prompt_file, .. })
+                    if prompt.is_empty() && prompt_file == Some(PathBuf::from(path))
+            ));
+        }
+    }
+
+    #[test]
+    fn exec_prompt_file_requires_one_input_and_rejects_conflicts() {
+        for args in [vec!["rebon", "exec"], vec!["rebon", "exec", "--json"]] {
+            assert_eq!(
+                Cli::try_parse_from(args).unwrap_err().kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+        }
+        assert_eq!(
+            Cli::try_parse_from(["rebon", "exec", "--prompt-file"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::InvalidValue
+        );
+        for path in ["prompt.txt", "-"] {
+            let error =
+                Cli::try_parse_from(["rebon", "exec", "--prompt-file", path, "positional prompt"])
+                    .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn exec_prompt_file_keeps_trailing_positional_behavior() {
+        let cli = Cli::try_parse_from([
+            "rebon",
+            "exec",
+            "inspect",
+            "--prompt-file",
+            "literal.txt",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Exec { prompt, prompt_file: None, json: false, .. })
+                if prompt == ["inspect", "--prompt-file", "literal.txt", "--json"]
+        ));
+    }
+
+    #[test]
+    fn exec_prompt_file_help_describes_utf8_bom_and_stdin() {
+        let error = Cli::try_parse_from(["rebon", "exec", "--help"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        for expected in ["--prompt-file <PATH>", "PROMPT", "UTF-8", "BOM", "stdin"] {
+            assert!(help.contains(expected), "{help}");
+        }
+    }
+
+    #[test]
     fn exec_configuration_flags_parse_after_subcommand() {
         let cli = Cli::parse_from([
             "rebon",
@@ -1897,6 +1972,7 @@ mod tests {
             cli.command,
             Some(Command::Exec {
                 prompt: vec!["inspect".to_string(), "the project".to_string()],
+                prompt_file: None,
                 json: false,
                 resume: None,
                 ephemeral: false,
@@ -1942,6 +2018,7 @@ mod tests {
             cli.command,
             Some(Command::Exec {
                 prompt: vec!["inspect".to_string()],
+                prompt_file: None,
                 json: false,
                 resume: None,
                 ephemeral: false,
