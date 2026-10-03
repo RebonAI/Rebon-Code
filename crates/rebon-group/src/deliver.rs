@@ -20,7 +20,9 @@
 //! `SessionStart` and `PostToolUse` events, hand it the session on stdin,
 //! and add what it prints as `additionalContext` — at the start of the next
 //! turn, or beside a tool result mid-turn. Neither starts a turn, so the
-//! hook is never the thing that wakes a member.
+//! hook is never the thing that wakes a member. `SessionStart` has no turn
+//! of its own to answer in, so it leaves what would wake the member pending
+//! for the app to type.
 
 use serde_json::{json, Value};
 
@@ -139,6 +141,20 @@ pub fn delivered(store: &GroupStore, member: &MemberKey, pending: &Pending, via:
     true
 }
 
+/// What a channel that starts no turn may hand over of `pending`: the
+/// briefing, the memory and the entries before the first one that wakes the
+/// member ([`crate::render::wakes`]). That entry and the rest stay pending,
+/// so the app can still type it into the idle CLI; handed over here, it
+/// would sit in a context with no turn to answer it, and the app would see
+/// nothing left to wake the member for.
+fn until_first_wake(mut pending: Pending) -> Pending {
+    if let Some(index) = pending.entries.iter().position(crate::render::wakes) {
+        pending.through = pending.entries[index].seq - 1;
+        pending.entries.truncate(index);
+    }
+    pending
+}
+
 /// The hook events that can carry context into the model.
 const CONTEXT_EVENTS: &[&str] = &["UserPromptSubmit", "SessionStart", "PostToolUse"];
 
@@ -169,7 +185,10 @@ pub fn hook_output(store: &GroupStore, agent: &str, input: &Value) -> Option<Val
             .get("source")
             .and_then(Value::as_str)
             .is_some_and(|source| FRESH_SOURCES.contains(&source));
-    let pending = pending_with(store, &member, fresh)?;
+    let mut pending = pending_with(store, &member, fresh)?;
+    if event == "SessionStart" {
+        pending = until_first_wake(pending);
+    }
     let text = crate::render::context(&pending);
     // Moved past what was looked at even when none of it was ours, so the
     // next event does not read it again.
@@ -315,6 +334,123 @@ mod tests {
         let output = hook_output(&store, "claude-code", &input("PostToolUse"))
             .expect("收件箱游标不应控制记忆注入");
         assert!(output.to_string().contains("shared-api-v2"));
+    }
+
+    #[test]
+    fn a_session_start_leaves_a_request_for_the_app_to_wake_the_member_with() {
+        for source in ["startup", "clear", "compact", "resume"] {
+            let (_dir, store, group) = setup(Delivery::Auto);
+            let planner = member("rebon", "s1", "planner", Delivery::Auto).key();
+            let coder = member("claude-code", "aa38", "coder", Delivery::Auto).key();
+            // The request from `setup` is followed by a note and a fact.
+            store
+                .append(
+                    &group,
+                    &planner,
+                    Draft {
+                        kind: EntryKind::Note,
+                        to: Some("coder".into()),
+                        re: None,
+                        supersedes: None,
+                        text: "context for it".into(),
+                    },
+                )
+                .unwrap();
+            remember(&store, &group, "shared-api-v2", None);
+            let start = json!({
+                "session_id": "aa38", "hook_event_name": "SessionStart", "source": source
+            });
+            // A session start opens no turn: the briefing and memory go into
+            // the context, the request stays for the app to type.
+            let output = hook_output(&store, "claude-code", &start).unwrap();
+            assert!(output.to_string().contains("shared-api-v2"), "{source}");
+            assert!(!output.to_string().contains("add the tests"), "{source}");
+            let waiting = pending(&store, &coder).unwrap();
+            let line = crate::render::terminal_prompt(&waiting.group, &waiting.entries);
+            assert!(line.unwrap().contains("add the tests"), "{source}");
+            // The turn that starts gets the request and what followed it.
+            let output = hook_output(&store, "claude-code", &input("UserPromptSubmit")).unwrap();
+            let text = output.to_string();
+            assert!(text.contains("add the tests") && text.contains("context for it"));
+            assert!(pending(&store, &coder).is_none(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_session_start_hands_over_what_came_before_the_first_request() {
+        let (_dir, store, group) = setup(Delivery::Auto);
+        let planner = member("rebon", "s1", "planner", Delivery::Auto).key();
+        let coder = member("claude-code", "aa38", "coder", Delivery::Auto).key();
+        hook_output(&store, "claude-code", &input("UserPromptSubmit")).unwrap();
+        for (kind, text) in [
+            (EntryKind::Note, "an earlier note"),
+            (EntryKind::Request, "a later request"),
+        ] {
+            store
+                .append(
+                    &group,
+                    &planner,
+                    Draft {
+                        kind,
+                        to: Some("coder".into()),
+                        re: None,
+                        supersedes: None,
+                        text: text.into(),
+                    },
+                )
+                .unwrap();
+        }
+        let start = json!({
+            "session_id": "aa38", "hook_event_name": "SessionStart", "source": "compact"
+        });
+        let text = hook_output(&store, "claude-code", &start)
+            .unwrap()
+            .to_string();
+        assert!(text.contains("an earlier note"));
+        assert!(!text.contains("a later request"));
+        let waiting = pending(&store, &coder).unwrap();
+        assert_eq!(waiting.entries.len(), 1);
+        assert_eq!(waiting.entries[0].text, "a later request");
+        // The user's answer to the member wakes it too, and waits the same way.
+        let (_dir, store, group) = setup(Delivery::Auto);
+        let question = store
+            .append(
+                &group,
+                &coder,
+                Draft {
+                    kind: EntryKind::Request,
+                    to: Some("user".into()),
+                    re: None,
+                    supersedes: None,
+                    text: "which one?".into(),
+                },
+            )
+            .unwrap();
+        hook_output(&store, "claude-code", &input("UserPromptSubmit")).unwrap();
+        store
+            .post_as_user(
+                &group,
+                Draft {
+                    kind: EntryKind::Reply,
+                    to: Some("coder".into()),
+                    re: question.id.clone(),
+                    supersedes: None,
+                    text: "use the first one".into(),
+                },
+            )
+            .unwrap();
+        let text = hook_output(&store, "claude-code", &start)
+            .map(|output| output.to_string())
+            .unwrap_or_default();
+        assert!(!text.contains("use the first one"));
+        assert!(pending(&store, &coder).is_some());
+    }
+
+    #[test]
+    fn mid_turn_hooks_still_hand_requests_over() {
+        let (_dir, store, _) = setup(Delivery::Auto);
+        let output = hook_output(&store, "claude-code", &input("PostToolUse")).unwrap();
+        assert!(output.to_string().contains("add the tests"));
     }
 
     #[test]

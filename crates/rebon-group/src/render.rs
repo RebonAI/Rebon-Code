@@ -245,18 +245,18 @@ pub fn user_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
     Some(text)
 }
 
+/// Whether `entry` is worth starting a turn for: a request, or the user's
+/// answer. The rest waits for a turn the member starts anyway.
+pub fn wakes(entry: &Entry) -> bool {
+    entry.kind == EntryKind::Request || (entry.kind == EntryKind::Reply && entry.is_from_user())
+}
+
 /// What the app types into a CLI's input to wake it: one line, since a
 /// terminal submits on Enter and folds long pastes away, that says who
 /// asked what and where the rest is. It reads as the user's message, so it
 /// says plainly that it is relayed.
 pub fn terminal_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
-    let requests: Vec<&Entry> = entries
-        .iter()
-        .filter(|entry| {
-            entry.kind == EntryKind::Request
-                || (entry.kind == EntryKind::Reply && entry.is_from_user())
-        })
-        .collect();
+    let requests: Vec<&Entry> = entries.iter().filter(|entry| wakes(entry)).collect();
     if requests.is_empty() {
         return None;
     }
