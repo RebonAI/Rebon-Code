@@ -36,6 +36,9 @@ const TAIL_BYTES: u64 = 512 * 1024;
 /// A turn left open this long ago is taken to have died with its process.
 const STALE_BUSY_MS: u64 = 10 * 60 * 1000;
 
+// Leave a gap between turns rather than spending a compaction call while work resumes.
+const COMPACT_IDLE_MS: u64 = 5 * 60 * 1000;
+
 /// Where each agent keeps its sessions.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Homes {
@@ -158,13 +161,28 @@ pub fn state(activity: &Activity, warmth: &Warmth, now_ms: u64) -> State {
     if idle_ms > u64::from(minutes) * 60_000 {
         return State::Cold;
     }
-    let window = activity.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
-    if let Some(tokens) = activity.context_tokens {
-        if tokens as f64 > f64::from(warmth.context_ratio) * window as f64 {
-            return State::Cold;
-        }
+    if long_context(activity, warmth) {
+        return State::Cold;
     }
     State::Warm
+}
+
+/// Whether an explicitly completed turn has been idle long enough to compact.
+/// Unlike wake-up warmth, a stale open turn is never considered idle here.
+pub fn compact_due(activity: &Activity, warmth: &Warmth, now_ms: u64) -> bool {
+    activity.busy == Some(false)
+        && activity
+            .last_activity_ms
+            .is_some_and(|last| now_ms.saturating_sub(last) >= COMPACT_IDLE_MS)
+        && activity.context_window != Some(0)
+        && long_context(activity, warmth)
+}
+
+fn long_context(activity: &Activity, warmth: &Warmth) -> bool {
+    let window = activity.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    activity
+        .context_tokens
+        .is_some_and(|tokens| tokens as f64 > f64::from(warmth.context_ratio) * window as f64)
 }
 
 /// `<root>/<any project>/<session_id>.jsonl`.

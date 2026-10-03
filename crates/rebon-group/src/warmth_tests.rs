@@ -222,6 +222,70 @@ fn session_path_finds_nothing_unknown_missing_or_escaping() {
 }
 
 #[test]
+fn idle_compaction_waits_for_five_minutes_and_a_long_context() {
+    let activity = Activity {
+        last_activity_ms: Some(1_000),
+        busy: Some(false),
+        context_tokens: Some(130_000),
+        ..Activity::default()
+    };
+    assert!(!compact_due(&activity, &Warmth::default(), 300_999));
+    assert!(compact_due(&activity, &Warmth::default(), 301_000));
+    assert!(!compact_due(&activity, &Warmth::default(), 999));
+}
+
+#[test]
+fn idle_compaction_never_treats_stale_work_or_unknown_state_as_idle() {
+    for busy in [Some(true), None] {
+        let activity = Activity {
+            last_activity_ms: Some(1_000),
+            busy,
+            context_tokens: Some(190_000),
+            ..Activity::default()
+        };
+        assert!(!compact_due(&activity, &Warmth::default(), 3_601_000));
+    }
+    assert!(!compact_due(
+        &Activity::default(),
+        &Warmth::default(),
+        3_601_000
+    ));
+}
+
+#[test]
+fn idle_compaction_uses_the_groups_context_threshold_and_model_window() {
+    let activity = Activity {
+        last_activity_ms: Some(1_000),
+        busy: Some(false),
+        context_tokens: Some(130_000),
+        context_window: Some(272_000),
+        ..Activity::default()
+    };
+    assert!(!compact_due(&activity, &Warmth::default(), 301_000));
+    let warmth = Warmth {
+        context_ratio: 0.4,
+        ..Warmth::default()
+    };
+    assert!(compact_due(&activity, &warmth, 301_000));
+}
+
+#[test]
+fn idle_compaction_leaves_short_missing_or_invalid_context_alone() {
+    let mut activity = Activity {
+        last_activity_ms: Some(1_000),
+        busy: Some(false),
+        ..Activity::default()
+    };
+    for tokens in [None, Some(0), Some(10_000), Some(120_000)] {
+        activity.context_tokens = tokens;
+        assert!(!compact_due(&activity, &Warmth::default(), 301_000));
+    }
+    activity.context_tokens = Some(190_000);
+    activity.context_window = Some(0);
+    assert!(!compact_due(&activity, &Warmth::default(), 301_000));
+}
+
+#[test]
 fn knows_exactly_the_agents_session_path_looks_for() {
     let dir = tempfile::tempdir().unwrap();
     for (agent, file) in [
