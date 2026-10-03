@@ -3,12 +3,16 @@
 //! Waking an agent re-sends its whole context. While its provider still
 //! caches that context the cost is small; once the cache has expired, or the
 //! context is so long that a re-read is expensive anyway, a group message is
-//! not worth it and waits in the inbox. Each agent keeps the facts that tell
-//! the two apart in its own files, and this module reads them:
+//! not worth it and waits in the inbox. A short context — a fresh session,
+//! or one just compacted — is cheap to re-read uncached, so an idle member
+//! carrying one stays wakeable past the cache and the group's idle limit.
+//! Each agent keeps the facts that tell these apart in its own files, and
+//! this module reads them:
 //!
 //! | agent | file | busy | context |
 //! |---|---|---|---|
-//! | rebon, Claude Code | `<projects>/*/<session>.jsonl` | last turn not ended | last assistant `usage` |
+//! | rebon | `<projects>/*/<session>.jsonl` | last turn not ended | last assistant `usage`, or the size of a newer `<session>.compact.json` |
+//! | Claude Code | `<projects>/*/<session>.jsonl` | last turn not ended | last assistant `usage`, or the last compaction's |
 //! | Codex | `<codex home>/sessions/Y/M/D/rollout-*-<session>.jsonl` | `task_started` last | `token_count` |
 //! | Grok Build | `<grok home>/sessions/*/<session>/` | — | `signals.json` |
 //!
@@ -38,6 +42,18 @@ const STALE_BUSY_MS: u64 = 10 * 60 * 1000;
 
 // Leave a gap between turns rather than spending a compaction call while work resumes.
 const COMPACT_IDLE_MS: u64 = 5 * 60 * 1000;
+
+/// A context at most this share of the long-context threshold is short:
+/// cheap to re-read uncached. A fresh Claude Code session measures about
+/// 45k tokens with its system prompt and tools, and a compaction summary
+/// adds 10–20k; two thirds of the default threshold (80k of 120k) holds
+/// that with room and stays clear of the contexts compaction is for.
+const SHORT_CONTEXT_SHARE: f64 = 2.0 / 3.0;
+
+/// Roughly how many bytes of serialized history make a token, for a size
+/// read off a file rather than reported by a model. JSON's own syntax makes
+/// it overestimate, which errs toward leaving a member alone.
+const BYTES_PER_TOKEN: u64 = 4;
 
 /// Where each agent keeps its sessions.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -93,7 +109,8 @@ pub enum State {
     Busy,
     /// Idle and cheap to wake.
     Warm,
-    /// Idle past its cache, or carrying a long context: leave it be.
+    /// Idle past its cache with more than a short context, or carrying a
+    /// long context: leave it be.
     Cold,
     /// Its files could not be read or are not known.
     Unknown,
@@ -138,7 +155,7 @@ pub fn activity(homes: &Homes, agent: &str, session_id: &str) -> Activity {
         return Activity::default();
     };
     match agent {
-        AgentKind::REBON => transcript_activity(&path, false),
+        AgentKind::REBON => rebon_activity(&path, session_id),
         AgentKind::CLAUDE_CODE => transcript_activity(&path, true),
         AgentKind::CODEX => rollout_activity(&path),
         AgentKind::GROK => grok_activity(&path),
@@ -158,7 +175,10 @@ pub fn state(activity: &Activity, warmth: &Warmth, now_ms: u64) -> State {
     let minutes = activity
         .cache_ttl_minutes
         .map_or(warmth.idle_minutes, |ttl| ttl.min(warmth.idle_minutes));
-    if idle_ms > u64::from(minutes) * 60_000 {
+    // An open turn gone stale may still be working, or dead with its
+    // process: only a finished turn is idle enough to wake on a short context.
+    let short = activity.busy == Some(false) && short_context(activity, warmth);
+    if idle_ms > u64::from(minutes) * 60_000 && !short {
         return State::Cold;
     }
     if long_context(activity, warmth) {
@@ -179,10 +199,23 @@ pub fn compact_due(activity: &Activity, warmth: &Warmth, now_ms: u64) -> bool {
 }
 
 fn long_context(activity: &Activity, warmth: &Warmth) -> bool {
-    let window = activity.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     activity
         .context_tokens
-        .is_some_and(|tokens| tokens as f64 > f64::from(warmth.context_ratio) * window as f64)
+        .is_some_and(|tokens| tokens as f64 > long_context_tokens(activity, warmth))
+}
+
+/// At most [`SHORT_CONTEXT_SHARE`] of the long-context threshold. A context
+/// whose size is not known is not short.
+fn short_context(activity: &Activity, warmth: &Warmth) -> bool {
+    activity.context_tokens.is_some_and(|tokens| {
+        tokens as f64 <= SHORT_CONTEXT_SHARE * long_context_tokens(activity, warmth)
+    })
+}
+
+/// The group's share of the member's window.
+fn long_context_tokens(activity: &Activity, warmth: &Warmth) -> f64 {
+    let window = activity.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    f64::from(warmth.context_ratio) * window as f64
 }
 
 /// `<root>/<any project>/<session_id>.jsonl`.
@@ -198,34 +231,56 @@ fn find_transcript(root: &Path, session_id: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+/// Rebon's `/compact` leaves the transcript as it is and writes the compacted
+/// baseline beside it, as `<session>.compact.json` (`rebon-core`'s
+/// `compact_baseline_path`). A baseline at least as new as the transcript
+/// means the context its last reply measured is gone; the baseline holds
+/// the history that replaced it, so its size, at [`BYTES_PER_TOKEN`], stands
+/// in for the size no reply has measured yet.
+fn rebon_activity(path: &Path, session_id: &str) -> Activity {
+    let mut activity = transcript_activity(path, false);
+    let baseline = path.with_file_name(format!("{session_id}.compact.json"));
+    let Ok(metadata) = std::fs::metadata(&baseline) else {
+        return activity;
+    };
+    let Some(compacted_ms) = modified_ms(&baseline) else {
+        return activity;
+    };
+    if activity
+        .last_activity_ms
+        .map_or(true, |last| compacted_ms >= last)
+    {
+        activity.last_activity_ms = Some(compacted_ms);
+        activity.context_tokens = Some(metadata.len() / BYTES_PER_TOKEN);
+    }
+    activity
+}
+
 /// Rebon's and Claude Code's transcripts: one JSON object per line, the
 /// model's replies carrying `message.stop_reason` and `message.usage`.
+/// Claude Code marks a compaction with a `compact_boundary` row; what came
+/// before it describes a context that is gone.
 fn transcript_activity(path: &Path, reads_cache_ttl: bool) -> Activity {
     let mut activity = Activity {
         last_activity_ms: modified_ms(path),
         ..Activity::default()
     };
     let lines = tail_lines(path);
-    // The last turn's state is the last user or assistant row's.
-    for value in lines.iter().rev() {
-        match value.get("type").and_then(Value::as_str) {
-            Some("assistant") => {
-                let stop = value
-                    .pointer("/message/stop_reason")
-                    .and_then(Value::as_str);
-                activity.busy = Some(!matches!(
-                    stop,
-                    Some("end_turn" | "stop_sequence" | "max_tokens" | "refusal")
-                ));
-                break;
-            }
-            Some("user") => {
-                activity.busy = Some(true);
-                break;
-            }
-            _ => {}
+    let boundary = lines.iter().rposition(|value| {
+        value.get("type").and_then(Value::as_str) == Some("system")
+            && value.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+    });
+    let lines = match boundary {
+        Some(index) => {
+            activity.context_tokens = lines[index]
+                .pointer("/compactMetadata/postTokens")
+                .and_then(Value::as_u64);
+            &lines[index + 1..]
         }
-    }
+        None => &lines[..],
+    };
+    // A compaction with no turn row after it finished while idle.
+    activity.busy = last_turn_busy(lines).or(boundary.map(|_| false));
     if let Some(usage) = lines
         .iter()
         .rev()
@@ -255,6 +310,50 @@ fn transcript_activity(path: &Path, reads_cache_ttl: bool) -> Activity {
         }
     }
     activity
+}
+
+/// Whether the last turn in `lines` is still open: the last assistant row's
+/// stop reason, or a user row after it. `None` when neither is there.
+///
+/// Claude Code also writes user rows that open no turn: a local command
+/// (`/model`, `/compact`) records a caveat, its `<command-name>` and its
+/// output once it has finished, and a compaction records its summary. A
+/// `<command-name>` counts as the local command's only when that command's
+/// output follows it; a prompt command (`/review`) has none and opens a turn.
+fn last_turn_busy(lines: &[Value]) -> Option<bool> {
+    let mut local_output = false;
+    for value in lines.iter().rev() {
+        match value.get("type").and_then(Value::as_str) {
+            Some("assistant") => {
+                let stop = value
+                    .pointer("/message/stop_reason")
+                    .and_then(Value::as_str);
+                return Some(!matches!(
+                    stop,
+                    Some("end_turn" | "stop_sequence" | "max_tokens" | "refusal")
+                ));
+            }
+            Some("user") => {
+                let text = value
+                    .pointer("/message/content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if text.starts_with("<local-command-stdout>")
+                    || text.starts_with("<local-command-stderr>")
+                {
+                    local_output = true;
+                } else if text.starts_with("<command-name>") && local_output {
+                    local_output = false;
+                } else if !text.starts_with("<local-command-caveat>")
+                    && value.get("isCompactSummary").and_then(Value::as_bool) != Some(true)
+                {
+                    return Some(true);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `<sessions>/YYYY/MM/DD/rollout-<time>-<session_id>.jsonl`, newest day

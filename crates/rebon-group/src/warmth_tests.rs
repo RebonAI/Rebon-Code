@@ -50,6 +50,234 @@ fn a_claude_code_turn_that_ended_is_idle_and_names_its_cache() {
     assert_eq!(state(&activity, &Warmth::default(), now()), State::Warm);
 }
 
+/// How Claude Code records a `/compact` typed while idle: the command's own
+/// rows land after the boundary, and no reply follows.
+fn claude_code_idle_compaction(boundary: Value) -> Vec<Value> {
+    vec![
+        json!({"type":"assistant","message":{"stop_reason":"end_turn","usage":{
+            "input_tokens":1,"cache_read_input_tokens":310000,"cache_creation_input_tokens":1000,
+            "cache_creation":{"ephemeral_1h_input_tokens":1000,"ephemeral_5m_input_tokens":0}}}}),
+        json!({"type":"system","subtype":"turn_duration"}),
+        json!({"type":"user","promptId":"p1","message":{"content":"/compact"}}),
+        boundary,
+        json!({"type":"user","promptId":"p1","isCompactSummary":true,
+            "message":{"content":"This session is being continued from a previous conversation."}}),
+        json!({"type":"user","promptId":"p1","isMeta":true,
+            "message":{"content":"<local-command-caveat>The command below was run directly in Claude Code.</local-command-caveat>"}}),
+        json!({"type":"user","promptId":"p1",
+            "message":{"content":"<command-name>/compact</command-name>\n<command-message>compact</command-message>\n<command-args></command-args>"}}),
+        json!({"type":"user","promptId":"p1",
+            "message":{"content":"<local-command-stdout>Compacted (ctrl+o to see full summary)</local-command-stdout>"}}),
+        json!({"type":"attachment","attachment":{"type":"hook_additional_context"}}),
+    ]
+}
+
+#[test]
+fn a_claude_code_session_compacted_while_idle_is_warm_on_its_compacted_context() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        &dir.path().join("claude/projects/C--work-app/aa38.jsonl"),
+        &lines(&claude_code_idle_compaction(json!({
+            "type":"system","subtype":"compact_boundary",
+            "compactMetadata":{"trigger":"manual","preTokens":311000,"postTokens":9913}}))),
+    );
+    let activity = activity(&homes(dir.path()), AgentKind::CLAUDE_CODE, "aa38");
+    assert_eq!(activity.busy, Some(false));
+    assert_eq!(activity.context_tokens, Some(9913));
+    // The cache the old reply wrote holds a context that is gone.
+    assert_eq!(activity.cache_ttl_minutes, None);
+    assert_eq!(state(&activity, &Warmth::default(), now()), State::Warm);
+    assert!(!compact_due(
+        &activity,
+        &Warmth::default(),
+        now() + 10 * 60_000
+    ));
+    // Short now: the hour no longer sends it cold.
+    assert_eq!(
+        state(&activity, &Warmth::default(), now() + 5 * 60 * 60_000),
+        State::Warm
+    );
+}
+
+#[test]
+fn a_compaction_that_does_not_record_its_size_leaves_the_context_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        &dir.path().join("claude/projects/C--work-app/aa38.jsonl"),
+        &lines(&claude_code_idle_compaction(json!({
+            "type":"system","subtype":"compact_boundary",
+            "compactMetadata":{"trigger":"auto","preTokens":228918}}))),
+    );
+    let activity = activity(&homes(dir.path()), AgentKind::CLAUDE_CODE, "aa38");
+    assert_eq!(activity.busy, Some(false));
+    assert_eq!(activity.context_tokens, None);
+    assert_eq!(state(&activity, &Warmth::default(), now()), State::Warm);
+    // Of no known size, it is not short: the hour still applies.
+    assert_eq!(
+        state(&activity, &Warmth::default(), now() + 2 * 60 * 60_000),
+        State::Cold
+    );
+}
+
+#[test]
+fn a_prompt_after_a_compaction_opens_a_turn_and_its_reply_measures_the_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("claude/projects/C--work-app/aa38.jsonl");
+    let mut rows = claude_code_idle_compaction(json!({
+        "type":"system","subtype":"compact_boundary",
+        "compactMetadata":{"trigger":"manual","postTokens":9913}}));
+    rows.push(json!({"type":"user","promptId":"p2","message":{"content":"go on"}}));
+    write(&path, &lines(&rows));
+    let opened = activity(&homes(dir.path()), AgentKind::CLAUDE_CODE, "aa38");
+    assert_eq!(opened.busy, Some(true));
+    assert_eq!(opened.context_tokens, Some(9913));
+
+    rows.push(
+        json!({"type":"assistant","message":{"stop_reason":"end_turn","usage":{
+        "input_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":12000,
+        "cache_creation":{"ephemeral_1h_input_tokens":12000,"ephemeral_5m_input_tokens":0}}}}),
+    );
+    write(&path, &lines(&rows));
+    let answered = activity(&homes(dir.path()), AgentKind::CLAUDE_CODE, "aa38");
+    assert_eq!(answered.busy, Some(false));
+    assert_eq!(answered.context_tokens, Some(12002));
+    assert_eq!(answered.cache_ttl_minutes, Some(60));
+}
+
+#[test]
+fn a_compaction_inside_a_turn_leaves_the_turn_open() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        &dir.path().join("claude/projects/C--work-app/aa38.jsonl"),
+        &lines(&[
+            json!({"type":"user","message":{"content":"go"}}),
+            json!({"type":"assistant","message":{"stop_reason":"tool_use","usage":{"input_tokens":190000}}}),
+            json!({"type":"system","subtype":"compact_boundary",
+                "compactMetadata":{"trigger":"auto","postTokens":8000}}),
+            json!({"type":"user","isCompactSummary":true,"message":{"content":"Summary"}}),
+            json!({"type":"assistant","message":{"stop_reason":"tool_use","usage":{"input_tokens":9000}}}),
+        ]),
+    );
+    let activity = activity(&homes(dir.path()), AgentKind::CLAUDE_CODE, "aa38");
+    assert_eq!(activity.busy, Some(true));
+    assert_eq!(activity.context_tokens, Some(9000));
+}
+
+#[test]
+fn a_local_command_run_while_idle_leaves_the_turn_ended() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        &dir.path().join("claude/projects/C--work-app/aa38.jsonl"),
+        &lines(&[
+            json!({"type":"assistant","message":{"stop_reason":"end_turn","usage":{"input_tokens":30000}}}),
+            json!({"type":"user","isMeta":true,
+                "message":{"content":"<local-command-caveat>Caveat</local-command-caveat>"}}),
+            json!({"type":"user","message":{"content":"<command-name>/model</command-name>"}}),
+            json!({"type":"user","message":{"content":"<local-command-stdout>Set model</local-command-stdout>"}}),
+            json!({"type":"user","message":{"content":"<local-command-stderr>warning</local-command-stderr>"}}),
+        ]),
+    );
+    let activity = activity(&homes(dir.path()), AgentKind::CLAUDE_CODE, "aa38");
+    assert_eq!(activity.busy, Some(false));
+    assert_eq!(activity.context_tokens, Some(30000));
+}
+
+#[test]
+fn a_prompt_command_opens_a_turn_until_it_is_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        &dir.path().join("claude/projects/C--work-app/aa38.jsonl"),
+        &lines(&[
+            json!({"type":"assistant","message":{"stop_reason":"end_turn","usage":{"input_tokens":30000}}}),
+            // An earlier local command's output must not hide the prompt
+            // command that followed it.
+            json!({"type":"user","message":{"content":"<local-command-stdout>Set model</local-command-stdout>"}}),
+            json!({"type":"user","message":{"content":"<command-name>/review</command-name>"}}),
+            json!({"type":"user","isMeta":true,"message":{"content":"Review the current diff."}}),
+        ]),
+    );
+    let activity = activity(&homes(dir.path()), AgentKind::CLAUDE_CODE, "aa38");
+    assert_eq!(activity.busy, Some(true));
+}
+
+fn set_modified(path: &Path, ms: u64) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + std::time::Duration::from_millis(ms))
+        .unwrap();
+}
+
+#[test]
+fn a_rebon_session_compacted_after_its_last_row_is_measured_by_its_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("rebon/projects/F--app/k7m2q.jsonl");
+    let baseline = dir.path().join("rebon/projects/F--app/k7m2q.compact.json");
+    write(
+        &transcript,
+        &lines(&[
+            json!({"type":"user","message":{"content":"go"}}),
+            json!({"type":"assistant","message":{"stop_reason":"end_turn","usage":{"input_tokens":150000}}}),
+        ]),
+    );
+    write(&baseline, &"x".repeat(80_000));
+    let at = now() - 60_000;
+    set_modified(&transcript, at - 6 * 60_000);
+    set_modified(&baseline, at);
+
+    let compacted = activity(&homes(dir.path()), AgentKind::REBON, "k7m2q");
+    assert_eq!(compacted.busy, Some(false));
+    assert_eq!(compacted.context_tokens, Some(20_000));
+    assert_eq!(compacted.last_activity_ms, Some(at));
+    assert_eq!(state(&compacted, &Warmth::default(), now()), State::Warm);
+    assert!(!compact_due(&compacted, &Warmth::default(), now()));
+    // Short: still wakeable long after the group's hour.
+    assert_eq!(
+        state(&compacted, &Warmth::default(), now() + 5 * 60 * 60_000),
+        State::Warm
+    );
+
+    // A turn after the compaction writes the transcript again, and its reply
+    // measures the context.
+    set_modified(&transcript, at + 1_000);
+    let resumed = activity(&homes(dir.path()), AgentKind::REBON, "k7m2q");
+    assert_eq!(resumed.context_tokens, Some(150000));
+    assert_eq!(resumed.last_activity_ms, Some(at + 1_000));
+}
+
+#[test]
+fn another_sessions_compaction_does_not_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let transcript = dir.path().join("rebon/projects/F--app/k7m2q.jsonl");
+    write(
+        &transcript,
+        &lines(&[
+            json!({"type":"assistant","message":{"stop_reason":"end_turn","usage":{"input_tokens":150000}}}),
+        ]),
+    );
+    let other = dir.path().join("rebon/projects/F--app/z9x8w.compact.json");
+    write(&other, "{}");
+    let at = now() - 60_000;
+    set_modified(&transcript, at - 60_000);
+    set_modified(&other, at);
+    let activity = activity(&homes(dir.path()), AgentKind::REBON, "k7m2q");
+    assert_eq!(activity.context_tokens, Some(150000));
+    // A Claude Code transcript is not read for Rebon's baseline either.
+    let claude = dir.path().join("claude/projects/C--work-app/aa38.jsonl");
+    write(
+        &claude,
+        &lines(&[
+            json!({"type":"assistant","message":{"stop_reason":"end_turn","usage":{"input_tokens":150000}}}),
+        ]),
+    );
+    write(&claude.with_file_name("aa38.compact.json"), "{}");
+    set_modified(&claude, at - 60_000);
+    set_modified(&claude.with_file_name("aa38.compact.json"), at);
+    let claude_activity = super::activity(&homes(dir.path()), AgentKind::CLAUDE_CODE, "aa38");
+    assert_eq!(claude_activity.context_tokens, Some(150000));
+}
+
 #[test]
 fn a_turn_waiting_on_a_tool_is_busy_until_it_goes_stale() {
     let dir = tempfile::tempdir().unwrap();
@@ -78,7 +306,8 @@ fn the_shorter_of_the_cache_and_the_groups_limit_decides() {
     let base = Activity {
         last_activity_ms: Some(now() - 6 * 60_000),
         busy: Some(false),
-        context_tokens: Some(1000),
+        // Past short, short of long: the cache decides.
+        context_tokens: Some(90_000),
         context_window: None,
         cache_ttl_minutes: Some(5),
     };
@@ -94,6 +323,85 @@ fn the_shorter_of_the_cache_and_the_groups_limit_decides() {
         ..base
     };
     assert_eq!(state(&unknown_ttl, &Warmth::default(), now()), State::Warm);
+}
+
+#[test]
+fn a_finished_turn_on_a_short_context_stays_warm_past_the_cache_and_the_hour() {
+    let short = Activity {
+        last_activity_ms: Some(now() - 5 * 60 * 60_000),
+        busy: Some(false),
+        context_tokens: Some(55_000),
+        context_window: None,
+        cache_ttl_minutes: Some(5),
+    };
+    assert_eq!(state(&short, &Warmth::default(), now()), State::Warm);
+    // Two thirds of the default 120k threshold is the edge.
+    for (tokens, expected) in [
+        (80_000, State::Warm),
+        (80_001, State::Cold),
+        (119_000, State::Cold),
+    ] {
+        let activity = Activity {
+            context_tokens: Some(tokens),
+            ..short.clone()
+        };
+        assert_eq!(
+            state(&activity, &Warmth::default(), now()),
+            expected,
+            "{tokens}"
+        );
+    }
+    // Within its cache a context short of long is warm either way.
+    let cached = Activity {
+        last_activity_ms: Some(now() - 60_000),
+        context_tokens: Some(119_000),
+        ..short
+    };
+    assert_eq!(state(&cached, &Warmth::default(), now()), State::Warm);
+}
+
+#[test]
+fn short_follows_the_groups_threshold_and_the_models_window() {
+    let activity = Activity {
+        last_activity_ms: Some(now() - 5 * 60 * 60_000),
+        busy: Some(false),
+        context_tokens: Some(300_000),
+        context_window: Some(1_000_000),
+        cache_ttl_minutes: None,
+    };
+    // 60% of a million is long, and two thirds of that short.
+    assert_eq!(state(&activity, &Warmth::default(), now()), State::Warm);
+    let tight = Warmth {
+        context_ratio: 0.3,
+        ..Warmth::default()
+    };
+    assert_eq!(state(&activity, &tight, now()), State::Cold);
+}
+
+#[test]
+fn only_a_finished_turn_of_known_size_is_short() {
+    let hours_ago = Activity {
+        last_activity_ms: Some(now() - 5 * 60 * 60_000),
+        busy: Some(false),
+        context_tokens: None,
+        context_window: None,
+        cache_ttl_minutes: None,
+    };
+    assert_eq!(state(&hours_ago, &Warmth::default(), now()), State::Cold);
+    // A turn left open, or a member that does not say, may still be working
+    // or dead with its process.
+    for busy in [Some(true), None] {
+        let activity = Activity {
+            busy,
+            context_tokens: Some(10_000),
+            ..hours_ago.clone()
+        };
+        assert_eq!(
+            state(&activity, &Warmth::default(), now()),
+            State::Cold,
+            "{busy:?}"
+        );
+    }
 }
 
 #[test]

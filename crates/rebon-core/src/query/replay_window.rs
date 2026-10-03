@@ -118,7 +118,9 @@ struct PersistedResumeSummary {
 
 const RESUME_SUMMARY_SIDECAR_VERSION: u32 = 1;
 
-/// `<project_dir>/<session_id>.compact.json`.
+/// `<project_dir>/<session_id>.compact.json`. `rebon-group`'s warmth reads
+/// this name too: a baseline newer than the transcript tells it the context
+/// the last reply measured is gone. Rename both together.
 fn compact_baseline_path(
     projects_root: &std::path::Path,
     cwd: &str,
