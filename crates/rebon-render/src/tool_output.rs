@@ -309,6 +309,29 @@ pub fn tool_result_update_content(tool_use_result: &Value) -> Option<Vec<ToolCal
         return Some(content);
     }
 
+    // Claude Code's Write reports the whole file it wrote as `content`, and
+    // the file it replaced (null when it created one) as `originalFile`.
+    if let (Some("create" | "update"), Some(file_path), Some(new_text)) = (
+        tool_use_result.get("type").and_then(Value::as_str),
+        tool_use_result.get("filePath").and_then(Value::as_str),
+        tool_use_result.get("content").and_then(Value::as_str),
+    ) {
+        let old_text = tool_use_result
+            .get("originalFile")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let mut content = vec![ToolCallContent::Diff(DiffContent {
+            path: file_path.to_string(),
+            old_text,
+            new_text: new_text.to_string(),
+        })];
+        if let Some(notification) = memory_notification {
+            content.push(text_content(notification));
+        }
+        return Some(content);
+    }
+
     let text = if let Some(summary) = skill_tool_result_summary(tool_use_result) {
         Some(summary)
     } else if let Some(path) = image_result_file_path(tool_use_result) {
@@ -565,6 +588,59 @@ mod tests {
             }
             other => panic!("expected Diff, got {other:?}"),
         }
+    }
+
+    /// Claude Code's Write has no oldString/newString: the file it wrote is
+    /// `content` and the one it replaced `originalFile` (null on create).
+    #[test]
+    fn claude_code_write_results_render_as_diffs() {
+        let created = tool_result_update_content(&json!({
+            "type": "create",
+            "filePath": "/repo/new.rs",
+            "content": "fn main() {}\n",
+            "originalFile": null,
+            "structuredPatch": [],
+        }))
+        .expect("a created file should produce a diff");
+        match created.as_slice() {
+            [ToolCallContent::Diff(diff)] => {
+                assert_eq!(diff.path, "/repo/new.rs");
+                assert_eq!(diff.old_text, None);
+                assert_eq!(diff.new_text, "fn main() {}\n");
+            }
+            other => panic!("expected a single diff, got {other:?}"),
+        }
+
+        let overwritten = tool_result_update_content(&json!({
+            "type": "update",
+            "filePath": "/repo/lib.rs",
+            "content": "after\n",
+            "originalFile": "before\n",
+            "structuredPatch": [],
+            "userModified": false,
+        }))
+        .expect("an overwritten file should produce a diff");
+        match overwritten.as_slice() {
+            [ToolCallContent::Diff(diff)] => {
+                assert_eq!(diff.path, "/repo/lib.rs");
+                assert_eq!(diff.old_text.as_deref(), Some("before\n"));
+                assert_eq!(diff.new_text, "after\n");
+            }
+            other => panic!("expected a single diff, got {other:?}"),
+        }
+    }
+
+    /// A Read result also has `filePath` + `content`, but its type is
+    /// `text`: it must stay a text block, not become a diff.
+    #[test]
+    fn read_results_with_top_level_content_stay_text() {
+        let content = tool_result_update_content(&json!({
+            "type": "text",
+            "filePath": "/repo/lib.rs",
+            "content": "hello",
+        }))
+        .unwrap();
+        assert_eq!(content, vec![text_content("hello".to_string())]);
     }
 
     #[test]
