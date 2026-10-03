@@ -28,6 +28,64 @@ fn run(
 const ROOT: &str = "/work/app";
 
 #[test]
+fn common_external_clients_bind_their_session_and_exchange_group_messages() {
+    for &agent in crate::identity::AgentKind::KNOWN {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GroupStore::new(dir.path());
+        let mut who = None;
+        let joined = run(
+            &store,
+            &mut who,
+            ROOT,
+            GROUP_JOIN,
+            json!({ "group": "clients", "agent": agent, "session_id": "native-session", "alias": "worker" }),
+        )
+        .unwrap();
+        assert_eq!(who, caller(agent, "native-session"));
+        assert_eq!(joined["you"], "worker");
+        let group_id = joined["group"]["id"].as_str().unwrap();
+        let request = store
+            .post_as_user(
+                group_id,
+                Draft {
+                    kind: EntryKind::Request,
+                    to: Some("worker".into()),
+                    re: None,
+                    supersedes: None,
+                    text: "verify the integration".into(),
+                },
+            )
+            .unwrap();
+        let inbox = run(&store, &mut who, ROOT, GROUP_INBOX, json!({ "full": true })).unwrap();
+        assert!(inbox["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["id"] == request.id.as_deref().unwrap()));
+        run(
+            &store,
+            &mut who,
+            ROOT,
+            GROUP_SEND,
+            json!({ "to": "user", "kind": "reply", "re": request.id, "text": "verified" }),
+        )
+        .unwrap();
+        run(
+            &store,
+            &mut who,
+            ROOT,
+            GROUP_REMEMBER,
+            json!({ "fact": "shared contract" }),
+        )
+        .unwrap();
+        let memory = run(&store, &mut who, ROOT, GROUP_RECALL, json!({})).unwrap();
+        assert!(memory.to_string().contains("shared contract"));
+        run(&store, &mut who, ROOT, GROUP_LEAVE, json!({})).unwrap();
+        assert!(store.load(group_id).unwrap().members.is_empty());
+    }
+}
+
+#[test]
 fn every_schema_is_a_closed_object_and_names_are_unique() {
     let specs = specs();
     let mut names: Vec<&str> = specs.iter().map(|spec| spec.name).collect();

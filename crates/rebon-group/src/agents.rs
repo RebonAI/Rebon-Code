@@ -152,6 +152,27 @@ mod tests {
     }
 
     #[test]
+    fn every_known_agent_can_be_admitted_excluded_and_reenabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GroupStore::new(dir.path());
+        let group = store.create("clients", "/work/app").unwrap();
+        for &agent in AgentKind::KNOWN {
+            store.set_agent_allowed(agent, false).unwrap();
+            assert!(
+                store.join(&group.id, member(agent, "s1")).is_err(),
+                "{agent}"
+            );
+            assert!(store.load(&group.id).unwrap().members.is_empty());
+            store.set_agent_allowed(agent, true).unwrap();
+            let joining = member(agent, "s1");
+            store.join(&group.id, joining.clone()).unwrap();
+            assert_eq!(store.load(&group.id).unwrap().members[0].agent, agent);
+            store.leave(&group.id, &joining.key()).unwrap();
+        }
+        assert_eq!(store.agent_policy().unwrap(), AgentPolicy::default());
+    }
+
+    #[test]
     fn switching_out_leaves_existing_members_where_they_are() {
         let dir = tempfile::tempdir().unwrap();
         let store = GroupStore::new(dir.path());

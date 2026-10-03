@@ -36,6 +36,31 @@ impl AgentKind {
     pub const OPENCODE: &'static str = "opencode";
     /// DeepSeek Harness.
     pub const DSH: &'static str = "dsh";
+    pub const PI: &'static str = "pi";
+    pub const ZCODE: &'static str = "zcode";
+    pub const GEMINI_CLI: &'static str = "gemini-cli";
+    pub const QWEN_CODE: &'static str = "qwen-code";
+    pub const KIMI_CLI: &'static str = "kimi-cli";
+    pub const AMP: &'static str = "amp";
+    pub const CURSOR_AGENT: &'static str = "cursor-agent";
+    pub const CRUSH: &'static str = "crush";
+
+    pub const KNOWN: &'static [&'static str] = &[
+        Self::REBON,
+        Self::CLAUDE_CODE,
+        Self::CODEX,
+        Self::GROK,
+        Self::OPENCODE,
+        Self::DSH,
+        Self::PI,
+        Self::ZCODE,
+        Self::GEMINI_CLI,
+        Self::QWEN_CODE,
+        Self::KIMI_CLI,
+        Self::AMP,
+        Self::CURSOR_AGENT,
+        Self::CRUSH,
+    ];
 }
 
 /// The session a server serves: which program, and its session id.
@@ -76,6 +101,21 @@ const SESSION_VARS: &[SessionVar] = &[
         var: "CLAUDE_CODE_SESSION_ID",
         image: &["claude"],
     },
+    SessionVar {
+        agent: AgentKind::PI,
+        var: "PI_SESSION_ID",
+        image: &["pi"],
+    },
+    SessionVar {
+        agent: AgentKind::GEMINI_CLI,
+        var: "GEMINI_SESSION_ID",
+        image: &["gemini"],
+    },
+    SessionVar {
+        agent: AgentKind::QWEN_CODE,
+        var: "QWEN_CODE_SESSION_ID",
+        image: &["qwen"],
+    },
     // Grok Build gives its stdio MCP servers the session id and strips a
     // spoofed one (xai-grok-mcp `servers.rs`).
     SessionVar {
@@ -90,16 +130,32 @@ const SESSION_VARS: &[SessionVar] = &[
 /// environment but sends `_meta["x-codex-turn-metadata"]` on every
 /// `tools/call` (codex-rs `core/src/mcp_tool_call.rs`). Its `session_id` is
 /// what Codex's hooks are given too, so a member found here is the one a
-/// hook finds; a sub-agent's thread shares its parent's session.
+/// hook finds; a sub-agent's thread shares its parent's session. Qwen Code's
+/// stdio clients can send `qwen-code/invocation` version 1 with `sessionId`.
 pub fn from_call_meta(meta: &serde_json::Value) -> Option<Caller> {
-    let codex = meta.get("x-codex-turn-metadata")?;
-    let id = ["session_id", "thread_id"]
-        .iter()
-        .find_map(|key| codex.get(*key).and_then(serde_json::Value::as_str))
-        .map(str::trim)
-        .filter(|id| !id.is_empty())?;
+    let (agent, id) = if let Some(codex) = meta.get("x-codex-turn-metadata") {
+        (
+            AgentKind::CODEX,
+            ["session_id", "thread_id"]
+                .iter()
+                .find_map(|key| codex.get(*key).and_then(serde_json::Value::as_str))?,
+        )
+    } else {
+        let qwen = meta.get("qwen-code/invocation")?;
+        if qwen.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+            return None;
+        }
+        (
+            AgentKind::QWEN_CODE,
+            qwen.get("sessionId").and_then(serde_json::Value::as_str)?,
+        )
+    };
+    let id = id.trim();
+    if id.is_empty() {
+        return None;
+    }
     Some(Caller {
-        agent: AgentKind::CODEX.to_string(),
+        agent: agent.to_string(),
         session_id: id.to_string(),
     })
 }
@@ -119,10 +175,14 @@ pub fn detect() -> Option<Caller> {
 }
 
 /// [`detect`] over a given environment and parent, for tests and for hosts
-/// that know better than the process environment.
+/// that know better than the process environment. `REBON_GROUP_AGENT` limits
+/// detection to the configured host so a nested CLI cannot inherit its
+/// launching agent's identity.
 pub fn resolve(env: &HashMap<String, String>, parent: Option<&Parent>) -> Option<Caller> {
+    let expected = env.get("REBON_GROUP_AGENT").map(|agent| agent.trim());
     let present: Vec<(&SessionVar, &str)> = SESSION_VARS
         .iter()
+        .filter(|known| expected.is_none_or(|agent| known.agent == agent))
         .filter_map(|known| {
             env.get(known.var)
                 .map(|value| value.trim())
@@ -272,6 +332,56 @@ mod tests {
     }
 
     #[test]
+    fn known_agent_names_are_distinct_and_cover_common_clients() {
+        let names: std::collections::HashSet<_> = AgentKind::KNOWN.iter().copied().collect();
+        assert_eq!(names.len(), AgentKind::KNOWN.len());
+        for agent in [
+            "pi",
+            "zcode",
+            "gemini-cli",
+            "qwen-code",
+            "kimi-cli",
+            "amp",
+            "cursor-agent",
+            "crush",
+        ] {
+            assert!(names.contains(agent), "{agent}");
+        }
+        assert!(names
+            .iter()
+            .all(|name| !name.is_empty() && *name == name.to_lowercase()));
+    }
+
+    #[test]
+    fn a_configured_external_host_does_not_inherit_the_launchers_identity() {
+        for &agent in AgentKind::KNOWN {
+            let inherited = env(&[
+                ("REBON_GROUP_AGENT", agent),
+                ("REBON_SESSION_ID", "parent-rebon"),
+                ("CLAUDE_CODE_SESSION_ID", "parent-claude"),
+                ("GROK_SESSION_ID", "parent-grok"),
+            ]);
+            let caller = resolve(&inherited, Some(&parent(10, "rebon-cli.exe")));
+            match agent {
+                AgentKind::REBON | AgentKind::CLAUDE_CODE | AgentKind::GROK => {
+                    assert_eq!(caller.unwrap().agent, agent);
+                }
+                _ => assert_eq!(caller, None, "{agent}"),
+            }
+        }
+        assert_eq!(
+            resolve(
+                &env(&[
+                    ("REBON_GROUP_AGENT", "unknown"),
+                    ("REBON_SESSION_ID", "parent")
+                ]),
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn one_session_variable_names_the_caller() {
         let caller = resolve(&env(&[("CLAUDE_CODE_SESSION_ID", "aa38901a")]), None).unwrap();
         assert_eq!(caller.agent, AgentKind::CLAUDE_CODE);
@@ -341,6 +451,47 @@ mod tests {
             from_call_meta(&serde_json::json!({ "progressToken": 1 })),
             None
         );
+    }
+
+    #[test]
+    fn native_external_session_variables_are_used_only_for_the_configured_host() {
+        for (agent, variable) in [
+            (AgentKind::PI, "PI_SESSION_ID"),
+            (AgentKind::GEMINI_CLI, "GEMINI_SESSION_ID"),
+            (AgentKind::QWEN_CODE, "QWEN_CODE_SESSION_ID"),
+        ] {
+            let values = env(&[
+                ("REBON_GROUP_AGENT", agent),
+                ("REBON_SESSION_ID", "parent"),
+                (variable, " native-session "),
+            ]);
+            let caller = resolve(&values, Some(&parent(10, "rebon-cli.exe"))).unwrap();
+            assert_eq!(caller.agent, agent);
+            assert_eq!(caller.session_id, "native-session");
+            assert_eq!(resolve(&env(&[(variable, " ")]), None), None);
+        }
+    }
+
+    #[test]
+    fn qwen_stdio_invocation_metadata_names_its_session() {
+        let caller = from_call_meta(&serde_json::json!({
+            "qwen-code/invocation": { "version": 1, "sessionId": " qwen-session ", "promptId": "p" }
+        }))
+        .unwrap();
+        assert_eq!(caller.agent, AgentKind::QWEN_CODE);
+        assert_eq!(caller.session_id, "qwen-session");
+        for invocation in [
+            serde_json::json!({ "version": 1, "sessionId": " " }),
+            serde_json::json!({ "version": 1, "sessionId": 1 }),
+            serde_json::json!({ "version": 2, "sessionId": "s" }),
+            serde_json::json!({ "sessionId": "s" }),
+            serde_json::json!({ "version": 1 }),
+        ] {
+            assert_eq!(
+                from_call_meta(&serde_json::json!({ "qwen-code/invocation": invocation })),
+                None
+            );
+        }
     }
 
     #[test]
