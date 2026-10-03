@@ -40,6 +40,15 @@ pub const MEMORY_GUIDE: &str = "The group memory is what keeps the members in st
      number instead of adding a second version. The memory file on disk is rebuilt from the \
      group's log, so writing to it directly is lost.";
 
+/// Ask for user input where the group can see and answer it.
+pub const QUESTION_GUIDE: &str = "When group work needs the user's answer, clarification or decision, \
+    call group_send with to=\"user\", kind=\"request\" and the complete question, including useful \
+    choices and what it blocks. Do not leave the question only in your own session or silently wait. \
+    Continue independent work if any; otherwise end the turn so the user's group reply can resume you. \
+    Read the answer with group_inbox; it is from user, kind reply, with re naming your request. \
+    Do not repeatedly send the same unanswered question. Native permission approvals still require \
+    the host's approval controls; a group message is not permission to bypass them.";
+
 /// The reminder a model reads: a system-reminder block with one
 /// `<group-entry>` per entry.
 pub fn reminder(group: &Group, entries: &[Entry]) -> Option<String> {
@@ -107,7 +116,7 @@ fn briefing(group: &Group, alias: &str) -> String {
          through the group_* tools (load them by name with your tool search if they are not \
          listed): group_send tells or asks a member, all, or user (the person you work for); \
          group_inbox reads what came in; group_remember keeps a fact; group_recall searches the \
-         memory.\n\n{MEMORY_GUIDE}",
+         memory.\n\n{MEMORY_GUIDE}\n\n{QUESTION_GUIDE}",
         escape_text(alias),
         escape_text(&group.name),
         escape_text(&with)
@@ -193,7 +202,11 @@ pub fn user_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
     let mine: Vec<&Entry> = entries
         .iter()
         .filter(|entry| {
-            entry.is_from_user() && matches!(entry.kind, EntryKind::Request | EntryKind::Note)
+            entry.is_from_user()
+                && matches!(
+                    entry.kind,
+                    EntryKind::Request | EntryKind::Note | EntryKind::Reply
+                )
         })
         .collect();
     if mine.is_empty() {
@@ -202,7 +215,11 @@ pub fn user_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
     let mut text = format!("[Agent group \"{}\"]", group.name);
     for entry in &mine {
         text.push_str("\n\n");
-        if let Some(id) = entry.id.as_deref() {
+        if entry.kind == EntryKind::Reply {
+            if let Some(id) = entry.re.as_deref() {
+                text.push_str(&format!("[User answer to {id}] "));
+            }
+        } else if let Some(id) = entry.id.as_deref() {
             text.push_str(&format!("({id}) "));
         }
         text.push_str(entry.text.trim());
@@ -235,7 +252,10 @@ pub fn user_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
 pub fn terminal_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
     let requests: Vec<&Entry> = entries
         .iter()
-        .filter(|entry| entry.kind == EntryKind::Request)
+        .filter(|entry| {
+            entry.kind == EntryKind::Request
+                || (entry.kind == EntryKind::Reply && entry.is_from_user())
+        })
         .collect();
     if requests.is_empty() {
         return None;
@@ -245,9 +265,14 @@ pub fn terminal_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
         .take(3)
         .map(|entry| {
             format!(
-                "{} asks ({}): {}",
+                "{} {} ({}): {}",
                 entry.from,
-                entry.id.as_deref().unwrap_or("?"),
+                if entry.kind == EntryKind::Reply {
+                    "answers"
+                } else {
+                    "asks"
+                },
+                entry.id.as_deref().or(entry.re.as_deref()).unwrap_or("?"),
                 first_chars(&entry.text, 160)
             )
         })
@@ -267,22 +292,33 @@ pub fn terminal_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
             .take(3)
             .map(|entry| {
                 format!(
-                    "({}) {}",
-                    entry.id.as_deref().unwrap_or("?"),
+                    "({}{}) {}",
+                    if entry.kind == EntryKind::Reply {
+                        "answer to "
+                    } else {
+                        ""
+                    },
+                    entry.id.as_deref().or(entry.re.as_deref()).unwrap_or("?"),
                     first_chars(&entry.text, 200)
                 )
             })
             .collect::<Vec<_>>()
             .join(" | ");
+        let guidance = if requests
+            .iter()
+            .any(|entry| entry.kind == EntryKind::Request)
+        {
+            "When done, report back with group_send (kind reply, re the request id, to \"user\"), and record anything settled for the whole group with group_remember."
+        } else {
+            "The user has answered your question. Read the full reply with group_inbox and continue the original task."
+        };
         return Some(format!(
-            "[Agent group \"{}\"] {asks}{rest}. When done, report back with group_send \
-             (kind reply, re the request id, to \"user\"), and record anything settled for the \
-             whole group with group_remember.",
+            "[Agent group \"{}\"] {asks}{rest}. {guidance}",
             group.name
         ));
     }
     Some(format!(
-        "[Relayed by Rebon from agent group \"{}\" — other agents, not me] {asks}{rest}. \
+        "[Relayed by Rebon from agent group \"{}\" — agent messages are from other agents, not me; messages from user are the user's own words] {asks}{rest}. \
          Read it with group_inbox and answer with group_send (kind reply, re the request id).",
         group.name
     ))

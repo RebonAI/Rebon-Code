@@ -419,13 +419,16 @@ impl GroupStore {
         })
     }
 
-    /// Writes `draft` to the log as the user ([`USER`]): a note, or a request
-    /// a member's reply will name. Posted from the desktop app, so no member
-    /// key stands behind it.
+    /// Writes `draft` to the log as the user ([`USER`]): a note, a request
+    /// a member's reply will name, or the answer to a member's question.
+    /// Posted from the desktop app, so no member key stands behind it.
     pub fn post_as_user(&self, id: &str, draft: Draft) -> Result<Entry> {
         check_id(id)?;
-        if !matches!(draft.kind, EntryKind::Note | EntryKind::Request) {
-            bail!("the user posts notes and requests");
+        if !matches!(
+            draft.kind,
+            EntryKind::Note | EntryKind::Request | EntryKind::Reply
+        ) {
+            bail!("the user posts notes, requests and replies");
         }
         if draft.text.trim().is_empty() {
             bail!("nothing to post");
@@ -433,7 +436,44 @@ impl GroupStore {
         self.with_lock(id, || {
             let path = self.dir(id).join(GROUP_FILE);
             let mut file = read_group_file(&path)?;
-            check_recipient(&file.group, draft.to.as_deref(), false)?;
+            if draft.kind == EntryKind::Reply {
+                let request_id = draft.re.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("a reply names the request it answers (`re`)")
+                })?;
+                let log = read_log(&self.dir(id))?;
+                let request = log
+                    .iter()
+                    .find(|entry| {
+                        entry.kind == EntryKind::Request
+                            && entry.id.as_deref() == Some(request_id)
+                            && !entry.is_from_user()
+                            && entry
+                                .to
+                                .as_deref()
+                                .is_some_and(|to| to.eq_ignore_ascii_case(USER))
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no question to the user named `{request_id}`")
+                    })?;
+                if !draft
+                    .to
+                    .as_deref()
+                    .is_some_and(|to| to.eq_ignore_ascii_case(&request.from))
+                {
+                    bail!("an answer must be addressed to the member who asked");
+                }
+                // 检查和落盘共用锁，两个窗口不能把同一个问题回答两次。
+                if log.iter().any(|entry| {
+                    entry.kind == EntryKind::Reply
+                        && entry.is_from_user()
+                        && entry.re.as_deref() == Some(request_id)
+                }) {
+                    bail!("question `{request_id}` has already been answered");
+                }
+                // 离群成员的问题仍可结案；其他发言继续要求当前成员地址。
+            } else {
+                check_recipient(&file.group, draft.to.as_deref(), false)?;
+            }
             let entry = self.append_locked(id, &mut file, USER, draft)?;
             write_json(&path, &file)?;
             Ok(entry)

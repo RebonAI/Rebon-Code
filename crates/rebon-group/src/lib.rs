@@ -53,3 +53,6 @@ pub use store::GroupStore;
 pub fn default_root(config_home: &std::path::Path) -> std::path::PathBuf {
     config_home.join("groups")
 }
+
+#[cfg(test)]
+mod user_requests_tests;
