@@ -531,6 +531,8 @@
   "app.GroupNewCount": "{count} 新",
   "app.GroupTabMembers": "成员",
   "app.GroupTabMemory": "共享记忆",
+  "app.GroupAsideHide": "收起侧栏",
+  "app.GroupAsideShow": "展开侧栏",
   "app.GroupUnreadCount": "{count} 未读",
   "app.GroupViaAttachment": "以 attachment 送达 {alias} · {time}",
   "app.GroupViaHook": "以 hook 送达 {alias} · {time}",

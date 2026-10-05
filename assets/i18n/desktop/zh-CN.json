@@ -531,6 +531,8 @@
   "GroupNewCount": "{count} 新",
   "GroupTabMembers": "成员",
   "GroupTabMemory": "共享记忆",
+  "GroupAsideHide": "收起侧栏",
+  "GroupAsideShow": "展开侧栏",
   "GroupUnreadCount": "{count} 未读",
   "GroupViaAttachment": "以 attachment 送达 {alias} · {time}",
   "GroupViaHook": "以 hook 送达 {alias} · {time}",

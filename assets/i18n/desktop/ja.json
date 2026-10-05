@@ -531,6 +531,8 @@
   "GroupNewCount": "新着 {count}",
   "GroupTabMembers": "メンバー",
   "GroupTabMemory": "共有メモリ",
+  "GroupAsideHide": "サイドパネルを隠す",
+  "GroupAsideShow": "サイドパネルを表示",
   "GroupUnreadCount": "未読 {count}",
   "GroupViaAttachment": "attachment で {alias} へ · {time}",
   "GroupViaHook": "hook で {alias} へ · {time}",

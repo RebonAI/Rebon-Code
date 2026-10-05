@@ -531,6 +531,8 @@
   "app.GroupNewCount": "新着 {count}",
   "app.GroupTabMembers": "メンバー",
   "app.GroupTabMemory": "共有メモリ",
+  "app.GroupAsideHide": "サイドパネルを隠す",
+  "app.GroupAsideShow": "サイドパネルを表示",
   "app.GroupUnreadCount": "未読 {count}",
   "app.GroupViaAttachment": "attachment で {alias} へ · {time}",
   "app.GroupViaHook": "hook で {alias} へ · {time}",

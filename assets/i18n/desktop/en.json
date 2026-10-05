@@ -531,6 +531,8 @@
   "GroupNewCount": "{count} new",
   "GroupTabMembers": "Members",
   "GroupTabMemory": "Shared memory",
+  "GroupAsideHide": "Hide side panel",
+  "GroupAsideShow": "Show side panel",
   "GroupUnreadCount": "{count} unread",
   "GroupViaAttachment": "as an attachment to {alias} · {time}",
   "GroupViaHook": "by hook to {alias} · {time}",
