@@ -37,19 +37,25 @@ class RegistrationError extends Error {
 export class RegistrationSink {
   #sealed = false;
 
-  constructor(pluginId, declared = {}) {
+  /// `probe` admits every name and records it: how rebon learns what a
+  /// package it has never seen registers, so its ceiling can be written for
+  /// a person to approve. Never used for a load that serves anything.
+  constructor(pluginId, declared = {}, { probe = false } = {}) {
     this.pluginId = pluginId;
+    this.probe = probe;
     this.declared = {
       services: new Set(declared.services ?? []),
       eventTopics: new Set(declared.eventTopics ?? []),
       llmProviders: new Set(declared.llmProviders ?? []),
       tools: new Set(declared.tools ?? []),
+      commands: new Set(declared.commands ?? []),
     };
     /** Protocol-shaped registrations, answered by `plugin/load`. */
     this.services = new Map();
     this.topics = new Map();
     this.llmProviders = new Map();
     this.tools = new Map();
+    this.commands = new Map();
     /** Handles on a session, handed out when a scope opens. */
     this.scopeHandlers = [];
     /** The sessions this plugin is currently attached to.
@@ -81,7 +87,7 @@ export class RegistrationSink {
     if (typeof name !== 'string' || name.length === 0) {
       throw new RegistrationError('[WRONG_SHAPE]', `a ${kind} needs a non-empty name`);
     }
-    if (!declared.has(name)) {
+    if (!this.probe && !declared.has(name)) {
       throw new RegistrationError(
         '[UNAUTHORIZED_REGISTER]',
         `${kind} ${JSON.stringify(name)} is not declared by ${this.pluginId}'s manifest`,
@@ -113,6 +119,11 @@ export class RegistrationSink {
   ///
   /// Not declared, because it is not a capability: every power the handle
   /// carries is one of the declarations above, checked when it is used.
+  command(definition, handler) {
+    this.#admit('command', definition?.name, this.declared.commands);
+    this.commands.set(definition.name, { definition, handler });
+  }
+
   scope(handler) {
     if (typeof handler !== 'function') {
       throw new RegistrationError('[WRONG_SHAPE]', 'a scope handler must be a function');
@@ -156,6 +167,8 @@ export class RegistrationSink {
       topicHandlers: this.topics,
       llmAdapters: this.llmProviders,
       toolHandlers: new Map([...this.tools].map(([name, entry]) => [name, entry.handler])),
+      commands: [...this.commands.values()].map((entry) => entry.definition),
+      commandHandlers: new Map([...this.commands].map(([name, entry]) => [name, entry.handler])),
       scopeHandlers: [...this.scopeHandlers],
     };
   }

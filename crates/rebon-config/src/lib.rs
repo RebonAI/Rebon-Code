@@ -203,7 +203,7 @@ pub fn load_model_pricing(config_dir: &Path) -> anyhow::Result<ModelPricingCatal
         Err(err) => {
             return Err(anyhow::anyhow!(
                 "failed to read rebon config.json at {path:?}: {err}"
-            ))
+            ));
         }
     };
     let root: serde_json::Value = serde_json::from_str(&raw)
@@ -1888,6 +1888,55 @@ pub fn save_active_acp_agent_in(config_dir: &Path, agent_id: Option<&str>) -> an
         }
     }
     write_config_roundtrip(config_dir, &config)
+}
+
+/// Lists kernel plugin `id` in `kernelPlugins.plugins` (the switch that
+/// loads an installed package), with `entry_config` as its composition
+/// config when given, or takes it off. Answers whether the file changed; an
+/// entry already there, with its own `config`, is left as it is.
+pub fn set_kernel_plugin_listed_in(
+    config_dir: &Path,
+    id: &str,
+    listed: bool,
+    entry_config: Option<&serde_json::Value>,
+) -> anyhow::Result<bool> {
+    let mut config = read_config_roundtrip(config_dir)?;
+    let section = config
+        .extra
+        .entry("kernelPlugins".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(section) = section.as_object_mut() else {
+        anyhow::bail!("config.json's kernelPlugins is not an object");
+    };
+    let plugins = section
+        .entry("plugins".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    let Some(plugins) = plugins.as_array_mut() else {
+        anyhow::bail!("config.json's kernelPlugins.plugins is not a list");
+    };
+    let names = |entry: &serde_json::Value| {
+        entry.get("id").and_then(serde_json::Value::as_str) == Some(id)
+            || entry.as_str() == Some(id)
+    };
+    let present = plugins.iter().any(names);
+    let changed = match (listed, present) {
+        (true, false) => {
+            plugins.push(match entry_config {
+                Some(entry_config) => serde_json::json!({ "id": id, "config": entry_config }),
+                None => serde_json::json!({ "id": id }),
+            });
+            true
+        }
+        (false, true) => {
+            plugins.retain(|entry| !names(entry));
+            true
+        }
+        _ => false,
+    };
+    if changed {
+        write_config_roundtrip(config_dir, &config)?;
+    }
+    Ok(changed)
 }
 
 pub fn load_update_preferences() -> anyhow::Result<UpdatePreferences> {
@@ -7495,6 +7544,61 @@ mod tests {
                 "error for {config} should mention `{expected}`, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn a_kernel_plugin_is_listed_once_and_taken_off_without_touching_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"theme":"dark","kernelPlugins":{"modules":{"a":"a.mjs"},"plugins":[{"id":"keep","config":{"x":1}},"plain"]}}"#,
+        );
+        let read = || -> serde_json::Value {
+            serde_json::from_slice(&fs::read(config_json_path(tmp.path())).unwrap()).unwrap()
+        };
+        assert!(set_kernel_plugin_listed_in(tmp.path(), "dsh-tool-todo", true, None).unwrap());
+        assert!(
+            !set_kernel_plugin_listed_in(tmp.path(), "dsh-tool-todo", true, None).unwrap(),
+            "listing it again is no change"
+        );
+        assert!(!set_kernel_plugin_listed_in(tmp.path(), "keep", true, None).unwrap());
+        let config = read();
+        assert_eq!(config["theme"], "dark");
+        assert_eq!(config["kernelPlugins"]["modules"]["a"], "a.mjs");
+        assert_eq!(config["kernelPlugins"]["plugins"][0]["config"]["x"], 1);
+        assert_eq!(config["kernelPlugins"]["plugins"][2]["id"], "dsh-tool-todo");
+        assert!(set_kernel_plugin_listed_in(tmp.path(), "plain", false, None).unwrap());
+        assert!(set_kernel_plugin_listed_in(tmp.path(), "dsh-tool-todo", false, None).unwrap());
+        assert!(!set_kernel_plugin_listed_in(tmp.path(), "absent", false, None).unwrap());
+        assert_eq!(
+            read()["kernelPlugins"]["plugins"],
+            serde_json::json!([{ "id": "keep", "config": { "x": 1 } }])
+        );
+    }
+
+    #[test]
+    fn a_kernel_plugin_is_listed_with_the_config_it_was_given() {
+        let tmp = TempDir::new().unwrap();
+        let config = serde_json::json!({ "allowParallelInProgress": false });
+        assert!(set_kernel_plugin_listed_in(tmp.path(), "todo", true, Some(&config)).unwrap());
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(config_json_path(tmp.path())).unwrap()).unwrap();
+        assert_eq!(
+            written["kernelPlugins"]["plugins"],
+            serde_json::json!([{ "id": "todo", "config": { "allowParallelInProgress": false } }])
+        );
+    }
+
+    #[test]
+    fn a_kernel_plugin_listed_in_a_config_with_no_section_makes_one() {
+        let tmp = TempDir::new().unwrap();
+        assert!(set_kernel_plugin_listed_in(tmp.path(), "p", true, None).unwrap());
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(config_json_path(tmp.path())).unwrap()).unwrap();
+        assert_eq!(
+            config["kernelPlugins"]["plugins"],
+            serde_json::json!([{ "id": "p" }])
+        );
     }
 
     #[test]

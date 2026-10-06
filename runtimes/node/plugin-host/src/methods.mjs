@@ -156,8 +156,11 @@ export function pluginCommandDefinition(input) {
       shape(kind, ['type', 'dialog'], [], 'command kind');
       validateName('dialog', string(kind.dialog, 'kind dialog'));
       break;
+    case 'output':
+      shape(kind, ['type'], [], 'command kind');
+      break;
     default:
-      throw new ProtocolError('[WRONG_SHAPE]', 'command kind must be prompt, explain or panel');
+      throw new ProtocolError('[WRONG_SHAPE]', 'command kind must be prompt, explain, panel or output');
   }
   return Object.freeze({ ...input });
 }

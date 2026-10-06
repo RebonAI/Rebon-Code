@@ -161,6 +161,9 @@ pub async fn bind_plane_model_provider(
         llm_providers: vec![contribution.id.clone()],
         ..ComposeEntry::default()
     };
+    // An installed package's adapter is someone else's code: its container.
+    let entry =
+        crate::container::Containment::load(&rebon_config::config_home_dir()).package(entry);
     plane
         .load_standalone(&entry)
         .await
@@ -171,7 +174,8 @@ pub async fn bind_plane_model_provider(
             contribution,
             contribution.id.clone(),
             plane.workspace_root().to_string(),
-            Arc::clone(plane.supervisor()),
+            // The host that loaded it: its container's, not the shared one.
+            plane.hosts().for_plugin(&entry.id),
             connection,
         ),
     )
@@ -342,19 +346,20 @@ pub(crate) fn unconfigured_entries(
     all_tools: &[String],
 ) -> Vec<ComposeEntry> {
     let named: BTreeSet<&str> = already.iter().map(|e| e.id.as_str()).collect();
+    let containment = crate::container::Containment::load(config_dir);
     crate::plugin_composition::installed_kernel_plugins(config_dir)
         .into_iter()
         .filter(|(name, _, _)| wanted.contains(name) && !named.contains(name.as_str()))
         .filter_map(|(name, root, manifest)| {
             let module = manifest.entry.clone()?;
-            Some(crate::plugin_manifests::entry_for(
+            Some(containment.package(crate::plugin_manifests::entry_for(
                 &manifest,
                 &name,
                 root,
                 module,
                 serde_json::Value::Null,
                 all_tools,
-            ))
+            )))
         })
         .collect()
 }

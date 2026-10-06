@@ -322,7 +322,17 @@ export class PluginHost {
       });
     }
     this.#cancelled.delete(envelope.call_id);
-    await this.#sendTerminal(envelope, 'success', payload);
+    try {
+      await this.#sendTerminal(envelope, 'success', payload);
+    } catch (error) {
+      if (error instanceof FramingError || !(error instanceof ProtocolError)) throw error;
+      // The answer itself could not be written. The call still ends, as the
+      // failure it is, rather than leaving rebon to wait out its bound.
+      return this.#sendTerminal(envelope, 'error', {
+        code: '[INVALID_ANSWER]',
+        message: `the handler answered a value that is not JSON: ${error.message}`.slice(0, 256),
+      });
+    }
     if (plan.finalize) await plan.finalize();
   }
   #plan(value) {

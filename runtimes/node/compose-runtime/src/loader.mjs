@@ -21,6 +21,7 @@
 // one, and step 4 is last so the ambiguous case (a bare default function) goes
 // to the composition rather than being guessed at from argument counts.
 import { resolveEntry } from '../../plugin-host/src/loader.mjs';
+import { createLoader as createModsLoader, isModRequest } from '../../mods-runtime/src/index.mjs';
 
 const own = (value, key) => value != null && Object.prototype.hasOwnProperty.call(value, key);
 
@@ -48,8 +49,13 @@ export function cordisPluginOf(module) {
 /// module does not recognise — an adapter that reimplemented it would be a
 /// second set of rules for the same shape.
 export async function createLoader({ next }) {
+  // A Claude Code mod is decided by the load request, before the module is
+  // read: rebon marked the request when it synthesised the mod's manifest,
+  // and the mods loader refuses to guess at one it did not mark.
+  const mods = await createModsLoader({ next });
   return {
     async load(request) {
+      if (isModRequest(request)) return mods.load(request);
       const url = resolveEntry(request.root, request.entry);
       let module;
       try {
@@ -71,6 +77,7 @@ export async function createLoader({ next }) {
     },
 
     async unload(pluginId) {
+      if (await mods.unload(pluginId)) return;
       const { disposeEntry } = await import('./realm.mjs');
       await disposeEntry(pluginId);
     },

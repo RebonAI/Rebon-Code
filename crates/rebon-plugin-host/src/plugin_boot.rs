@@ -243,14 +243,17 @@ pub struct MissingRuntime {
 /// nothing of the many and asks exactly once of the few who wrote the section.
 pub fn missing_runtime_for_configured_plugins() -> Option<MissingRuntime> {
     let config_dir = rebon_config::config_home_dir();
-    let raw = std::fs::read(config_dir.join("config.json")).ok()?;
-    let config: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let config: serde_json::Value = std::fs::read(config_dir.join("config.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .unwrap_or(serde_json::Value::Null);
     let entries = config
-        .get("kernelPlugins")?
-        .get("plugins")
+        .get("kernelPlugins")
+        .and_then(|section| section.get("plugins"))
         .and_then(serde_json::Value::as_array)
         .map(Vec::len)
-        .unwrap_or(0);
+        .unwrap_or(0)
+        + crate::mods::compose::discovered_mod_dirs(&config_dir).len();
     if entries == 0 {
         return None;
     }
@@ -327,7 +330,8 @@ pub fn plane_runtime_status() -> PlaneRuntimeStatus {
                 .and_then(serde_json::Value::as_array)
                 .map(Vec::len)
         })
-        .unwrap_or(0);
+        .unwrap_or(0)
+        + crate::mods::compose::discovered_mod_dirs(&config_dir).len();
 
     let store = rebon_node_runtime::ManagedRuntimeStore::under_config_home(
         &rebon_config::config_home_dir(),
@@ -409,7 +413,9 @@ fn refusal_slot() -> &'static std::sync::Mutex<Option<CompositionRefusal>> {
 
 /// Forgets the last refusal. Called where a new attempt begins and where a
 /// plane goes away, so the answer is always about the current generation.
-pub(crate) fn clear_composition_refusal() {
+/// Public for the desktop app: after it installs a runtime it lets the plane
+/// try again, which the `node-host` plugin otherwise does on its own reload.
+pub fn clear_composition_refusal() {
     *refusal_slot().lock().expect("composition refusal poisoned") = None;
 }
 
@@ -579,6 +585,13 @@ async fn ensure_plane(
 /// to *describe* what is running must not bring a Node host up by asking.
 pub fn running_plugin_plane() -> Option<Arc<crate::plugin_plane::PluginPlane>> {
     running_plane().plane
+}
+
+/// The runtime the running plane was booted on, for a caller on a thread
+/// with none of its own that has to await the plane (a session owner's
+/// connection thread reloading its mods).
+pub fn running_plane_runtime() -> Option<tokio::runtime::Handle> {
+    running_plane().runtime
 }
 
 /// How many times this process has actually tried to start a host.
@@ -914,6 +927,11 @@ async fn boot_process_plugin_plane(
     };
     compose_tools.bind_plane(plane.tool_dispatch());
     web_seat.bind_plane(plane.tool_dispatch());
+    // The Claude Code mods: their `$` seat, their place on the policy seat
+    // and the surfaces' view of what they draw, all effects of the plane's
+    // fork. Installed before any entry loads, so a mod entry is attached as
+    // it comes up.
+    plane.install_mods(kernel, config_dir.clone());
 
     // One load per entry, in config order. A single bad entry is reported and
     // the rest of the composition still runs — the same rule the embedded

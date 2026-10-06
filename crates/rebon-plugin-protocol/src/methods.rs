@@ -564,6 +564,12 @@ pub enum PluginCommandKind {
     Explain { text: String },
     /// Opens a panel by its dialog id.
     Panel { dialog: String },
+    /// Answered by [`COMMAND_INVOKE_METHOD`] like `Prompt`, but what comes
+    /// back is shown to the person and stays out of the model's turn — a
+    /// command that does something and reports it (a DeepSeek Harness
+    /// command, whose handler runs "without sending the command to the
+    /// model").
+    Output,
 }
 
 impl PluginCommandDefinition {
@@ -598,6 +604,7 @@ impl PluginCommandDefinition {
                 }
             }
             PluginCommandKind::Panel { dialog } => validate_name("dialog", dialog),
+            PluginCommandKind::Output => Ok(()),
         }
     }
 }

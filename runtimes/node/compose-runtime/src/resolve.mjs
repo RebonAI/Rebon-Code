@@ -24,50 +24,20 @@ import { registerHooks } from 'node:module';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { payloadDir } from './payload.mjs';
+import provided from './provided-modules.json' with { type: 'json' };
 
 /// Payload-relative module map, keyed by bare specifier.
 ///
 /// Mirrors `build_import_map` entry for entry, minus the `node:` shims.
 export function payloadModules(dir) {
   const at = (relative) => pathToFileURL(path.join(dir, relative)).href;
-  return new Map(Object.entries({
-    cordis: at('vendor/cordis/index.js'),
-    cosmokit: at('vendor/cosmokit/index.mjs'),
-    schemastery: at('vendor/schemastery/index.mjs'),
-    '@deepseek-ai/cordis': at('vendor/cordis/index.js'),
-    '@deepseek-ai/cosmokit': at('vendor/cosmokit/index.mjs'),
-    '@deepseek-ai/schemastery': at('vendor/schemastery/index.mjs'),
-    '@deepseek-ai/cordis-plugin-timer': at('vendor/dsh/timer.js'),
-    '@deepseek-ai/cordis-plugin-logger-console': at('vendor/dsh/logger-console.js'),
-    '@deepseek-ai/dsh-llm-deepseek': at('vendor/dsh/llm-deepseek.js'),
-    '@deepseek-ai/dsh-timeout': at('vendor/dsh/timeout.js'),
-    '@deepseek-ai/dsh-llm': at('compose/shims/dsh-llm.js'),
-    '@deepseek-ai/dsh-credentials': at('compose/shims/dsh-credentials.js'),
-    '@deepseek-ai/dsh-settings': at('compose/shims/dsh-settings.js'),
-    '@deepseek-ai/dsh-launch-environment': at('compose/shims/dsh-launch-environment.js'),
-    '@deepseek-ai/dsh-anonymous-user-id': at('compose/shims/dsh-anonymous-user-id.js'),
-    'eventsource-parser': at('vendor/eventsource-parser/index.js'),
-    '@deepseek-ai/dsh-tools': at('compose/shims/dsh-tools.js'),
-    '@deepseek-ai/dsh-tool-todo': at('vendor/dsh/tool-todo.js'),
-    zod: at('compose/shims/zod-lite.js'),
-    '@deepseek-ai/dsh-web': at('compose/shims/dsh-web.js'),
-    '@deepseek-ai/dsh-web-search-exa': at('vendor/dsh/web-search-exa.js'),
-    '@deepseek-ai/dsh-tool-web': at('vendor/dsh/tool-web.js'),
-    '@deepseek-ai/dsh-scope': at('vendor/dsh/scope.js'),
-    '@deepseek-ai/dsh-session': at('vendor/dsh/session.js'),
-    '@deepseek-ai/dsh-agent': at('vendor/dsh/agent.js'),
-    '@deepseek-ai/dsh-system-prompt': at('vendor/dsh/system-prompt.js'),
-    '@deepseek-ai/dsh-agent-loop': at('vendor/dsh/agent-loop.js'),
-  }));
+  return new Map(Object.entries(provided.payload).map(([name, relative]) => [name, at(relative)]));
 }
 
 /// Specifiers this package answers itself rather than from the payload.
 export function localModules() {
   const at = (relative) => new URL(relative, import.meta.url).href;
-  return new Map(Object.entries({
-    rebon: at('./bridge.mjs'),
-    'eventsource-parser/stream': at('./eventsource-stream.mjs'),
-  }));
+  return new Map(Object.entries(provided.runtime).map(([name, relative]) => [name, at(relative)]));
 }
 
 let installed;

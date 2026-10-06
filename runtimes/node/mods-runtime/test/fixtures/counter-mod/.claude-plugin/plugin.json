@@ -1,0 +1,8 @@
+{
+  "name": "counter",
+  "version": "0.1.0",
+  "description": "A fixture mod: a pane with a button, a command, a tool.call rewrite and a prompt rewrite.",
+  "userConfig": {
+    "prefix": { "type": "string", "description": "What the status line starts with", "default": "n=" }
+  }
+}

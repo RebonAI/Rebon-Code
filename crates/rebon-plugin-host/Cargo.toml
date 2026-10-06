@@ -45,6 +45,13 @@ rebon-config.workspace = true
 rebon-types.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
+# `$.fs.read(path, { as: "bytes" })` answers base64; `$.http.fetch` is one
+# request on the workspace client.
+base64.workspace = true
+reqwest.workspace = true
+# A mod's hook outputs are parsed, aggregated and projected by the hook
+# runtime's own functions: what a mod may do to an event is what a hook may.
+rebon-hooks.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true

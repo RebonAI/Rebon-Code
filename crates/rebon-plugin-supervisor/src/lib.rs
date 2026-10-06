@@ -68,6 +68,7 @@ pub mod state;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    ffi::OsString,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -228,6 +229,75 @@ pub trait EventPublisher: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Payload, ToolRefusal>> + Send + '_>>;
 }
 
+/// An OS sandbox a host runs under: the complete command line it runs instead
+/// of Node's (the Node command is inside it), with the environment changes
+/// it asks for applied over the host's own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HostLauncher {
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
+    pub env_set: Vec<(OsString, OsString)>,
+    pub env_unset: Vec<OsString>,
+}
+
+/// Node's own command line for a host: Node's flags, the host script and its
+/// arguments. What a launcher wraps.
+pub fn node_argv(config: &HostConfig) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = vec![config.node.clone().into_os_string()];
+    argv.extend(config.node_args.iter().cloned());
+    argv.push(config.host_script.clone().into_os_string());
+    argv.extend(config.host_args.iter().map(OsString::from));
+    argv
+}
+
+/// The argv a host starts with: the launcher's whole command line when there
+/// is one, else Node's.
+pub fn host_argv(config: &HostConfig) -> (OsString, Vec<OsString>) {
+    let mut node: Vec<OsString> =
+        Vec::with_capacity(config.node_args.len() + config.host_args.len() + 2);
+    node.extend(config.node_args.iter().cloned());
+    node.push(config.host_script.clone().into_os_string());
+    node.extend(config.host_args.iter().map(OsString::from));
+    match &config.launcher {
+        Some(launcher) => (
+            launcher.program.clone().into_os_string(),
+            launcher.args.clone(),
+        ),
+        None => (config.node.clone().into_os_string(), node),
+    }
+}
+
+/// The host's command, the one place it is built: `spawn` and `restart`
+/// must start the same process or a restarted host would escape whatever
+/// confined the first one.
+fn host_command(config: &HostConfig) -> Command {
+    let (program, args) = host_argv(config);
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(vars) = &config.environment {
+        command.env_clear();
+        command.envs(vars.iter().map(|(key, value)| (key, value)));
+    }
+    if let Some(launcher) = &config.launcher {
+        command.envs(launcher.env_set.iter().map(|(key, value)| (key, value)));
+        for key in &launcher.env_unset {
+            command.env_remove(key);
+        }
+    }
+    command
+        .current_dir(&config.working_directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // A host outliving the supervisor would hold plugin state nobody
+        // can reach and keep whatever the plugins opened.
+        .kill_on_drop(true);
+    // Never flash a console window: this runs under a desktop app too.
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    command
+}
+
 #[derive(Clone)]
 pub struct HostConfig {
     /// Absolute Node executable, normally from
@@ -242,6 +312,17 @@ pub struct HostConfig {
     /// host refuses to start rather than falling back if it cannot build the
     /// loader it was pointed at, so this is a demand rather than a hint.
     pub host_args: Vec<String>,
+    /// Arguments for Node itself, ahead of the host script: the permission
+    /// flags a contained host runs under (`--permission`, `--allow-fs-read`).
+    pub node_args: Vec<OsString>,
+    /// The whole environment the host starts with. `None` inherits this
+    /// process's, which is what the trusted process plane does; a contained
+    /// host gets exactly the variables it was granted and nothing else, so a
+    /// key in the parent's environment is not a plugin's to read.
+    pub environment: Option<Vec<(OsString, OsString)>>,
+    /// What the host runs under, when something confines it: an OS sandbox
+    /// whose argv ends where Node's begins.
+    pub launcher: Option<HostLauncher>,
     pub working_directory: PathBuf,
     pub host_epoch: u64,
     pub stderr_tail_bytes: usize,
@@ -269,6 +350,12 @@ impl std::fmt::Debug for HostConfig {
             .field("node", &self.node)
             .field("host_script", &self.host_script)
             .field("host_args", &self.host_args)
+            .field("node_args", &self.node_args)
+            .field(
+                "environment",
+                &self.environment.as_ref().map(|vars| vars.len()),
+            )
+            .field("launcher", &self.launcher)
             .field("working_directory", &self.working_directory)
             .field("host_epoch", &self.host_epoch)
             .field("stderr_tail_bytes", &self.stderr_tail_bytes)
@@ -289,6 +376,9 @@ impl HostConfig {
             node: node.into(),
             host_script: host_script.into(),
             host_args: Vec::new(),
+            node_args: Vec::new(),
+            environment: None,
+            launcher: None,
             // A constructor default the caller overrides per host; a vanished
             // cwd is not this crate's error to raise.
             working_directory: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -877,21 +967,9 @@ impl PluginHostSupervisor {
     }
 
     async fn spawn(config: HostConfig) -> Result<Self, SupervisorError> {
-        let mut command = Command::new(&config.node);
-        command
-            .arg(&config.host_script)
-            .args(&config.host_args)
-            .current_dir(&config.working_directory)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // A host outliving the supervisor would hold plugin state nobody
-            // can reach and keep whatever the plugins opened.
-            .kill_on_drop(true);
-        // Never flash a console window: this runs under a desktop app too.
-        #[cfg(windows)]
-        command.creation_flags(0x0800_0000);
-        let mut child = command.spawn().map_err(SupervisorError::Spawn)?;
+        let mut child = host_command(&config)
+            .spawn()
+            .map_err(SupervisorError::Spawn)?;
 
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
@@ -1663,19 +1741,9 @@ impl PluginHostSupervisor {
             .bytes
             .clear();
 
-        let mut command = Command::new(&self.config.node);
-        command
-            .arg(&self.config.host_script)
-            .args(&self.config.host_args)
-            .current_dir(&self.config.working_directory)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // Never flash a console window: this runs under a desktop app too.
-        #[cfg(windows)]
-        command.creation_flags(0x0800_0000);
-        let mut child = command.spawn().map_err(SupervisorError::Spawn)?;
+        let mut child = host_command(&self.config)
+            .spawn()
+            .map_err(SupervisorError::Spawn)?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
@@ -2091,6 +2159,101 @@ fn decode<T: serde::de::DeserializeOwned>(payload: &Payload) -> Result<T, Payloa
 
 #[cfg(test)]
 mod tests {
+    fn os(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn an_unconfined_host_is_node_then_its_script_then_the_host_arguments() {
+        let config = HostConfig::new("/n/node", "/h/cli.mjs").with_loader("/c/index.mjs");
+        let (program, args) = host_argv(&config);
+        assert_eq!(program, OsString::from("/n/node"));
+        assert_eq!(args, os(&["/h/cli.mjs", "--loader", "/c/index.mjs"]));
+        assert!(config.environment.is_none(), "the trusted plane inherits");
+    }
+
+    #[test]
+    fn node_flags_go_before_the_script_so_node_reads_them_not_the_host() {
+        let mut config = HostConfig::new("/n/node", "/h/cli.mjs");
+        config.node_args = os(&["--permission", "--allow-fs-read=/p"]);
+        let (_, args) = host_argv(&config);
+        assert_eq!(
+            args,
+            os(&["--permission", "--allow-fs-read=/p", "/h/cli.mjs"])
+        );
+    }
+
+    #[test]
+    fn a_launcher_runs_its_whole_command_line_which_carries_nodes() {
+        let mut config = HostConfig::new("/n/node", "/h/cli.mjs").with_loader("/c/index.mjs");
+        config.node_args = os(&["--permission"]);
+        let mut wrapped = os(&["exec", "--"]);
+        wrapped.extend(node_argv(&config));
+        assert_eq!(
+            node_argv(&config),
+            os(&[
+                "/n/node",
+                "--permission",
+                "/h/cli.mjs",
+                "--loader",
+                "/c/index.mjs"
+            ])
+        );
+        config.launcher = Some(HostLauncher {
+            program: PathBuf::from("/s/sandbox"),
+            args: wrapped,
+            ..HostLauncher::default()
+        });
+        let (program, args) = host_argv(&config);
+        assert_eq!(program, OsString::from("/s/sandbox"));
+        assert_eq!(
+            args,
+            os(&[
+                "exec",
+                "--",
+                "/n/node",
+                "--permission",
+                "/h/cli.mjs",
+                "--loader",
+                "/c/index.mjs"
+            ])
+        );
+    }
+
+    #[test]
+    fn a_granted_environment_replaces_the_inherited_one() {
+        let mut config = HostConfig::new("/n/node", "/h/cli.mjs");
+        config.environment = Some(vec![(OsString::from("ONLY"), OsString::from("this"))]);
+        config.launcher = Some(HostLauncher {
+            program: PathBuf::from("/s/sandbox"),
+            env_set: vec![(
+                OsString::from("HTTPS_PROXY"),
+                OsString::from("http://127.0.0.1:9"),
+            )],
+            env_unset: os(&["ONLY"]),
+            ..HostLauncher::default()
+        });
+        let command = host_command(&config);
+        let std = command.as_std();
+        let envs: Vec<(OsString, Option<OsString>)> = std
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(OsString::from)))
+            .collect();
+        assert!(envs.contains(&(
+            OsString::from("HTTPS_PROXY"),
+            Some(OsString::from("http://127.0.0.1:9"))
+        )));
+        assert!(
+            !envs
+                .iter()
+                .any(|(key, value)| key == "ONLY" && value.is_some()),
+            "the launcher's unset wins"
+        );
+        // env_clear leaves no inherited variable behind: everything the child
+        // sees is in this list.
+        assert!(!envs.iter().any(|(key, _)| key == "PATH"));
+    }
+
     use super::*;
 
     /// An `Inner` with no process behind it, sitting on `epoch`.

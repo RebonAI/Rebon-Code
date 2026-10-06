@@ -513,13 +513,17 @@ impl PluginRegistry {
         request.validate()?;
         let plugin_id = identity.plugin_id.clone();
         let state = Self::routable_mut(&mut self.plugins, &plugin_id)?;
-        // A `prompt` command is the only one there is anything to ask about:
-        // an `explain` said its sentence and a `panel` named its dialog at
-        // registration. Refusing the other two here rather than letting the
-        // host find no handler keeps the two sides of the protocol agreeing
-        // about what an invoke can even be for.
+        // `prompt` and `output` commands are the ones there is anything to
+        // ask about: an `explain` said its sentence and a `panel` named its
+        // dialog at registration. Refusing those two here rather than letting
+        // the host find no handler keeps the two sides of the protocol
+        // agreeing about what an invoke can even be for.
         match state.commands.get(&request.name) {
-            Some(command) if matches!(command.kind, PluginCommandKind::Prompt) => {}
+            Some(command)
+                if matches!(
+                    command.kind,
+                    PluginCommandKind::Prompt | PluginCommandKind::Output
+                ) => {}
             _ => {
                 return Err(RegistryError::UnknownCommand {
                     plugin_id,

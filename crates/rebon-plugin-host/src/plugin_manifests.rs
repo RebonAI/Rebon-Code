@@ -65,6 +65,7 @@ pub fn entry_for(
         seats: manifest.seats.clone(),
         settings: manifest.settings.clone(),
         publish: true,
+        container: None,
     }
 }
 

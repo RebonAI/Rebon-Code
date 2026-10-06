@@ -136,6 +136,10 @@ pub struct ComposeEntry {
     /// what a plugin registered; `publish` is only about what it does with it.
     #[serde(default = "publish_by_default")]
     pub publish: bool,
+    /// The container this entry runs in, when it does not run in the shared
+    /// host: someone else's code, confined (see [`crate::container`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<crate::container::ContainerSpec>,
 }
 
 fn publish_by_default() -> bool {
@@ -159,6 +163,7 @@ impl Default for ComposeEntry {
             seats: Vec::new(),
             settings: Vec::new(),
             publish: true,
+            container: None,
         }
     }
 }
@@ -260,7 +265,12 @@ pub struct EntryReport {
 
 /// A running composition.
 pub struct PluginPlane {
-    supervisor: Arc<PluginHostSupervisor>,
+    /// The shared host and the containers, and which plugin each serves.
+    hosts: PlaneHosts,
+    /// The containers running now, by container id.
+    containers: tokio::sync::Mutex<BTreeMap<String, ContainerHost>>,
+    /// What starting a container needs that the shared host was started with.
+    template: ContainerTemplate,
     ctx: Context,
     /// The workspace the plane's own scope names.
     workspace_root: String,
@@ -310,6 +320,10 @@ pub struct PluginPlane {
     /// second would report a diff computed against a composition that no longer
     /// exists. Async, because it is held across the loads and unloads.
     reconcile: tokio::sync::Mutex<()>,
+    /// The Claude Code mods loaded on this plane, once [`Self::install_mods`]
+    /// has run. Shared with the seat dispatcher, which routes the `mods` seat
+    /// here; empty on a plane that never installed it (the tests' own).
+    mods: Arc<std::sync::OnceLock<Arc<crate::mods::ModsRegistry>>>,
 }
 
 /// What a reload did, by name, so a person can see it rather than infer it.
@@ -394,6 +408,89 @@ fn classify(current: &BTreeMap<String, ComposeEntry>, wanted: &[ComposeEntry]) -
     plan
 }
 
+/// Which host serves a plugin: the shared one, or the container it runs in.
+///
+/// One table every caller routes through — the tool dispatch, the mods
+/// registry, the plane itself — so "who answers this plugin" has one answer
+/// however the call arrived.
+#[derive(Clone)]
+pub struct PlaneHosts {
+    main: Arc<PluginHostSupervisor>,
+    contained: Arc<Mutex<BTreeMap<String, Arc<PluginHostSupervisor>>>>,
+}
+
+impl PlaneHosts {
+    fn new(main: Arc<PluginHostSupervisor>) -> Self {
+        Self {
+            main,
+            contained: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// The shared host.
+    pub fn main(&self) -> &Arc<PluginHostSupervisor> {
+        &self.main
+    }
+
+    /// The host that serves `plugin_id`.
+    pub fn for_plugin(&self, plugin_id: &str) -> Arc<PluginHostSupervisor> {
+        self.contained
+            .lock()
+            .expect("plane hosts poisoned")
+            .get(plugin_id)
+            .cloned()
+            .unwrap_or_else(|| Arc::clone(&self.main))
+    }
+
+    /// Whether `plugin_id` runs in a container.
+    pub fn is_contained(&self, plugin_id: &str) -> bool {
+        self.contained
+            .lock()
+            .expect("plane hosts poisoned")
+            .contains_key(plugin_id)
+    }
+
+    fn assign(&self, plugin_id: &str, host: &Arc<PluginHostSupervisor>) {
+        self.contained
+            .lock()
+            .expect("plane hosts poisoned")
+            .insert(plugin_id.to_owned(), Arc::clone(host));
+    }
+
+    fn release(&self, plugin_id: &str) {
+        self.contained
+            .lock()
+            .expect("plane hosts poisoned")
+            .remove(plugin_id);
+    }
+}
+
+/// One running container.
+struct ContainerHost {
+    supervisor: Arc<PluginHostSupervisor>,
+    /// The entries loaded in it; the host goes when the last one leaves.
+    members: BTreeSet<String>,
+    /// What lives as long as the host (the network proxy).
+    _keep_alive: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+/// What a container's host is started with, copied from the shared host's
+/// start so a container is the same plane in a smaller box.
+struct ContainerTemplate {
+    node: PathBuf,
+    host_script: PathBuf,
+    loader: PathBuf,
+    compose_root: PathBuf,
+    payload_dir: Option<PathBuf>,
+    web: Value,
+    modules: BTreeMap<String, String>,
+    invoker: Arc<dyn ToolInvoker>,
+    seats: Arc<KernelSeats>,
+    events: Arc<KernelEvents>,
+    exposed_tools: Vec<String>,
+    exposed_seats: Vec<String>,
+}
+
 #[derive(Default)]
 struct Registrations {
     /// Whether these reached rebon's seats. A private entry is recorded all the
@@ -430,8 +527,26 @@ impl PluginPlane {
         tools: Arc<ComposeToolRegistry>,
         invoker: Arc<dyn ToolInvoker>,
     ) -> Result<Arc<Self>, SupervisorError> {
-        let seats = Arc::new(KernelSeats { ctx: ctx.clone() });
+        let mods = Arc::new(std::sync::OnceLock::new());
+        let seats = Arc::new(KernelSeats {
+            ctx: ctx.clone(),
+            mods: Arc::clone(&mods),
+        });
         let events = Arc::new(KernelEvents { ctx: ctx.clone() });
+        let template = ContainerTemplate {
+            node: config.node.clone(),
+            host_script: config.host_script.clone(),
+            loader: config.loader.clone(),
+            compose_root: config.compose_root.clone(),
+            payload_dir: config.payload_dir.clone(),
+            web: config.web.clone(),
+            modules: config.modules.clone(),
+            invoker: Arc::clone(&invoker),
+            seats: Arc::clone(&seats),
+            events: Arc::clone(&events),
+            exposed_tools: config.exposed_tools.clone(),
+            exposed_seats: config.exposed_seats.clone(),
+        };
         let host = HostConfig::new(config.node.clone(), config.host_script.clone())
             .with_loader(&config.loader)
             .with_working_directory(config.working_directory.clone())
@@ -467,8 +582,11 @@ impl PluginPlane {
             .open_scope(COMPOSE_PLUGIN_ID, &scope, &workspace_root)
             .await?;
 
+        let hosts = PlaneHosts::new(Arc::clone(&supervisor));
         let plane = Arc::new(Self {
-            supervisor: Arc::clone(&supervisor),
+            hosts: hosts.clone(),
+            containers: tokio::sync::Mutex::new(BTreeMap::new()),
+            template,
             ctx,
             workspace_root,
             scope,
@@ -483,16 +601,248 @@ impl PluginPlane {
             loaded: Mutex::new(BTreeMap::new()),
             generation: AtomicU64::new(0),
             reconcile: tokio::sync::Mutex::new(()),
+            mods,
         });
         tools.bind_plane(Arc::new(PlaneToolDispatch {
-            supervisor,
+            hosts,
             owner: Arc::downgrade(&plane),
         }));
         Ok(plane)
     }
 
+    /// The shared host.
     pub fn supervisor(&self) -> &Arc<PluginHostSupervisor> {
-        &self.supervisor
+        self.hosts.main()
+    }
+
+    /// Every host this plane runs, and which plugin each serves.
+    pub fn hosts(&self) -> &PlaneHosts {
+        &self.hosts
+    }
+
+    /// The containers running now, by id, with the entries in each.
+    pub async fn containers(&self) -> BTreeMap<String, Vec<String>> {
+        self.containers
+            .lock()
+            .await
+            .iter()
+            .map(|(id, host)| (id.clone(), host.members.iter().cloned().collect()))
+            .collect()
+    }
+
+    /// The host an entry loads on: its container's, started if this is the
+    /// container's first entry, or the shared one.
+    async fn host_for_entry(
+        &self,
+        entry: &ComposeEntry,
+    ) -> Result<Arc<PluginHostSupervisor>, HostCallError> {
+        let Some(spec) = &entry.container else {
+            return Ok(Arc::clone(self.hosts.main()));
+        };
+        // Held across the start: two entries of one bundle loading at once
+        // must not start the container twice.
+        let mut containers = self.containers.lock().await;
+        if let Some(running) = containers.get_mut(&spec.id) {
+            running.members.insert(entry.id.clone());
+            self.hosts.assign(&entry.id, &running.supervisor);
+            return Ok(Arc::clone(&running.supervisor));
+        }
+        let (supervisor, keep_alive) = self.start_container(spec).await?;
+        containers.insert(
+            spec.id.clone(),
+            ContainerHost {
+                supervisor: Arc::clone(&supervisor),
+                members: BTreeSet::from([entry.id.clone()]),
+                _keep_alive: keep_alive,
+            },
+        );
+        self.hosts.assign(&entry.id, &supervisor);
+        Ok(supervisor)
+    }
+
+    /// Starts one container's host and its realm.
+    async fn start_container(
+        &self,
+        spec: &crate::container::ContainerSpec,
+    ) -> Result<
+        (
+            Arc<PluginHostSupervisor>,
+            Option<Arc<dyn std::any::Any + Send + Sync>>,
+        ),
+        HostCallError,
+    > {
+        let refuse = |why: String| {
+            HostCallError::Malformed(format!("[CONTAINER_REFUSED] {}: {why}", spec.id))
+        };
+        let data = PathBuf::from(&spec.data_dir);
+        std::fs::create_dir_all(data.join("tmp"))
+            .map_err(|error| refuse(format!("creating {}: {error}", data.display())))?;
+        let template = &self.template;
+        let mut extra_read = vec![template.compose_root.clone()];
+        extra_read.extend(template.payload_dir.iter().cloned());
+        let read: Vec<PathBuf> = extra_read
+            .iter()
+            .cloned()
+            .chain(spec.read.iter().map(PathBuf::from))
+            .chain(crate::container::runtime_root(&template.host_script))
+            .collect();
+        // Node's half first: the OS layer wraps the command line it makes.
+        let node_half = crate::container::container_launch(
+            spec,
+            &template.host_script,
+            &extra_read,
+            &|key| std::env::var_os(key),
+            &[],
+        );
+        let mut probe_config = HostConfig::new(template.node.clone(), template.host_script.clone())
+            .with_loader(&template.loader);
+        probe_config.node_args = node_half.node_args.clone();
+        let argv = rebon_plugin_supervisor::node_argv(&probe_config);
+        let confinement = match self.ctx.get::<rebon_tool::ContainerSandboxService>() {
+            Some(sandbox) => sandbox
+                .confine(&rebon_tool::ConfineRequest {
+                    container: spec.id.clone(),
+                    node: template.node.clone(),
+                    argv,
+                    environment: node_half.environment.clone(),
+                    read,
+                    write: data.clone(),
+                    network: spec.network.clone(),
+                })
+                .map_err(refuse)?,
+            None => {
+                let mut confinement = rebon_tool::ContainerConfinement::default();
+                confinement.notes.push(
+                    "no container sandbox in this build: the host runs under Node's \
+                     permission model only, and its network is not restricted"
+                        .to_owned(),
+                );
+                confinement
+            }
+        };
+        for note in &confinement.notes {
+            tracing::warn!(container = %spec.id, "{note}");
+        }
+        let launch = crate::container::container_launch(
+            spec,
+            &template.host_script,
+            &extra_read,
+            &|key| std::env::var_os(key),
+            &confinement.environment,
+        );
+        let mut host = HostConfig::new(template.node.clone(), template.host_script.clone())
+            .with_loader(&template.loader)
+            .with_working_directory(launch.working_directory.clone())
+            .with_tool_invoker(
+                Arc::clone(&template.invoker),
+                template.exposed_tools.iter().cloned(),
+            )
+            .with_seat_dispatcher(
+                Arc::clone(&template.seats) as Arc<dyn SeatDispatcher>,
+                template.exposed_seats.iter().cloned(),
+            )
+            .with_event_publisher(Arc::clone(&template.events) as Arc<dyn EventPublisher>);
+        host.node_args = launch.node_args;
+        host.environment = Some(launch.environment);
+        host.launcher = confinement
+            .launcher
+            .as_ref()
+            .map(crate::container::host_launcher);
+        let supervisor = Arc::new(
+            PluginHostSupervisor::start(host)
+                .await
+                .map_err(|error| refuse(format!("starting its host: {error}")))?,
+        );
+        let control = PluginLoadRequest {
+            plugin_id: COMPOSE_PLUGIN_ID.to_owned(),
+            root: template.compose_root.to_string_lossy().into_owned(),
+            entry: "src/plugin.mjs".to_owned(),
+            services: vec!["compose".to_owned()],
+            config: Payload::from(serde_json::json!({
+                "payloadDir": template.payload_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                "entries": [],
+                "web": template.web,
+                "modules": template.modules,
+            })),
+            event_topics: Vec::new(),
+            published_topics: Vec::new(),
+            llm_providers: Vec::new(),
+            tools: Vec::new(),
+            commands: Vec::new(),
+            invokable_tools: Vec::new(),
+            seats: Vec::new(),
+        };
+        let realm = async {
+            supervisor.load_plugin(&control).await?;
+            supervisor
+                .open_scope(COMPOSE_PLUGIN_ID, &self.scope, &self.workspace_root)
+                .await
+        };
+        if let Err(error) = realm.await {
+            let _ = supervisor.shutdown().await;
+            return Err(error);
+        }
+        Ok((supervisor, confinement.keep_alive))
+    }
+
+    /// Takes an entry out of its container, and the container down with its
+    /// last entry: the process goes, and everything the plugin held with it.
+    async fn leave_container(&self, plugin_id: &str) {
+        if !self.hosts.is_contained(plugin_id) {
+            return;
+        }
+        self.hosts.release(plugin_id);
+        let emptied = {
+            let mut containers = self.containers.lock().await;
+            let Some(id) = containers
+                .iter()
+                .find(|(_, host)| host.members.contains(plugin_id))
+                .map(|(id, _)| id.clone())
+            else {
+                return;
+            };
+            let host = containers.get_mut(&id).expect("found above");
+            host.members.remove(plugin_id);
+            if host.members.is_empty() {
+                containers.remove(&id)
+            } else {
+                None
+            }
+        };
+        if let Some(host) = emptied {
+            let _ = host.supervisor.shutdown().await;
+        }
+    }
+
+    /// Puts the mods registry on this plane: the `mods` seat answers, the
+    /// policy seat hears the mods, and every mod entry loaded from now on is
+    /// attached. Once per plane; a second call is a no-op.
+    pub fn install_mods(
+        &self,
+        kernel: &Arc<rebon_kernel::Kernel>,
+        config_dir: PathBuf,
+    ) -> Arc<crate::mods::ModsRegistry> {
+        let registry = self.mods.get_or_init(|| {
+            let registry = crate::mods::ModsRegistry::new(
+                self.hosts.clone(),
+                self.scope.clone(),
+                kernel.context().clone(),
+                self.ctx.clone(),
+                Arc::clone(&self.tools),
+                self.runtime.clone(),
+                self.unary_call_timeout,
+                config_dir,
+            );
+            registry.install(kernel);
+            registry.set_tool_invoker(Arc::clone(&self.template.invoker));
+            registry
+        });
+        Arc::clone(registry)
+    }
+
+    /// The mods registry, when one was installed.
+    pub fn mods(&self) -> Option<Arc<crate::mods::ModsRegistry>> {
+        self.mods.get().cloned()
     }
 
     /// The scope this plane's own calls travel on.
@@ -512,27 +862,69 @@ impl PluginPlane {
     /// "who serves this name" a single answer.
     pub fn tool_dispatch(self: &Arc<Self>) -> Arc<dyn ComposeToolDispatch> {
         Arc::new(PlaneToolDispatch {
-            supervisor: Arc::clone(&self.supervisor),
+            hosts: self.hosts.clone(),
             owner: Arc::downgrade(self),
         })
     }
 
     /// Loads one entry and registers what it reported on rebon's seats.
     pub async fn load_entry(&self, entry: &ComposeEntry) -> Result<EntryReport, HostCallError> {
+        let host = self.host_for_entry(entry).await?;
+        match self.load_entry_on(&host, entry).await {
+            Ok(report) => Ok(report),
+            Err(error) => {
+                self.leave_container(&entry.id).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn load_entry_on(
+        &self,
+        host: &Arc<PluginHostSupervisor>,
+        entry: &ComposeEntry,
+    ) -> Result<EntryReport, HostCallError> {
         self.declare_settings(entry);
-        let ready = match self.supervisor.load_plugin(&entry.load_request()).await {
+        let ready = match host.load_plugin(&entry.load_request()).await {
             Ok(ready) => ready,
             Err(error) => {
                 self.undeclare_settings(&entry.id);
                 return Err(error);
             }
         };
+        // A mod joins the registry before its scope opens: opening the scope
+        // runs its `session.start`, whose first `$` calls (a status, a
+        // command's description) reach the `mods` seat, and the seat answers
+        // for the mods it knows.
+        if crate::mods::ModsRegistry::entry_is_mod(entry) {
+            match self.mods() {
+                Some(mods) => {
+                    if let Err(error) = mods.attach(entry) {
+                        // Its commands or tools could not be seated: the same
+                        // ending a failed registration gets.
+                        self.undeclare_settings(&entry.id);
+                        self.unload_best_effort(host, &entry.id).await;
+                        return Err(HostCallError::Malformed(error));
+                    }
+                }
+                None => tracing::warn!(
+                    entry = %entry.id,
+                    "a mod loaded on a plane with no mods registry; its hooks, commands and tools are not reachable"
+                ),
+            }
+        }
         // Before anything is asked of it: the plane's own scope is what a
         // report, a tool call or a model turn rebon initiates travels on.
-        self.supervisor
+        if let Err(error) = host
             .open_scope(&entry.id, &self.scope, &self.workspace_root)
-            .await?;
-        let extras = match self.report_for(&entry.id).await {
+            .await
+        {
+            self.withdraw(&entry.id);
+            self.undeclare_settings(&entry.id);
+            self.unload_best_effort(host, &entry.id).await;
+            return Err(error);
+        }
+        let extras = match self.report_for(host, &entry.id).await {
             Ok(extras) => extras,
             // Not every composition entry is a Cordis plugin. A module
             // exporting `activate` is a plugin in rebon's own shape, and the
@@ -551,18 +943,25 @@ impl PluginPlane {
                 // then be refused as already loaded.
                 self.withdraw(&entry.id);
                 self.undeclare_settings(&entry.id);
-                self.unload_best_effort(&entry.id).await;
+                self.unload_best_effort(host, &entry.id).await;
                 return Err(error);
             }
         };
-        if let Err(error) = self.register(&entry.id, &ready, &extras, entry.publish) {
+        if let Err(error) = self.register(
+            host,
+            &entry.id,
+            &ready,
+            &extras,
+            entry.publish,
+            crate::mods::ModsRegistry::entry_is_mod(entry),
+        ) {
             // Both sides have to agree about what is loaded. An entry rebon
             // could not finish registering is one rebon will not route to, so
             // leaving it mounted would be a plugin running for nobody — and a
             // reload of the same id would then be refused as already loaded.
             self.withdraw(&entry.id);
             self.undeclare_settings(&entry.id);
-            self.unload_best_effort(&entry.id).await;
+            self.unload_best_effort(host, &entry.id).await;
             return Err(error);
         }
         // Recorded only once the entry is fully up, so a failed load leaves
@@ -640,7 +1039,13 @@ impl PluginPlane {
     /// registration first would only make the answer arrive for a tool rebon
     /// says does not exist.
     pub async fn unload_entry(&self, plugin_id: &str) -> Result<(), HostCallError> {
-        self.supervisor.unload_plugin(plugin_id).await?;
+        let host = self.hosts.for_plugin(plugin_id);
+        let drained = host.unload_plugin(plugin_id).await;
+        // A contained entry goes either way: if its host will not drain it,
+        // taking the container down is the unload.
+        if !self.hosts.is_contained(plugin_id) {
+            drained?;
+        }
         self.withdraw(plugin_id);
         self.undeclare_settings(plugin_id);
         self.loaded
@@ -653,6 +1058,7 @@ impl PluginPlane {
             .lock()
             .expect("plane standalone table")
             .remove(plugin_id);
+        self.leave_container(plugin_id).await;
         Ok(())
     }
 
@@ -668,13 +1074,10 @@ impl PluginPlane {
     /// caller. It cost exactly that: a host that answered `plugin/load` and
     /// then never answered `plugin/unload` parked a starting session for good,
     /// with the refusal it was about to print already in hand.
-    async fn unload_best_effort(&self, plugin_id: &str) {
-        if tokio::time::timeout(
-            Self::STANDALONE_LOAD_TIMEOUT,
-            self.supervisor.unload_plugin(plugin_id),
-        )
-        .await
-        .is_err()
+    async fn unload_best_effort(&self, host: &Arc<PluginHostSupervisor>, plugin_id: &str) {
+        if tokio::time::timeout(Self::STANDALONE_LOAD_TIMEOUT, host.unload_plugin(plugin_id))
+            .await
+            .is_err()
         {
             tracing::warn!(
                 plugin = plugin_id,
@@ -734,6 +1137,19 @@ impl PluginPlane {
         {
             return Ok(());
         }
+        let host = self.host_for_entry(entry).await?;
+        let outcome = self.load_standalone_on(&host, entry).await;
+        if outcome.is_err() {
+            self.leave_container(&entry.id).await;
+        }
+        outcome
+    }
+
+    async fn load_standalone_on(
+        &self,
+        host: &Arc<PluginHostSupervisor>,
+        entry: &ComposeEntry,
+    ) -> Result<(), HostCallError> {
         self.declare_settings(entry);
         // Bounded, because the caller is a session starting and the thing it
         // is waiting on is a separate process. A host that takes the request
@@ -742,7 +1158,7 @@ impl PluginPlane {
         // to explain itself, waiting on a reply that was never coming.
         let ready = match tokio::time::timeout(
             Self::STANDALONE_LOAD_TIMEOUT,
-            self.supervisor.load_plugin(&entry.load_request()),
+            host.load_plugin(&entry.load_request()),
         )
         .await
         {
@@ -768,14 +1184,13 @@ impl PluginPlane {
             .find(|declared| !ready.llm_providers.contains(*declared))
         {
             self.undeclare_settings(&entry.id);
-            self.unload_best_effort(&entry.id).await;
+            self.unload_best_effort(host, &entry.id).await;
             return Err(HostCallError::UnregisteredProvider {
                 plugin_id: entry.id.clone(),
                 provider: missing.clone(),
             });
         }
-        self.supervisor
-            .open_scope(&entry.id, &self.scope, &self.workspace_root)
+        host.open_scope(&entry.id, &self.scope, &self.workspace_root)
             .await?;
         // The same registration a composition entry gets, minus the half that
         // only a composition can answer: model catalogs and prompt sections
@@ -783,10 +1198,17 @@ impl PluginPlane {
         // plugin behind this one. Everything a plugin reports for itself —
         // tools, commands, services — lands on the same seats either way,
         // which is the point of the plugin model being one model.
-        if let Err(error) = self.register(&entry.id, &ready, &Value::Null, entry.publish) {
+        if let Err(error) = self.register(
+            host,
+            &entry.id,
+            &ready,
+            &Value::Null,
+            entry.publish,
+            crate::mods::ModsRegistry::entry_is_mod(entry),
+        ) {
             self.withdraw(&entry.id);
             self.undeclare_settings(&entry.id);
-            self.unload_best_effort(&entry.id).await;
+            self.unload_best_effort(host, &entry.id).await;
             return Err(error);
         }
         self.standalone
@@ -902,7 +1324,8 @@ impl PluginPlane {
         workspace_root: &str,
     ) -> Result<(), HostCallError> {
         for plugin_id in self.loaded() {
-            self.supervisor
+            self.hosts
+                .for_plugin(&plugin_id)
                 .open_scope(&plugin_id, scope_id, workspace_root)
                 .await?;
         }
@@ -925,7 +1348,13 @@ impl PluginPlane {
     /// Winds the host down and withdraws every registration the composition
     /// made, whichever way it ends.
     pub async fn shutdown(&self) {
-        let _ = self.supervisor.shutdown().await;
+        let _ = self.hosts.main().shutdown().await;
+        let containers: Vec<ContainerHost> = std::mem::take(&mut *self.containers.lock().await)
+            .into_values()
+            .collect();
+        for container in containers {
+            let _ = container.supervisor.shutdown().await;
+        }
         // Bound to a local first. A guard created inside the `for` expression
         // lives until the loop ends, and `withdraw` takes the same lock — which
         // is a deadlock rather than an error, because `std::sync::Mutex` is not
@@ -943,10 +1372,14 @@ impl PluginPlane {
     }
 
     /// Asks the composition for the facts the ready report has no field for.
-    async fn report_for(&self, plugin_id: &str) -> Result<Value, HostCallError> {
+    async fn report_for(
+        &self,
+        host: &Arc<PluginHostSupervisor>,
+        plugin_id: &str,
+    ) -> Result<Value, HostCallError> {
         let payload = tokio::time::timeout(
             REPORT_TIMEOUT,
-            self.supervisor.call_service(
+            host.call_service(
                 COMPOSE_PLUGIN_ID,
                 &self.scope,
                 "compose",
@@ -964,13 +1397,19 @@ impl PluginPlane {
         })
     }
 
+    /// `is_mod` says the entry is a Claude Code mod: its tools and commands
+    /// are seated by the mods registry rather than here, which re-seats them
+    /// when a `$.tool.register` or `$.command.register` refines one at run
+    /// time; the plane still routes them.
     #[allow(clippy::too_many_arguments)]
     fn register(
         &self,
+        host: &Arc<PluginHostSupervisor>,
         plugin_id: &str,
         ready: &PluginReadyReport,
         extras: &Value,
         publish: bool,
+        is_mod: bool,
     ) -> Result<(), HostCallError> {
         let mut record = Registrations {
             published: publish,
@@ -1004,7 +1443,7 @@ impl PluginPlane {
         // declared tools and maybe a route behind it, and `withdraw` can only
         // undo what it can find. Returning before recording would leak
         // exactly those — which is what the old token path did.
-        let outcome = self.register_published(plugin_id, ready, extras, &mut record);
+        let outcome = self.register_published(host, plugin_id, ready, extras, &mut record, is_mod);
         self.registered
             .lock()
             .expect("plane registrations poisoned")
@@ -1016,10 +1455,12 @@ impl PluginPlane {
     /// its model routes and its prompt sections.
     fn register_published(
         &self,
+        host: &Arc<PluginHostSupervisor>,
         plugin_id: &str,
         ready: &PluginReadyReport,
         extras: &Value,
         record: &mut Registrations,
+        is_mod: bool,
     ) -> Result<(), HostCallError> {
         // One scope per entry, so what it registered leaves in one statement
         // when it unloads — the kernel's own answer to the question the old
@@ -1044,7 +1485,7 @@ impl PluginPlane {
             proxies.push(proxy);
             record.tools.push(tool.name.clone());
         }
-        if !proxies.is_empty() {
+        if !proxies.is_empty() && !is_mod {
             match self.ctx.get::<ToolSeatService>() {
                 Some(seat) => seat
                     .register_tools(
@@ -1068,8 +1509,14 @@ impl PluginPlane {
             }
         }
 
-        self.register_commands(plugin_id, ready, &scope, record)?;
-        self.register_services(plugin_id, ready, &scope, record);
+        // A mod's one service is the registry's line to it, called by plugin
+        // id (`ModsRegistry::call_mod`); published on the kernel it would
+        // answer to no one, and every mod after the first would collide on
+        // the name.
+        if !is_mod {
+            self.register_commands(host, plugin_id, ready, &scope, record)?;
+            self.register_services(host, plugin_id, ready, &scope, record);
+        }
 
         for provider in extras
             .get("providers")
@@ -1090,7 +1537,7 @@ impl PluginPlane {
             register_llm_host(
                 name.to_owned(),
                 Arc::new(LlmRoute {
-                    supervisor: Arc::clone(&self.supervisor),
+                    supervisor: Arc::clone(host),
                     plugin_id: plugin_id.to_owned(),
                     provider: name.to_owned(),
                     scope: self.scope.clone(),
@@ -1154,6 +1601,7 @@ impl PluginPlane {
     /// to prevent.
     fn register_commands(
         &self,
+        host: &Arc<PluginHostSupervisor>,
         plugin_id: &str,
         ready: &PluginReadyReport,
         scope: &Context,
@@ -1180,8 +1628,10 @@ impl PluginPlane {
                 PluginCommandKind::Panel { dialog } => {
                     CommandHandler::Panel(Cow::Owned(dialog.clone()))
                 }
-                PluginCommandKind::Prompt => CommandHandler::Prompt(
-                    self.command_proxy(plugin_id.to_owned(), definition.name.clone()),
+                // Both ask the plugin; the spec's kind says what the answer
+                // is (a turn, or text shown and kept from the model).
+                PluginCommandKind::Prompt | PluginCommandKind::Output => CommandHandler::Prompt(
+                    self.command_proxy(host, plugin_id.to_owned(), definition.name.clone()),
                 ),
             };
             seat.register(scope, command_spec(definition), handler)
@@ -1208,16 +1658,38 @@ impl PluginPlane {
     /// ignoring them.
     fn command_proxy(
         &self,
+        host: &Arc<PluginHostSupervisor>,
         plugin_id: String,
         name: String,
     ) -> Arc<dyn Fn(&CommandArgs) -> Result<String, String> + Send + Sync> {
         // The four handles the call needs, cloned once rather than a handle on
         // the plane: a proxy that held the plane would keep the host alive for
         // as long as any menu remembered the command.
-        let supervisor = Arc::clone(&self.supervisor);
-        let plane_scope = self.scope.clone();
-        let runtime = self.runtime.clone();
-        let bound = self.unary_call_timeout;
+        command_proxy(
+            Arc::clone(host),
+            self.scope.clone(),
+            self.runtime.clone(),
+            self.unary_call_timeout,
+            plugin_id,
+            name,
+        )
+    }
+}
+
+/// The proxy behind a plugin's `prompt` command.
+///
+/// Shared by the plane (every plugin's commands) and the mods registry (a
+/// mod's, which it re-seats): one way of asking a plugin what a command
+/// expands to.
+pub(crate) fn command_proxy(
+    supervisor: Arc<PluginHostSupervisor>,
+    plane_scope: String,
+    runtime: tokio::runtime::Handle,
+    bound: Duration,
+    plugin_id: String,
+    name: String,
+) -> Arc<dyn Fn(&CommandArgs) -> Result<String, String> + Send + Sync> {
+    {
         Arc::new(move |args: &CommandArgs| {
             let request = CommandInvokeRequest {
                 name: name.clone(),
@@ -1239,7 +1711,7 @@ impl PluginPlane {
                 ));
                 let _ = tx.send(outcome);
             });
-            match rx.recv_timeout(bound + Self::PROXY_JOIN_EXTRA) {
+            match rx.recv_timeout(bound + PluginPlane::PROXY_JOIN_EXTRA) {
                 Ok(Ok(payload)) => match payload.to_value() {
                     Ok(Value::String(text)) => Ok(text),
                     Ok(Value::Null) => Ok(String::new()),
@@ -1266,7 +1738,9 @@ impl PluginPlane {
             }
         })
     }
+}
 
+impl PluginPlane {
     /// Publishes a plugin's services on the entry's scope.
     ///
     /// On the entry's own fork rather than the kernel root, which is the
@@ -1276,6 +1750,7 @@ impl PluginPlane {
     /// refused here and said out loud rather than silently winning.
     fn register_services(
         &self,
+        host: &Arc<PluginHostSupervisor>,
         plugin_id: &str,
         ready: &PluginReadyReport,
         scope: &Context,
@@ -1284,7 +1759,7 @@ impl PluginPlane {
         for name in &ready.services {
             let proxy = Arc::new(PlaneServiceProxy {
                 bound: self.unary_call_timeout,
-                supervisor: Arc::clone(&self.supervisor),
+                supervisor: Arc::clone(host),
                 plugin_id: plugin_id.to_owned(),
                 scope: self.scope.clone(),
                 service: name.clone(),
@@ -1305,6 +1780,9 @@ impl PluginPlane {
     /// Best-effort throughout: a composition is going away either way, and one
     /// seat refusing a withdrawal must not strand the others.
     fn withdraw(&self, plugin_id: &str) {
+        if let Some(mods) = self.mods() {
+            mods.detach(plugin_id);
+        }
         let Some(record) = self
             .registered
             .lock()
@@ -1379,7 +1857,8 @@ impl PluginPlane {
         workspace_root: &str,
     ) -> Result<(), HostCallError> {
         for plugin_id in plugin_ids {
-            self.supervisor
+            self.hosts
+                .for_plugin(plugin_id)
                 .open_scope(plugin_id, scope_id, workspace_root)
                 .await?;
         }
@@ -1398,7 +1877,8 @@ impl PluginPlane {
         request: Value,
     ) -> Result<Value, HostCallError> {
         let payload = self
-            .supervisor
+            .hosts
+            .for_plugin(plugin_id)
             .call_service(plugin_id, scope_id, service, Payload::from(request))
             .await?;
         payload.to_value().map_err(|error| {
@@ -1425,6 +1905,9 @@ fn command_spec(definition: &PluginCommandDefinition) -> CommandSpec {
             PluginCommandKind::Prompt => CommandKind::Prompt,
             PluginCommandKind::Explain { .. } => CommandKind::Explain,
             PluginCommandKind::Panel { .. } => CommandKind::Panel,
+            // The kind a mod's command has: the answer is the command's
+            // output, shown where it was typed.
+            PluginCommandKind::Output => CommandKind::Session,
         });
     if let Some(hint) = &definition.hint {
         spec = spec.hint(hint.clone());
@@ -1574,6 +2057,7 @@ pub fn default_exposed_seats() -> Vec<String> {
         "credentials".to_owned(),
         "logger".to_owned(),
         "settings".to_owned(),
+        rebon_types::MODS_SEAT.to_owned(),
     ]
 }
 
@@ -1585,6 +2069,10 @@ pub fn default_exposed_seats() -> Vec<String> {
 /// a panic: which seats a kernel provides depends on how it was assembled.
 struct KernelSeats {
     ctx: Context,
+    /// The mods registry, which answers the `mods` seat itself: its methods
+    /// run child processes and HTTP requests, which a synchronous JSON
+    /// service on the reader's thread could not.
+    mods: Arc<std::sync::OnceLock<Arc<crate::mods::ModsRegistry>>>,
 }
 
 impl SeatDispatcher for KernelSeats {
@@ -1595,6 +2083,19 @@ impl SeatDispatcher for KernelSeats {
         Box<dyn std::future::Future<Output = Result<Payload, ToolRefusal>> + Send + '_>,
     > {
         let mut params = invocation.params.to_value().unwrap_or(Value::Null);
+        if invocation.seat == rebon_types::MODS_SEAT {
+            return match self.mods.get() {
+                Some(mods) => {
+                    mods.seat_call(&invocation.identity.plugin_id, &invocation.method, params)
+                }
+                None => Box::pin(async move {
+                    Err(ToolRefusal::new(
+                        "[UNAVAILABLE_SEAT]",
+                        "the mods seat is not installed on this plane",
+                    ))
+                }),
+            };
+        }
         // Who is calling is the host's answer, not the plugin's. Written over
         // whatever the params carried, so a plugin cannot reach another
         // plugin's settings namespace by naming it here — see
@@ -1643,7 +2144,7 @@ impl EventPublisher for KernelEvents {
 
 /// Runs a composition tool through `tool/call`.
 struct PlaneToolDispatch {
-    supervisor: Arc<PluginHostSupervisor>,
+    hosts: PlaneHosts,
     owner: std::sync::Weak<PluginPlane>,
 }
 
@@ -1658,12 +2159,13 @@ impl ComposeToolDispatch for PlaneToolDispatch {
             .ok_or_else(|| format!("no composition entry provides {tool}"))?;
         let payload = Payload::from(input);
         let scope = plane.scope().to_owned();
+        let host = self.hosts.for_plugin(&owner);
         let call: std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>> = match route {
-            Route::Tool => Box::pin(self.supervisor.call_tool(&owner, &scope, tool, payload)),
+            Route::Tool => Box::pin(host.call_tool(&owner, &scope, tool, payload)),
             // A composition tool reached through a service: the caller's own
             // `timeout` below is this call's bound, and a tool's length is the
             // tool's business.
-            Route::Service => Box::pin(self.supervisor.call_service(&owner, &scope, tool, payload)),
+            Route::Service => Box::pin(host.call_service(&owner, &scope, tool, payload)),
         };
         match tokio::time::timeout(timeout, call).await {
             Err(_) => Err(format!("composition tool {tool} did not answer in time")),
@@ -1767,6 +2269,7 @@ mod reload_tests {
             seats: Vec::new(),
             settings: Vec::new(),
             publish: true,
+            container: None,
         }
     }
 
@@ -1883,6 +2386,30 @@ mod reload_tests {
     /// `publish` is part of what an entry *is* — a private entry promoted to a
     /// published one has to restart, or its registrations never reach rebon's
     /// seats.
+    #[test]
+    fn a_container_whose_grants_changed_is_restarted() {
+        let spec = crate::container::ContainerSpec {
+            id: "snake@rebon".into(),
+            data_dir: "/data/snake".into(),
+            ..Default::default()
+        };
+        let mut before = entry("snake", Value::Null);
+        before.container = Some(spec.clone());
+        let mut after = before.clone();
+        after.container = Some(crate::container::ContainerSpec {
+            network: vec!["api.example.com".into()],
+            ..spec
+        });
+        let plan = classify(&running(&[before.clone()]), &[after]);
+        assert_eq!(plan.changed, vec!["snake".to_string()]);
+        // Moving an entry into a container is a change too: it has to leave
+        // the shared host for its own.
+        let mut shared = before.clone();
+        shared.container = None;
+        let plan = classify(&running(&[shared]), &[before]);
+        assert_eq!(plan.changed, vec!["snake".to_string()]);
+    }
+
     #[test]
     fn publish_is_part_of_the_comparison() {
         let before = vec![entry("a", Value::Null)];

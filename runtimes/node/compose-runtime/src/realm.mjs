@@ -27,10 +27,11 @@ import RebonCredentials from './credentials-runtime.mjs';
 import RebonToolsRuntime from './tools-runtime.mjs';
 import RebonWebRuntime from './web-runtime.mjs';
 import RebonSystemPromptRuntime from './systemprompt-runtime.mjs';
+import RebonCommandsRuntime from './commands-runtime.mjs';
 
 /** The built-in seats, in mount order: a dsh `inject` is satisfied at mount
  *  time, so a seat that arrives after the plugin needing it never arrives. */
-const BUILTIN_SEATS = ['llm', 'credentials', 'tools', 'web', 'systemPrompt'];
+const BUILTIN_SEATS = ['llm', 'credentials', 'tools', 'web', 'systemPrompt', 'commands'];
 
 let state;
 
@@ -104,6 +105,7 @@ export async function createRealm({ web = null, entries = [] } = {}) {
   await ctx.plugin(RebonToolsRuntime);
   await ctx.plugin(RebonWebRuntime, { web });
   await ctx.plugin(RebonSystemPromptRuntime);
+  await ctx.plugin(RebonCommandsRuntime);
 
   state = { ctx, placements, groups, realms, fibers: new Map(), sinks: new Map() };
   return state;
@@ -148,7 +150,7 @@ function requiredInjects(plugin) {
 /// The sink rides on the entry's own derived context, which is what lets a seat
 /// attribute a registration synchronously — the moment a plugin registers, the
 /// context it registered through says which plugin it was.
-export async function mountEntry(request, plugin) {
+export async function mountEntry(request, plugin, { probe = false } = {}) {
   const live = realm();
   const { pluginId } = request;
   if (live.groups.has(pluginId)) {
@@ -161,7 +163,7 @@ export async function mountEntry(request, plugin) {
     throw new ComposeError('[PLUGIN_ALREADY_LOADED]', `${pluginId} is already mounted`);
   }
   const parent = live.placements.get(pluginId) ?? live.ctx;
-  const sink = new RegistrationSink(pluginId, request);
+  const sink = new RegistrationSink(pluginId, request, { probe });
   const derived = parent.extend({ [OWNER]: pluginId, [SINK]: sink });
   // Refused before mounting rather than waited for. Cordis lets a plugin wait
   // for a service that has not arrived yet, and inside one composition that is

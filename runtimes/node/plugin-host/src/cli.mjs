@@ -143,5 +143,18 @@ if (import.meta.url === pathToFileURL(process.argv[1]).href) {
     process.exitCode = await runHost({
       input: process.stdin, output: process.stdout, error: process.stderr, loader,
     });
+    // Once the host returns there is nobody left to serve: rebon shut it
+    // down, or rebon is gone and stdin ended. A plugin's timer or open handle
+    // must not keep the process alive past that — it would outlive rebon as
+    // an orphan holding whatever the plugin opened. What was already written
+    // is flushed first; a stream that cannot flush does not hold the exit.
+    const flushed = (stream) => new Promise((resolve) => {
+      if (stream.destroyed || !stream.writable) return resolve();
+      stream.once('error', () => resolve());
+      try { stream.write('', () => resolve()); } catch { resolve(); }
+    });
+    const grace = new Promise((resolve) => setTimeout(resolve, 1000).unref());
+    await Promise.race([Promise.all([flushed(process.stdout), flushed(process.stderr)]), grace]);
+    process.exit();
   }
 }

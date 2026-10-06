@@ -1,0 +1,13 @@
+{
+  "name": "@rebon/mods-runtime",
+  "version": "0.0.0-private",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": { "node": ">=24.19.0 <25" },
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "exports": {
+    ".": "./src/index.mjs",
+    "./claude-code": "./src/claude-code.mjs"
+  }
+}

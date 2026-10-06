@@ -33,6 +33,7 @@ use rebon_kernel_seats::kernel_compose_tools::{
 use rebon_kernel_seats::kernel_config_seats::{ConfigSeatsPlugin, CREDENTIALS_AUTHORIZE_EVENT};
 use rebon_kernel_seats::kernel_core_commands::CoreCommandsPlugin;
 use rebon_kernel_seats::kernel_prompt_sections::{ComposePromptSections, SYSTEM_PROMPT_SERVICE};
+use rebon_plugin_host::container::ContainerSpec;
 use rebon_plugin_host::plugin_plane::{ComposeEntry, ComposeNode, PluginPlane, PluginPlaneConfig};
 use rebon_plugin_supervisor::{ToolInvocation, ToolInvoker, ToolRefusal};
 use rebon_provider::kernel_llm_dispatch::unregister_llm_host;
@@ -510,6 +511,75 @@ async fn a_composition_tool_lands_in_the_process_registry_and_leaves_on_unload()
 
     fixture.plane.shutdown().await;
     let _ = fixture.tools;
+}
+
+/// The DeepSeek Harness packages Rebon's own marketplace offers load on the
+/// real plane as an install leaves them: by their package's declaration, with
+/// the composition config the package asks to be listed with.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_marketplaces_dsh_packages_load_and_register_their_tools() {
+    use rebon_plugin_host::plugin_manifests::{entry_for, read_package_manifest};
+
+    let _serial = serialised().await;
+    for (id, module, tools) in [
+        ("dsh-tool-todo", "tool-todo.js", vec!["todo_write"]),
+        (
+            "dsh-tool-web",
+            "tool-web.js",
+            vec!["web_search", "web_fetch"],
+        ),
+    ] {
+        let Some(fixture) = boot(
+            vec![ComposeNode {
+                id: id.into(),
+                ..Default::default()
+            }],
+            &["WebSearch", "WebFetch"],
+        )
+        .await
+        else {
+            return;
+        };
+        let package = repo().join("marketplace/plugins").join(id);
+        let (declared_as, manifest) = read_package_manifest(&package.join(module))
+            .expect("the package declares a kernel plugin");
+        assert_eq!(declared_as, id);
+        let raw: Value = serde_json::from_slice(
+            &std::fs::read(package.join("rebon-plugin.json")).expect("the package manifest"),
+        )
+        .expect("the package manifest is JSON");
+        let config = raw["metadata"]["kernelPluginConfig"][id].clone();
+        let config = if config.is_null() {
+            serde_json::json!({})
+        } else {
+            config
+        };
+        let entry = entry_for(
+            &manifest,
+            id,
+            package.clone(),
+            manifest.entry.clone().expect("an entry module"),
+            config,
+            &["WebSearch".to_string(), "WebFetch".to_string()],
+        );
+        fixture
+            .plane
+            .load_entry(&entry)
+            .await
+            .unwrap_or_else(|error| panic!("{id} loads from the marketplace package: {error}"));
+        let registry = process_compose_tools().expect("the process tool table is bound");
+        let mut names = registry.tool_names();
+        names.sort();
+        let mut wanted: Vec<String> = tools.iter().map(|tool| tool.to_string()).collect();
+        wanted.sort();
+        assert_eq!(names, wanted, "{id} registered exactly what it declares");
+        fixture
+            .plane
+            .unload_entry(id)
+            .await
+            .expect("the entry drains");
+        fixture.plane.shutdown().await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1304,6 +1374,374 @@ async fn the_example_package_registers_its_command() {
         Some(serde_json::json!("Bonjour")),
         "the refusals wrote nothing"
     );
+
+    fixture.plane.shutdown().await;
+}
+
+/// What the container probe answered, dug out of whatever envelope the tool
+/// result travels in: the probe answers one JSON string.
+fn probe_answer(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .filter(|parsed| parsed.get("ok").is_some())
+            .or_else(|| {
+                serde_json::from_str::<Value>(text)
+                    .ok()
+                    .and_then(|v| probe_answer(&v))
+            }),
+        Value::Array(items) => items.iter().find_map(probe_answer),
+        Value::Object(map) => {
+            if map.contains_key("ok") && (map.contains_key("value") || map.contains_key("code")) {
+                return Some(value.clone());
+            }
+            map.values().find_map(probe_answer)
+        }
+        _ => None,
+    }
+}
+
+async fn probe(plane: &Arc<PluginPlane>, tool: &str, action: &str, path: &str) -> Value {
+    let answer = plane
+        .tool_dispatch()
+        .serve(
+            tool,
+            serde_json::json!({ "action": action, "path": path }),
+            Duration::from_secs(20),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{tool} {action} failed: {error}"));
+    probe_answer(&answer).unwrap_or_else(|| panic!("no probe answer in {answer}"))
+}
+
+fn probe_entry(id: &str, tool: &str, container: Option<ContainerSpec>) -> ComposeEntry {
+    let root = repo().join("crates/rebon-harness/tests/fixtures/container-probe");
+    ComposeEntry {
+        id: id.into(),
+        root: plain(&root),
+        entry: "probe.mjs".into(),
+        config: serde_json::json!({ "tool": tool }),
+        tools: vec![tool.into()],
+        container,
+        ..ComposeEntry::default()
+    }
+}
+
+/// A plugin in a container runs in a Node host of its own that reads only
+/// the runtime and its package, writes only its data directory, starts no
+/// process and sees no variable it was not granted — while the same plugin on
+/// the shared host can do all of that. Changing its grants restarts it in a
+/// new process, and its last entry leaving takes the container down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_contained_plugin_is_confined_to_its_own_files_and_dies_with_its_last_entry() {
+    let _serial = serialised().await;
+    let Some(fixture) = boot(Vec::new(), &[]).await else {
+        return;
+    };
+    let package = repo().join("crates/rebon-harness/tests/fixtures/container-probe");
+    let data = fixture.config_dir().join("plugins/data/probe-box");
+    let spec = ContainerSpec {
+        id: "probe-box".into(),
+        read: vec![plain(&package)],
+        data_dir: plain(&data),
+        network: Vec::new(),
+        env: Vec::new(),
+    };
+
+    fixture
+        .plane
+        .load_entry(&probe_entry("probe-shared", "probe_shared", None))
+        .await
+        .expect("the probe loads on the shared host");
+    fixture
+        .plane
+        .load_entry(&probe_entry(
+            "probe-boxed",
+            "probe_boxed",
+            Some(spec.clone()),
+        ))
+        .await
+        .expect("the probe loads in its container");
+    assert_eq!(
+        fixture.plane.containers().await,
+        BTreeMap::from([("probe-box".to_string(), vec!["probe-boxed".to_string()])])
+    );
+
+    // Two processes.
+    let shared_pid = probe(&fixture.plane, "probe_shared", "pid", "").await["value"].clone();
+    let boxed_pid = probe(&fixture.plane, "probe_boxed", "pid", "").await["value"].clone();
+    assert_ne!(shared_pid, boxed_pid, "the container is a host of its own");
+
+    // Files: its package and its data, nothing else.
+    let own_file = plain(&package.join("probe.mjs"));
+    let elsewhere = plain(&repo().join("Cargo.toml"));
+    assert_eq!(
+        probe(&fixture.plane, "probe_boxed", "read", &own_file).await["ok"],
+        true
+    );
+    let denied = probe(&fixture.plane, "probe_boxed", "read", &elsewhere).await;
+    assert_eq!(denied["ok"], false, "{denied}");
+    assert_eq!(denied["code"], "ERR_ACCESS_DENIED");
+    assert_eq!(
+        probe(&fixture.plane, "probe_shared", "read", &elsewhere).await["ok"],
+        true
+    );
+    let inside = plain(&data.join("note.txt"));
+    assert_eq!(
+        probe(&fixture.plane, "probe_boxed", "write", &inside).await["ok"],
+        true
+    );
+    let outside = plain(&fixture.config_dir().join("escaped.txt"));
+    assert_eq!(
+        probe(&fixture.plane, "probe_boxed", "write", &outside).await["code"],
+        "ERR_ACCESS_DENIED"
+    );
+    assert!(!fixture.config_dir().join("escaped.txt").exists());
+
+    // No processes, no inherited environment.
+    assert_eq!(
+        probe(&fixture.plane, "probe_boxed", "spawn", "").await["code"],
+        "ERR_ACCESS_DENIED"
+    );
+    assert_eq!(
+        probe(&fixture.plane, "probe_boxed", "env", "PATH").await["value"],
+        Value::Null
+    );
+    assert_ne!(
+        probe(&fixture.plane, "probe_shared", "env", "PATH").await["value"],
+        Value::Null
+    );
+
+    // A grant changed: the entry restarts, in a new process, with it.
+    let granted = ContainerSpec {
+        env: vec!["PATH".into()],
+        ..spec.clone()
+    };
+    let outcome = fixture
+        .plane
+        .reload(&[
+            probe_entry("probe-shared", "probe_shared", None),
+            probe_entry("probe-boxed", "probe_boxed", Some(granted)),
+        ])
+        .await
+        .expect("the reload runs");
+    assert_eq!(
+        outcome.changed,
+        vec!["probe-boxed".to_string()],
+        "{outcome:?}"
+    );
+    assert!(outcome.failed.is_empty(), "{outcome:?}");
+    let restarted_pid = probe(&fixture.plane, "probe_boxed", "pid", "").await["value"].clone();
+    assert_ne!(restarted_pid, boxed_pid, "a fresh process, not a re-import");
+    assert_ne!(
+        probe(&fixture.plane, "probe_boxed", "env", "PATH").await["value"],
+        Value::Null
+    );
+
+    // Its last entry leaving takes the container with it.
+    fixture
+        .plane
+        .unload_entry("probe-boxed")
+        .await
+        .expect("the contained entry unloads");
+    assert!(fixture.plane.containers().await.is_empty());
+    assert!(fixture
+        .plane
+        .tool_dispatch()
+        .serve(
+            "probe_boxed",
+            serde_json::json!({ "action": "pid" }),
+            Duration::from_secs(5)
+        )
+        .await
+        .is_err());
+    // The shared host is untouched.
+    assert_eq!(
+        probe(&fixture.plane, "probe_shared", "pid", "").await["value"],
+        shared_pid
+    );
+
+    fixture.plane.shutdown().await;
+}
+
+/// A container reaches the network only through its own proxy: the host it
+/// was granted answers, and a container granted nothing is refused by name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_contained_plugin_reaches_only_the_hosts_it_was_granted() {
+    let _serial = serialised().await;
+    let Some(fixture) = boot(Vec::new(), &[]).await else {
+        return;
+    };
+    fixture
+        .kernel
+        .context()
+        .provide::<rebon_tool::ContainerSandboxService>(Arc::new(
+            rebon_plugin_sandbox::container::ContainerSandbox,
+        ))
+        .expect("the container seat provides");
+    // Offline names: `.invalid` never resolves, so what tells the two apart
+    // is who answered — the proxy refusing (403) before any lookup, or the
+    // proxy admitting the host and then failing to reach it. (Loopback names
+    // are not a test of this: Node's env proxy never applies to them.)
+    let granted_url = "http://granted.invalid/";
+    let other_url = "http://other.invalid/";
+    let package = repo().join("crates/rebon-harness/tests/fixtures/container-probe");
+    let spec = |id: &str, network: Vec<String>| ContainerSpec {
+        id: id.into(),
+        read: vec![plain(&package)],
+        data_dir: plain(&fixture.config_dir().join("plugins/data").join(id)),
+        network,
+        env: Vec::new(),
+    };
+    fixture
+        .plane
+        .load_entry(&probe_entry(
+            "probe-granted",
+            "probe_granted",
+            Some(spec("granted-box", vec!["granted.invalid".into()])),
+        ))
+        .await
+        .expect("the granted probe loads");
+    fixture
+        .plane
+        .load_entry(&probe_entry(
+            "probe-closed",
+            "probe_closed",
+            Some(spec("closed-box", Vec::new())),
+        ))
+        .await
+        .expect("the closed probe loads");
+
+    // Node tunnels every request to a non-loopback host through the
+    // proxy with CONNECT and reports any refusal as "Request was cancelled",
+    // so what the plugin sees cannot tell the proxy's 403 from a failed
+    // lookup. The contract is checked in its two halves instead: the host is
+    // pointed at its own proxy, and that proxy admits exactly the grant.
+    async fn proxy_of(plane: &Arc<PluginPlane>, tool: &str) -> u16 {
+        let env = |name: &'static str| {
+            let plane = Arc::clone(plane);
+            let tool = tool.to_owned();
+            async move { probe(&plane, &tool, "env", name).await["value"].clone() }
+        };
+        assert_eq!(
+            env("NODE_USE_ENV_PROXY").await,
+            "1",
+            "Node's fetch honours the proxy"
+        );
+        let url = env("HTTPS_PROXY").await;
+        let url = url.as_str().expect("the host is pointed at a proxy");
+        url.rsplit(':').next().unwrap().parse().expect("a port")
+    }
+    /// The proxy's first line for a CONNECT, or `None` when it is still
+    /// working on it — an admitted `.invalid` host waits on its lookup, while
+    /// a refusal is decided before any lookup and answered at once.
+    async fn connect_status(port: u16, host: &str) -> Option<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("the container's proxy listens");
+        socket
+            .write_all(format!("CONNECT {host}:80 HTTP/1.1\r\nHost: {host}:80\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut buffer = vec![0u8; 512];
+        let read = tokio::time::timeout(Duration::from_secs(3), socket.read(&mut buffer))
+            .await
+            .ok()?
+            .ok()?;
+        Some(
+            String::from_utf8_lossy(&buffer[..read])
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned(),
+        )
+    }
+    let granted_proxy = proxy_of(&fixture.plane, "probe_granted").await;
+    let closed_proxy = proxy_of(&fixture.plane, "probe_closed").await;
+    assert_ne!(granted_proxy, closed_proxy, "a proxy per container");
+    let admitted = connect_status(granted_proxy, "granted.invalid").await;
+    assert!(
+        !admitted.as_deref().unwrap_or_default().contains(" 403"),
+        "the granted host is admitted: {admitted:?}"
+    );
+    let refused = connect_status(granted_proxy, "other.invalid").await;
+    assert!(
+        refused.as_deref().is_some_and(|line| line.contains(" 403")),
+        "a host it was not granted: {refused:?}"
+    );
+    let closed = connect_status(closed_proxy, "granted.invalid").await;
+    assert!(
+        closed.as_deref().is_some_and(|line| line.contains(" 403")),
+        "a container granted nothing reaches nothing: {closed:?}"
+    );
+    // And the plugin's own request went to the proxy rather than out: the
+    // refused lookup never happened on the plugin's side.
+    let fetched = probe(&fixture.plane, "probe_closed", "fetch", other_url).await;
+    assert_eq!(fetched["ok"], false, "{fetched}");
+    let _ = granted_url;
+
+    fixture.plane.shutdown().await;
+}
+
+/// A DeepSeek Harness plugin's `ctx.commands.register` becomes rebon's own
+/// slash command: listed on the command seat as one whose answer is shown
+/// rather than sent to the model, answered by the plugin in its container.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dsh_plugin_s_commands_are_rebon_commands_that_answer_in_place() {
+    use rebon_command_seat::{CommandArgs, CommandHandler, CommandSeatService, Surface};
+    let _serial = serialised().await;
+    let Some(fixture) = boot(Vec::new(), &[]).await else {
+        return;
+    };
+    let package = repo().join("crates/rebon-harness/tests/fixtures/container-probe");
+    let entry = ComposeEntry {
+        id: "dsh-commands".into(),
+        root: plain(&package),
+        entry: "commands.mjs".into(),
+        commands: vec!["greet".into(), "refuse".into()],
+        container: Some(ContainerSpec {
+            id: "commands-box".into(),
+            read: vec![plain(&package)],
+            data_dir: plain(&fixture.config_dir().join("plugins/data/commands-box")),
+            network: Vec::new(),
+            env: Vec::new(),
+        }),
+        ..ComposeEntry::default()
+    };
+    fixture
+        .plane
+        .load_entry(&entry)
+        .await
+        .expect("the plugin loads with its commands");
+    let seat = fixture
+        .kernel
+        .context()
+        .get::<CommandSeatService>()
+        .expect("the command seat");
+    let greet = seat.find("greet").expect("/greet is on the seat");
+    assert_eq!(greet.spec.kind, rebon_slash_commands::CommandKind::Session);
+    assert_eq!(greet.spec.hint.as_deref(), Some("<name>"));
+    let run = |name: &'static str, rest: &'static str| {
+        let command = seat.find(name).expect("on the seat");
+        let CommandHandler::Prompt(expand) = &command.handler else {
+            panic!("an output command asks its plugin");
+        };
+        let expand = Arc::clone(expand);
+        tokio::task::spawn_blocking(move || {
+            expand(&CommandArgs {
+                raw: format!("/{name}{rest}"),
+                rest: rest.to_owned(),
+                surface: Surface::Tui,
+            })
+        })
+    };
+    assert_eq!(
+        run("greet", " rebon").await.unwrap().unwrap(),
+        "hello rebon"
+    );
+    let refused = run("refuse", "").await.unwrap().unwrap_err();
+    assert!(refused.contains("refused on purpose"), "{refused}");
 
     fixture.plane.shutdown().await;
 }

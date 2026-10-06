@@ -120,10 +120,44 @@ export function identityOf(envelope) {
   return Object.freeze({ host_epoch: envelope.host_epoch, plugin_id: envelope.plugin_id, scope_id: envelope.scope_id,
     scope_generation: envelope.scope_generation, call_id: envelope.call_id });
 }
+/// A value a plugin produced, as `JSON.stringify` would write it.
+///
+/// What a handler returns or a plugin sends is ordinary JavaScript, and
+/// ordinary JavaScript leaves `undefined` in objects (`{ text, context }` with
+/// no context), carries a `Date`, or builds its result with a class. The wire
+/// takes plain JSON only, and refusing such a value used to mean the call was
+/// never answered at all. This is the normalisation every JS author already
+/// expects: `toJSON` is honoured; an `undefined`, function or symbol property
+/// is left out, and in an array becomes `null`; a class instance is written as
+/// its own enumerable fields. A non-finite number becomes `null`. What still
+/// cannot be written — a cycle, a `BigInt` — is refused with a reason.
+export function toWireJson(value, seen = new Set(), inArray = false) {
+  if (value instanceof RawJsonNumber) return value;
+  if (value !== null && typeof value === 'object' && typeof value.toJSON === 'function') value = value.toJSON();
+  if (value === undefined || typeof value === 'function' || typeof value === 'symbol') return inArray ? null : undefined;
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'bigint') throw new ProtocolError('invalid_payload', 'a BigInt cannot be written as JSON; convert it to a number or a string');
+  if (seen.has(value)) throw new ProtocolError('invalid_payload', 'payload must not be cyclic');
+  seen.add(value);
+  let copy;
+  if (Array.isArray(value)) copy = value.map((item) => toWireJson(item, seen, true));
+  else {
+    copy = {};
+    for (const key of Object.keys(value)) {
+      const item = toWireJson(value[key], seen, false);
+      if (item !== undefined) copy[key] = item;
+    }
+  }
+  seen.delete(value);
+  return copy;
+}
+const wire = (payload) => (payload === undefined ? null : toWireJson(payload));
+
 export function envelope(identity, message) { return validateEnvelope({ protocol_version: PROTOCOL_VERSION, ...identity, message }); }
-export function terminal(identity, status, payload) { return envelope(identity, { type: 'terminal', status, payload }); }
-export function request(identity, method, payload) { return envelope(identity, { type: 'request', method, payload }); }
-export function notification(identity, method, payload) { return envelope(identity, { type: 'notification', method, payload }); }
-export function chunk(identity, payload) { return envelope(identity, { type: 'chunk', payload }); }
+export function terminal(identity, status, payload) { return envelope(identity, { type: 'terminal', status, payload: wire(payload) }); }
+export function request(identity, method, payload) { return envelope(identity, { type: 'request', method, payload: wire(payload) }); }
+export function notification(identity, method, payload) { return envelope(identity, { type: 'notification', method, payload: wire(payload) }); }
+export function chunk(identity, payload) { return envelope(identity, { type: 'chunk', payload: wire(payload) }); }
 export function cancel(target) { return notification(target, CALL_CANCEL_METHOD, null); }
 export function isPlatformControl(value) { return value.plugin_id === PLATFORM_PLUGIN_ID && value.scope_id === PLATFORM_CONTROL_SCOPE_ID && value.scope_generation === 0; }

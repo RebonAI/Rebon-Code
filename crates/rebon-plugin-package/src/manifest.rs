@@ -34,6 +34,11 @@ pub struct PluginManifest {
     pub integrity: Option<PluginIntegrity>,
     #[serde(default)]
     pub metadata: BTreeMap<String, Value>,
+    /// What the package asks of the container it runs in: hosts it connects
+    /// to and variables it reads (see [`crate::container`]). A request, not a
+    /// grant — installing records what the person allowed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<crate::container::ContainerRequest>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -189,7 +194,7 @@ impl PluginManifest {
                 anyhow!("invalid kernel plugin `{name}` entry `{entry}`: {error}")
             })?;
             if let Some(root) = root {
-                ensure_path_inside_root(root, &relative).map_err(|error| {
+                ensure_path_inside_root(root, &root.join(&relative)).map_err(|error| {
                     anyhow!("invalid kernel plugin `{name}` entry `{entry}`: {error}")
                 })?;
             }
@@ -576,6 +581,34 @@ mod tests {
         }));
         let error = manifest.validate(None).unwrap_err().to_string();
         assert!(error.contains("no entry module"), "{error}");
+    }
+
+    /// The entry is looked for inside the package's own root, wherever the
+    /// process happens to run: an install from any folder finds it.
+    #[test]
+    fn a_kernel_plugin_entry_resolves_against_the_package_root_not_the_cwd() {
+        let package = tempfile::tempdir().unwrap();
+        std::fs::write(
+            package.path().join("plugin.mjs"),
+            "export function activate() {}",
+        )
+        .unwrap();
+        let manifest = manifest_json(serde_json::json!({
+            "name": "demo",
+            "version": "1.0.0",
+            "capabilities": {"kernelPlugins": {"demo": {"entry": "plugin.mjs"}}}
+        }));
+        assert!(
+            !std::env::current_dir().unwrap().join("plugin.mjs").exists(),
+            "the test's cwd must not hold the entry"
+        );
+        manifest.validate(Some(package.path())).unwrap();
+        let missing = manifest_json(serde_json::json!({
+            "name": "demo",
+            "version": "1.0.0",
+            "capabilities": {"kernelPlugins": {"demo": {"entry": "absent.mjs"}}}
+        }));
+        assert!(missing.validate(Some(package.path())).is_err());
     }
 
     /// An entry is a module inside the package, held to the same rule as every

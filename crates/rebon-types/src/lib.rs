@@ -7,6 +7,7 @@
 
 mod app_visual_effect;
 mod cancel;
+pub mod claude_mod;
 mod constant_time;
 pub mod effort_indicator;
 pub mod env;
@@ -29,6 +30,7 @@ mod ultraplan_run;
 
 pub use app_visual_effect::*;
 pub use cancel::PromptCancel;
+pub use claude_mod::*;
 pub use constant_time::constant_time_eq;
 pub use file_mention::{
     FileMentionLocation, FileMentionQuery, FileMentionQueryError, MAX_FILE_MENTION_QUERY_BYTES,

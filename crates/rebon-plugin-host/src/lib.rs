@@ -39,10 +39,12 @@
 //! race would be a plugin that silently does not exist.
 
 pub mod compose_patches;
+pub mod container;
 pub mod kernel_loop_backend;
 pub mod kernel_loop_plane;
 pub mod kernel_node_host;
 pub mod loop_host;
+pub mod mods;
 pub mod plugin_boot;
 pub mod plugin_composition;
 pub mod plugin_manifests;

@@ -8,6 +8,7 @@ publish.workspace = true
 description = "The session as every surface drives it: engine half, runtime, and the slash commands that act on it."
 
 [dependencies]
+regex.workspace = true
 # The layer below: job state, store, protocol, owner/lease, the thin client.
 # This crate is the host half that sits on top of it (the two cannot be
 # one crate because the host needs the store and the store must not need the

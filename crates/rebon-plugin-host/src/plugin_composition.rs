@@ -89,21 +89,81 @@ pub fn plane_composition(
     roots: &CompositionRoots,
     all_tools: &[String],
 ) -> Result<PlaneComposition, String> {
-    let raw = std::fs::read(config_dir.join("config.json"))
-        .map_err(|error| format!("config.json is unreadable: {error}"))?;
-    let config: Value =
-        serde_json::from_slice(&raw).map_err(|error| format!("config.json is invalid: {error}"))?;
-    let Some(section) = config.get("kernelPlugins") else {
-        return Ok(PlaneComposition::default());
+    // No `config.json`, or one without `kernelPlugins`, configures no
+    // composition — but a mod folder dropped under the config home is still
+    // one to load, so neither ends the reading here.
+    let config: Value = match std::fs::read(config_dir.join("config.json")) {
+        Ok(raw) => serde_json::from_slice(&raw)
+            .map_err(|error| format!("config.json is invalid: {error}"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Value::Null,
+        Err(error) => return Err(format!("config.json is unreadable: {error}")),
     };
-    let manifests = PayloadManifests::load(&roots.runtime)?;
-    Ok(compose_section(
-        section,
-        roots,
-        all_tools,
-        &manifests,
-        &installed_kernel_plugins(config_dir),
-    ))
+    let mut composition = match config.get("kernelPlugins") {
+        Some(section) => {
+            let manifests = PayloadManifests::load(&roots.runtime)?;
+            compose_section(
+                section,
+                roots,
+                all_tools,
+                &manifests,
+                &installed_kernel_plugins(config_dir),
+                config_dir,
+            )
+        }
+        None => PlaneComposition::default(),
+    };
+    if crate::mods::process_loads_mods() {
+        add_discovered_mods(&mut composition, config_dir, all_tools);
+    } else {
+        // A pure client of session workers: its mods run in each worker,
+        // where the turns are, and a copy here would only fire its
+        // `session.start` a second time and hear nothing.
+        let mods: Vec<String> = composition
+            .entries
+            .iter()
+            .filter(|entry| rebon_plugin_package::is_mod_config(&entry.config))
+            .map(|entry| entry.id.clone())
+            .collect();
+        composition
+            .entries
+            .retain(|entry| !mods.contains(&entry.id));
+        composition
+            .structure
+            .retain(|node| !mods.contains(&node.id));
+    }
+    Ok(composition)
+}
+
+/// The mod folders this machine loads without configuration — under
+/// `<config_home>/mods/` and the folders `REBON_MOD_DIRS` and
+/// `CLAUDE_CODE_PLUGIN_DIRS` name — appended after the configured entries,
+/// under the manifest's own name. A name the configuration already uses
+/// keeps the configured entry.
+pub fn add_discovered_mods(
+    composition: &mut PlaneComposition,
+    config_dir: &Path,
+    all_tools: &[String],
+) {
+    let taken: Vec<String> = composition
+        .entries
+        .iter()
+        .map(|entry| entry.id.clone())
+        .collect();
+    let mut skipped = Vec::new();
+    let containment = crate::container::Containment::load(config_dir);
+    for entry in
+        crate::mods::compose::discovered_entries(config_dir, &taken, all_tools, &mut skipped)
+    {
+        // A mod folder nobody pointed at by hand runs in its own container.
+        let entry = containment.mod_entry(entry);
+        composition.structure.push(ComposeNode {
+            id: entry.id.clone(),
+            isolate: None,
+            group: None,
+        });
+        composition.entries.push(entry);
+    }
+    composition.skipped.extend(skipped);
 }
 
 /// The kernel plugins the installed packages declare, in precedence order.
@@ -143,6 +203,7 @@ pub fn compose_section(
     all_tools: &[String],
     manifests: &PayloadManifests,
     installed: &[(String, PathBuf, KernelPluginManifest)],
+    config_dir: &Path,
 ) -> PlaneComposition {
     let base: Vec<Value> = section
         .get("plugins")
@@ -192,11 +253,13 @@ pub fn compose_section(
         manifests,
         &modules,
         installed,
+        config_dir,
         &mut out,
     );
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk(
     entries: &[Value],
     roots: &CompositionRoots,
@@ -204,6 +267,7 @@ fn walk(
     manifests: &PayloadManifests,
     modules: &BTreeMap<String, PathBuf>,
     installed: &[(String, PathBuf, KernelPluginManifest)],
+    config_dir: &Path,
     out: &mut PlaneComposition,
 ) -> Vec<ComposeNode> {
     let mut nodes = Vec::new();
@@ -221,7 +285,9 @@ fn walk(
         if let Some(group) = entry.get("group").and_then(Value::as_array) {
             // A group is a container, not a module: it becomes structure and
             // nothing is loaded for it.
-            let children = walk(group, roots, all_tools, manifests, modules, installed, out);
+            let children = walk(
+                group, roots, all_tools, manifests, modules, installed, config_dir, out,
+            );
             nodes.push(ComposeNode {
                 id: id.to_owned(),
                 isolate,
@@ -236,7 +302,7 @@ fn walk(
             .to_owned();
         let config = entry.get("config").cloned().unwrap_or(Value::Null);
         match load_request(
-            id, &name, config, roots, all_tools, manifests, modules, installed,
+            id, &name, config, roots, all_tools, manifests, modules, installed, config_dir,
         ) {
             Ok(request) => {
                 out.entries.push(request);
@@ -255,6 +321,7 @@ fn walk(
     nodes
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_request(
     id: &str,
     name: &str,
@@ -264,6 +331,7 @@ fn load_request(
     manifests: &PayloadManifests,
     modules: &BTreeMap<String, PathBuf>,
     installed: &[(String, PathBuf, KernelPluginManifest)],
+    config_dir: &Path,
 ) -> Result<ComposeEntry, String> {
     if let Some(manifest) = manifests.get(name) {
         let entry = manifest
@@ -290,20 +358,28 @@ fn load_request(
                 .entry
                 .clone()
                 .ok_or_else(|| format!("the installed declaration for {name} names no module"))?;
-            return Ok(entry_for(
-                manifest,
-                id,
-                root.clone(),
-                entry,
-                config,
-                all_tools,
-            ));
+            // Installed means someone else's: it runs in its container.
+            return Ok(
+                crate::container::Containment::load(config_dir).package(entry_for(
+                    manifest,
+                    id,
+                    root.clone(),
+                    entry,
+                    config,
+                    all_tools,
+                )),
+            );
         }
         return Err(format!(
             "{name} is not a package rebon ships, not a name `kernelPlugins.modules` maps, and \
              not declared by any installed plugin"
         ));
     };
+    // A Claude Code mod folder, named by its folder, its manifest or its
+    // hooks module: the ceiling is read off the hooks module itself.
+    if let Some(mod_root) = crate::mods::compose::mod_root_of(module) {
+        return crate::mods::compose::mod_entry(id, &mod_root, config_dir, &config, all_tools);
+    }
     let root = module
         .parent()
         .ok_or_else(|| format!("{} has no directory", module.display()))?
@@ -350,7 +426,14 @@ mod tests {
         let section = serde_json::json!({
             "plugins": [{ "id": "llm", "name": "@deepseek-ai/dsh-llm-deepseek", "config": { "a": 1 } }]
         });
-        let out = compose_section(&section, &roots(), &[], &manifests(), &[]);
+        let out = compose_section(
+            &section,
+            &roots(),
+            &[],
+            &manifests(),
+            &[],
+            Path::new("/nowhere"),
+        );
 
         assert_eq!(out.entries.len(), 1);
         let entry = &out.entries[0];
@@ -387,6 +470,7 @@ mod tests {
             &[],
             &manifests(),
             &[installed("demo-plane", "/packages/demo", "index.mjs")],
+            Path::new("/nowhere"),
         );
 
         assert_eq!(out.skipped, Vec::<String>::new());
@@ -423,6 +507,7 @@ mod tests {
             &[],
             &manifests(),
             &[installed("demo-plane", "/packages/demo", "index.mjs")],
+            Path::new("/nowhere"),
         );
 
         assert_eq!(out.entries.len(), 1, "{:?}", out.skipped);
@@ -435,7 +520,14 @@ mod tests {
     #[test]
     fn a_name_nothing_declares_is_skipped_and_says_where_it_looked() {
         let section = serde_json::json!({ "plugins": [{ "id": "x", "name": "nowhere" }] });
-        let out = compose_section(&section, &roots(), &[], &manifests(), &[]);
+        let out = compose_section(
+            &section,
+            &roots(),
+            &[],
+            &manifests(),
+            &[],
+            Path::new("/nowhere"),
+        );
 
         assert!(out.entries.is_empty());
         assert_eq!(out.skipped.len(), 1);
@@ -451,7 +543,14 @@ mod tests {
             "plugins": [{ "id": "loop", "name": "@deepseek-ai/dsh-agent-loop" }]
         });
         let tools = vec!["Read".to_string(), "Write".to_string()];
-        let out = compose_section(&section, &roots(), &tools, &manifests(), &[]);
+        let out = compose_section(
+            &section,
+            &roots(),
+            &tools,
+            &manifests(),
+            &[],
+            Path::new("/nowhere"),
+        );
         assert_eq!(out.entries[0].invokable_tools, tools);
     }
 
@@ -464,7 +563,14 @@ mod tests {
                 "group": [{ "id": "sessions", "name": "@deepseek-ai/dsh-session" }],
             }]
         });
-        let out = compose_section(&section, &roots(), &[], &manifests(), &[]);
+        let out = compose_section(
+            &section,
+            &roots(),
+            &[],
+            &manifests(),
+            &[],
+            Path::new("/nowhere"),
+        );
 
         assert_eq!(out.entries.len(), 1, "only the leaf loads");
         assert_eq!(out.entries[0].id, "sessions");
@@ -477,7 +583,14 @@ mod tests {
     #[test]
     fn an_entry_with_no_manifest_anywhere_is_skipped_by_name() {
         let section = serde_json::json!({ "plugins": [{ "id": "mystery", "name": "who-knows" }] });
-        let out = compose_section(&section, &roots(), &[], &manifests(), &[]);
+        let out = compose_section(
+            &section,
+            &roots(),
+            &[],
+            &manifests(),
+            &[],
+            Path::new("/nowhere"),
+        );
 
         assert!(out.entries.is_empty());
         assert_eq!(out.skipped.len(), 1);
@@ -490,7 +603,14 @@ mod tests {
             "plugins": [{ "id": "llm", "name": "@deepseek-ai/dsh-llm-deepseek" }],
             "patches": [{ "remove": "llm" }],
         });
-        let out = compose_section(&section, &roots(), &[], &manifests(), &[]);
+        let out = compose_section(
+            &section,
+            &roots(),
+            &[],
+            &manifests(),
+            &[],
+            Path::new("/nowhere"),
+        );
         assert!(out.entries.is_empty(), "the patch layer removed the entry");
     }
 }
