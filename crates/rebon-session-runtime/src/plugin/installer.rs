@@ -10,6 +10,7 @@ use super::manifest::{PluginManifest, PLUGIN_MANIFEST_FILE};
 use super::package::{unpack_package, PackageLimits};
 use super::source::{resolve_install_source, ResolvedPluginSource};
 use super::store::{InstalledPluginRecord, PluginScope, PluginSourceKind, PluginStore};
+use rebon_harness::rebon_plugin_package::store::PluginSourceIdentity;
 
 /// A container's grant and data directory, gone: what uninstalling leaves.
 pub(crate) fn forget_container_in(config_home: &Path, container: &str) {
@@ -31,6 +32,8 @@ pub struct PluginInstaller {
     store: PluginStore,
     cwd: PathBuf,
     plugin_dirs: Vec<PathBuf>,
+    source_identity: Option<PluginSourceIdentity>,
+    replace_source: bool,
 }
 
 impl PluginInstaller {
@@ -39,7 +42,20 @@ impl PluginInstaller {
             store,
             cwd,
             plugin_dirs,
+            source_identity: None,
+            replace_source: false,
         }
+    }
+
+    /// Replacing a source preserves plugin data; installation resets grants from the new manifest.
+    pub fn with_replace_source(mut self, replace: bool) -> Self {
+        self.replace_source = replace;
+        self
+    }
+
+    pub(crate) fn with_source_identity(mut self, source: PluginSourceIdentity) -> Self {
+        self.source_identity = Some(source);
+        self
     }
 
     /// Installs a directory, a package archive, or a built-in alias.
@@ -107,6 +123,16 @@ impl PluginInstaller {
                 )
             }
             ResolvedPluginSource::BuiltinAlias(alias) => {
+                let source_identity = PluginSourceIdentity::Builtin {
+                    name: alias.name.to_owned(),
+                };
+                self.store.ensure_source_available(
+                    alias.name,
+                    &source_identity,
+                    &[],
+                    None,
+                    false,
+                )?;
                 let record = InstalledPluginRecord {
                     name: alias.name.to_string(),
                     version: alias.version.to_string(),
@@ -114,6 +140,7 @@ impl PluginInstaller {
                     disabled_capabilities: Vec::new(),
                     source_kind: PluginSourceKind::Builtin,
                     source: Some(alias.name.to_string()),
+                    source_identity: Some(source_identity),
                     digest: None,
                     manifest: None,
                 };
@@ -187,13 +214,51 @@ impl PluginInstaller {
         staged_root: PathBuf,
         source_label: String,
     ) -> anyhow::Result<InstalledPluginRecord> {
-        let admitted = (|| -> anyhow::Result<(PluginManifest, String)> {
+        let mut marketplace_update = None;
+        let admitted = (|| -> anyhow::Result<(PluginManifest, String, PluginSourceIdentity)> {
+            let source_identity = match &self.source_identity {
+                Some(source) => source.clone(),
+                None => PluginSourceIdentity::local(Path::new(&source_label))?,
+            };
             let manifest = PluginManifest::load_from_dir(&staged_root)?;
+            let runtime_ids: Vec<String> = manifest
+                .capabilities
+                .kernel_plugins
+                .keys()
+                .cloned()
+                .collect();
+            self.store.ensure_source_available(
+                &manifest.name,
+                &source_identity,
+                &runtime_ids,
+                Some(scope),
+                self.replace_source,
+            )?;
+            if let Some(home) = self.config_home() {
+                let mut installs =
+                    rebon_harness::rebon_plugin_package::marketplace::MarketplaceInstalls::load(
+                        &home,
+                    )?;
+                // Package locations are package names; only mod locations are directory paths.
+                let superseded = installs.ensure_source_available(
+                    &source_identity,
+                    rebon_harness::rebon_plugin_package::marketplace::InstallKind::Package,
+                    Path::new(&manifest.name),
+                    &runtime_ids,
+                    self.replace_source && scope == PluginScope::User,
+                )?;
+                if !superseded.is_empty() {
+                    for id in superseded {
+                        installs.by_id.remove(&id);
+                    }
+                    marketplace_update = Some((home, installs));
+                }
+            }
             ensure_self_contained(&staged_root, &manifest)?;
             let digest = compute_dir_digest(&staged_root)?;
-            Ok((manifest, digest))
+            Ok((manifest, digest, source_identity))
         })();
-        let (staged_manifest, digest) = match admitted {
+        let (staged_manifest, digest, source_identity) = match admitted {
             Ok(admitted) => admitted,
             Err(err) => {
                 let _ = fs::remove_dir_all(&staging);
@@ -241,10 +306,14 @@ impl PluginInstaller {
             disabled_capabilities: Vec::new(),
             source_kind: PluginSourceKind::Local,
             source: Some(source_label),
+            source_identity: Some(source_identity),
             digest: Some(digest),
             manifest: Some(staged_manifest),
         };
         self.store.upsert_record(scope, record.clone())?;
+        if let Some((home, installs)) = marketplace_update {
+            installs.save(&home)?;
+        }
         self.retire_superseded_versions(scope, &record)?;
         self.grant_container(&record)?;
         Ok(record)

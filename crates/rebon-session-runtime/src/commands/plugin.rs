@@ -95,7 +95,7 @@ pub fn handle_plugin_command(text: &str, session: &EngineSession) -> PluginComma
 
 pub fn handle_plugin_command_in(text: &str, context: &PluginCommandContext) -> PluginCommandResult {
     let args = command_args(text, "plugin");
-    let tokens = match tokenize_plugin_args(args) {
+    let mut tokens = match tokenize_plugin_args(args) {
         Ok(tokens) => tokens,
         Err(err) => return PluginCommandResult::err(err),
     };
@@ -103,14 +103,21 @@ pub fn handle_plugin_command_in(text: &str, context: &PluginCommandContext) -> P
         return PluginCommandResult::ok(plugin_usage_text());
     }
 
+    let replace_source = tokens.iter().any(|token| token == "--replace-source");
+    if replace_source && tokens[0] != "install" {
+        return PluginCommandResult::err("--replace-source is only supported by /plugin install");
+    }
+    tokens.retain(|token| token != "--replace-source");
     let cwd = context.cwd.clone();
     let store = crate::plugin::PluginStore::new(context.config_home.clone(), cwd.clone());
     let installer =
-        crate::plugin::PluginInstaller::new(store, cwd.clone(), context.plugin_dirs.clone());
+        crate::plugin::PluginInstaller::new(store, cwd.clone(), context.plugin_dirs.clone())
+            .with_replace_source(replace_source);
     let marketplaces = crate::plugin::marketplace::MarketplaceManager::new(
         context.config_home.clone(),
         cwd.clone(),
-    );
+    )
+    .with_replace_source(replace_source);
     match tokens[0].as_str() {
         "browse" | "discover" => match marketplaces.browse() {
             Ok(catalog) => PluginCommandResult::ok(crate::plugin::marketplace::format_catalog(
@@ -167,7 +174,7 @@ pub fn handle_plugin_command_in(text: &str, context: &PluginCommandContext) -> P
             };
             let Some(source) = rest.first() else {
                 return PluginCommandResult::err(
-                    "Usage: /plugin install <path|archive|name|rust-lsp> [--scope user|project] [--sha256 <hex>]",
+                    "Usage: /plugin install <path|archive|name|rust-lsp> [--scope user|project] [--sha256 <hex>] [--replace-source]",
                 );
             };
             match installer.install(source, scope, sha256.as_deref()) {
@@ -441,7 +448,7 @@ fn tokenize_plugin_args(input: &str) -> Result<Vec<String>, String> {
 fn plugin_usage_text() -> String {
     [
         "Usage:",
-        "  /plugin install <path|archive|name|rust-lsp> [--scope user|project] [--sha256 <hex>]",
+        "  /plugin install <path|archive|name|rust-lsp> [--scope user|project] [--sha256 <hex>] [--replace-source]",
         "  /plugin list [--scope user|project]",
         "  /plugin status [name] [--scope user|project]",
         "  /plugin verify [name] [--scope user|project]",
@@ -591,6 +598,34 @@ mod tests {
         assert!(!removed.is_err, "{}", removed.text);
         assert!(run("/plugin marketplace frobnicate").is_err);
         assert!(run("/plugin marketplace add").is_err);
+    }
+
+    #[test]
+    fn plugin_replace_source_requires_install_and_reaches_local_installer() {
+        let _guard = rebon_tool::tasks::test_support::TestConfigHome::new("slash-replace-source");
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["a", "b"] {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(
+                dir.join("rebon-plugin.json"),
+                r#"{"name":"demo","version":"1.0.0"}"#,
+            )
+            .unwrap();
+        }
+        let context = PluginCommandContext {
+            cwd: tmp.path().to_path_buf(),
+            plugin_dirs: vec![],
+            config_home: tmp.path().join("home"),
+        };
+        let run = |text| handle_plugin_command_in(text, &context);
+        assert!(!run("/plugin install ./a").is_err);
+        assert!(run("/plugin install ./b").is_err);
+        let result = run("/plugin install --replace-source ./b");
+        assert!(!result.is_err, "{}", result.text);
+        assert!(!run("/plugin install ./a --replace-source").is_err);
+        assert!(run("/plugin list --replace-source").is_err);
+        assert!(run("/plugin install --replace-source").is_err);
     }
 
     #[test]

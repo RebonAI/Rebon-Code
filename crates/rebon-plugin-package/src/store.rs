@@ -35,6 +35,83 @@ pub enum PluginSourceKind {
     Builtin,
 }
 
+/// Recorded by the installer; a package's source/name is not proof of origin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum PluginSourceIdentity {
+    Local {
+        path: PathBuf,
+    },
+    Builtin {
+        name: String,
+    },
+    BuiltinMarketplace {
+        plugin: String,
+    },
+    Marketplace {
+        catalog: crate::marketplace::MarketplaceSource,
+        plugin: String,
+        source: crate::marketplace::PluginSource,
+    },
+}
+
+impl PluginSourceIdentity {
+    pub fn local(path: &std::path::Path) -> anyhow::Result<Self> {
+        Ok(Self::Local {
+            path: Self::canonical_path(path)?,
+        })
+    }
+
+    fn canonical_path(path: &std::path::Path) -> anyhow::Result<PathBuf> {
+        let canonical = path.canonicalize()?;
+        Ok(PathBuf::from(rebon_session::cwd_identity(
+            &canonical.to_string_lossy(),
+        )))
+    }
+
+    /// Versions and revisions identify artifacts, not origins; keep the full package name and registry.
+    /// Remote addresses remain case-sensitive unless their equivalence can be established.
+    pub fn marketplace(
+        mut catalog: crate::marketplace::MarketplaceSource,
+        plugin: String,
+        mut source: crate::marketplace::PluginSource,
+    ) -> anyhow::Result<Self> {
+        use crate::marketplace::{MarketplaceSource, PluginSource, RemoteSource};
+        match &mut catalog {
+            MarketplaceSource::Github { git_ref, .. } | MarketplaceSource::Git { git_ref, .. } => {
+                *git_ref = None
+            }
+            MarketplaceSource::Directory { path } | MarketplaceSource::File { path } => {
+                *path = Self::canonical_path(path)?;
+            }
+            MarketplaceSource::Url { .. } => {}
+        }
+        if let PluginSource::Remote(remote) = &mut source {
+            match remote {
+                RemoteSource::Github { git_ref, sha, .. }
+                | RemoteSource::Url { git_ref, sha, .. }
+                | RemoteSource::GitSubdir { git_ref, sha, .. } => {
+                    *git_ref = None;
+                    *sha = None;
+                }
+                RemoteSource::Npm { version, .. } => *version = None,
+                RemoteSource::Archive { sha256, .. } => *sha256 = None,
+                RemoteSource::Command { .. } => {}
+            }
+        }
+        Ok(Self::Marketplace {
+            catalog,
+            plugin,
+            source,
+        })
+    }
+
+    pub fn key(&self) -> String {
+        serde_json::to_string(self)
+            .expect("plugin source identity contains only serializable fields")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct InstalledPluginRecord {
@@ -46,6 +123,9 @@ pub struct InstalledPluginRecord {
     pub source_kind: PluginSourceKind,
     #[serde(default)]
     pub source: Option<String>,
+    /// Missing legacy origins stay unknown; neither the current catalog nor package claims prove them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_identity: Option<PluginSourceIdentity>,
     #[serde(default)]
     pub digest: Option<String>,
     #[serde(default)]
@@ -53,6 +133,22 @@ pub struct InstalledPluginRecord {
 }
 
 impl InstalledPluginRecord {
+    fn matches_source(&self, source: &PluginSourceIdentity) -> bool {
+        if let Some(recorded) = &self.source_identity {
+            return recorded == source;
+        }
+        match (&self.source_kind, self.source.as_deref(), source) {
+            (PluginSourceKind::Builtin, Some(recorded), PluginSourceIdentity::Builtin { name }) => {
+                recorded == name && self.name == *name
+            }
+            (PluginSourceKind::Local, Some(recorded), PluginSourceIdentity::Local { path }) => {
+                std::path::Path::new(recorded).is_absolute()
+                    && rebon_session::cwd_identity(recorded) == path.to_string_lossy()
+            }
+            _ => false,
+        }
+    }
+
     pub fn source_label(&self, scope: PluginScope) -> String {
         match self.source_kind {
             PluginSourceKind::Local => format!("plugin:{}@local:{}", self.name, scope.as_str()),
@@ -125,6 +221,45 @@ impl PluginStore {
         // on its own, but a write and a read inside one clock tick would look
         // unchanged to it; this is the half of the answer only the writer has.
         crate::discovery::invalidate();
+        Ok(())
+    }
+
+    pub fn ensure_source_available(
+        &self,
+        name: &str,
+        source: &PluginSourceIdentity,
+        runtime_ids: &[String],
+        target_scope: Option<PluginScope>,
+        replace_source: bool,
+    ) -> anyhow::Result<()> {
+        for scope in [PluginScope::User, PluginScope::Project] {
+            for record in self.load_state(scope)?.plugins {
+                let runtime_conflict = runtime_ids.iter().find(|id| {
+                    record.manifest.as_ref().is_some_and(|manifest| {
+                        manifest.capabilities.kernel_plugins.contains_key(*id)
+                    })
+                });
+                if record.name != name && runtime_conflict.is_none() {
+                    continue;
+                }
+                if record.name == name
+                    && (record.matches_source(source)
+                        || (replace_source && target_scope == Some(scope)))
+                {
+                    continue;
+                }
+                if record.name == name && target_scope == Some(scope) {
+                    anyhow::bail!(
+                        "plugin `{name}` has another or unknown source in {} scope; use --replace-source to confirm replacement without deleting its data",
+                        scope.as_str()
+                    );
+                }
+                anyhow::bail!(
+                    "plugin `{name}` conflicts with installed plugin `{}` in {} scope (runtime id: {}); remove the conflicting install before installing this source",
+                    record.name, scope.as_str(), runtime_conflict.map(String::as_str).unwrap_or(name)
+                );
+            }
+        }
         Ok(())
     }
 
@@ -241,6 +376,210 @@ impl PluginStore {
 mod tests {
     use super::*;
 
+    fn sourced_record(name: &str, source: Option<PluginSourceIdentity>) -> InstalledPluginRecord {
+        let mut record: InstalledPluginRecord = serde_json::from_value(serde_json::json!({
+            "name": name, "version": "1.0.0", "enabled": true, "sourceKind": "local",
+            "manifest": { "name": name, "version": "1.0.0", "source": "builtin:forged",
+                "capabilities": { "kernelPlugins": { "shared": { "entry": "index.mjs" } } } }
+        }))
+        .unwrap();
+        record.source_identity = source;
+        record
+    }
+
+    #[test]
+    fn marketplace_identity_retains_npm_scope_but_not_versions() {
+        use crate::marketplace::{MarketplaceSource, PluginSource, RemoteSource};
+        let identity = |package: &str, version: &str| {
+            PluginSourceIdentity::marketplace(
+                MarketplaceSource::Github {
+                    repo: "owner/catalog".into(),
+                    git_ref: Some(version.into()),
+                },
+                "tool".into(),
+                PluginSource::Remote(RemoteSource::Npm {
+                    package: package.into(),
+                    version: Some(version.into()),
+                    registry: None,
+                }),
+            )
+            .unwrap()
+        };
+        assert_eq!(identity("@one/tool", "1"), identity("@one/tool", "2"));
+        assert_ne!(identity("@one/tool", "1"), identity("@two/tool", "1"));
+        let key = identity("@one/tool", "1").key();
+        assert!(key.contains("@one/tool"));
+        assert_eq!(
+            serde_json::from_str::<PluginSourceIdentity>(&key).unwrap(),
+            identity("@one/tool", "1")
+        );
+    }
+
+    #[test]
+    fn source_identity_distinguishes_origins_and_kinds() {
+        let local = PluginSourceIdentity::Local {
+            path: PathBuf::from("same"),
+        };
+        let builtin = PluginSourceIdentity::Builtin {
+            name: "same".into(),
+        };
+        assert_ne!(local.key(), builtin.key());
+        assert_ne!(
+            local.key(),
+            PluginSourceIdentity::Local {
+                path: PathBuf::from("other")
+            }
+            .key()
+        );
+    }
+
+    #[test]
+    fn install_source_allows_same_source_upgrade_without_using_manifest_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PluginStore::new(tmp.path().join("home"), tmp.path().join("project"));
+        let source = PluginSourceIdentity::Local {
+            path: tmp.path().join("source"),
+        };
+        store
+            .upsert_record(
+                PluginScope::User,
+                sourced_record("demo", Some(source.clone())),
+            )
+            .unwrap();
+        assert!(store
+            .ensure_source_available(
+                "demo",
+                &source,
+                &["shared".into()],
+                Some(PluginScope::User),
+                false
+            )
+            .is_ok());
+        assert!(store
+            .ensure_source_available(
+                "demo",
+                &PluginSourceIdentity::Builtin {
+                    name: "forged".into()
+                },
+                &["shared".into()],
+                Some(PluginScope::User),
+                false
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn install_source_rejects_another_package_claiming_the_runtime_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PluginStore::new(tmp.path().join("home"), tmp.path().join("project"));
+        let source = PluginSourceIdentity::Local {
+            path: tmp.path().join("source"),
+        };
+        store
+            .upsert_record(
+                PluginScope::Project,
+                sourced_record("one", Some(source.clone())),
+            )
+            .unwrap();
+        let before = store.load_state(PluginScope::Project).unwrap();
+        assert!(store
+            .ensure_source_available(
+                "two",
+                &source,
+                &["shared".into()],
+                Some(PluginScope::User),
+                false
+            )
+            .is_err());
+        assert_eq!(store.load_state(PluginScope::Project).unwrap(), before);
+        assert!(store
+            .ensure_source_available(
+                "two",
+                &source,
+                &["unrelated".into()],
+                Some(PluginScope::User),
+                false
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn legacy_install_source_stays_unknown_and_cannot_be_claimed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PluginStore::new(tmp.path().join("home"), tmp.path().join("project"));
+        let record = sourced_record("demo", None);
+        assert!(record.source_identity.is_none());
+        store.upsert_record(PluginScope::User, record).unwrap();
+        let source = PluginSourceIdentity::Local {
+            path: tmp.path().join("source"),
+        };
+        let error = store
+            .ensure_source_available("demo", &source, &[], Some(PluginScope::User), false)
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown source"));
+    }
+
+    #[test]
+    fn legacy_builtin_and_canonical_local_sources_can_be_recognized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = PluginSourceIdentity::local(tmp.path()).unwrap();
+        assert_eq!(
+            local,
+            PluginSourceIdentity::local(&tmp.path().join(".")).unwrap()
+        );
+        let mut record = sourced_record("demo", None);
+        record.source = Some(
+            tmp.path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        assert!(record.matches_source(&local));
+        record.source = Some("relative/path".into());
+        assert!(!record.matches_source(&local));
+        record.source_kind = PluginSourceKind::Builtin;
+        record.source = Some("demo".into());
+        assert!(record.matches_source(&PluginSourceIdentity::Builtin {
+            name: "demo".into()
+        }));
+        record.source = Some("different".into());
+        assert!(!record.matches_source(&PluginSourceIdentity::Builtin {
+            name: "demo".into()
+        }));
+    }
+
+    #[test]
+    fn replacement_is_limited_to_the_same_package_and_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PluginStore::new(tmp.path().join("home"), tmp.path().join("project"));
+        store
+            .upsert_record(PluginScope::User, sourced_record("demo", None))
+            .unwrap();
+        let source = PluginSourceIdentity::local(tmp.path()).unwrap();
+        assert!(store
+            .ensure_source_available("demo", &source, &[], Some(PluginScope::User), true)
+            .is_ok());
+        let error = store
+            .ensure_source_available("demo", &source, &[], Some(PluginScope::Project), true)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("--replace-source"), "{error}");
+        assert!(error.contains("demo") && error.contains("user"), "{error}");
+        assert!(store
+            .ensure_source_available(
+                "other",
+                &source,
+                &["shared".into()],
+                Some(PluginScope::User),
+                true
+            )
+            .is_err());
+        assert!(store.load_state(PluginScope::User).unwrap().plugins[0]
+            .source_identity
+            .is_none());
+    }
+
     #[test]
     fn round_trips_scope_state_atomically() {
         let tmp = tempfile::tempdir().unwrap();
@@ -252,6 +591,7 @@ mod tests {
             disabled_capabilities: Vec::new(),
             source_kind: PluginSourceKind::Builtin,
             source: Some("rust-lsp".into()),
+            source_identity: None,
             digest: None,
             manifest: None,
         };
@@ -278,6 +618,7 @@ mod tests {
             disabled_capabilities: Vec::new(),
             source_kind: PluginSourceKind::Builtin,
             source: Some("a".into()),
+            source_identity: None,
             digest: None,
             manifest: None,
         };

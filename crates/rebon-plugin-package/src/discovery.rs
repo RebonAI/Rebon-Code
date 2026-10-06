@@ -37,7 +37,9 @@ use std::sync::Mutex;
 use rebon_types::KernelPluginManifest;
 
 use crate::manifest::{PluginManifest, PLUGIN_MANIFEST_FILE};
-use crate::store::{InstalledPluginRecord, PluginScope, PluginSourceKind, PluginStore};
+use crate::store::{
+    InstalledPluginRecord, PluginScope, PluginSourceIdentity, PluginSourceKind, PluginStore,
+};
 
 /// Where a plugin came from, in precedence order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -78,6 +80,7 @@ pub struct DiscoveredPlugin {
     pub origin: PluginOrigin,
     /// The label already used in diagnostics and MCP config attribution.
     pub source: String,
+    pub source_identity: Option<PluginSourceIdentity>,
     pub plugin: InstalledPlugin,
 }
 
@@ -304,10 +307,18 @@ fn resolve(
             ));
             continue;
         }
+        let source_identity = match PluginSourceIdentity::local(&root) {
+            Ok(identity) => identity,
+            Err(error) => {
+                out.warnings.push(format!("{}: {error}", root.display()));
+                continue;
+            }
+        };
         match PluginManifest::load_from_dir(&root) {
             Ok(manifest) => out.plugins.push(DiscoveredPlugin {
                 origin: PluginOrigin::SessionDir,
                 source: format!("plugin:{}@local:session", manifest.name),
+                source_identity: Some(source_identity),
                 plugin: InstalledPlugin::Package {
                     root,
                     manifest: Box::new(manifest),
@@ -370,6 +381,7 @@ fn push_record(
         PluginSourceKind::Builtin => out.plugins.push(DiscoveredPlugin {
             origin,
             source,
+            source_identity: record.source_identity.clone(),
             plugin: InstalledPlugin::Builtin {
                 name: record.name.clone(),
             },
@@ -387,6 +399,7 @@ fn push_record(
                 Ok(manifest) => out.plugins.push(DiscoveredPlugin {
                     origin,
                     source,
+                    source_identity: record.source_identity.clone(),
                     plugin: InstalledPlugin::Package {
                         root,
                         manifest: Box::new(manifest),
@@ -440,6 +453,7 @@ mod tests {
             disabled_capabilities: Vec::new(),
             source_kind: PluginSourceKind::Local,
             source: None,
+            source_identity: None,
             digest: None,
             manifest: Some(manifest_with(name, capabilities)),
         }
@@ -461,6 +475,41 @@ mod tests {
             )
             .unwrap();
         store
+    }
+
+    #[test]
+    fn discovery_keeps_installed_identity_instead_of_manifest_claims() {
+        let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let identity = PluginSourceIdentity::Local {
+            path: dir.path().join("origin"),
+        };
+        let mut installed = record("demo", true, serde_json::json!({}));
+        installed.source_identity = Some(identity.clone());
+        installed.manifest.as_mut().unwrap().source = Some("builtin:forged".into());
+        let store = store_with(dir.path(), vec![installed], Vec::new());
+        let found = discover(&store, &[], dir.path(), true).unwrap();
+        assert_eq!(found.plugins[0].source_identity, Some(identity));
+    }
+
+    #[test]
+    fn a_session_directory_gets_its_actual_root_as_source() {
+        let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("plugin");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            root.join(PLUGIN_MANIFEST_FILE),
+            r#"{"name":"demo","version":"1","source":"builtin:forged"}"#,
+        )
+        .unwrap();
+        let store = store_with(dir.path(), Vec::new(), Vec::new());
+        let found = discover(&store, &[root.clone()], dir.path(), true).unwrap();
+        assert_eq!(found.plugins[0].root(), Some(root.as_path()));
+        assert_eq!(
+            found.plugins[0].source_identity,
+            Some(PluginSourceIdentity::local(&root).unwrap())
+        );
     }
 
     /// Asking three times is legitimate; reading the disk three times is not.

@@ -421,6 +421,7 @@ mod tests {
                     disabled_capabilities: Vec::new(),
                     source_kind: PluginSourceKind::Builtin,
                     source: Some("rust-lsp".into()),
+                    source_identity: None,
                     digest: None,
                     manifest: None,
                 },
@@ -466,6 +467,7 @@ mod tests {
                     disabled_capabilities: Vec::new(),
                     source_kind: PluginSourceKind::Builtin,
                     source: Some("rust-lsp".into()),
+                    source_identity: None,
                     digest: None,
                     manifest: None,
                 },
@@ -517,6 +519,7 @@ mod tests {
             disabled_capabilities: Vec::new(),
             source_kind: PluginSourceKind::Builtin,
             source: Some("rust-lsp".into()),
+            source_identity: None,
             digest: None,
             manifest: None,
         };

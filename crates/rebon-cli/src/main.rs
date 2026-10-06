@@ -549,6 +549,9 @@ enum PluginCommand {
         /// opened; a mismatch refuses the install.
         #[arg(long, value_name = "HEX")]
         sha256: Option<String>,
+        /// Confirm source replacement, preserving data and resetting grants from the new manifest.
+        #[arg(long)]
+        replace_source: bool,
     },
     /// Re-hash installed packages and report any that changed on disk since
     /// they were installed.
@@ -1244,10 +1247,15 @@ async fn run_plugin_command(command: PluginCommand) -> anyhow::Result<()> {
     let marketplaces =
         plugin::marketplace::MarketplaceManager::new(rebon_config::config_home_dir(), cwd.clone());
     match command {
-        PluginCommand::Install { source, scope, .. }
-            if plugin::marketplace::is_marketplace_spec(&source, &cwd) =>
-        {
-            let install = marketplaces.install(&source, scope)?;
+        PluginCommand::Install {
+            source,
+            scope,
+            replace_source,
+            ..
+        } if plugin::marketplace::is_marketplace_spec(&source, &cwd) => {
+            let install = marketplaces
+                .with_replace_source(replace_source)
+                .install(&source, scope)?;
             println!(
                 "{}",
                 plugin::marketplace::format_install("installed", &install)
@@ -1280,8 +1288,13 @@ async fn run_plugin_command(command: PluginCommand) -> anyhow::Result<()> {
             source,
             scope,
             sha256,
+            replace_source,
         } => {
-            let record = installer.install(&source, scope, sha256.as_deref())?;
+            let record = installer.with_replace_source(replace_source).install(
+                &source,
+                scope,
+                sha256.as_deref(),
+            )?;
             println!(
                 "{}",
                 plugin::format_plugin_result("installed", scope, &record)
@@ -3134,8 +3147,31 @@ mod tests {
                     source: "agent-radar@rebon".into(),
                     scope: plugin::PluginScope::User,
                     sha256: None,
+                    replace_source: false,
                 }
             })
+        );
+    }
+
+    #[test]
+    fn plugin_replace_source_is_an_explicit_install_option() {
+        for source in ["rust-lsp", "demo.tgz", "radar@mods"] {
+            let cli =
+                Cli::try_parse_from(["rebon", "plugin", "install", source, "--replace-source"])
+                    .unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Plugin {
+                    command: PluginCommand::Install {
+                        replace_source: true,
+                        ..
+                    }
+                })
+            ));
+        }
+        assert!(
+            Cli::try_parse_from(["rebon", "plugin", "uninstall", "demo", "--replace-source"])
+                .is_err()
         );
     }
 
@@ -3149,6 +3185,7 @@ mod tests {
                     source: "rust-lsp".to_string(),
                     scope: plugin::PluginScope::User,
                     sha256: None,
+                    replace_source: false,
                 }
             })
         );
@@ -3168,6 +3205,7 @@ mod tests {
                     source: "demo-1.0.0.tgz".to_string(),
                     scope: plugin::PluginScope::User,
                     sha256: Some("ab".repeat(32)),
+                    replace_source: false,
                 }
             })
         );

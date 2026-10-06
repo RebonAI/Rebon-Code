@@ -590,6 +590,8 @@ pub struct MarketplaceInstall {
         skip_serializing_if = "crate::container::ContainerRequest::is_empty"
     )]
     pub granted: crate::container::ContainerGrant,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_identity: Option<crate::store::PluginSourceIdentity>,
 }
 
 /// `name@marketplace`, the id an install is known by.
@@ -605,6 +607,51 @@ pub struct MarketplaceInstalls {
 }
 
 impl MarketplaceInstalls {
+    pub fn ensure_source_available(
+        &self,
+        source: &crate::store::PluginSourceIdentity,
+        kind: InstallKind,
+        location: &Path,
+        runtime_ids: &[String],
+        replace_source: bool,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut superseded = Vec::new();
+        for (id, installed) in &self.by_id {
+            let same_location = installed.kind == kind && installed.location == location;
+            let mut installed_ids = installed.kernel_plugins.clone();
+            if installed.kind == InstallKind::Mod && installed_ids.is_empty() && !same_location {
+                match crate::claude_mod::read_claude_mod(&installed.location) {
+                    Ok(mod_) => installed_ids.push(mod_.manifest.name),
+                    Err(error) if runtime_ids.contains(&installed.plugin) => {
+                        bail!("cannot establish runtime ownership for `{id}`: {error}");
+                    }
+                    Err(error) => {
+                        tracing::warn!(plugin = %id, %error, "legacy mod cannot load; skipping its runtime identity");
+                    }
+                }
+            }
+            let overlaps = same_location || runtime_ids.iter().any(|id| installed_ids.contains(id));
+            if !overlaps {
+                continue;
+            }
+            if same_location
+                && (installed.source_identity.as_ref() == Some(source) || replace_source)
+            {
+                superseded.push(id.clone());
+                continue;
+            }
+            if same_location {
+                bail!("plugin conflicts with `{id}` from another or unknown source; use --replace-source to confirm replacement of the same install without deleting its data");
+            }
+            let conflicts: Vec<_> = runtime_ids
+                .iter()
+                .filter(|id| installed_ids.contains(id))
+                .collect();
+            bail!("runtime ids {conflicts:?} are owned by `{id}`; remove the conflicting install before installing this source");
+        }
+        Ok(superseded)
+    }
+
     pub fn path(config_home: &Path) -> PathBuf {
         plugins_dir(config_home).join("marketplace_installs.json")
     }
@@ -933,6 +980,7 @@ mod tests {
                 version: Some("0.1.0".into()),
                 kernel_plugins: Vec::new(),
                 installed_at_ms: 9,
+                source_identity: None,
                 granted: crate::container::ContainerGrant {
                     network: vec!["api.example.com".into()],
                     env: Vec::new(),

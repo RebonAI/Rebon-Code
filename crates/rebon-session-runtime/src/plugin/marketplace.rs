@@ -34,6 +34,7 @@ use rebon_harness::rebon_plugin_package::marketplace::{
 use super::installer::copy_dir_recursive;
 use super::package::{unpack_archive_folder, PackageLimits};
 use super::{PluginInstaller, PluginScope, PluginStore};
+use rebon_harness::rebon_plugin_package::store::PluginSourceIdentity;
 
 /// The env var naming the folder of Rebon's own marketplace.
 pub const MARKETPLACE_DIR_ENV: &str = "REBON_MARKETPLACE_DIR";
@@ -124,6 +125,7 @@ pub struct Catalog {
 /// A marketplace whose catalog was read.
 struct Loaded {
     name: String,
+    source: MarketplaceSource,
     root: Option<PathBuf>,
     manifest: MarketplaceManifest,
 }
@@ -132,6 +134,7 @@ pub struct MarketplaceManager {
     config_home: PathBuf,
     cwd: PathBuf,
     builtin: Option<PathBuf>,
+    replace_source: bool,
 }
 
 impl MarketplaceManager {
@@ -140,12 +143,18 @@ impl MarketplaceManager {
             config_home,
             cwd,
             builtin: builtin_marketplace_dir(),
+            replace_source: false,
         }
     }
 
     /// The same manager with Rebon's own marketplace read from `dir`.
     pub fn with_builtin(mut self, dir: Option<PathBuf>) -> Self {
         self.builtin = dir;
+        self
+    }
+
+    pub fn with_replace_source(mut self, replace: bool) -> Self {
+        self.replace_source = replace;
         self
     }
 
@@ -166,6 +175,7 @@ impl MarketplaceManager {
                 None,
                 read.map(|manifest| Loaded {
                     name: BUILTIN_MARKETPLACE.to_owned(),
+                    source: MarketplaceSource::Directory { path: dir.clone() },
                     root: Some(dir.clone()),
                     manifest,
                 }),
@@ -180,6 +190,7 @@ impl MarketplaceManager {
                 known.last_updated_ms,
                 read.map(|manifest| Loaded {
                     name: name.clone(),
+                    source: known.source.clone(),
                     root: known.root(),
                     manifest,
                 }),
@@ -412,6 +423,17 @@ impl MarketplaceManager {
         let id = plugin_id(&entry.name, &loaded.name);
         let scratch = self.scratch_dir("plugin")?;
         let folder = materialize(&loaded, &entry.source, scratch.path())?;
+        let source_identity = if loaded.name == BUILTIN_MARKETPLACE {
+            PluginSourceIdentity::BuiltinMarketplace {
+                plugin: entry.name.clone(),
+            }
+        } else {
+            PluginSourceIdentity::marketplace(
+                loaded.source.clone(),
+                entry.name.clone(),
+                entry.source.clone(),
+            )?
+        };
         let mut installs = MarketplaceInstalls::load(&self.config_home)?;
         let mut shape = PluginShape::of(&folder);
         if matches!(shape, PluginShape::Unsupported { .. })
@@ -422,75 +444,127 @@ impl MarketplaceManager {
             super::dsh_npm::adapt(&folder, entry.rebon_config.as_ref())?;
             shape = PluginShape::RebonPackage;
         }
-        let install =
-            match shape {
-                PluginShape::ClaudeMod => {
-                    let target = self
-                        .config_home
-                        .join(rebon_types::MODS_DIR)
-                        .join(&entry.name);
-                    replace_dir(&folder, &target)?;
-                    MarketplaceInstall {
-                        marketplace: loaded.name.clone(),
-                        plugin: entry.name.clone(),
-                        kind: InstallKind::Mod,
-                        location: target,
-                        version: entry.version.clone(),
-                        kernel_plugins: Vec::new(),
-                        installed_at_ms: rebon_types::wall_clock_ms(),
-                        // A mod declares nothing beyond its own folder.
-                        granted: Default::default(),
-                    }
+        let install = match shape {
+            PluginShape::ClaudeMod => {
+                let target = self
+                    .config_home
+                    .join(rebon_types::MODS_DIR)
+                    .join(&entry.name);
+                let mod_ = rebon_harness::rebon_plugin_package::read_claude_mod(&folder)
+                    .map_err(anyhow::Error::msg)?;
+                let runtime_ids = vec![mod_.manifest.name];
+                let superseded = installs.ensure_source_available(
+                    &source_identity,
+                    InstallKind::Mod,
+                    &target,
+                    &runtime_ids,
+                    self.replace_source,
+                )?;
+                PluginStore::new(self.config_home.clone(), self.cwd.clone())
+                    .ensure_source_available(
+                        &entry.name,
+                        &source_identity,
+                        &runtime_ids,
+                        None,
+                        false,
+                    )?;
+                if target.exists()
+                    && !self.replace_source
+                    && !installs.by_id.values().any(|install| {
+                        install.kind == InstallKind::Mod
+                            && install.location == target
+                            && install.source_identity.as_ref() == Some(&source_identity)
+                    })
+                {
+                    bail!(
+                            "mod directory {} belongs to an unknown source; use --replace-source to confirm replacement without deleting its data",
+                            target.display()
+                        );
                 }
-                PluginShape::RebonPackage => {
-                    let installer = PluginInstaller::new(
-                        PluginStore::new(self.config_home.clone(), self.cwd.clone()),
-                        self.cwd.clone(),
-                        Vec::new(),
+                replace_dir(&folder, &target)?;
+                for old_id in superseded {
+                    installs.by_id.remove(&old_id);
+                }
+                installs.save(&self.config_home)?;
+                let mut grants =
+                    rebon_harness::rebon_plugin_package::container::ContainerGrants::load(
+                        &self.config_home,
                     );
-                    let record =
-                        installer.install(&folder.to_string_lossy(), PluginScope::User, None)?;
-                    let kernel_plugins: Vec<String> = record
-                        .manifest
-                        .as_ref()
-                        .map(|manifest| {
-                            manifest
-                                .capabilities
-                                .kernel_plugins
-                                .keys()
-                                .cloned()
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    for kernel_plugin in &kernel_plugins {
-                        let config = default_kernel_config(record.manifest.as_ref(), kernel_plugin);
-                        rebon_config::set_kernel_plugin_listed_in(
-                            &self.config_home,
-                            kernel_plugin,
-                            true,
-                            config.as_ref(),
-                        )?;
-                    }
-                    MarketplaceInstall {
+                grants.set(
+                    &rebon_harness::rebon_plugin_package::container::mod_container_id(
+                        &runtime_ids[0],
+                    ),
+                    Default::default(),
+                );
+                grants.save(&self.config_home)?;
+                MarketplaceInstall {
+                    marketplace: loaded.name.clone(),
+                    plugin: entry.name.clone(),
+                    kind: InstallKind::Mod,
+                    location: target,
+                    version: entry.version.clone(),
+                    kernel_plugins: runtime_ids,
+                    source_identity: Some(source_identity.clone()),
+                    installed_at_ms: rebon_types::wall_clock_ms(),
+                    // A mod declares nothing beyond its own folder.
+                    granted: Default::default(),
+                }
+            }
+            PluginShape::RebonPackage => {
+                let installer = PluginInstaller::new(
+                    PluginStore::new(self.config_home.clone(), self.cwd.clone()),
+                    self.cwd.clone(),
+                    Vec::new(),
+                )
+                .with_source_identity(source_identity.clone())
+                .with_replace_source(self.replace_source);
+                let record =
+                    installer.install(&folder.to_string_lossy(), PluginScope::User, None)?;
+                installs = MarketplaceInstalls::load(&self.config_home)?;
+                let kernel_plugins: Vec<String> = record
+                    .manifest
+                    .as_ref()
+                    .map(|manifest| {
+                        manifest
+                            .capabilities
+                            .kernel_plugins
+                            .keys()
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for kernel_plugin in &kernel_plugins {
+                    let config = default_kernel_config(record.manifest.as_ref(), kernel_plugin);
+                    rebon_config::set_kernel_plugin_listed_in(
+                        &self.config_home,
+                        kernel_plugin,
+                        true,
+                        config.as_ref(),
+                    )?;
+                }
+                MarketplaceInstall {
                     marketplace: loaded.name.clone(),
                     plugin: entry.name.clone(),
                     kind: InstallKind::Package,
                     location: PathBuf::from(&record.name),
                     version: Some(record.version.clone()),
                     kernel_plugins,
+                    source_identity: Some(source_identity),
                     installed_at_ms: rebon_types::wall_clock_ms(),
                     granted: rebon_harness::rebon_plugin_package::container::ContainerGrants::load(
                         &self.config_home,
                     )
-                    .get(&rebon_harness::rebon_plugin_package::container::package_container_id(
-                        &record.name,
-                    )),
+                    .get(
+                        &rebon_harness::rebon_plugin_package::container::package_container_id(
+                            &record.name,
+                        ),
+                    ),
                 }
-                }
-                PluginShape::Unsupported { reason } => {
-                    bail!("{id} is not a plugin Rebon installs: {reason}")
-                }
-            };
+            }
+            PluginShape::Unsupported { reason } => {
+                bail!("{id} is not a plugin Rebon installs: {reason}")
+            }
+        };
         installs.by_id.insert(id, install.clone());
         installs.save(&self.config_home)?;
         Ok(install)
@@ -1534,6 +1608,292 @@ mod tests {
     }
 
     #[test]
+    fn another_marketplace_cannot_replace_an_installed_mod() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("market-source-mod");
+        let fx = fixture();
+        marketplace(&fx.work.join("a"), "alpha");
+        marketplace(&fx.work.join("b"), "beta");
+        let manager = manager(&fx);
+        manager.add("./a").unwrap();
+        manager.add("./b").unwrap();
+        let installed = manager.install("radar@alpha", PluginScope::User).unwrap();
+        write(&installed.location.join("owner.txt"), "alpha");
+
+        let error = manager
+            .install("radar@beta", PluginScope::User)
+            .unwrap_err();
+        assert!(error.to_string().contains("source"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(installed.location.join("owner.txt")).unwrap(),
+            "alpha"
+        );
+        assert_eq!(manager.installs().unwrap().by_id.len(), 1);
+    }
+
+    #[test]
+    fn another_marketplace_cannot_replace_an_installed_package() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("market-source-package");
+        let fx = fixture();
+        marketplace(&fx.work.join("a"), "alpha");
+        marketplace(&fx.work.join("b"), "beta");
+        let manager = manager(&fx);
+        manager.add("./a").unwrap();
+        manager.add("./b").unwrap();
+        manager.install("greeter@alpha", PluginScope::User).unwrap();
+        let store = PluginStore::new(fx.home.clone(), fx.work.clone());
+        let before = store.load_state(PluginScope::User).unwrap();
+
+        let error = manager
+            .install("greeter@beta", PluginScope::User)
+            .unwrap_err();
+        assert!(error.to_string().contains("source"), "{error}");
+        assert_eq!(store.load_state(PluginScope::User).unwrap(), before);
+        assert_eq!(manager.installs().unwrap().by_id.len(), 1);
+    }
+
+    #[test]
+    fn explicit_source_replacement_preserves_data_resets_grants_and_retires_old_owner() {
+        use rebon_harness::rebon_plugin_package::container::{
+            container_data_dir, ContainerGrant, ContainerGrants,
+        };
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("replace-source");
+        for (name, container) in [("greeter", "pkg-greeter"), ("radar", "mod-radar")] {
+            let fx = fixture();
+            marketplace(&fx.work.join("a"), "alpha");
+            marketplace(&fx.work.join("b"), "beta");
+            let manager = manager(&fx);
+            manager.add("./a").unwrap();
+            manager.add("./b").unwrap();
+            let old_id = format!("{name}@alpha");
+            let new_id = format!("{name}@beta");
+            let old = manager.install(&old_id, PluginScope::User).unwrap();
+            let data = container_data_dir(&fx.home, container).join("state.txt");
+            write(&data, "retained");
+            let mut grants = ContainerGrants::load(&fx.home);
+            grants.set(
+                container,
+                ContainerGrant {
+                    network: vec!["old.example".into()],
+                    env: vec!["OLD_SECRET".into()],
+                },
+            );
+            grants.save(&fx.home).unwrap();
+            let manager = manager.with_replace_source(true);
+            let new = manager.install(&new_id, PluginScope::User).unwrap();
+            assert_ne!(old.source_identity, new.source_identity);
+            assert_eq!(std::fs::read_to_string(&data).unwrap(), "retained");
+            assert_eq!(
+                ContainerGrants::load(&fx.home).get(container),
+                ContainerGrant::default()
+            );
+            let installs = manager.installs().unwrap();
+            assert_eq!(installs.by_id.len(), 1);
+            assert!(installs.by_id.contains_key(&new_id));
+            assert!(manager.uninstall(&old_id).is_err());
+            assert_eq!(std::fs::read_to_string(&data).unwrap(), "retained");
+        }
+    }
+
+    #[test]
+    fn legacy_marketplace_identity_requires_explicit_confirmation() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("legacy-market-source");
+        for name in ["greeter", "radar"] {
+            let fx = fixture();
+            marketplace(&fx.work.join("market"), "m");
+            let manager = manager(&fx);
+            manager.add("./market").unwrap();
+            let id = format!("{name}@m");
+            manager.install(&id, PluginScope::User).unwrap();
+            let mut installs = manager.installs().unwrap();
+            installs.by_id.get_mut(&id).unwrap().source_identity = None;
+            installs.save(&fx.home).unwrap();
+            let store = PluginStore::new(fx.home.clone(), fx.work.clone());
+            let mut state = store.load_state(PluginScope::User).unwrap();
+            for record in &mut state.plugins {
+                record.source_identity = None;
+            }
+            store.save_state_atomic(PluginScope::User, &state).unwrap();
+            assert!(manager
+                .install(&id, PluginScope::User)
+                .unwrap_err()
+                .to_string()
+                .contains("--replace-source"));
+            let install = manager
+                .with_replace_source(true)
+                .install(&id, PluginScope::User)
+                .unwrap();
+            assert!(install.source_identity.is_some());
+        }
+    }
+
+    #[test]
+    fn an_unrelated_broken_legacy_mod_does_not_block_a_package_install() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("broken-legacy-mod");
+        let fx = fixture();
+        marketplace(&fx.work.join("market"), "m");
+        let manager = manager(&fx);
+        manager.add("./market").unwrap();
+        manager.install("radar@m", PluginScope::User).unwrap();
+        let mut installs = manager.installs().unwrap();
+        let old = installs.by_id.get_mut("radar@m").unwrap();
+        old.kernel_plugins.clear();
+        old.source_identity = None;
+        write(
+            &old.location.join(".claude-plugin/plugin.json"),
+            "invalid json",
+        );
+        installs.save(&fx.home).unwrap();
+        manager.install("greeter@m", PluginScope::User).unwrap();
+    }
+
+    #[test]
+    fn same_source_upgrade_preserves_identity_and_runtime_id() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("source-upgrade");
+        let fx = fixture();
+        marketplace(&fx.work.join("market"), "m");
+        let manager = manager(&fx);
+        manager.add("./market").unwrap();
+        let first = manager.install("greeter@m", PluginScope::User).unwrap();
+        let path = fx.work.join("market/plugins/greeter/rebon-plugin.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["version"] = json!("2.0.0");
+        manifest["source"] = json!("builtin:forged");
+        write(&path, &manifest.to_string());
+        let second = manager.install("greeter@m", PluginScope::User).unwrap();
+        assert_eq!(first.source_identity, second.source_identity);
+        assert_eq!(second.kernel_plugins, vec!["greeter"]);
+        let record = PluginStore::new(fx.home.clone(), fx.work.clone())
+            .load_state(PluginScope::User)
+            .unwrap()
+            .plugins
+            .remove(0);
+        assert_eq!(record.source_identity, second.source_identity);
+        assert_eq!(record.version, "2.0.0");
+    }
+
+    #[test]
+    fn a_different_package_cannot_claim_an_installed_runtime_id() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("source-runtime-id");
+        let fx = fixture();
+        marketplace(&fx.work.join("a"), "alpha");
+        marketplace(&fx.work.join("b"), "beta");
+        let path = fx.work.join("b/plugins/greeter/rebon-plugin.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["name"] = json!("different-package");
+        write(&path, &manifest.to_string());
+        let manager = manager(&fx);
+        manager.add("./a").unwrap();
+        manager.add("./b").unwrap();
+        manager.install("greeter@alpha", PluginScope::User).unwrap();
+        let grants = fx.home.join("plugins/grants.json");
+        let before = std::fs::read(&grants).unwrap();
+        let error = manager
+            .install("greeter@beta", PluginScope::User)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("--replace-source"), "{error}");
+        assert!(
+            error.contains("greeter") && error.contains("user"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&grants).unwrap(), before);
+        assert_eq!(manager.installs().unwrap().by_id.len(), 1);
+    }
+
+    #[test]
+    fn replacing_a_catalog_origin_cannot_take_over_its_old_install() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("source-catalog");
+        let fx = fixture();
+        marketplace(&fx.work.join("a"), "same");
+        marketplace(&fx.work.join("b"), "same");
+        let manager = manager(&fx);
+        manager.add("./a").unwrap();
+        let first = manager.install("radar@same", PluginScope::User).unwrap();
+        manager.remove("same").unwrap();
+        manager.add("./b").unwrap();
+        assert!(manager.install("radar@same", PluginScope::User).is_err());
+        assert_eq!(manager.installs().unwrap().by_id["radar@same"], first);
+    }
+
+    #[test]
+    fn a_mod_cannot_claim_a_packages_runtime_id() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("source-mod-package");
+        let fx = fixture();
+        marketplace(&fx.work.join("market"), "m");
+        write_mod(&fx.work.join("market/mods/radar"), "greeter");
+        let manager = manager(&fx);
+        manager.add("./market").unwrap();
+        manager.install("greeter@m", PluginScope::User).unwrap();
+        let error = manager
+            .install("radar@m", PluginScope::User)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("--replace-source"), "{error}");
+        assert!(error.contains("greeter@m"), "{error}");
+        assert!(!fx.home.join("mods/radar").exists());
+    }
+
+    #[test]
+    fn builtin_marketplace_upgrade_survives_relocation() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("builtin-relocation");
+        let fx = fixture();
+        let old = fx.work.join("old-builtin");
+        let new = fx.work.join("new-builtin");
+        marketplace(&old, BUILTIN_MARKETPLACE);
+        marketplace(&new, BUILTIN_MARKETPLACE);
+        let path = new.join("plugins/greeter/rebon-plugin.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["version"] = json!("2.0.0");
+        write(&path, &manifest.to_string());
+        let manager = manager(&fx).with_builtin(Some(old));
+        let package = manager.install("greeter@rebon", PluginScope::User).unwrap();
+        let mod_ = manager.install("radar@rebon", PluginScope::User).unwrap();
+        let manager = manager.with_builtin(Some(new));
+        let upgraded = manager.install("greeter@rebon", PluginScope::User).unwrap();
+        assert_eq!(upgraded.version.as_deref(), Some("2.0.0"));
+        assert_eq!(upgraded.source_identity, package.source_identity);
+        assert_eq!(
+            manager
+                .install("radar@rebon", PluginScope::User)
+                .unwrap()
+                .source_identity,
+            mod_.source_identity
+        );
+    }
+
+    #[test]
+    fn a_grant_write_failure_does_not_leave_the_old_owner_active() {
+        use rebon_harness::rebon_plugin_package::container::container_data_dir;
+        let _home =
+            rebon_tool::tasks::test_support::TestConfigHome::new("replacement-grant-failure");
+        for (name, container) in [("greeter", "pkg-greeter"), ("radar", "mod-radar")] {
+            let fx = fixture();
+            marketplace(&fx.work.join("a"), "alpha");
+            marketplace(&fx.work.join("b"), "beta");
+            let manager = manager(&fx);
+            manager.add("./a").unwrap();
+            manager.add("./b").unwrap();
+            let old_id = format!("{name}@alpha");
+            manager.install(&old_id, PluginScope::User).unwrap();
+            let data = container_data_dir(&fx.home, container).join("state.txt");
+            write(&data, "retained");
+            let grants = fx.home.join("plugins/grants.json");
+            std::fs::remove_file(&grants).unwrap();
+            std::fs::create_dir(&grants).unwrap();
+            let manager = manager.with_replace_source(true);
+            assert!(manager
+                .install(&format!("{name}@beta"), PluginScope::User)
+                .is_err());
+            assert!(!manager.installs().unwrap().by_id.contains_key(&old_id));
+            assert!(manager.uninstall(&old_id).is_err());
+            assert_eq!(std::fs::read_to_string(data).unwrap(), "retained");
+        }
+    }
+
+    #[test]
     fn rebons_own_marketplace_is_always_listed_and_never_removed() {
         let fx = fixture();
         let builtin = fx.work.join("builtin");
@@ -1693,6 +2053,7 @@ mod tests {
         );
         let loaded = Loaded {
             name: "lonely".into(),
+            source: MarketplaceSource::File { path: file.clone() },
             root: None,
             manifest: MarketplaceManifest::read(&file).unwrap(),
         };
