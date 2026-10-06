@@ -910,6 +910,8 @@ async fn boot_process_plugin_plane(
             scope_id: None,
             working_directory: workspace_root,
             unary_call_timeout: None,
+            drain_deadline: None,
+            lifecycle_sink: None,
         },
         ctx.clone(),
         compose_tools.clone(),

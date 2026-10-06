@@ -152,6 +152,130 @@ pub struct PluginStateChanged {
     pub generation: u64,
 }
 
+/// Which run of a plugin something belongs to.
+///
+/// `plugin_id` names a plugin; this names one *load attempt* of it. Two
+/// attempts of one id differ by `generation`, and a host restart moves
+/// `host_epoch`, so a fact recorded about one run cannot be read as being
+/// about the next. Assigned before the load is sent, so whatever the plugin
+/// does while it activates already belongs to this run.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginIncarnation {
+    /// Where the plugin came from (ecosystem and package identity). `None`
+    /// until sources carry one.
+    pub source: Option<String>,
+    pub plugin_id: String,
+    /// The host process the run is on; `0` for a plugin running in rebon's
+    /// own process. A plane draws a random base when it starts and gives each
+    /// host it spawns its own epoch above it, so two hosts — or the same plane
+    /// started twice — are told apart with high probability, not certainty.
+    /// A record that must be unique across processes pairs this with the
+    /// writer's own identity rather than trusting it alone.
+    pub host_epoch: u64,
+    /// Per plugin, starting at 1, advanced by every load attempt — a failed
+    /// one included, since the failure is a fact about that attempt. Counted
+    /// by whoever runs the plugin, so it restarts with that runner.
+    pub generation: u64,
+}
+
+/// Where one run of a plugin stands.
+///
+/// A host's own protocol phase (admitted, ready, draining, unloaded) lives
+/// and dies with that host. This is the account that outlives it: how the run
+/// ended, including the two endings a host cannot report about itself.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "phase", rename_all = "camelCase")]
+pub enum PluginLifecycle {
+    /// The load has been sent and has not answered.
+    Loading,
+    /// Loaded and routable.
+    Ready,
+    /// Unloading: new calls are refused, calls already running are waited on.
+    Draining,
+    /// Gone, with nothing of it left running.
+    Unloaded,
+    /// The load attempt failed.
+    Failed { reason: String },
+    /// Did not finish its calls in time and was ended with the host it ran
+    /// in — or ran in a host that was ended for another plugin's sake, which
+    /// `reason` names. The host is confirmed gone before this is recorded.
+    Forced {
+        outstanding: Vec<String>,
+        reason: String,
+    },
+    /// Did not finish (or could not be asked to finish) on a host that cannot
+    /// be ended for it. Withdrawn; its id cannot run again in this process.
+    Stuck {
+        outstanding: Vec<String>,
+        reason: String,
+    },
+}
+
+impl PluginLifecycle {
+    /// Whether the run is over: nothing more will be recorded about it.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Unloaded | Self::Failed { .. } | Self::Forced { .. } | Self::Stuck { .. }
+        )
+    }
+}
+
+/// One run of a plugin and where it stands.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleRecord {
+    pub incarnation: PluginIncarnation,
+    pub state: PluginLifecycle,
+}
+
+/// Emitted after a run of a plugin moves between lifecycle states.
+///
+/// A terminal state is emitted only once it is true — after the run's
+/// registrations are withdrawn and, where a host was ended, after it is gone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginLifecycleChanged {
+    pub incarnation: PluginIncarnation,
+    /// `None` for the first state of a run.
+    pub from: Option<PluginLifecycle>,
+    pub to: PluginLifecycle,
+}
+
+/// Where lifecycle facts are made durable before anyone is told about them.
+///
+/// Whoever records a run's state change commits the fact here first, then
+/// changes its own table, then announces [`PluginLifecycleChanged`] — so a
+/// listener never hears of a change the record of which could still be lost.
+/// The announcement itself is best effort (the event plane contains panics and
+/// has no acknowledgement), which is exactly why durability cannot ride on it.
+///
+/// What a refused commit means is the recorder's to say, and it depends on
+/// whether the change has already happened: a change not yet made (a load
+/// about to be sent) is not made, while a change that is already true (a
+/// plugin withdrawn, a host ended) is kept and announced anyway, with the
+/// failure reported, because a table that disagrees with reality is worse
+/// than a journal with a gap.
+///
+/// `commit` is called synchronously, under the recorder's ordering lock and
+/// on an async worker thread. It must be quick — one append and its fsync —
+/// and must not block on async work or call back into the recorder, which
+/// would deadlock.
+pub trait LifecycleSink: Send + Sync {
+    fn commit(&self, fact: &PluginLifecycleChanged) -> Result<(), String>;
+}
+
+/// A [`LifecycleSink`] handle that can sit in a `Debug` configuration.
+#[derive(Clone)]
+pub struct SharedLifecycleSink(pub std::sync::Arc<dyn LifecycleSink>);
+
+impl std::fmt::Debug for SharedLifecycleSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedLifecycleSink")
+    }
+}
+
 /// Which on-disk file a [`ConfigChanged`] event is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigFileKind {

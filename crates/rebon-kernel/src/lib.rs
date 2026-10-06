@@ -51,8 +51,10 @@ pub mod testing;
 
 pub use context::Context;
 pub use def::{
-    ConfigChanged, ConfigFileKind, DynPluginDef, PluginDef, PluginFactory, PluginHost, PluginKind,
-    PluginState, PluginStateChanged, SessionClosed, SessionOpened,
+    ConfigChanged, ConfigFileKind, DynPluginDef, LifecycleRecord, LifecycleSink, PluginDef,
+    PluginFactory, PluginHost, PluginIncarnation, PluginKind, PluginLifecycle,
+    PluginLifecycleChanged, PluginState, PluginStateChanged, SessionClosed, SessionOpened,
+    SharedLifecycleSink,
 };
 pub use disposer::{Disposer, Scope};
 pub use error::KernelError;

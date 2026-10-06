@@ -90,6 +90,16 @@ impl PlaneHost for HarnessPlaneHost {
                         "node-host: the composition was reconciled"
                     );
                 }
+                // Not failures: the switch was honoured and nothing is routed
+                // to them. They are said out loud because a stuck one cannot
+                // be switched back on until rebon restarts.
+                if !outcome.forced.is_empty() || !outcome.stuck.is_empty() {
+                    tracing::warn!(
+                        forced = ?outcome.forced,
+                        stuck = ?outcome.stuck,
+                        "node-host: some plugins did not finish their calls in time"
+                    );
+                }
                 if outcome.failed.is_empty() {
                     Ok(())
                 } else {

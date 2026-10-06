@@ -195,6 +195,8 @@ impl PlaneLoopHost {
                 scope_id: Some(scope_id.clone()),
                 working_directory: spec.workspace_root.clone(),
                 unary_call_timeout: None,
+                drain_deadline: None,
+                lifecycle_sink: None,
             },
             fork.clone(),
             registry,

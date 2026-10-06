@@ -172,6 +172,8 @@ async fn a_mod_loads_seats_its_command_draws_and_answers_hooks() {
             scope_id: None,
             working_directory: repo.clone(),
             unary_call_timeout: Some(Duration::from_secs(10)),
+            drain_deadline: None,
+            lifecycle_sink: None,
         },
         ctx.clone(),
         registry,
@@ -454,10 +456,10 @@ async fn scenario(
     assert!(unknown.is_err());
 
     // Unloading takes the command off the seat and the mod out of the table.
-    plane
-        .unload_entry("counter")
-        .await
-        .expect("the mod unloads");
+    assert!(
+        plane.unload_entry("counter").await.is_clean(),
+        "the mod unloads"
+    );
     assert!(mods.get("counter").is_none());
     assert!(seat.find("count").is_none(), "/count left with the mod");
     assert!(mods.ui.snapshot().status.is_empty());

@@ -202,6 +202,8 @@ async fn boot_with_bound(
             scope_id: None,
             working_directory: repo.clone(),
             unary_call_timeout,
+            drain_deadline: None,
+            lifecycle_sink: None,
         },
         ctx,
         registry,
@@ -499,11 +501,10 @@ async fn a_composition_tool_lands_in_the_process_registry_and_leaves_on_unload()
         .expect("the tool is dispatchable");
     assert_eq!(tool.id().as_str(), "todo_write");
 
-    fixture
-        .plane
-        .unload_entry("tool-todo")
-        .await
-        .expect("the entry drains");
+    assert!(
+        fixture.plane.unload_entry("tool-todo").await.is_clean(),
+        "the entry drains"
+    );
     assert!(
         registry.tool_names().is_empty(),
         "unloading withdrew exactly what the entry registered"
@@ -573,11 +574,10 @@ async fn the_marketplaces_dsh_packages_load_and_register_their_tools() {
         let mut wanted: Vec<String> = tools.iter().map(|tool| tool.to_string()).collect();
         wanted.sort();
         assert_eq!(names, wanted, "{id} registered exactly what it declares");
-        fixture
-            .plane
-            .unload_entry(id)
-            .await
-            .expect("the entry drains");
+        assert!(
+            fixture.plane.unload_entry(id).await.is_clean(),
+            "the entry drains"
+        );
         fixture.plane.shutdown().await;
     }
 }
@@ -983,11 +983,14 @@ async fn a_plugin_contributes_commands_and_services_to_the_seats() {
     assert_eq!(answered["saw"], "ping", "{answered}");
 
     // Unloading takes all of it out.
-    fixture
-        .plane
-        .unload_entry("fixture-commands")
-        .await
-        .expect("the entry drains");
+    assert!(
+        fixture
+            .plane
+            .unload_entry("fixture-commands")
+            .await
+            .is_clean(),
+        "the entry drains"
+    );
     assert_eq!(seat.len(), builtins, "the seat is back to the built-ins");
     assert!(seat.find("fixture-echo").is_none());
     assert!(seat.find("fx").is_none(), "the alias went with it");
@@ -1091,11 +1094,14 @@ async fn a_host_native_composition_entry_loads_and_its_commands_reach_the_seat()
     // The other half of the old failure: the entry used to be left running on
     // the host with nothing registered, so the same id could never be loaded
     // again. Unload and reload proves both sides agree about what is up.
-    fixture
-        .plane
-        .unload_entry("fixture-commands")
-        .await
-        .expect("the entry drains");
+    assert!(
+        fixture
+            .plane
+            .unload_entry("fixture-commands")
+            .await
+            .is_clean(),
+        "the entry drains"
+    );
     assert_eq!(seat.len(), builtins, "the seat is back to the built-ins");
     fixture
         .plane
@@ -1539,11 +1545,10 @@ async fn a_contained_plugin_is_confined_to_its_own_files_and_dies_with_its_last_
     );
 
     // Its last entry leaving takes the container with it.
-    fixture
-        .plane
-        .unload_entry("probe-boxed")
-        .await
-        .expect("the contained entry unloads");
+    assert!(
+        fixture.plane.unload_entry("probe-boxed").await.is_clean(),
+        "the contained entry unloads"
+    );
     assert!(fixture.plane.containers().await.is_empty());
     assert!(fixture
         .plane

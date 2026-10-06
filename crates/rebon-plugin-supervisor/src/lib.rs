@@ -81,19 +81,19 @@ use rebon_plugin_protocol::{
     CallClosed, CallIdentity, CodecError, CommandInvokeRequest, EventDelivery, EventEmitRequest,
     EventSubscribeRequest, EventUnsubscribeRequest, LlmControlRequest, LlmStreamRequest,
     NdjsonCodec, Payload, PluginCommandDefinition, PluginDrainReport, PluginLoadRequest,
-    PluginReadyReport, PluginToolDefinition, PluginUnloadRequest, RegistryError, SeatCallRequest,
-    ServiceCallRequest, TerminalStatus, ToolInvokeRequest, WireEnvelope, WireMessage,
-    CALL_CANCEL_METHOD, COMMAND_INVOKE_METHOD, EVENT_DELIVER_METHOD, EVENT_EMIT_METHOD,
-    EVENT_SUBSCRIBE_METHOD, EVENT_UNSUBSCRIBE_METHOD, LLM_CONTROL_METHOD, LLM_STREAM_METHOD,
-    PLATFORM_INITIALIZE_METHOD, PLATFORM_SHUTDOWN_METHOD, PLUGIN_LOAD_METHOD, PLUGIN_UNLOAD_METHOD,
-    SCOPE_CLOSE_METHOD, SCOPE_OPEN_METHOD, SEAT_CALL_METHOD, SERVICE_CALL_METHOD, TOOL_CALL_METHOD,
-    TOOL_INVOKE_METHOD,
+    PluginPhase, PluginReadyReport, PluginToolDefinition, PluginUnloadRequest, RegistryError,
+    SeatCallRequest, ServiceCallRequest, TerminalStatus, ToolInvokeRequest, WireEnvelope,
+    WireMessage, CALL_CANCEL_METHOD, COMMAND_INVOKE_METHOD, EVENT_DELIVER_METHOD,
+    EVENT_EMIT_METHOD, EVENT_SUBSCRIBE_METHOD, EVENT_UNSUBSCRIBE_METHOD, LLM_CONTROL_METHOD,
+    LLM_STREAM_METHOD, PLATFORM_INITIALIZE_METHOD, PLATFORM_SHUTDOWN_METHOD, PLUGIN_LOAD_METHOD,
+    PLUGIN_UNLOAD_METHOD, SCOPE_CLOSE_METHOD, SCOPE_OPEN_METHOD, SEAT_CALL_METHOD,
+    SERVICE_CALL_METHOD, TOOL_CALL_METHOD, TOOL_INVOKE_METHOD,
 };
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdin, Command},
-    sync::{mpsc, oneshot, Mutex},
+    sync::{mpsc, oneshot, Mutex, Notify},
 };
 
 pub use state::{HostFailure, Inbound, StateError, SupervisorState, HOST_FAILED_CODE};
@@ -116,6 +116,9 @@ pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// A shut-down host is not alive — it is gone — but it did not crash, and a
 /// caller deciding whether to report an incident needs to tell those apart.
 pub const SHUTDOWN_REASON: &str = "plugin host shut down on request";
+
+/// The failure recorded for a host ended by [`PluginHostSupervisor::terminate`].
+pub const TERMINATED_REASON: &str = "plugin host terminated";
 
 /// How long `platform/initialize` may take before the host is declared unusable.
 ///
@@ -444,6 +447,13 @@ impl HostConfig {
         self
     }
 
+    /// The epoch this host starts on. Distinct hosts should get distinct
+    /// epochs, so a call identity names one process; the default is `1`.
+    pub fn with_host_epoch(mut self, host_epoch: u64) -> Self {
+        self.host_epoch = host_epoch;
+        self
+    }
+
     pub fn with_startup_timeout(mut self, timeout: Duration) -> Self {
         self.startup_timeout = timeout;
         self
@@ -519,6 +529,27 @@ pub enum HostCallError {
     /// bound this is what a caller waits on forever.
     #[error("{HOST_UNANSWERED_CODE} plugin {plugin_id:?} did not answer within {seconds} seconds")]
     HostUnanswered { plugin_id: String, seconds: u64 },
+    /// An earlier unload of this plugin never finished draining, on a host
+    /// that cannot be taken down without taking other plugins with it. The old
+    /// run is still answering the calls it had, so loading the id again would
+    /// put two runs of one plugin side by side.
+    #[error(
+        "{PLUGIN_STUCK_CODE} plugin {plugin_id:?} is still finishing {count} call(s) from before its unload; restart rebon to load it again"
+    )]
+    Stuck { plugin_id: String, count: usize },
+    /// The host took `platform/shutdown` and did not answer within the
+    /// shutdown window. The process is reaped regardless.
+    #[error("{HOST_UNANSWERED_CODE} the plugin host did not answer its shutdown within {seconds} seconds")]
+    ShutdownUnanswered { seconds: u64 },
+    /// A load was not started because the fact that it was starting could not
+    /// be recorded. Nothing was sent to the host.
+    #[error("{LIFECYCLE_UNRECORDED_CODE} plugin {plugin_id:?} was not loaded: its start could not be recorded: {reason}")]
+    LifecycleUnrecorded { plugin_id: String, reason: String },
+}
+
+/// A bound as the whole seconds a person reads, never "0 seconds".
+pub fn whole_seconds(bound: Duration) -> u64 {
+    bound.as_secs_f64().ceil().max(1.0) as u64
 }
 
 /// Finds the host's entry module.
@@ -830,6 +861,10 @@ struct Inner {
     seat_dispatcher: Option<Arc<dyn SeatDispatcher>>,
     exposed_seats: BTreeSet<String>,
     event_publisher: Option<Arc<dyn EventPublisher>>,
+    /// Woken whenever a drain may have ended: the last call of one closed, or
+    /// the host died and took every call with it. [`PluginHostSupervisor::await_drain`]
+    /// re-reads the registry on each wake, so a spurious one costs a lock.
+    drains: Notify,
 }
 
 impl Inner {
@@ -851,6 +886,7 @@ impl Inner {
                 call_id,
                 "the last call of a drain closed; the plugin is unloaded"
             );
+            self.drains.notify_waiters();
         }
     }
 
@@ -889,6 +925,9 @@ impl Inner {
 
     /// Closes stdin and hands every owed call the failure now on record.
     async fn settle_failed(&self, owed: Vec<WireEnvelope>) {
+        // A dead host has nothing left running, so every drain waiting on it
+        // is over — whatever the ledger still says until the terminals land.
+        self.drains.notify_waiters();
         // Closing stdin first lets a host that is merely wedged notice EOF and
         // exit on its own rather than needing to be killed.
         *self.stdin.lock().await = None;
@@ -990,6 +1029,7 @@ impl PluginHostSupervisor {
             seat_dispatcher: config.seat_dispatcher.clone(),
             exposed_seats: config.exposed_seats.clone(),
             event_publisher: config.event_publisher.clone(),
+            drains: Notify::new(),
         });
 
         tokio::spawn(drain_stderr(stderr, Arc::clone(&inner.stderr)));
@@ -1155,6 +1195,26 @@ impl PluginHostSupervisor {
         }
     }
 
+    /// [`Self::unload_plugin`] with a bound on the request itself.
+    ///
+    /// The drain after it is bounded by [`Self::await_drain`]; this bounds the
+    /// part before it, a host that takes `plugin/unload` and never answers.
+    /// On expiry this side is already draining — new calls are refused — and
+    /// stays so; what happens to the host is the caller's decision.
+    pub async fn unload_plugin_within(
+        &self,
+        plugin_id: &str,
+        bound: Duration,
+    ) -> Result<PluginDrainReport, HostCallError> {
+        match tokio::time::timeout(bound, self.unload_plugin(plugin_id)).await {
+            Ok(answer) => answer,
+            Err(_) => Err(HostCallError::HostUnanswered {
+                plugin_id: plugin_id.to_owned(),
+                seconds: whole_seconds(bound),
+            }),
+        }
+    }
+
     /// Begins draining one plugin and returns the host's ledger of what was
     /// still running.
     pub async fn unload_plugin(&self, plugin_id: &str) -> Result<PluginDrainReport, HostCallError> {
@@ -1194,6 +1254,54 @@ impl PluginHostSupervisor {
             revoked_subscriptions: local.revoked_subscriptions,
             ..remote
         })
+    }
+
+    /// Waits for an unload that began with work in flight to finish.
+    ///
+    /// [`Self::unload_plugin`] answers as soon as the drain *begins*: new calls
+    /// are refused from then on, but the ones already running keep running, and
+    /// whoever closes the last of them is what retires the plugin. A caller
+    /// that is about to withdraw the plugin's registrations, or take its
+    /// container down, has to wait for that moment rather than assume it —
+    /// otherwise "unloaded" is a claim made while the old code is still
+    /// answering.
+    ///
+    /// `Ok` once nothing of the plugin is running here: its drain finished, it
+    /// was never draining, or the host died (a dead host runs nothing). `Err`
+    /// carries the calls still in flight when `deadline` passed; what to do
+    /// about them is the caller's decision, because only the caller knows
+    /// whether the plugin can be forced out.
+    pub async fn await_drain(
+        &self,
+        plugin_id: &str,
+        deadline: Duration,
+    ) -> Result<(), Vec<String>> {
+        let until = tokio::time::Instant::now() + deadline;
+        loop {
+            // Registered before the check so a drain finishing between the
+            // check and the wait still wakes it.
+            let notified = self.inner.drains.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.inner.state.lock().await;
+                if !state.is_alive() {
+                    return Ok(());
+                }
+                if state.registry().phase(plugin_id) != Some(PluginPhase::Draining) {
+                    return Ok(());
+                }
+            }
+            if tokio::time::timeout_at(until, notified).await.is_err() {
+                let state = self.inner.state.lock().await;
+                if !state.is_alive()
+                    || state.registry().phase(plugin_id) != Some(PluginPhase::Draining)
+                {
+                    return Ok(());
+                }
+                return Err(state.registry().in_flight(plugin_id));
+            }
+        }
     }
 
     /// Calls a service on a loaded plugin, inside one of its open scopes.
@@ -1679,17 +1787,32 @@ impl PluginHostSupervisor {
     ///
     /// A host that does not exit within the configured window is killed: an
     /// orderly shutdown is preferred, but not at the price of hanging the
-    /// process that asked for it.
+    /// process that asked for it. The same window bounds the request itself,
+    /// and a request that fails or goes unanswered still ends in the process
+    /// being reaped — the error is reported afterwards, not instead.
     pub async fn shutdown(&self) -> Result<(), HostCallError> {
+        let mut asked = Ok(());
         if self.is_alive().await {
             let identity = {
                 let mut state = self.inner.state.lock().await;
                 let call_id = state.next_call_id();
                 CallIdentity::platform_control(state.host_epoch(), call_id)
-                    .map_err(|error| HostCallError::State(StateError::Lifecycle(error.into())))?
+                    .map_err(|error| HostCallError::State(StateError::Lifecycle(error.into())))
             };
-            self.request(identity, PLATFORM_SHUTDOWN_METHOD, Payload::null())
-                .await?;
+            asked = match identity {
+                Ok(identity) => match tokio::time::timeout(
+                    self.config.shutdown_timeout,
+                    self.request(identity, PLATFORM_SHUTDOWN_METHOD, Payload::null()),
+                )
+                .await
+                {
+                    Ok(answer) => answer.map(|_| ()),
+                    Err(_) => Err(HostCallError::ShutdownUnanswered {
+                        seconds: whole_seconds(self.config.shutdown_timeout),
+                    }),
+                },
+                Err(error) => Err(error),
+            };
             // Recorded before stdin closes, so the reader's EOF finds a reason
             // already set and "first failure wins" reports the deliberate one
             // rather than "the host closed its output".
@@ -1697,7 +1820,25 @@ impl PluginHostSupervisor {
         }
         *self.inner.stdin.lock().await = None;
         self.reap().await;
-        Ok(())
+        asked
+    }
+
+    /// Ends the host now: no request, no grace window.
+    ///
+    /// For a host whose plugin would not finish its calls in time, where
+    /// asking politely is exactly what already failed. Returns once the process
+    /// has been waited on, so a caller can say the host is gone rather than
+    /// that it was told to go. Everything still waiting on the host is answered
+    /// with its failure.
+    pub async fn terminate(&self) {
+        self.inner.fail(HostFailure::new(TERMINATED_REASON)).await;
+        *self.inner.stdin.lock().await = None;
+        let mut guard = self.child.lock().await;
+        if let Some(child) = guard.as_mut() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        *guard = None;
     }
 
     /// Whether this host is gone because it was asked to leave.
@@ -2001,6 +2142,12 @@ pub const UNAVAILABLE_EVENTS_CODE: &str = "[UNAVAILABLE_EVENTS]";
 /// The refusal for a host that took a request and never answered it.
 pub const HOST_UNANSWERED_CODE: &str = "[HOST_UNANSWERED]";
 
+/// Code for [`HostCallError::Stuck`].
+pub const PLUGIN_STUCK_CODE: &str = "[PLUGIN_STUCK]";
+
+/// Code for [`HostCallError::LifecycleUnrecorded`].
+pub const LIFECYCLE_UNRECORDED_CODE: &str = "[LIFECYCLE_UNRECORDED]";
+
 /// The refusal for a provider a plugin declares but never registers.
 ///
 /// The mirror image of `[UNDECLARED_ADAPTER]`, which is a plugin registering
@@ -2277,6 +2424,7 @@ mod tests {
             seat_dispatcher: None,
             exposed_seats: BTreeSet::new(),
             event_publisher: None,
+            drains: Notify::new(),
         }
     }
 

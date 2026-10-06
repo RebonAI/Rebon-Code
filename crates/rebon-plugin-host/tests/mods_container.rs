@@ -160,6 +160,8 @@ async fn a_contained_mod_reads_its_own_writes_its_data_and_asks_for_the_rest() {
             scope_id: None,
             working_directory: repo.clone(),
             unary_call_timeout: Some(Duration::from_secs(10)),
+            drain_deadline: None,
+            lifecycle_sink: None,
         },
         ctx.clone(),
         registry,

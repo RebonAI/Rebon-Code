@@ -52,13 +52,15 @@ use rebon_command_seat::{
     Surfaces,
 };
 use rebon_core::tool_seat::{Priority, ToolSeatService};
-use rebon_kernel::{Context, JsonService, KernelError};
+use rebon_kernel::{
+    Context, JsonService, KernelError, PluginLifecycleChanged, SharedLifecycleSink,
+};
 use rebon_plugin_protocol::{
     CommandInvokeRequest, Payload, PluginCommandDefinition, PluginCommandKind,
-    PluginCommandSurface, PluginLoadRequest, PluginReadyReport,
+    PluginCommandSurface, PluginLoadRequest, PluginReadyReport, RegistryError,
 };
 use rebon_plugin_supervisor::{
-    EventPublisher, HostCallError, HostConfig, PluginHostSupervisor, PublishedEvent,
+    whole_seconds, EventPublisher, HostCallError, HostConfig, PluginHostSupervisor, PublishedEvent,
     SeatDispatcher, SeatInvocation, SupervisorError, ToolInvoker, ToolRefusal,
 };
 use serde::{Deserialize, Serialize};
@@ -241,6 +243,12 @@ pub struct PluginPlaneConfig {
     /// takes [`PluginPlane::UNARY_CALL_TIMEOUT`]; a test names a short one so
     /// it can watch the bound fire without waiting out the real number.
     pub unary_call_timeout: Option<std::time::Duration>,
+    /// How long an unload waits for a plugin's in-flight calls to finish
+    /// before deciding it will not. `None` is [`PluginPlane::DRAIN_DEADLINE`].
+    pub drain_deadline: Option<std::time::Duration>,
+    /// Where lifecycle facts are committed before the plane's table changes
+    /// and the change is announced. `None` records nowhere but the table.
+    pub lifecycle_sink: Option<SharedLifecycleSink>,
 }
 
 impl PluginPlaneConfig {
@@ -278,6 +286,22 @@ pub struct PluginPlane {
     scope: String,
     /// The deadline the two unary proxies put on a plugin call.
     unary_call_timeout: std::time::Duration,
+    /// See [`PluginPlaneConfig::drain_deadline`].
+    drain_deadline: std::time::Duration,
+    /// Every plugin this plane has tried to run, and where each one stands.
+    ///
+    /// Kept after an unload, because that is when it is most needed: a plugin
+    /// that would not drain is a fact about the *next* load of its id, and the
+    /// generation a reload starts from has to survive the unload in between.
+    lifecycle: Mutex<BTreeMap<String, LifecycleRecord>>,
+    /// See [`PluginPlaneConfig::lifecycle_sink`].
+    lifecycle_sink: Option<SharedLifecycleSink>,
+    /// Held across commit, table change and announcement, so facts reach the
+    /// sink, the table and listeners in one order. A listener must not drive a
+    /// lifecycle change itself (an unload, a load) from inside its handler.
+    lifecycle_order: Mutex<()>,
+    /// The last commit the sink refused, if any.
+    lifecycle_sink_error: Mutex<Option<String>>,
     /// The table its tools dispatch through, and the read plane a plugin on
     /// the other side of the pipe lists from. Kept because the plane's
     /// lifetime has to cover it: a registry outliving the plane would offer
@@ -326,6 +350,59 @@ pub struct PluginPlane {
     mods: Arc<std::sync::OnceLock<Arc<crate::mods::ModsRegistry>>>,
 }
 
+pub use rebon_kernel::{LifecycleRecord, PluginIncarnation, PluginLifecycle};
+
+/// How one unload ended. The run's lifecycle record says the same thing, in
+/// the kernel's vocabulary, once the ending is true.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnloadOutcome {
+    /// Drained, withdrawn, gone.
+    Clean,
+    /// Ended with its container. `taken_down` names the other plugins that
+    /// were in it, which went with it: a container is one process, so it
+    /// cannot be ended for one of its plugins and kept for the rest.
+    Forced {
+        outstanding: Vec<String>,
+        reason: String,
+        taken_down: Vec<String>,
+    },
+    /// See [`PluginLifecycle::Stuck`].
+    Stuck {
+        outstanding: Vec<String>,
+        reason: String,
+    },
+}
+
+impl UnloadOutcome {
+    /// Whether the plugin drained and left nothing behind.
+    pub fn is_clean(&self) -> bool {
+        matches!(self, Self::Clean)
+    }
+}
+
+/// How an unload of a run that already ended reads, or `None` if it has not.
+fn ended_outcome(state: &PluginLifecycle) -> Option<UnloadOutcome> {
+    match state {
+        PluginLifecycle::Unloaded | PluginLifecycle::Failed { .. } => Some(UnloadOutcome::Clean),
+        PluginLifecycle::Forced {
+            outstanding,
+            reason,
+        } => Some(UnloadOutcome::Forced {
+            outstanding: outstanding.clone(),
+            reason: reason.clone(),
+            taken_down: Vec::new(),
+        }),
+        PluginLifecycle::Stuck {
+            outstanding,
+            reason,
+        } => Some(UnloadOutcome::Stuck {
+            outstanding: outstanding.clone(),
+            reason: reason.clone(),
+        }),
+        PluginLifecycle::Loading | PluginLifecycle::Ready | PluginLifecycle::Draining => None,
+    }
+}
+
 /// What a reload did, by name, so a person can see it rather than infer it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ReloadOutcome {
@@ -343,6 +420,12 @@ pub struct ReloadOutcome {
     /// to start is not a reason to leave four working ones in whatever state
     /// the reload had reached.
     pub failed: Vec<(String, String)>,
+    /// Removed or restarted entries that did not drain in time and were taken
+    /// down with their container. Their details are in [`PluginPlane::lifecycle`].
+    pub forced: Vec<String>,
+    /// Removed or restarted entries that did not drain in time and could not be
+    /// taken down; loading them again needs a restart.
+    pub stuck: Vec<String>,
 }
 
 impl ReloadOutcome {
@@ -476,7 +559,41 @@ struct ContainerHost {
 
 /// What a container's host is started with, copied from the shared host's
 /// start so a container is the same plane in a smaller box.
+/// Hands out host epochs: a random base per plane, one step per host it
+/// spawns.
+///
+/// A host is told apart by its epoch on every call identity, and the plane's
+/// own counter would start over with the plane. The base makes two planes —
+/// or one rebon started twice — unlikely to collide; the step leaves room for
+/// a supervisor's own restarts (+1 each) before the next host's range. Every
+/// epoch stays below 2^52, a safe JSON integer, which the wire requires.
+struct HostEpochs {
+    base: u64,
+    next: AtomicU64,
+}
+
+impl HostEpochs {
+    const STEP_BITS: u32 = 10;
+
+    fn new() -> Self {
+        use std::hash::{BuildHasher, Hasher};
+        let random = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        Self {
+            base: (random & ((1 << 21) - 1)) << 31,
+            next: AtomicU64::new(1),
+        }
+    }
+
+    fn next(&self) -> u64 {
+        self.base | (self.next.fetch_add(1, Ordering::Relaxed) << Self::STEP_BITS)
+    }
+}
+
 struct ContainerTemplate {
+    /// Shared with the plane's own host, so no two hosts share an epoch.
+    epochs: Arc<HostEpochs>,
     node: PathBuf,
     host_script: PathBuf,
     loader: PathBuf,
@@ -533,7 +650,9 @@ impl PluginPlane {
             mods: Arc::clone(&mods),
         });
         let events = Arc::new(KernelEvents { ctx: ctx.clone() });
+        let epochs = Arc::new(HostEpochs::new());
         let template = ContainerTemplate {
+            epochs: Arc::clone(&epochs),
             node: config.node.clone(),
             host_script: config.host_script.clone(),
             loader: config.loader.clone(),
@@ -548,6 +667,7 @@ impl PluginPlane {
             exposed_seats: config.exposed_seats.clone(),
         };
         let host = HostConfig::new(config.node.clone(), config.host_script.clone())
+            .with_host_epoch(epochs.next())
             .with_loader(&config.loader)
             .with_working_directory(config.working_directory.clone())
             .with_tool_invoker(invoker, config.exposed_tools.iter().cloned())
@@ -593,6 +713,11 @@ impl PluginPlane {
             unary_call_timeout: config
                 .unary_call_timeout
                 .unwrap_or(Self::UNARY_CALL_TIMEOUT),
+            drain_deadline: config.drain_deadline.unwrap_or(Self::DRAIN_DEADLINE),
+            lifecycle: Mutex::new(BTreeMap::new()),
+            lifecycle_sink: config.lifecycle_sink.clone(),
+            lifecycle_order: Mutex::new(()),
+            lifecycle_sink_error: Mutex::new(None),
             tools: Arc::clone(&tools),
             registered: Mutex::new(BTreeMap::new()),
             runtime: tokio::runtime::Handle::current(),
@@ -695,6 +820,7 @@ impl PluginPlane {
             &[],
         );
         let mut probe_config = HostConfig::new(template.node.clone(), template.host_script.clone())
+            .with_host_epoch(template.epochs.next())
             .with_loader(&template.loader);
         probe_config.node_args = node_half.node_args.clone();
         let argv = rebon_plugin_supervisor::node_argv(&probe_config);
@@ -731,6 +857,7 @@ impl PluginPlane {
             &confinement.environment,
         );
         let mut host = HostConfig::new(template.node.clone(), template.host_script.clone())
+            .with_host_epoch(template.epochs.next())
             .with_loader(&template.loader)
             .with_working_directory(launch.working_directory.clone())
             .with_tool_invoker(
@@ -810,7 +937,16 @@ impl PluginPlane {
             }
         };
         if let Some(host) = emptied {
-            let _ = host.supervisor.shutdown().await;
+            // `shutdown` reaps the process whether or not the host answered,
+            // so an error here is about manners, not about the process being
+            // left behind — but it is still said, not swallowed.
+            if let Err(error) = host.supervisor.shutdown().await {
+                tracing::warn!(
+                    plugin = plugin_id,
+                    %error,
+                    "the container did not shut down cleanly; it was ended"
+                );
+            }
         }
     }
 
@@ -869,11 +1005,25 @@ impl PluginPlane {
 
     /// Loads one entry and registers what it reported on rebon's seats.
     pub async fn load_entry(&self, entry: &ComposeEntry) -> Result<EntryReport, HostCallError> {
+        self.refuse_if_stuck(&entry.id)?;
         let host = self.host_for_entry(entry).await?;
+        if let Err(error) = self.begin_attempt(&host, &entry.id).await {
+            self.leave_container(&entry.id).await;
+            return Err(error);
+        }
         match self.load_entry_on(&host, entry).await {
-            Ok(report) => Ok(report),
+            Ok(report) => {
+                self.record_lifecycle(&entry.id, PluginLifecycle::Ready);
+                Ok(report)
+            }
             Err(error) => {
                 self.leave_container(&entry.id).await;
+                self.record_lifecycle(
+                    &entry.id,
+                    PluginLifecycle::Failed {
+                        reason: error.to_string(),
+                    },
+                );
                 Err(error)
             }
         }
@@ -1038,14 +1188,125 @@ impl PluginPlane {
     /// flight is answered by the tool it is already inside, and pulling the
     /// registration first would only make the answer arrive for a tool rebon
     /// says does not exist.
-    pub async fn unload_entry(&self, plugin_id: &str) -> Result<(), HostCallError> {
-        let host = self.hosts.for_plugin(plugin_id);
-        let drained = host.unload_plugin(plugin_id).await;
-        // A contained entry goes either way: if its host will not drain it,
-        // taking the container down is the unload.
-        if !self.hosts.is_contained(plugin_id) {
-            drained?;
+    ///
+    /// "After the drain" means after it *finishes*: `plugin/unload` answers
+    /// when the drain begins, so the calls still running are waited on here.
+    /// One deadline covers both the request and the wait. Past it — or if the
+    /// host will not take the request at all — a contained entry is ended with
+    /// its whole container ([`UnloadOutcome::Forced`]), and an entry on the
+    /// shared host, which cannot be ended for it, is withdrawn and marked
+    /// [`UnloadOutcome::Stuck`], so its id is refused until a restart rather
+    /// than loaded beside the run that is still answering.
+    ///
+    /// The run's terminal state is recorded last: after its registrations are
+    /// withdrawn and, where a container was ended, after the process is gone.
+    /// A contained entry leaving cleanly can take up to twice the host's
+    /// shutdown window when it is the container's last: once for the request,
+    /// once for the process to exit before it is killed.
+    ///
+    /// A run that already ended — forced out with another plugin's container,
+    /// failed with its host — is not unloaded again: its record says how it
+    /// ended, and that is what is returned.
+    pub async fn unload_entry(&self, plugin_id: &str) -> UnloadOutcome {
+        if let Some(ended) = self
+            .lifecycle(plugin_id)
+            .and_then(|record| ended_outcome(&record.state))
+        {
+            return ended;
         }
+        let host = self.hosts.for_plugin(plugin_id);
+        let contained = self.hosts.is_contained(plugin_id);
+        self.record_lifecycle(plugin_id, PluginLifecycle::Draining);
+
+        let until = tokio::time::Instant::now() + self.drain_deadline;
+        let remaining = || until.saturating_duration_since(tokio::time::Instant::now());
+        // `Ok` when nothing of the plugin is left running; `Err` with what is
+        // still running (possibly unknown) and why it did not finish.
+        let drained: Result<(), (Vec<String>, String)> =
+            match host.unload_plugin_within(plugin_id, remaining()).await {
+                Ok(_) => host
+                    .await_drain(plugin_id, remaining())
+                    .await
+                    .map_err(|outstanding| {
+                        (
+                            outstanding,
+                            format!(
+                                "did not finish its calls within {} seconds",
+                                whole_seconds(self.drain_deadline)
+                            ),
+                        )
+                    }),
+                // A host that never heard of the id runs nothing of it.
+                Err(HostCallError::Registry {
+                    source: RegistryError::UnknownPlugin { .. },
+                }) => Ok(()),
+                // A dead host runs nothing, whichever layer said so.
+                Err(_) if !host.is_alive().await => Ok(()),
+                Err(error) => Err((
+                    host.in_flight(plugin_id).await,
+                    format!("the unload was not completed: {error}"),
+                )),
+            };
+
+        match drained {
+            Ok(()) => {
+                self.forget(plugin_id);
+                // Before the container is left: a dead host's container is
+                // taken out of the table with every plugin still in it.
+                if !host.is_alive().await {
+                    self.note_dead_host(&host, Some(plugin_id)).await;
+                }
+                self.leave_container(plugin_id).await;
+                self.record_lifecycle(plugin_id, PluginLifecycle::Unloaded);
+                UnloadOutcome::Clean
+            }
+            Err((outstanding, reason)) if contained => {
+                tracing::warn!(
+                    plugin = plugin_id,
+                    ?outstanding,
+                    %reason,
+                    "ending the plugin's container"
+                );
+                let taken_down = self.force_container(plugin_id, &reason).await;
+                self.record_lifecycle(
+                    plugin_id,
+                    PluginLifecycle::Forced {
+                        outstanding: outstanding.clone(),
+                        reason: reason.clone(),
+                    },
+                );
+                UnloadOutcome::Forced {
+                    outstanding,
+                    reason,
+                    taken_down,
+                }
+            }
+            Err((outstanding, reason)) => {
+                tracing::warn!(
+                    plugin = plugin_id,
+                    ?outstanding,
+                    %reason,
+                    "plugin did not drain and cannot be ended; its id is refused until restart"
+                );
+                self.forget(plugin_id);
+                self.record_lifecycle(
+                    plugin_id,
+                    PluginLifecycle::Stuck {
+                        outstanding: outstanding.clone(),
+                        reason: reason.clone(),
+                    },
+                );
+                UnloadOutcome::Stuck {
+                    outstanding,
+                    reason,
+                }
+            }
+        }
+    }
+
+    /// Takes everything one entry put into rebon back out of it, and forgets
+    /// the entry was loaded.
+    fn forget(&self, plugin_id: &str) {
         self.withdraw(plugin_id);
         self.undeclare_settings(plugin_id);
         self.loaded
@@ -1058,8 +1319,253 @@ impl PluginPlane {
             .lock()
             .expect("plane standalone table")
             .remove(plugin_id);
-        self.leave_container(plugin_id).await;
-        Ok(())
+    }
+
+    /// Ends the container `plugin_id` runs in, with every plugin in it.
+    ///
+    /// Each member is withdrawn first, then the process is ended and waited
+    /// on, and only then are the other members recorded as forced — so no
+    /// record says a run is over while its process still is not. Returns the
+    /// other members, which the caller may want to start again.
+    async fn force_container(&self, plugin_id: &str, reason: &str) -> Vec<String> {
+        let removed = {
+            let mut containers = self.containers.lock().await;
+            let id = containers
+                .iter()
+                .find(|(_, host)| host.members.contains(plugin_id))
+                .map(|(id, _)| id.clone());
+            id.and_then(|id| containers.remove(&id))
+        };
+        let Some(container) = removed else {
+            self.forget(plugin_id);
+            self.hosts.release(plugin_id);
+            return Vec::new();
+        };
+        let mut others = Vec::new();
+        for member in &container.members {
+            if member != plugin_id {
+                others.push((member.clone(), container.supervisor.in_flight(member).await));
+            }
+            self.forget(member);
+            self.hosts.release(member);
+        }
+        container.supervisor.terminate().await;
+        for (member, outstanding) in &others {
+            self.record_lifecycle(
+                member,
+                PluginLifecycle::Forced {
+                    outstanding: outstanding.clone(),
+                    reason: format!(
+                        "its container was ended because {plugin_id} had to be ended: {reason}"
+                    ),
+                },
+            );
+        }
+        others.into_iter().map(|(member, _)| member).collect()
+    }
+
+    /// How long an unload waits for a plugin's in-flight calls by default:
+    /// long enough for a tool mid-write to finish, short enough that a
+    /// person uninstalling something is not left wondering.
+    pub const DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Where one plugin's latest run stands, if this plane has ever tried to
+    /// run it.
+    pub fn lifecycle(&self, plugin_id: &str) -> Option<LifecycleRecord> {
+        self.lifecycle
+            .lock()
+            .expect("plane lifecycle table")
+            .get(plugin_id)
+            .cloned()
+    }
+
+    /// Every plugin this plane has tried to run, and where each stands.
+    pub fn lifecycles(&self) -> BTreeMap<String, LifecycleRecord> {
+        self.lifecycle
+            .lock()
+            .expect("plane lifecycle table")
+            .clone()
+    }
+
+    /// Refuses an id whose last run never drained.
+    fn refuse_if_stuck(&self, plugin_id: &str) -> Result<(), HostCallError> {
+        match self.lifecycle(plugin_id).map(|record| record.state) {
+            Some(PluginLifecycle::Stuck { outstanding, .. }) => Err(HostCallError::Stuck {
+                plugin_id: plugin_id.to_owned(),
+                count: outstanding.len(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// Opens a new run of the plugin, before its load is sent, so that
+    /// anything it does while it activates already has a run to belong to.
+    ///
+    /// The one lifecycle change that is refused when the sink refuses it:
+    /// nothing has happened yet, so not starting is the honest answer, and
+    /// the attempt consumes no generation.
+    async fn begin_attempt(
+        &self,
+        host: &Arc<PluginHostSupervisor>,
+        plugin_id: &str,
+    ) -> Result<PluginIncarnation, HostCallError> {
+        let host_epoch = host.host_epoch().await;
+        let _order = self.lifecycle_order.lock().expect("plane lifecycle order");
+        let generation = self
+            .lifecycle(plugin_id)
+            .map_or(1, |record| record.incarnation.generation + 1);
+        let fact = PluginLifecycleChanged {
+            incarnation: PluginIncarnation {
+                source: None,
+                plugin_id: plugin_id.to_owned(),
+                host_epoch,
+                generation,
+            },
+            from: None,
+            to: PluginLifecycle::Loading,
+        };
+        self.commit_lifecycle(&fact)
+            .map_err(|reason| HostCallError::LifecycleUnrecorded {
+                plugin_id: plugin_id.to_owned(),
+                reason,
+            })?;
+        self.lifecycle
+            .lock()
+            .expect("plane lifecycle table")
+            .insert(
+                plugin_id.to_owned(),
+                LifecycleRecord {
+                    incarnation: fact.incarnation.clone(),
+                    state: fact.to.clone(),
+                },
+            );
+        self.ctx.emit(&fact);
+        Ok(fact.incarnation)
+    }
+
+    /// Moves the plugin's current run to `to`: committed to the sink, then
+    /// the table, then announced on the kernel's event plane. The one place a
+    /// run's state changes after it opened.
+    ///
+    /// Every change made here is already true by the time it is recorded — a
+    /// load answered, a drain begun, registrations withdrawn, a host ended —
+    /// so a refused commit does not undo it: the table keeps agreeing with
+    /// what happened, the change is still announced, and the refusal is
+    /// logged and kept for [`Self::lifecycle_sink_error`].
+    fn record_lifecycle(&self, plugin_id: &str, to: PluginLifecycle) {
+        let _order = self.lifecycle_order.lock().expect("plane lifecycle order");
+        let Some(current) = self.lifecycle(plugin_id) else {
+            return;
+        };
+        let fact = PluginLifecycleChanged {
+            incarnation: current.incarnation,
+            from: Some(current.state),
+            to,
+        };
+        if let Err(reason) = self.commit_lifecycle(&fact) {
+            tracing::error!(
+                plugin = plugin_id,
+                to = ?fact.to,
+                %reason,
+                "a lifecycle fact could not be recorded; the change stands"
+            );
+        }
+        if let Some(record) = self
+            .lifecycle
+            .lock()
+            .expect("plane lifecycle table")
+            .get_mut(plugin_id)
+        {
+            record.state = fact.to.clone();
+        }
+        self.ctx.emit(&fact);
+    }
+
+    fn commit_lifecycle(&self, fact: &PluginLifecycleChanged) -> Result<(), String> {
+        let Some(sink) = &self.lifecycle_sink else {
+            return Ok(());
+        };
+        sink.0.commit(fact).inspect_err(|reason| {
+            *self
+                .lifecycle_sink_error
+                .lock()
+                .expect("plane lifecycle sink error") = Some(reason.clone());
+        })
+    }
+
+    /// The last lifecycle fact the sink refused, if it ever refused one.
+    pub fn lifecycle_sink_error(&self) -> Option<String> {
+        self.lifecycle_sink_error
+            .lock()
+            .expect("plane lifecycle sink error")
+            .clone()
+    }
+
+    /// Records every other run on a host that died as failed, and takes them
+    /// out of rebon.
+    ///
+    /// A dead host is noticed when something reaches for it — an unload, the
+    /// start of a reload — not the moment it exits; until then its plugins
+    /// still read as ready. (Hearing of the exit as it happens needs the
+    /// supervisor to say so, which is S3's.)
+    async fn note_dead_host(&self, host: &Arc<PluginHostSupervisor>, except: Option<&str>) {
+        let members: Vec<String> = self
+            .lifecycles()
+            .into_iter()
+            .filter(|(id, record)| {
+                !record.state.is_terminal()
+                    && Some(id.as_str()) != except
+                    && Arc::ptr_eq(&self.hosts.for_plugin(id), host)
+            })
+            .map(|(id, _)| id)
+            .collect();
+        let container = {
+            let mut containers = self.containers.lock().await;
+            let id = containers
+                .iter()
+                .find(|(_, running)| Arc::ptr_eq(&running.supervisor, host))
+                .map(|(id, _)| id.clone());
+            id.and_then(|id| containers.remove(&id))
+        };
+        for member in &members {
+            self.forget(member);
+            self.hosts.release(member);
+        }
+        if let Some(container) = container {
+            for member in &container.members {
+                self.hosts.release(member);
+            }
+            // Reaps the dead process; there is nothing left to ask.
+            let _ = container.supervisor.shutdown().await;
+        }
+        for member in members {
+            self.record_lifecycle(
+                &member,
+                PluginLifecycle::Failed {
+                    reason: "its plugin host exited".to_owned(),
+                },
+            );
+        }
+    }
+
+    /// Notices every host that died since the plane last looked.
+    async fn sweep_dead_hosts(&self) {
+        let main = Arc::clone(self.hosts.main());
+        if !main.is_alive().await {
+            self.note_dead_host(&main, None).await;
+        }
+        let containers: Vec<Arc<PluginHostSupervisor>> = self
+            .containers
+            .lock()
+            .await
+            .values()
+            .map(|running| Arc::clone(&running.supervisor))
+            .collect();
+        for host in containers {
+            if !host.is_alive().await {
+                self.note_dead_host(&host, None).await;
+            }
+        }
     }
 
     /// How long a session waits for one package to load before being told the
@@ -1137,10 +1643,24 @@ impl PluginPlane {
         {
             return Ok(());
         }
+        self.refuse_if_stuck(&entry.id)?;
         let host = self.host_for_entry(entry).await?;
-        let outcome = self.load_standalone_on(&host, entry).await;
-        if outcome.is_err() {
+        if let Err(error) = self.begin_attempt(&host, &entry.id).await {
             self.leave_container(&entry.id).await;
+            return Err(error);
+        }
+        let outcome = self.load_standalone_on(&host, entry).await;
+        match &outcome {
+            Ok(()) => self.record_lifecycle(&entry.id, PluginLifecycle::Ready),
+            Err(error) => {
+                self.leave_container(&entry.id).await;
+                self.record_lifecycle(
+                    &entry.id,
+                    PluginLifecycle::Failed {
+                        reason: error.to_string(),
+                    },
+                );
+            }
         }
         outcome
     }
@@ -1273,6 +1793,9 @@ impl PluginPlane {
     /// exactly what moved.
     pub async fn reload(&self, wanted: &[ComposeEntry]) -> Result<ReloadOutcome, HostCallError> {
         let _one_at_a_time = self.reconcile.lock().await;
+        // A plugin on a host that died is no longer running, whatever the
+        // table says; the diff has to see that to start it again.
+        self.sweep_dead_hosts().await;
 
         let current = self.loaded.lock().expect("plane loaded table").clone();
         // Classify first, act second: the diff is computed against one
@@ -1285,16 +1808,39 @@ impl PluginPlane {
             removed: plan.removed,
             unchanged: plan.unchanged,
             failed: Vec::new(),
+            forced: Vec::new(),
+            stuck: Vec::new(),
         };
-        let to_start: Vec<&ComposeEntry> = plan.start.iter().map(|index| &wanted[*index]).collect();
+        let mut to_start: Vec<&ComposeEntry> =
+            plan.start.iter().map(|index| &wanted[*index]).collect();
 
         for id in &plan.stop {
-            if let Err(error) = self.unload_entry(id).await {
-                // Report it and keep going: a plugin that will not drain is not
-                // a reason to leave the rest of the composition half-reconciled.
-                outcome
-                    .failed
-                    .push((id.clone(), format!("unload failed: {error}")));
+            // Already ended with another plugin's container, earlier in this
+            // same loop; it is reported once, as forced.
+            if outcome.forced.contains(id) {
+                continue;
+            }
+            // A plugin that will not drain is not a reason to leave the rest
+            // of the composition half-reconciled: each ending is reported and
+            // the reload goes on.
+            match self.unload_entry(id).await {
+                UnloadOutcome::Clean => {}
+                UnloadOutcome::Forced { taken_down, .. } => {
+                    outcome.forced.push(id.clone());
+                    // Its container's other plugins went with it. Those the
+                    // composition still wants come back up, in a new one, so
+                    // none of them was left running untouched.
+                    for other in taken_down {
+                        outcome.unchanged.retain(|unchanged| *unchanged != other);
+                        if let Some(entry) = wanted.iter().find(|entry| entry.id == other) {
+                            if !to_start.iter().any(|start| start.id == other) {
+                                to_start.push(entry);
+                            }
+                        }
+                        outcome.forced.push(other);
+                    }
+                }
+                UnloadOutcome::Stuck { .. } => outcome.stuck.push(id.clone()),
             }
         }
 

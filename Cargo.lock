@@ -3397,6 +3397,7 @@ dependencies = [
 name = "rebon-kernel"
 version = "1.8.7"
 dependencies = [
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",

@@ -8,6 +8,7 @@ publish.workspace = true
 description = "Minimal plugin kernel: Cordis-isomorphic context tree, disposer scopes, dual-plane (typed + JSON) service registry, and typed event bus with emit/bail/waterfall dispatch. The seed that everything else in rebon migrates onto as plugins."
 
 [dependencies]
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
