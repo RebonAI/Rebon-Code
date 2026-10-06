@@ -502,7 +502,7 @@
   "GroupMoveHere": "移到此处",
   "GroupName": "名称",
   "GroupNamePlaceholder": "例如「标题栏与文件树改版」",
-  "GroupNeedsMcp": "首次在此项目使用群组，需要写入 .mcp.json 与 .codex/config.toml",
+  "GroupNeedsMcp": "选择要在此项目中接入群组工具的 agent（已接入的保持开启）",
   "GroupNew": "新建群组",
   "GroupNewAndAdd": "新建群组并拉入…",
   "GroupNewSubtitle": "群组属于一个项目；一个会话同一时间只在一个群组里。",

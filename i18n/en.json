@@ -502,7 +502,7 @@
   "app.GroupMoveHere": "Move here",
   "app.GroupName": "Name",
   "app.GroupNamePlaceholder": "e.g. “Title bar and file tree”",
-  "app.GroupNeedsMcp": "First group in this project: .mcp.json and .codex/config.toml get the group tools",
+  "app.GroupNeedsMcp": "Choose the agents that get the group tools in this project (ones already set up stay on)",
   "app.GroupNew": "New group",
   "app.GroupNewAndAdd": "New group and add…",
   "app.GroupNewSubtitle": "A group belongs to one project; a session is in one group at a time.",

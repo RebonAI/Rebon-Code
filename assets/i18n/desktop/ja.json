@@ -502,7 +502,7 @@
   "GroupMoveHere": "ここへ移動",
   "GroupName": "名前",
   "GroupNamePlaceholder": "例：「タイトルバーとファイルツリー」",
-  "GroupNeedsMcp": "このプロジェクト初のグループです。.mcp.json と .codex/config.toml にグループツールを書き込みます",
+  "GroupNeedsMcp": "このプロジェクトでグループツールを使うエージェントを選択（設定済みのものはそのまま）",
   "GroupNew": "新しいグループ",
   "GroupNewAndAdd": "新しいグループを作って追加…",
   "GroupNewSubtitle": "グループは一つのプロジェクトに属し、セッションが入れるグループは一度に一つです。",

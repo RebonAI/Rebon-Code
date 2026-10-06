@@ -502,7 +502,7 @@
   "GroupMoveHere": "Move here",
   "GroupName": "Name",
   "GroupNamePlaceholder": "e.g. “Title bar and file tree”",
-  "GroupNeedsMcp": "First group in this project: .mcp.json and .codex/config.toml get the group tools",
+  "GroupNeedsMcp": "Choose the agents that get the group tools in this project (ones already set up stay on)",
   "GroupNew": "New group",
   "GroupNewAndAdd": "New group and add…",
   "GroupNewSubtitle": "A group belongs to one project; a session is in one group at a time.",
