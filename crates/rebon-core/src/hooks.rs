@@ -536,6 +536,9 @@ pub struct UserPromptSubmitEffects {
     /// `UserPromptSubmit.sessionTitle`, last one wins.
     pub session_title: Option<String>,
     pub mark_session_complete: bool,
+    /// `UserPromptSubmit.replacementPrompt`: what the model reads instead
+    /// of the typed prompt. The context blocks still append after it.
+    pub replacement: Option<String>,
 }
 
 pub fn apply_user_prompt_submit_effects(effects: &[HookEffect]) -> UserPromptSubmitDecision {
@@ -553,6 +556,7 @@ pub fn apply_user_prompt_submit_effects(effects: &[HookEffect]) -> UserPromptSub
             HookEffect::SystemMessage { text } => applied.system_messages.push(text.clone()),
             HookEffect::SetSessionTitle { title } => applied.session_title = Some(title.clone()),
             HookEffect::MarkSessionComplete => applied.mark_session_complete = true,
+            HookEffect::ReplacePrompt { text } => applied.replacement = Some(text.clone()),
             unsupported => tracing::debug!(
                 effect = ?unsupported,
                 "unsupported UserPromptSubmit hook effect ignored"
@@ -768,6 +772,9 @@ mod tests {
                 title: "two".into(),
             },
             HookEffect::MarkSessionComplete,
+            HookEffect::ReplacePrompt {
+                text: "rewritten".into(),
+            },
             // Not a prompt effect; ignored rather than refused.
             HookEffect::BlockStop {
                 reason: "irrelevant".into(),
@@ -780,6 +787,7 @@ mod tests {
                 system_messages: vec!["shown".into()],
                 session_title: Some("two".into()),
                 mark_session_complete: true,
+                replacement: Some("rewritten".into()),
             })
         );
     }

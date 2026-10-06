@@ -813,6 +813,8 @@ mod tests {
 
         let input = invocation(HookEventPayload::Stop {
             stop_reason: Some("ok".into()),
+            last_assistant_message: None,
+            stop_hook_active: false,
         });
         let out = runtime.run_event(&input).await;
         assert_eq!(out.selected, 1);

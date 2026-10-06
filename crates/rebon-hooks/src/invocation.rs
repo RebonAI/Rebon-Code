@@ -156,6 +156,14 @@ pub enum HookEventPayload {
     Stop {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stop_reason: Option<String>,
+        /// The turn's final answer, as Claude Code hands it
+        /// (`last_assistant_message`); absent when a cancel stops the turn.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_assistant_message: Option<String>,
+        /// A Stop hook already kept this turn going (Claude Code's
+        /// `stop_hook_active`): a hook that blocks should let it end now.
+        #[serde(default)]
+        stop_hook_active: bool,
     },
     StopFailure {
         error: String,
@@ -624,7 +632,11 @@ mod tests {
                 model: "opus".into(),
             },
             HookEvent::SessionEnd => HookEventPayload::SessionEnd { reason: None },
-            HookEvent::Stop => HookEventPayload::Stop { stop_reason: None },
+            HookEvent::Stop => HookEventPayload::Stop {
+                stop_reason: None,
+                last_assistant_message: None,
+                stop_hook_active: false,
+            },
             HookEvent::StopFailure => HookEventPayload::StopFailure { error: "x".into() },
             HookEvent::SubagentStart => HookEventPayload::SubagentStart {
                 agent_id: "a".into(),

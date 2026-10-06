@@ -434,6 +434,7 @@ mod tests {
             hook_specific_output: Some(HookSpecificOutput::UserPromptSubmit {
                 additional_context: Some("ctx".into()),
                 session_title: None,
+                replacement_prompt: None,
             }),
             ..SyncHookJsonOutput::default()
         });

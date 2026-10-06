@@ -452,13 +452,13 @@ fn run_stop_hook(session: &TuiEngineSession, stop_reason: Option<String>) -> Res
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return Ok(());
     };
-    let verdict = handle.block_on(
-        session
-            .engine_half
-            .runtime
-            .policy
-            .emit(HookEventPayload::Stop { stop_reason }),
-    );
+    let verdict = handle.block_on(session.engine_half.runtime.policy.emit(
+        HookEventPayload::Stop {
+            stop_reason,
+            last_assistant_message: None,
+            stop_hook_active: false,
+        },
+    ));
     // Gated: a terminal refusal refuses the stop, as a `BlockStop` does.
     match verdict.denial() {
         Some(reason) => Err(reason.to_string()),

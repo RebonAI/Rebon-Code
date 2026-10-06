@@ -59,6 +59,10 @@ pub struct HookResult {
     pub additional_context: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_title: Option<String>,
+    /// `UserPromptSubmit.replacementPrompt`: the prompt the model reads
+    /// instead of the one typed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_user_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,6 +100,7 @@ impl Default for HookResult {
             hook_permission_decision_reason: None,
             additional_context: None,
             session_title: None,
+            replacement_prompt: None,
             initial_user_message: None,
             goal_completed: None,
             goal_continuation_prompt: None,
@@ -127,6 +132,10 @@ pub struct AggregatedHookResult {
     pub additional_contexts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_title: Option<String>,
+    /// The last `replacementPrompt` any hook gave: a later rewrite sees
+    /// an earlier one's text, the way a chain's `next` does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_user_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -284,9 +293,11 @@ pub fn process_hook_json_output(
             HookSpecificOutput::UserPromptSubmit {
                 additional_context,
                 session_title,
+                replacement_prompt,
             } => {
                 result.additional_context = additional_context.clone();
                 result.session_title = session_title.clone();
+                result.replacement_prompt = replacement_prompt.clone();
             }
             HookSpecificOutput::Setup { additional_context }
             | HookSpecificOutput::SubagentStart { additional_context }
@@ -397,6 +408,9 @@ pub fn aggregate_hook_results(results: &[HookResult]) -> AggregatedHookResult {
         }
         if aggregated.session_title.is_none() {
             aggregated.session_title = result.session_title.clone();
+        }
+        if result.replacement_prompt.is_some() {
+            aggregated.replacement_prompt = result.replacement_prompt.clone();
         }
         if aggregated.initial_user_message.is_none() {
             aggregated.initial_user_message = result.initial_user_message.clone();
@@ -589,6 +603,7 @@ mod tests {
             hook_specific_output: Some(HookSpecificOutput::UserPromptSubmit {
                 additional_context: Some("ctx".into()),
                 session_title: Some("renamed".into()),
+                replacement_prompt: None,
             }),
             ..SyncHookJsonOutput::default()
         };

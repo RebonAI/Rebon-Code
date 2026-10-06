@@ -1548,6 +1548,7 @@ mod request_building;
 mod run_query_loop;
 mod session_prompt_cache;
 mod session_tool_exposure;
+mod stop_hooks;
 mod stream_events_and_cancel;
 mod system_prompt_config;
 mod task_reconciliation;

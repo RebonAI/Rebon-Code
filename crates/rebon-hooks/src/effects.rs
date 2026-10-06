@@ -109,6 +109,10 @@ pub enum HookEffect {
     /// Surface a system-level message to the UI (toast / status
     /// line). Produced by `systemMessage`.
     SystemMessage { text: String },
+    /// Send this text to the model in place of the prompt that was typed.
+    /// Produced by `UserPromptSubmit.replacementPrompt`; the transcript
+    /// keeps what the person wrote.
+    ReplacePrompt { text: String },
 }
 
 /// Turn an aggregated hook result into a list of effects for the
@@ -234,6 +238,13 @@ pub fn project_effects(event: HookEvent, agg: &AggregatedHookResult) -> Vec<Hook
             effects.push(HookEffect::InjectContext {
                 text: context.clone(),
             });
+        }
+    }
+
+    // --- UserPromptSubmit prompt replacement ------------------------
+    if event == HookEvent::UserPromptSubmit {
+        if let Some(text) = &agg.replacement_prompt {
+            effects.push(HookEffect::ReplacePrompt { text: text.clone() });
         }
     }
 

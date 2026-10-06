@@ -628,6 +628,61 @@ enum StopReasonFlow {
     Stop,
 }
 
+/// What one drive keeps about how its turn may still be extended past its
+/// last answer.
+#[derive(Debug, Default)]
+struct TerminalState {
+    /// Iterations granted past `max_iterations` for continuations a turn
+    /// hook or a Stop hook asked for.
+    continuations_remaining: usize,
+    /// How many times a Stop hook has kept this turn going.
+    stop_hook_continuations: usize,
+}
+
+/// How many times Stop hooks may keep one turn going. A hook is told it
+/// already did (`stop_hook_active`) and is expected to let the turn end; one
+/// that never does still ends it here.
+pub(crate) const MAX_STOP_HOOK_CONTINUATIONS: usize = 3;
+
+/// The wire name of a stop reason (`end_turn`), as hooks read it.
+fn stop_reason_name(reason: &StopReason) -> Option<String> {
+    serde_json::to_value(reason)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+}
+
+/// The Stop event at a turn's natural end, the main agent's (a sub-agent's
+/// end is its spawner's `SubagentStop`): `Some(reason)` when a hook keeps the
+/// turn going, to be read by the model as the person's next words.
+///
+/// A subscriber that gives no answer is dropped rather than refusing: here a
+/// refusal is the harm, a model kept running on a hook's silence.
+async fn stop_gate(
+    params: &QueryParams,
+    message: &AssistantMessage,
+    stop_reason: Option<&StopReason>,
+    stop_hook_active: bool,
+) -> Option<String> {
+    if params.policy.agent().is_some() {
+        return None;
+    }
+    let verdict = params
+        .policy
+        .emit_with(
+            crate::policy_seat::HookEventPayload::Stop {
+                stop_reason: stop_reason.and_then(stop_reason_name),
+                last_assistant_message: Some(message.text()),
+                stop_hook_active,
+            },
+            crate::policy_seat::OnSilence::Drop,
+        )
+        .await;
+    match verdict.denial() {
+        Some(reason) => Some(reason.to_string()),
+        None => crate::hooks::apply_stop_effects(verdict.effects()).err(),
+    }
+}
+
 /// Settle cancellation, continuation, and terminal subscribers.
 #[allow(clippy::too_many_arguments)]
 async fn settle_stop_reason(
@@ -642,7 +697,7 @@ async fn settle_stop_reason(
     wants_tools: bool,
     total_usage: &mut Usage,
     stop_reason_final: &mut Option<StopReason>,
-    terminal_continuations_remaining: &mut usize,
+    terminal: &mut TerminalState,
 ) -> StopReasonFlow {
     // Preserve partial tool-use transcript validity on cancellation.
     if cancel.is_cancelled() {
@@ -681,7 +736,7 @@ async fn settle_stop_reason(
                 iteration,
                 params.max_iterations,
                 followups,
-                &mut (*terminal_continuations_remaining),
+                &mut terminal.continuations_remaining,
             );
             // Usage precedes the terminal phase's writebacks.
             manager.set_usage_baseline(message.usage.input_tokens);
@@ -689,6 +744,39 @@ async fn settle_stop_reason(
             return StopReasonFlow::NextIteration;
         }
         commit_turn_hook_writeback(manager, context, tx, iteration + 1, applied);
+        // The turn's own Stop event: a hook may keep it going, its reason the
+        // model's next user message, as Claude Code's Stop hooks do.
+        if let Some(reason) = stop_gate(
+            params,
+            message,
+            stop_reason_final.as_ref(),
+            terminal.stop_hook_continuations > 0,
+        )
+        .await
+        {
+            if terminal.stop_hook_continuations < MAX_STOP_HOOK_CONTINUATIONS {
+                terminal.stop_hook_continuations += 1;
+                tracing::info!(%reason, "a Stop hook kept the turn going");
+                reserve_terminal_continuations(
+                    iteration,
+                    params.max_iterations,
+                    1,
+                    &mut terminal.continuations_remaining,
+                );
+                manager.set_usage_baseline(message.usage.input_tokens);
+                manager.push_message(ApiMessage {
+                    role: Role::Assistant,
+                    content: message.content.clone(),
+                });
+                manager.push_message(ApiMessage::user_text(reason));
+                return StopReasonFlow::NextIteration;
+            }
+            tracing::warn!(
+                %reason,
+                times = terminal.stop_hook_continuations,
+                "Stop hooks kept refusing to let the turn end; ending it"
+            );
+        }
         let _ = tx.send(QueryEvent::Done {
             final_message: message.clone(),
             stop_reason: stop_reason_final.clone().unwrap_or(StopReason::EndTurn),
@@ -1522,7 +1610,7 @@ impl TurnControlPlugin {
         let mut pending_max_token_content: Option<Vec<ApiContentBlock>> = None;
         let mut automatic_max_token_continuations = 0usize;
         let mut truncated_tool_call_rounds = 0usize;
-        let mut terminal_continuations_remaining = 0usize;
+        let mut terminal = TerminalState::default();
         let mut iterations_run = 0usize;
         let hard_iteration_limit = params
             .max_iterations
@@ -1533,10 +1621,10 @@ impl TurnControlPlugin {
             let _ =
                 apply_turn_hook_writebacks(&mut manager, &mut params, &mut context, &tx, iteration);
             if iteration >= params.max_iterations {
-                if terminal_continuations_remaining == 0 {
+                if terminal.continuations_remaining == 0 {
                     break;
                 }
-                terminal_continuations_remaining -= 1;
+                terminal.continuations_remaining -= 1;
             }
             iterations_run = iteration + 1;
             if cancel.is_cancelled() {
@@ -1651,7 +1739,7 @@ impl TurnControlPlugin {
                 wants_tools,
                 &mut total_usage,
                 &mut stop_reason_final,
-                &mut terminal_continuations_remaining,
+                &mut terminal,
             )
             .await
             {

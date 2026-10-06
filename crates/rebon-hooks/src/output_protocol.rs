@@ -174,6 +174,15 @@ pub enum HookSpecificOutput {
             rename = "sessionTitle"
         )]
         session_title: Option<String>,
+        /// The prompt the model reads in place of the one typed. A mod's
+        /// `prompt.submit` hook rewrites with `next({ ...e, text })`, and
+        /// this is how that rewrite reaches the host.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "replacementPrompt"
+        )]
+        replacement_prompt: Option<String>,
     },
     #[serde(rename = "SessionStart")]
     SessionStart {

@@ -501,16 +501,23 @@ impl PolicySources {
     /// Put one event to every interested subscriber and return the
     /// terminal verdict.
     ///
-    /// This is the one entry point. Every trigger point in the engine and
-    /// its hosts goes through it; what a particular event means is the
-    /// caller's projection of the effects that come back.
+    /// This is the one entry point (with [`Self::emit_with`], its spelled
+    /// out form). Every trigger point in the engine and its hosts goes
+    /// through it; what a particular event means is the caller's projection
+    /// of the effects that come back.
     pub async fn emit(&self, payload: HookEventPayload) -> Verdict {
-        let mut request = PolicyRequest::new(self.context.clone(), payload);
-        request.agent = self.agent.clone();
-        self.emit_request(request).await
+        self.emit_with(payload, OnSilence::Refuse).await
     }
 
-    async fn emit_request(&self, request: PolicyRequest) -> Verdict {
+    /// [`Self::emit`], saying what a subscriber that gives no answer (times
+    /// out, panics) costs a gated event.
+    pub async fn emit_with(&self, payload: HookEventPayload, on_silence: OnSilence) -> Verdict {
+        let mut request = PolicyRequest::new(self.context.clone(), payload);
+        request.agent = self.agent.clone();
+        self.emit_request(request, on_silence).await
+    }
+
+    async fn emit_request(&self, request: PolicyRequest, on_silence: OnSilence) -> Verdict {
         let kind = request.kind();
         let class = class_of(kind);
         let mut effects: Vec<HookEffect> = Vec::new();
@@ -540,8 +547,8 @@ impl PolicySources {
                 },
                 Err(failure) => {
                     let reason = failure.deny_reason(&entry.id, kind, budget);
-                    match class {
-                        PolicyClass::Gated => {
+                    match (class, on_silence) {
+                        (PolicyClass::Gated, OnSilence::Refuse) => {
                             tracing::error!(
                                 subscriber = %entry.id,
                                 event = %kind.name(),
@@ -549,10 +556,10 @@ impl PolicySources {
                             );
                             return Verdict::Deny { reason };
                         }
-                        PolicyClass::Notification => tracing::warn!(
+                        _ => tracing::warn!(
                             subscriber = %entry.id,
                             event = %kind.name(),
-                            "policy subscriber {failure} on a notification event; \
+                            "policy subscriber {failure}; \
                              its contribution is dropped and the rest still run"
                         ),
                     }
@@ -592,6 +599,17 @@ impl PolicySources {
             Err(_) => Err(SubscriberFailure::TimedOut),
         }
     }
+}
+
+/// What a gated event does about a subscriber that gives no answer at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnSilence {
+    /// Refuse: a gate that goes quiet is not opened. Every gate but one.
+    Refuse,
+    /// Drop its contribution, as a notification does: for the gate whose
+    /// refusal is itself the harm, the Stop at a turn's natural end, where a
+    /// refusal keeps the model running.
+    Drop,
 }
 
 /// Why a subscriber produced no answer at all.
@@ -859,6 +877,39 @@ mod tests {
         let reason = verdict.denial().expect("a gate that goes quiet is refused");
         assert!(reason.contains("hangs"), "{reason}");
         assert!(reason.contains("PreToolUse"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_gate_emitted_with_on_silence_drop_survives_a_quiet_subscriber() {
+        let (healthy, calls) = Fixed::new(Verdict::Modify {
+            effects: vec![message("still here")],
+        });
+        let sources = PolicySources::default()
+            .with_subscriber(
+                "a-hangs",
+                Order::FIRST,
+                Arc::new(Hangs) as Arc<dyn PolicySubscriber>,
+            )
+            .with_subscriber("b-boom", Order::NORMAL, Arc::new(PanicsInPoll))
+            .with_subscriber("c-healthy", Order::LAST, healthy);
+        let verdict = sources
+            .emit_with(pre_tool_use("Bash"), OnSilence::Drop)
+            .await;
+        assert_eq!(verdict.denial(), None, "silence is not a refusal here");
+        assert_eq!(verdict.effects(), &[message("still here")]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn on_silence_drop_still_honours_a_subscribers_own_refusal() {
+        let (refuses, _) = Fixed::new(Verdict::Deny {
+            reason: "keep going".into(),
+        });
+        let sources = PolicySources::default().with_subscriber("refuses", Order::NORMAL, refuses);
+        let verdict = sources
+            .emit_with(pre_tool_use("Bash"), OnSilence::Drop)
+            .await;
+        assert_eq!(verdict.denial(), Some("keep going"));
     }
 
     #[tokio::test]

@@ -1408,6 +1408,9 @@ async fn run_user_prompt_submit_hook(
                 ));
             }
             UserPromptSubmitDecision::Continue(effects) => {
+                if let Some(text) = effects.replacement {
+                    *prompt = text;
+                }
                 for context_text in &effects.additional_context {
                     append_additional_context(prompt, context_text);
                 }
@@ -1757,6 +1760,8 @@ async fn execute_background_job_inner(
             let verdict = handle.block_on(policy.emit(
                 rebon_core::policy_seat::HookEventPayload::Stop {
                     stop_reason: Some(stop_reason.to_string()),
+                    last_assistant_message: None,
+                    stop_hook_active: false,
                 },
             ));
             // Gated: a terminal refusal refuses the cancel, exactly as a
