@@ -5,10 +5,12 @@
 //!
 //! ```text
 //! sandbox-win.exe exec --quiet
+//!   [--pipe-stdin]
 //!   [--deny-read   <path>]...
 //!   [--mask-file   <realPath> <fakePath>]...
 //!   [--deny-write  <path>]...
 //!   [--allow-write <path>]...
+//!   [--allow-read  <path>]...
 //!   [--block-network]
 //!   [--inherit-env <NAME>]...
 //!   [--env <KEY=VALUE>]...
@@ -25,6 +27,20 @@
 //! "believed it was blocked, nothing was blocked" failure, and it is why
 //! [`crate::core::status`] emits a version the caller can compare.
 //!
+//! `--pipe-stdin` and `--allow-read` came after the grammar was first frozen.
+//! They are opt-in — a caller that does not send them gets exactly the old
+//! behaviour — and `status` advertises them on its `features=` line, so a
+//! caller can tell an older helper (which would refuse them as unknown) apart
+//! before it builds an argv.
+//!
+//! ## `--allow-read` paths are held to a stricter shape
+//!
+//! Every other path flag only refuses an empty value. A read grant widens what
+//! the sandbox can reach, and is placed inheritably, so a relative path (which
+//! would resolve against the helper's working directory), a `..` that walks
+//! somewhere else, or a whole volume would each grant far more than the caller
+//! named. [`grant_path_problem`] refuses those.
+//!
 //! ## What is *not* checked here
 //!
 //! Three constraints are already discharged on the caller's side, and
@@ -34,7 +50,8 @@
 //! * the command line is capped at 30000 UTF-16 units before spawn;
 //! * per-exec ACL overrides (`allow_read_overrides` / `allow_write_overrides`)
 //!   are refused there with `PerExecAclUnsupported`, so every `--allow-write`
-//!   that arrives is session-scoped;
+//!   that arrives is session-scoped — except that read overrides are sent as
+//!   `--allow-read` once this helper's `status` advertises `allow-read`;
 //! * glob write patterns are skipped there with a `GLOB_WRITE_PATTERN` warning,
 //!   so every path is concrete.
 
@@ -54,10 +71,16 @@ pub struct MaskRule {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecRequest {
     pub quiet: bool,
+    /// Give the confined process a real stdin pipe fed from the helper's own
+    /// stdin, instead of NUL. For long-lived hosts that speak a protocol over
+    /// stdin/stdout; one-shot commands keep NUL.
+    pub pipe_stdin: bool,
     pub deny_read: Vec<PathBuf>,
     pub masks: Vec<MaskRule>,
     pub deny_write: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,
+    /// Read + execute + traverse grants, validated by [`grant_path_problem`].
+    pub allow_read: Vec<PathBuf>,
     pub block_network: bool,
     pub inherit_env: Vec<String>,
     pub set_env: Vec<(String, String)>,
@@ -90,6 +113,14 @@ pub enum ArgvError {
     #[error("`--env` needs KEY=VALUE, got `{0}`")]
     MalformedEnv(String),
 
+    /// A grant path that would reach more than the caller named.
+    #[error("`{flag}` refused `{path}`: {reason}")]
+    UnsafePath {
+        flag: &'static str,
+        path: String,
+        reason: &'static str,
+    },
+
     #[error("no `--` separator — there is nothing to run")]
     MissingSeparator,
 
@@ -117,6 +148,7 @@ pub fn parse_exec(arguments: &[String]) -> Result<ExecRequest, ArgvError> {
 
         match argument {
             "--quiet" => request.quiet = true,
+            "--pipe-stdin" => request.pipe_stdin = true,
             "--block-network" => request.block_network = true,
             "--deny-read" => {
                 request
@@ -132,6 +164,11 @@ pub fn parse_exec(arguments: &[String]) -> Result<ExecRequest, ArgvError> {
                 request
                     .allow_write
                     .push(path_value(arguments, &mut index, "--allow-write")?);
+            }
+            "--allow-read" => {
+                request
+                    .allow_read
+                    .push(grant_path_value(arguments, &mut index, "--allow-read")?);
             }
             "--mask-file" => {
                 let real = path_value(arguments, &mut index, "--mask-file")?;
@@ -188,6 +225,9 @@ pub fn render_exec(request: &ExecRequest) -> Vec<String> {
     if request.quiet {
         arguments.push("--quiet".to_string());
     }
+    if request.pipe_stdin {
+        arguments.push("--pipe-stdin".into());
+    }
     for path in &request.deny_read {
         arguments.push("--deny-read".into());
         arguments.push(display(path));
@@ -203,6 +243,10 @@ pub fn render_exec(request: &ExecRequest) -> Vec<String> {
     }
     for path in &request.allow_write {
         arguments.push("--allow-write".into());
+        arguments.push(display(path));
+    }
+    for path in &request.allow_read {
+        arguments.push("--allow-read".into());
         arguments.push(display(path));
     }
     if request.block_network {
@@ -267,6 +311,72 @@ fn path_value(
     flag: &'static str,
 ) -> Result<PathBuf, ArgvError> {
     text_value(arguments, index, flag).map(PathBuf::from)
+}
+
+/// A path a read grant is placed on: [`path_value`]'s refusals, then
+/// [`grant_path_problem`]'s.
+fn grant_path_value(
+    arguments: &[String],
+    index: &mut usize,
+    flag: &'static str,
+) -> Result<PathBuf, ArgvError> {
+    let path = text_value(arguments, index, flag)?;
+    if let Some(reason) = grant_path_problem(&path) {
+        return Err(ArgvError::UnsafePath { flag, path, reason });
+    }
+    Ok(PathBuf::from(path))
+}
+
+/// Why `path` may not carry a grant, or `None` when it may.
+///
+/// Parsed as a Windows path by hand rather than with [`std::path::Path`], which
+/// splits on the separator of the platform it runs on: `core` is tested on
+/// Linux and macOS too, and there `C:\x` is one opaque component.
+///
+/// Accepted: `X:\a\b` and `\\server\share\a` (which covers `\\?\X:\a`), with at
+/// least one component below the volume or share, no `.` / `..`, no `/`, and no
+/// empty component (a doubled or trailing separator). The caller already sends
+/// that shape, so anything else is a caller bug or a forged argv, and refusing
+/// it costs nothing.
+pub fn grant_path_problem(path: &str) -> Option<&'static str> {
+    let bytes = path.as_bytes();
+    let rest = if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+    {
+        &path[3..]
+    } else if let Some(rest) = path.strip_prefix(r"\\") {
+        rest
+    } else {
+        return Some(
+            "it is not an absolute Windows path, so it would resolve against the helper's \
+             working directory",
+        );
+    };
+    if path.contains('/') {
+        return Some(
+            "it uses `/`; the caller normalises to `\\`, and a ledger row must compare equal \
+             to the rule that placed it",
+        );
+    }
+    let components: Vec<&str> = rest.split('\\').collect();
+    // A UNC path's first two components are the server and the share, which
+    // together are the volume.
+    let volume_depth = if path.starts_with(r"\\") { 2 } else { 0 };
+    let named = components.iter().filter(|part| !part.is_empty()).count();
+    if named <= volume_depth {
+        return Some("it names a whole volume or share, which is far wider than any read root");
+    }
+    if components.iter().any(|part| part.is_empty()) {
+        return Some("it is not normalised: it has a doubled or trailing separator");
+    }
+    if components.iter().any(|part| *part == "." || *part == "..") {
+        return Some(
+            "it has a `.` or `..` component, so the path it names is not the path it spells",
+        );
+    }
+    None
 }
 
 #[cfg(test)]
@@ -394,7 +504,13 @@ mod tests {
 
     #[test]
     fn a_flag_missing_its_value_is_refused() {
-        for flag in ["--deny-read", "--deny-write", "--allow-write", "--cwd"] {
+        for flag in [
+            "--deny-read",
+            "--deny-write",
+            "--allow-write",
+            "--allow-read",
+            "--cwd",
+        ] {
             let error = parse_exec(&words(&[flag])).unwrap_err();
             assert_eq!(error, ArgvError::MissingValue { flag: leak(flag) });
         }
@@ -421,6 +537,7 @@ mod tests {
             "--deny-read",
             "--deny-write",
             "--allow-write",
+            "--allow-read",
             "--cwd",
             "--env",
             "--inherit-env",
@@ -549,6 +666,125 @@ mod tests {
         assert_eq!(request.command, words(&["git", "log", "--", "path"]));
     }
 
+    #[test]
+    fn the_old_callers_argv_asks_for_neither_new_capability() {
+        // An argv built before `--pipe-stdin` / `--allow-read` existed keeps NUL stdin
+        // and grants nothing extra.
+        let request = parse_exec(&caller_argv()).unwrap();
+        assert!(!request.pipe_stdin);
+        assert!(request.allow_read.is_empty());
+    }
+
+    #[test]
+    fn pipe_stdin_is_a_bare_flag() {
+        let request = parse_exec(&words(&["--quiet", "--pipe-stdin", "--", "node.exe"])).unwrap();
+        assert!(request.pipe_stdin);
+        assert_eq!(request.command, vec!["node.exe"]);
+        // It takes no value: the separator after it is still the separator.
+        let request = parse_exec(&words(&["--pipe-stdin", "--", "x"])).unwrap();
+        assert!(request.pipe_stdin);
+    }
+
+    #[test]
+    fn pipe_stdin_after_the_separator_belongs_to_the_command() {
+        let request = parse_exec(&words(&["--", "node.exe", "--pipe-stdin"])).unwrap();
+        assert!(!request.pipe_stdin);
+        assert_eq!(request.command, words(&["node.exe", "--pipe-stdin"]));
+    }
+
+    #[test]
+    fn allow_read_accepts_absolute_normalised_paths_in_order() {
+        let request = parse_exec(&words(&[
+            "--allow-read",
+            r"C:\Users\u\AppData\Roaming\rebon\plugins",
+            "--allow-read",
+            r"\\server\share\tools",
+            "--allow-read",
+            r"\\?\D:\node",
+            "--",
+            "x",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request.allow_read,
+            vec![
+                PathBuf::from(r"C:\Users\u\AppData\Roaming\rebon\plugins"),
+                PathBuf::from(r"\\server\share\tools"),
+                PathBuf::from(r"\\?\D:\node"),
+            ]
+        );
+    }
+
+    #[test]
+    fn allow_read_refuses_paths_that_reach_further_than_they_spell() {
+        for path in [
+            r"plugins",
+            r"plugins\host",
+            r"C:plugins",
+            r"\plugins",
+            r"C:/Users/u/plugins",
+            r"C:\Users\u/plugins",
+            r"C:\Users\u\..\v",
+            r"C:\Users\.\u",
+            r"C:\",
+            r"C:\\",
+            r"\\server\share",
+            r"\\server\share\",
+            r"\\?\C:\",
+            r"C:\Users\u\",
+            r"C:\Users\\u",
+        ] {
+            let error = parse_exec(&words(&["--allow-read", path, "--", "x"])).unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    ArgvError::UnsafePath { flag: "--allow-read", path: refused, .. }
+                        if refused == path
+                ),
+                "{path} was not refused as unsafe: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_read_refuses_an_empty_value_like_every_path_flag() {
+        assert_eq!(
+            parse_exec(&words(&["--allow-read", "", "--", "x"])).unwrap_err(),
+            ArgvError::EmptyValue {
+                flag: "--allow-read"
+            }
+        );
+    }
+
+    #[test]
+    fn the_stricter_grant_check_is_not_applied_to_the_old_path_flags() {
+        // Their behaviour is frozen: a relative `--deny-write` still parses as it did.
+        let request = parse_exec(&words(&["--deny-write", "vendor", "--", "x"])).unwrap();
+        assert_eq!(request.deny_write, vec![PathBuf::from("vendor")]);
+    }
+
+    #[test]
+    fn an_argv_with_the_new_flags_round_trips_in_the_frozen_order() {
+        let argv = words(&[
+            "--quiet",
+            "--pipe-stdin",
+            "--deny-read",
+            r"C:\Users\u\.ssh",
+            "--allow-write",
+            r"C:\work",
+            "--allow-read",
+            r"C:\plugins",
+            "--block-network",
+            "--cwd",
+            r"C:\work",
+            "--",
+            "node.exe",
+            "host.js",
+        ]);
+        let request = parse_exec(&argv).unwrap();
+        assert_eq!(render_exec(&request), argv);
+    }
+
     /// `MissingValue` carries a `&'static str`; tests build flag names at runtime, so
     /// this maps the handful of known names back to statics.
     fn leak(flag: &str) -> &'static str {
@@ -556,6 +792,7 @@ mod tests {
             "--deny-read" => "--deny-read",
             "--deny-write" => "--deny-write",
             "--allow-write" => "--allow-write",
+            "--allow-read" => "--allow-read",
             "--cwd" => "--cwd",
             "--mask-file" => "--mask-file",
             "--env" => "--env",

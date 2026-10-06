@@ -189,6 +189,7 @@ mod tests {
                 AceKind::DenyRead | AceKind::DenyExecute => AceOrigin::DenyRead,
                 AceKind::DenyWrite => AceOrigin::DenyWrite,
                 AceKind::AllowWrite => AceOrigin::AllowWrite,
+                AceKind::AllowRead => AceOrigin::AllowRead,
             },
         }
     }
@@ -466,6 +467,59 @@ mod tests {
         assert_eq!(report.failed.len(), 1);
         assert!(report.failed[0].1.contains(r"C:\a"), "{:?}", report.failed);
         assert_eq!(report.placed.len(), 1);
+    }
+
+    #[test]
+    fn a_read_grant_is_recorded_as_its_own_kind_and_placed_after_the_denies() {
+        // The ledger row carries `AllowRead`, which is what `reap` hands back to
+        // `revoke` — the kind decides which mask comes off the DACL.
+        let world = World::with(&[r"C:\plugins", r"C:\plugins\secrets"]);
+        let counter = RefCell::new(0);
+        let prepared = prepare(
+            &[
+                ace(AceKind::DenyRead, r"C:\plugins\secrets"),
+                ace(AceKind::AllowRead, r"C:\plugins"),
+            ],
+            &context(&world, &counter),
+        )
+        .unwrap();
+
+        assert_eq!(prepared[1].entry.kind, AceKind::AllowRead);
+        assert_eq!(prepared[1].entry.path, r"C:\plugins");
+        assert!(prepared[1].entry.placeholders.is_empty());
+
+        let mut ledger = Ledger::default();
+        for item in &prepared {
+            assert_eq!(ledger.record(item.entry.clone()), RecordOutcome::Added);
+        }
+
+        let writer = RecordingWriter::new();
+        assert!(place(&prepared, &writer).is_ok());
+        assert_eq!(
+            *writer.placed.borrow(),
+            vec![
+                (PathBuf::from(r"C:\plugins\secrets"), AceKind::DenyRead),
+                (PathBuf::from(r"C:\plugins"), AceKind::AllowRead),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_read_grant_ahead_of_a_deny_is_refused_like_any_grant() {
+        let world = World::with(&[r"C:\plugins"]);
+        let counter = RefCell::new(0);
+        let error = prepare(
+            &[
+                ace(AceKind::AllowRead, r"C:\plugins"),
+                ace(AceKind::DenyRead, r"C:\plugins\secrets"),
+            ],
+            &context(&world, &counter),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("deny"), "{error}");
+        assert!(world.created.borrow().is_empty(), "it created something");
     }
 
     #[test]

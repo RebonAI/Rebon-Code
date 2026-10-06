@@ -422,6 +422,7 @@ mod tests {
                 AceKind::DenyRead | AceKind::DenyExecute => AceOrigin::DenyRead,
                 AceKind::DenyWrite => AceOrigin::DenyWrite,
                 AceKind::AllowWrite => AceOrigin::AllowWrite,
+                AceKind::AllowRead => AceOrigin::AllowRead,
             },
         }
     }

@@ -272,6 +272,10 @@ pub struct CommandRequest {
     pub allow_read: Vec<PathBuf>,
     /// Windows only: see `allow_read`.
     pub allow_write: Vec<PathBuf>,
+    /// Windows only: what this one `sandbox-win.exe exec` asks beyond the
+    /// session's rules — a real stdin for a long-lived host, read roots for
+    /// the confined accounts. `None` is today's one-shot shape.
+    pub sandbox_win: Option<crate::runtime::windows::SandboxWinExecOptions>,
 }
 
 impl CommandRequest {
@@ -291,7 +295,16 @@ impl CommandRequest {
             git_safe_directories: Vec::new(),
             allow_read: Vec::new(),
             allow_write: Vec::new(),
+            sandbox_win: None,
         }
+    }
+
+    pub fn with_sandbox_win(
+        mut self,
+        options: crate::runtime::windows::SandboxWinExecOptions,
+    ) -> Self {
+        self.sandbox_win = Some(options);
+        self
     }
 
     pub fn with_command_id(mut self, id: impl Into<String>) -> Self {

@@ -203,6 +203,7 @@ pub mod agent_registry;
 pub mod bash;
 pub mod builtin_agents;
 pub mod command_sandbox;
+pub mod container_sandbox;
 pub mod core_tools;
 pub mod cron;
 pub mod edit;
@@ -252,6 +253,10 @@ pub use agent::SubAgentContext;
 pub use command_sandbox::{
     BinShell, CommandSandbox, DoctorLevel, DoctorLine, PreparedCommand, RefusingSandbox,
     SandboxDoctor, SessionSandboxService, SessionSandboxSource, SESSION_SANDBOX_SERVICE,
+};
+pub use container_sandbox::{
+    ConfineRequest, ConfinedLauncher, ContainerConfinement, ContainerSandboxService,
+    ContainerSandboxSource, CONTAINER_SANDBOX_SERVICE,
 };
 pub use cron::CronContext;
 pub use escalation::EscalationContext;

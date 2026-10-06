@@ -31,6 +31,18 @@
 //! every `--env` and `--unset-env`, including the proxy variables that are how a
 //! `--block-network` command reaches anything at all. The extra logon is the price
 //! of the environment being ours to shape.
+//!
+//! ## stdin
+//!
+//! NUL by default: a one-shot command that blocks on input would hang with
+//! nobody to type at it. `--pipe-stdin` swaps that for a pipe this process
+//! feeds from its own stdin — for a long-lived host that speaks a protocol over
+//! stdin/stdout. The pipe is built like the output pipes, mirrored: the child
+//! gets the read end (inheritable), this process keeps the write end (not
+//! inheritable), and EOF on our stdin closes it so the child sees EOF too. The
+//! job and its `KILL_ON_JOB_CLOSE` are untouched by it: the relay thread holds
+//! no job handle, is never joined, and process exit ends it wherever it is
+//! blocked.
 
 use crate::core::env::EnvBlock;
 use crate::sys::SysResult;
@@ -52,6 +64,9 @@ pub struct LaunchRequest<'a> {
     /// sandbox, not a broken one, and `exec` says so out loud when it happens
     /// rather than leaving the caller to assume the isolation it asked for.
     pub desktop: Option<&'a str>,
+    /// Relay this process's stdin to the child (`--pipe-stdin`) instead of
+    /// giving it NUL.
+    pub pipe_stdin: bool,
 }
 
 /// How the command ended.
@@ -91,8 +106,10 @@ mod imp {
     };
     use windows_sys::Win32::Security::{LogonUserW, SECURITY_ATTRIBUTES};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        CreateFileW, ReadFile, WriteFile, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
     };
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
     use windows_sys::Win32::System::Environment::{
         CreateEnvironmentBlock, DestroyEnvironmentBlock,
     };
@@ -240,33 +257,110 @@ mod imp {
         }
     }
 
-    /// One direction of the child's output.
+    /// One direction of the child's standard I/O.
     struct Pipe {
         parent: Owned,
         child: Owned,
     }
 
     impl Pipe {
-        fn new() -> SysResult<Self> {
-            let attributes = SECURITY_ATTRIBUTES {
-                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-                lpSecurityDescriptor: null_mut(),
-                bInheritHandle: 1,
-            };
-            let mut read: HANDLE = 0;
-            let mut write: HANDLE = 0;
-            if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
-                return Err(last_error("CreatePipe"));
-            }
+        /// The child writes, this process reads: stdout and stderr.
+        fn output() -> SysResult<Self> {
+            let (read, write) = inheritable_pipe()?;
             // Only the child's end may be inherited. A copy of the read end
             // in the child would hold the pipe open, and the read below would
             // never see end-of-file — the command would finish and the helper
             // would hang forever.
-            unsafe { SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0) };
+            unsafe { SetHandleInformation(read.0, HANDLE_FLAG_INHERIT, 0) };
             Ok(Self {
-                parent: Owned(read),
-                child: Owned(write),
+                parent: read,
+                child: write,
             })
+        }
+
+        /// This process writes, the child reads: stdin under `--pipe-stdin`.
+        fn input() -> SysResult<Self> {
+            let (read, write) = inheritable_pipe()?;
+            // The mirror of `output`: a copy of the write end in the child
+            // would hold the pipe open, so closing ours at our stdin's EOF
+            // would never reach the child as end-of-file — a host waiting for
+            // its peer to hang up would wait forever. Checked rather than
+            // assumed, because unlike the output case nothing downstream would
+            // notice the leak.
+            if unsafe { SetHandleInformation(write.0, HANDLE_FLAG_INHERIT, 0) } == 0 {
+                return Err(last_error("SetHandleInformation(stdin pipe)"));
+            }
+            Ok(Self {
+                parent: write,
+                child: read,
+            })
+        }
+    }
+
+    /// `(read, write)`, both inheritable until the caller narrows one.
+    fn inheritable_pipe() -> SysResult<(Owned, Owned)> {
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: null_mut(),
+            bInheritHandle: 1,
+        };
+        let mut read: HANDLE = 0;
+        let mut write: HANDLE = 0;
+        if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
+            return Err(last_error("CreatePipe"));
+        }
+        Ok((Owned(read), Owned(write)))
+    }
+
+    /// What the child's stdin is.
+    enum ChildInput {
+        /// The default. A confined command that blocks on input would hang
+        /// with nothing to say why, and there is nobody to type at it.
+        Nul(Owned),
+        /// `--pipe-stdin`: a pipe this process feeds from its own stdin.
+        Pipe(Pipe),
+    }
+
+    impl ChildInput {
+        fn open(pipe_stdin: bool) -> SysResult<Self> {
+            if !pipe_stdin {
+                return Ok(Self::Nul(open_nul()?));
+            }
+            let pipe = Pipe::input()?;
+            // Our own stdin is the relay thread's to read, and nobody else's.
+            // Should a copy of it reach the child alongside the pipe, the child
+            // could read the caller's bytes directly, race the relay for them,
+            // and hold the caller's pipe open after the relay has seen EOF.
+            // Best effort: a console handle may refuse the change, and a
+            // console is not a stream another process can steal from.
+            unsafe { SetHandleInformation(GetStdHandle(STD_INPUT_HANDLE), HANDLE_FLAG_INHERIT, 0) };
+            Ok(Self::Pipe(pipe))
+        }
+
+        /// The handle that goes into `STARTUPINFOW::hStdInput`.
+        fn child_handle(&self) -> HANDLE {
+            match self {
+                Self::Nul(nul) => nul.0,
+                Self::Pipe(pipe) => pipe.child.0,
+            }
+        }
+
+        /// Called once the child is running: drop this process's copy of the
+        /// child's end and, for a pipe, start feeding it.
+        ///
+        /// Held until after the spawn for the same reason as the output ends —
+        /// closing it earlier would hand the child a closed handle — and the
+        /// relay starts only after `ResumeThread`, so a command that never ran
+        /// never consumed a byte of the caller's stdin.
+        fn start(self) {
+            match self {
+                Self::Nul(nul) => drop(nul),
+                Self::Pipe(Pipe { parent, child }) => {
+                    drop(child);
+                    // Detached on purpose; see `relay_stdin`.
+                    drop(relay_stdin(parent));
+                }
+            }
         }
     }
 
@@ -317,6 +411,77 @@ mod imp {
                 }
             }
         })
+    }
+
+    /// Feed this process's stdin to the child's until either side ends.
+    ///
+    /// Never joined. The caller may keep the helper's stdin open as long as it
+    /// likes, and the helper's exit has to follow the *child's*: when the child
+    /// exits, `run` returns and process exit ends this thread wherever it is
+    /// blocked. It owns no job handle, so it cannot hold `KILL_ON_JOB_CLOSE`
+    /// back either.
+    ///
+    /// EOF (or a read error) on our stdin drops `child_stdin`, closing the
+    /// child's stdin — how a host learns its peer has gone. A failed write
+    /// means the child closed its end or exited, and there is nobody left to
+    /// deliver to.
+    ///
+    /// Raw `ReadFile` / `WriteFile` with no `std::io` buffer in between: each
+    /// chunk goes into the pipe the moment it is read, which is the per-chunk
+    /// flush — no user-space buffer exists to hold a line back. Bytes pass
+    /// through undecoded, as on the way out. Nothing here touches stdout, so
+    /// `--quiet` (stdout carries only the child's bytes) still holds.
+    fn relay_stdin(child_stdin: Owned) -> std::thread::JoinHandle<()> {
+        let source = Sendable(unsafe { GetStdHandle(STD_INPUT_HANDLE) });
+        std::thread::spawn(move || {
+            let source = source;
+            let sink = child_stdin;
+            if source.0 == 0 || source.0 == INVALID_HANDLE_VALUE {
+                // No stdin at all is an immediate EOF; `sink` drops here.
+                return;
+            }
+            let mut buffer = [0u8; 8192];
+            loop {
+                let mut read = 0u32;
+                let ok = unsafe {
+                    ReadFile(
+                        source.0,
+                        buffer.as_mut_ptr(),
+                        buffer.len() as u32,
+                        &mut read,
+                        null_mut(),
+                    )
+                };
+                if ok == 0 || read == 0 {
+                    break;
+                }
+                if !write_all(sink.0, &buffer[..read as usize]) {
+                    break;
+                }
+            }
+            drop(sink);
+        })
+    }
+
+    /// `WriteFile` until every byte is in, or `false` once the reader is gone.
+    fn write_all(handle: HANDLE, mut bytes: &[u8]) -> bool {
+        while !bytes.is_empty() {
+            let mut written = 0u32;
+            let ok = unsafe {
+                WriteFile(
+                    handle,
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                    &mut written,
+                    null_mut(),
+                )
+            };
+            if ok == 0 || written == 0 {
+                return false;
+            }
+            bytes = &bytes[written as usize..];
+        }
+        true
     }
 
     fn open_nul() -> SysResult<Owned> {
@@ -408,16 +573,15 @@ mod imp {
     }
 
     pub fn run(request: &LaunchRequest<'_>) -> SysResult<LaunchOutcome> {
-        let stdout = Pipe::new()?;
-        let stderr = Pipe::new()?;
-        let nul = open_nul()?;
+        let stdout = Pipe::output()?;
+        let stderr = Pipe::output()?;
+        let stdin = ChildInput::open(request.pipe_stdin)?;
 
         let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
         startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
         startup.dwFlags = STARTF_USESTDHANDLES;
-        // stdin is NUL. A confined command that blocks on input would
-        // hang with nothing to say why, and there is nobody to type at it.
-        startup.hStdInput = nul.0;
+        // NUL unless `--pipe-stdin`; see `ChildInput`.
+        startup.hStdInput = stdin.child_handle();
         startup.hStdOutput = stdout.child.0;
         startup.hStdError = stderr.child.0;
 
@@ -502,7 +666,7 @@ mod imp {
         // spawn: closing them earlier would hand the child a closed pipe.
         drop(stdout.child);
         drop(stderr.child);
-        drop(nul);
+        stdin.start();
 
         let stdout_relay = relay(stdout.parent.0, false);
         let stderr_relay = relay(stderr.parent.0, true);

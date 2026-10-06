@@ -22,6 +22,11 @@
 //! confining it, and the fact that the ACE it would rewrite sits inside its own
 //! write root does not make that acceptable. The deny side asks for the same two
 //! rights explicitly, so a path under both rules is doubly covered.
+//!
+//! A read grant (`--allow-read`) is the read and execute half of a write grant
+//! and nothing else: enough to load a runtime and its modules from a directory
+//! the sandbox accounts could not otherwise see, and not one bit that changes
+//! bytes, metadata or the security descriptor.
 
 use crate::core::argv::ExecRequest;
 use serde::{Deserialize, Serialize};
@@ -58,6 +63,9 @@ pub enum AceKind {
     DenyRead,
     DenyWrite,
     AllowWrite,
+    /// Read, execute and list/traverse — from `--allow-read`. A grant, so it
+    /// sorts after every deny: a `--deny-read` on the same path still wins.
+    AllowRead,
     /// Deny running a file at all — used by `install` on the helper's own binary,
     /// never by [`plan_aces`].
     ///
@@ -124,13 +132,30 @@ impl AceKind {
                     | READ_CONTROL
                     | SYNCHRONIZE
             }
+
+            // `FILE_GENERIC_READ | FILE_GENERIC_EXECUTE`, spelled out. On a directory
+            // `FILE_READ_DATA` is `FILE_LIST_DIRECTORY` and `FILE_EXECUTE` is
+            // `FILE_TRAVERSE`, so this also lists and walks the tree. It has to stay a
+            // different mask from `AllowWrite`: `revoke` matches an ACE by (trustee,
+            // allow-or-deny, exact mask), and two kinds sharing one would take each
+            // other's ACE off.
+            AceKind::AllowRead => {
+                FILE_READ_DATA
+                    | FILE_READ_EA
+                    | FILE_EXECUTE
+                    | FILE_READ_ATTRIBUTES
+                    | READ_CONTROL
+                    | SYNCHRONIZE
+            }
         }
     }
 
     /// The `SANDBOX_WIN_DENIED` operation word for a denial under this rule.
     pub const fn denied_operation(self) -> &'static str {
         match self {
-            AceKind::DenyRead | AceKind::DenyExecute => crate::core::markers::op::READ,
+            AceKind::DenyRead | AceKind::DenyExecute | AceKind::AllowRead => {
+                crate::core::markers::op::READ
+            }
             AceKind::DenyWrite | AceKind::AllowWrite => crate::core::markers::op::WRITE,
         }
     }
@@ -146,6 +171,7 @@ pub enum AceOrigin {
     DenyRead,
     DenyWrite,
     AllowWrite,
+    AllowRead,
     /// A `--mask-file` that could not be a mask.
     MaskDegraded,
 }
@@ -228,6 +254,17 @@ pub fn plan_aces(request: &ExecRequest) -> AcePlan {
             AceOrigin::AllowWrite,
         );
     }
+    // Last, with the other grant. A path under both `--allow-write` and
+    // `--allow-read` gets both ACEs: each is its own ledger row and its own
+    // revoke, and neither is a subset the other can stand in for at revoke time.
+    for path in &request.allow_read {
+        push(
+            &mut plan.aces,
+            path,
+            AceKind::AllowRead,
+            AceOrigin::AllowRead,
+        );
+    }
 
     plan
 }
@@ -297,6 +334,7 @@ mod tests {
             deny_read: vec![PathBuf::from("a")],
             deny_write: vec![PathBuf::from("b")],
             allow_write: vec![PathBuf::from("c")],
+            allow_read: vec![PathBuf::from("f")],
             masks: vec![MaskRule {
                 real: PathBuf::from("d"),
                 fake: PathBuf::from("e"),
@@ -507,6 +545,122 @@ mod tests {
     fn the_denied_operation_word_matches_the_rule() {
         assert_eq!(AceKind::DenyRead.denied_operation(), "read");
         assert_eq!(AceKind::DenyWrite.denied_operation(), "write");
+    }
+
+    #[test]
+    fn a_read_grant_reads_executes_and_traverses() {
+        let mask = AceKind::AllowRead.access_mask();
+        for (name, right) in [
+            // FILE_LIST_DIRECTORY on a container.
+            ("FILE_READ_DATA", rights::FILE_READ_DATA),
+            ("FILE_READ_EA", rights::FILE_READ_EA),
+            // FILE_TRAVERSE on a container; loading an image needs it on a file.
+            ("FILE_EXECUTE", rights::FILE_EXECUTE),
+            ("FILE_READ_ATTRIBUTES", rights::FILE_READ_ATTRIBUTES),
+            ("READ_CONTROL", rights::READ_CONTROL),
+            ("SYNCHRONIZE", rights::SYNCHRONIZE),
+        ] {
+            assert_ne!(mask & right, 0, "{name} missing from a read grant");
+        }
+    }
+
+    #[test]
+    fn a_read_grant_carries_no_write_bit_at_all() {
+        let mask = AceKind::AllowRead.access_mask();
+        for (name, right) in [
+            ("FILE_WRITE_DATA", rights::FILE_WRITE_DATA),
+            ("FILE_APPEND_DATA", rights::FILE_APPEND_DATA),
+            ("FILE_WRITE_EA", rights::FILE_WRITE_EA),
+            ("FILE_DELETE_CHILD", rights::FILE_DELETE_CHILD),
+            ("FILE_WRITE_ATTRIBUTES", rights::FILE_WRITE_ATTRIBUTES),
+            ("DELETE", rights::DELETE),
+            ("WRITE_DAC", rights::WRITE_DAC),
+            ("WRITE_OWNER", rights::WRITE_OWNER),
+        ] {
+            assert_eq!(mask & right, 0, "{name} should not be in a read grant");
+        }
+        // Exactly FILE_GENERIC_READ | FILE_GENERIC_EXECUTE (0x1200A9).
+        assert_eq!(mask, 0x0012_00A9);
+    }
+
+    #[test]
+    fn a_read_grant_is_a_different_ace_from_a_write_grant() {
+        // `revoke` matches by (trustee, allow-or-deny, exact mask). Sharing a mask would
+        // let revoking one grant take the other off the disk.
+        assert_ne!(
+            AceKind::AllowRead.access_mask(),
+            AceKind::AllowWrite.access_mask()
+        );
+        assert!(!AceKind::AllowRead.is_deny());
+        assert_eq!(AceKind::AllowRead.denied_operation(), "read");
+    }
+
+    #[test]
+    fn a_read_grant_on_a_directory_is_inherited_by_everything_below_it() {
+        let ace = PlannedAce {
+            path: PathBuf::from(r"C:\plugins"),
+            kind: AceKind::AllowRead,
+            origin: AceOrigin::AllowRead,
+        };
+        assert_eq!(
+            ace.ace_flags(true),
+            inheritance::CONTAINER_INHERIT_ACE | inheritance::OBJECT_INHERIT_ACE
+        );
+        assert_eq!(ace.ace_flags(false), 0);
+    }
+
+    #[test]
+    fn read_grants_plan_after_every_deny_and_after_write_grants() {
+        let mut request = request();
+        request.allow_read = vec![PathBuf::from(r"C:\plugins"), PathBuf::from(r"C:\node")];
+        request.allow_write = vec![PathBuf::from(r"C:\work")];
+        request.deny_read = vec![PathBuf::from(r"C:\plugins\secrets")];
+        request.deny_write = vec![PathBuf::from(r"C:\work\vendor")];
+
+        let plan = plan_aces(&request);
+        let kinds: Vec<AceKind> = plan.aces.iter().map(|a| a.kind).collect();
+
+        assert!(is_correctly_ordered(&plan.aces));
+        assert_eq!(
+            kinds,
+            vec![
+                AceKind::DenyRead,
+                AceKind::DenyWrite,
+                AceKind::AllowWrite,
+                AceKind::AllowRead,
+                AceKind::AllowRead,
+            ]
+        );
+        assert_eq!(
+            paths(&plan, AceKind::AllowRead),
+            vec![r"C:\plugins", r"C:\node"]
+        );
+        assert!(plan
+            .aces
+            .iter()
+            .filter(|ace| ace.kind == AceKind::AllowRead)
+            .all(|ace| ace.origin == AceOrigin::AllowRead));
+    }
+
+    #[test]
+    fn a_repeated_read_grant_is_one_ace_but_read_and_write_on_one_path_are_two() {
+        let mut request = request();
+        request.allow_read = vec![PathBuf::from(r"C:\a"), PathBuf::from(r"C:\a")];
+        assert_eq!(plan_aces(&request).aces.len(), 1);
+
+        request.allow_write = vec![PathBuf::from(r"C:\a")];
+        assert_eq!(plan_aces(&request).aces.len(), 2);
+    }
+
+    #[test]
+    fn no_read_grant_is_planned_unless_asked_for() {
+        let mut request = request();
+        request.deny_read = vec![PathBuf::from(r"C:\a")];
+        request.allow_write = vec![PathBuf::from(r"C:\w")];
+        assert!(plan_aces(&request)
+            .aces
+            .iter()
+            .all(|ace| ace.kind != AceKind::AllowRead));
     }
 
     #[test]

@@ -20,7 +20,10 @@
 //! * **ACLs are session-scoped.** They are set on real directories on
 //!   a real disk, so a per-command read/write allowance is not
 //!   expressible — RFC §6.4. Asking for one is an error, never a
-//!   silently dropped rule.
+//!   silently dropped rule. The one exception is a read allowance, once
+//!   the helper advertises `allow-read`: it becomes a `--allow-read`
+//!   grant that lives for the session, which is the honest reading of
+//!   "per command" on a real disk.
 //! * **The command line is finite.** `CreateProcessW` stops at 32767
 //!   UTF-16 units, and a sandbox that truncates its own deny list
 //!   would be worse than one that refuses — RFC §6.2.
@@ -55,6 +58,72 @@ pub const PRESERVED_ENV_VARS: &[&str] = &["PATH", "PATHEXT"];
 /// through npm — so "these are the same version" is a runtime fact, not a
 /// build-time one.
 pub const SUPPORTED_STATUS_VERSION: u32 = 1;
+
+/// The `features=` token for `exec --pipe-stdin`. Mirrors the helper's
+/// `core::status::FEATURE_PIPE_STDIN`.
+pub const FEATURE_PIPE_STDIN: &str = "pipe-stdin";
+/// The `features=` token for `exec --allow-read`. Mirrors the helper's
+/// `core::status::FEATURE_ALLOW_READ`.
+pub const FEATURE_ALLOW_READ: &str = "allow-read";
+
+/// The opt-in `exec` capabilities a helper advertised on its `status`
+/// `features=` line.
+///
+/// Separate from [`SandboxWinStatus`] rather than two more fields on it: the
+/// features are not part of readiness — a helper without them is a fully
+/// working helper for one-shot commands — and the status struct's shape is
+/// pinned by the callers that build it field by field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SandboxWinFeatures {
+    /// `exec --pipe-stdin` is understood.
+    pub supports_pipe_stdin: bool,
+    /// `exec --allow-read <path>` is understood.
+    pub supports_allow_read: bool,
+}
+
+/// Read the `features=` line out of `sandbox-win.exe status` stdout.
+///
+/// A helper that predates the line has none, which reads as "no features" —
+/// the safe answer, because an older helper refuses the flags as unknown.
+/// Tokens this build does not know are ignored; a token only counts when it
+/// matches exactly.
+pub fn parse_status_features(status_stdout: &str) -> SandboxWinFeatures {
+    let tokens: Vec<&str> = status_stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("features="))
+        .map(|value| value.split(',').map(str::trim).collect())
+        .unwrap_or_default();
+    SandboxWinFeatures {
+        supports_pipe_stdin: tokens.contains(&FEATURE_PIPE_STDIN),
+        supports_allow_read: tokens.contains(&FEATURE_ALLOW_READ),
+    }
+}
+
+/// What a caller may ask of one `sandbox-win.exe exec` beyond the session's
+/// rules.
+///
+/// `Default` asks for nothing and makes [`build_sandbox_win_argv_with`]
+/// produce exactly what [`build_sandbox_win_argv`] always has — the one-shot
+/// Bash / PowerShell shape, with stdin NUL.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxWinExecOptions {
+    /// Give the confined process a real stdin, relayed from the helper's own,
+    /// instead of NUL (`--pipe-stdin`). For a long-lived host speaking NDJSON
+    /// over stdin/stdout; the caller then writes to the helper's stdin.
+    pub pipe_stdin: bool,
+    /// Read roots for the confined accounts (`--allow-read`): read, execute
+    /// and traverse, inherited by everything below, never write. Must be
+    /// absolute and normalised — the helper refuses anything else.
+    ///
+    /// Like every ACE the helper places, a grant is owned by the calling
+    /// process's session and stays until that session is reaped, not until the
+    /// command exits; it applies to the sandbox group, so other confined
+    /// commands running meanwhile can read the same roots.
+    pub allow_read: Vec<PathBuf>,
+    /// What the helper advertised, from [`parse_status_features`]. Asking for
+    /// a capability it lacks is refused here rather than at spawn.
+    pub features: SandboxWinFeatures,
+}
 
 /// What `sandbox-win.exe status` reports back.
 ///
@@ -166,7 +235,11 @@ impl SandboxWinStatus {
 /// ```text
 /// sandbox-win.exe exec [--quiet]
 ///   [--deny-read  <path>]...
+///   [--mask-file  <real> <fake>]...
 ///   [--deny-write <path>]...
+///   [--allow-write <path>]...
+///   [--block-network]
+///   [--inherit-env NAME]...
 ///   [--env KEY=VALUE]...
 ///   [--unset-env KEY]...
 ///   [--cwd <path>]
@@ -183,15 +256,51 @@ pub fn build_sandbox_win_argv(
     config: &EffectiveConfig,
     env: &EnvPlan,
 ) -> Result<(String, Vec<String>, Vec<Warning>), SandboxError> {
+    build_sandbox_win_argv_with(config, env, &SandboxWinExecOptions::default())
+}
+
+/// [`build_sandbox_win_argv`], plus the opt-in capabilities in `options`.
+///
+/// The two new flags only ever appear when asked for, in their frozen slots —
+/// `--pipe-stdin` right after `--quiet`, `--allow-read` right after the last
+/// `--allow-write` — so default options give a byte-identical argv.
+///
+/// Per-command read overrides (`allow_read_overrides`) stop being refused once
+/// the helper advertises `allow-read`, and travel as `--allow-read` after the
+/// roots in `options.allow_read`. Per-command write overrides are refused
+/// whatever the helper says.
+pub fn build_sandbox_win_argv_with(
+    config: &EffectiveConfig,
+    env: &EnvPlan,
+    options: &SandboxWinExecOptions,
+) -> Result<(String, Vec<String>, Vec<Warning>), SandboxError> {
+    let features = options.features;
     // Refuse the inexpressible rules first, before any work: a caller
     // that gets an argv back must be able to trust that every rule it
     // asked for is in it.
-    if let Some(path) = config
-        .allow_read_overrides
-        .first()
-        .or_else(|| config.allow_write_overrides.first())
-    {
+    let refused_read = if features.supports_allow_read {
+        None
+    } else {
+        config.allow_read_overrides.first()
+    };
+    if let Some(path) = refused_read.or_else(|| config.allow_write_overrides.first()) {
         return Err(SandboxError::PerExecAclUnsupported { path: path.clone() });
+    }
+    if options.pipe_stdin && !features.supports_pipe_stdin {
+        return Err(helper_lacks(FEATURE_PIPE_STDIN));
+    }
+    if !options.allow_read.is_empty() && !features.supports_allow_read {
+        return Err(helper_lacks(FEATURE_ALLOW_READ));
+    }
+    let mut read_roots: Vec<&PathBuf> = Vec::new();
+    for root in options
+        .allow_read
+        .iter()
+        .chain(&config.allow_read_overrides)
+    {
+        if !read_roots.contains(&root) {
+            read_roots.push(root);
+        }
     }
 
     let sandbox_win =
@@ -214,6 +323,9 @@ pub fn build_sandbox_win_argv(
 
     let mut warnings = Vec::new();
     let mut args = vec!["exec".to_string(), "--quiet".to_string()];
+    if options.pipe_stdin {
+        args.push("--pipe-stdin".into());
+    }
 
     for path in &config.read_rules.deny_only {
         args.push("--deny-read".into());
@@ -276,6 +388,10 @@ pub fn build_sandbox_win_argv(
         args.push("--allow-write".into());
         args.push(windows_path(root));
     }
+    for root in read_roots {
+        args.push("--allow-read".into());
+        args.push(windows_path(root));
+    }
 
     if config.network_restricted {
         args.push("--block-network".into());
@@ -311,6 +427,21 @@ pub fn build_sandbox_win_argv(
     }
 
     Ok((sandbox_win.to_string_lossy().into_owned(), args, warnings))
+}
+
+/// The refusal for a capability the installed helper did not advertise.
+///
+/// An older helper would refuse the flag itself as unknown, so nothing would run
+/// unconfined either way; refusing here names the remedy instead of leaving the
+/// caller to decode the helper's stderr.
+fn helper_lacks(feature: &str) -> SandboxError {
+    SandboxError::MissingDependency {
+        dependency: "sandbox-win",
+        detail: format!(
+            "the installed sandbox-win.exe does not support `{feature}` (it is not on its \
+             `status` features line); reinstall the helper (`sandbox-win.exe install`)"
+        ),
+    }
 }
 
 /// The length `CreateProcessW` will see.
@@ -923,6 +1054,328 @@ mod tests {
         // user's commands.
         let bare = sandbox_win_candidates(None, Some(Path::new("rebon.exe")));
         assert!(!bare.contains(&PathBuf::from(SANDBOX_WIN_BINARY)));
+    }
+
+    fn every_feature() -> SandboxWinFeatures {
+        SandboxWinFeatures {
+            supports_pipe_stdin: true,
+            supports_allow_read: true,
+        }
+    }
+
+    /// A session with every rule kind the one-shot builder emits.
+    fn populated(request: CommandRequest) -> EffectiveConfig {
+        effective(
+            |session| {
+                session.filesystem.deny_read = vec![PathBuf::from(r"C:\secret")];
+                session.filesystem.allow_write = vec![PathBuf::from(r"C:\work")];
+                session.filesystem.deny_write = vec![PathBuf::from(r"C:\work\vendor")];
+                session.credentials.files = vec![(
+                    PathBuf::from(r"C:\Users\u\.npmrc"),
+                    CredentialFileRule::Mask {
+                        fake: PathBuf::from(r"C:\tmp\fake"),
+                    },
+                )];
+            },
+            request.with_cwd(r"C:\work"),
+        )
+    }
+
+    fn build_with(
+        config: &EffectiveConfig,
+        options: &SandboxWinExecOptions,
+    ) -> Result<(String, Vec<String>, Vec<Warning>), SandboxError> {
+        build_sandbox_win_argv_with(config, &build_env_plan(config), options)
+    }
+
+    #[test]
+    fn the_one_shot_argv_is_pinned_byte_for_byte() {
+        // The shape Bash / PowerShell commands have always produced. Default options
+        // must not move a single argument.
+        let config = populated(request());
+        let (program, args, _) = build(&config);
+
+        assert_eq!(program, r"C:\Rebon\sandbox-win.exe");
+        assert_eq!(args, GOLDEN_ONE_SHOT_ARGV);
+        let (_, with_defaults, _) = build_with(&config, &Default::default()).unwrap();
+        assert_eq!(with_defaults, GOLDEN_ONE_SHOT_ARGV);
+    }
+
+    /// What the builder produced for [`populated`] before `--pipe-stdin` and
+    /// `--allow-read` existed. `\etc\ssh\ssh_config.d` is the constant
+    /// `ALWAYS_DENY_READ` entry every restricted command carries.
+    const GOLDEN_ONE_SHOT_ARGV: &[&str] = &[
+        "exec",
+        "--quiet",
+        "--deny-read",
+        r"C:\secret",
+        "--deny-read",
+        r"\etc\ssh\ssh_config.d",
+        "--mask-file",
+        r"C:\Users\u\.npmrc",
+        r"C:\tmp\fake",
+        "--deny-write",
+        r"C:\work\vendor",
+        "--allow-write",
+        r"C:\work",
+        "--inherit-env",
+        "PATH",
+        "--inherit-env",
+        "PATHEXT",
+        "--cwd",
+        r"C:\work",
+        "--",
+        "bash.exe",
+        "-c",
+        "echo hi",
+    ];
+
+    #[test]
+    fn default_options_match_the_plain_builder_for_every_shape() {
+        for config in [
+            effective(|_| {}, request()),
+            populated(request()),
+            populated(request().with_network_restriction(true)),
+            populated(request().with_git_safe_directories([PathBuf::from(r"C:\work")])),
+        ] {
+            let plain = build(&config);
+            let defaulted = build_with(&config, &SandboxWinExecOptions::default()).unwrap();
+            assert_eq!(plain, defaulted);
+            assert!(!plain
+                .1
+                .iter()
+                .any(|a| a == "--pipe-stdin" || a == "--allow-read"));
+        }
+    }
+
+    #[test]
+    fn advertised_features_alone_change_nothing() {
+        // A new helper running an old-shaped command: nothing asked for, nothing sent.
+        let config = populated(request());
+        let options = SandboxWinExecOptions {
+            features: every_feature(),
+            ..Default::default()
+        };
+        assert_eq!(build_with(&config, &options).unwrap(), build(&config));
+    }
+
+    #[test]
+    fn pipe_stdin_goes_right_after_quiet_and_moves_nothing_else() {
+        let config = populated(request());
+        let options = SandboxWinExecOptions {
+            pipe_stdin: true,
+            features: every_feature(),
+            ..Default::default()
+        };
+
+        let (_, args, _) = build_with(&config, &options).unwrap();
+        let (_, plain, _) = build(&config);
+
+        assert_eq!(&args[..3], &["exec", "--quiet", "--pipe-stdin"]);
+        let mut without: Vec<String> = args.clone();
+        without.remove(2);
+        assert_eq!(without, plain);
+    }
+
+    #[test]
+    fn pipe_stdin_is_refused_when_the_helper_does_not_advertise_it() {
+        let config = populated(request());
+        let options = SandboxWinExecOptions {
+            pipe_stdin: true,
+            features: SandboxWinFeatures {
+                supports_pipe_stdin: false,
+                supports_allow_read: true,
+            },
+            ..Default::default()
+        };
+
+        match build_with(&config, &options) {
+            Err(SandboxError::MissingDependency { dependency, detail }) => {
+                assert_eq!(dependency, "sandbox-win");
+                assert!(detail.contains("pipe-stdin"), "{detail}");
+            }
+            other => panic!("expected MissingDependency, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_roots_follow_the_write_roots_with_backslashes() {
+        let config = populated(request());
+        let options = SandboxWinExecOptions {
+            allow_read: vec![
+                PathBuf::from("C:/Users/u/AppData/Roaming/rebon/plugins"),
+                PathBuf::from(r"C:\Program Files\nodejs"),
+            ],
+            features: every_feature(),
+            ..Default::default()
+        };
+
+        let (_, args, _) = build_with(&config, &options).unwrap();
+        let (_, plain, _) = build(&config);
+
+        let last_write = plain.iter().rposition(|a| a == "--allow-write").unwrap();
+        let inserted = &args[last_write + 2..last_write + 6];
+        assert_eq!(
+            inserted,
+            &[
+                "--allow-read",
+                r"C:\Users\u\AppData\Roaming\rebon\plugins",
+                "--allow-read",
+                r"C:\Program Files\nodejs",
+            ]
+        );
+        let mut without = args.clone();
+        without.drain(last_write + 2..last_write + 6);
+        assert_eq!(without, plain);
+    }
+
+    #[test]
+    fn read_roots_are_refused_when_the_helper_does_not_advertise_them() {
+        let config = populated(request());
+        let options = SandboxWinExecOptions {
+            allow_read: vec![PathBuf::from(r"C:\plugins")],
+            features: SandboxWinFeatures {
+                supports_pipe_stdin: true,
+                supports_allow_read: false,
+            },
+            ..Default::default()
+        };
+
+        match build_with(&config, &options) {
+            Err(SandboxError::MissingDependency { detail, .. }) => {
+                assert!(detail.contains("allow-read"), "{detail}");
+            }
+            other => panic!("expected MissingDependency, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_exec_allow_read_becomes_a_read_root_once_the_helper_supports_it() {
+        let mut req = request();
+        req.allow_read = vec![PathBuf::from(r"C:\data"), PathBuf::from(r"C:\plugins")];
+        let config = effective(|_| {}, req);
+        let options = SandboxWinExecOptions {
+            allow_read: vec![PathBuf::from(r"C:\plugins")],
+            features: every_feature(),
+            ..Default::default()
+        };
+
+        let (_, args, _) = build_with(&config, &options).unwrap();
+        let roots: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index > 0 && args[index - 1] == "--allow-read")
+            .map(|(_, value)| value)
+            .collect();
+
+        // The explicit roots first, then the overrides, each path once.
+        assert_eq!(roots, vec![r"C:\plugins", r"C:\data"]);
+    }
+
+    #[test]
+    fn per_exec_allow_read_is_still_refused_by_a_helper_without_the_feature() {
+        let mut req = request();
+        req.allow_read = vec![PathBuf::from(r"C:\data")];
+        let config = effective(|_| {}, req);
+        let options = SandboxWinExecOptions {
+            features: SandboxWinFeatures {
+                supports_pipe_stdin: true,
+                supports_allow_read: false,
+            },
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            build_with(&config, &options),
+            Err(SandboxError::PerExecAclUnsupported { path }) if path == Path::new(r"C:\data")
+        ));
+    }
+
+    #[test]
+    fn per_exec_allow_write_is_refused_whatever_the_helper_advertises() {
+        let mut req = request();
+        req.allow_write = vec![PathBuf::from(r"C:\other")];
+        let config = effective(|_| {}, req);
+        let options = SandboxWinExecOptions {
+            pipe_stdin: true,
+            allow_read: vec![PathBuf::from(r"C:\plugins")],
+            features: every_feature(),
+        };
+
+        assert!(matches!(
+            build_with(&config, &options),
+            Err(SandboxError::PerExecAclUnsupported { path }) if path == Path::new(r"C:\other")
+        ));
+    }
+
+    #[test]
+    fn both_capabilities_together_keep_the_frozen_order() {
+        let config = populated(request().with_network_restriction(true));
+        let options = SandboxWinExecOptions {
+            pipe_stdin: true,
+            allow_read: vec![PathBuf::from(r"C:\plugins")],
+            features: every_feature(),
+        };
+
+        let (_, args, _) = build_with(&config, &options).unwrap();
+        let position = |flag: &str| args.iter().position(|a| a == flag).unwrap();
+
+        assert!(position("--quiet") < position("--pipe-stdin"));
+        assert!(position("--pipe-stdin") < position("--deny-read"));
+        assert!(position("--allow-write") < position("--allow-read"));
+        assert!(position("--allow-read") < position("--block-network"));
+        assert!(position("--allow-read") < position("--"));
+    }
+
+    #[test]
+    fn the_features_line_is_read_when_present() {
+        let text = "version=1\nuser=ok\ncredentials=ok\nwfp=ok\nfeatures=pipe-stdin,allow-read\n";
+        assert_eq!(parse_status_features(text), every_feature());
+    }
+
+    #[test]
+    fn a_helper_without_a_features_line_has_no_features() {
+        // Every helper shipped before this line existed.
+        let text = "version=1\nuser=ok\ncredentials=ok\nwfp=ok\n";
+        assert_eq!(parse_status_features(text), SandboxWinFeatures::default());
+        assert_eq!(parse_status_features(""), SandboxWinFeatures::default());
+    }
+
+    #[test]
+    fn unknown_feature_tokens_are_ignored_and_only_exact_tokens_count() {
+        let text = "version=1\r\nfeatures= time-travel , allow-read,pipe-stdin-v2 \r\n# note\n";
+        assert_eq!(
+            parse_status_features(text),
+            SandboxWinFeatures {
+                supports_pipe_stdin: false,
+                supports_allow_read: true,
+            }
+        );
+        assert_eq!(
+            parse_status_features("features=\n"),
+            SandboxWinFeatures::default()
+        );
+        // A diagnostic that merely mentions the word is not the line.
+        assert_eq!(
+            parse_status_features("# features=pipe-stdin is new\n"),
+            SandboxWinFeatures::default()
+        );
+    }
+
+    #[test]
+    fn the_features_line_does_not_disturb_the_status_contract() {
+        // The existing probes are `contains` tests and a `version=` line; the new line
+        // must not light up any of them.
+        let text = "version=1\nuser=missing\ncredentials=missing\nwfp=missing\nfeatures=pipe-stdin,allow-read\n";
+        for probe in ["user=ok", "credentials=ok", "wfp=ok"] {
+            assert!(!text.contains(probe));
+        }
+        let version: Option<u32> = text.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("version=")
+                .and_then(|value| value.trim().parse().ok())
+        });
+        assert_eq!(version, Some(SUPPORTED_STATUS_VERSION));
     }
 
     #[test]

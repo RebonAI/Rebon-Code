@@ -53,6 +53,7 @@ use rebon_tool::command_sandbox::{
 };
 use rebon_ui_seat::{DialogDef, UiSeatService};
 
+pub mod container;
 pub mod doctor;
 pub mod exec;
 pub mod panel;
@@ -119,6 +120,8 @@ impl Plugin for SandboxPlugin {
         // The seat goes on this plugin's own context, so disabling the plugin
         // takes it out of the registry.
         ctx.provide::<SessionSandboxService>(Arc::new(SandboxSource))?;
+        // And the plugin containers' network: a proxy per container.
+        ctx.provide::<rebon_tool::ContainerSandboxService>(Arc::new(container::ContainerSandbox))?;
 
         // `/sandbox` describes what this plugin confines, so it comes and
         // goes with the same switch: a session that turned the sandbox off is

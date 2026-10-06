@@ -26,9 +26,24 @@
 //! old helper is the dangerous one — it ignores flags it does not know while
 //! reporting success. [`crate::core::argv`] refuses unknown flags so that
 //! failure is loud, and this line is how the caller will one day see it coming.
+//!
+//! ## The features line
+//!
+//! `features=<token>,<token>…` names the opt-in `exec` capabilities this binary
+//! implements ([`FEATURES`]). It is additive, so the version stays 1: a caller
+//! that predates the line ignores it, and a helper that predates it simply has
+//! no such line, which a caller reads as "none of them". A caller ignores tokens
+//! it does not know. No token may contain a probe string, which a test pins.
 
 /// Version of the `status` contract, not of the binary.
 pub const STATUS_VERSION: u32 = 1;
+
+/// `exec --pipe-stdin`: the child gets a stdin pipe relayed from the helper's.
+pub const FEATURE_PIPE_STDIN: &str = "pipe-stdin";
+/// `exec --allow-read <path>`: an inheritable read + execute grant.
+pub const FEATURE_ALLOW_READ: &str = "allow-read";
+/// Every token on the `features=` line, in the order printed.
+pub const FEATURES: &[&str] = &[FEATURE_PIPE_STDIN, FEATURE_ALLOW_READ];
 
 /// The three probe strings, exactly as the caller looks for them.
 pub const PROBE_USER: &str = "user=ok";
@@ -54,10 +69,11 @@ impl StatusFacts {
 /// Render the `status` stdout.
 pub fn render(facts: &StatusFacts) -> String {
     format!(
-        "version={STATUS_VERSION}\nuser={}\ncredentials={}\nwfp={}\n",
+        "version={STATUS_VERSION}\nuser={}\ncredentials={}\nwfp={}\nfeatures={}\n",
         state(facts.user),
         state(facts.credentials),
         state(facts.wfp),
+        FEATURES.join(","),
     )
 }
 
@@ -75,6 +91,15 @@ const fn state(present: bool) -> &'static str {
 pub struct ParsedStatus {
     pub version: Option<u32>,
     pub facts: StatusFacts,
+    pub features: StatusFeatures,
+}
+
+/// The `features=` tokens this module knows. Absent line, absent token and
+/// unknown token all read as "not supported".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatusFeatures {
+    pub pipe_stdin: bool,
+    pub allow_read: bool,
 }
 
 /// Read a `status` output back.
@@ -88,8 +113,17 @@ pub fn parse(text: &str) -> ParsedStatus {
             .strip_prefix("version=")
             .and_then(|value| value.trim().parse().ok())
     });
+    let tokens: Vec<&str> = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("features="))
+        .map(|value| value.split(',').map(str::trim).collect())
+        .unwrap_or_default();
     ParsedStatus {
         version,
+        features: StatusFeatures {
+            pipe_stdin: tokens.contains(&FEATURE_PIPE_STDIN),
+            allow_read: tokens.contains(&FEATURE_ALLOW_READ),
+        },
         facts: StatusFacts {
             user: text.contains(PROBE_USER),
             credentials: text.contains(PROBE_CREDENTIALS),
@@ -219,6 +253,48 @@ mod tests {
             }
             assert!(!facts.is_ready(), "case {missing}");
         }
+    }
+
+    #[test]
+    fn the_features_line_advertises_both_capabilities() {
+        let text = render(&StatusFacts::default());
+        assert!(
+            text.lines()
+                .any(|line| line == "features=pipe-stdin,allow-read"),
+            "{text}"
+        );
+        let parsed = parse(&text);
+        assert!(parsed.features.pipe_stdin);
+        assert!(parsed.features.allow_read);
+    }
+
+    #[test]
+    fn the_features_line_never_lights_up_a_probe() {
+        // The caller reads the probes with `contains`; a token spelling one would
+        // report a piece installed on a machine that has none.
+        let text = render(&StatusFacts::default());
+        for probe in [PROBE_USER, PROBE_CREDENTIALS, PROBE_WFP] {
+            assert!(!text.contains(probe), "{text}");
+        }
+        for token in FEATURES {
+            assert!(!token.contains(',') && !token.contains('='), "{token}");
+        }
+    }
+
+    #[test]
+    fn a_helper_without_a_features_line_supports_none_of_them() {
+        let parsed = parse("version=1\nuser=ok\ncredentials=ok\nwfp=ok\n");
+        assert_eq!(parsed.features, StatusFeatures::default());
+        assert_eq!(parsed.version, Some(1));
+    }
+
+    #[test]
+    fn unknown_feature_tokens_are_ignored() {
+        let parsed = parse("version=1\nfeatures= teleport , allow-read ,pipe-stdin-v2\n");
+        assert!(parsed.features.allow_read);
+        assert!(!parsed.features.pipe_stdin, "a prefix match is not a token");
+        let parsed = parse("version=1\nfeatures=\n");
+        assert_eq!(parsed.features, StatusFeatures::default());
     }
 
     #[test]

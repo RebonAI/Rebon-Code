@@ -66,12 +66,14 @@ impl Owner {
     /// The session these ACEs belong to.
     ///
     /// ACEs are a **session-level** resource: the caller refuses per-command
-    /// `allowRead`/`allowWrite`, so every `exec` from one Rebon process asks for the
-    /// same set. But the helper is a per-command process — it exits when the command
-    /// does — so it cannot own anything that has to outlive one command. The owner
-    /// is the process that *called* it, and the session id is derived from that
-    /// owner rather than passed in: the `exec` grammar is frozen and has no field
-    /// for one.
+    /// `allowWrite` (and `allowRead` unless this helper advertises `allow-read`), so
+    /// every `exec` from one Rebon process asks for much the same set. A read grant
+    /// one `exec` adds is still owned by the session, and stays until the session
+    /// is reaped, not until that command exits. But the helper is a per-command
+    /// process — it exits when the command does — so it cannot own anything that
+    /// has to outlive one command. The owner is the process that *called* it, and
+    /// the session id is derived from that owner rather than passed in: the `exec`
+    /// grammar is frozen and has no field for one.
     ///
     /// The creation time is in the id, not just the PID. Two Rebon processes where
     /// the second reused the first's PID must not inherit each other's rows — the
@@ -709,5 +711,35 @@ mod tests {
         let text = String::from_utf8(ledger.to_bytes()).unwrap();
 
         assert!(text.contains(r#""kind": "allow_write""#), "{text}");
+    }
+
+    #[test]
+    fn a_read_grant_row_round_trips_under_its_own_name() {
+        let mut ledger = Ledger::default();
+        let mut row = entry("a", r"C:\plugins", 10, "s1");
+        row.kind = AceKind::AllowRead;
+        ledger.record(row);
+
+        let bytes = ledger.to_bytes();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+
+        assert!(text.contains(r#""kind": "allow_read""#), "{text}");
+        assert_eq!(Ledger::load(&bytes).unwrap(), ledger);
+    }
+
+    #[test]
+    fn a_read_grant_and_a_write_grant_on_one_file_are_two_aces() {
+        // Each kind is its own ACE on the disk and its own revoke, so neither row may
+        // stand in for the other — not as a duplicate, and not as an "other claim"
+        // that would stop the last holder's ACE from coming off.
+        let mut ledger = Ledger::default();
+        let mut read = entry("r", r"C:\plugins", 10, "s1");
+        read.kind = AceKind::AllowRead;
+        let mut write = entry("w", r"C:\plugins", 10, "s1");
+        write.kind = AceKind::AllowWrite;
+
+        assert_eq!(ledger.record(read.clone()), RecordOutcome::Added);
+        assert_eq!(ledger.record(write), RecordOutcome::Added);
+        assert_eq!(ledger.other_claims(&read), 0);
     }
 }

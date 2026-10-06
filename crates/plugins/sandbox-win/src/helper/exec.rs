@@ -19,7 +19,8 @@
 //! 5. **Record, then place.** The ledger row is written before the ACE, so a
 //!    crash between them leaves a row with no ACE — recoverable — rather than
 //!    an ACE with no row, which nothing on the machine knows how to remove.
-//! 6. **Launch, and relay the exit code verbatim.**
+//! 6. **Launch, and relay the exit code verbatim.** stdin is NUL unless
+//!    `--pipe-stdin` asked for the helper's own stdin to be relayed.
 //!
 //! ## Refusing is a success
 //!
@@ -149,6 +150,7 @@ fn confine_and_run(request: &ExecRequest, aces: &[crate::core::acl::PlannedAce])
         working_directory: request.cwd.as_deref(),
         environment: &environment,
         desktop: desktop.as_ref().map(|desktop| desktop.lp_desktop()),
+        pipe_stdin: request.pipe_stdin,
     })?;
 
     Ok(outcome.exit_code)

@@ -182,7 +182,10 @@ mod tests {
             },
             &[],
         ));
-        assert_eq!(text, "version=1\nuser=ok\ncredentials=ok\nwfp=ok\n");
+        assert_eq!(
+            text,
+            "version=1\nuser=ok\ncredentials=ok\nwfp=ok\nfeatures=pipe-stdin,allow-read\n"
+        );
     }
 
     #[test]

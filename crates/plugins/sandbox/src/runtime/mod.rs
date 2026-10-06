@@ -348,8 +348,11 @@ impl SandboxRuntime {
                 (program, args, warnings, SandboxBackend::Seatbelt)
             }
             SandboxPlatform::Windows => {
-                let (program, args, warnings) =
-                    windows::build_sandbox_win_argv(&effective, &env_plan)?;
+                let (program, args, warnings) = windows::build_sandbox_win_argv_with(
+                    &effective,
+                    &env_plan,
+                    &request.sandbox_win.clone().unwrap_or_default(),
+                )?;
                 (program, args, warnings, SandboxBackend::SandboxWin)
             }
             SandboxPlatform::Unknown => {

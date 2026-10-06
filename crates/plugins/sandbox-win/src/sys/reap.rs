@@ -186,6 +186,8 @@ mod tests {
     #[derive(Default)]
     struct FakeWriter {
         revoked: RefCell<Vec<String>>,
+        /// The kind each revoke was asked for, parallel to `revoked`.
+        revoked_kinds: RefCell<Vec<AceKind>>,
         fail_on: HashSet<String>,
     }
 
@@ -194,12 +196,13 @@ mod tests {
             Ok(())
         }
 
-        fn revoke(&self, path: &Path, _kind: AceKind, _trustee: &str) -> SysResult<()> {
+        fn revoke(&self, path: &Path, kind: AceKind, _trustee: &str) -> SysResult<()> {
             let path = path.to_string_lossy().into_owned();
             if self.fail_on.contains(&path) {
                 return Err(SysError::Invalid("the DACL could not be written".into()));
             }
             self.revoked.borrow_mut().push(path);
+            self.revoked_kinds.borrow_mut().push(kind);
             Ok(())
         }
     }
@@ -428,6 +431,44 @@ mod tests {
 
         assert_eq!(second.revoked.len(), 1);
         assert!(ledger.entries.is_empty());
+    }
+
+    #[test]
+    fn a_dead_sessions_read_grant_is_revoked_as_a_read_grant() {
+        // Reaped exactly like the other kinds, and the kind reaches the writer: the
+        // writer matches the ACE by mask, so a read grant revoked as anything else
+        // would stay on the disk.
+        let mut ledger = Ledger::default();
+        let mut grant = entry("grant", r"C:\plugins", 10, "s1", 999);
+        grant.kind = AceKind::AllowRead;
+        let mut write = entry("write", r"C:\plugins", 10, "s1", 999);
+        write.kind = AceKind::AllowWrite;
+        write.placed_at_ms = 5;
+        let mut live = entry("live", r"C:\other", 11, "s2", 1);
+        live.kind = AceKind::AllowRead;
+        ledger.record(grant);
+        ledger.record(write);
+        ledger.record(live);
+        assert_eq!(
+            ledger.entries.len(),
+            3,
+            "read and write grants are two rows"
+        );
+
+        let mut harness = Harness::new();
+        harness.alive.insert(1);
+        harness.present.push((r"C:\plugins".into(), 10, 1));
+        harness.present.push((r"C:\other".into(), 11, 1));
+
+        let report = harness.run(&mut ledger, reap_dead_sessions);
+
+        assert_eq!(report.revoked.len(), 2);
+        assert_eq!(
+            *harness.writer.revoked_kinds.borrow(),
+            vec![AceKind::AllowRead, AceKind::AllowWrite]
+        );
+        assert_eq!(ledger.entries.len(), 1);
+        assert_eq!(ledger.entries[0].id, "live");
     }
 
     #[test]
