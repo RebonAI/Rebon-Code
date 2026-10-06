@@ -45,6 +45,7 @@ mod dispatch_prompt;
 mod executable_quiesce;
 mod existing_session;
 mod global_stats;
+pub mod journal;
 /// The file mailbox a local terminal host is still commanded through. Kept
 /// indefinitely, and named for what it is: it predates the
 /// endpoint and is not wired to worker IPC.
