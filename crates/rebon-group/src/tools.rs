@@ -94,7 +94,7 @@ pub fn specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: GROUP_SEND,
-            description: "Write to your agent group. kind note (default) tells, request asks a member to do something and returns a request id, reply answers a request (name it in re). to is a member's alias, all, or user. When you need the user's answer or decision, send to user with kind request and the complete question so it appears as pending in the group. Do not silently wait in your own session. Sending never waits: continue independent work or end your turn; the user's reply resumes you. Read the answer with group_inbox. Do not repeat an unanswered question. Keep it short — the others read it in their own context.",
+            description: "Write to your agent group. kind note (default) tells, request asks a member to do something and returns a request id, reply answers a request (name it in re). to is a member's alias, all, or user. Anything sent to a member's alias goes straight into that member's input — queued behind its current turn if it is busy — and starts its turn, so send to one member only what needs it to act or answer, never just to acknowledge or thank; a note to all waits for each member's next turn. When you need the user's answer or decision, send to user with kind request and the complete question so it appears as pending in the group. Do not silently wait in your own session. Sending never waits: continue independent work or end your turn; the user's reply resumes you. Read the answer with group_inbox. Do not repeat an unanswered question. Keep it short — the others read it in their own context.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

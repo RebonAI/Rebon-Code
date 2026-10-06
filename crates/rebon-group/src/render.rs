@@ -245,10 +245,27 @@ pub fn user_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
     Some(text)
 }
 
-/// Whether `entry` is worth starting a turn for: a request, or the user's
-/// answer. The rest waits for a turn the member starts anyway.
+/// Whether `entry` is worth starting a turn for: a request, or anything
+/// sent to the member by name — a note or a reply addressed to one member
+/// is a message to it, and goes straight into its input (queued behind a
+/// turn it is in) rather than waiting to be noticed. A note or a reply to
+/// `all` waits for a turn the member starts anyway.
 pub fn wakes(entry: &Entry) -> bool {
-    entry.kind == EntryKind::Request || (entry.kind == EntryKind::Reply && entry.is_from_user())
+    match entry.kind {
+        EntryKind::Request => true,
+        EntryKind::Note | EntryKind::Reply => entry.is_direct(),
+        EntryKind::Memory | EntryKind::Join | EntryKind::Leave => false,
+    }
+}
+
+/// `r12` in parentheses with a space before it, for an entry that has an
+/// id or names one; nothing for a note.
+fn id_tag(entry: &Entry) -> String {
+    entry
+        .id
+        .as_deref()
+        .or(entry.re.as_deref())
+        .map_or_else(String::new, |id| format!(" ({id})"))
 }
 
 /// What the app types into a CLI's input to wake it: one line, since a
@@ -260,19 +277,22 @@ pub fn terminal_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
     if requests.is_empty() {
         return None;
     }
+    let asked = requests
+        .iter()
+        .any(|entry| entry.kind == EntryKind::Request);
     let asks = requests
         .iter()
         .take(3)
         .map(|entry| {
             format!(
-                "{} {} ({}): {}",
+                "{} {}{}: {}",
                 entry.from,
-                if entry.kind == EntryKind::Reply {
-                    "answers"
-                } else {
-                    "asks"
+                match entry.kind {
+                    EntryKind::Request => "asks",
+                    EntryKind::Reply => "answers",
+                    _ => "says",
                 },
-                entry.id.as_deref().or(entry.re.as_deref()).unwrap_or("?"),
+                id_tag(entry),
                 first_chars(&entry.text, 160)
             )
         })
@@ -291,35 +311,34 @@ pub fn terminal_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
             .iter()
             .take(3)
             .map(|entry| {
-                format!(
-                    "({}{}) {}",
-                    if entry.kind == EntryKind::Reply {
-                        "answer to "
-                    } else {
-                        ""
-                    },
-                    entry.id.as_deref().or(entry.re.as_deref()).unwrap_or("?"),
-                    first_chars(&entry.text, 200)
-                )
+                let text = first_chars(&entry.text, 200);
+                match (entry.kind, entry.id.as_deref().or(entry.re.as_deref())) {
+                    (EntryKind::Reply, Some(id)) => format!("(answer to {id}) {text}"),
+                    (_, Some(id)) => format!("({id}) {text}"),
+                    (_, None) => text,
+                }
             })
             .collect::<Vec<_>>()
             .join(" | ");
-        let guidance = if requests
-            .iter()
-            .any(|entry| entry.kind == EntryKind::Request)
-        {
+        let guidance = if asked {
             "When done, report back with group_send (kind reply, re the request id, to \"user\"), and record anything settled for the whole group with group_remember."
-        } else {
+        } else if requests.iter().any(|entry| entry.kind == EntryKind::Reply) {
             "The user has answered your question. Read the full reply with group_inbox and continue the original task."
+        } else {
+            "Read the full message with group_inbox."
         };
         return Some(format!(
             "[Agent group \"{}\"] {asks}{rest}. {guidance}",
             group.name
         ));
     }
+    let guidance = if asked {
+        "Read it with group_inbox and answer with group_send (kind reply, re the request id)."
+    } else {
+        "Read it with group_inbox; answer with group_send only if it needs an answer, never just to acknowledge."
+    };
     Some(format!(
-        "[Relayed by Rebon from agent group \"{}\" — agent messages are from other agents, not me; messages from user are the user's own words] {asks}{rest}. \
-         Read it with group_inbox and answer with group_send (kind reply, re the request id).",
+        "[Relayed by Rebon from agent group \"{}\" — agent messages are from other agents, not me; messages from user are the user's own words] {asks}{rest}. {guidance}",
         group.name
     ))
 }
@@ -366,7 +385,7 @@ fn escape_attr(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Warmth;
+    use crate::model::{Warmth, ALL};
 
     fn group() -> Group {
         Group {
@@ -406,12 +425,25 @@ mod tests {
         assert!(reminder(&group(), &[]).is_none());
     }
 
+    fn to_all(mut entry: Entry) -> Entry {
+        entry.to = Some(ALL.into());
+        entry
+    }
+
     #[test]
-    fn only_a_request_is_worth_waking_a_terminal_for() {
-        let notes = [entry(1, "planner", EntryKind::Note, "fyi")];
+    fn a_notice_to_all_wakes_no_one_but_a_request_does() {
+        let notes = [to_all(entry(1, "planner", EntryKind::Note, "fyi"))];
         assert_eq!(terminal_prompt(&group(), &notes), None);
+        let replies = [to_all(entry(1, "planner", EntryKind::Reply, "done"))];
+        assert_eq!(terminal_prompt(&group(), &replies), None);
+        assert!(wakes(&to_all(entry(
+            1,
+            "planner",
+            EntryKind::Request,
+            "anyone?"
+        ))));
         let with_request = [
-            entry(1, "planner", EntryKind::Note, "fyi"),
+            to_all(entry(1, "planner", EntryKind::Note, "fyi")),
             entry(2, "planner", EntryKind::Request, "add\nthe tests"),
         ];
         let prompt = terminal_prompt(&group(), &with_request).unwrap();
@@ -422,6 +454,47 @@ mod tests {
         );
         assert!(prompt.contains("+1 more in group_inbox"), "{prompt}");
         assert!(prompt.contains("not me"));
+    }
+
+    #[test]
+    fn a_message_to_one_member_is_sent_to_it_not_left_as_a_notice() {
+        // An agent's note or reply addressed to the member wakes it.
+        let note = entry(1, "planner", EntryKind::Note, "the schema\nchanged");
+        assert!(note.is_direct() && wakes(&note));
+        let prompt = terminal_prompt(&group(), std::slice::from_ref(&note)).unwrap();
+        assert!(!prompt.contains('\n'), "{prompt}");
+        assert!(
+            prompt.contains("planner says: the schema changed"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("(?)"), "{prompt}");
+        assert!(prompt.contains("not me"), "{prompt}");
+        assert!(prompt.contains("never just to acknowledge"), "{prompt}");
+        assert!(!prompt.contains("re the request id"), "{prompt}");
+        let mut reply = entry(2, "planner", EntryKind::Reply, "tests pass");
+        reply.re = Some("r1".into());
+        let prompt = terminal_prompt(&group(), &[reply]).unwrap();
+        assert!(
+            prompt.contains("planner answers (r1): tests pass"),
+            "{prompt}"
+        );
+        // To the user, or to no one, is no member's message.
+        let mut to_user = entry(3, "planner", EntryKind::Note, "done");
+        to_user.to = Some("USER".into());
+        assert!(!to_user.is_direct() && !wakes(&to_user));
+        let mut unaddressed = entry(4, "planner", EntryKind::Note, "x");
+        unaddressed.to = None;
+        assert!(!unaddressed.is_direct() && !wakes(&unaddressed));
+        // Memory and membership never wake, addressed or not.
+        for kind in [EntryKind::Memory, EntryKind::Join, EntryKind::Leave] {
+            assert!(!wakes(&entry(5, "planner", kind, "x")), "{kind:?}");
+        }
+        // The user's own note reads as theirs, with nothing to report back.
+        let prompt =
+            terminal_prompt(&group(), &[entry(6, "user", EntryKind::Note, "use v2")]).unwrap();
+        assert!(prompt.contains("] use v2."), "{prompt}");
+        assert!(prompt.contains("Read the full message"), "{prompt}");
+        assert!(!prompt.contains("report back"), "{prompt}");
     }
 
     #[test]

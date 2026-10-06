@@ -505,9 +505,9 @@ mod tests {
         let planner = member("rebon", "s1", "planner", Delivery::Auto).key();
         let coder = member("claude-code", "aa38", "coder", Delivery::Auto).key();
         hook_output(&store, "claude-code", &input("UserPromptSubmit")).unwrap();
-        for (kind, text) in [
-            (EntryKind::Note, "an earlier note"),
-            (EntryKind::Request, "a later request"),
+        for (kind, to, text) in [
+            (EntryKind::Note, "all", "an earlier note"),
+            (EntryKind::Request, "coder", "a later request"),
         ] {
             store
                 .append(
@@ -515,7 +515,7 @@ mod tests {
                     &planner,
                     Draft {
                         kind,
-                        to: Some("coder".into()),
+                        to: Some(to.into()),
                         re: None,
                         supersedes: None,
                         text: text.into(),
@@ -567,6 +567,29 @@ mod tests {
             .unwrap_or_default();
         assert!(!text.contains("use the first one"));
         assert!(pending(&store, &coder).is_some());
+        // So does another agent's note sent to the member by name: it is a
+        // message to it, not a notice to read in passing.
+        let (_dir, store, group) = setup(Delivery::Auto);
+        hook_output(&store, "claude-code", &input("UserPromptSubmit")).unwrap();
+        store
+            .append(
+                &group,
+                &planner,
+                Draft {
+                    kind: EntryKind::Note,
+                    to: Some("coder".into()),
+                    re: None,
+                    supersedes: None,
+                    text: "the schema changed".into(),
+                },
+            )
+            .unwrap();
+        let text = hook_output(&store, "claude-code", &start)
+            .map(|output| output.to_string())
+            .unwrap_or_default();
+        assert!(!text.contains("the schema changed"));
+        let waiting = pending(&store, &coder).unwrap();
+        assert_eq!(waiting.entries[0].text, "the schema changed");
     }
 
     #[test]

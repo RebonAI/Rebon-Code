@@ -139,6 +139,15 @@ impl Entry {
             Some(to) => to.eq_ignore_ascii_case(ALL) || to.eq_ignore_ascii_case(alias),
         }
     }
+
+    /// Addressed to one member by its alias rather than to everyone (or to
+    /// the user, who is no member): a message to that member, not a notice
+    /// the group leaves for whoever reads it.
+    pub fn is_direct(&self) -> bool {
+        self.to
+            .as_deref()
+            .is_some_and(|to| !to.eq_ignore_ascii_case(ALL) && !to.eq_ignore_ascii_case(USER))
+    }
 }
 
 /// The address every member reads.
