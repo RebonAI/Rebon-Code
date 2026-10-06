@@ -10,6 +10,7 @@ mod acp_control_plane;
 mod agent_runtime;
 mod cancel_call;
 mod ipc_commands;
+mod mods_request;
 mod owner_descriptor_gate;
 mod pending_prompt;
 mod permissions_questions;

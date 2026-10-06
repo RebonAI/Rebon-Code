@@ -783,6 +783,9 @@ pub(crate) fn default_budget(request: &BackgroundIpcRequest) -> Duration {
         BackgroundIpcRequest::Compact { .. } => crate::command_response_timeout("compact"),
         BackgroundIpcRequest::Rewind { .. } => crate::command_response_timeout("rewind"),
         BackgroundIpcRequest::SetSessionOption { .. } => Duration::from_secs(30),
+        // A drawing or a mod command runs a hook in the owner's Node host,
+        // which has its own bound; this only has to outlast it.
+        BackgroundIpcRequest::Mods { .. } => Duration::from_secs(20),
         _ => Duration::from_secs(2),
     }
 }

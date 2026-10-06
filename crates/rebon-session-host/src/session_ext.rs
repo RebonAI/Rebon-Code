@@ -191,6 +191,8 @@ pub mod method {
     pub const SUBSCRIBE: &str = "_session/subscribe";
     /// Stop waiting for a call that is still running.
     pub const CANCEL_CALL: &str = "_session/cancel_call";
+    /// Ask the session's Claude Code mods one question.
+    pub const MODS: &str = "_session/mods";
 
     /// Owner to client: the first message on a new subscription.
     pub const HELLO: &str = "_session/hello";
@@ -221,6 +223,7 @@ pub mod method {
         RELEASE_LEASE,
         SUBSCRIBE,
         CANCEL_CALL,
+        MODS,
         HELLO,
         TURN,
         STATUS_CHANGED,
@@ -253,6 +256,14 @@ pub struct RunCommandParams {
     pub name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+}
+
+/// [`method::MODS`]: one call for the session's mods, `{ "op": ..., ... }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ModsParams {
+    pub call: serde_json::Value,
 }
 
 /// What a slash command produced.
@@ -583,6 +594,7 @@ pub fn method_and_params(
             serde_json::json!({ "commandId": command_id }),
         ),
         R::Subscribe { since } => (method::SUBSCRIBE, serde_json::json!({ "since": since })),
+        R::Mods { call } => (method::MODS, serde_json::json!({ "call": call })),
         // Covered by the standard; see the note on this function.
         R::Reply { .. } | R::Steer { .. } | R::Cancel { .. } | R::PermissionAnswer { .. } => {
             return None
@@ -921,7 +933,7 @@ mod tests {
         let mut unique = sorted.clone();
         unique.dedup();
         assert_eq!(sorted, unique, "a method name is listed twice");
-        assert_eq!(method::ALL.len(), 20);
+        assert_eq!(method::ALL.len(), 21);
     }
 
     /// `_session/steering` is not declared here on purpose: it already exists

@@ -201,6 +201,7 @@ fn roots() -> Vec<(&'static str, Schema)> {
             "CancelCallResult",
             schema_for!(session_ext::CancelCallResult),
         ),
+        ("ModsParams", schema_for!(session_ext::ModsParams)),
         ("HelloParams", schema_for!(session_ext::HelloParams)),
         ("TurnParams", schema_for!(session_ext::TurnParams)),
         (

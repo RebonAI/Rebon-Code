@@ -2546,6 +2546,47 @@ pub fn broadcast_reconcile_plugins(store: &BackgroundStore) -> Vec<(String, anyh
         .collect()
 }
 
+/// Tell every job that publishes an endpoint to reload its Claude Code mods
+/// (`{ "op": "reload" }`), so a mod folder added or edited is picked up by
+/// the sessions already running, not only by the next one. Answered per job
+/// with the reload report, or why that job could not do it.
+pub fn broadcast_mods_reload(
+    store: &BackgroundStore,
+) -> Vec<(String, anyhow::Result<serde_json::Value>)> {
+    let jobs = match store.list_jobs() {
+        Ok(jobs) => jobs,
+        Err(err) => return vec![("<list>".to_string(), Err(err))],
+    };
+    jobs.into_iter()
+        .filter_map(|state| {
+            let port = state.process.ipc_port?;
+            let token = state.process.ipc_token.clone()?;
+            let outcome = send_background_ipc_request_full(
+                &state,
+                port,
+                token,
+                BackgroundIpcRequest::Mods {
+                    call: serde_json::json!({ "op": "reload" }),
+                },
+                None,
+            )
+            .and_then(|response| {
+                if response.ok {
+                    Ok(response.data.unwrap_or(serde_json::Value::Null))
+                } else {
+                    Err(anyhow::anyhow!(
+                        "{}",
+                        response
+                            .error
+                            .unwrap_or_else(|| "the owner refused".to_owned())
+                    ))
+                }
+            });
+            Some((state.identity.job_id.clone(), outcome))
+        })
+        .collect()
+}
+
 /// Send a request and hand back the whole response, payload included.
 ///
 /// `command_id` makes the send idempotent: a retry after a lost connection

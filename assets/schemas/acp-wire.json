@@ -1559,6 +1559,16 @@
       ],
       "type": "object"
     },
+    "ModsParams": {
+      "description": "[`method::MODS`]: one call for the session's mods, `{ \"op\": ..., ... }`.",
+      "properties": {
+        "call": true
+      },
+      "required": [
+        "call"
+      ],
+      "type": "object"
+    },
     "OutOfRangeRuntime": {
       "description": "A Node that answered, but not with a version this build accepts.",
       "properties": {

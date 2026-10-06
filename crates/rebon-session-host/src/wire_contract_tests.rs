@@ -627,6 +627,12 @@ fn every_request_variant_has_the_encoding_it_has_today() {
             r#""reconcilePlugins""#,
         ),
         (
+            BackgroundIpcRequest::Mods {
+                call: serde_json::json!({"op": "snapshot", "since": 3}),
+            },
+            r#"{"mods":{"call":{"op":"snapshot","since":3}}}"#,
+        ),
+        (
             BackgroundIpcRequest::Lease {
                 client_id: "tui-1".to_string(),
                 kind: ClientLeaseKind::Tui,
@@ -654,7 +660,7 @@ fn every_request_variant_has_the_encoding_it_has_today() {
             r#"{"cancelCall":{"command_id":"cmd-7"}}"#,
         ),
     ];
-    assert_eq!(cases.len(), 19, "one case per request variant");
+    assert_eq!(cases.len(), 20, "one case per request variant");
     for (request, expected) in cases {
         assert_eq!(canonical_of(&request), expected, "{request:?}");
         let decoded: BackgroundIpcRequest =

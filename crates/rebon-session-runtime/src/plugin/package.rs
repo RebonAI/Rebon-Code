@@ -123,6 +123,43 @@ pub(crate) fn unpack_package(
     }
 }
 
+/// Unpacks a `.tgz` / `.tar.gz` / `.tar` under the same limits and checks
+/// as a package, without asking for a `rebon-plugin.json`: a marketplace
+/// plugin may be a Claude Code mod. Answers the folder holding the content,
+/// the one directory an npm tarball wraps it in, or the destination itself.
+pub(crate) fn unpack_archive_folder(
+    archive: &Path,
+    destination: &Path,
+    limits: PackageLimits,
+) -> anyhow::Result<PathBuf> {
+    let file = fs::File::open(archive)
+        .with_context(|| format!("failed to open archive {}", archive.display()))?;
+    let reader = std::io::BufReader::new(file);
+    let plain_tar = archive.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .to_ascii_lowercase()
+            .ends_with(".tar")
+    });
+    let unpacked = if plain_tar {
+        unpack_tar(reader, destination, limits)
+    } else {
+        unpack_tar(
+            std::io::BufReader::new(flate2::read::GzDecoder::new(reader)),
+            destination,
+            limits,
+        )
+    };
+    if let Err(error) = unpacked {
+        let _ = fs::remove_dir_all(destination);
+        return Err(error.context(format!("archive {}", archive.display())));
+    }
+    let mut children = fs::read_dir(destination)?.flatten();
+    match (children.next(), children.next()) {
+        (Some(only), None) if only.file_type()?.is_dir() => Ok(only.path()),
+        _ => Ok(destination.to_path_buf()),
+    }
+}
+
 /// A package is either flat or wrapped in exactly one directory — the shape npm
 /// tarballs use. More than one candidate is ambiguous, and guessing which
 /// directory is the plugin is how the wrong code gets installed.

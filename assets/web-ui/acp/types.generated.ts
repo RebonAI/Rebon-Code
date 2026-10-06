@@ -670,6 +670,11 @@ export interface ModelsResponse {
   provider?: string;
 }
 
+/** [`method::MODS`]: one call for the session's mods, `{ "op": ..., ... }`. */
+export interface ModsParams {
+  call: JsonValue;
+}
+
 /** A Node that answered, but not with a version this build accepts. */
 export interface OutOfRangeRuntime {
   /** Where it lives. */

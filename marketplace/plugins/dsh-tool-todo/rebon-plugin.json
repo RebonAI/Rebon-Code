@@ -1,0 +1,27 @@
+{
+  "name": "dsh-tool-todo",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness todo list: a todo_write tool the model keeps its plan in. Packaged from the DeepSeek Harness module Rebon vendors (@deepseek-ai/dsh-tool-todo).",
+  "license": "MIT",
+  "capabilities": {
+    "kernelPlugins": {
+      "dsh-tool-todo": {
+        "entry": "tool-todo.js",
+        "tools": [
+          "todo_write"
+        ],
+        "publishedTopics": [
+          "compose:session/append"
+        ]
+      }
+    }
+  },
+  "metadata": {
+    "upstream": "@deepseek-ai/dsh-tool-todo",
+    "kernelPluginConfig": {
+      "dsh-tool-todo": {
+        "allowParallelInProgress": false
+      }
+    }
+  }
+}

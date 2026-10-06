@@ -6,10 +6,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context};
 use sha2::{Digest, Sha256};
 
-use super::manifest::PluginManifest;
+use super::manifest::{PluginManifest, PLUGIN_MANIFEST_FILE};
 use super::package::{unpack_package, PackageLimits};
 use super::source::{resolve_install_source, ResolvedPluginSource};
 use super::store::{InstalledPluginRecord, PluginScope, PluginSourceKind, PluginStore};
+
+/// A container's grant and data directory, gone: what uninstalling leaves.
+pub(crate) fn forget_container_in(config_home: &Path, container: &str) {
+    let mut grants =
+        rebon_harness::rebon_plugin_package::container::ContainerGrants::load(config_home);
+    if grants.containers.contains_key(container) {
+        grants.remove(container);
+        let _ = grants.save(config_home);
+    }
+    let data =
+        rebon_harness::rebon_plugin_package::container::container_data_dir(config_home, container);
+    if data.exists() {
+        let _ = fs::remove_dir_all(&data);
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PluginInstaller {
@@ -104,6 +119,37 @@ impl PluginInstaller {
                 };
                 self.store.upsert_record(scope, record.clone())?;
                 Ok(record)
+            }
+            ResolvedPluginSource::ClaudeMod { root, manifest } => {
+                let staging = self.staging_dir(scope, &manifest.name, &manifest.version);
+                if staging.exists() {
+                    let _ = fs::remove_dir_all(&staging);
+                }
+                fs::create_dir_all(&staging)?;
+                let staged_root = staging.join("package");
+                if let Err(err) = copy_dir_recursive(&root, &staged_root) {
+                    let _ = fs::remove_dir_all(&staging);
+                    return Err(err);
+                }
+                // The synthesised manifest travels with the copy: an installed
+                // mod is found by name the way any package is, and the ceiling
+                // it loads against is the one the scan read at install time.
+                let written = serde_json::to_vec_pretty(&manifest)
+                    .context("serialising the mod's synthesised manifest")
+                    .and_then(|bytes| {
+                        fs::write(staged_root.join(PLUGIN_MANIFEST_FILE), bytes)
+                            .context("writing the mod's synthesised manifest")
+                    });
+                if let Err(err) = written {
+                    let _ = fs::remove_dir_all(&staging);
+                    return Err(err);
+                }
+                self.publish_staged(
+                    scope,
+                    staging,
+                    staged_root,
+                    root.to_string_lossy().to_string(),
+                )
             }
             ResolvedPluginSource::LocalPath { root, manifest }
             | ResolvedPluginSource::ConfiguredDir { root, manifest } => {
@@ -200,7 +246,49 @@ impl PluginInstaller {
         };
         self.store.upsert_record(scope, record.clone())?;
         self.retire_superseded_versions(scope, &record)?;
+        self.grant_container(&record)?;
         Ok(record)
+    }
+
+    /// The config home, where container grants and data live whatever the
+    /// install scope: a container is the person's, not the project's.
+    fn config_home(&self) -> Option<PathBuf> {
+        self.store
+            .scope_dir(PluginScope::User)
+            .parent()
+            .map(Path::to_path_buf)
+    }
+
+    /// What the package asks of its container becomes its grant. Installing
+    /// it is the consent, and what was granted is said in the install's
+    /// answer; `plugins/grants.json` is where a person narrows it.
+    fn grant_container(&self, record: &InstalledPluginRecord) -> anyhow::Result<()> {
+        let Some(home) = self.config_home() else {
+            return Ok(());
+        };
+        let request = record
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.container.clone())
+            .unwrap_or_default();
+        let mut grants =
+            rebon_harness::rebon_plugin_package::container::ContainerGrants::load(&home);
+        grants.set(
+            &rebon_harness::rebon_plugin_package::container::package_container_id(&record.name),
+            request,
+        );
+        grants.save(&home)
+    }
+
+    /// Takes a package's container with it: its grant and its data.
+    fn forget_container(&self, name: &str) {
+        let Some(home) = self.config_home() else {
+            return;
+        };
+        forget_container_in(
+            &home,
+            &rebon_harness::rebon_plugin_package::container::package_container_id(name),
+        );
     }
 
     /// Drop every other installed version of the same plugin.
@@ -265,6 +353,7 @@ impl PluginInstaller {
     ) -> anyhow::Result<Option<InstalledPluginRecord>> {
         let removed = self.store.uninstall(scope, name)?;
         if let Some(record) = &removed {
+            self.forget_container(&record.name);
             if matches!(record.source_kind, PluginSourceKind::Local) {
                 let dir = self
                     .store
@@ -526,7 +615,9 @@ fn ensure_self_contained(
     Ok(())
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
+/// Copies a plugin folder: everything but staging leftovers and a git
+/// checkout's `.git` (a plugin fetched from a repository needs none of it).
+pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
@@ -535,7 +626,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
         let metadata = entry.metadata()?;
         if metadata.is_dir() {
             let name = entry.file_name();
-            if name.to_string_lossy().starts_with(".stage-") {
+            let name = name.to_string_lossy();
+            if name.starts_with(".stage-") || name == ".git" {
                 continue;
             }
             copy_dir_recursive(&path, &dest)?;

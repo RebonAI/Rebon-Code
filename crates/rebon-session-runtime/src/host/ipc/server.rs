@@ -1743,6 +1743,34 @@ fn run_command_on_turn_loop(
 /// long enough that a `/compact` running for minutes does not spin.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How long a `Mods` request may wait on the mods' Node host. Under the
+/// client's own budget for it, so the client hears this side's answer.
+const MODS_CALL_BOUND: Duration = Duration::from_secs(15);
+
+/// `{ "op": "reload" }`: re-read the composition here, so a mod folder added
+/// or edited since this owner started is loaded (or reloaded) in its session.
+/// On a thread of its own: the plane's runtime may be blocked on from there
+/// whatever thread this connection is served on.
+fn reload_mods_here() -> Result<serde_json::Value, String> {
+    let Some(runtime) = rebon_plugin_host::plugin_boot::running_plane_runtime() else {
+        return Err("no plugin plane is running in this session".to_owned());
+    };
+    let outcome = std::thread::spawn(move || {
+        runtime.block_on(rebon_plugin_host::plugin_boot::reload_process_composition(
+            &rebon_harness::kernel_bootstrap::process_plugin_registry(),
+        ))
+    })
+    .join()
+    .map_err(|_| "the reload thread panicked".to_owned())??;
+    Ok(serde_json::json!({
+        "added": outcome.added,
+        "changed": outcome.changed,
+        "removed": outcome.removed,
+        "unchanged": outcome.unchanged,
+        "failed": outcome.failed,
+    }))
+}
+
 /// The slash command a typed session request is spelled as, when it is one.
 ///
 /// `None` means the request changes the job record rather than the live
@@ -1853,6 +1881,23 @@ pub(crate) fn handle_background_ipc_request(
             // here any more. A refusal would read to the client as an owner too
             // old to know the request, which would be a lie.
             reply_with_data(&serde_json::json!({ "released": released }))
+        }
+        BackgroundIpcRequest::Mods { call } => {
+            // The mods this owner's plane loaded; a session whose plane has
+            // none answers an empty table rather than an error, so a surface
+            // polling it reads "nothing to draw".
+            let answer = if call.get("op").and_then(serde_json::Value::as_str) == Some("reload") {
+                reload_mods_here()
+            } else {
+                match rebon_plugin_host::mods::process_mods() {
+                    Some(mods) => mods.serve_remote_blocking(call, MODS_CALL_BOUND),
+                    None => rebon_plugin_host::mods::ModsRegistry::answer_without_mods(&call),
+                }
+            };
+            match answer {
+                Ok(data) => reply_with_data(&data),
+                Err(error) => Err(request_error(anyhow::anyhow!(error))),
+            }
         }
         BackgroundIpcRequest::ReconcilePlugins => {
             // Another process wrote a plugin switch; this owner's registry is

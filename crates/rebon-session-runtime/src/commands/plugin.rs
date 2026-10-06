@@ -5,6 +5,12 @@
 //! thing the command reads from the session is its working directory, which
 //! decides what "project scope" means, so this belongs beside the session
 //! rather than inside the view that happens to type it.
+//!
+//! The marketplaces are here too: `/plugin marketplace add|list|update|remove`,
+//! `/plugin browse`, and `/plugin install plugin@marketplace`. Adding,
+//! updating and installing from one go to the network
+//! ([`plugin_command_needs_network`]), so a front end with a loop to keep
+//! drawing runs those through [`handle_plugin_command_in`] off it.
 
 use std::path::PathBuf;
 
@@ -38,7 +44,56 @@ pub fn parse_plugin_command(text: &str) -> Option<()> {
     name_ends_here(strip_command_prefix(text, "plugin")?).then_some(())
 }
 
+/// What a `/plugin` command needs from where it was typed: no session, so it
+/// can run on another thread.
+#[derive(Clone, Debug)]
+pub struct PluginCommandContext {
+    pub cwd: PathBuf,
+    pub plugin_dirs: Vec<PathBuf>,
+    pub config_home: PathBuf,
+}
+
+impl PluginCommandContext {
+    pub fn of(session: &EngineSession) -> Self {
+        Self {
+            cwd: PathBuf::from(&session.cwd),
+            plugin_dirs: session
+                .startup
+                .plugin_dirs
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+            config_home: crate::rebon_config::config_home_dir(),
+        }
+    }
+}
+
+/// Whether a `/plugin` command goes to the network: adding or updating a
+/// marketplace, or installing a plugin from one.
+pub fn plugin_command_needs_network(text: &str, cwd: &std::path::Path) -> bool {
+    let Ok(tokens) = tokenize_plugin_args(command_args(text, "plugin")) else {
+        return false;
+    };
+    match tokens
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["marketplace", "add" | "update", ..] => true,
+        ["install", rest @ ..] => rest
+            .iter()
+            .filter(|token| !token.starts_with("--"))
+            .any(|token| crate::plugin::marketplace::is_marketplace_spec(token, cwd)),
+        _ => false,
+    }
+}
+
 pub fn handle_plugin_command(text: &str, session: &EngineSession) -> PluginCommandResult {
+    handle_plugin_command_in(text, &PluginCommandContext::of(session))
+}
+
+pub fn handle_plugin_command_in(text: &str, context: &PluginCommandContext) -> PluginCommandResult {
     let args = command_args(text, "plugin");
     let tokens = match tokenize_plugin_args(args) {
         Ok(tokens) => tokens,
@@ -48,20 +103,58 @@ pub fn handle_plugin_command(text: &str, session: &EngineSession) -> PluginComma
         return PluginCommandResult::ok(plugin_usage_text());
     }
 
-    let cwd = PathBuf::from(&session.cwd);
-    let store =
-        crate::plugin::PluginStore::new(crate::rebon_config::config_home_dir(), cwd.clone());
-    let installer = crate::plugin::PluginInstaller::new(
-        store,
-        cwd,
-        session
-            .startup
-            .plugin_dirs
-            .iter()
-            .map(PathBuf::from)
-            .collect(),
+    let cwd = context.cwd.clone();
+    let store = crate::plugin::PluginStore::new(context.config_home.clone(), cwd.clone());
+    let installer =
+        crate::plugin::PluginInstaller::new(store, cwd.clone(), context.plugin_dirs.clone());
+    let marketplaces = crate::plugin::marketplace::MarketplaceManager::new(
+        context.config_home.clone(),
+        cwd.clone(),
     );
     match tokens[0].as_str() {
+        "browse" | "discover" => match marketplaces.browse() {
+            Ok(catalog) => PluginCommandResult::ok(crate::plugin::marketplace::format_catalog(
+                &catalog,
+                tokens.get(1).map(String::as_str),
+            )),
+            Err(err) => PluginCommandResult::err(format!("{err:#}")),
+        },
+        "marketplace" | "marketplaces" => marketplace_command(&marketplaces, &tokens[1..]),
+        "install"
+            if tokens[1..]
+                .iter()
+                .filter(|token| !token.starts_with("--"))
+                .any(|token| crate::plugin::marketplace::is_marketplace_spec(token, &cwd)) =>
+        {
+            let (scope, rest) = parse_plugin_scope_arg(&tokens[1..]);
+            let scope = match scope {
+                Ok(scope) => scope,
+                Err(err) => return PluginCommandResult::err(err),
+            };
+            let spec = rest.first().cloned().unwrap_or_default();
+            match marketplaces.install(&spec, scope) {
+                Ok(install) => PluginCommandResult::ok(crate::plugin::marketplace::format_install(
+                    "installed",
+                    &install,
+                )),
+                Err(err) => PluginCommandResult::err(format!("{err:#}")),
+            }
+        }
+        "uninstall" | "remove" | "rm"
+            if tokens.get(1).is_some_and(|name| {
+                marketplaces
+                    .installs()
+                    .is_ok_and(|installs| installs.by_id.contains_key(name))
+            }) =>
+        {
+            match marketplaces.uninstall(&tokens[1]) {
+                Ok(install) => PluginCommandResult::ok(crate::plugin::marketplace::format_install(
+                    "uninstalled",
+                    &install,
+                )),
+                Err(err) => PluginCommandResult::err(format!("{err:#}")),
+            }
+        }
         "install" => {
             let (scope, rest) = parse_plugin_scope_arg(&tokens[1..]);
             let scope = match scope {
@@ -172,6 +265,67 @@ pub fn handle_plugin_command(text: &str, session: &EngineSession) -> PluginComma
             }
         }
         _ => PluginCommandResult::ok(plugin_usage_text()),
+    }
+}
+
+/// `/plugin marketplace add|list|update|remove`.
+fn marketplace_command(
+    marketplaces: &crate::plugin::marketplace::MarketplaceManager,
+    args: &[String],
+) -> PluginCommandResult {
+    const USAGE: &str = "Usage: /plugin marketplace add <owner/repo|git url|url|path> | list | update [name] | remove <name>";
+    match args.first().map(String::as_str) {
+        Some("add") => {
+            let Some(source) = args.get(1) else {
+                return PluginCommandResult::err(USAGE);
+            };
+            match marketplaces.add(source) {
+                Ok(view) => PluginCommandResult::ok(format!(
+                    "added marketplace {} ({} plugins) from {}",
+                    view.name, view.plugins, view.source
+                )),
+                Err(err) => PluginCommandResult::err(format!("{err:#}")),
+            }
+        }
+        Some("list" | "ls") | None => match marketplaces.marketplaces() {
+            Ok(views) => {
+                PluginCommandResult::ok(crate::plugin::marketplace::format_marketplaces(&views))
+            }
+            Err(err) => PluginCommandResult::err(format!("{err:#}")),
+        },
+        Some("update") => match marketplaces.update(args.get(1).map(String::as_str)) {
+            Ok(outcomes) => {
+                let failed = outcomes.iter().any(|(_, outcome)| outcome.is_err());
+                let lines: Vec<String> = outcomes
+                    .into_iter()
+                    .map(|(name, outcome)| match outcome {
+                        Ok(()) => format!("updated {name}"),
+                        Err(error) => format!("{name}: {error}"),
+                    })
+                    .collect();
+                let text = if lines.is_empty() {
+                    "no marketplaces to update".to_owned()
+                } else {
+                    lines.join("\n")
+                };
+                if failed {
+                    PluginCommandResult::err(text)
+                } else {
+                    PluginCommandResult::ok(text)
+                }
+            }
+            Err(err) => PluginCommandResult::err(format!("{err:#}")),
+        },
+        Some("remove" | "rm") => {
+            let Some(name) = args.get(1) else {
+                return PluginCommandResult::err(USAGE);
+            };
+            match marketplaces.remove(name) {
+                Ok(()) => PluginCommandResult::ok(format!("removed marketplace {name}")),
+                Err(err) => PluginCommandResult::err(format!("{err:#}")),
+            }
+        }
+        Some(_) => PluginCommandResult::err(USAGE),
     }
 }
 
@@ -294,6 +448,10 @@ fn plugin_usage_text() -> String {
         "  /plugin enable <name> [--scope user|project]",
         "  /plugin disable <name> [--scope user|project]",
         "  /plugin uninstall <name> [--scope user|project]",
+        "  /plugin browse [marketplace]",
+        "  /plugin install <plugin@marketplace>",
+        "  /plugin marketplace add <owner/repo|git url|url|path>",
+        "  /plugin marketplace list | update [name] | remove <name>",
         "",
         "Capabilities are materialized on next startup.",
     ]
@@ -340,6 +498,100 @@ fn format_plugin_records(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_marketplace_adds_updates_and_installs_go_to_the_network() {
+        let cwd = std::env::temp_dir();
+        assert!(plugin_command_needs_network(
+            "/plugin marketplace add o/r",
+            &cwd
+        ));
+        assert!(plugin_command_needs_network(
+            "/plugin marketplace update",
+            &cwd
+        ));
+        assert!(plugin_command_needs_network(
+            "/plugin install radar@mods",
+            &cwd
+        ));
+        assert!(plugin_command_needs_network(
+            "/plugin install --scope user radar@mods",
+            &cwd
+        ));
+        assert!(!plugin_command_needs_network(
+            "/plugin install ./local",
+            &cwd
+        ));
+        assert!(!plugin_command_needs_network(
+            "/plugin marketplace list",
+            &cwd
+        ));
+        assert!(!plugin_command_needs_network("/plugin browse", &cwd));
+        assert!(!plugin_command_needs_network("/plugin list", &cwd));
+    }
+
+    #[test]
+    fn marketplace_subcommands_run_against_the_context_they_are_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let work = dir.path().join("work");
+        let market = work.join("market");
+        std::fs::create_dir_all(market.join(".claude-plugin")).unwrap();
+        std::fs::create_dir_all(market.join("radar/.claude-plugin")).unwrap();
+        std::fs::create_dir_all(market.join("radar/hooks")).unwrap();
+        std::fs::write(
+            market.join("radar/.claude-plugin/plugin.json"),
+            r#"{"name":"radar"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            market.join("radar/hooks/hooks.json"),
+            r#"{"modules":["./r.ts"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            market.join("radar/hooks/r.ts"),
+            "export const register = () => {};",
+        )
+        .unwrap();
+        std::fs::write(
+            market.join(".claude-plugin/marketplace.json"),
+            r#"{"name":"team","plugins":[{"name":"radar","source":"./radar","description":"live line"}]}"#,
+        )
+        .unwrap();
+        let context = PluginCommandContext {
+            cwd: work.clone(),
+            plugin_dirs: Vec::new(),
+            config_home: home.clone(),
+        };
+        let run = |text: &str| handle_plugin_command_in(text, &context);
+        let added = run("/plugin marketplace add ./market");
+        assert!(!added.is_err, "{}", added.text);
+        assert!(
+            added.text.contains("added marketplace team (1 plugins)"),
+            "{}",
+            added.text
+        );
+        let listed = run("/plugin marketplace list");
+        assert!(listed.text.contains("team  1 plugins"), "{}", listed.text);
+        let browsed = run("/plugin browse team");
+        assert!(
+            browsed.text.starts_with("radar@team  mod  live line"),
+            "{}",
+            browsed.text
+        );
+        let installed = run("/plugin install radar@team");
+        assert!(!installed.is_err, "{}", installed.text);
+        assert!(home.join("mods/radar/hooks/r.ts").is_file());
+        assert!(run("/plugin browse").text.contains("[installed]"));
+        let uninstalled = run("/plugin uninstall radar@team");
+        assert!(!uninstalled.is_err, "{}", uninstalled.text);
+        assert!(!home.join("mods/radar").exists());
+        let removed = run("/plugin marketplace remove team");
+        assert!(!removed.is_err, "{}", removed.text);
+        assert!(run("/plugin marketplace frobnicate").is_err);
+        assert!(run("/plugin marketplace add").is_err);
+    }
 
     #[test]
     fn plugin_sha256_flag_is_lifted_out_of_the_arguments() {

@@ -623,6 +623,10 @@ fn translate(
                 command_id: params.command_id,
             }
         }
+        method::MODS => {
+            let params: ext::ModsParams = decode(request_method, params)?;
+            BackgroundIpcRequest::Mods { call: params.call }
+        }
         // The standard methods. A prompt is a prompt whichever protocol
         // carried it, so these translate rather than getting a `_session/*`
         // spelling of their own.
@@ -822,6 +826,13 @@ mod tests {
                 method::RECONCILE_PLUGINS,
                 json!({}),
                 BackgroundIpcRequest::ReconcilePlugins,
+            ),
+            (
+                method::MODS,
+                json!({"call": {"op": "snapshot", "since": 3}}),
+                BackgroundIpcRequest::Mods {
+                    call: json!({"op": "snapshot", "since": 3}),
+                },
             ),
             (
                 method::RUN_COMMAND,
@@ -1051,6 +1062,9 @@ mod tests {
             BackgroundIpcRequest::Ping,
             BackgroundIpcRequest::Status,
             BackgroundIpcRequest::ReconcilePlugins,
+            BackgroundIpcRequest::Mods {
+                call: json!({"op": "press", "plugin": "counter", "element": "more"}),
+            },
             BackgroundIpcRequest::RunCommand {
                 name: "hooks".into(),
                 args: vec!["list".into()],

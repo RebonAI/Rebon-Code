@@ -1,0 +1,258 @@
+{
+  "name": "rebon",
+  "owner": {
+    "name": "Rebon",
+    "url": "https://github.com/RebonAI/Rebon-Code"
+  },
+  "description": "Rebon's own marketplace: DeepSeek Harness plugins and Claude Code mods.",
+  "metadata": {
+    "version": "1"
+  },
+  "plugins": [
+    {
+      "name": "dsh-tool-todo",
+      "source": "./plugins/dsh-tool-todo",
+      "description": "DeepSeek Harness todo list: a todo_write tool the model keeps its plan in.",
+      "version": "0.1.0",
+      "category": "deepseek-harness",
+      "tags": [
+        "dsh",
+        "deepseek"
+      ]
+    },
+    {
+      "name": "dsh-tool-web",
+      "source": "./plugins/dsh-tool-web",
+      "description": "DeepSeek Harness web tools: web_search and web_fetch.",
+      "version": "0.1.0",
+      "category": "deepseek-harness",
+      "tags": [
+        "dsh",
+        "deepseek"
+      ]
+    },
+    {
+      "name": "dsh-web-search-exa",
+      "source": "./plugins/dsh-web-search-exa",
+      "description": "DeepSeek Harness Exa search backend for web_search (needs an Exa API key).",
+      "version": "0.1.0",
+      "category": "deepseek-harness",
+      "tags": [
+        "dsh",
+        "deepseek"
+      ]
+    },
+    {
+      "name": "dsh-llm-deepseek",
+      "source": "./plugins/dsh-llm-deepseek",
+      "description": "DeepSeek Harness model provider for the official DeepSeek API, on the plugin plane.",
+      "version": "0.1.0",
+      "category": "deepseek-harness",
+      "tags": [
+        "dsh",
+        "deepseek"
+      ]
+    },
+    {
+      "name": "dsh-web-search-perplexity",
+      "source": {
+        "source": "npm",
+        "package": "@deepseek-ai/dsh-web-search-perplexity",
+        "version": "0.0.1-rc.1"
+      },
+      "description": "DeepSeek Harness Perplexity search backend for web_search (needs a Perplexity API key).",
+      "version": "0.0.1-rc.1",
+      "category": "deepseek-harness",
+      "tags": [
+        "dsh",
+        "deepseek",
+        "npm"
+      ]
+    },
+    {
+      "name": "dsh-web-search-deepseek",
+      "source": {
+        "source": "npm",
+        "package": "@deepseek-ai/dsh-web-search-deepseek",
+        "version": "0.0.1-rc.1"
+      },
+      "description": "DeepSeek Harness DeepSeek search backend for web_search, through the official API.",
+      "version": "0.0.1-rc.1",
+      "category": "deepseek-harness",
+      "tags": [
+        "dsh",
+        "deepseek",
+        "npm"
+      ]
+    },
+    {
+      "name": "dsh-web-fetch-http",
+      "source": {
+        "source": "npm",
+        "package": "@deepseek-ai/dsh-web-fetch-http",
+        "version": "0.0.1-rc.5"
+      },
+      "description": "DeepSeek Harness public HTTP(S) fetch provider for web_fetch.",
+      "version": "0.0.1-rc.5",
+      "category": "deepseek-harness",
+      "tags": [
+        "dsh",
+        "deepseek",
+        "npm"
+      ]
+    },
+    {
+      "name": "dsh-tool-call-timeout-policy",
+      "source": {
+        "source": "npm",
+        "package": "@deepseek-ai/dsh-tool-call-timeout-policy",
+        "version": "0.0.1-rc.3"
+      },
+      "description": "DeepSeek Harness per-tool deadline: a tool call that outlives it answers TOOL_TIMEOUT.",
+      "version": "0.0.1-rc.3",
+      "category": "deepseek-harness",
+      "tags": [
+        "dsh",
+        "deepseek",
+        "npm"
+      ]
+    },
+    {
+      "name": "dsh-repeat-tool-reminder",
+      "source": {
+        "source": "npm",
+        "package": "@deepseek-ai/dsh-repeat-tool-reminder",
+        "version": "0.0.1-rc.3"
+      },
+      "description": "DeepSeek Harness reminder when the agent loops on identical tool calls.",
+      "version": "0.0.1-rc.3",
+      "category": "deepseek-harness",
+      "tags": [
+        "dsh",
+        "deepseek",
+        "npm"
+      ]
+    },
+    {
+      "name": "dsh-skill-office",
+      "source": {
+        "source": "npm",
+        "package": "@deepseek-ai/dsh-skill-office",
+        "version": "0.1.6-alpha.2"
+      },
+      "description": "DeepSeek Harness skills for Word, Excel and PowerPoint documents, as rebon skills.",
+      "version": "0.1.6-alpha.2",
+      "category": "deepseek-harness",
+      "tags": [
+        "dsh",
+        "deepseek",
+        "npm"
+      ]
+    },
+    {
+      "name": "agent-radar",
+      "source": {
+        "source": "git-subdir",
+        "url": "hamzafer/claude-code-mods",
+        "path": "mods/agent-radar"
+      },
+      "description": "One live line above the prompt per running subagent; /radar shows every agent and its messages.",
+      "category": "claude-code-mods",
+      "tags": [
+        "mod",
+        "community"
+      ],
+      "homepage": "https://github.com/hamzafer/claude-code-mods"
+    },
+    {
+      "name": "context-bar",
+      "source": {
+        "source": "git-subdir",
+        "url": "hamzafer/claude-code-mods",
+        "path": "mods/context-bar"
+      },
+      "description": "Your context window as a stacked bar above the prompt; /context-bar shows or hides it.",
+      "category": "claude-code-mods",
+      "tags": [
+        "mod",
+        "community"
+      ],
+      "homepage": "https://github.com/hamzafer/claude-code-mods"
+    },
+    {
+      "name": "snake",
+      "source": {
+        "source": "git-subdir",
+        "url": "hamzafer/claude-code-mods",
+        "path": "mods/snake"
+      },
+      "description": "Play Snake in a pane while Claude works; /snake turns it on or off.",
+      "category": "claude-code-mods",
+      "tags": [
+        "mod",
+        "community"
+      ],
+      "homepage": "https://github.com/hamzafer/claude-code-mods"
+    },
+    {
+      "name": "next-steps",
+      "source": {
+        "source": "git-subdir",
+        "url": "hamzafer/claude-code-mods",
+        "path": "mods/next-steps"
+      },
+      "description": "Suggested next steps drawn above the prompt after each answer.",
+      "category": "claude-code-mods",
+      "tags": [
+        "mod",
+        "community"
+      ],
+      "homepage": "https://github.com/hamzafer/claude-code-mods"
+    },
+    {
+      "name": "session-status",
+      "source": {
+        "source": "git-subdir",
+        "url": "liawzishen/claude-code-mods",
+        "path": "session-status"
+      },
+      "description": "Elapsed time, prompts and tool calls in the status line.",
+      "category": "claude-code-mods",
+      "tags": [
+        "mod",
+        "community"
+      ],
+      "homepage": "https://github.com/liawzishen/claude-code-mods"
+    },
+    {
+      "name": "git-diff-timeline",
+      "source": {
+        "source": "git-subdir",
+        "url": "liawzishen/claude-code-mods",
+        "path": "git-diff-timeline"
+      },
+      "description": "A Git Diff pane: what changed, file by file, with branch compare; /gitdiff opens it.",
+      "category": "claude-code-mods",
+      "tags": [
+        "mod",
+        "community"
+      ],
+      "homepage": "https://github.com/liawzishen/claude-code-mods"
+    },
+    {
+      "name": "token-weather",
+      "source": {
+        "source": "git-subdir",
+        "url": "cskwork/claude-code-mods",
+        "path": "token-weather"
+      },
+      "description": "A live forecast of the context window, drawn above the prompt.",
+      "category": "claude-code-mods",
+      "tags": [
+        "mod",
+        "community"
+      ],
+      "homepage": "https://github.com/cskwork/claude-code-mods"
+    }
+  ]
+}

@@ -227,6 +227,19 @@ pub enum BackgroundIpcRequest {
     CancelCall {
         command_id: String,
     },
+    /// One question for the Claude Code mods this owner loaded: what they
+    /// put on screen since a version, draw a pane, a press, a mod command.
+    ///
+    /// The mods of a hosted session load where its turns run, because only
+    /// there do their hooks hear them; a surface in another process asks
+    /// through this. `call` is `{ "op": ..., ... }`, read by the owner's
+    /// `rebon_plugin_host::mods::ModsRegistry::serve_remote`, and the answer's
+    /// `data` is that call's answer. Kept as one opaque request rather than a
+    /// variant per question: the questions belong to the mods runtime and
+    /// grow with it, and the wire should not have to.
+    Mods {
+        call: serde_json::Value,
+    },
 }
 
 /// One line of a session's live event stream.

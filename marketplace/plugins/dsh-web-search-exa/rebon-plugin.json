@@ -1,0 +1,27 @@
+{
+  "name": "dsh-web-search-exa",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness Exa search backend for web_search (needs an Exa API key). Packaged from the DeepSeek Harness module Rebon vendors (@deepseek-ai/dsh-web-search-exa).",
+  "license": "MIT",
+  "capabilities": {
+    "kernelPlugins": {
+      "dsh-web-search-exa": {
+        "entry": "web-search-exa.js",
+        "services": [
+          "web:search:exa"
+        ],
+        "seats": [
+          "credentials"
+        ]
+      }
+    }
+  },
+  "metadata": {
+    "upstream": "@deepseek-ai/dsh-web-search-exa"
+  },
+  "container": {
+    "network": [
+      "api.exa.ai"
+    ]
+  }
+}

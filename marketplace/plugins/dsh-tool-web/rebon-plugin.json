@@ -1,0 +1,27 @@
+{
+  "name": "dsh-tool-web",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness web tools: web_search and web_fetch. Packaged from the DeepSeek Harness module Rebon vendors (@deepseek-ai/dsh-tool-web).",
+  "license": "MIT",
+  "capabilities": {
+    "kernelPlugins": {
+      "dsh-tool-web": {
+        "entry": "tool-web.js",
+        "tools": [
+          "web_search",
+          "web_fetch"
+        ],
+        "publishedTopics": [
+          "compose:session/append"
+        ],
+        "invokableTools": [
+          "WebSearch",
+          "WebFetch"
+        ]
+      }
+    }
+  },
+  "metadata": {
+    "upstream": "@deepseek-ai/dsh-tool-web"
+  }
+}

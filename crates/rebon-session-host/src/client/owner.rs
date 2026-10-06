@@ -425,6 +425,13 @@ impl OwnerHandle {
         Ok(serde_json::from_value(data)?)
     }
 
+    /// One question for the session's Claude Code mods (`{ "op": ... }`),
+    /// answered with that call's JSON. See [`BackgroundIpcRequest::Mods`].
+    pub fn mods(&self, call: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let response = self.send(BackgroundIpcRequest::Mods { call }, None)?;
+        Ok(response.data.unwrap_or(serde_json::Value::Null))
+    }
+
     /// Take or renew this client's lease, keeping the owner alive.
     pub fn lease(&self, client_id: &str, kind: ClientLeaseKind) -> anyhow::Result<()> {
         self.send(

@@ -463,9 +463,11 @@ pub fn project_system_text_message(input: &SystemTextMessageInput) -> SystemText
                     };
                 }
             }
+            // `mod_notice` is what a Claude Code mod said to the person
+            // (`$.ui.toast`, a transcript `$.ui.log`): shown at any level.
             if !matches!(
                 subtype.as_str(),
-                "stop_hook_summary" | "turn_duration" | "provider_switch"
+                "stop_hook_summary" | "turn_duration" | "provider_switch" | "mod_notice"
             ) && !input.verbose
                 && level == "info"
             {
@@ -923,6 +925,36 @@ mod tests {
                 assert_eq!(display.content, content.trim());
             }
         }
+    }
+
+    #[test]
+    fn a_mod_notice_shows_at_info_level_dim_and_without_a_marker() {
+        for verbose in [false, true] {
+            let projection = project_system_text_message(&SystemTextMessageInput {
+                verbose,
+                ..input(SystemTextProjectionInput::Generic {
+                    subtype: "mod_notice".into(),
+                    level: "info".into(),
+                    content: Some("probe: bumped".into()),
+                })
+            });
+            let SystemTextProjection::Generic(display) = projection else {
+                panic!("a mod's toast is shown whether or not verbose is on");
+            };
+            assert_eq!(display.content, "probe: bumped");
+            assert!(display.dim_color);
+            assert_eq!(display.marker, None);
+        }
+        let SystemTextProjection::Generic(error) =
+            project_system_text_message(&input(SystemTextProjectionInput::Generic {
+                subtype: "mod_notice".into(),
+                level: "error".into(),
+                content: Some("probe: failed".into()),
+            }))
+        else {
+            panic!("an error notice shows");
+        };
+        assert_eq!(error.marker, Some(SystemVisualMarker::BlackCircle));
     }
 
     #[test]

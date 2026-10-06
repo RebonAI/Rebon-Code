@@ -1,0 +1,27 @@
+{
+  "name": "dsh-llm-deepseek",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness model provider for the official DeepSeek API, on the plugin plane. Packaged from the DeepSeek Harness module Rebon vendors (@deepseek-ai/dsh-llm-deepseek).",
+  "license": "MIT",
+  "capabilities": {
+    "kernelPlugins": {
+      "dsh-llm-deepseek": {
+        "entry": "llm-deepseek.js",
+        "seats": [
+          "credentials"
+        ],
+        "llmProviders": [
+          "deepseek-official"
+        ]
+      }
+    }
+  },
+  "metadata": {
+    "upstream": "@deepseek-ai/dsh-llm-deepseek"
+  },
+  "container": {
+    "network": [
+      "api.deepseek.com"
+    ]
+  }
+}

@@ -23,6 +23,14 @@ pub(crate) enum ResolvedPluginSource {
     Archive {
         archive: PathBuf,
     },
+    /// A Claude Code mod folder: `.claude-plugin/plugin.json` beside a
+    /// `hooks/hooks.json`. It carries no `rebon-plugin.json`; the manifest here
+    /// is the one rebon synthesised from the hooks module's scan, which the
+    /// installer writes into the installed copy so the plane finds it by name.
+    ClaudeMod {
+        root: PathBuf,
+        manifest: PluginManifest,
+    },
 }
 
 pub(crate) fn resolve_install_source(
@@ -51,6 +59,16 @@ pub(crate) fn resolve_install_source(
             .with_context(|| format!("failed to resolve plugin path {}", candidate.display()))?;
         let manifest = PluginManifest::load_from_dir(&root)?;
         return Ok(ResolvedPluginSource::LocalPath { root, manifest });
+    }
+    if rebon_harness::rebon_plugin_package::is_claude_mod_dir(&candidate) {
+        let root = candidate
+            .canonicalize()
+            .with_context(|| format!("failed to resolve mod folder {}", candidate.display()))?;
+        let mod_ = rebon_harness::rebon_plugin_package::read_claude_mod(&root)
+            .map_err(|reason| anyhow::anyhow!(reason))?;
+        let manifest = rebon_harness::rebon_plugin_package::plugin_manifest_for(&mod_);
+        manifest.validate(None)?;
+        return Ok(ResolvedPluginSource::ClaudeMod { root, manifest });
     }
 
     if let Some(alias) = builtin_alias(trimmed) {
