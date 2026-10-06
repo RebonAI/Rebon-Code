@@ -19,6 +19,7 @@ services/
 runtimes/node/
   plugin-host/                our own JS plugin host, not Node.js itself
   compose-runtime/            the plugin composition runtime
+  mods-runtime/               the Claude Code mods loader (hooks modules, JSX/TS)
   plugins/                    JS plugin packages and the browser extension
 assets/
   schemas/                    generated ACP / Web API / session wire artifacts

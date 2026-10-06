@@ -61,6 +61,9 @@ RIPGREP_BINARY_NAME = "rg"
 RIPGREP_VERSION = "14.1.1"
 WRAPPER_LAUNCHER = NPM_ASSETS_ROOT / "wrapper" / "bin" / "rebon.js"
 NODE_ROOT = REPO_ROOT / "runtimes" / "node"
+# Rebon's own plugin marketplace (DeepSeek Harness packages, Claude Code
+# mods): `builtin_marketplace_dir` looks for it beside the executable.
+MARKETPLACE_ROOT = REPO_ROOT / "marketplace"
 # The plugin plane's script trees, laid out next to the executable so
 # rebon-plugin-supervisor's locate_host_script/locate_compose_loader find them
 # in an install the way tests find them in a checkout. Test directories stay
@@ -72,6 +75,9 @@ PLANE_SCRIPT_SETS = (
         "compose-runtime",
         ("src", "payload", "package.json", "payload-manifests.json"),
     ),
+    # The Claude Code mods loader the composition runtime imports by
+    # relative path, so it has to sit beside it.
+    ("mods-runtime", ("src", "package.json")),
 )
 FORBIDDEN_RELEASE_SUFFIXES = (".pdb", ".map", ".rs", ".ts", ".tsx")
 FORBIDDEN_RELEASE_DIR_NAMES = {".git", "node_modules", "target", "dist"}
@@ -548,6 +554,9 @@ def copy_plane_scripts(dest_dir: Path) -> None:
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
+    if not (MARKETPLACE_ROOT / ".claude-plugin" / "marketplace.json").is_file():
+        raise SystemExit(f"Built-in marketplace missing: {MARKETPLACE_ROOT}")
+    shutil.copytree(MARKETPLACE_ROOT, dest_dir / "marketplace", dirs_exist_ok=True)
 
 
 def copy_postinstall_script(package_dir: Path) -> None:

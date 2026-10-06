@@ -152,6 +152,11 @@ jobs:
           $composeTests = Get-ChildItem runtimes/node/compose-runtime/test/*.test.mjs | ForEach-Object { $_.FullName }
           & $node --test @composeTests
           if ($LASTEXITCODE -ne 0) { throw "Node compose runtime tests failed with exit code $LASTEXITCODE" }
+          # The Claude Code mods runtime: the JSX/TypeScript transform, the
+          # hook chain and a real .tsx mod loaded through the loader seam.
+          $modsTests = Get-ChildItem runtimes/node/mods-runtime/test/*.test.mjs | ForEach-Object { $_.FullName }
+          & $node --test @modsTests
+          if ($LASTEXITCODE -ne 0) { throw "Node mods runtime tests failed with exit code $LASTEXITCODE" }
           $env:REBON_TEST_NODE = $node
           $env:REBON_REQUIRE_TEST_NODE = '1'
           cargo test -p rebon-plugin-protocol --locked
@@ -192,6 +197,10 @@ jobs:
           # one kernel and process-wide registration slots.
           cargo test -p rebon-plugin-host --test kernel_seats_plane --locked -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Kernel seat tests failed with exit code $LASTEXITCODE" }
+          # A Claude Code mod on the real plane: loaded through the compose
+          # loader, seated, drawn, and heard by the policy subscriber.
+          cargo test -p rebon-plugin-host --test mods_plane --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Mods plane tests failed with exit code $LASTEXITCODE" }
           # And the whole chain from one config.json, which is the shape a user
           # actually arrives in.
           cargo test -p rebon-harness --test kernel_mainline_deepseek_js --locked -- --test-threads=1
