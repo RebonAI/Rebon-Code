@@ -1683,7 +1683,7 @@ fn run_model(cx: Cx<'_>, command: &str) -> Option<bool> {
 
 fn run_plugin(cx: Cx<'_>, command: &str) -> Option<bool> {
     parse_plugin_command(command)?;
-    let (app, session, ..) = cx.split();
+    let (app, session, handle, ..) = cx.split();
     accept(app, session, command);
     let plugin_args = super::commands::strip_command_prefix(command, "plugin")
         .unwrap_or("")
@@ -1693,18 +1693,42 @@ fn run_plugin(cx: Cx<'_>, command: &str) -> Option<bool> {
         app.slash_picker = None;
         app.at_mention_picker = None;
         let result = handle_plugin_command("/plugin list", session);
+        let catalog = handle_plugin_command("/plugin browse", session);
         push_dialog(
             app,
             ids::dialog::PLUGINS,
             DialogArgs::values([
                 result.text.as_str(),
                 if result.is_err { "err" } else { "ok" },
+                if catalog.is_err {
+                    ""
+                } else {
+                    catalog.text.as_str()
+                },
             ]),
         );
         return Some(false);
     }
+    // Adding a marketplace or installing from one goes to the network: off
+    // the loop it goes, and its answer lands as the command's output.
+    let context = crate::session::commands::plugin::PluginCommandContext::of(session);
+    if crate::session::commands::plugin::plugin_command_needs_network(command, &context.cwd)
+        && super::submit::spawn_plugin_command(app, handle, command, context)
+    {
+        return Some(false);
+    }
     let result = handle_plugin_command(command, session);
-    command_result(app, result.is_err, &result.text);
+    if result.is_err {
+        command_result(app, true, &result.text);
+    } else {
+        super::transcript_messages::inject_local_command_feedback_with_command(
+            app,
+            "plugin",
+            command,
+            &result.text,
+        );
+        app.follow_transcript_tail = true;
+    }
     Some(false)
 }
 

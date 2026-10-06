@@ -42,6 +42,8 @@ pub(in crate::tui) struct StatusBarInfo<'a> {
     pub(super) goal_activity: Option<GoalActivityInfo>,
     /// Optional left-side hint rendered immediately after the cwd.
     pub(super) footer_action_hint: Option<&'a str>,
+    /// What the mods say in the footer (`AppState::mods_status`).
+    pub(super) mods_status: Option<String>,
     /// Optional right-aligned hint suggesting a fresh session.
     /// Only populated when the session is idle (no active prompt, no
     /// active coordinator-backed agents, no foreground coordinator tasks,

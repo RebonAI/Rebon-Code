@@ -98,10 +98,10 @@ fn config_dialog_defs() -> Vec<DialogDef> {
         // which only the front end's command path can run. Always opens
         // — an error is a row in the panel, not a refusal.
         DialogDef::new(ids::dialog::PLUGINS, |args| {
-            Some(Box::new(PluginsDialogState::open(
-                args.value_at(0),
-                args.value_at(1) == "err",
-            )))
+            Some(Box::new(
+                PluginsDialogState::open(args.value_at(0), args.value_at(1) == "err")
+                    .with_catalog(args.value_at(2)),
+            ))
         }),
         // A `HooksDialogInput` payload: which events exist needs the
         // tool list and the agent registry, and what is configured needs

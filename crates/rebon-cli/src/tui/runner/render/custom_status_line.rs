@@ -70,6 +70,14 @@ fn status_line_rows(app: &AppState, width: u16) -> Vec<Line<'static>> {
     let mut primary_line = ansi_line_to_ratatui(primary.clone());
     let mut primary_spans = status_line_prefix_spans(app);
     primary_spans.append(&mut primary_line.spans);
+    // A configured status line takes the footer's place, so what the mods
+    // say with `$.ui.status` rides at its end rather than going unseen.
+    if let Some(mods) = app.mods_status.as_deref() {
+        primary_spans.push(Span::styled(
+            format!("  {mods}"),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
     primary_line.spans = primary_spans;
     let mut primary_rows = hard_wrap_line(primary_line, width);
     let mut extra_rows = padded

@@ -960,6 +960,20 @@ fn route_hosted_dialog_action(
         }
         (dialog::PLUGINS, action::EXECUTE) => {
             let command = action.value().to_string();
+            let context = crate::session::commands::plugin::PluginCommandContext::of(session);
+            if crate::session::commands::plugin::plugin_command_needs_network(
+                &command,
+                &context.cwd,
+            ) && super::submit::spawn_plugin_command(app, handle, &command, context)
+            {
+                if let Some(dialog) = app
+                    .dialogs
+                    .top_as_mut::<plugins_dialog::PluginsDialogState>()
+                {
+                    dialog.set_feedback(format!("Working: {command} …"), false);
+                }
+                return;
+            }
             let result = crate::session::commands::plugin::handle_plugin_command(&command, session);
             if result.is_err {
                 super::transcript_messages::inject_system_message(app, "error", &result.text);
@@ -972,18 +986,7 @@ fn route_hosted_dialog_action(
                 );
             }
             app.follow_transcript_tail = true;
-            let refreshed = (!result.is_err).then(|| {
-                crate::session::commands::plugin::handle_plugin_command("/plugin list", session)
-            });
-            if let Some(dialog) = app
-                .dialogs
-                .top_as_mut::<plugins_dialog::PluginsDialogState>()
-            {
-                dialog.set_feedback(result.text, result.is_err);
-                if let Some(list) = refreshed {
-                    dialog.refresh(&list.text, list.is_err);
-                }
-            }
+            super::submit::refresh_plugins_dialog(app, session, Some((result.text, result.is_err)));
         }
         (dialog::SETTINGS, action::APPLY_CONFIG) => {
             apply_settings_config(app, session, handle, theme, &action);

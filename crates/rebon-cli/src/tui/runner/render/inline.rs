@@ -284,6 +284,7 @@ struct InlineFramePlan {
     desired_prompt_height: u16,
     desired_queue_height: u16,
     desired_picker_height: u16,
+    desired_mods_height: u16,
     show_agent_switcher: bool,
     layout: InlineFrameLayout,
 }
@@ -365,8 +366,14 @@ fn plan_inline_frame(
     } else {
         0
     };
+    let desired_mods_height = if has_permission_suffix || has_inline_modal {
+        0
+    } else {
+        inline_mods_height(app, area.width, full_viewport_height)
+    };
     let desired_base_host_height = desired_ultraplan_height
         .saturating_add(desired_task_list_height)
+        .saturating_add(desired_mods_height)
         .saturating_add(desired_prompt_height)
         .saturating_add(desired_queue_height)
         .saturating_add(desired_picker_height)
@@ -387,6 +394,7 @@ fn plan_inline_frame(
     };
     let desired_prompt_block_height = desired_ultraplan_height
         .saturating_add(desired_task_list_height)
+        .saturating_add(desired_mods_height)
         .saturating_add(desired_prompt_height)
         .saturating_add(desired_queue_height)
         .saturating_add(desired_picker_height)
@@ -469,6 +477,7 @@ fn plan_inline_frame(
         desired_prompt_height,
         desired_queue_height,
         desired_picker_height,
+        desired_mods_height,
         show_agent_switcher,
         layout,
     }
@@ -488,6 +497,9 @@ pub(in crate::tui::runner) fn render_inline_frame_in_area(
     cursor_hint: &mut Option<(u16, u16)>,
 ) {
     clear_rect(frame, area);
+    // What a mod drew is recorded afresh by every frame, as in screen mode.
+    app.mods_hits.clear();
+    app.mods_sites.clear();
 
     if app.agent_view.is_some() {
         if let Some(dialog) = app.agent_view.as_mut() {
@@ -508,6 +520,7 @@ pub(in crate::tui::runner) fn render_inline_frame_in_area(
         desired_prompt_height,
         desired_queue_height,
         desired_picker_height,
+        desired_mods_height,
         show_agent_switcher,
         layout,
     } = plan_inline_frame(
@@ -649,11 +662,20 @@ pub(in crate::tui::runner) fn render_inline_frame_in_area(
             let reserved_after_ultraplan = ultraplan_height.saturating_add(reserved_prompt_suffix);
             let task_list_height =
                 desired_task_list_height.min(host_height.saturating_sub(reserved_after_ultraplan));
+            // What the mods draw sits against the prompt, under the task
+            // list, in what the prompt and its suffixes leave.
+            let mods_height = desired_mods_height.min(
+                host_height
+                    .saturating_sub(reserved_after_ultraplan)
+                    .saturating_sub(task_list_height),
+            );
+            let above_queue = ultraplan_height
+                .saturating_add(task_list_height)
+                .saturating_add(mods_height);
             let queue_height = if has_queue_banner {
                 desired_queue_height.min(
                     host_height
-                        .saturating_sub(ultraplan_height)
-                        .saturating_sub(task_list_height)
+                        .saturating_sub(above_queue)
                         .saturating_sub(prompt_min_height),
                 )
             } else {
@@ -661,14 +683,12 @@ pub(in crate::tui::runner) fn render_inline_frame_in_area(
             };
             let picker_height = desired_picker_height.min(
                 host_height
-                    .saturating_sub(ultraplan_height)
-                    .saturating_sub(task_list_height)
+                    .saturating_sub(above_queue)
                     .saturating_sub(queue_height)
                     .saturating_sub(prompt_min_height),
             );
             let prompt_height = host_height
-                .saturating_sub(ultraplan_height)
-                .saturating_sub(task_list_height)
+                .saturating_sub(above_queue)
                 .saturating_sub(queue_height)
                 .saturating_sub(picker_height);
             let ultraplan_area = Rect::new(
@@ -683,13 +703,19 @@ pub(in crate::tui::runner) fn render_inline_frame_in_area(
                 layout.prompt.width,
                 task_list_height,
             );
-            let queue_area = Rect::new(
+            let mods_area = Rect::new(
                 layout.prompt.x,
                 layout
                     .prompt
                     .y
                     .saturating_add(ultraplan_height)
                     .saturating_add(task_list_height),
+                layout.prompt.width,
+                mods_height,
+            );
+            let queue_area = Rect::new(
+                layout.prompt.x,
+                layout.prompt.y.saturating_add(above_queue),
                 layout.prompt.width,
                 queue_height,
             );
@@ -698,8 +724,7 @@ pub(in crate::tui::runner) fn render_inline_frame_in_area(
                 layout
                     .prompt
                     .y
-                    .saturating_add(ultraplan_height)
-                    .saturating_add(task_list_height)
+                    .saturating_add(above_queue)
                     .saturating_add(queue_height),
                 layout.prompt.width,
                 prompt_height,
@@ -723,6 +748,9 @@ pub(in crate::tui::runner) fn render_inline_frame_in_area(
                     app.task_list_collapsed,
                     full_viewport_height,
                 );
+            }
+            if mods_area.height > 0 {
+                render_inline_mods(frame, mods_area, app, full_viewport_height);
             }
             if queue_height > 0 {
                 render_queue_banner(frame, queue_area, &queue_layout);
@@ -880,8 +908,14 @@ pub(in crate::tui::runner) fn desired_inline_viewport_height(
     } else {
         0
     };
+    let desired_mods_height = if has_permission_suffix || has_inline_modal {
+        0
+    } else {
+        inline_mods_height(app, input.width, terminal_height)
+    };
     let desired_prompt_block_height = desired_ultraplan_height
         .saturating_add(desired_task_list_height)
+        .saturating_add(desired_mods_height)
         .saturating_add(desired_prompt_height)
         .saturating_add(desired_queue_height)
         .saturating_add(desired_picker_height)

@@ -464,6 +464,8 @@ struct LoopState {
     last_paste_flush_at: Option<Instant>,
     inline_runtime: InlineRuntimeState,
     custom_status_line_runtime: super::custom_status_line::CustomStatusLineRuntime,
+    /// What the Claude Code mods have shown on this surface.
+    mods_surface: super::mods_surface::ModsSurfaceState,
     rc_status_runtime: crate::tui::bridge_dialog::RcStatusRuntime,
     prefix_scan_state: crate::file_scanner::PrefixScanState,
     last_agent_view_left_press_at: Option<Instant>,
@@ -537,6 +539,7 @@ pub(in crate::tui::runner) fn event_loop_with_mode(
         last_paste_flush_at: None,
         inline_runtime: initial_inline_runtime.unwrap_or_default(),
         custom_status_line_runtime: super::custom_status_line::CustomStatusLineRuntime::default(),
+        mods_surface: super::mods_surface::ModsSurfaceState::default(),
         rc_status_runtime: crate::tui::bridge_dialog::RcStatusRuntime::default(),
         prefix_scan_state: crate::file_scanner::PrefixScanState::new(),
         last_agent_view_left_press_at: None,
@@ -944,6 +947,20 @@ fn session_pipeline(
                 state.ui_mode,
             );
         }
+        // What the mods put on screen since the last pass, and the prompts
+        // they queued; after the channels and the mailbox, so a prompt a mod
+        // submits rides the same bookkeeping a typed one does.
+        if app.resume_dialog.is_none() {
+            super::mods_surface::mods_tick(
+                app,
+                session,
+                handle,
+                &mut state.mods_surface,
+                &mut state.active_prompt,
+                &mut state.pending_permission,
+                state.ui_mode,
+            );
+        }
         maybe_update_loading_state(
             app,
             session,
@@ -1341,6 +1358,7 @@ fn derive_frame_inputs<'slot>(
                 elapsed_ms: now_ms.saturating_sub(goal.started_at_ms),
             }),
         footer_action_hint,
+        mods_status: app.mods_status.clone(),
         new_session_hint,
     };
     FrameInputs {
@@ -2390,6 +2408,12 @@ fn route_key_to_surfaces(
         ) {
             return Ok(PhaseFlow::NextIteration);
         }
+    }
+
+    // A mod's band or pane holding the keyboard (or the ctrl+x tab that
+    // gives it one) comes before the prompt's own pickers and keys.
+    if super::mods_keys::mods_key(app, &key) {
+        return Ok(PhaseFlow::NextIteration);
     }
 
     if let Some(result) = crate::tui::slash_picker::handle_key(&mut app.slash_picker, &key) {
@@ -4380,6 +4404,7 @@ fn run_inline_background_tasks_overlay(
             goal_activity: None,
             footer_action_hint: None,
             new_session_hint: None,
+            mods_status: app.mods_status.clone(),
         };
         let runtime_input = app.build_runtime_input();
         let runtime_state = derive_prompt_input_runtime_state(&runtime_input, prompt_rainbow_color);

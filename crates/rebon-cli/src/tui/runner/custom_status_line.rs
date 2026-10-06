@@ -578,6 +578,7 @@ mod tests {
             agent_activity: None,
             goal_activity: None,
             footer_action_hint: None,
+            mods_status: None,
             new_session_hint: None,
         }
     }

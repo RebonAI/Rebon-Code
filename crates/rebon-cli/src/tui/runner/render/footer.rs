@@ -169,6 +169,12 @@ pub(in crate::tui::runner) fn render_footer(
             Style::default().fg(parse_theme_color(ds_footer.chromeYellow)),
         ));
     }
+    if let Some(mods) = status.mods_status.as_deref() {
+        left_spans.push(Span::styled(
+            format!("  {mods}"),
+            Style::default().fg(parse_theme_color(ds_footer.inactive)),
+        ));
+    }
 
     // Right side: active-agent timer, /new hint and context-budget indicator, right-aligned.
     // The timer stays visible while any coordinator-backed agent is active.
@@ -274,6 +280,7 @@ mod tests {
                 agent_activity: None,
                 goal_activity: None,
                 footer_action_hint: None,
+                mods_status: None,
                 new_session_hint: None,
             };
             let zones = LayoutZones {

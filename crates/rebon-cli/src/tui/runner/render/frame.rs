@@ -41,6 +41,8 @@ pub(in crate::tui::runner) fn render_frame(
     let area = frame.area();
     app.transcript_sticky_anchor_area = None;
     app.scroll_to_bottom_area = None;
+    app.mods_hits.clear();
+    app.mods_sites.clear();
 
     // Top-level reset of the back buffer. Two paths below paint
     // partial coverage of `area` and historically left dirty cells:
@@ -201,6 +203,9 @@ impl FrameStage<'_, '_, '_> {
             width: area.width,
             height: area.height.saturating_sub(reserved_bottom),
         };
+        // A docked mod pane takes its column before the landing centers in
+        // what is left.
+        let main_area = render_mods_panes(self.frame, main_area, self.app);
         // Bound to a local first: the prompt surface borrows both the
         // frame and the app, and the task list painted inside the block
         // needs them back.
@@ -216,6 +221,15 @@ impl FrameStage<'_, '_, '_> {
             self.cursor_hint,
         );
         if let Some(prompt_area) = prompt_area {
+            // The band above the prompt sits on the rows just above the
+            // centered prompt, as wide as it.
+            let above_prompt = Rect::new(
+                prompt_area.x,
+                main_area.y,
+                prompt_area.width,
+                prompt_area.y.saturating_sub(main_area.y),
+            );
+            render_mods_band(self.frame, above_prompt, self.app);
             let task_list_height = self.plan.task_list.height;
             if self.app.input.is_empty() && self.app.mode == "prompt" && task_list_height > 0 {
                 let prompt_bottom = prompt_area.y.saturating_add(prompt_area.height);
@@ -307,9 +321,14 @@ impl FrameStage<'_, '_, '_> {
             ..*self.theme
         };
 
+        // What the mods draw takes its room out of the transcript's: the
+        // band above the prompt from the bottom, a docked pane from the
+        // right. Both are nothing when no mod drew one.
+        let transcript = render_mods_band(self.frame, chunks[1], self.app);
+        let transcript = render_mods_panes(self.frame, transcript, self.app);
         render_transcript_area(
             self.frame,
-            chunks[1],
+            transcript,
             self.app,
             &animated_theme,
             self.cursor_hint,

@@ -4,6 +4,10 @@
 //! a projection of `/plugin list`, and every mutation goes back out as a
 //! textual `/plugin` command, so the existing command path stays the one
 //! source of plugin behaviour — and this reducer stays a reducer.
+//!
+//! Two tabs, switched with Tab: **Installed** (the store's packages) and
+//! **Discover** (what the marketplaces offer, a projection of
+//! `/plugin browse`), where Enter installs a plugin as `plugin@marketplace`.
 
 use crate::model::{
     DialogAction, DialogKey, DialogModel, DialogOutcome, KeyPress, PanelPane, PanelRow, PanelView,
@@ -17,14 +21,44 @@ pub const DIALOG_ID: &str = "plugins";
 pub const ACTION_EXECUTE: &str = "execute";
 
 const TITLE: &str = " Manage plugins ";
-const FOOTER: &str =
-    "↑/↓ or j/k select · Enter/Space enable or disable · u uninstall (twice) · Esc close";
+const FOOTER: &str = "↑/↓ or j/k select · Enter/Space enable or disable · u uninstall (twice) · Tab discover · Esc close";
+const DISCOVER_FOOTER: &str =
+    "↑/↓ or j/k select · Enter install · u uninstall (twice) · Tab installed · Esc close";
 const EMPTY: &str = "No plugins installed.";
+const DISCOVER_EMPTY: &str =
+    "No marketplace lists any plugins. Add one with /plugin marketplace add owner/repo.";
 const MAX_VISIBLE: usize = 12;
 
 /// Rows of chrome the list shares its pane with: the summary line above
 /// it and the blank separator below.
 const PANE_CHROME: usize = 2;
+
+/// One plugin a marketplace offers, read back from `/plugin browse`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscoverRow {
+    /// `plugin@marketplace`.
+    id: String,
+    /// `mod`, `package`, `unsupported`, or the source kind for a plugin
+    /// fetched from elsewhere.
+    kind: String,
+    installed: bool,
+    description: String,
+}
+
+impl DiscoverRow {
+    /// Whether Rebon can install it at all: not a plugin shape it refuses,
+    /// not a source it will not run.
+    fn installable(&self) -> bool {
+        !matches!(self.kind.as_str(), "unsupported" | "command")
+    }
+}
+
+/// Which list the panel shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Installed,
+    Discover,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PluginDialogRow {
@@ -40,6 +74,9 @@ struct PluginDialogRow {
 pub struct PluginsDialogState {
     rows: Vec<PluginDialogRow>,
     selected: usize,
+    tab: Tab,
+    discover: Vec<DiscoverRow>,
+    discover_selected: usize,
     feedback: Option<(String, bool)>,
     /// Name armed by a first uninstall press. Uninstalling is irreversible,
     /// so the second press on the same plugin is what actually runs the
@@ -62,10 +99,27 @@ impl PluginsDialogState {
         Self {
             rows,
             selected: 0,
+            tab: Tab::Installed,
+            discover: Vec::new(),
+            discover_selected: 0,
             feedback: is_err.then(|| (list_text.to_string(), true)),
             pending_uninstall: None,
             viewport_rows: None,
         }
+    }
+
+    /// The panel with the Discover tab filled from `/plugin browse`.
+    pub fn with_catalog(mut self, catalog_text: &str) -> Self {
+        self.refresh_catalog(catalog_text);
+        self
+    }
+
+    /// Replace the Discover rows after a change, from `/plugin browse`.
+    pub fn refresh_catalog(&mut self, catalog_text: &str) {
+        self.discover = parse_catalog(catalog_text);
+        self.discover_selected = self
+            .discover_selected
+            .min(self.discover.len().saturating_sub(1));
     }
 
     /// Replace rows after a mutation by running `/plugin list` again.
@@ -88,7 +142,11 @@ impl PluginsDialogState {
     /// the blank separator and footer, plus a row each for feedback and
     /// for an armed uninstall.
     pub fn desired_height(&self) -> u16 {
-        let rows = self.rows.len().clamp(1, MAX_VISIBLE) as u16;
+        let rows = self
+            .rows
+            .len()
+            .max(self.discover.len())
+            .clamp(1, MAX_VISIBLE) as u16;
         rows.saturating_add(6 + self.extra_rows() as u16)
     }
 
@@ -99,18 +157,49 @@ impl PluginsDialogState {
     }
 
     fn move_selection(&mut self, forward: bool) {
-        let last = self.rows.len().saturating_sub(1);
-        self.selected = if forward {
-            if self.selected >= last {
+        let (len, selected) = match self.tab {
+            Tab::Installed => (self.rows.len(), &mut self.selected),
+            Tab::Discover => (self.discover.len(), &mut self.discover_selected),
+        };
+        let last = len.saturating_sub(1);
+        *selected = if forward {
+            if *selected >= last {
                 0
             } else {
-                self.selected + 1
+                *selected + 1
             }
-        } else if self.selected == 0 {
+        } else if *selected == 0 {
             last
         } else {
-            self.selected - 1
+            *selected - 1
         };
+    }
+
+    /// The rows the current tab lists.
+    fn tab_len(&self) -> usize {
+        match self.tab {
+            Tab::Installed => self.rows.len(),
+            Tab::Discover => self.discover.len(),
+        }
+    }
+
+    /// Enter on a Discover row: install it, or say why it cannot be.
+    fn install_selected(&mut self) -> DialogOutcome {
+        let Some(row) = self.discover.get(self.discover_selected) else {
+            return DialogOutcome::None;
+        };
+        if !row.installable() {
+            self.feedback = Some((
+                format!("{} is not a plugin Rebon installs ({})", row.id, row.kind),
+                true,
+            ));
+            return DialogOutcome::None;
+        }
+        DialogOutcome::Action(DialogAction::staying(
+            DIALOG_ID,
+            ACTION_EXECUTE,
+            format!("/plugin install {}", quote_plugin_name(&row.id)),
+        ))
     }
 
     fn selected_command(&self, uninstall: bool) -> Option<String> {
@@ -134,11 +223,26 @@ impl PluginsDialogState {
     }
 
     fn arm_or_confirm_uninstall(&mut self, armed: Option<String>) -> DialogOutcome {
-        let Some(name) = self.rows.get(self.selected).map(|row| row.name.clone()) else {
+        let name = match self.tab {
+            Tab::Installed => self.rows.get(self.selected).map(|row| row.name.clone()),
+            Tab::Discover => self
+                .discover
+                .get(self.discover_selected)
+                .filter(|row| row.installed)
+                .map(|row| row.id.clone()),
+        };
+        let Some(name) = name else {
             return DialogOutcome::None;
         };
         if armed.as_deref() == Some(name.as_str()) {
-            return self.execute(true);
+            return match self.tab {
+                Tab::Installed => self.execute(true),
+                Tab::Discover => DialogOutcome::Action(DialogAction::staying(
+                    DIALOG_ID,
+                    ACTION_EXECUTE,
+                    format!("/plugin uninstall {}", quote_plugin_name(&name)),
+                )),
+            };
         }
         self.pending_uninstall = Some(name);
         DialogOutcome::None
@@ -170,6 +274,9 @@ impl PluginsDialogState {
     /// Split out from [`DialogModel::view`] so the window can be driven
     /// against a chosen height instead of the last painted one.
     fn body_rows(&self, pane_rows: usize) -> Vec<PanelRow> {
+        if self.tab == Tab::Discover {
+            return self.discover_body_rows(pane_rows);
+        }
         let enabled_count = self.rows.iter().filter(|row| row.enabled).count();
         let mut rows = vec![PanelRow::one(TextSpan::dim(format!(
             "{} installed · {} enabled · changes take effect next startup",
@@ -189,6 +296,50 @@ impl PluginsDialogState {
             }
         }
 
+        if let Some((message, is_err)) = &self.feedback {
+            let one_line = message.lines().next().unwrap_or_default().to_string();
+            rows.push(PanelRow::one(if *is_err {
+                TextSpan::new(one_line, crate::model::RowTone::Error)
+            } else {
+                TextSpan::dim(one_line)
+            }));
+        }
+        if let Some(name) = &self.pending_uninstall {
+            rows.push(PanelRow::one(TextSpan::new(
+                format!("Press u again to uninstall {name} · any other key cancels"),
+                crate::model::RowTone::Warning,
+            )));
+        }
+        rows.push(PanelRow::blank());
+        rows
+    }
+
+    /// The Discover tab: what the marketplaces offer, a window over it, and
+    /// the same feedback and confirmation rows as the Installed tab.
+    fn discover_body_rows(&self, pane_rows: usize) -> Vec<PanelRow> {
+        let installed = self.discover.iter().filter(|row| row.installed).count();
+        let mut rows = vec![PanelRow::one(TextSpan::dim(format!(
+            "{} offered · {} installed · from the marketplaces (/plugin marketplace)",
+            self.discover.len(),
+            installed
+        )))];
+        if self.discover.is_empty() {
+            rows.push(PanelRow::one(TextSpan::dim(DISCOVER_EMPTY)));
+        } else {
+            let available = pane_rows
+                .saturating_sub(PANE_CHROME + self.extra_rows())
+                .clamp(1, MAX_VISIBLE)
+                .min(self.discover.len());
+            let start = if self.discover_selected >= available {
+                self.discover_selected + 1 - available
+            } else {
+                0
+            };
+            let end = (start + available).min(self.discover.len());
+            for (offset, row) in self.discover[start..end].iter().enumerate() {
+                rows.push(discover_row(row, start + offset == self.discover_selected));
+            }
+        }
         if let Some((message, is_err)) = &self.feedback {
             let one_line = message.lines().next().unwrap_or_default().to_string();
             rows.push(PanelRow::one(if *is_err {
@@ -239,6 +390,76 @@ impl PluginsDialogState {
             TextSpan::dim(format!(" · {}", row.source)),
         ])
     }
+}
+
+/// One Discover row: the marker, the id, what kind of plugin it is (red
+/// when Rebon will not install it), whether it is installed, and what it
+/// does.
+fn discover_row(row: &DiscoverRow, selected: bool) -> PanelRow {
+    use crate::model::RowTone;
+    let mut spans = vec![
+        TextSpan::new(
+            if selected { "❯ " } else { "  " },
+            if selected {
+                RowTone::Brand
+            } else {
+                RowTone::Dim
+            },
+        ),
+        TextSpan::new(
+            row.id.clone(),
+            if selected {
+                RowTone::Brand
+            } else {
+                RowTone::Normal
+            },
+        ),
+        TextSpan::new(
+            format!(" · {}", row.kind),
+            if row.installable() {
+                RowTone::Dim
+            } else {
+                RowTone::Error
+            },
+        ),
+    ];
+    if row.installed {
+        spans.push(TextSpan::new(" · installed", RowTone::Success));
+    }
+    if !row.description.is_empty() {
+        spans.push(TextSpan::dim(format!(" · {}", row.description)));
+    }
+    PanelRow::spans(spans)
+}
+
+/// Read `/plugin browse`'s rows back: `id  kind[  [installed]]  description`.
+/// A line whose first column is not `plugin@marketplace` is a note, not a
+/// plugin, and is skipped.
+fn parse_catalog(text: &str) -> Vec<DiscoverRow> {
+    text.lines()
+        .filter_map(|line| {
+            let mut columns = line
+                .split("  ")
+                .map(str::trim)
+                .filter(|column| !column.is_empty());
+            let id = columns.next()?;
+            if !id.contains('@') || id.contains(' ') {
+                return None;
+            }
+            let kind = columns.next()?.to_string();
+            let mut rest: Vec<&str> = columns.collect();
+            let installed = rest.first() == Some(&"[installed]");
+            if installed {
+                rest.remove(0);
+            }
+            Some(DiscoverRow {
+                id: id.to_string(),
+                kind,
+                installed,
+                description: rest.join("  "),
+            })
+        })
+        .collect()
 }
 
 /// Read `/plugin list`'s columns back. A line that is not five columns
@@ -322,17 +543,29 @@ impl DialogModel for PluginsDialogState {
                     plain: true
                 }
         );
-        if !self.rows.is_empty() && (move_up || move_down) {
+        if self.tab_len() > 0 && (move_up || move_down) {
             self.move_selection(move_down);
             return DialogOutcome::None;
         }
-        match press.key {
-            DialogKey::Escape => DialogOutcome::Close,
-            DialogKey::Enter => self.toggle_selected(),
-            DialogKey::Char {
-                value: ' ',
-                plain: true,
-            } => self.toggle_selected(),
+        match (press.key, self.tab) {
+            (DialogKey::Escape, _) => DialogOutcome::Close,
+            (DialogKey::Tab | DialogKey::BackTab, tab) => {
+                self.tab = match tab {
+                    Tab::Installed => Tab::Discover,
+                    Tab::Discover => Tab::Installed,
+                };
+                self.feedback = None;
+                DialogOutcome::None
+            }
+            (DialogKey::Enter, Tab::Discover) => self.install_selected(),
+            (DialogKey::Enter, Tab::Installed) => self.toggle_selected(),
+            (
+                DialogKey::Char {
+                    value: ' ',
+                    plain: true,
+                },
+                Tab::Installed,
+            ) => self.toggle_selected(),
             _ => DialogOutcome::None,
         }
     }
@@ -344,10 +577,14 @@ impl DialogModel for PluginsDialogState {
             .viewport_rows
             .map(usize::from)
             .unwrap_or_else(|| usize::from(self.desired_height()));
+        let (title, footer) = match self.tab {
+            Tab::Installed => (format!("{TITLE}· [Installed]  Discover "), FOOTER),
+            Tab::Discover => (format!("{TITLE}· Installed  [Discover] "), DISCOVER_FOOTER),
+        };
         ViewSpec::Panel(PanelView {
-            title: TITLE.into(),
+            title: title.into(),
             body: PanelPane::rows(self.body_rows(pane_rows.saturating_sub(1))),
-            footer: vec![TextSpan::dim(FOOTER)],
+            footer: vec![TextSpan::dim(footer)],
             desired_height: Some(self.desired_height()),
             ..PanelView::default()
         })
@@ -376,6 +613,123 @@ mod tests {
 
     fn execute(command: &str) -> DialogOutcome {
         DialogOutcome::Action(DialogAction::staying(DIALOG_ID, ACTION_EXECUTE, command))
+    }
+
+    const CATALOG: &str = "dsh-tool-todo@rebon  package  DeepSeek Harness todo list
+agent-radar@claude-code-mods  mod  [installed]  One live line  per agent
+skills@x  unsupported  skills only
+shell@x  command
+the other marketplace lists no plugins";
+
+    fn discover() -> PluginsDialogState {
+        let mut dialog = PluginsDialogState::open(LIST, false).with_catalog(CATALOG);
+        dialog.on_key(DialogKey::Tab.into());
+        dialog
+    }
+
+    #[test]
+    fn the_catalog_reads_back_ids_kinds_installed_and_descriptions() {
+        let rows = parse_catalog(CATALOG);
+        assert_eq!(rows.len(), 4, "the note line is not a plugin");
+        assert_eq!(rows[0].id, "dsh-tool-todo@rebon");
+        assert_eq!(rows[0].kind, "package");
+        assert!(!rows[0].installed);
+        assert_eq!(rows[0].description, "DeepSeek Harness todo list");
+        assert!(rows[1].installed);
+        assert_eq!(rows[1].description, "One live line  per agent");
+        assert!(!rows[2].installable());
+        assert!(!rows[3].installable());
+        assert_eq!(rows[3].description, "");
+    }
+
+    #[test]
+    fn tab_switches_to_discover_where_enter_installs_by_id() {
+        let mut dialog = discover();
+        assert_eq!(
+            dialog.on_key(DialogKey::Enter.into()),
+            execute("/plugin install dsh-tool-todo@rebon")
+        );
+        dialog.on_key(DialogKey::Down.into());
+        assert_eq!(
+            dialog.on_key(DialogKey::Enter.into()),
+            execute("/plugin install agent-radar@claude-code-mods"),
+            "installing again is how a plugin is updated"
+        );
+        dialog.on_key(DialogKey::Tab.into());
+        assert_eq!(
+            dialog.on_key(DialogKey::Enter.into()),
+            execute("/plugin disable alpha --scope user"),
+            "back on Installed, Enter toggles as before"
+        );
+    }
+
+    #[test]
+    fn a_plugin_rebon_does_not_install_says_so_instead() {
+        let mut dialog = discover();
+        dialog.on_key(DialogKey::Down.into());
+        dialog.on_key(DialogKey::Down.into());
+        assert_eq!(dialog.on_key(DialogKey::Enter.into()), DialogOutcome::None);
+        assert!(dialog
+            .feedback
+            .as_ref()
+            .is_some_and(|(text, err)| *err && text.contains("skills@x")));
+    }
+
+    #[test]
+    fn u_twice_uninstalls_an_installed_discover_row_and_nothing_else() {
+        let mut dialog = discover();
+        assert_eq!(
+            dialog.on_key(
+                DialogKey::Char {
+                    value: 'u',
+                    plain: true
+                }
+                .into()
+            ),
+            DialogOutcome::None
+        );
+        assert!(
+            dialog.pending_uninstall.is_none(),
+            "an uninstalled row has nothing to uninstall"
+        );
+        dialog.on_key(DialogKey::Down.into());
+        dialog.on_key(
+            DialogKey::Char {
+                value: 'u',
+                plain: true,
+            }
+            .into(),
+        );
+        assert_eq!(
+            dialog.on_key(
+                DialogKey::Char {
+                    value: 'u',
+                    plain: true
+                }
+                .into()
+            ),
+            execute("/plugin uninstall agent-radar@claude-code-mods")
+        );
+    }
+
+    #[test]
+    fn the_discover_tab_draws_its_rows_and_says_when_none_are_offered() {
+        let dialog = discover();
+        let ViewSpec::Panel(panel) = dialog.view() else {
+            panic!("a panel");
+        };
+        assert!(panel.title.contains("[Discover]"));
+        let empty = {
+            let mut dialog = PluginsDialogState::open(LIST, false).with_catalog("");
+            dialog.on_key(DialogKey::Tab.into());
+            dialog
+        };
+        let text: String = empty
+            .discover_body_rows(10)
+            .iter()
+            .flat_map(|row| row.spans.iter().map(|span| span.text.clone()))
+            .collect();
+        assert!(text.contains("marketplace add"), "{text}");
     }
 
     fn panel(dialog: &PluginsDialogState) -> PanelView {
@@ -471,7 +825,7 @@ mod tests {
     fn the_view_is_a_content_sized_panel_with_a_summary_and_a_hint_footer() {
         let view = panel(&dialog());
 
-        assert_eq!(view.title, TITLE);
+        assert_eq!(view.title, format!("{TITLE}· [Installed]  Discover "));
         assert!(view.side.is_none());
         assert!(view.tabs.is_empty());
         assert_eq!(view.desired_height, Some(8));

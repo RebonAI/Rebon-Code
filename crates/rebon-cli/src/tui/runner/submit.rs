@@ -166,6 +166,8 @@ pub(super) fn submit_or_queue_with_images_and_uuid(
                             &command.spec,
                             rebon_slash_commands::Surface::Tui,
                         );
+                        let answers_in_transcript =
+                            command.spec.kind == rebon_slash_commands::CommandKind::Session;
                         // Who registered the command decides how long the
                         // answer takes, and a plugin's answer comes from
                         // another process. Off the loop it goes, so the
@@ -174,8 +176,11 @@ pub(super) fn submit_or_queue_with_images_and_uuid(
                             spawn_command_expansion(
                                 app,
                                 handle,
-                                command.spec.name.as_ref(),
-                                text.trim_end(),
+                                CommandExpansion {
+                                    name: command.spec.name.as_ref(),
+                                    line: text.trim_end(),
+                                    answers_in_transcript,
+                                },
                                 expand,
                                 args,
                                 expansion_tx,
@@ -183,6 +188,16 @@ pub(super) fn submit_or_queue_with_images_and_uuid(
                             return false;
                         }
                         match expand(&args) {
+                            Ok(output) if answers_in_transcript => {
+                                save_to_history_for_session_if_needed(
+                                    app,
+                                    session,
+                                    text.trim_end(),
+                                );
+                                clear_input(app);
+                                show_command_output(app, &output);
+                                return false;
+                            }
                             Ok(expanded) => {
                                 text = expanded;
                                 None
@@ -410,6 +425,9 @@ fn submit_after_command_dispatch(
                 return false;
             }
             UserPromptSubmitDecision::Continue(effects) => {
+                if let Some(text) = effects.replacement {
+                    submit.text = text;
+                }
                 for context_text in &effects.additional_context {
                     append_additional_context(&mut submit.text, context_text);
                 }
@@ -454,12 +472,104 @@ fn submit_after_command_dispatch(
 /// The input is cleared the way a submitted line is: the line is on its way,
 /// and a person who gives up on it (Esc) or whose command fails gets it back
 /// from history, which is why the line as typed is remembered here.
-#[allow(clippy::too_many_arguments)]
+/// A `/plugin` command that goes to the network (adding a marketplace,
+/// installing from one), run off the loop the way a plugin command's
+/// expansion is: its answer lands as the command's output, and refreshes the
+/// plugin manager when that is open. `false` when there is no loop to answer
+/// to, and the caller runs it in place.
+pub(super) fn spawn_plugin_command(
+    app: &mut AppState,
+    handle: &Handle,
+    line: &str,
+    context: crate::session::commands::plugin::PluginCommandContext,
+) -> bool {
+    let Some(expansion_tx) = app.command_expansion_tx.clone() else {
+        return false;
+    };
+    let owned = line.to_owned();
+    let run = std::sync::Arc::new(
+        move |_: &rebon_kernel_seats::kernel_core_commands::CommandArgs| {
+            let result =
+                crate::session::commands::plugin::handle_plugin_command_in(&owned, &context);
+            if result.is_err {
+                Err(result.text)
+            } else {
+                Ok(result.text)
+            }
+        },
+    );
+    spawn_command_expansion(
+        app,
+        handle,
+        CommandExpansion {
+            name: "plugin",
+            line,
+            answers_in_transcript: true,
+        },
+        run,
+        rebon_kernel_seats::kernel_core_commands::CommandArgs {
+            raw: line.to_owned(),
+            rest: String::new(),
+            surface: rebon_slash_commands::Surface::Tui,
+        },
+        expansion_tx,
+    );
+    true
+}
+
+/// The plugin manager, when it is the dialog on top: its rows read again
+/// from `/plugin list` and `/plugin browse`, with `feedback` under them.
+pub(super) fn refresh_plugins_dialog(
+    app: &mut AppState,
+    session: &TuiEngineSession,
+    feedback: Option<(String, bool)>,
+) {
+    use rebon_dialog::plugins_dialog::PluginsDialogState;
+    if app.dialogs.top_as_mut::<PluginsDialogState>().is_none() {
+        return;
+    }
+    let ok = feedback.as_ref().is_none_or(|(_, is_err)| !is_err);
+    let list = ok
+        .then(|| crate::session::commands::plugin::handle_plugin_command("/plugin list", session));
+    let catalog = ok.then(|| {
+        crate::session::commands::plugin::handle_plugin_command("/plugin browse", session)
+    });
+    let Some(dialog) = app.dialogs.top_as_mut::<PluginsDialogState>() else {
+        return;
+    };
+    if let Some((text, is_err)) = feedback {
+        dialog.set_feedback(text, is_err);
+    }
+    if let Some(list) = list {
+        dialog.refresh(&list.text, list.is_err);
+    }
+    if let Some(catalog) = catalog.filter(|catalog| !catalog.is_err) {
+        dialog.refresh_catalog(&catalog.text);
+    }
+}
+
+/// The command line a [`spawn_command_expansion`] waits on.
+struct CommandExpansion<'a> {
+    name: &'a str,
+    line: &'a str,
+    /// See `ExpandingCommand::answers_in_transcript`.
+    answers_in_transcript: bool,
+}
+
+/// What a command that answers in the transcript returned, as its output
+/// row; nothing at all for a command that returned nothing.
+fn show_command_output(app: &mut AppState, output: &str) {
+    if output.trim().is_empty() {
+        return;
+    }
+    inject_system_message(app, "local_command", output);
+    app.follow_transcript_tail = true;
+}
+
 fn spawn_command_expansion(
     app: &mut AppState,
     handle: &Handle,
-    name: &str,
-    line: &str,
+    command: CommandExpansion<'_>,
     expand: std::sync::Arc<
         dyn Fn(&rebon_kernel_seats::kernel_core_commands::CommandArgs) -> Result<String, String>
             + Send
@@ -470,10 +580,16 @@ fn spawn_command_expansion(
 ) {
     let id = app.next_command_expansion_id;
     app.next_command_expansion_id += 1;
+    let CommandExpansion {
+        name,
+        line,
+        answers_in_transcript,
+    } = command;
     app.expanding_command = Some(crate::tui::app::ExpandingCommand {
         id,
         name: name.to_string(),
         line: line.to_string(),
+        answers_in_transcript,
     });
     clear_input(app);
     inject_system_message(app, "command-expanding", &format!("Expanding /{name}…"));
@@ -504,7 +620,37 @@ pub(super) fn drain_command_expansion(
         let Some(pending) = app.expanding_command.take_if(|pending| pending.id == id) else {
             continue;
         };
+        // A `/plugin` command run off the loop: already in history, it
+        // answers the way the same command run in place does.
+        if pending.name == "plugin" {
+            let (text, is_err) = match outcome {
+                Ok(text) => (text, false),
+                Err(text) => (text, true),
+            };
+            if is_err {
+                inject_system_message(app, "error", &text);
+            } else {
+                super::transcript_messages::inject_local_command_feedback_with_command(
+                    app,
+                    "plugin",
+                    &pending.line,
+                    &text,
+                );
+            }
+            app.follow_transcript_tail = true;
+            refresh_plugins_dialog(app, session, Some((text, is_err)));
+            return;
+        }
         match outcome {
+            Ok(output) if pending.answers_in_transcript => {
+                save_to_history_for_session_if_needed(app, session, &pending.line);
+                show_command_output(app, &output);
+            }
+            Err(failure) if pending.answers_in_transcript => {
+                save_to_history_for_session_if_needed(app, session, &pending.line);
+                inject_system_message(app, "error", &failure);
+                app.follow_transcript_tail = true;
+            }
             Ok(expanded) => {
                 submit_expanded_text(app, expanded, session, handle, active_prompt);
             }
@@ -1529,6 +1675,7 @@ mod tests {
     use super::{
         drain_command_expansion, parse_user_skill_invocation, prepare_ultraplan_resume_submit,
         spawn_command_expansion, submit_or_queue, submit_or_queue_with_images_and_uuid,
+        CommandExpansion,
     };
 
     fn make_immediate_handle() -> (Runtime, Handle) {
@@ -1687,8 +1834,11 @@ mod tests {
         spawn_command_expansion(
             &mut app,
             &handle,
-            "slow",
-            "/slow tea",
+            CommandExpansion {
+                name: "slow",
+                line: "/slow tea",
+                answers_in_transcript: false,
+            },
             Arc::new(
                 |args: &rebon_kernel_seats::kernel_core_commands::CommandArgs| {
                     Ok(format!("please make {}", args.rest))
@@ -1739,6 +1889,77 @@ mod tests {
         runtime.shutdown_background();
     }
 
+    /// A command that answers in the transcript (a mod's) shows what it
+    /// returned as its output and starts no turn; one that returned nothing
+    /// shows nothing.
+    #[test]
+    fn a_command_answering_in_the_transcript_is_shown_and_not_sent() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        let mut app = AppState::new();
+        let (tx, mut rx) = unbounded_channel();
+        app.command_expansion_tx = Some(tx.clone());
+        let mut active_prompt = None;
+
+        for (line, answer) in [("/radar", "0 running, 0 finished"), ("/quiet", "  ")] {
+            let answer = answer.to_string();
+            spawn_command_expansion(
+                &mut app,
+                &handle,
+                CommandExpansion {
+                    name: line.trim_start_matches('/'),
+                    line,
+                    answers_in_transcript: true,
+                },
+                Arc::new(
+                    move |_: &rebon_kernel_seats::kernel_core_commands::CommandArgs| {
+                        Ok(answer.clone())
+                    },
+                ),
+                expansion_args(line, ""),
+                tx.clone(),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.expanding_command.is_some() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the answer never landed"
+                );
+                std::thread::yield_now();
+                drain_command_expansion(
+                    &mut app,
+                    &mut session,
+                    &handle,
+                    &mut active_prompt,
+                    &mut rx,
+                );
+            }
+        }
+        runtime.block_on(tokio::task::yield_now());
+
+        let outputs: Vec<String> = app
+            .rebon_tui
+            .transcript
+            .rows()
+            .iter()
+            .filter_map(|row| match row {
+                rebon_tui::Message::System(system) if system.subtype == "local_command" => {
+                    system.content.clone()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outputs, vec!["0 running, 0 finished".to_string()]);
+        assert!(active_prompt.is_none(), "no turn starts");
+        assert!(
+            recorder.take_requests().is_empty(),
+            "nothing reaches the model"
+        );
+        runtime.shutdown_background();
+    }
+
     /// An expansion that failed is a sentence for the person, not prompt
     /// text. The loop shows it and sends nothing — the same answer the
     /// inline path gives, arriving a few frames later.
@@ -1755,6 +1976,7 @@ mod tests {
             id: 7,
             name: "slow".into(),
             line: "/slow tea".into(),
+            answers_in_transcript: false,
         });
         let mut active_prompt = None;
 
@@ -1796,8 +2018,11 @@ mod tests {
         spawn_command_expansion(
             &mut app,
             &handle,
-            "slow",
-            "/slow tea",
+            CommandExpansion {
+                name: "slow",
+                line: "/slow tea",
+                answers_in_transcript: false,
+            },
             Arc::new(
                 |_: &rebon_kernel_seats::kernel_core_commands::CommandArgs| {
                     Ok("brew tea slowly".to_string())
@@ -1815,8 +2040,11 @@ mod tests {
         spawn_command_expansion(
             &mut app,
             &handle,
-            "fast",
-            "/fast coffee",
+            CommandExpansion {
+                name: "fast",
+                line: "/fast coffee",
+                answers_in_transcript: false,
+            },
             Arc::new(
                 |_: &rebon_kernel_seats::kernel_core_commands::CommandArgs| {
                     Ok("pour coffee".to_string())

@@ -538,7 +538,8 @@ enum Command {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 enum PluginCommand {
-    /// Install a local plugin path, a package archive, or a built-in alias.
+    /// Install a local plugin path, a package archive, a built-in alias, or
+    /// a marketplace plugin (`plugin@marketplace`).
     Install {
         #[arg(value_name = "PATH_OR_ARCHIVE_OR_NAME")]
         source: String,
@@ -589,6 +590,51 @@ enum PluginCommand {
         name: String,
         #[arg(long = "scope", value_parser = parse_plugin_scope, default_value = "user")]
         scope: plugin::PluginScope,
+    },
+    /// Read a Claude Code mod folder the way the plane will: its manifest,
+    /// its hooks module, and what that module hooks, calls and registers.
+    Validate {
+        #[arg(value_name = "FOLDER")]
+        path: String,
+    },
+    /// List the plugins the marketplaces offer, and which are installed.
+    Browse {
+        /// Only this marketplace's plugins.
+        #[arg(long, value_name = "NAME")]
+        marketplace: Option<String>,
+        /// The whole catalog as JSON (marketplaces and plugins).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage Claude Code-compatible plugin marketplaces.
+    Marketplace {
+        #[command(subcommand)]
+        command: MarketplaceCommand,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+enum MarketplaceCommand {
+    /// Add a marketplace: `owner/repo[#ref]`, a git URL, a URL to a
+    /// `marketplace.json`, or a local folder or file.
+    Add {
+        #[arg(value_name = "SOURCE")]
+        source: String,
+    },
+    /// List the marketplaces, Rebon's own first.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch a marketplace again, or every added one.
+    Update {
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// Remove an added marketplace. What was installed from it stays.
+    Remove {
+        #[arg(value_name = "NAME")]
+        name: String,
     },
 }
 
@@ -1194,8 +1240,42 @@ fn rc_host(runtime: background::BackgroundRuntimeFields) -> rebon_rc_runner::cli
 async fn run_plugin_command(command: PluginCommand) -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("failed to read the current directory")?;
     let store = plugin::PluginStore::new(rebon_config::config_home_dir(), cwd.clone());
-    let installer = plugin::PluginInstaller::new(store, cwd, Vec::new());
+    let installer = plugin::PluginInstaller::new(store, cwd.clone(), Vec::new());
+    let marketplaces =
+        plugin::marketplace::MarketplaceManager::new(rebon_config::config_home_dir(), cwd.clone());
     match command {
+        PluginCommand::Install { source, scope, .. }
+            if plugin::marketplace::is_marketplace_spec(&source, &cwd) =>
+        {
+            let install = marketplaces.install(&source, scope)?;
+            println!(
+                "{}",
+                plugin::marketplace::format_install("installed", &install)
+            );
+        }
+        PluginCommand::Uninstall { name, .. }
+            if marketplaces.installs()?.by_id.contains_key(&name) =>
+        {
+            let install = marketplaces.uninstall(&name)?;
+            println!(
+                "{}",
+                plugin::marketplace::format_install("uninstalled", &install)
+            );
+        }
+        PluginCommand::Browse { marketplace, json } => {
+            let catalog = marketplaces.browse()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&catalog)?);
+            } else {
+                println!(
+                    "{}",
+                    plugin::marketplace::format_catalog(&catalog, marketplace.as_deref())
+                );
+            }
+        }
+        PluginCommand::Marketplace { command } => {
+            run_marketplace_command(&marketplaces, command)?;
+        }
         PluginCommand::Install {
             source,
             scope,
@@ -1256,8 +1336,156 @@ async fn run_plugin_command(command: PluginCommand) -> anyhow::Result<()> {
         PluginCommand::Status { name, scope } => {
             print_plugin_records(installer.status(name.as_deref(), scope)?);
         }
+        PluginCommand::Validate { path } => {
+            let root = rebon_config::resolve_against_cwd(&cwd, &path);
+            print!("{}", describe_claude_mod(&root)?);
+        }
     }
     Ok(())
+}
+
+fn run_marketplace_command(
+    marketplaces: &plugin::marketplace::MarketplaceManager,
+    command: MarketplaceCommand,
+) -> anyhow::Result<()> {
+    match command {
+        MarketplaceCommand::Add { source } => {
+            let view = marketplaces.add(&source)?;
+            println!(
+                "added marketplace {} ({} plugins) from {}",
+                view.name, view.plugins, view.source
+            );
+        }
+        MarketplaceCommand::List { json } => {
+            let views = marketplaces.marketplaces()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&views)?);
+            } else {
+                println!("{}", plugin::marketplace::format_marketplaces(&views));
+            }
+        }
+        MarketplaceCommand::Update { name } => {
+            let mut failed = 0usize;
+            for (name, outcome) in marketplaces.update(name.as_deref())? {
+                match outcome {
+                    Ok(()) => println!("updated {name}"),
+                    Err(error) => {
+                        failed += 1;
+                        println!("{name}: {error}");
+                    }
+                }
+            }
+            if failed > 0 {
+                anyhow::bail!("{failed} marketplaces did not update");
+            }
+        }
+        MarketplaceCommand::Remove { name } => {
+            marketplaces.remove(&name)?;
+            println!("removed marketplace {name}");
+        }
+    }
+    Ok(())
+}
+
+/// What `rebon plugin validate` prints: the lists `claude plugin validate`
+/// prints, read by rebon's own scanner, and the ceiling the plane would load
+/// the mod against.
+fn describe_claude_mod(root: &Path) -> anyhow::Result<String> {
+    use rebon_harness::rebon_plugin_package::{kernel_manifest_for, read_claude_mod};
+    let mod_ = read_claude_mod(root).map_err(|reason| anyhow::anyhow!(reason))?;
+    let ceiling = kernel_manifest_for(&mod_);
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{} {}\n",
+        mod_.manifest.name,
+        mod_.manifest.version.as_deref().unwrap_or("(no version)")
+    ));
+    if let Some(description) = &mod_.manifest.description {
+        out.push_str(&format!("  {description}\n"));
+    }
+    out.push_str(&format!("  folder: {}\n", root.display()));
+    out.push_str(&format!("  hooks module: {}\n", mod_.hooks_module));
+    let list = |label: &str, items: &[String]| -> String {
+        if items.is_empty() {
+            format!("  {label}: (none)\n")
+        } else {
+            format!("  {label}: {}\n", items.join(", "))
+        }
+    };
+    out.push_str(&list("events", &mod_.scan.events));
+    out.push_str(&list("calls", &mod_.scan.calls));
+    out.push_str(&list("commands", &ceiling.commands));
+    out.push_str(&list("tools", &ceiling.tools));
+    out.push_str(&list("seats", &ceiling.seats));
+    let reaches = match &ceiling.invokable_tools {
+        serde_json::Value::String(all) => all.clone(),
+        serde_json::Value::Array(list) if list.is_empty() => "(no tool)".to_owned(),
+        other => other.to_string(),
+    };
+    out.push_str(&format!("  invokes: {reaches}\n"));
+    if !mod_.scan.env_reads.is_empty() || !mod_.scan.env_writes.is_empty() {
+        out.push_str(&format!(
+            "  env: reads {:?}, writes {:?}\n",
+            mod_.scan.env_reads, mod_.scan.env_writes
+        ));
+    }
+    let options: Vec<String> = mod_
+        .manifest
+        .user_config
+        .iter()
+        .map(|(name, field)| {
+            format!(
+                "{name} ({}{})",
+                field.ty.as_deref().unwrap_or("string"),
+                field
+                    .default
+                    .as_ref()
+                    .map(|d| format!(", default {d}"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect();
+    out.push_str(&list("options", &options));
+    for warning in &mod_.scan.warnings {
+        out.push_str(&format!("  warning: {warning}\n"));
+    }
+    let unserved: Vec<&str> = mod_
+        .scan
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.as_str(),
+                "turn.step"
+                    | "process.spawn"
+                    | "session.append"
+                    | "prompt.compose"
+                    | "prompt.section"
+                    | "prompt.context"
+                    | "prompt.attachment"
+                    | "tool.describe"
+                    | "command.describe"
+                    | "config.describe"
+                    | "session.receive"
+                    | "session.send"
+                    | "session.measure"
+                    | "agent.offer"
+                    | "agent.spawn"
+                    | "skill.prompt"
+                    | "attribution.text"
+                    | "plugin.register"
+                    | "engine.create"
+            )
+        })
+        .map(String::as_str)
+        .collect();
+    if !unserved.is_empty() {
+        out.push_str(&format!(
+            "  note: rebon raises no {} event; those hooks never run here\n",
+            unserved.join(", ")
+        ));
+    }
+    Ok(out)
 }
 
 fn print_plugin_records(records: Vec<(plugin::PluginScope, plugin::InstalledPluginRecord)>) {
@@ -2845,6 +3073,70 @@ mod tests {
     fn hidden_background_supervisor_parses() {
         let cli = Cli::parse_from(["rebon", "__background-supervisor"]);
         assert_eq!(cli.command, Some(Command::BackgroundSupervisor));
+    }
+
+    #[test]
+    fn plugin_marketplace_and_browse_subcommands_parse() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["rebon", "plugin"];
+            argv.extend_from_slice(args);
+            Cli::parse_from(argv).command
+        };
+        assert_eq!(
+            parse(&["marketplace", "add", "hamzafer/claude-code-mods"]),
+            Some(Command::Plugin {
+                command: PluginCommand::Marketplace {
+                    command: MarketplaceCommand::Add {
+                        source: "hamzafer/claude-code-mods".into()
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["marketplace", "list", "--json"]),
+            Some(Command::Plugin {
+                command: PluginCommand::Marketplace {
+                    command: MarketplaceCommand::List { json: true }
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["marketplace", "update"]),
+            Some(Command::Plugin {
+                command: PluginCommand::Marketplace {
+                    command: MarketplaceCommand::Update { name: None }
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["marketplace", "remove", "mods"]),
+            Some(Command::Plugin {
+                command: PluginCommand::Marketplace {
+                    command: MarketplaceCommand::Remove {
+                        name: "mods".into()
+                    }
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["browse", "--marketplace", "rebon", "--json"]),
+            Some(Command::Plugin {
+                command: PluginCommand::Browse {
+                    marketplace: Some("rebon".into()),
+                    json: true
+                }
+            })
+        );
+        assert_eq!(
+            parse(&["install", "agent-radar@rebon"]),
+            Some(Command::Plugin {
+                command: PluginCommand::Install {
+                    source: "agent-radar@rebon".into(),
+                    scope: plugin::PluginScope::User,
+                    sha256: None,
+                }
+            })
+        );
     }
 
     #[test]

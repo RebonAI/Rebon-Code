@@ -125,6 +125,13 @@ pub(crate) fn decide_session_host(
     {
         overrides.startup_hosted = true;
     }
+    if mirrors_a_worker(overrides) {
+        // The worker loads the session's mods and runs their hooks; a copy
+        // here would fire every `session.start` a second time and hear none
+        // of the turns. The terminal draws the worker's instead
+        // (`tui::runner::mods_surface`). Decided before the plane boots.
+        rebon_plugin_host::mods::set_process_loads_mods(false);
+    }
     tracing::info!(
         elapsed_ms = startup_started.elapsed().as_millis() as u64,
         hosted = hosted_startup.is_some(),
@@ -134,5 +141,46 @@ pub(crate) fn decide_session_host(
     SessionHostDecision {
         draw_before_session,
         hosted: hosted_startup,
+    }
+}
+
+/// Whether this terminal's session runs in a worker it mirrors: one started
+/// for it above, one it attaches to, or one a startup choice (a resume, the
+/// agent list) will host once made.
+fn mirrors_a_worker(overrides: &RuntimeOverride) -> bool {
+    overrides.attached_background_job_id.is_some() || overrides.startup_hosted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_terminal_mirroring_a_worker_goes_without_mods_of_its_own() {
+        let local = RuntimeOverride {
+            startup_local: true,
+            ..RuntimeOverride::default()
+        };
+        assert!(
+            !mirrors_a_worker(&local),
+            "a bare or --local run hosts here"
+        );
+        let started = RuntimeOverride {
+            attached_background_job_id: Some("job-1".into()),
+            startup_hosted: false,
+            ..RuntimeOverride::default()
+        };
+        assert!(
+            mirrors_a_worker(&started),
+            "a worker started for it, or an attach"
+        );
+        let deferred = RuntimeOverride {
+            startup_hosted: true,
+            ..RuntimeOverride::default()
+        };
+        assert!(
+            mirrors_a_worker(&deferred),
+            "--hosted whose worker a resume or the agent list starts later"
+        );
     }
 }

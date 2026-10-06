@@ -81,6 +81,29 @@ pub(crate) fn inject_system_message(app: &mut AppState, subtype: &str, content: 
     );
 }
 
+/// Inject what a Claude Code mod said to the person (`$.ui.toast`, a
+/// transcript `$.ui.log`). Its `mod_notice` subtype is shown at any level,
+/// where an info-level notice is shown only in verbose mode. `key` tells
+/// two notices made in one millisecond apart.
+pub(crate) fn inject_mod_notice(
+    app: &mut AppState,
+    level: rebon_tui::SystemLevel,
+    key: &str,
+    content: &str,
+) {
+    rebon_tui::reducer(
+        &mut app.rebon_tui,
+        rebon_tui::Action::Commit(rebon_tui::Message::System(rebon_tui::SystemMessage {
+            uuid: format!("s-mod_notice-{key}-{}", rebon_types::wall_clock_ms_u128()),
+            timestamp: format_system_time_iso_ms(SystemTime::now()),
+            subtype: "mod_notice".into(),
+            content: Some(content.to_string()),
+            level: Some(level),
+            is_meta: None,
+        })),
+    );
+}
+
 pub(crate) fn inject_worked_message(app: &mut AppState, elapsed: Duration) {
     inject_system_message(app, "turn_duration", &worked_summary(elapsed));
 }

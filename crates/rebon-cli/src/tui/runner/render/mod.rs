@@ -54,6 +54,7 @@ mod header;
 mod inline;
 pub(crate) use inline::InlineTailMeasureSlot;
 mod landing;
+mod mods;
 mod notices;
 mod pickers;
 mod prompt;
@@ -68,6 +69,8 @@ use footer::*;
 use header::*;
 use inline::*;
 use landing::*;
+use mods::*;
+pub(in crate::tui::runner) use mods::{shown_choice, PANE_BODY_COLUMNS};
 use notices::*;
 use pickers::*;
 use prompt::*;
@@ -591,6 +594,7 @@ mod tests {
             agent_activity: None,
             goal_activity: None,
             footer_action_hint: None,
+            mods_status: None,
             new_session_hint: None,
         };
         let backend = TestBackend::new(80, height);
@@ -656,6 +660,7 @@ mod tests {
             agent_activity: None,
             goal_activity: None,
             footer_action_hint: None,
+            mods_status: None,
             new_session_hint: None,
         };
         let backend = TestBackend::new(80, height);
@@ -705,6 +710,7 @@ mod tests {
             agent_activity: None,
             goal_activity: None,
             footer_action_hint: None,
+            mods_status: None,
             new_session_hint: None,
         };
         let session = make_test_tui_session();
@@ -765,6 +771,7 @@ mod tests {
             agent_activity: None,
             goal_activity: None,
             footer_action_hint: Some("·"),
+            mods_status: None,
             new_session_hint: None,
         };
         let backend = TestBackend::new(80, 20);
@@ -882,6 +889,7 @@ mod tests {
             agent_activity: None,
             goal_activity: None,
             footer_action_hint: None,
+            mods_status: None,
             new_session_hint: None,
         };
         let backend = TestBackend::new(area.right(), area.bottom());
@@ -1001,6 +1009,7 @@ mod tests {
             agent_activity: None,
             goal_activity: None,
             footer_action_hint: None,
+            mods_status: None,
             new_session_hint: None,
         };
         let backend = TestBackend::new(80, height);
@@ -1793,6 +1802,7 @@ mod tests {
             agent_activity: None,
             goal_activity: None,
             footer_action_hint: None,
+            mods_status: None,
             new_session_hint: None,
         };
         let backend = TestBackend::new(terminal_area.width, terminal_area.height);
@@ -2017,6 +2027,7 @@ mod tests {
             agent_activity: None,
             goal_activity: None,
             footer_action_hint: Some("press ← again for agents view"),
+            mods_status: None,
             new_session_hint: None,
         };
         let zones = test_layout_zones();
@@ -2046,6 +2057,7 @@ mod tests {
             agent_activity: None,
             goal_activity: None,
             footer_action_hint: None,
+            mods_status: None,
             new_session_hint: None,
         };
         let zones = test_layout_zones();
@@ -2096,6 +2108,7 @@ mod tests {
             agent_activity: None,
             goal_activity: None,
             footer_action_hint: None,
+            mods_status: None,
             new_session_hint: None,
         };
         let mut zones = test_layout_zones();
@@ -2129,6 +2142,7 @@ mod tests {
             agent_activity: None,
             goal_activity: None,
             footer_action_hint: None,
+            mods_status: None,
             new_session_hint: None,
         };
         let zones = test_layout_zones();
@@ -2167,6 +2181,7 @@ mod tests {
                 elapsed_ms: 65_000,
             }),
             footer_action_hint: None,
+            mods_status: None,
             new_session_hint: None,
         };
         let zones = test_layout_zones();
@@ -3854,5 +3869,163 @@ mod tests {
             !source.contains("&mut app.transcript_measure_cache"),
             "inline sliced transcript must not reuse AppState's long-lived measurement cache"
         );
+    }
+
+    fn mod_band_tree() -> rebon_types::ModUiNode {
+        serde_json::from_value(
+            serde_json::json!({ "type": "Box", "props": { "gap": 1 }, "children": [
+            { "type": "Text", "props": {}, "children": ["probe band"] },
+            { "type": "Button", "props": { "key": "bump", "hotkey": "b" }, "children": ["Bump"] },
+        ] }),
+        )
+        .expect("a tree")
+    }
+
+    fn mod_pane(tree: Option<rebon_types::ModUiNode>) -> crate::tui::app::TerminalModPane {
+        crate::tui::app::TerminalModPane {
+            id: "probe".into(),
+            plugin: "probe".into(),
+            plugin_name: "probe".into(),
+            title: "Probe".into(),
+            unasked: false,
+            close_on_escape: false,
+            version: 1,
+            drawn_version: 1,
+            tree,
+            error: None,
+        }
+    }
+
+    /// An inline frame at `width` columns, against a borrowed app.
+    fn render_inline_rows_at(app: &mut AppState, width: u16, height: u16) -> Vec<String> {
+        let theme = RenderTheme::plain();
+        let runtime_state =
+            derive_prompt_input_runtime_state(&app.build_runtime_input(), |_, _, _| {
+                "#ffffff".to_string()
+            });
+        let status = StatusBarInfo {
+            provider: "test",
+            model: "model",
+            cwd: "cwd",
+            elapsed_ms: 0,
+            effort_display: String::new(),
+            fast_mode_display: String::new(),
+            context_left_pct: None,
+            agent_activity: None,
+            goal_activity: None,
+            footer_action_hint: None,
+            mods_status: None,
+            new_session_hint: None,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                let mut cursor_hint = None;
+                render_inline_frame(
+                    frame,
+                    app,
+                    &runtime_state,
+                    &theme,
+                    false,
+                    &status,
+                    None,
+                    0,
+                    height,
+                    &mut cursor_hint,
+                );
+            })
+            .expect("draw");
+        all_rows(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn the_inline_frame_draws_a_mods_band_above_the_prompt_and_records_its_controls() {
+        let mut app = AppState::new();
+        app.mods_band = Some(("probe".into(), mod_band_tree()));
+        let rows = render_inline_rows_at(&mut app, 80, 24);
+        let band = rows
+            .iter()
+            .position(|row| row.contains("probe band"))
+            .unwrap_or_else(|| panic!("the band is drawn: {rows:#?}"));
+        let prompt = rows
+            .iter()
+            .position(|row| row.contains('❯'))
+            .expect("the prompt");
+        assert!(band < prompt, "the band sits above the prompt: {rows:#?}");
+        assert_eq!(app.mods_sites.len(), 1);
+        assert_eq!(app.mods_sites[0].component, "AbovePrompt");
+        assert!(app.mods_hits.iter().any(|hit| hit.element == "bump"));
+    }
+
+    #[test]
+    fn every_inline_frame_records_the_mods_afresh() {
+        let mut app = AppState::new();
+        app.mods_band = Some(("probe".into(), mod_band_tree()));
+        render_inline_rows_at(&mut app, 80, 24);
+        render_inline_rows_at(&mut app, 80, 24);
+        assert_eq!(
+            app.mods_sites.len(),
+            1,
+            "a second frame does not add a second band"
+        );
+        assert_eq!(app.mods_hits.len(), 1);
+        app.mods_band = None;
+        let rows = render_inline_rows_at(&mut app, 80, 24);
+        assert!(!rows.iter().any(|row| row.contains("probe band")));
+        assert!(app.mods_sites.is_empty() && app.mods_hits.is_empty());
+    }
+
+    #[test]
+    fn the_inline_frame_stacks_a_seated_pane_over_the_band() {
+        let mut app = AppState::new();
+        app.mods_band = Some(("probe".into(), mod_band_tree()));
+        let body: rebon_types::ModUiNode = serde_json::from_value(serde_json::json!(
+            { "type": "Text", "props": {}, "children": ["pane body"] }
+        ))
+        .unwrap();
+        app.mods_panes.push(mod_pane(Some(body)));
+        let rows = render_inline_rows_at(&mut app, 120, 30);
+        let title = rows
+            .iter()
+            .position(|row| row.contains("Probe · probe"))
+            .unwrap_or_else(|| panic!("the pane is framed and titled: {rows:#?}"));
+        let body_row = rows
+            .iter()
+            .position(|row| row.contains("pane body"))
+            .expect("its body");
+        let band = rows
+            .iter()
+            .position(|row| row.contains("probe band"))
+            .expect("the band");
+        assert!(title < body_row && body_row < band, "{rows:#?}");
+        assert_eq!(app.mods_sites.len(), 2);
+
+        // Below 100 columns a pane the person asked for does not seat.
+        let narrow = render_inline_rows_at(&mut app, 80, 30);
+        assert!(!narrow.iter().any(|row| row.contains("pane body")));
+    }
+
+    #[test]
+    fn the_screen_landing_draws_the_band_above_its_prompt() {
+        let mut app = AppState::new();
+        app.mods_band = Some(("probe".into(), mod_band_tree()));
+        let rows = render_screen_rows(app, 100, 30);
+        assert!(
+            rows.iter().any(|row| row.contains("probe band")),
+            "an empty session's landing still shows the band: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_configured_status_line_carries_the_mods_status() {
+        let mut app = AppState::new();
+        app.custom_status_line.output = vec!["my line".into()];
+        app.mods_status = Some("probe: loaded".into());
+        let rows = render_inline_rows_at(&mut app, 100, 20);
+        let line = rows
+            .iter()
+            .find(|row| row.contains("my line"))
+            .unwrap_or_else(|| panic!("the status line: {rows:#?}"));
+        assert!(line.contains("probe: loaded"), "{line}");
     }
 }

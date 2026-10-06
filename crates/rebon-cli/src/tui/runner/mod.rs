@@ -43,6 +43,8 @@ mod layout_and_scroll;
 mod live_agent_view;
 mod local_agent_continuation;
 mod mid_turn_submit_queue;
+mod mods_keys;
+mod mods_surface;
 mod native_commands;
 mod onboarding_hooks;
 mod paste_burst;

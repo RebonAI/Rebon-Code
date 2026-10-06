@@ -236,6 +236,21 @@ pub(super) fn handle_mouse_event(
                 .on_scroll_away(build_scroll_snapshot(app, vh));
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            // A click on a mod's control gives its site the keyboard, and a
+            // Button or Link is pressed; the loop hands the press over on its
+            // next pass. A click in the prompt gives the keyboard back.
+            if let Some(hit) = app
+                .mods_hits
+                .iter()
+                .find(|hit| point_in_rect(mouse.column, mouse.row, Some(hit.area)))
+                .cloned()
+            {
+                super::mods_keys::mods_click(app, hit, mouse.column, mouse.row);
+                return;
+            }
+            if point_in_rect(mouse.column, mouse.row, Some(prompt_area)) {
+                app.mods_focus = None;
+            }
             if is_screen_mode && point_in_rect(mouse.column, mouse.row, app.scroll_to_bottom_area) {
                 repin_transcript_to_bottom(app);
                 app.selection.clear();

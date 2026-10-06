@@ -140,6 +140,10 @@ pub struct ExpandingCommand {
     pub id: u64,
     /// The command's name, for the notice on screen.
     pub name: String,
+    /// The command answers in the transcript rather than with a prompt
+    /// (`CommandKind::Session`, which a mod's command is): what it returns is
+    /// shown as its output, and no turn starts.
+    pub answers_in_transcript: bool,
     /// The line as typed. The input is cleared while the expansion runs, so
     /// this is what a failed expansion leaves in history for the person to
     /// recall and retype.
@@ -522,6 +526,29 @@ pub struct AppState {
     /// Whether the stash hint notification has been dismissed this
     /// session. Once set, the hint is never re-shown.
     pub stash_hint_dismissed: bool,
+    /// What the loaded Claude Code mods put in the footer with `$.ui.status`,
+    /// joined; `None` when none has.
+    pub mods_status: Option<String>,
+    /// The band a mod drew above the prompt (`AbovePrompt`), with the plugin
+    /// id that drew it.
+    pub mods_band: Option<(String, rebon_types::ModUiNode)>,
+    /// The panes the mods have open, and the terminal's drawing of each.
+    pub mods_panes: Vec<TerminalModPane>,
+    /// Where this frame drew a mod's Buttons, Links, Inputs and Selects;
+    /// rebuilt every frame.
+    pub mods_hits: Vec<ModHit>,
+    /// The mod sites (the band, each seated pane) this frame drew, in the
+    /// order the focus chord walks them; rebuilt every frame.
+    pub mods_sites: Vec<ModSite>,
+    /// What the person did to those since the last pass of the loop.
+    pub mods_acts: Vec<ModAct>,
+    /// The mod site holding the keyboard, when one does.
+    pub mods_focus: Option<ModFocus>,
+    /// A pane opened with `focus` that takes the keyboard once it is drawn.
+    pub mods_focus_wanted: Option<ModSite>,
+    /// Ctrl+X was pressed while a mod site was drawn: a Tab next takes the
+    /// focus to the next site.
+    pub mods_chord_armed: bool,
     /// Latest macOS Option-as-Meta hint for status-bar toast display.
     /// Cleared after the renderer consumes it or after a timeout.
     pub option_meta_hint_toast: Option<OptionMetaHint>,
@@ -909,6 +936,15 @@ impl AppState {
             side_question_visible: false,
             prompt_suggestion_active: false,
             stash_hint_dismissed: false,
+            mods_status: None,
+            mods_band: None,
+            mods_panes: Vec::new(),
+            mods_hits: Vec::new(),
+            mods_sites: Vec::new(),
+            mods_acts: Vec::new(),
+            mods_focus: None,
+            mods_focus_wanted: None,
+            mods_chord_armed: false,
             option_meta_hint_toast: None,
             last_esc_press_ms: 0,
             last_left_press_ms: 0,
@@ -1663,4 +1699,163 @@ mod tests {
         app.dialogs.close_all();
         assert!(!app.has_fullscreen_dialog());
     }
+}
+
+/// A mod's pane as the terminal docks it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TerminalModPane {
+    pub id: String,
+    pub plugin: String,
+    pub plugin_name: String,
+    pub title: String,
+    /// Opened by the mod rather than by the person: seats only on a wide
+    /// terminal.
+    pub unasked: bool,
+    /// Opened with `closeOnEscape`: Esc in it closes it.
+    pub close_on_escape: bool,
+    /// The pane's version in the mods' table, and the one last drawn.
+    pub version: u64,
+    pub drawn_version: u64,
+    pub tree: Option<rebon_types::ModUiNode>,
+    pub error: Option<String>,
+}
+
+impl TerminalModPane {
+    pub fn site(&self) -> ModSite {
+        ModSite {
+            plugin: self.plugin.clone(),
+            component: "Pane".to_owned(),
+            request_id: self.id.clone(),
+        }
+    }
+}
+
+/// One place a mod draws: the band above the prompt, or one pane.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModSite {
+    /// The plugin id of the mod whose hook drew it.
+    pub plugin: String,
+    /// `AbovePrompt` or `Pane`.
+    pub component: String,
+    /// The instance its render hook was asked under.
+    pub request_id: String,
+}
+
+/// Where a mod's control was drawn, and what it is.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModHit {
+    pub area: ratatui::layout::Rect,
+    pub site: ModSite,
+    /// The element's `key`: `e.element` at the press.
+    pub element: String,
+    pub kind: ModHitKind,
+    /// Drawn `autoFocus`: the focus ring starts here when its site takes the
+    /// keyboard.
+    pub auto_focus: bool,
+}
+
+/// What a drawn control does when the person acts on it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModHitKind {
+    /// Pressed with a click, Enter or Space, or its `hotkey`.
+    Button {
+        hotkey: Option<char>,
+    },
+    Link {
+        href: Option<String>,
+    },
+    /// A text field, holding `value` as drawn.
+    Input {
+        value: String,
+    },
+    /// A pick among `options`, `value` the one drawn as selected.
+    Select {
+        options: Vec<ModSelectOption>,
+        value: Option<String>,
+    },
+    /// A surface module's region (`Client`): while the ring is on it, the
+    /// keys are its own, and a click is a pointer event inside it.
+    Client,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModSelectOption {
+    pub label: String,
+    pub value: String,
+}
+
+/// A mod site holding the keyboard.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ModFocus {
+    pub site: ModSite,
+    /// The control the ring is on; `None` before the person (or an
+    /// `autoFocus`) put it on one.
+    pub element: Option<String>,
+    /// The person moved the ring: an `autoFocus` no longer applies.
+    pub moved: bool,
+    /// Text typed into an Input, by key, until it is submitted.
+    pub drafts: std::collections::BTreeMap<String, String>,
+    /// The option a Select is turned to, by key, until it is picked.
+    pub choices: std::collections::BTreeMap<String, usize>,
+    /// Esc closes the site (a pane opened with `closeOnEscape`).
+    pub close_on_escape: bool,
+}
+
+/// Something the person did to a mod's drawing, for the loop to hand over.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModAct {
+    Press {
+        site: ModSite,
+        element: String,
+        href: Option<String>,
+    },
+    /// `kind` is `change` (one edit, `onInput`) or `submit` (Enter,
+    /// `onSubmit`).
+    Input {
+        site: ModSite,
+        element: String,
+        kind: &'static str,
+        value: String,
+    },
+    Select {
+        site: ModSite,
+        element: String,
+        value: String,
+    },
+    ClosePane {
+        plugin: String,
+        id: String,
+    },
+    /// The ring moved within `site` (from `previous`), for the mod's
+    /// `ui.focus` hooks to keep or redirect; `by_plugin` when its own
+    /// `autoFocus` or `$.ui.focus` moved it rather than the person.
+    Focus {
+        site: ModSite,
+        element: Option<String>,
+        previous: Option<String>,
+        by_plugin: bool,
+    },
+    /// A key for the `Client` under the ring, as `ClientKeyEvent`.
+    ClientKey {
+        site: ModSite,
+        element: String,
+        key: serde_json::Value,
+    },
+    /// A pointer event inside a `Client`, region-relative.
+    ClientPointer {
+        site: ModSite,
+        element: String,
+        pointer: serde_json::Value,
+    },
+}
+
+/// What a mod's `ui.focus` hooks said about one move of the ring.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModFocusOutcome {
+    pub site: ModSite,
+    /// Where the move put the ring, and where it was before.
+    pub asked: Option<String>,
+    pub previous: Option<String>,
+    /// `Err(reason)`: kept where it was; `Ok(landed)`: where it lands.
+    pub answer: Result<Option<String>, String>,
 }
