@@ -454,6 +454,9 @@ mod tests {
         }
     }
 
+    // Only a Windows `Path` splits `C:\node\node.exe` at its backslash; on
+    // macOS Node's folder would read as empty, and only Windows runs this.
+    #[cfg(windows)]
     #[test]
     fn on_windows_the_host_runs_under_the_helper_with_a_pipe_its_reads_and_no_network() {
         let features = crate::runtime::windows::SandboxWinFeatures {

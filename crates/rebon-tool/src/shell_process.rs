@@ -31,6 +31,12 @@ const OUTPUT_RESPONSE_BYTES: usize = 64 * 1024;
 const MONITOR_LINE_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_RUNNING_SHELLS_PER_OWNER: usize = 16;
 const MAX_COMPLETED_SHELLS_PER_OWNER: usize = 64;
+/// How long the output readers get to reach end of file once the process
+/// group is gone. They normally reach it at once; they do not while a
+/// process outside the group holds a pipe's write end. On macOS that can be
+/// any process another thread spawned while the pipe was being made: without
+/// `pipe2`, std marks a new pipe close-on-exec in a second step.
+const READER_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ShellOutputEncoding {
@@ -1416,13 +1422,34 @@ async fn supervise_process(
     if let Err(err) = entry.process_tree.terminate() {
         entry.record_error(format!("failed to clean up process tree: {err}"));
     }
-    if let Err(err) = stdout_task.await {
-        entry.record_error(format!("background stdout reader failed: {err}"));
-    }
-    if let Err(err) = stderr_task.await {
-        entry.record_error(format!("background stderr reader failed: {err}"));
-    }
+    let drain_deadline = Instant::now() + READER_DRAIN_GRACE;
+    drain_reader(stdout_task, drain_deadline, &entry, "stdout").await;
+    drain_reader(stderr_task, drain_deadline, &entry, "stderr").await;
     entry.finish(wait_result);
+}
+
+/// Let a reader finish what the pipe still holds, but no longer than
+/// `deadline`: whatever keeps the pipe open past it is not the shell's.
+/// Cutting it off is not an error, so a command that exited cleanly still
+/// reads as exited.
+async fn drain_reader(
+    mut reader: JoinHandle<()>,
+    deadline: Instant,
+    entry: &ShellEntry,
+    stream: &str,
+) {
+    match tokio::time::timeout_at(deadline, &mut reader).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => entry.record_error(format!("background {stream} reader failed: {err}")),
+        Err(_) => {
+            tracing::debug!(
+                shell_id = %entry.shell_id,
+                stream,
+                "output cut off: pipe held open outside the process group"
+            );
+            reader.abort();
+        }
+    }
 }
 
 fn running_count(entries: &HashMap<String, Arc<ShellEntry>>, owner: &ShellOwner) -> usize {
@@ -2851,6 +2878,35 @@ mod tests {
         let completion = wait_for_monitor_completion(&controller).await;
         assert_eq!(completion.status, MonitorTaskCompletionStatus::AutoStopped);
         assert_eq!(lock(&controller.monitor_events).len(), 1);
+    }
+
+    /// A process outside the group can hold stdout open after the group is
+    /// gone; on macOS any process spawned while the pipe was made can. Perl
+    /// stands in for one here: `setpgrp` leaves the group the stop reaps,
+    /// and it keeps the pipe for longer than the test waits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_monitor_auto_stop_does_not_wait_for_a_pipe_held_outside_the_group() {
+        let _env = crate::test_env::hold_env();
+        let script = "perl -e 'setpgrp(0, 0); sleep 10' & sleep 0.5; printf 'event\\n'; sleep 30";
+        let registry = ShellProcessRegistry::new();
+        let controller = Arc::new(RecordingTaskController::default());
+        *lock(&controller.monitor_disposition) = Some(MonitorEventDisposition::AutoStop);
+        let context = context("session-a").with_task_runtime_controller(controller.clone());
+        registry
+            .spawn_monitor(
+                &context,
+                configured_command(script),
+                script.into(),
+                "noisy events".into(),
+                "shell command (redacted)".into(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let completion = wait_for_monitor_completion(&controller).await;
+        assert_eq!(completion.status, MonitorTaskCompletionStatus::AutoStopped);
     }
 
     #[test]
