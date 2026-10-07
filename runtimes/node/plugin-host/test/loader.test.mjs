@@ -3,8 +3,19 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { loadPlugin, resolveEntry } from '../src/loader.mjs';
 
-const request=(over={})=>({pluginId:'plugin.a',root:path.resolve('/packages/demo'),entry:'index.mjs',services:['compose'],eventTopics:['session'],...over});
+const request=(over={})=>({adapter:{id:'native',revision:1},pluginId:'plugin.a',root:path.resolve('/packages/demo'),entry:'index.mjs',services:['compose'],eventTopics:['session'],...over});
 const module_=(activate)=>async()=>({activate});
+
+test('unsupported or missing adapters are rejected before importing the entry', async () => {
+  for (const adapter of [undefined, { id: 'future', revision: 1 }, { id: 'native', revision: 2 }, { id: 'cordis', revision: 1 }, { id: 'claude-mods', revision: 1 }]) {
+    let imported = false;
+    await assert.rejects(loadPlugin(request({ adapter }), async () => {
+      imported = true;
+      return { activate() {} };
+    }), { code: adapter === undefined ? '[WRONG_SHAPE]' : '[UNSUPPORTED_ADAPTER]' });
+    assert.equal(imported, false);
+  }
+});
 
 test('an entry resolves inside its package root',()=>{const root=path.resolve('/packages/demo');const url=resolveEntry(root,'src/index.mjs');assert.ok(url.startsWith('file:'));assert.ok(decodeURIComponent(url).includes('src'));});
 

@@ -79,7 +79,7 @@ fn payload_tokens_survive_without_the_feature() {
     use rebon_plugin_protocol::{NdjsonCodec, WireMessage};
 
     let frame = concat!(
-        r#"{"protocol_version":1,"host_epoch":7,"plugin_id":"p","scope_id":"s","#,
+        r#"{"protocol_version":2,"host_epoch":7,"plugin_id":"p","scope_id":"s","#,
         r#""scope_generation":3,"call_id":"c","message":{"type":"notification","#,
         r#""method":"m","payload":{"n":0.10000000000000001}}}"#,
         "\n"

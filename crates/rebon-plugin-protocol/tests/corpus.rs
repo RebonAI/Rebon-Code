@@ -19,7 +19,7 @@ fn bytes(source: &Value) -> Vec<u8> {
     }
     assert_eq!(source["generator"], "padded_request");
     let target = source["body_bytes"].as_u64().unwrap() as usize;
-    let sample = r#"{"protocol_version":1,"host_epoch":0,"plugin_id":"p","scope_id":"s","scope_generation":0,"call_id":"padding","message":{"type":"notification","method":"m","payload":""}}"#;
+    let sample = r#"{"protocol_version":2,"host_epoch":0,"plugin_id":"p","scope_id":"s","scope_generation":0,"call_id":"padding","message":{"type":"notification","method":"m","payload":""}}"#;
     let padding = target - sample.len();
     let mut body = sample
         .replacen("\"\"}}", &format!("\"{}\"}}}}", "x".repeat(padding)), 1)
@@ -202,6 +202,6 @@ fn opaque_payload_duplicates_are_last_wins_but_typed_duplicates_reject() {
     let value: Value = serde_json::from_str(r#"{"a":1,"a":2}"#).unwrap();
     assert_eq!(value, json!({"a": 2}));
     let mut codec = NdjsonCodec::default();
-    assert!(codec.push(br#"{"protocol_version":1,"protocol_version":1,"host_epoch":0,"plugin_id":"p","scope_id":"s","scope_generation":0,"call_id":"c","message":{"type":"notification","method":"m","payload":null}}
+    assert!(codec.push(br#"{"protocol_version":2,"protocol_version":2,"host_epoch":0,"plugin_id":"p","scope_id":"s","scope_generation":0,"call_id":"c","message":{"type":"notification","method":"m","payload":null}}
 "#).is_err());
 }

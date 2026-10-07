@@ -345,7 +345,18 @@ fn load_request(
         } else {
             roots.payload.clone()
         };
-        return Ok(entry_for(manifest, id, root, entry, config, all_tools));
+        return Ok(entry_for(
+            manifest,
+            id,
+            root,
+            entry,
+            config,
+            all_tools,
+            rebon_plugin_protocol::PluginAdapter {
+                id: "cordis".into(),
+                revision: 1,
+            },
+        ));
     }
     let Some(module) = modules.get(name) else {
         // Nothing pointed at a file, so the name has to have been declared by
@@ -379,7 +390,7 @@ fn load_request(
     // A package that declares nothing is not loaded declaring nothing: it would
     // start, be refused at every registration it attempts, and look like a bug
     // in the plugin rather than a missing manifest.
-    let (declared_as, manifest) = read_package_manifest(module)
+    let (declared_as, manifest, compatibility) = read_package_manifest(module)
         .map_err(|problem| format!("{} — {problem}", plain_path(&root)))?;
     tracing::debug!(
         plugin = id,
@@ -387,7 +398,18 @@ fn load_request(
         package = %root.display(),
         "composition entry loaded against its package's own declaration"
     );
-    Ok(entry_for(&manifest, id, root, file, config, all_tools))
+    Ok(entry_for(
+        &manifest,
+        id,
+        root,
+        file,
+        config,
+        all_tools,
+        rebon_plugin_protocol::PluginAdapter {
+            id: compatibility.adapter_id().into(),
+            revision: rebon_plugin_package::compatibility::ADAPTER_REVISION,
+        },
+    ))
 }
 
 /// The load request for a kernel plugin an installed package declares,
@@ -408,6 +430,10 @@ pub(crate) fn installed_entry(
         module,
         config,
         all_tools,
+        rebon_plugin_protocol::PluginAdapter {
+            id: declared.compatibility.adapter_id().into(),
+            revision: rebon_plugin_package::compatibility::ADAPTER_REVISION,
+        },
     );
     entry.source = declared.source.clone();
     Some(entry)
@@ -450,6 +476,8 @@ mod tests {
         let entry = &out.entries[0];
         assert_eq!(entry.id, "llm");
         assert_eq!(entry.entry, "vendor/dsh/llm-deepseek.js");
+        assert_eq!(entry.adapter.id, "cordis");
+        assert_eq!(entry.adapter.revision, 1);
         assert_eq!(entry.llm_providers, vec!["deepseek-official"]);
         assert_eq!(entry.seats, vec!["credentials"]);
         assert_eq!(entry.config, serde_json::json!({ "a": 1 }));
@@ -466,6 +494,9 @@ mod tests {
                 ..KernelPluginManifest::default()
             },
             source: Some(format!("source-of-{name}")),
+            compatibility: rebon_plugin_package::compatibility::LoadCompatibility::Current(
+                rebon_plugin_package::compatibility::PluginFormat::Rebon,
+            ),
         }
     }
 
@@ -504,7 +535,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("rebon-plugin.json"),
-            br#"{"name":"local","version":"0.0.1","capabilities":{"kernelPlugins":{
+            br#"{"name":"local","version":"0.0.1","compatibility":{"format":"rebon-plugin","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-plugin-api","range":"^1"}]},"capabilities":{"kernelPlugins":{
                  "demo-plane": { "entry": "local.mjs", "services": ["from-disk"] }}}}"#,
         )
         .unwrap();

@@ -35,11 +35,11 @@ export const PAYLOAD_ENTRY = {
 };
 
 const control = (call_id, method, payload = null) => ({
-  protocol_version: 1, host_epoch: 7, plugin_id: '$rebon/platform', scope_id: '$rebon/control',
+  protocol_version: 2, host_epoch: 7, plugin_id: '$rebon/platform', scope_id: '$rebon/control',
   scope_generation: 0, call_id, message: { type: 'request', method, payload },
 });
 const scoped = (pluginId, call_id, method, payload, generation = 1) => ({
-  protocol_version: 1, host_epoch: 7, plugin_id: pluginId, scope_id: 'session.1',
+  protocol_version: 2, host_epoch: 7, plugin_id: pluginId, scope_id: 'session.1',
   scope_generation: generation, call_id, message: { type: 'request', method, payload },
 });
 
@@ -134,6 +134,7 @@ export async function startHost({ env = {}, tools = {}, seats = {} } = {}) {
 export async function loadCompose(kit, { entries = [], web = null, modules = {} } = {}) {
   return kit.control('plugin/load', {
     pluginId: 'rebon:compose',
+    adapter: { id: 'native', revision: 1 },
     root: COMPOSE_ROOT.replace(/\\/g, '/'),
     entry: 'src/plugin.mjs',
     services: ['compose'],
@@ -145,6 +146,7 @@ export async function loadCompose(kit, { entries = [], web = null, modules = {} 
 export async function loadEntry(kit, { id, specifier, root, entry, config = null, ...declared }) {
   return kit.control('plugin/load', {
     pluginId: id,
+    adapter: { id: 'cordis', revision: 1 },
     root: root ?? PAYLOAD.replace(/\\/g, '/'),
     entry: entry ?? PAYLOAD_ENTRY[specifier],
     config,

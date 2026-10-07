@@ -10,8 +10,8 @@ import assert from 'node:assert/strict';
 import { PluginHost } from '../src/host.mjs';
 import { identityOf, terminal } from '../src/protocol.mjs';
 
-const control = (call_id, method, payload = null) => ({ protocol_version: 1, host_epoch: 7, plugin_id: '$rebon/platform', scope_id: '$rebon/control', scope_generation: 0, call_id, message: { type: 'request', method, payload } });
-const scoped = (call_id, method, generation, payload, over = {}) => ({ protocol_version: 1, host_epoch: 7, plugin_id: 'plugin.a', scope_id: 'scope.a', scope_generation: generation, call_id, message: { type: 'request', method, payload }, ...over });
+const control = (call_id, method, payload = null) => ({ protocol_version: 2, host_epoch: 7, plugin_id: '$rebon/platform', scope_id: '$rebon/control', scope_generation: 0, call_id, message: { type: 'request', method, payload } });
+const scoped = (call_id, method, generation, payload, over = {}) => ({ protocol_version: 2, host_epoch: 7, plugin_id: 'plugin.a', scope_id: 'scope.a', scope_generation: generation, call_id, message: { type: 'request', method, payload }, ...over });
 
 /// A transport that answers whatever the host asks, the way a live supervisor
 /// would. Without this the host's `scope/open` would wait forever, which is
@@ -42,7 +42,7 @@ const answered = (sent, call_id) => terminals(sent).find((x) => x.call_id === ca
 
 async function ready(kit, { generation = 1 } = {}) {
   await kit.host.accept(control('i', 'platform/initialize'));
-  await kit.host.accept(control('l', 'plugin/load', { pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs', services: [], eventTopics: ['session'] }));
+  await kit.host.accept(control('l', 'plugin/load', { pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs', adapter: { id: 'native', revision: 1 }, services: [], eventTopics: ['session'] }));
   await kit.host.accept(scoped('o', 'scope/open', generation, { workspace_root: 'C:/w' }));
   return kit;
 }
@@ -74,7 +74,7 @@ test('a plugin with no topics subscribes to nothing', async () => {
 test('a refused subscription fails the scope open that asked for it', async () => {
   const kit = harness({ status: 'error', answer: () => ({ code: '[UNKNOWN_TOPIC]', message: 'no such topic' }) });
   await kit.host.accept(control('i', 'platform/initialize'));
-  await kit.host.accept(control('l', 'plugin/load', { pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs', eventTopics: ['session'] }));
+  await kit.host.accept(control('l', 'plugin/load', { pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs', adapter: { id: 'native', revision: 1 }, eventTopics: ['session'] }));
   await kit.host.accept(scoped('o', 'scope/open', 1, { workspace_root: 'C:/w' }));
   assert.equal(answered(kit.sent, 'o').status, 'error');
   // rebon's own refusal code survives the trip, rather than being flattened

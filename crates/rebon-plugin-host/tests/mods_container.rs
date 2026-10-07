@@ -106,7 +106,7 @@ fn write_probe_mod(into: &Path) -> PathBuf {
     std::fs::create_dir_all(root.join("hooks")).unwrap();
     std::fs::write(
         root.join(".claude-plugin/plugin.json"),
-        json!({ "name": "probe-mod", "version": "0.1.0" }).to_string(),
+        json!({ "name": "probe-mod", "version": "0.1.0", "rebon": {"format":"claude-mods","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-claude-mods-api","range":"^1"}]} }).to_string(),
     )
     .unwrap();
     std::fs::write(

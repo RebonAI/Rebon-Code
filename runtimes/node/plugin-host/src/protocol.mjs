@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 export const MAX_SAFE_WIRE_INTEGER = Number.MAX_SAFE_INTEGER;
 export const PLATFORM_PLUGIN_ID = '$rebon/platform';

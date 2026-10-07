@@ -548,7 +548,7 @@ mod tests {
         std::fs::create_dir_all(market.join("radar/hooks")).unwrap();
         std::fs::write(
             market.join("radar/.claude-plugin/plugin.json"),
-            r#"{"name":"radar"}"#,
+            r#"{"name":"radar","rebon":{"format":"claude-mods","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-claude-mods-api","range":"^1"}]}}"#,
         )
         .unwrap();
         std::fs::write(
@@ -609,7 +609,7 @@ mod tests {
             std::fs::create_dir(&dir).unwrap();
             std::fs::write(
                 dir.join("rebon-plugin.json"),
-                r#"{"name":"demo","version":"1.0.0"}"#,
+                r#"{"name":"demo","version":"1.0.0","compatibility":{"format":"rebon-plugin","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-plugin-api","range":"^1"}]}}"#,
             )
             .unwrap();
         }

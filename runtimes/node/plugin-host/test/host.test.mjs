@@ -1,9 +1,38 @@
 import test from 'node:test';import assert from 'node:assert/strict';
 import { PluginHost } from '../src/host.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { FramingError } from '../src/framing.mjs';
-const control=(call_id,method,payload=null,over={})=>({protocol_version:1,host_epoch:7,plugin_id:'$rebon/platform',scope_id:'$rebon/control',scope_generation:0,call_id,message:{type:'request',method,payload},...over});
-const scope=(call_id,method,generation,payload,over={})=>({protocol_version:1,host_epoch:7,plugin_id:'plugin.a',scope_id:'scope.a',scope_generation:generation,call_id,message:{type:'request',method,payload},...over});
+const control=(call_id,method,payload=null,over={})=>({protocol_version:2,host_epoch:7,plugin_id:'$rebon/platform',scope_id:'$rebon/control',scope_generation:0,call_id,message:{type:'request',method,payload},...over});
+const scope=(call_id,method,generation,payload,over={})=>({protocol_version:2,host_epoch:7,plugin_id:'plugin.a',scope_id:'scope.a',scope_generation:generation,call_id,message:{type:'request',method,payload},...over});
 const setup=(writerOverride)=>{const sent=[];const writer=writerOverride??{send:async x=>sent.push(x),flush:async()=>{writer.flushed=true}};return {host:new PluginHost(writer),sent,writer}};
+test('wire admission rejects missing and malformed adapters before module side effects', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rebon-adapter-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(root, 'entry.mjs'), `import fs from 'node:fs'; fs.writeFileSync(new URL('imported', import.meta.url), 'ran'); export function activate() {}`);
+  const { host, sent } = setup();
+  await host.accept(control('init', 'platform/initialize'));
+  for (const [i, [adapter, code]] of [
+    [undefined, '[MISSING_FIELD]'], [null, '[WRONG_SHAPE]'],
+    [{ id: 'native' }, '[MISSING_FIELD]'],
+    [{ id: 'native', revision: 1, extra: true }, '[UNKNOWN_FIELD]'],
+    [{ id: 'native', revision: 1.5 }, '[WRONG_SHAPE]'],
+    [{ id: 'future', revision: 1 }, '[UNSUPPORTED_ADAPTER]'],
+    [{ id: 'native', revision: 2 }, '[UNSUPPORTED_ADAPTER]'],
+    [{ id: 'cordis', revision: 1 }, '[UNSUPPORTED_ADAPTER]'],
+    [{ id: 'claude-mods', revision: 1 }, '[UNSUPPORTED_ADAPTER]'],
+    [{ id: 'legacy-1.9', revision: 1 }, '[UNSUPPORTED_ADAPTER]'],
+  ].entries()) {
+    const payload = { pluginId: 'refused', root, entry: 'entry.mjs' };
+    if (adapter !== undefined) payload.adapter = adapter;
+    await host.accept(control(`load-${i}`, 'plugin/load', payload));
+    assert.equal(sent.at(-1).message.status, 'error');
+    assert.equal(sent.at(-1).message.payload.code, code);
+    assert.equal(fs.existsSync(path.join(root, 'imported')), false);
+  }
+});
+
 test('initialize exactly once, reserved identity, epoch and real capability',async()=>{const {host,sent}=setup();await host.dispatch(control('i','platform/initialize',{host_epoch:7}));assert.equal(sent[0].message.status,'success');assert.equal(JSON.stringify(sent[0].message.payload),JSON.stringify({capabilities:{scope_lifecycle:true}}));await host.dispatch(control('i2','platform/initialize'));assert.equal(sent[1].message.payload.code,'already_initialized');});
 test('initialize payload validation occurs before host state mutation',async()=>{const {host,sent}=setup();await host.dispatch(control('bad','platform/initialize',{workspace_root:'x'}));assert.equal(host.state,'pre_initialize');assert.equal(sent[0].message.payload.code,'workspace_in_initialize');await host.dispatch(control('i','platform/initialize'));assert.equal(host.state,'initialized');});
 test('open validation and failed ledger registration do not mutate scope state',async()=>{const {host,sent}=setup();await host.dispatch(control('i','platform/initialize'));await host.dispatch(scope('bad','scope/open',3,{workspace_root:4}));assert.equal(sent.at(-1).message.payload.code,'scope_open_payload');await host.dispatch(scope('o','scope/open',3,{workspace_root:'w'}));assert.equal(sent.at(-1).message.status,'success');await assert.rejects(host.dispatch(scope('o','scope/close',4,null)),{code:'call_id_reused'});await host.dispatch(scope('c','scope/close',4,null));assert.equal(sent.at(-1).message.status,'success');});

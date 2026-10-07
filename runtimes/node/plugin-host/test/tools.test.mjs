@@ -8,8 +8,8 @@ import assert from 'node:assert/strict';
 import { PluginHost } from '../src/host.mjs';
 import { identityOf, terminal } from '../src/protocol.mjs';
 
-const control = (call_id, method, payload = null) => ({ protocol_version: 1, host_epoch: 7, plugin_id: '$rebon/platform', scope_id: '$rebon/control', scope_generation: 0, call_id, message: { type: 'request', method, payload } });
-const scoped = (call_id, method, generation, payload) => ({ protocol_version: 1, host_epoch: 7, plugin_id: 'plugin.a', scope_id: 'scope.a', scope_generation: generation, call_id, message: { type: 'request', method, payload } });
+const control = (call_id, method, payload = null) => ({ protocol_version: 2, host_epoch: 7, plugin_id: '$rebon/platform', scope_id: '$rebon/control', scope_generation: 0, call_id, message: { type: 'request', method, payload } });
+const scoped = (call_id, method, generation, payload) => ({ protocol_version: 2, host_epoch: 7, plugin_id: 'plugin.a', scope_id: 'scope.a', scope_generation: generation, call_id, message: { type: 'request', method, payload } });
 
 /// A rebon that answers `tool/invoke` however the test needs.
 ///
@@ -62,7 +62,7 @@ const shape = (value) => JSON.parse(JSON.stringify(value));
 
 async function ready(kit) {
   await kit.host.accept(control('i', 'platform/initialize'));
-  await kit.host.accept(control('l', 'plugin/load', { pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs', services: ['use', 'look', 'fail', 'explode'], eventTopics: ['session'], invokableTools: kit.tools }));
+  await kit.host.accept(control('l', 'plugin/load', { pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs', adapter: { id: 'native', revision: 1 }, services: ['use', 'look', 'fail', 'explode'], eventTopics: ['session'], invokableTools: kit.tools }));
   await kit.host.accept(scoped('o', 'scope/open', 1, { workspace_root: 'C:/w' }));
   return kit;
 }

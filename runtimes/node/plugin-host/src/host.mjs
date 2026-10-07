@@ -448,6 +448,8 @@ export class PluginHost {
     // and so a rejection that arrives while the load is still in flight is
     // known to be this load's rather than someone else's later work.
     return { run: () => asEntryLoad(request.pluginId, async () => {
+      // Adapter admission belongs to the executing loader, before import.
+      // The default loader supports native only; composition owns the others.
       const loaded = await this.load(request);
       this.#plugins.set(request.pluginId, {
         phase: 'ready',

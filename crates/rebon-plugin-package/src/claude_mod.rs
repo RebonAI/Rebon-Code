@@ -25,6 +25,7 @@ use rebon_types::{
 };
 use serde_json::Value;
 
+use crate::compatibility::{CompatibilityDeclaration, PluginFormat};
 use crate::manifest::{PluginCapabilities, PluginManifest};
 
 /// The seats every mod may call: its own `$`, its settings namespace, and
@@ -37,10 +38,28 @@ pub struct ClaudeMod {
     /// The folder holding `.claude-plugin/plugin.json`, as given.
     pub root: PathBuf,
     pub manifest: ClaudeModManifest,
+    pub compatibility: Option<CompatibilityDeclaration>,
     pub hooks: ClaudeModHooksFile,
     /// The hooks module, relative to the root with forward slashes.
     pub hooks_module: String,
     pub scan: ModScan,
+}
+
+impl ClaudeMod {
+    pub fn declare_install_compatibility(&mut self) {
+        if self.compatibility.is_none() {
+            self.compatibility = Some(CompatibilityDeclaration {
+                format: PluginFormat::ClaudeMods.name().to_owned(),
+                format_version: crate::compatibility::FORMAT_VERSION,
+                adapter_revision: crate::compatibility::ADAPTER_REVISION,
+                sdk: vec![crate::compatibility::SdkRequirement {
+                    name: "rebon-claude-mods-api".to_owned(),
+                    range: "^1".to_owned(),
+                }],
+                dsh_snapshot: None,
+            });
+        }
+    }
 }
 
 /// Whether `path` is a folder with a mod manifest in it.
@@ -73,6 +92,14 @@ pub fn read_claude_mod(root: &Path) -> Result<ClaudeMod, String> {
             manifest.name
         ));
     }
+    let compatibility = manifest
+        .rest
+        .get("rebon")
+        .map(|value| {
+            CompatibilityDeclaration::read(&manifest.name, Some(value), PluginFormat::ClaudeMods)
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let hooks_path = root.join(CLAUDE_HOOKS_FILE);
     let raw = std::fs::read(&hooks_path).map_err(|error| {
         format!(
@@ -110,6 +137,7 @@ pub fn read_claude_mod(root: &Path) -> Result<ClaudeMod, String> {
     Ok(ClaudeMod {
         root: root.to_path_buf(),
         manifest,
+        compatibility,
         hooks,
         hooks_module,
         scan,
@@ -554,6 +582,7 @@ pub fn plugin_manifest_for(mod_: &ClaudeMod) -> PluginManifest {
             .version
             .clone()
             .unwrap_or_else(|| "0.0.0".to_owned()),
+        compatibility: mod_.compatibility.clone(),
         description: mod_.manifest.description.clone(),
         source: None,
         capabilities: PluginCapabilities {
@@ -854,6 +883,40 @@ export const register = on => {
         assert_eq!(package.version, "1.2.3");
         assert!(package.capabilities.kernel_plugins.contains_key("tally"));
         assert_eq!(package.metadata["claudeMod"], json!(true));
+    }
+
+    #[test]
+    fn only_installation_supplies_a_missing_mod_contract_and_preserves_overrides() {
+        for explicit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_mod(dir.path(), MODULE);
+            let path = dir.path().join(CLAUDE_PLUGIN_MANIFEST);
+            if explicit {
+                let mut raw: Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                raw["rebon"] = json!({"format":"claude-mods","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-claude-mods-api","range":"=1.0.0"}]});
+                std::fs::write(&path, raw.to_string()).unwrap();
+            }
+            let before = std::fs::read(&path).unwrap();
+            let mut mod_ = read_claude_mod(dir.path()).unwrap();
+            assert_eq!(mod_.compatibility.is_some(), explicit);
+            mod_.declare_install_compatibility();
+            let declared = mod_.compatibility.clone();
+            mod_.declare_install_compatibility();
+            assert_eq!(mod_.compatibility, declared);
+            let manifest = plugin_manifest_for(&mod_);
+            let declaration = manifest.compatibility.as_ref().unwrap();
+            assert_eq!(declaration.format, "claude-mods");
+            assert_eq!(
+                declaration.sdk[0].range,
+                if explicit { "=1.0.0" } else { "^1" }
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(
+                read_claude_mod(dir.path()).unwrap().compatibility.is_some(),
+                explicit
+            );
+        }
     }
 
     #[test]

@@ -362,6 +362,10 @@ fn loop_entries(
             module,
             config,
             exposed_tools,
+            rebon_plugin_protocol::PluginAdapter {
+                id: "cordis".into(),
+                revision: 1,
+            },
         ));
     }
     Ok(out)

@@ -571,6 +571,16 @@ pub enum InstallKind {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ModCompatibilityRecord {
+    pub manifest: crate::manifest::PluginManifest,
+    pub digest: String,
+    // A legacy load's observation is not evidence of the content at installation.
+    #[serde(default)]
+    pub first_seen: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MarketplaceInstall {
     pub marketplace: String,
     pub plugin: String,
@@ -592,6 +602,26 @@ pub struct MarketplaceInstall {
     pub granted: crate::container::ContainerGrant,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_identity: Option<crate::store::PluginSourceIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mod_compatibility: Option<ModCompatibilityRecord>,
+}
+
+impl MarketplaceInstall {
+    pub(crate) fn matches_mod_owner(&self, id: &str, runtime_id: &str) -> bool {
+        let source_matches = match &self.source_identity {
+            Some(crate::store::PluginSourceIdentity::Marketplace { plugin, .. }) => {
+                plugin == &self.plugin && self.marketplace != BUILTIN_MARKETPLACE
+            }
+            Some(crate::store::PluginSourceIdentity::BuiltinMarketplace { plugin }) => {
+                plugin == &self.plugin && self.marketplace == BUILTIN_MARKETPLACE
+            }
+            _ => false,
+        };
+        source_matches
+            && id == plugin_id(&self.plugin, &self.marketplace)
+            && self.kernel_plugins.len() == 1
+            && self.kernel_plugins[0] == runtime_id
+    }
 }
 
 /// `name@marketplace`, the id an install is known by.
@@ -981,6 +1011,7 @@ mod tests {
                 kernel_plugins: Vec::new(),
                 installed_at_ms: 9,
                 source_identity: None,
+                mod_compatibility: None,
                 granted: crate::container::ContainerGrant {
                     network: vec!["api.example.com".into()],
                     env: Vec::new(),

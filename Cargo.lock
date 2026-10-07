@@ -3866,8 +3866,10 @@ dependencies = [
  "rebon-hooks",
  "rebon-session",
  "rebon-types",
+ "semver",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tracing",
 ]

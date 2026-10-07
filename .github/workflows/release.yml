@@ -82,6 +82,8 @@ jobs:
         run: |
           python3 -m py_compile scripts/build_npm_package.py scripts/publish_npm_package.py
           bash -n scripts/npm_publish_dist.sh
+      - name: Test plugin package compatibility and integrity
+        run: cargo test -p rebon-plugin-package --locked --no-fail-fast
       - name: Cargo metadata
         run: cargo metadata --format-version 1 --no-deps
       - name: Cargo check

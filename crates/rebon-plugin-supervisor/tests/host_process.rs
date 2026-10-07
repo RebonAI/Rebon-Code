@@ -248,7 +248,7 @@ process.stdin.on('data', (chunk) => {{
     const frame = JSON.parse(line);
     if (frame.message.type === 'request' && frame.message.method === 'platform/initialize') {{
       process.stdout.write(JSON.stringify({{ ...frame, message: {{ type: 'terminal', status: 'success', payload: null }} }}) + NL);
-      process.stdout.write(JSON.stringify({{ protocol_version: 1, host_epoch: frame.host_epoch,
+      process.stdout.write(JSON.stringify({{ protocol_version: frame.protocol_version, host_epoch: frame.host_epoch,
         plugin_id: '$rebon/platform', scope_id: '$rebon/control', scope_generation: 0, call_id: 'up-1',
         message: {{ type: 'request', method: '{method}', payload: {payload} }} }}) + NL);
     }} else if (frame.message.type === 'terminal' && frame.call_id === 'up-1') {{

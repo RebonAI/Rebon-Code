@@ -92,6 +92,9 @@ pub struct ModRecord {
 
 impl ModRecord {
     fn from_entry(entry: &ComposeEntry) -> Option<Self> {
+        if !ModsRegistry::entry_is_mod(entry) {
+            return None;
+        }
         let marker = entry.config.get(MOD_MARKER)?.as_object()?;
         let name = marker
             .get("name")
@@ -464,7 +467,14 @@ impl ModsRegistry {
 
     /// Whether this entry would be a mod, before it is attached.
     pub fn entry_is_mod(entry: &ComposeEntry) -> bool {
-        rebon_plugin_package::is_mod_config(&entry.config)
+        entry.adapter.revision == 1
+            && match entry.adapter.id.as_str() {
+                "claude-mods" => true,
+                // Only the explicit legacy profile retains marker-based selection.
+                // Remove this branch with legacy-1.9 in the next major.
+                "legacy-1.9" => rebon_plugin_package::is_mod_config(&entry.config),
+                _ => false,
+            }
     }
 
     /// Records a loaded mod and puts its commands and tools on the seats.
@@ -1109,6 +1119,10 @@ mod tests {
             id: "tally".into(),
             root: "/mods/tally".into(),
             entry: "hooks/register.ts".into(),
+            adapter: rebon_plugin_protocol::PluginAdapter {
+                id: "claude-mods".into(),
+                revision: 1,
+            },
             config: json!({ MOD_MARKER: {
                 "name": "tally", "version": "1.0.0",
                 "events": ["tool.call", "classic.*"], "calls": ["ui.status"],
@@ -1126,5 +1140,17 @@ mod tests {
         assert_eq!(record.tools()[0].name, "mcp__tally__count");
         assert_eq!(record.facts().cwd, "/mods/tally");
         assert!(ModRecord::from_entry(&ComposeEntry::default()).is_none());
+        for id in ["native", "cordis", "unknown"] {
+            let mut other = entry.clone();
+            other.adapter.id = id.into();
+            assert!(!ModsRegistry::entry_is_mod(&other));
+            assert!(ModRecord::from_entry(&other).is_none());
+        }
+        let mut legacy = entry.clone();
+        legacy.adapter.id = "legacy-1.9".into();
+        assert!(ModsRegistry::entry_is_mod(&legacy));
+        assert!(ModRecord::from_entry(&legacy).is_some());
+        legacy.adapter.revision = 2;
+        assert!(!ModsRegistry::entry_is_mod(&legacy));
     }
 }

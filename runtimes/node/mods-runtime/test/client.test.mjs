@@ -21,6 +21,7 @@ async function load() {
   const loader = await createLoader({ next: async () => { throw new Error('not a mod?'); } });
   const sealed = await loader.load({
     pluginId: 'clientmod',
+    adapter: { id: 'claude-mods', revision: 1 },
     root,
     entry: 'hooks/register.tsx',
     services: ['mod'],

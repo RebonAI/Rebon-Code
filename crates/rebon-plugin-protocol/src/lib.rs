@@ -28,7 +28,7 @@ pub use lifecycle::{
 };
 pub use methods::{
     CommandInvokeRequest, EventDelivery, EventEmitRequest, EventSubscribeRequest,
-    EventUnsubscribeRequest, LlmControlRequest, LlmStreamRequest, PayloadError,
+    EventUnsubscribeRequest, LlmControlRequest, LlmStreamRequest, PayloadError, PluginAdapter,
     PluginCommandCategory, PluginCommandDefinition, PluginCommandKind, PluginCommandSurface,
     PluginDrainReport, PluginLoadRequest, PluginReadyReport, PluginToolDefinition,
     PluginUnloadRequest, SeatCallRequest, ServiceCallRequest, ToolInvokeRequest,
@@ -50,7 +50,7 @@ use serde::{
 use thiserror::Error;
 
 /// Wire protocol version emitted and accepted by this crate.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Largest integer exactly representable by a JavaScript JSON number (2^53 - 1).
 pub const MAX_SAFE_WIRE_INTEGER: u64 = 9_007_199_254_740_991;
 /// Reserved platform plugin namespace. Plugin manifests must not use this value.

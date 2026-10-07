@@ -163,7 +163,7 @@ fn codec_rejects_oversize_input_before_unbounded_growth_and_incomplete_eof() {
     ));
 
     let mut codec = NdjsonCodec::new(1024);
-    codec.push(br#"{"protocol_version":1}"#).unwrap();
+    codec.push(br#"{"protocol_version":2}"#).unwrap();
     assert!(matches!(
         codec.finish(),
         Err(CodecError::IncompleteFrame { .. })
@@ -177,27 +177,27 @@ fn public_serde_rejects_unsupported_version_on_encode_and_decode() {
     let encode_error = serde_json::to_vec(&unsupported).unwrap_err();
     assert!(encode_error
         .to_string()
-        .contains("unsupported protocol version 2; expected 1"));
+        .contains("unsupported protocol version 3; expected 2"));
 
     let text = serde_json::to_string(&request("direct-serde-decode"))
         .unwrap()
-        .replace("\"protocol_version\":1", "\"protocol_version\":2");
+        .replace("\"protocol_version\":2", "\"protocol_version\":3");
     let decode_error = serde_json::from_str::<WireEnvelope>(&text).unwrap_err();
     assert!(decode_error
         .to_string()
-        .contains("unsupported protocol version 2; expected 1"));
+        .contains("unsupported protocol version 3; expected 2"));
 }
 
 #[test]
 fn codec_rejects_unsupported_version_and_unknown_fields() {
     let mut value = serde_json::to_value(request("bad-version")).unwrap();
-    value["protocol_version"] = json!(2);
+    value["protocol_version"] = json!(1);
     let mut bytes = serde_json::to_vec(&value).unwrap();
     bytes.push(b'\n');
     let mut codec = NdjsonCodec::new(1024);
     assert!(matches!(
         codec.push(&bytes),
-        Err(CodecError::UnsupportedVersion { actual: 2, .. })
+        Err(CodecError::UnsupportedVersion { actual: 1, .. })
     ));
     assert!(matches!(codec.push(b"{}\n"), Err(CodecError::Failed)));
 
@@ -604,7 +604,7 @@ fn platform_control_identity_is_reserved_exact_and_roundtrips() {
             payload: json!(null).into(),
         },
     );
-    let exact = "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"$rebon/platform\",\"scope_id\":\"$rebon/control\",\"scope_generation\":0,\"call_id\":\"control-1\",\"message\":{\"type\":\"request\",\"method\":\"platform/initialize\",\"payload\":null}}\n";
+    let exact = "{\"protocol_version\":2,\"host_epoch\":7,\"plugin_id\":\"$rebon/platform\",\"scope_id\":\"$rebon/control\",\"scope_generation\":0,\"call_id\":\"control-1\",\"message\":{\"type\":\"request\",\"method\":\"platform/initialize\",\"payload\":null}}\n";
     let encoded = NdjsonCodec::new(1024).encode(&envelope).unwrap();
     assert_eq!(encoded, exact.as_bytes());
     assert_eq!(
@@ -618,7 +618,7 @@ fn cancel_shape_is_exact_and_intent_is_idempotent_without_terminal_ownership() {
     assert_eq!(CALL_CANCEL_METHOD, "call/cancel");
     let cancel = WireEnvelope::cancel(identity("cancel-target"));
     assert!(cancel.is_cancel());
-    let exact = "{\"protocol_version\":1,\"host_epoch\":7,\"plugin_id\":\"plugin.example\",\"scope_id\":\"session-1\",\"scope_generation\":3,\"call_id\":\"cancel-target\",\"message\":{\"type\":\"notification\",\"method\":\"call/cancel\",\"payload\":null}}\n";
+    let exact = "{\"protocol_version\":2,\"host_epoch\":7,\"plugin_id\":\"plugin.example\",\"scope_id\":\"session-1\",\"scope_generation\":3,\"call_id\":\"cancel-target\",\"message\":{\"type\":\"notification\",\"method\":\"call/cancel\",\"payload\":null}}\n";
     assert_eq!(
         NdjsonCodec::new(1024).encode(&cancel).unwrap(),
         exact.as_bytes()

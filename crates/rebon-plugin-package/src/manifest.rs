@@ -22,6 +22,8 @@ pub const PLUGIN_MANIFEST_FILE: &str = "rebon-plugin.json";
 pub struct PluginManifest {
     pub name: String,
     pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<crate::compatibility::CompatibilityDeclaration>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]

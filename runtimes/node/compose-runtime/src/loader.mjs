@@ -7,20 +7,12 @@
 // they differ only in what "loading" means, which is exactly the question the
 // host delegates.
 //
-// The rule, in order, and deliberately not a heuristic — a package's shape is
-// something its author decides, so it should be decidable by reading it:
-//
-//   1. `activate` is a function                → the host's own loader
-//   2. `apply` is the module's own function    → a Cordis plugin (the module)
-//   3. `default` is an object with `apply`     → a Cordis plugin
-//   4. `default` is a function                 → a Cordis functional plugin
-//   5. anything else                           → the host's own loader, which
-//                                                refuses it by name
-//
-// Step 1 comes first so a rebon-native plugin is never mistaken for a Cordis
-// one, and step 4 is last so the ambiguous case (a bare default function) goes
-// to the composition rather than being guessed at from argument counts.
-import { resolveEntry } from '../../plugin-host/src/loader.mjs';
+// The load request explicitly selects native, Cordis, or Claude Code mods.
+// Export shape only selects a legal entry form *within* that ecosystem.
+// The explicit legacy-1.9 profile alone retains the 1.9.x selection rules;
+// package admission decides eligibility, and the next major removes it.
+import { requireAdapter, resolveEntry, UnsupportedAdapter } from '../../plugin-host/src/loader.mjs';
+import { pluginAdapter } from '../../plugin-host/src/methods.mjs';
 import { createLoader as createModsLoader, isModRequest } from '../../mods-runtime/src/index.mjs';
 
 const own = (value, key) => value != null && Object.prototype.hasOwnProperty.call(value, key);
@@ -35,7 +27,6 @@ class LoaderError extends Error {
 
 /// The Cordis plugin a module holds, or undefined if it does not hold one.
 export function cordisPluginOf(module) {
-  if (typeof module?.activate === 'function') return undefined;
   if (own(module, 'apply') && typeof module.apply === 'function') return module;
   const fallback = module?.default;
   if (fallback && typeof fallback === 'object' && typeof fallback.apply === 'function') return fallback;
@@ -45,17 +36,26 @@ export function cordisPluginOf(module) {
 
 /// Builds the load/unload seams the host runs with.
 ///
-/// `next` is the host's own loader, handed back untouched for anything this
-/// module does not recognise — an adapter that reimplemented it would be a
-/// second set of rules for the same shape.
+/// `next` is the host's native loader: delegating keeps one set of rules for
+/// that ecosystem. No unrecognised adapter is passed through to it.
 export async function createLoader({ next }) {
-  // A Claude Code mod is decided by the load request, before the module is
-  // read: rebon marked the request when it synthesised the mod's manifest,
-  // and the mods loader refuses to guess at one it did not mark.
-  const mods = await createModsLoader({ next });
+  // Mod configuration still carries its scanned declarations, but only an
+  // explicit adapter selects that loader outside the legacy profile.
+  const mods = await createModsLoader();
   return {
     async load(request) {
-      if (isModRequest(request)) return mods.load(request);
+      const adapter = pluginAdapter(request.adapter);
+      switch (adapter.id) {
+        case 'native': return next(request);
+        case 'claude-mods': return mods.load(request);
+        case 'cordis':
+        case 'legacy-1.9': requireAdapter(adapter, adapter.id); break;
+        default: throw new UnsupportedAdapter(adapter);
+      }
+      const legacy = adapter.id === 'legacy-1.9';
+      if (legacy && isModRequest(request)) {
+        return mods.load({ ...request, adapter: { id: 'claude-mods', revision: 1 } });
+      }
       const url = resolveEntry(request.root, request.entry);
       let module;
       try {
@@ -63,11 +63,15 @@ export async function createLoader({ next }) {
       } catch (cause) {
         throw new LoaderError('[ENTRY_FAILED]', `plugin entry ${request.entry} failed to load: ${cause?.message ?? cause}`);
       }
-      const plugin = cordisPluginOf(module);
-      // Importing is idempotent, so handing the already-imported module back to
-      // the host's loader costs nothing and keeps one import per entry — which
-      // matters, because a module evaluated twice would register twice.
-      if (plugin === undefined) return next(request, async () => module);
+      const plugin = legacy && typeof module?.activate === 'function'
+        ? undefined : cordisPluginOf(module);
+      // Only the explicit legacy profile keeps shape-based dispatch. Importing
+      // is idempotent; passing the module through avoids evaluating it twice.
+      // The derived native request does not mutate the caller's descriptor.
+      if (plugin === undefined) {
+        if (legacy) return next({ ...request, adapter: { id: 'native', revision: 1 } }, async () => module);
+        throw new LoaderError('[NOT_CORDIS]', `plugin entry ${request.entry} exports no Cordis plugin (no apply)`);
+      }
 
       // Imported lazily: this module is loaded by the host at startup, long
       // before module resolution for the payload has been installed.

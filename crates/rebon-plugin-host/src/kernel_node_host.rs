@@ -164,6 +164,10 @@ pub async fn bind_plane_model_provider(
         id: contribution.id.clone(),
         root: crate::plugin_manifests::plain_path(&transport.root),
         entry: transport.entry.clone(),
+        adapter: rebon_plugin_protocol::PluginAdapter {
+            id: "native".into(),
+            revision: 1,
+        },
         // The user's connection settings ride each turn rather than the load,
         // because the same loaded adapter serves whichever provider entry is
         // selected right now. See `ModelProviderTurnV1`.

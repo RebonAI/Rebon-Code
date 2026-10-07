@@ -8,8 +8,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PluginHost } from '../src/host.mjs';
 
-const control = (call_id, method, payload = null) => ({ protocol_version: 1, host_epoch: 7, plugin_id: '$rebon/platform', scope_id: '$rebon/control', scope_generation: 0, call_id, message: { type: 'request', method, payload } });
-const scoped = (call_id, method, generation, payload) => ({ protocol_version: 1, host_epoch: 7, plugin_id: 'plugin.a', scope_id: 'scope.a', scope_generation: generation, call_id, message: { type: 'request', method, payload } });
+const control = (call_id, method, payload = null) => ({ protocol_version: 2, host_epoch: 7, plugin_id: '$rebon/platform', scope_id: '$rebon/control', scope_generation: 0, call_id, message: { type: 'request', method, payload } });
+const scoped = (call_id, method, generation, payload) => ({ protocol_version: 2, host_epoch: 7, plugin_id: 'plugin.a', scope_id: 'scope.a', scope_generation: generation, call_id, message: { type: 'request', method, payload } });
 
 function harness() {
   const sent = [];
@@ -48,7 +48,7 @@ const chunks = (sent, call_id) => sent.filter((x) => x.message.type === 'chunk' 
 
 async function ready(kit) {
   await kit.host.accept(control('i', 'platform/initialize'));
-  await kit.host.accept(control('l', 'plugin/load', { pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs', services: ['count', 'leak', 'late', 'patient'] }));
+  await kit.host.accept(control('l', 'plugin/load', { pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs', adapter: { id: 'native', revision: 1 }, services: ['count', 'leak', 'late', 'patient'] }));
   await kit.host.accept(scoped('o', 'scope/open', 1, { workspace_root: 'C:/w' }));
   return kit;
 }
@@ -82,7 +82,7 @@ test('a context that outlived its call cannot emit', async () => {
   assert.equal(chunks(kit.sent, 'a').length, 0, 'nothing was emitted after the end');
 });
 
-const cancelFor = (call_id) => ({ protocol_version: 1, host_epoch: 7, plugin_id: 'plugin.a', scope_id: 'scope.a', scope_generation: 1, call_id, message: { type: 'notification', method: 'call/cancel', payload: null } });
+const cancelFor = (call_id) => ({ protocol_version: 2, host_epoch: 7, plugin_id: 'plugin.a', scope_id: 'scope.a', scope_generation: 1, call_id, message: { type: 'notification', method: 'call/cancel', payload: null } });
 
 // Cancel asks; it does not command. A handler that stops by returning has not
 // failed, and reporting it as an error would make a deliberate stop look like a

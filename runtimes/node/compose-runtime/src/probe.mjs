@@ -48,7 +48,7 @@ async function probe(root, entry, config) {
   const missing = wanted.required.filter((service) => !seats.includes(service));
   const base = { name: plugin.name ?? null, inject: wanted, seats };
   try {
-    const sink = await mountEntry({ pluginId: 'probe', config }, plugin, { probe: true });
+    const sink = await mountEntry({ pluginId: 'probe', adapter: { id: 'cordis', revision: 1 }, config }, plugin, { probe: true });
     const loaded = sink.loaded();
     return {
       ok: true,

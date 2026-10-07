@@ -64,8 +64,9 @@ pub(crate) fn resolve_install_source(
         let root = candidate
             .canonicalize()
             .with_context(|| format!("failed to resolve mod folder {}", candidate.display()))?;
-        let mod_ = rebon_harness::rebon_plugin_package::read_claude_mod(&root)
+        let mut mod_ = rebon_harness::rebon_plugin_package::read_claude_mod(&root)
             .map_err(|reason| anyhow::anyhow!(reason))?;
+        mod_.declare_install_compatibility();
         let manifest = rebon_harness::rebon_plugin_package::plugin_manifest_for(&mod_);
         manifest.validate(None)?;
         return Ok(ResolvedPluginSource::ClaudeMod { root, manifest });

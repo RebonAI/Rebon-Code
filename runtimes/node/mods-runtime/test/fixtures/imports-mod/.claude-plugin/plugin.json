@@ -1,1 +1,1 @@
-{ "name": "imports", "version": "0.1.0", "description": "Imports written the TypeScript way" }
+{ "name": "imports", "version": "0.1.0", "rebon": {"format":"claude-mods","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-claude-mods-api","range":"^1"}]}, "description": "Imports written the TypeScript way" }

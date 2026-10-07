@@ -56,7 +56,7 @@ use rebon_kernel::{
     Context, JsonService, KernelError, PluginLifecycleChanged, SharedLifecycleSink,
 };
 use rebon_plugin_protocol::{
-    CommandInvokeRequest, Payload, PluginCommandDefinition, PluginCommandKind,
+    CommandInvokeRequest, Payload, PluginAdapter, PluginCommandDefinition, PluginCommandKind,
     PluginCommandSurface, PluginLoadRequest, PluginReadyReport, RegistryError,
 };
 use rebon_plugin_supervisor::{
@@ -102,6 +102,7 @@ pub struct ComposeEntry {
     pub id: String,
     pub root: String,
     pub entry: String,
+    pub adapter: PluginAdapter,
     #[serde(default)]
     pub config: Value,
     #[serde(default)]
@@ -163,6 +164,10 @@ impl Default for ComposeEntry {
             id: String::new(),
             root: String::new(),
             entry: String::new(),
+            adapter: PluginAdapter {
+                id: "native".into(),
+                revision: 1,
+            },
             config: Value::Null,
             services: Vec::new(),
             event_topics: Vec::new(),
@@ -193,6 +198,7 @@ impl ComposeEntry {
             plugin_id: self.id.clone(),
             root,
             entry: self.entry.clone(),
+            adapter: self.adapter.clone(),
             services: self.services.clone(),
             event_topics: self.event_topics.clone(),
             published_topics: self.published_topics.clone(),
@@ -699,6 +705,10 @@ impl PluginPlane {
             plugin_id: COMPOSE_PLUGIN_ID.to_owned(),
             root: config.compose_root.to_string_lossy().into_owned(),
             entry: "src/plugin.mjs".to_owned(),
+            adapter: PluginAdapter {
+                id: "native".into(),
+                revision: 1,
+            },
             services: vec!["compose".to_owned()],
             config: Payload::from(config.control_config()),
             event_topics: Vec::new(),
@@ -909,6 +919,10 @@ impl PluginPlane {
             plugin_id: COMPOSE_PLUGIN_ID.to_owned(),
             root: compose_root.to_string_lossy().into_owned(),
             entry: "src/plugin.mjs".to_owned(),
+            adapter: PluginAdapter {
+                id: "native".into(),
+                revision: 1,
+            },
             services: vec!["compose".to_owned()],
             config: Payload::from(serde_json::json!({
                 "payloadDir": payload_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
@@ -2830,6 +2844,10 @@ mod reload_tests {
             id: id.to_string(),
             root: "/packages/demo".to_string(),
             entry: "index.mjs".to_string(),
+            adapter: PluginAdapter {
+                id: "native".into(),
+                revision: 1,
+            },
             config,
             services: vec!["echo".to_string()],
             event_topics: Vec::new(),
@@ -2877,6 +2895,34 @@ mod reload_tests {
         assert_eq!(plan.added, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(plan.start, vec![0, 1]);
         assert!(plan.stop.is_empty());
+    }
+
+    #[test]
+    fn adapter_changes_restart_the_entry_and_travel_on_the_load_request() {
+        let original = entry("a", Value::Null);
+        assert_eq!(original.adapter, ComposeEntry::default().adapter);
+        for adapter in [
+            PluginAdapter {
+                id: "cordis".into(),
+                revision: 1,
+            },
+            PluginAdapter {
+                id: "native".into(),
+                revision: 2,
+            },
+        ] {
+            let mut changed = original.clone();
+            changed.adapter = adapter.clone();
+            assert_eq!(changed.load_request().adapter, adapter);
+            let plan = classify(&running(&[original.clone()]), &[changed]);
+            assert_eq!(plan.changed, vec!["a".to_string()]);
+            assert_eq!(plan.stop, vec!["a".to_string()]);
+            assert_eq!(plan.start, vec![0]);
+            assert!(plan.unchanged.is_empty());
+        }
+        let mut encoded = serde_json::to_value(&original).unwrap();
+        encoded.as_object_mut().unwrap().remove("adapter");
+        assert!(serde_json::from_value::<ComposeEntry>(encoded).is_err());
     }
 
     /// A changed entry is a stop *and* a start: an id cannot be loaded twice,

@@ -10,8 +10,8 @@ import assert from 'node:assert/strict';
 import { PluginHost } from '../src/host.mjs';
 import { toWireJson } from '../src/protocol.mjs';
 
-const control = (call_id, method, payload = null) => ({ protocol_version: 1, host_epoch: 7, plugin_id: '$rebon/platform', scope_id: '$rebon/control', scope_generation: 0, call_id, message: { type: 'request', method, payload } });
-const scoped = (call_id, method, payload) => ({ protocol_version: 1, host_epoch: 7, plugin_id: 'plugin.a', scope_id: 'scope.a', scope_generation: 1, call_id, message: { type: 'request', method, payload } });
+const control = (call_id, method, payload = null) => ({ protocol_version: 2, host_epoch: 7, plugin_id: '$rebon/platform', scope_id: '$rebon/control', scope_generation: 0, call_id, message: { type: 'request', method, payload } });
+const scoped = (call_id, method, payload) => ({ protocol_version: 2, host_epoch: 7, plugin_id: 'plugin.a', scope_id: 'scope.a', scope_generation: 1, call_id, message: { type: 'request', method, payload } });
 const answered = (sent, call_id) => sent.filter((x) => x.message.type === 'terminal').find((x) => x.call_id === call_id)?.message;
 
 class Point {
@@ -26,7 +26,7 @@ async function hostAnswering(serviceHandlers) {
     load: async () => ({ services: [...serviceHandlers.keys()], eventTopics: [], serviceHandlers, topicHandlers: new Map() }),
   });
   await host.accept(control('i', 'platform/initialize'));
-  await host.accept(control('l', 'plugin/load', { pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs', services: [...serviceHandlers.keys()] }));
+  await host.accept(control('l', 'plugin/load', { pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs', adapter: { id: 'native', revision: 1 }, services: [...serviceHandlers.keys()] }));
   await host.accept(scoped('o', 'scope/open', { workspace_root: 'C:/w' }));
   return { host, sent };
 }

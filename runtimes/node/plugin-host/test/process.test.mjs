@@ -1,8 +1,16 @@
 import test from 'node:test';import assert from 'node:assert/strict';import { spawn } from 'node:child_process';import { once } from 'node:events';import { fileURLToPath } from 'node:url';
 const cli=fileURLToPath(new URL('../src/cli.mjs',import.meta.url));
-const frame=(identity,method,payload)=>JSON.stringify({protocol_version:1,...identity,message:{type:'request',method,payload}})+'\n';
+const frame=(identity,method,payload)=>JSON.stringify({protocol_version:2,...identity,message:{type:'request',method,payload}})+'\n';
 const control=(call_id)=>({host_epoch:7,plugin_id:'$rebon/platform',scope_id:'$rebon/control',scope_generation:0,call_id});const scope=(call_id,g)=>({host_epoch:7,plugin_id:'plugin.a',scope_id:'scope.a',scope_generation:g,call_id});
 async function run(input){const child=spawn(process.execPath,[cli],{stdio:['pipe','pipe','pipe']});let stdout='',stderr='';child.stdout.setEncoding('utf8').on('data',x=>stdout+=x);child.stderr.setEncoding('utf8').on('data',x=>stderr+=x);child.stdin.end(input);const [code]=await once(child,'exit');return {code,stdout,stderr};}
+test('protocol v1 is refused during initialize before host activation', async () => {
+  const result = await run(frame({ ...control('old'), protocol_version: 1 }, 'platform/initialize', null));
+  assert.equal(result.code, 2);
+  assert.equal(result.stdout, '');
+  const diagnostic = JSON.parse(result.stderr);
+  assert.equal(diagnostic.code, 'bad_version');
+  assert.match(diagnostic.message, /2/);
+});
 test('process good initialize/open/close/shutdown lifecycle exits zero',async()=>{const input=frame(control('i'),'platform/initialize',null)+frame(scope('o',3),'scope/open',{workspace_root:'C:/w'})+frame(scope('c',4),'scope/close',null)+frame(control('s'),'platform/shutdown',null);const result=await run(input);assert.equal(result.code,0);assert.equal(result.stderr,'');const lines=result.stdout.trim().split('\n').map(JSON.parse);assert.deepEqual(lines.map(x=>x.call_id).sort(),['c','i','o','s']);assert.ok(lines.every(x=>x.message.type==='terminal'&&x.message.status==='success'));});
 test('late output-pipe failure during shutdown exits with write_error',async()=>{const child=spawn(process.execPath,[cli],{stdio:['pipe','pipe','pipe']});let stderr='';child.stderr.setEncoding('utf8').on('data',x=>stderr+=x);child.stdin.write(frame(control('i'),'platform/initialize',null));await once(child.stdout,'data');child.stdout.destroy();child.stdin.end(frame(control('s'),'platform/shutdown',null));const [code]=await once(child,'exit');assert.equal(code,4);assert.equal(JSON.parse(stderr).code,'write_error');});
 test('shutdown plus valid extra in same chunk writes shutdown terminal then exits 2',async()=>{const result=await run(frame(control('i'),'platform/initialize',null)+frame(control('s'),'platform/shutdown',null)+frame(control('late'),'platform/initialize',null));assert.equal(result.code,2);assert.deepEqual(result.stdout.trim().split('\n').map(x=>JSON.parse(x).call_id).sort(),['i','s']);assert.equal(JSON.parse(result.stderr).code,'frame_after_shutdown');});

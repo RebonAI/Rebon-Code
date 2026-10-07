@@ -284,6 +284,15 @@ fn validate_declarations(kind: &'static str, names: &[String]) -> Result<(), Pay
     Ok(())
 }
 
+/// The explicitly selected plugin ecosystem and its adapter contract revision.
+/// Support belongs to the executing loader, not to the wire data model.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PluginAdapter {
+    pub id: String,
+    pub revision: u32,
+}
+
 /// `plugin/load` — what the host admits, taken from the plugin's manifest.
 ///
 /// The declarations are the contract: a plugin may register a service or a topic
@@ -298,6 +307,7 @@ pub struct PluginLoadRequest {
     pub root: String,
     /// Package-relative entry module.
     pub entry: String,
+    pub adapter: PluginAdapter,
     #[serde(default)]
     pub services: Vec<String>,
     #[serde(default)]
@@ -848,6 +858,10 @@ mod tests {
             plugin_id: plugin.into(),
             root: "/packages/demo".into(),
             entry: "index.mjs".into(),
+            adapter: PluginAdapter {
+                id: "native".into(),
+                revision: 1,
+            },
             services: vec!["compose".into()],
             event_topics: vec!["session".into()],
             published_topics: vec!["compose:session/append".into()],
@@ -870,6 +884,7 @@ mod tests {
                 "pluginId": "plugin.a",
                 "root": "/packages/demo",
                 "entry": "index.mjs",
+                "adapter": {"id": "native", "revision": 1},
                 "services": ["compose"],
                 "eventTopics": ["session"],
                 "publishedTopics": ["compose:session/append"],
@@ -890,7 +905,7 @@ mod tests {
     #[test]
     fn declarations_default_to_empty_but_unknown_fields_are_refused() {
         let minimal: PluginLoadRequest =
-            serde_json::from_value(json!({"pluginId": "p", "root": "/pkg", "entry": "i.mjs"}))
+            serde_json::from_value(json!({"pluginId": "p", "root": "/pkg", "entry": "i.mjs", "adapter": {"id": "native", "revision": 1}}))
                 .unwrap();
         assert!(minimal.services.is_empty());
         assert!(minimal.event_topics.is_empty());
@@ -907,6 +922,34 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("unknown field"), "{error}");
+    }
+
+    #[test]
+    fn adapter_is_required_and_its_shape_is_strict_but_support_is_not_wire_policy() {
+        let mut value = serde_json::to_value(load("p")).unwrap();
+        value.as_object_mut().unwrap().remove("adapter");
+        assert!(serde_json::from_value::<PluginLoadRequest>(value.clone()).is_err());
+        for malformed in [
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"id": 1, "revision": 1}),
+            json!({"id": "native"}),
+            json!({"id": "native", "revision": -1}),
+            json!({"id": "native", "revision": 1.5}),
+            json!({"id": "native", "revision": 4294967296u64}),
+            json!({"id": "native", "revision": "1"}),
+            json!({"id": "native", "revision": 1, "extra": true}),
+        ] {
+            value["adapter"] = malformed;
+            assert!(serde_json::from_value::<PluginLoadRequest>(value.clone()).is_err());
+        }
+        for id in ["native", "cordis", "claude-mods", "legacy-1.9", "future"] {
+            value["adapter"] = json!({"id": id, "revision": u32::MAX});
+            let request: PluginLoadRequest = serde_json::from_value(value.clone()).unwrap();
+            request.validate().unwrap();
+            assert_eq!(request.adapter.id, id);
+        }
     }
 
     /// A manifest must not be able to address itself as platform control, which

@@ -15,6 +15,8 @@ rebon-types.workspace = true
 # The install state file is published through the shared atomic write.
 rebon-session.workspace = true
 anyhow.workspace = true
+semver = "1.0.28"
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

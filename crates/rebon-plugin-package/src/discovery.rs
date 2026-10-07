@@ -36,6 +36,7 @@ use std::sync::Mutex;
 
 use rebon_types::KernelPluginManifest;
 
+use crate::compatibility::{legacy_diagnostic, resolve_package, LoadCompatibility, PluginFormat};
 use crate::manifest::{PluginManifest, PLUGIN_MANIFEST_FILE};
 use crate::store::{
     InstalledPluginRecord, PluginScope, PluginSourceIdentity, PluginSourceKind, PluginStore,
@@ -81,6 +82,7 @@ pub struct DiscoveredPlugin {
     /// The label already used in diagnostics and MCP config attribution.
     pub source: String,
     pub source_identity: Option<PluginSourceIdentity>,
+    pub compatibility: LoadCompatibility,
     pub plugin: InstalledPlugin,
 }
 
@@ -113,6 +115,7 @@ pub struct KernelPluginDeclaration {
     /// [`PluginSourceIdentity::key`]. `None` when the install predates source
     /// tracking and its origin is unknown.
     pub source: Option<String>,
+    pub compatibility: LoadCompatibility,
 }
 
 /// Everything in effect, plus what could not be read.
@@ -161,6 +164,7 @@ impl Discovered {
                         name: name.clone(),
                         root: root.to_path_buf(),
                         manifest: declaration.clone(),
+                        compatibility: plugin.compatibility,
                         source: plugin
                             .source_identity
                             .as_ref()
@@ -294,7 +298,14 @@ pub fn discover(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(entry) = remembered.as_ref() {
-        if entry.asked_for == asked_for && entry.stamp == stamp {
+        if entry.asked_for == asked_for
+            && entry.stamp == stamp
+            && !entry
+                .found
+                .plugins
+                .iter()
+                .any(|plugin| plugin.compatibility == LoadCompatibility::Legacy19)
+        {
             return Ok(entry.found.clone());
         }
     }
@@ -337,11 +348,15 @@ fn resolve(
                 continue;
             }
         };
-        match PluginManifest::load_from_dir(&root) {
-            Ok(manifest) => out.plugins.push(DiscoveredPlugin {
+        match PluginManifest::load_from_dir(&root).and_then(|manifest| {
+            let compatibility = resolve_package(&root, &manifest, None)?;
+            Ok((manifest, compatibility))
+        }) {
+            Ok((manifest, compatibility)) => out.plugins.push(DiscoveredPlugin {
                 origin: PluginOrigin::SessionDir,
                 source: format!("plugin:{}@local:session", manifest.name),
                 source_identity: Some(source_identity),
+                compatibility,
                 plugin: InstalledPlugin::Package {
                     root,
                     manifest: Box::new(manifest),
@@ -405,6 +420,7 @@ fn push_record(
             origin,
             source,
             source_identity: record.source_identity.clone(),
+            compatibility: LoadCompatibility::Current(PluginFormat::Rebon),
             plugin: InstalledPlugin::Builtin {
                 name: record.name.clone(),
             },
@@ -418,16 +434,28 @@ fn push_record(
                 Some(manifest) => Ok(manifest),
                 None => PluginManifest::load_from_dir(&root),
             };
-            match manifest {
-                Ok(manifest) => out.plugins.push(DiscoveredPlugin {
-                    origin,
-                    source,
-                    source_identity: record.source_identity.clone(),
-                    plugin: InstalledPlugin::Package {
-                        root,
-                        manifest: Box::new(manifest),
-                    },
-                }),
+            let admitted = manifest.and_then(|manifest| {
+                let compatibility = resolve_package(&root, &manifest, Some(record))?;
+                Ok((manifest, compatibility))
+            });
+            match admitted {
+                Ok((manifest, compatibility)) => {
+                    if compatibility == LoadCompatibility::Legacy19 {
+                        if let Some(diagnostic) = legacy_diagnostic(&root, &manifest.name) {
+                            out.warnings.push(diagnostic);
+                        }
+                    }
+                    out.plugins.push(DiscoveredPlugin {
+                        origin,
+                        source,
+                        source_identity: record.source_identity.clone(),
+                        compatibility,
+                        plugin: InstalledPlugin::Package {
+                            root,
+                            manifest: Box::new(manifest),
+                        },
+                    });
+                }
                 Err(error) => out.warnings.push(error.to_string()),
             }
         }
@@ -460,7 +488,10 @@ mod tests {
     use crate::store::PluginInstallState;
 
     fn manifest_with(name: &str, body: serde_json::Value) -> PluginManifest {
-        let mut value = serde_json::json!({ "name": name, "version": "1.0.0" });
+        let mut value = serde_json::json!({ "name": name, "version": "1.0.0", "compatibility": {
+            "format":"rebon-plugin", "formatVersion":1, "adapterRevision":1,
+            "sdk":[{"name":"rebon-plugin-api","range":"^1"}]
+        } });
         value
             .as_object_mut()
             .unwrap()
@@ -523,7 +554,9 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::write(
             root.join(PLUGIN_MANIFEST_FILE),
-            r#"{"name":"demo","version":"1","source":"builtin:forged"}"#,
+            serde_json::to_vec(&serde_json::json!({"name":"demo","version":"1","source":"builtin:forged","compatibility":{
+                "format":"rebon-plugin","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-plugin-api","range":"^1"}]
+            }})).unwrap(),
         )
         .unwrap();
         let store = store_with(dir.path(), Vec::new(), Vec::new());
@@ -650,7 +683,7 @@ mod tests {
         std::fs::create_dir_all(&session).unwrap();
         std::fs::write(
             session.join(PLUGIN_MANIFEST_FILE),
-            br#"{"name":"sess","version":"1.0.0","capabilities":{}}"#,
+            serde_json::to_vec(&manifest_with("sess", serde_json::json!({}))).unwrap(),
         )
         .unwrap();
         let store = store_with(
@@ -662,6 +695,65 @@ mod tests {
         let found = discover(&store, &[session], dir.path(), true).unwrap();
         assert_eq!(found.plugins[0].origin, PluginOrigin::SessionDir);
         assert!(found.plugins[0].source.contains("session"));
+    }
+
+    #[test]
+    fn an_undeclared_plugin_dir_is_refused_without_using_legacy() {
+        let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("plugin");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            root.join(PLUGIN_MANIFEST_FILE),
+            br#"{"name":"demo","version":"1"}"#,
+        )
+        .unwrap();
+        let store = store_with(dir.path(), Vec::new(), Vec::new());
+        let found = discover(&store, &[root], dir.path(), true).unwrap();
+        assert!(found.plugins.is_empty());
+        assert_eq!(found.warnings.len(), 1);
+        assert!(found.warnings[0].contains("missing compatibility declaration"));
+    }
+
+    #[test]
+    fn legacy_discovery_warns_once_and_rechecks_content_on_the_next_load() {
+        let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with(dir.path(), Vec::new(), Vec::new());
+        let root = store.plugin_version_dir(PluginScope::User, "old", "1.0.0");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut installed = record("old", true, serde_json::json!({}));
+        installed.manifest.as_mut().unwrap().compatibility = None;
+        installed.source_identity = Some(PluginSourceIdentity::Local {
+            path: dir.path().join("origin"),
+        });
+        std::fs::write(
+            root.join(PLUGIN_MANIFEST_FILE),
+            serde_json::to_vec(installed.manifest.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("entry.mjs"), "original").unwrap();
+        installed.digest = Some(crate::integrity::compute_dir_digest(&root).unwrap());
+        store
+            .save_state_atomic(
+                PluginScope::User,
+                &PluginInstallState {
+                    plugins: vec![installed],
+                },
+            )
+            .unwrap();
+        let first = discover(&store, &[], dir.path(), true).unwrap();
+        assert_eq!(first.plugins[0].compatibility, LoadCompatibility::Legacy19);
+        assert_eq!(first.warnings.len(), 1);
+        assert!(first.warnings[0].contains("legacy-1.9"));
+        let second = discover(&store, &[], dir.path(), true).unwrap();
+        assert_eq!(second.plugins[0].compatibility, LoadCompatibility::Legacy19);
+        assert!(second.warnings.is_empty());
+        std::fs::write(root.join("entry.mjs"), "modified").unwrap();
+        let modified = discover(&store, &[], dir.path(), true).unwrap();
+        assert!(modified.plugins.is_empty());
+        assert_eq!(modified.warnings.len(), 1);
+        assert!(modified.warnings[0].contains("no longer match"));
     }
 
     #[test]
