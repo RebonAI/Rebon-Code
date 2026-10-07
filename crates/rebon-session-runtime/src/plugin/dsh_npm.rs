@@ -364,12 +364,6 @@ fn npm_beside(node: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
-fn plain(path: &Path) -> String {
-    path.to_string_lossy()
-        .trim_start_matches(r"\\?\")
-        .to_owned()
-}
-
 /// Makes the npm package in `dir` a rebon package, in place.
 ///
 /// `config` is the composition config a package cannot start without, when
@@ -446,6 +440,10 @@ pub fn adapt_with(
         }
     }
 
+    // By where they really are: Node opens the entry by its real path and
+    // checks that against the grants (see `container::real_path`).
+    let real = rebon_plugin_host::container::real_path;
+    let (compose_root, package_root) = (real(compose_root), real(dir));
     let runtime_root = compose_root
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent", compose_root.display()))?;
@@ -453,10 +451,10 @@ pub fn adapt_with(
     let mut probe = Command::new(node);
     probe
         .arg("--permission")
-        .arg(format!("--allow-fs-read={}", plain(runtime_root)))
-        .arg(format!("--allow-fs-read={}", plain(dir)))
+        .arg(format!("--allow-fs-read={}", runtime_root.display()))
+        .arg(format!("--allow-fs-read={}", package_root.display()))
         .arg(compose_root.join("src").join("probe.mjs"))
-        .arg(plain(dir))
+        .arg(&package_root)
         .arg(&entry);
     if let Some(config) = config {
         probe.arg(config.to_string());

@@ -41,7 +41,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -182,9 +182,16 @@ impl Default for ComposeEntry {
 
 impl ComposeEntry {
     pub(crate) fn load_request(&self) -> PluginLoadRequest {
+        // A contained host can only open its package where it really is.
+        let root = match &self.container {
+            Some(_) => crate::container::real_path(Path::new(&self.root))
+                .to_string_lossy()
+                .into_owned(),
+            None => self.root.clone(),
+        };
         PluginLoadRequest {
             plugin_id: self.id.clone(),
-            root: self.root.clone(),
+            root,
             entry: self.entry.clone(),
             services: self.services.clone(),
             event_topics: self.event_topics.clone(),
@@ -813,25 +820,33 @@ impl PluginPlane {
         std::fs::create_dir_all(data.join("tmp"))
             .map_err(|error| refuse(format!("creating {}: {error}", data.display())))?;
         let template = &self.template;
-        let mut extra_read = vec![template.compose_root.clone()];
-        extra_read.extend(template.payload_dir.iter().cloned());
+        // Every script the host is handed by where it really is, as its
+        // grants name it (see `container::real_path`).
+        let real = crate::container::real_path;
+        let host_script = real(&template.host_script);
+        let loader = real(&template.loader);
+        let compose_root = real(&template.compose_root);
+        let payload_dir = template.payload_dir.as_deref().map(real);
+        let mut extra_read = vec![compose_root.clone()];
+        extra_read.extend(payload_dir.iter().cloned());
         let read: Vec<PathBuf> = extra_read
             .iter()
             .cloned()
             .chain(spec.read.iter().map(PathBuf::from))
-            .chain(crate::container::runtime_root(&template.host_script))
+            .chain(crate::container::runtime_root(&host_script))
+            .map(|path| real(&path))
             .collect();
         // Node's half first: the OS layer wraps the command line it makes.
         let node_half = crate::container::container_launch(
             spec,
-            &template.host_script,
+            &host_script,
             &extra_read,
             &|key| std::env::var_os(key),
             &[],
         );
-        let mut probe_config = HostConfig::new(template.node.clone(), template.host_script.clone())
+        let mut probe_config = HostConfig::new(template.node.clone(), host_script.clone())
             .with_host_epoch(template.epochs.next())
-            .with_loader(&template.loader);
+            .with_loader(&loader);
         probe_config.node_args = node_half.node_args.clone();
         let argv = rebon_plugin_supervisor::node_argv(&probe_config);
         let confinement = match self.ctx.get::<rebon_tool::ContainerSandboxService>() {
@@ -842,7 +857,7 @@ impl PluginPlane {
                     argv,
                     environment: node_half.environment.clone(),
                     read,
-                    write: data.clone(),
+                    write: real(&data),
                     network: spec.network.clone(),
                 })
                 .map_err(refuse)?,
@@ -861,14 +876,14 @@ impl PluginPlane {
         }
         let launch = crate::container::container_launch(
             spec,
-            &template.host_script,
+            &host_script,
             &extra_read,
             &|key| std::env::var_os(key),
             &confinement.environment,
         );
-        let mut host = HostConfig::new(template.node.clone(), template.host_script.clone())
+        let mut host = HostConfig::new(template.node.clone(), host_script.clone())
             .with_host_epoch(template.epochs.next())
-            .with_loader(&template.loader)
+            .with_loader(&loader)
             .with_working_directory(launch.working_directory.clone())
             .with_tool_invoker(
                 Arc::clone(&template.invoker),
@@ -892,11 +907,11 @@ impl PluginPlane {
         );
         let control = PluginLoadRequest {
             plugin_id: COMPOSE_PLUGIN_ID.to_owned(),
-            root: template.compose_root.to_string_lossy().into_owned(),
+            root: compose_root.to_string_lossy().into_owned(),
             entry: "src/plugin.mjs".to_owned(),
             services: vec!["compose".to_owned()],
             config: Payload::from(serde_json::json!({
-                "payloadDir": template.payload_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                "payloadDir": payload_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
                 "entries": [],
                 "web": template.web,
                 "modules": template.modules,

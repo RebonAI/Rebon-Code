@@ -1492,7 +1492,8 @@ async fn a_contained_plugin_is_confined_to_its_own_files_and_dies_with_its_last_
         probe(&fixture.plane, "probe_shared", "read", &elsewhere).await["ok"],
         true
     );
-    let inside = plain(&data.join("note.txt"));
+    // Granted, as the container is handed it, where it really is.
+    let inside = plain(&rebon_plugin_host::container::real_path(&data).join("note.txt"));
     assert_eq!(
         probe(&fixture.plane, "probe_boxed", "write", &inside).await["ok"],
         true

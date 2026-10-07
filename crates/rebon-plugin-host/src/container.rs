@@ -90,6 +90,31 @@ pub fn permission_path(path: &Path) -> PathBuf {
     }
 }
 
+/// A path as a contained host is handed it: where it really is.
+///
+/// Node opens a module by its real path and checks that path against the
+/// grants, so a package reached through a link — macOS's temp directory is
+/// one, `/var` → `/private/var` — is refused under the path it was granted as.
+/// Granting the link as well is no way out: following it needs the link
+/// itself readable, which for `/var` is everything under it. So the host is
+/// given, and granted, only real paths. One that does not exist yet stays as
+/// given.
+pub fn real_path(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
+        Ok(real) => unverbatim(&real),
+        Err(_) => permission_path(path),
+    }
+}
+
+/// A canonical Windows path written the way it is opened: `\\?\C:\x` as
+/// `C:\x`, and a share, `\\?\UNC\server\share\x`, as `\\server\share\x`.
+fn unverbatim(path: &Path) -> PathBuf {
+    match path.to_string_lossy().strip_prefix(r"\\?\UNC\") {
+        Some(share) => PathBuf::from(format!(r"\\{share}")),
+        None => permission_path(path),
+    }
+}
+
 /// Builds the Node half of a container's launch.
 ///
 /// `parent_env` reads rebon's own environment; nothing from it reaches the
@@ -102,10 +127,10 @@ pub fn container_launch(
     parent_env: &dyn Fn(&str) -> Option<OsString>,
     confinement_env: &[(OsString, OsString)],
 ) -> ContainerLaunch {
-    let data = permission_path(Path::new(&spec.data_dir));
+    let data = real_path(Path::new(&spec.data_dir));
     let mut read: Vec<PathBuf> = Vec::new();
     let mut grant = |path: PathBuf| {
-        let path = permission_path(&path);
+        let path = real_path(&path);
         if !read.contains(&path) {
             read.push(path);
         }
@@ -351,6 +376,44 @@ mod tests {
     }
 
     #[test]
+    fn a_package_reached_through_a_link_is_granted_where_it_really_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("pkg");
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        // A roundabout path stands in for a link: canonicalising resolves
+        // both, and macOS's temp directory is a real link on top.
+        let roundabout = |path: &Path| path.join("..").join(path.file_name().unwrap());
+        let spec = ContainerSpec {
+            read: vec![roundabout(&package).to_string_lossy().into_owned()],
+            data_dir: roundabout(&data).to_string_lossy().into_owned(),
+            ..spec()
+        };
+        let launch = launch(&spec, &[]);
+        let real = real_path(&package);
+        let real_data = real_path(&data);
+        assert_eq!(
+            real,
+            permission_path(&std::fs::canonicalize(&package).unwrap())
+        );
+        assert!(launch.read.contains(&real), "{:?}", launch.read);
+        assert!(!launch.read.iter().any(|path| {
+            path.components()
+                .any(|part| part == std::path::Component::ParentDir)
+        }));
+        assert!(launch
+            .node_args
+            .contains(&flag("--allow-fs-write=", &real_data)));
+        assert_eq!(launch.working_directory, real_data);
+        // Not there yet: kept as given.
+        assert_eq!(
+            real_path(Path::new("/no/such/place")),
+            PathBuf::from("/no/such/place")
+        );
+    }
+
+    #[test]
     fn only_granted_and_baseline_variables_cross_into_the_container() {
         let launch = launch(&spec(), &[]);
         assert_eq!(
@@ -441,6 +504,19 @@ mod tests {
         assert_eq!(
             permission_path(Path::new(r"\\?\UNC\server\share")),
             PathBuf::from(r"\\?\UNC\server\share")
+        );
+    }
+
+    #[test]
+    fn a_real_path_is_written_the_way_it_is_opened() {
+        assert_eq!(
+            unverbatim(Path::new(r"\\?\UNC\server\share\x")),
+            PathBuf::from(r"\\server\share\x")
+        );
+        assert_eq!(unverbatim(Path::new(r"\\?\C:\x")), PathBuf::from(r"C:\x"));
+        assert_eq!(
+            unverbatim(Path::new("/private/var/x")),
+            PathBuf::from("/private/var/x")
         );
     }
 

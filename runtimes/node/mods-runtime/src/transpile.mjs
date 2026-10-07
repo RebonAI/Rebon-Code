@@ -13,7 +13,7 @@
 // (`jsx-transform.mjs`), then Node's own `stripTypeScriptTypes` in
 // `transform` mode — the JSX is what the type stripper refuses, so it has to
 // be gone before the stripper sees the file.
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { registerHooks, stripTypeScriptTypes } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -68,16 +68,30 @@ export function resolveModFile(filename) {
 const roots = new Set();
 let installed = false;
 
+/// A mod root as the hooks see its files: Node resolves a module to where it
+/// really is, so a root reached through a link is also known by that.
+function rootUrls(root) {
+  const given = path.resolve(root);
+  let real = given;
+  try {
+    real = realpathSync(given);
+  } catch {
+    // Not there (yet): only the path as given can name its files.
+  }
+  return [...new Set([given, real])].map((dir) => {
+    const url = pathToFileURL(dir).href;
+    return url.endsWith('/') ? url : `${url}/`;
+  });
+}
+
 /// Says that files under `root` are a mod's, so the hooks answer for them.
 export function registerModRoot(root) {
-  const url = pathToFileURL(path.resolve(root)).href;
-  roots.add(url.endsWith('/') ? url : `${url}/`);
+  for (const url of rootUrls(root)) roots.add(url);
   install();
 }
 
 export function unregisterModRoot(root) {
-  const url = pathToFileURL(path.resolve(root)).href;
-  roots.delete(url.endsWith('/') ? url : `${url}/`);
+  for (const url of rootUrls(root)) roots.delete(url);
 }
 
 function underModRoot(url) {

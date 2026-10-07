@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,7 +11,10 @@ const runtime = path.resolve(here, '..');
 const probeScript = path.join(runtime, 'src', 'probe.mjs');
 const payload = path.join(runtime, 'payload');
 
-function probe(root, entry, config, { permission = true } = {}) {
+// As rebon runs it: granted, and handed, paths by where they really are. Node
+// opens a module by its real path, and macOS's temp directory is a link.
+function probe(given, entry, config, { permission = true } = {}) {
+  const root = realpathSync(given);
   const args = permission
     ? ['--permission', `--allow-fs-read=${path.resolve(runtime, '..')}`, `--allow-fs-read=${root}`, probeScript, root, entry]
     : [probeScript, root, entry];
