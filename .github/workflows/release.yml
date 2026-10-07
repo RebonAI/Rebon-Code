@@ -246,8 +246,10 @@ jobs:
         # antivirus quarantines every freshly built test binary that drives a
         # JSON-RPC loop. This step is the only place they run, so it is the
         # gate. New feature plugins under crates/plugins/ go on this list.
+        # --no-fail-fast: a failure in one crate otherwise leaves every crate
+        # after it untested, and a release run should name all of them.
         run: >-
-          cargo test --locked
+          cargo test --locked --no-fail-fast
           -p rebon-core -p rebon-harness -p rebon-tool -p rebon-acp
           -p rebon-agent-core -p rebon-slash-commands -p rebon-acp-client -p rebon-config
           -p rebon-proto
