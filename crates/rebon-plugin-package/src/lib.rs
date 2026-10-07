@@ -34,6 +34,8 @@ pub use claude_mod::{
     discover_mod_dirs, is_claude_mod_dir, is_mod_config, kernel_manifest_for, mod_config,
     plugin_manifest_for, read_claude_mod, scan_hooks_module, user_config_options, ClaudeMod,
 };
-pub use discovery::{discover, Discovered, DiscoveredPlugin, InstalledPlugin, PluginOrigin};
+pub use discovery::{
+    discover, Discovered, DiscoveredPlugin, InstalledPlugin, KernelPluginDeclaration, PluginOrigin,
+};
 pub use manifest::{PluginCapabilities, PluginManifest, PLUGIN_MANIFEST_FILE};
 pub use store::{InstalledPluginRecord, PluginScope, PluginSourceKind, PluginStore};

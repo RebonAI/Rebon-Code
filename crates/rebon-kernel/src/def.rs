@@ -162,8 +162,10 @@ pub struct PluginStateChanged {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginIncarnation {
-    /// Where the plugin came from (ecosystem and package identity). `None`
-    /// until sources carry one.
+    /// Where the plugin came from: the installer's record of its package's
+    /// source, as an opaque key the kernel does not interpret. `None` for a
+    /// plugin with no recorded install source — one rebon ships, a mod, an
+    /// explicit module path, or an install that predates source tracking.
     pub source: Option<String>,
     pub plugin_id: String,
     /// The host process the run is on; `0` for a plugin running in rebon's

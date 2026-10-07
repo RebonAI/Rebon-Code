@@ -299,13 +299,13 @@ pub fn available_entries() -> Vec<AvailableEntry> {
         })
         .collect();
     let named: BTreeSet<&str> = configured.iter().map(|e| e.id.as_str()).collect();
-    for (name, _, manifest) in crate::plugin_composition::installed_kernel_plugins(&config_dir) {
-        if named.contains(name.as_str()) || manifest.entry.is_none() {
+    for declared in crate::plugin_composition::installed_kernel_plugins(&config_dir) {
+        if named.contains(declared.name.as_str()) || declared.manifest.entry.is_none() {
             continue;
         }
         entries.push(AvailableEntry {
-            id: name.clone(),
-            title: format!("Node plugin: {name} (installed)"),
+            title: format!("Node plugin: {} (installed)", declared.name),
+            id: declared.name,
             configured: false,
         });
     }
@@ -359,17 +359,17 @@ pub(crate) fn unconfigured_entries(
     let containment = crate::container::Containment::load(config_dir);
     crate::plugin_composition::installed_kernel_plugins(config_dir)
         .into_iter()
-        .filter(|(name, _, _)| wanted.contains(name) && !named.contains(name.as_str()))
-        .filter_map(|(name, root, manifest)| {
-            let module = manifest.entry.clone()?;
-            Some(containment.package(crate::plugin_manifests::entry_for(
-                &manifest,
-                &name,
-                root,
-                module,
+        .filter(|declared| {
+            wanted.contains(&declared.name) && !named.contains(declared.name.as_str())
+        })
+        .filter_map(|declared| {
+            crate::plugin_composition::installed_entry(
+                &declared,
+                &declared.name,
                 serde_json::Value::Null,
                 all_tools,
-            )))
+            )
+            .map(|entry| containment.package(entry))
         })
         .collect()
 }

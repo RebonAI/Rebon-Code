@@ -331,6 +331,41 @@ async fn a_quiet_unload_is_clean_and_the_next_load_is_a_new_run() {
     .await;
 }
 
+/// A run says where its package came from: the entry's recorded source is on
+/// every fact about the run, from the first one on, and an entry with none
+/// gives runs with none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_carries_its_entry_source() {
+    with_plane(
+        Duration::from_secs(5),
+        |Rig { plane, ctx, tmp }| async move {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            {
+                let seen = Arc::clone(&seen);
+                ctx.on::<PluginLifecycleChanged>(move |event| {
+                    if event.incarnation.plugin_id == ID {
+                        seen.lock().unwrap().push(event.incarnation.source.clone());
+                    }
+                });
+            }
+            let root = package(&tmp);
+            let mut sourced = entry(&root);
+            sourced.source = Some(r#"{"kind":"local","path":"/origin"}"#.into());
+            plane.load_entry(&sourced).await.expect("loads");
+            plane.unload_entry(ID).await;
+            plane.load_entry(&entry(&root)).await.expect("loads again");
+
+            // Loading, Ready, Draining and Unloaded of the first run; Loading
+            // and Ready of the second.
+            let mut expected = vec![sourced.source.clone(); 4];
+            expected.extend([None, None]);
+            assert_eq!(*seen.lock().unwrap(), expected);
+            assert_eq!(plane.lifecycle(ID).unwrap().incarnation.source, None);
+        },
+    )
+    .await;
+}
+
 /// A call in flight inside the deadline is waited on, and still answered by
 /// the run it was made to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

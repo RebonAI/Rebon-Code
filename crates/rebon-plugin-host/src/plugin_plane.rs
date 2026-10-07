@@ -142,6 +142,15 @@ pub struct ComposeEntry {
     /// host: someone else's code, confined (see [`crate::container`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<crate::container::ContainerSpec>,
+    /// Where the entry's package came from, as its installer recorded it: an
+    /// opaque key, stamped on every run of the entry as
+    /// [`PluginIncarnation::source`]. `None` for anything with no install
+    /// record — a package rebon ships, a mod, an explicit module path.
+    ///
+    /// Part of the entry's equality, so a package whose source was replaced
+    /// is restarted by a reload rather than kept running as the old one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 fn publish_by_default() -> bool {
@@ -166,6 +175,7 @@ impl Default for ComposeEntry {
             settings: Vec::new(),
             publish: true,
             container: None,
+            source: None,
         }
     }
 }
@@ -1007,7 +1017,7 @@ impl PluginPlane {
     pub async fn load_entry(&self, entry: &ComposeEntry) -> Result<EntryReport, HostCallError> {
         self.refuse_if_stuck(&entry.id)?;
         let host = self.host_for_entry(entry).await?;
-        if let Err(error) = self.begin_attempt(&host, &entry.id).await {
+        if let Err(error) = self.begin_attempt(&host, entry).await {
             self.leave_container(&entry.id).await;
             return Err(error);
         }
@@ -1407,8 +1417,9 @@ impl PluginPlane {
     async fn begin_attempt(
         &self,
         host: &Arc<PluginHostSupervisor>,
-        plugin_id: &str,
+        entry: &ComposeEntry,
     ) -> Result<PluginIncarnation, HostCallError> {
+        let plugin_id = entry.id.as_str();
         let host_epoch = host.host_epoch().await;
         let _order = self.lifecycle_order.lock().expect("plane lifecycle order");
         let generation = self
@@ -1416,7 +1427,7 @@ impl PluginPlane {
             .map_or(1, |record| record.incarnation.generation + 1);
         let fact = PluginLifecycleChanged {
             incarnation: PluginIncarnation {
-                source: None,
+                source: entry.source.clone(),
                 plugin_id: plugin_id.to_owned(),
                 host_epoch,
                 generation,
@@ -1645,7 +1656,7 @@ impl PluginPlane {
         }
         self.refuse_if_stuck(&entry.id)?;
         let host = self.host_for_entry(entry).await?;
-        if let Err(error) = self.begin_attempt(&host, &entry.id).await {
+        if let Err(error) = self.begin_attempt(&host, entry).await {
             self.leave_container(&entry.id).await;
             return Err(error);
         }
@@ -2816,6 +2827,7 @@ mod reload_tests {
             settings: Vec::new(),
             publish: true,
             container: None,
+            source: None,
         }
     }
 
@@ -2964,6 +2976,20 @@ mod reload_tests {
         let plan = classify(&running(&before), &[promoted]);
 
         assert_eq!(plan.changed, vec!["a".to_string()]);
+    }
+
+    /// A package reinstalled from somewhere else is another plugin under the
+    /// same id: it restarts, so its runs say where they came from.
+    #[test]
+    fn a_source_that_changed_is_restarted() {
+        let mut before = entry("a", Value::Null);
+        before.source = Some("old".into());
+        let mut after = before.clone();
+        after.source = Some("new".into());
+        let plan = classify(&running(&[before.clone()]), &[after]);
+        assert_eq!(plan.changed, vec!["a".to_string()]);
+        let plan = classify(&running(&[before.clone()]), &[before]);
+        assert_eq!(plan.unchanged, vec!["a".to_string()]);
     }
 
     /// A reload that changed nothing must not advance the generation: the

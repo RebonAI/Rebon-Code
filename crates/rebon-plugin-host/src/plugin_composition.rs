@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use rebon_types::KernelPluginManifest;
+use rebon_plugin_package::KernelPluginDeclaration;
 
 use crate::plugin_manifests::{entry_for, plain_path, read_package_manifest, PayloadManifests};
 use crate::plugin_plane::{ComposeEntry, ComposeNode};
@@ -176,7 +176,7 @@ pub fn add_discovered_mods(
 /// The project scope and the trust check both key off the process's working
 /// directory, which is the project a session was started in — the same thing
 /// every other project-scoped lookup uses.
-pub fn installed_kernel_plugins(config_dir: &Path) -> Vec<(String, PathBuf, KernelPluginManifest)> {
+pub fn installed_kernel_plugins(config_dir: &Path) -> Vec<KernelPluginDeclaration> {
     // Also runs on plane reloads mid-session, where a vanished cwd must not
     // fail the composition; the relative root then finds no project plugins.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -202,7 +202,7 @@ pub fn compose_section(
     roots: &CompositionRoots,
     all_tools: &[String],
     manifests: &PayloadManifests,
-    installed: &[(String, PathBuf, KernelPluginManifest)],
+    installed: &[KernelPluginDeclaration],
     config_dir: &Path,
 ) -> PlaneComposition {
     let base: Vec<Value> = section
@@ -266,7 +266,7 @@ fn walk(
     all_tools: &[String],
     manifests: &PayloadManifests,
     modules: &BTreeMap<String, PathBuf>,
-    installed: &[(String, PathBuf, KernelPluginManifest)],
+    installed: &[KernelPluginDeclaration],
     config_dir: &Path,
     out: &mut PlaneComposition,
 ) -> Vec<ComposeNode> {
@@ -330,7 +330,7 @@ fn load_request(
     all_tools: &[String],
     manifests: &PayloadManifests,
     modules: &BTreeMap<String, PathBuf>,
-    installed: &[(String, PathBuf, KernelPluginManifest)],
+    installed: &[KernelPluginDeclaration],
     config_dir: &Path,
 ) -> Result<ComposeEntry, String> {
     if let Some(manifest) = manifests.get(name) {
@@ -351,24 +351,11 @@ fn load_request(
         // Nothing pointed at a file, so the name has to have been declared by
         // something installed. This is what makes `rebon plugin install` enough:
         // the package says what it puts on the plane, and a composition names it.
-        if let Some((_, root, manifest)) =
-            installed.iter().find(|(declared, _, _)| declared == name)
-        {
-            let entry = manifest
-                .entry
-                .clone()
-                .ok_or_else(|| format!("the installed declaration for {name} names no module"))?;
+        if let Some(declared) = installed.iter().find(|declared| declared.name == name) {
             // Installed means someone else's: it runs in its container.
-            return Ok(
-                crate::container::Containment::load(config_dir).package(entry_for(
-                    manifest,
-                    id,
-                    root.clone(),
-                    entry,
-                    config,
-                    all_tools,
-                )),
-            );
+            return installed_entry(declared, id, config, all_tools)
+                .map(|entry| crate::container::Containment::load(config_dir).package(entry))
+                .ok_or_else(|| format!("the installed declaration for {name} names no module"));
         }
         return Err(format!(
             "{name} is not a package rebon ships, not a name `kernelPlugins.modules` maps, and \
@@ -403,9 +390,33 @@ fn load_request(
     Ok(entry_for(&manifest, id, root, file, config, all_tools))
 }
 
+/// The load request for a kernel plugin an installed package declares,
+/// carrying the package's recorded source; `None` if it names no module.
+///
+/// Not yet in its container: where it runs is the caller's to decide.
+pub(crate) fn installed_entry(
+    declared: &KernelPluginDeclaration,
+    id: &str,
+    config: Value,
+    all_tools: &[String],
+) -> Option<ComposeEntry> {
+    let module = declared.manifest.entry.clone()?;
+    let mut entry = entry_for(
+        &declared.manifest,
+        id,
+        declared.root.clone(),
+        module,
+        config,
+        all_tools,
+    );
+    entry.source = declared.source.clone();
+    Some(entry)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rebon_types::KernelPluginManifest;
 
     fn roots() -> CompositionRoots {
         CompositionRoots {
@@ -445,16 +456,17 @@ mod tests {
         assert_eq!(out.structure.len(), 1);
     }
 
-    fn installed(name: &str, root: &str, entry: &str) -> (String, PathBuf, KernelPluginManifest) {
-        (
-            name.to_string(),
-            PathBuf::from(root),
-            KernelPluginManifest {
+    fn installed(name: &str, root: &str, entry: &str) -> KernelPluginDeclaration {
+        KernelPluginDeclaration {
+            name: name.to_string(),
+            root: PathBuf::from(root),
+            manifest: KernelPluginManifest {
                 entry: Some(entry.to_string()),
                 services: vec!["echo".to_string()],
                 ..KernelPluginManifest::default()
             },
-        )
+            source: Some(format!("source-of-{name}")),
+        }
     }
 
     /// What installing a plugin is supposed to buy: the composition names it,
@@ -481,6 +493,8 @@ mod tests {
         assert_eq!(entry.entry, "index.mjs");
         assert_eq!(entry.services, vec!["echo".to_string()]);
         assert_eq!(entry.config, serde_json::json!({ "a": 1 }));
+        // The package's recorded source travels with the load request.
+        assert_eq!(entry.source.as_deref(), Some("source-of-demo-plane"));
     }
 
     /// Pointing `modules` at a directory is a statement about *which* copy to
@@ -513,6 +527,8 @@ mod tests {
         assert_eq!(out.entries.len(), 1, "{:?}", out.skipped);
         assert_eq!(out.entries[0].entry, "local.mjs");
         assert_eq!(out.entries[0].services, vec!["from-disk".to_string()]);
+        // A module path has no install record, so no source either.
+        assert_eq!(out.entries[0].source, None);
     }
 
     /// A name nothing accounts for names all three places it could have come

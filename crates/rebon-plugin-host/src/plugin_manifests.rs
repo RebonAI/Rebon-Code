@@ -66,6 +66,7 @@ pub fn entry_for(
         settings: manifest.settings.clone(),
         publish: true,
         container: None,
+        source: None,
     }
 }
 

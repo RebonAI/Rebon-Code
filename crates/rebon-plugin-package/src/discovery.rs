@@ -101,6 +101,20 @@ impl DiscoveredPlugin {
     }
 }
 
+/// One kernel plugin an installed package declares, by the name a
+/// composition refers to it by.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KernelPluginDeclaration {
+    pub name: String,
+    /// The package root, which the declaration's `entry` is relative to.
+    pub root: PathBuf,
+    pub manifest: KernelPluginManifest,
+    /// The installer-recorded source of the declaring package, as the opaque
+    /// [`PluginSourceIdentity::key`]. `None` when the install predates source
+    /// tracking and its origin is unknown.
+    pub source: Option<String>,
+}
+
 /// Everything in effect, plus what could not be read.
 ///
 /// Warnings rather than failures: one unreadable package must not take down a
@@ -132,8 +146,9 @@ impl Discovered {
     ///
     /// First writer wins, so the precedence above decides which package
     /// provides a name two packages both declare. The package root travels
-    /// with it because an `entry` is relative to it.
-    pub fn kernel_plugins(&self) -> Vec<(String, PathBuf, KernelPluginManifest)> {
+    /// with it because an `entry` is relative to it, and the package's source
+    /// so that whatever runs the plugin can say where it came from.
+    pub fn kernel_plugins(&self) -> Vec<KernelPluginDeclaration> {
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
         for plugin in &self.plugins {
@@ -142,7 +157,15 @@ impl Discovered {
             };
             for (name, declaration) in &manifest.capabilities.kernel_plugins {
                 if seen.insert(name.clone()) {
-                    out.push((name.clone(), root.to_path_buf(), declaration.clone()));
+                    out.push(KernelPluginDeclaration {
+                        name: name.clone(),
+                        root: root.to_path_buf(),
+                        manifest: declaration.clone(),
+                        source: plugin
+                            .source_identity
+                            .as_ref()
+                            .map(PluginSourceIdentity::key),
+                    });
                 }
             }
         }
@@ -679,11 +702,39 @@ mod tests {
         let found = discover(&store, &[], dir.path(), true).unwrap();
         let declared = found.kernel_plugins();
         assert_eq!(declared.len(), 1);
-        let (name, root, manifest) = &declared[0];
-        assert_eq!(name, "demo");
-        assert!(root.ends_with(Path::new("plane-pkg").join("1.0.0")));
-        assert_eq!(manifest.entry.as_deref(), Some("index.mjs"));
-        assert_eq!(manifest.services, vec!["echo".to_string()]);
+        let declaration = &declared[0];
+        assert_eq!(declaration.name, "demo");
+        assert!(declaration
+            .root
+            .ends_with(Path::new("plane-pkg").join("1.0.0")));
+        assert_eq!(declaration.manifest.entry.as_deref(), Some("index.mjs"));
+        assert_eq!(declaration.manifest.services, vec!["echo".to_string()]);
+        // Installed before sources were recorded: unknown, not guessed.
+        assert_eq!(declaration.source, None);
+    }
+
+    /// A declaration carries the installer's record of where its package came
+    /// from, never what the package's own manifest claims.
+    #[test]
+    fn a_kernel_plugin_declaration_carries_its_package_source() {
+        let _serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let identity = PluginSourceIdentity::BuiltinMarketplace {
+            plugin: "plane-pkg".into(),
+        };
+        let mut installed = record(
+            "plane-pkg",
+            true,
+            serde_json::json!({"kernelPlugins": {"demo": {"entry": "index.mjs"}}}),
+        );
+        installed.source_identity = Some(identity.clone());
+        installed.manifest.as_mut().unwrap().source = Some("builtin:forged".into());
+        let store = store_with(dir.path(), vec![installed], Vec::new());
+
+        let found = discover(&store, &[], dir.path(), true).unwrap();
+        let declared = found.kernel_plugins();
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].source, Some(identity.key()));
     }
 
     #[test]
@@ -701,6 +752,6 @@ mod tests {
         let found = discover(&store, &[], dir.path(), true).unwrap();
         let declared = found.kernel_plugins();
         assert_eq!(declared.len(), 1);
-        assert_eq!(declared[0].2.entry.as_deref(), Some("project.mjs"));
+        assert_eq!(declared[0].manifest.entry.as_deref(), Some("project.mjs"));
     }
 }
