@@ -16,7 +16,7 @@
 //! model never reads them until it has already decided to call one.
 
 use crate::deliver::Pending;
-use crate::model::{Entry, EntryKind, Group};
+use crate::model::{Entry, EntryKind, Group, Member};
 
 /// At most this many entries are spelled out; the rest are counted.
 pub const MAX_LINES: usize = 12;
@@ -343,6 +343,69 @@ pub fn terminal_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
     ))
 }
 
+/// Each open request handed to a successor is cut to this many characters:
+/// the prompt is a command-line argument when the app starts a CLI with it,
+/// and Windows caps a command line at 32,767, so [`MAX_LINES`] of them must
+/// fit with room to spare.
+pub const HANDOVER_CHARS: usize = 1500;
+
+/// The first message of a session that took a member's place
+/// ([`crate::GroupStore::hand_over`]): whose place it took, and the
+/// requests to that alias still waiting for an answer, which nothing else
+/// hands it — they are older than its joining, so its inbox starts after
+/// them.
+pub fn handover_prompt(group: &Group, previous: &Member, open: &[Entry]) -> String {
+    let alias = &previous.alias;
+    let mut text = format!(
+        "[Agent group \"{}\"] You are {alias} in this group now. The user handed {alias}'s work to \
+         you: the {} session {} that was {alias} has left the group.",
+        group.name, previous.agent, previous.session_id
+    );
+    if let Some(role) = previous
+        .role
+        .as_deref()
+        .filter(|role| !role.trim().is_empty())
+    {
+        text.push_str(&format!(" Your role: {}.", role.trim()));
+    }
+    if open.is_empty() {
+        text.push_str(&format!(
+            "\n\nNothing asked of {alias} is waiting for an answer. Read the group with group_info \
+             and its memory with group_recall, and carry on with {alias}'s part of the work."
+        ));
+    } else {
+        text.push_str(&format!(
+            "\n\nThese requests to {alias} are still waiting for an answer, and are yours now:"
+        ));
+        for entry in open.iter().take(MAX_LINES) {
+            text.push_str(&format!(
+                "\n\n({}) from {}: {}",
+                entry.id.as_deref().unwrap_or_default(),
+                entry.from,
+                first_chars(&entry.text, HANDOVER_CHARS)
+            ));
+        }
+        if open.len() > MAX_LINES {
+            let rest: Vec<&str> = open[MAX_LINES..]
+                .iter()
+                .filter_map(|entry| entry.id.as_deref())
+                .collect();
+            text.push_str(&format!("\n\n(+{} more: {})", rest.len(), rest.join(", ")));
+        }
+        text.push_str(
+            "\n\nWork on each and answer it with group_send (kind reply, re its id, to whoever \
+             asked). If the work settles something the whole group should keep, record it with \
+             group_remember.",
+        );
+    }
+    text.push_str(&format!(
+        " What the previous session did may help: read it with session_read (session {}) if you \
+         have that tool.",
+        previous.session_id
+    ));
+    text
+}
+
 fn entry_tag(entry: &Entry) -> String {
     let mut attrs = format!(
         " seq=\"{}\" from=\"{}\" kind=\"{}\"",
@@ -410,6 +473,65 @@ mod tests {
             supersedes: None,
             text: text.into(),
         }
+    }
+
+    fn previous(role: Option<&str>) -> Member {
+        Member {
+            agent: "codex".into(),
+            session_id: "019c-old".into(),
+            alias: "coder".into(),
+            role: role.map(str::to_string),
+            delivery: crate::model::Delivery::Auto,
+            joined_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn a_successor_is_told_whose_place_it_took_and_every_open_request() {
+        let open = [
+            entry(4, "planner", EntryKind::Request, "fix the\nparser"),
+            entry(7, "user", EntryKind::Request, "and add a test"),
+        ];
+        let text = handover_prompt(&group(), &previous(Some(" writes the parser ")), &open);
+        for part in [
+            "\"refactor\"",
+            "You are coder",
+            "codex session 019c-old",
+            "Your role: writes the parser.",
+            "(r4) from planner: fix the parser",
+            "(r7) from user: and add a test",
+            "re its id",
+            "session_read (session 019c-old)",
+        ] {
+            assert!(text.contains(part), "{part} missing: {text}");
+        }
+        assert!(!text.contains('{') && !text.contains('}'), "{text}");
+        assert!(!text.contains("Nothing asked"), "{text}");
+    }
+
+    #[test]
+    fn a_successor_with_nothing_open_is_told_so_and_no_empty_role() {
+        let text = handover_prompt(&group(), &previous(Some("  ")), &[]);
+        assert!(text.contains("Nothing asked of coder is waiting"), "{text}");
+        assert!(!text.contains("Your role"), "{text}");
+        assert!(!text.contains("group_send"), "{text}");
+        assert!(!text.contains('{') && !text.contains('}'), "{text}");
+    }
+
+    #[test]
+    fn many_or_long_open_requests_stay_within_a_command_line() {
+        let long = "x".repeat(HANDOVER_CHARS * 3);
+        let open: Vec<Entry> = (1..=MAX_LINES as u64 + 2)
+            .map(|seq| entry(seq, "planner", EntryKind::Request, &long))
+            .collect();
+        let text = handover_prompt(&group(), &previous(None), &open);
+        assert_eq!(text.matches(") from planner: ").count(), MAX_LINES);
+        let last = MAX_LINES as u64;
+        assert!(
+            text.contains(&format!("(+2 more: r{}, r{})", last + 1, last + 2)),
+            "{text}"
+        );
+        assert!(text.encode_utf16().count() < 32_767, "{}", text.len());
     }
 
     #[test]

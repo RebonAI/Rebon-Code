@@ -16,7 +16,9 @@ use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Entry, EntryKind, Group, Handoff, Member, MemberKey, Via, Warmth, ALL, USER};
+use crate::model::{
+    open_requests_to, Entry, EntryKind, Group, Handoff, Member, MemberKey, Via, Warmth, ALL, USER,
+};
 
 const GROUP_FILE: &str = "group.json";
 const LOG_FILE: &str = "log.jsonl";
@@ -67,6 +69,17 @@ pub struct Inbox {
     pub entries: Vec<Entry>,
     /// The log's last seq when it was read; the read cursor moves here.
     pub last_seq: u64,
+}
+
+/// A member's place handed to a new session ([`GroupStore::hand_over`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HandOver {
+    /// The group with the successor in the place.
+    pub group: Group,
+    /// The member as it was before: the session that left.
+    pub previous: Member,
+    /// The requests to the alias still waiting for an answer, oldest first.
+    pub open: Vec<Entry>,
 }
 
 /// `group.json` plus the bookkeeping only the store reads.
@@ -281,16 +294,35 @@ impl GroupStore {
         })
     }
 
-    /// Takes `key` out of the group and logs it.
+    /// Takes `key` out of the group and logs it. The requests to it that it
+    /// never answered go too: no one is left to answer them, and a later
+    /// member given the same alias must not inherit them. The leave entry
+    /// names them, so whoever asked knows to ask again elsewhere.
     pub fn leave(&self, id: &str, key: &MemberKey) -> Result<Option<Entry>> {
         check_id(id)?;
         self.with_lock(id, || {
-            let path = self.dir(id).join(GROUP_FILE);
+            let dir = self.dir(id);
+            let path = dir.join(GROUP_FILE);
             let mut file = read_group_file(&path)?;
             let Some(index) = file.group.members.iter().position(|m| m.key() == *key) else {
                 return Ok(None);
             };
             let member = file.group.members.remove(index);
+            let log = read_log(&dir)?;
+            let open: Vec<&Entry> = open_requests_to(&log, &member.alias);
+            let mut text = format!("{} left", member.alias);
+            if !open.is_empty() {
+                let ids: Vec<&str> = open
+                    .iter()
+                    .filter_map(|entry| entry.id.as_deref())
+                    .collect();
+                text.push_str(&format!(
+                    "; its unanswered requests were withdrawn: {}",
+                    ids.join(", ")
+                ));
+                let seqs: Vec<u64> = open.iter().map(|entry| entry.seq).collect();
+                drop_entries(&dir, &seqs)?;
+            }
             let entry = self.append_locked(
                 id,
                 &mut file,
@@ -300,14 +332,103 @@ impl GroupStore {
                     to: None,
                     re: None,
                     supersedes: None,
-                    text: format!("{} left", member.alias),
+                    text,
                 },
             )?;
             write_json(&path, &file)?;
-            let mut cursors = read_cursors(&self.dir(id))?;
+            let mut cursors = read_cursors(&dir)?;
             cursors.remove(&key.as_string());
-            write_json(&self.dir(id).join(CURSORS_FILE), &cursors)?;
+            write_json(&dir.join(CURSORS_FILE), &cursors)?;
             Ok(Some(entry))
+        })
+    }
+
+    /// Puts the session `successor` in the place of member `key`: under its
+    /// alias, role and delivery, so what was addressed to that alias —
+    /// above all the requests it has not answered, which stay open — is
+    /// now the successor's. Both the leaving and the joining are logged;
+    /// the successor starts with nothing unread, like any new member, and
+    /// is handed the open requests by whoever starts it (see
+    /// [`crate::render::handover_prompt`]).
+    pub fn hand_over(&self, id: &str, key: &MemberKey, successor: &MemberKey) -> Result<HandOver> {
+        check_id(id)?;
+        if !self.agent_policy()?.allows(&successor.agent) {
+            bail!(
+                "{} is switched out of agent groups (Rebon desktop: Settings > Groups)",
+                successor.agent
+            );
+        }
+        if let Some(other) = self.group_of(successor)? {
+            bail!(
+                "session {} is already in group `{}`",
+                successor.session_id,
+                other.name
+            );
+        }
+        self.with_lock(id, || {
+            let dir = self.dir(id);
+            let path = dir.join(GROUP_FILE);
+            let mut file = read_group_file(&path)?;
+            let Some(slot) = file.group.members.iter_mut().find(|m| m.key() == *key) else {
+                bail!("not a member of this group");
+            };
+            let previous = slot.clone();
+            *slot = Member {
+                agent: successor.agent.clone(),
+                session_id: successor.session_id.clone(),
+                joined_at_ms: now_ms(),
+                ..previous.clone()
+            };
+            let alias = previous.alias.clone();
+            self.append_locked(
+                id,
+                &mut file,
+                &alias,
+                Draft {
+                    kind: EntryKind::Leave,
+                    to: None,
+                    re: None,
+                    supersedes: None,
+                    text: format!(
+                        "{alias} left, handing its work to a new {} session",
+                        successor.agent
+                    ),
+                },
+            )?;
+            let joined = self.append_locked(
+                id,
+                &mut file,
+                &alias,
+                Draft {
+                    kind: EntryKind::Join,
+                    to: None,
+                    re: None,
+                    supersedes: None,
+                    text: format!("{alias} joined ({}), taking over", successor.agent),
+                },
+            )?;
+            write_json(&path, &file)?;
+            let mut cursors = read_cursors(&dir)?;
+            cursors.remove(&key.as_string());
+            cursors.insert(
+                successor.as_string(),
+                Cursor {
+                    delivered: joined.seq,
+                    read: joined.seq,
+                    ..Cursor::default()
+                },
+            );
+            write_json(&dir.join(CURSORS_FILE), &cursors)?;
+            let log = read_log(&dir)?;
+            let open = open_requests_to(&log, &alias)
+                .into_iter()
+                .cloned()
+                .collect();
+            Ok(HandOver {
+                group: file.group,
+                previous,
+                open,
+            })
         })
     }
 
@@ -844,6 +965,30 @@ fn append_handoff(
 /// The log, in order.
 fn read_log(dir: &Path) -> Result<Vec<Entry>> {
     read_lines(&dir.join(LOG_FILE))
+}
+
+/// Takes the entries numbered `seqs` out of the log. Line by line, so a
+/// line this build cannot read — a kind a newer one writes — stays as it
+/// is; the seqs are never handed out again, since `last_seq` lives in
+/// `group.json`.
+fn drop_entries(dir: &Path, seqs: &[u64]) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Seq {
+        seq: u64,
+    }
+    let path = dir.join(LOG_FILE);
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let mut kept = String::with_capacity(text.len());
+    for line in text.lines() {
+        let dropped =
+            serde_json::from_str::<Seq>(line).is_ok_and(|entry| seqs.contains(&entry.seq));
+        if !dropped && !line.trim().is_empty() {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    write_text(&path, &kept)
 }
 
 /// A JSON-lines file, in order. A line that does not parse — the tail of a

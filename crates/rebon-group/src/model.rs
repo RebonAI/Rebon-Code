@@ -150,6 +150,27 @@ impl Entry {
     }
 }
 
+/// The requests addressed to `alias` that no reply names yet: work asked of
+/// that member and not answered. They go with it when it leaves, and pass
+/// to whoever takes its place.
+pub fn open_requests_to<'a>(log: &'a [Entry], alias: &str) -> Vec<&'a Entry> {
+    let answered: std::collections::HashSet<&str> = log
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::Reply)
+        .filter_map(|entry| entry.re.as_deref())
+        .collect();
+    log.iter()
+        .filter(|entry| {
+            entry.kind == EntryKind::Request
+                && entry
+                    .to
+                    .as_deref()
+                    .is_some_and(|to| to.eq_ignore_ascii_case(alias))
+                && entry.id.as_deref().is_some_and(|id| !answered.contains(id))
+        })
+        .collect()
+}
+
 /// The address every member reads.
 pub const ALL: &str = "all";
 

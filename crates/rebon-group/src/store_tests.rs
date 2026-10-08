@@ -544,3 +544,227 @@ fn a_member_brought_in_before_its_session_had_an_id_takes_the_id_later() {
         .rekey_member(&group.id, &key("claude-code", "c1"), "c1")
         .is_err());
 }
+
+fn request(to: &str, text: &str) -> Draft {
+    Draft {
+        kind: EntryKind::Request,
+        to: Some(to.into()),
+        re: None,
+        supersedes: None,
+        text: text.into(),
+    }
+}
+
+fn reply(to: &str, re: &str) -> Draft {
+    Draft {
+        kind: EntryKind::Reply,
+        to: Some(to.into()),
+        re: Some(re.into()),
+        supersedes: None,
+        text: "done".into(),
+    }
+}
+
+fn texts(store: &GroupStore, id: &str) -> Vec<String> {
+    store
+        .entries_after(id, 0)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.text)
+        .collect()
+}
+
+#[test]
+fn a_leaving_member_takes_its_unanswered_requests_with_it() {
+    let (_dir, store, group) = pair();
+    let planner = key("rebon", "s1");
+    let coder = key("claude-code", "c1");
+    let open = store
+        .append(&group.id, &planner, request("Coder", "open one"))
+        .unwrap();
+    let answered = store
+        .append(&group.id, &planner, request("coder", "answered one"))
+        .unwrap();
+    store
+        .append(
+            &group.id,
+            &coder,
+            reply("planner", answered.id.as_deref().unwrap()),
+        )
+        .unwrap();
+    store
+        .append(&group.id, &planner, note("coder", "a note to it"))
+        .unwrap();
+    store
+        .append(&group.id, &coder, request("planner", "its own ask"))
+        .unwrap();
+    store
+        .post_as_user(&group.id, request("coder", "the user's ask"))
+        .unwrap();
+
+    let left = store.leave(&group.id, &coder).unwrap().unwrap();
+
+    let log = texts(&store, &group.id);
+    assert!(!log
+        .iter()
+        .any(|text| text == "open one" || text == "the user's ask"));
+    for kept in ["answered one", "done", "a note to it", "its own ask"] {
+        assert!(
+            log.iter().any(|text| text == kept),
+            "{kept} was dropped: {log:?}"
+        );
+    }
+    assert!(left.text.starts_with("coder left"), "{}", left.text);
+    assert!(
+        left.text.contains(open.id.as_deref().unwrap()),
+        "{}",
+        left.text
+    );
+    assert!(
+        !left.text.contains(answered.id.as_deref().unwrap()),
+        "{}",
+        left.text
+    );
+    // Seqs taken out are not handed out again.
+    let next = store
+        .append(&group.id, &planner, note("all", "after"))
+        .unwrap();
+    assert_eq!(next.seq, left.seq + 1);
+    // A later member under the same alias starts with none of them.
+    store
+        .join(&group.id, member("codex", "x1", "coder"))
+        .unwrap();
+    let entries = store.entries_after(&group.id, 0).unwrap();
+    assert!(crate::model::open_requests_to(&entries, "coder").is_empty());
+}
+
+#[test]
+fn a_member_with_nothing_open_just_leaves() {
+    let (_dir, store, group) = pair();
+    store
+        .append(&group.id, &key("rebon", "s1"), note("coder", "hi"))
+        .unwrap();
+    let before = texts(&store, &group.id);
+    let left = store
+        .leave(&group.id, &key("claude-code", "c1"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(left.text, "coder left");
+    assert_eq!(texts(&store, &group.id)[..before.len()], before[..]);
+    // Leaving twice is nothing.
+    assert!(store
+        .leave(&group.id, &key("claude-code", "c1"))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn withdrawing_requests_keeps_log_lines_this_build_cannot_read() {
+    let (dir, store, group) = pair();
+    store
+        .append(&group.id, &key("rebon", "s1"), request("coder", "open"))
+        .unwrap();
+    let log = dir.path().join("groups").join(&group.id).join(LOG_FILE);
+    let foreign = r#"{"seq":99,"atMs":1,"from":"x","kind":"poll","text":"from a newer build"}"#;
+    let mut text = std::fs::read_to_string(&log).unwrap();
+    text.push_str(foreign);
+    text.push('\n');
+    std::fs::write(&log, text).unwrap();
+
+    store.leave(&group.id, &key("claude-code", "c1")).unwrap();
+
+    let after = std::fs::read_to_string(&log).unwrap();
+    assert!(after.contains(foreign));
+    assert!(!after.contains("\"open\""));
+}
+
+#[test]
+fn a_successor_takes_the_members_place_and_its_open_requests() {
+    let (_dir, store, group) = pair();
+    let planner = key("rebon", "s1");
+    let coder = key("claude-code", "c1");
+    store
+        .update_member(&group.id, &coder, |member| {
+            member.role = Some("writes the parser".into());
+            member.delivery = Delivery::PullOnly;
+        })
+        .unwrap();
+    let open = store
+        .append(&group.id, &planner, request("coder", "fix it"))
+        .unwrap();
+    let done = store
+        .append(&group.id, &planner, request("coder", "done already"))
+        .unwrap();
+    store
+        .append(
+            &group.id,
+            &coder,
+            reply("planner", done.id.as_deref().unwrap()),
+        )
+        .unwrap();
+    let successor = key("claude-code", "c2");
+
+    let handed = store.hand_over(&group.id, &coder, &successor).unwrap();
+
+    assert_eq!(handed.previous.key(), coder);
+    assert_eq!(handed.open, vec![open.clone()]);
+    let now = store.load(&group.id).unwrap();
+    assert!(now.member(&coder).is_none());
+    let taken = now.member(&successor).unwrap();
+    assert_eq!(taken.alias, "coder");
+    assert_eq!(taken.role.as_deref(), Some("writes the parser"));
+    assert_eq!(taken.delivery, Delivery::PullOnly);
+    assert_eq!(now.members.len(), 2);
+    assert_eq!(handed.group, now);
+    // Logged as a leave and a join, the open request left where it was.
+    let log = store.entries_after(&group.id, 0).unwrap();
+    let tail: Vec<EntryKind> = log.iter().rev().take(2).rev().map(|e| e.kind).collect();
+    assert_eq!(tail, vec![EntryKind::Leave, EntryKind::Join]);
+    assert!(log.contains(&open));
+    // It starts with nothing unread; the old session's cursor is gone.
+    let cursors = store.cursors(&group.id).unwrap();
+    assert!(!cursors.contains_key(&coder.as_string()));
+    let cursor = cursors[&successor.as_string()];
+    assert_eq!(
+        (cursor.read, cursor.delivered),
+        (log.last().unwrap().seq, log.last().unwrap().seq)
+    );
+    assert!(!cursor.briefed);
+    // It answers as coder, and the request is closed.
+    store
+        .append(
+            &group.id,
+            &successor,
+            reply("planner", open.id.as_deref().unwrap()),
+        )
+        .unwrap();
+    let log = store.entries_after(&group.id, 0).unwrap();
+    assert!(crate::model::open_requests_to(&log, "coder").is_empty());
+    // The old session can no longer write.
+    assert!(store
+        .append(&group.id, &coder, note("all", "still here"))
+        .is_err());
+}
+
+#[test]
+fn a_hand_over_is_refused_when_it_cannot_be_made_whole() {
+    let (_dir, store, group) = pair();
+    let coder = key("claude-code", "c1");
+    let before = texts(&store, &group.id);
+    // Not a member.
+    assert!(store
+        .hand_over(&group.id, &key("codex", "nobody"), &key("codex", "x1"))
+        .is_err());
+    // A successor already in a group.
+    assert!(store
+        .hand_over(&group.id, &coder, &key("rebon", "s1"))
+        .is_err());
+    // A program switched out of groups.
+    store.set_agent_allowed("codex", false).unwrap();
+    assert!(store
+        .hand_over(&group.id, &coder, &key("codex", "x1"))
+        .is_err());
+    // Nothing changed.
+    assert_eq!(texts(&store, &group.id), before);
+    assert!(store.load(&group.id).unwrap().member(&coder).is_some());
+}
