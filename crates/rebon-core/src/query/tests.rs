@@ -1544,6 +1544,7 @@ mod code_mode;
 mod context_reset_and_cache_trace;
 mod executor_integration;
 mod model_routing;
+mod replay_compaction;
 mod request_building;
 mod run_query_loop;
 mod session_prompt_cache;

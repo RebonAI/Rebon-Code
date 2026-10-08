@@ -538,6 +538,98 @@ impl ManualCompactReport {
     }
 }
 
+/// Summarises `messages` — the history a turn would replay — into a
+/// baseline anchored on the last of `entries`, the transcript rows that
+/// history was projected from: what `/compact` installs, and what a replay
+/// over the auto-compact threshold installs before its turn is sent. The
+/// next turn replays the baseline plus the rows written after the anchor.
+///
+/// The providers are tried in order; when every one fails the history is
+/// truncated instead, which still frees context, and the report says so.
+/// `Err` when the history is already shorter than what is kept verbatim,
+/// or when truncating would not shorten it either.
+pub(super) async fn summarise_into_baseline(
+    entries: &[TranscriptEntry],
+    messages: &[ApiMessage],
+    providers: [Option<Arc<dyn CompactProvider>>; 2],
+    instructions: Option<&str>,
+    summary_options: &rebon_api::CompactSummaryOptions,
+) -> Result<
+    (
+        super::replay_window::PreparedResumeSummary,
+        ManualCompactReport,
+    ),
+    String,
+> {
+    if messages.len() <= MANUAL_COMPACT_PROTECTED_TURNS * 2 {
+        return Err(
+            "This session is already shorter than the history /compact preserves.".to_string(),
+        );
+    }
+    let mut compacted = None;
+    let mut last_error = None;
+    for provider in providers.into_iter().flatten() {
+        match rebon_api::compact_with_retry(
+            provider.as_ref(),
+            messages,
+            None,
+            MANUAL_COMPACT_PROTECTED_TURNS,
+            instructions,
+            summary_options,
+        )
+        .await
+        {
+            Ok((result, _)) if !result.messages.is_empty() => {
+                compacted = Some(result.messages);
+                break;
+            }
+            Ok(_) => last_error = Some("compact provider returned no messages".to_string()),
+            Err(err) => last_error = Some(err.to_string()),
+        }
+    }
+
+    let used_model = compacted.is_some();
+    let mut projection = match compacted {
+        Some(messages) => messages,
+        None => {
+            let truncated =
+                rebon_api::auto_compact_truncate(messages.to_vec(), MANUAL_COMPACT_PROTECTED_TURNS);
+            if truncated.len() >= messages.len() {
+                return Err(format!(
+                    "Unable to compact this session: {}",
+                    last_error.unwrap_or_else(|| {
+                        "no compact provider is configured for this model".to_string()
+                    })
+                ));
+            }
+            tracing::warn!(
+                error = last_error.as_deref().unwrap_or("no provider"),
+                "compact: model-based compaction unavailable, truncated instead"
+            );
+            truncated
+        }
+    };
+    rebon_api::ensure_tool_result_pairing(&mut projection);
+
+    let report = manual_compact_report(
+        messages,
+        &projection,
+        recent_transcript_files(entries),
+        used_model,
+    );
+    tracing::info!(
+        used_model = report.used_model,
+        messages_before = report.messages_before,
+        messages_after = report.messages_after,
+        tokens_before = report.tokens_before,
+        tokens_after = report.tokens_after,
+        "compact: history summarised into a replay baseline"
+    );
+    let prepared =
+        super::replay_window::ReplayWindowStore::prepare_resume_summary(entries, projection)?;
+    Ok((prepared, report))
+}
+
 /// Describe a finished manual compaction by re-reading its own output.
 ///
 /// The providers return only a replacement message list, so the structure

@@ -153,13 +153,6 @@ impl ResumeReplayHandle {
         if entries.is_empty() {
             return Err("This session has nothing to compact yet.".to_string());
         }
-        let messages = transcript_to_api_messages(entries);
-        if messages.len() <= MANUAL_COMPACT_PROTECTED_TURNS * 2 {
-            return Err(
-                "This session is already shorter than the history /compact preserves.".to_string(),
-            );
-        }
-
         let runtime = self.runtime_model.as_ref().map(SharedRuntimeModel::get);
         let primary = runtime
             .as_ref()
@@ -173,70 +166,14 @@ impl ResumeReplayHandle {
             self.compact_custom_instructions.as_deref(),
             manual_instructions,
         );
-
-        let mut compacted = None;
-        let mut last_error = None;
-        for provider in [primary, fallback].into_iter().flatten() {
-            match rebon_api::compact_with_retry(
-                provider.as_ref(),
-                &messages,
-                None,
-                MANUAL_COMPACT_PROTECTED_TURNS,
-                instructions.as_deref(),
-                &self.compact_summary_options,
-            )
-            .await
-            {
-                Ok((result, _)) if !result.messages.is_empty() => {
-                    compacted = Some(result.messages);
-                    break;
-                }
-                Ok(_) => last_error = Some("compact provider returned no messages".to_string()),
-                Err(err) => last_error = Some(err.to_string()),
-            }
-        }
-
-        let used_model = compacted.is_some();
-        let mut projection = match compacted {
-            Some(messages) => messages,
-            None => {
-                let truncated = rebon_api::auto_compact_truncate(
-                    messages.clone(),
-                    MANUAL_COMPACT_PROTECTED_TURNS,
-                );
-                if truncated.len() >= messages.len() {
-                    return Err(format!(
-                        "Unable to compact this session: {}",
-                        last_error.unwrap_or_else(|| {
-                            "no compact provider is configured for this model".to_string()
-                        })
-                    ));
-                }
-                tracing::warn!(
-                    error = last_error.as_deref().unwrap_or("no provider"),
-                    "compact_now: model-based compaction unavailable, truncated instead"
-                );
-                truncated
-            }
-        };
-        rebon_api::ensure_tool_result_pairing(&mut projection);
-
-        let report = manual_compact_report(
-            &messages,
-            &projection,
-            recent_transcript_files(entries),
-            used_model,
-        );
-        tracing::info!(
-            used_model = report.used_model,
-            messages_before = report.messages_before,
-            messages_after = report.messages_after,
-            tokens_before = report.tokens_before,
-            tokens_after = report.tokens_after,
-            "compact_now: manual compaction finished"
-        );
-        let prepared = ReplayWindowStore::prepare_resume_summary(entries, projection)?;
-        Ok((prepared, report))
+        summarise_into_baseline(
+            entries,
+            &transcript_to_api_messages(entries),
+            [primary, fallback],
+            instructions.as_deref(),
+            &self.compact_summary_options,
+        )
+        .await
     }
 
     pub fn install_summary(&self, session_id: String, prepared: PreparedResumeSummary) {
@@ -3981,6 +3918,124 @@ struct TurnRequest {
 }
 
 impl EngineQueryExecutor {
+    /// Before phase 8 cuts the replay to budget: a replay the auto-compact
+    /// threshold says is too long is summarised, and the summary kept as the
+    /// session's baseline the way `/compact` keeps one, so the turns after
+    /// this one replay the summary plus what came after it.
+    ///
+    /// A compaction inside a turn lives only in that turn's memory, and the
+    /// next turn replays the whole transcript again. That replay used to be
+    /// cut to the threshold by fixed rules — no summary, no notice — and the
+    /// pre-turn check then found nothing left to compact, so a compaction
+    /// never outlasted the turn it ran in. The cut stays behind this for a
+    /// summary that cannot be made.
+    ///
+    /// How long the replay is: the local estimate, or what the provider
+    /// measured for the requests the replay carries again, whichever is
+    /// more — the estimate reads CJK text and code short.
+    async fn compact_oversized_replay(
+        &self,
+        frame: &TurnFrame,
+        history: Vec<ApiMessage>,
+    ) -> Vec<ApiMessage> {
+        let Some(handle) = frame.prune_level.as_ref() else {
+            return history;
+        };
+        // The row the replay ends on: what a baseline is anchored to. The
+        // turn's own prompt is written after this, so it follows the anchor.
+        let Some(anchor) = frame.prior_tail_uuid.as_deref() else {
+            return history;
+        };
+        let estimated =
+            estimate_messages_input_tokens(frame.prompt.effective_system.as_deref(), &history);
+        let measured = self
+            .replay_windows
+            .measured_context_tokens(&frame.session_id)
+            .unwrap_or(0);
+        if !handle
+            .budget
+            .should_auto_compact_for_tokens(estimated.max(measured))
+        {
+            return history;
+        }
+        let path =
+            rebon_session::transcript_file_path(&self.projects_root, &frame.cwd, &frame.session_id);
+        let entries = match rebon_session::load_transcript_from_file(&path) {
+            Ok(Some(loaded)) => loaded.messages,
+            Ok(None) => return history,
+            Err(error) => {
+                tracing::warn!(%error, session_id = %frame.session_id, "replay compaction could not read the transcript");
+                return history;
+            }
+        };
+        let Some(end) = entries.iter().position(|entry| entry.uuid == anchor) else {
+            return history;
+        };
+        tracing::info!(
+            session_id = %frame.session_id,
+            estimated,
+            measured,
+            threshold = handle.budget.auto_compact_threshold(),
+            "replay over the auto-compact threshold; summarising it into a baseline"
+        );
+        let publisher = frame.update_publisher.as_ref();
+        if let Some(publisher) = publisher {
+            publisher
+                .publish_to(
+                    &frame.session_id,
+                    SessionUpdate::CompactingStarted {
+                        messages_before: history.len(),
+                    },
+                )
+                .await;
+        }
+        let instructions = compact_custom_instructions_for_request(
+            self.compact_custom_instructions.as_deref(),
+            None,
+        );
+        let result = summarise_into_baseline(
+            &entries[..=end],
+            &history,
+            [
+                frame.compact_provider.clone(),
+                frame.compact_fallback_provider.clone(),
+            ],
+            instructions.as_deref(),
+            &self.compact_summary_options,
+        )
+        .await;
+        let (history, used_model) = match result {
+            Ok((prepared, report)) => {
+                let projection = prepared.projection.clone();
+                self.replay_windows.install_persistent_resume_summary(
+                    &self.projects_root,
+                    &frame.cwd,
+                    frame.session_id.clone(),
+                    prepared,
+                );
+                handle.budget.record_compact_success();
+                (projection, report.used_model)
+            }
+            Err(error) => {
+                tracing::warn!(%error, session_id = %frame.session_id, "replay compaction failed; the replay is cut to budget instead");
+                handle.budget.record_compact_failure();
+                (history, false)
+            }
+        };
+        if let Some(publisher) = publisher {
+            publisher
+                .publish_to(
+                    &frame.session_id,
+                    SessionUpdate::CompactingDone {
+                        messages_after: history.len(),
+                        used_model,
+                    },
+                )
+                .await;
+        }
+        history
+    }
+
     /// Phase 8 of `execute`: assemble the request out of everything the turn
     /// settled, and build the context its tools will run in.
     ///
@@ -4037,6 +4092,7 @@ impl EngineQueryExecutor {
                 max_tokens: configured_max_tokens,
             }
         });
+        history = self.compact_oversized_replay(frame, history).await;
         history = truncate_replay_window_for_budget(
             &frame.session_id,
             frame.prompt.effective_system.as_deref(),

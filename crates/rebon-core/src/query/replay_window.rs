@@ -31,6 +31,9 @@ pub(super) struct ReplayWindow {
     title_conversation_text: Option<String>,
     has_anchored_minimal_anchor: bool,
     has_assistant_turn: bool,
+    /// How long the context the projection replays measured, as the
+    /// provider counted it ([`measured_context_tokens`]).
+    measured_context_tokens: Option<u32>,
     /// The model this projection kept encrypted reasoning for; a turn on any
     /// other model rebuilds rather than reuse it.
     reasoning_model: Option<String>,
@@ -63,6 +66,7 @@ impl ReplayWindow {
             title_conversation_text,
             has_anchored_minimal_anchor,
             has_assistant_turn,
+            measured_context_tokens: None,
             reasoning_model: None,
             projection,
         }
@@ -149,6 +153,35 @@ fn write_compact_baseline(
     })
     .map_err(std::io::Error::other)?;
     rebon_session::write_file_atomically(path, &body)
+}
+
+/// The longest context a reply after the row `after` (every reply, without
+/// one) reports having been sent, as the provider counted it: its prompt,
+/// cache included, plus what it wrote. A replay holds at least that much,
+/// since everything those requests carried is in it again — even when one
+/// was sent after an in-turn compaction, the requests before it were not.
+/// Replies before `after` are left out: a baseline summarises them.
+pub(super) fn measured_context_tokens(
+    raw: &[rebon_session::TranscriptEntry],
+    after: Option<&str>,
+) -> Option<u32> {
+    let start = after
+        .and_then(|uuid| raw.iter().position(|entry| entry.uuid == uuid))
+        .map_or(0, |index| index + 1);
+    raw[start..]
+        .iter()
+        .filter(|entry| entry.entry_type == "assistant")
+        .filter_map(|entry| {
+            let usage: Usage =
+                serde_json::from_value(entry.raw.get("message")?.get("usage")?.clone()).ok()?;
+            Some(
+                usage
+                    .context_input_tokens()
+                    .saturating_add(usage.output_tokens),
+            )
+        })
+        .filter(|tokens| *tokens > 0)
+        .max()
 }
 
 fn read_compact_baseline(path: &std::path::Path) -> Option<PersistedResumeSummary> {
@@ -772,6 +805,28 @@ impl ReplayWindowStore {
             .is_some_and(|window| window.has_anchored_minimal_anchor)
     }
 
+    /// How long the context this session's replay holds measured last time
+    /// a provider counted it: the longest prompt sent since the history the
+    /// replay summarises, which the replay carries whole. `None` when no
+    /// reply since then reported its usage.
+    pub(super) fn measured_context_tokens(&self, session_id: &str) -> Option<u32> {
+        self.windows
+            .lock()
+            .expect("replay window store mutex poisoned")
+            .windows
+            .get(session_id)
+            .and_then(|window| window.measured_context_tokens)
+    }
+
+    /// The row the session's installed baseline is anchored on.
+    fn resume_anchor_uuid(&self, session_id: &str) -> Option<String> {
+        self.resume_summaries
+            .lock()
+            .expect("resume summary store mutex poisoned")
+            .get(session_id)
+            .map(|baseline| baseline.anchor_uuid.clone())
+    }
+
     pub(super) fn has_assistant_turn(&self, session_id: &str) -> bool {
         self.windows
             .lock()
@@ -918,20 +973,21 @@ impl ReplayWindowStore {
             let canonical_has_anchored_minimal_anchor =
                 history_has_anchored_minimal_anchor(&canonical);
             let canonical_has_assistant_turn = history_has_assistant_turn(&canonical);
-            let normalized = match self.project_resume_summary_for_model(
+            let (normalized, anchor_uuid) = match self.project_resume_summary_for_model(
                 projects_root,
                 &source.cwd,
                 session_id,
                 &raw,
                 reasoning_model,
             ) {
-                Ok(Some(projected)) => projected,
-                Ok(None) => canonical,
+                Ok(Some(projected)) => (projected, self.resume_anchor_uuid(session_id)),
+                Ok(None) => (canonical, None),
                 Err(message) => return Err(failed_replay(state, source, message)),
             };
             let mut window = ReplayWindow::from_normalized(&source, normalized);
             window.has_anchored_minimal_anchor = canonical_has_anchored_minimal_anchor;
             window.has_assistant_turn = canonical_has_assistant_turn;
+            window.measured_context_tokens = measured_context_tokens(&raw, anchor_uuid.as_deref());
             window.reasoning_model = reasoning_model.map(str::to_string);
             window.last_raw_uuid = last_raw_uuid.clone();
             let rendered = window.render();
