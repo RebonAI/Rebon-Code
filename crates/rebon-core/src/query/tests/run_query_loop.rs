@@ -1701,3 +1701,49 @@ async fn run_query_poller_not_called_when_first_iteration_ends_turn() {
         .any(|e| matches!(e, QueryEvent::AttachmentInjected { .. })));
     assert_eq!(poller.calls.lock().unwrap().len(), 0);
 }
+
+/// An Anthropic reply counts only what came after its cache breakpoint in
+/// `input_tokens`; the context it describes is that plus the cached prefix.
+/// Read as `input_tokens` alone, a cached 240k context looked like 50
+/// tokens and auto-compaction never came due.
+#[tokio::test]
+async fn a_cached_prefix_counts_toward_the_context_budget() {
+    let tool = Arc::new(RecordingTool::new("Read", json!({"contents": "hi"})));
+    let engine = build_engine_with(tool as Arc<dyn Tool>);
+
+    let mut turn = text_turn("msg_1", "ok");
+    turn[0] = StreamEvent::MessageStart {
+        message_id: "msg_1".into(),
+        model: "mock".into(),
+        usage: Usage {
+            input_tokens: 50,
+            cache_read_input_tokens: 240_000,
+            cache_creation_input_tokens: 1_200,
+            ..Default::default()
+        },
+    };
+    let mock = MockModelClient::new();
+    mock.push_turn(turn);
+    let client: Arc<dyn ModelClient> = Arc::new(mock);
+    let handle = PruneLevelHandle::with_context_window(PruneLevel::Conservative, 200_000);
+    let params = QueryParams {
+        max_tokens: 4_096,
+        prune_level: Some(handle.clone()),
+        ..QueryParams::new("mock", vec![ApiMessage::user_text("go on")])
+    };
+
+    let mut rx = run_query(
+        engine,
+        SessionHandle::new(client),
+        params,
+        ToolContext::new().with_cwd("/tmp/repo"),
+        CancelToken::new(),
+    );
+    let events = drain(&mut rx).await;
+
+    assert!(matches!(events.last(), Some(QueryEvent::Done { .. })));
+    assert_eq!(handle.budget.last_input_tokens(), 241_250);
+    assert!(handle
+        .budget
+        .should_auto_compact_for_tokens(handle.budget.last_input_tokens()));
+}

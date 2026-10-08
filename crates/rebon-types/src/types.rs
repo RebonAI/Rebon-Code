@@ -174,7 +174,16 @@ impl Usage {
         if self.total_input_tokens > 0 {
             return self.total_input_tokens;
         }
+        self.context_input_tokens()
+    }
 
+    /// How long the prompt of this one request was: what the context window
+    /// held. An OpenAI-shaped count already includes its cached prefix; an
+    /// Anthropic-shaped `input_tokens` is only what came after the last
+    /// cache breakpoint, so its cache reads and writes are added back. Not
+    /// the iteration totals a server-side compaction reports, which add up
+    /// several prompts.
+    pub fn context_input_tokens(&self) -> u32 {
         if self.prompt_cache_hit_tokens > 0 || self.prompt_cache_miss_tokens > 0 {
             if self.input_tokens > 0 {
                 self.input_tokens
@@ -533,6 +542,50 @@ mod usage_tests {
         };
 
         assert_eq!(usage.billed_input_tokens(), 110);
+    }
+
+    #[test]
+    fn the_context_counts_an_anthropic_cached_prefix() {
+        let usage: Usage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 50,
+            "cache_read_input_tokens": 240_000,
+            "cache_creation_input_tokens": 1_200,
+            "output_tokens": 10
+        }))
+        .unwrap();
+        assert_eq!(usage.context_input_tokens(), 241_250);
+    }
+
+    #[test]
+    fn the_context_does_not_count_an_openai_cached_prefix_twice() {
+        let usage: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1_000,
+            "prompt_tokens_details": {"cached_tokens": 900},
+            "completion_tokens": 10
+        }))
+        .unwrap();
+        assert_eq!(usage.context_input_tokens(), 1_000);
+        let deepseek = Usage {
+            prompt_cache_miss_tokens: 20,
+            prompt_cache_hit_tokens: 80,
+            ..Default::default()
+        };
+        assert_eq!(deepseek.context_input_tokens(), 100);
+    }
+
+    #[test]
+    fn the_context_is_the_last_prompt_not_a_server_compactions_total() {
+        let usage: Usage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 23_000,
+            "output_tokens": 1_000,
+            "iterations": [
+                {"type": "compaction", "input_tokens": 180_000, "output_tokens": 3_500},
+                {"type": "message", "input_tokens": 23_000, "output_tokens": 1_000}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(usage.context_input_tokens(), 23_000);
+        assert_eq!(usage.billed_input_tokens(), 203_000);
     }
 }
 

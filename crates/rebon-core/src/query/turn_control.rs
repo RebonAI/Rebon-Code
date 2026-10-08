@@ -739,7 +739,7 @@ async fn settle_stop_reason(
                 &mut terminal.continuations_remaining,
             );
             // Usage precedes the terminal phase's writebacks.
-            manager.set_usage_baseline(message.usage.input_tokens);
+            manager.set_usage_baseline(message.usage.context_input_tokens());
             commit_turn_hook_writeback(manager, context, tx, iteration + 1, applied);
             return StopReasonFlow::NextIteration;
         }
@@ -763,7 +763,7 @@ async fn settle_stop_reason(
                     1,
                     &mut terminal.continuations_remaining,
                 );
-                manager.set_usage_baseline(message.usage.input_tokens);
+                manager.set_usage_baseline(message.usage.context_input_tokens());
                 manager.push_message(ApiMessage {
                     role: Role::Assistant,
                     content: message.content.clone(),
@@ -826,7 +826,7 @@ async fn settle_stream_outcome(
     let mut message = accumulator.finish();
     (*total_usage).merge(&message.usage);
     if let Some(handle) = &params.prune_level {
-        handle.report_usage(message.usage.input_tokens);
+        handle.report_usage(message.usage.context_input_tokens());
     }
     tx.emit_cache_trace(&CacheTraceEvent::RequestUsage {
         model: &params.model,
@@ -899,7 +899,7 @@ async fn settle_stream_outcome(
                 Some(pending) => merge_continued_content(pending, message.content.clone()),
                 None => message.content.clone(),
             });
-            manager.set_usage_baseline(message.usage.input_tokens);
+            manager.set_usage_baseline(message.usage.context_input_tokens());
             manager.push_message(ApiMessage {
                 role: Role::Assistant,
                 content: message.content.clone(),
@@ -1765,7 +1765,7 @@ impl TurnControlPlugin {
 
             // Append the assistant message to history before dispatching
             // the tool calls, preserving QueryEngine behavior.
-            manager.set_usage_baseline(message.usage.input_tokens);
+            manager.set_usage_baseline(message.usage.context_input_tokens());
             manager.push_message(ApiMessage {
                 role: Role::Assistant,
                 content: message.content.clone(),
