@@ -3455,6 +3455,7 @@ dependencies = [
  "clap",
  "fs2",
  "rebon-group",
+ "rebon-permission-relay",
  "rebon-proto",
  "rebon-session",
  "rebon-session-host",
@@ -3491,6 +3492,16 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "rebon-permission-relay"
+version = "1.9.2"
+dependencies = [
+ "rebon-session",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

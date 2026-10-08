@@ -109,6 +109,44 @@ pub struct HookArgs {
     pub agent: String,
 }
 
+/// `rebon permission …`: an agent CLI's permission requests, asked in the
+/// Rebon app that runs it.
+#[derive(Debug, clap::Subcommand, PartialEq, Eq)]
+pub enum PermissionCommand {
+    /// Hand a permission request to the Rebon app and print its answer.
+    ///
+    /// Run by Claude Code or Codex as their PermissionRequest hook, which the
+    /// app adds when it starts one, with the request as JSON on stdin. It
+    /// waits for the user's answer in the app and prints allow or deny; it
+    /// prints nothing — and the CLI asks on its own screen — when the app is
+    /// not there to ask, the user turns to the terminal, or anything fails.
+    Hook(HookArgs),
+}
+
+/// Run a `rebon permission` subcommand.
+pub fn run_permission(command: PermissionCommand) -> anyhow::Result<()> {
+    match command {
+        PermissionCommand::Hook(args) => {
+            use std::io::Read;
+            let mut input = String::new();
+            if std::io::stdin().read_to_string(&mut input).is_err() {
+                return Ok(());
+            }
+            let output = rebon_permission_relay::run_hook(
+                &args.agent,
+                &input,
+                |name| std::env::var(name).ok(),
+                // Unknown counts as there: the wait has a deadline anyway.
+                |pid| rebon_session_host::process_is_running(pid) != Some(false),
+            );
+            if let Some(output) = output {
+                println!("{output}");
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Run a `rebon group` subcommand.
 pub fn run_group(command: GroupCommand) -> anyhow::Result<()> {
     match command {

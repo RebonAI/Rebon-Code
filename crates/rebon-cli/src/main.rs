@@ -364,6 +364,14 @@ enum Command {
         #[command(subcommand)]
         command: rebon_mcp_channel::cli::GroupCommand,
     },
+    /// Permission requests from Claude Code or Codex running in the Rebon
+    /// app: `rebon permission hook` is their PermissionRequest hook, and asks
+    /// the user in the app.
+    #[command(hide = true)]
+    Permission {
+        #[command(subcommand)]
+        command: rebon_mcp_channel::cli::PermissionCommand,
+    },
     /// Remote Control: serve this machine's Rebon sessions to an RC server.
     ///
     /// `rebon rc login` binds the machine, `rebon rc serve` registers it and
@@ -1181,6 +1189,7 @@ async fn run_headless_command(command: Command) -> anyhow::Result<()> {
             .await
         }
         Command::Group { command } => rebon_mcp_channel::cli::run_group(command),
+        Command::Permission { command } => rebon_mcp_channel::cli::run_permission(command),
         Command::BrowserMcp { args } => {
             sibling_command::forward_to_sibling("browser-mcp", BROWSER_MCP_SIBLING, args)
         }

@@ -257,7 +257,7 @@ jobs:
           -p rebon-session-state -p rebon-kernel
           -p rebon-kernel-seats -p rebon-provider -p rebon-plugin-host
           -p rebon-instructions -p rebon-session -p rebon-session-host -p rebon-session-runtime
-          -p rebon-mcp-channel -p rebon-rc-runner
+          -p rebon-mcp-channel -p rebon-permission-relay -p rebon-rc-runner
           -p rebon-command-seat -p rebon-dialog -p rebon-tui
           -p rebon-render -p rebon-message-tui
           -p rebon-plugin-cron -p rebon-plugin-web -p rebon-plugin-monitor

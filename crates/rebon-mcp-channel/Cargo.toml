@@ -25,6 +25,7 @@ rebon-tools-core.workspace = true
 rebon-types.workspace = true
 # The agent-group tools and the store behind them (RFC-0009).
 rebon-group.workspace = true
+rebon-permission-relay.workspace = true
 
 anyhow.workspace = true
 clap.workspace = true

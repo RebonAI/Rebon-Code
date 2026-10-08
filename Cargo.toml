@@ -67,6 +67,7 @@ members = [
     "crates/rebon-width",
     "crates/rebon-group",
     "crates/rebon-mcp-channel",
+    "crates/rebon-permission-relay",
     "crates/rebon-schema-gen",
     "crates/plugins/monitor",
     "crates/plugins/notebook",
@@ -172,6 +173,7 @@ rebon-session-state = { path = "crates/rebon-session-state" }
 rebon-session-host = { path = "crates/rebon-session-host" }
 rebon-session-runtime = { path = "crates/rebon-session-runtime" }
 rebon-group = { path = "crates/rebon-group" }
+rebon-permission-relay = { path = "crates/rebon-permission-relay" }
 rebon-mcp-channel = { path = "crates/rebon-mcp-channel" }
 rebon-config = { path = "crates/rebon-config" }
 rebon-harness = { path = "crates/rebon-harness" }
