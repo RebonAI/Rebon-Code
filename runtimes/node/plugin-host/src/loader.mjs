@@ -13,7 +13,22 @@
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { ProtocolError } from './protocol.mjs';
-import { pluginCommandDefinition, pluginToolDefinition, validateName } from './methods.mjs';
+import { pluginAdapter, pluginCommandDefinition, pluginToolDefinition, validateName } from './methods.mjs';
+
+export class UnsupportedAdapter extends ProtocolError {
+  constructor(adapter) {
+    super('[UNSUPPORTED_ADAPTER]', `unsupported plugin adapter ${JSON.stringify(adapter.id)} revision ${adapter.revision}`);
+    this.name = 'UnsupportedAdapter';
+  }
+}
+
+/// Checks the adapter this loader can execute, before importing any plugin code.
+/// Other ecosystems are selected by the composition loader, not by this host.
+export function requireAdapter(input, id) {
+  const adapter = pluginAdapter(input);
+  if (adapter.id !== id || adapter.revision !== 1) throw new UnsupportedAdapter(adapter);
+  return adapter;
+}
 
 /// Resolves an entry against its package root and refuses anything outside it.
 ///
@@ -161,6 +176,7 @@ class Registrar {
 /// `importModule` is injectable so the loader's rules can be tested without a
 /// file on disk for every case.
 export async function loadPlugin(request, importModule = (url) => import(url)) {
+  requireAdapter(request.adapter, 'native');
   const url = resolveEntry(request.root, request.entry);
   let module;
   try {

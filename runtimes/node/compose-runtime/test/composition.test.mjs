@@ -11,6 +11,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { loadCompose, loadEntry, openScope, plainly, startHost } from './harness.mjs';
+import { createLoader } from '../src/loader.mjs';
+import { loadPlugin } from '../../plugin-host/src/loader.mjs';
 
 /// Writes a small Cordis plugin package and returns its load coordinates.
 function cordisPackage(body) {
@@ -18,6 +20,108 @@ function cordisPackage(body) {
   fs.writeFileSync(path.join(root, 'entry.mjs'), body);
   return { root: root.replace(/\\/g, '/'), entry: 'entry.mjs' };
 }
+
+test('composition rejects missing, unknown and future adapters before top-level effects', async (t) => {
+  const pkg = cordisPackage(`import fs from 'node:fs'; fs.writeFileSync(new URL('imported', import.meta.url), 'ran'); export function activate() {}`);
+  t.after(() => fs.rmSync(pkg.root, { recursive: true, force: true }));
+  const loader = await createLoader({ next: loadPlugin });
+  const adapters = [undefined, { id: 'unknown', revision: 1 }, { id: 'Native', revision: 1 }];
+  for (const id of ['native', 'cordis', 'claude-mods', 'legacy-1.9']) {
+    adapters.push({ id, revision: 0 }, { id, revision: 2 });
+  }
+  for (const adapter of adapters) {
+    await assert.rejects(loader.load({ pluginId: 'refused', ...pkg, adapter }), {
+      code: adapter === undefined ? '[WRONG_SHAPE]' : '[UNSUPPORTED_ADAPTER]',
+    });
+    assert.equal(fs.existsSync(path.join(pkg.root, 'imported')), false);
+  }
+});
+
+test('explicit adapters choose one ecosystem even when a module exports both', async (t) => {
+  const kit = await startHost();
+  t.after(() => kit.stop());
+  await loadCompose(kit);
+  const mixed = `
+    export const inject = ['systemPrompt'];
+    export function activate(api) { api.service('native-only', () => 'native'); }
+    export function apply(ctx) { ctx.systemPrompt.section({ name: 'cordis-only', order: 1, text: 'cordis' }); }
+  `;
+  for (const id of ['native', 'cordis']) {
+    const pkg = cordisPackage(mixed);
+    t.after(() => fs.rmSync(pkg.root, { recursive: true, force: true }));
+    const load = await loadEntry(kit, { id, ...pkg, adapter: { id, revision: 1 }, services: id === 'native' ? ['native-only'] : [] });
+    assert.equal(load.status, 'success', JSON.stringify(load.payload));
+    assert.deepEqual(plainly(load.payload.services), id === 'native' ? ['native-only'] : []);
+  }
+  await openScope(kit, 'rebon:compose');
+  const report = await kit.scoped('rebon:compose', 'service/call', { service: 'compose', request: { kind: 'report', pluginId: 'cordis' } });
+  assert.deepEqual(plainly(report.terminal.payload.sections), [{ name: 'cordis-only', order: 1, text: 'cordis' }]);
+});
+
+test('explicit adapters never retry another ecosystem after missing or failing activation', async (t) => {
+  const kit = await startHost();
+  t.after(() => kit.stop());
+  await loadCompose(kit);
+  const cases = [
+    ['cordis', `export function activate() { mark(); }`, '[NOT_CORDIS]'],
+    ['native', `export function apply() { mark(); }`, '[NO_ACTIVATE]'],
+    ['native', `export function activate() { throw Error('native failed'); } export function apply() { mark(); }`, '[ACTIVATE_FAILED]'],
+    ['cordis', `export function activate() { mark(); } export function apply() { throw Error('cordis failed'); }`, null],
+  ];
+  for (const [index, [id, body, code]] of cases.entries()) {
+    const pkg = cordisPackage(`import fs from 'node:fs'; function mark() { fs.writeFileSync(new URL('crossed', import.meta.url), 'ran'); } ${body}`);
+    t.after(() => fs.rmSync(pkg.root, { recursive: true, force: true }));
+    const load = await loadEntry(kit, { id: `refuse-${index}`, ...pkg, adapter: { id, revision: 1 } });
+    assert.equal(load.status, 'error');
+    if (code) assert.equal(load.payload.code, code);
+    assert.equal(fs.existsSync(path.join(pkg.root, 'crossed')), false);
+  }
+});
+
+test('Cordis accepts its module apply, default object and default function forms', async (t) => {
+  const kit = await startHost();
+  t.after(() => kit.stop());
+  await loadCompose(kit);
+  for (const [i, body] of [
+    'export function apply() {}',
+    'export default { apply() {} };',
+    'export default function plugin() {}',
+  ].entries()) {
+    const pkg = cordisPackage(body);
+    t.after(() => fs.rmSync(pkg.root, { recursive: true, force: true }));
+    const load = await loadEntry(kit, { id: `form-${i}`, ...pkg, adapter: { id: 'cordis', revision: 1 } });
+    assert.equal(load.status, 'success', JSON.stringify(load.payload));
+  }
+});
+
+test('mods marker is configuration, not ecosystem selection, except in explicit legacy-1.9', async (t) => {
+  const pkg = cordisPackage(`export function register() {} export function activate(api) { api.service('native-only', () => true); }`);
+  t.after(() => fs.rmSync(pkg.root, { recursive: true, force: true }));
+  const loader = await createLoader({ next: loadPlugin });
+  for (const id of ['native', 'claude-mods', 'legacy-1.9']) {
+    const request = Object.freeze({ pluginId: id, ...pkg, adapter: Object.freeze({ id, revision: 1 }), services: ['native-only'], config: { $claudeMod: {} } });
+    const loaded = await loader.load(request);
+    assert.deepEqual([...loaded.services], id === 'native' ? ['native-only'] : ['mod']);
+    assert.equal(request.adapter.id, id);
+    if (id !== 'native') await loader.unload(id);
+  }
+});
+
+test('only explicit legacy-1.9 retains activate-first and Cordis default selection', async (t) => {
+  const kit = await startHost();
+  t.after(() => kit.stop());
+  await loadCompose(kit);
+  for (const [id, body, services] of [
+    ['mixed', `export function activate(api) { api.service('legacy-native', () => true); } export function apply() { throw Error('wrong ecosystem'); }`, ['legacy-native']],
+    ['default', `export default function plugin() {}`, []],
+  ]) {
+    const pkg = cordisPackage(body);
+    t.after(() => fs.rmSync(pkg.root, { recursive: true, force: true }));
+    const load = await loadEntry(kit, { id, ...pkg, adapter: { id: 'legacy-1.9', revision: 1 }, services });
+    assert.equal(load.status, 'success', JSON.stringify(load.payload));
+    assert.deepEqual(plainly(load.payload.services), services);
+  }
+});
 
 const TOOLBOX = `
 import { defineTool } from '@deepseek-ai/dsh-tools';

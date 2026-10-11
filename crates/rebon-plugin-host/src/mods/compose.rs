@@ -6,8 +6,8 @@
 //!   `.claude-plugin/plugin.json`), and `plugins` lists the name;
 //! * the folder sits under `<config_home>/mods/`, or a folder `REBON_MOD_DIRS`
 //!   or `CLAUDE_CODE_PLUGIN_DIRS` names — loaded under the manifest's own
-//!   name, with no configuration written, which is what makes dropping a
-//!   mod folder there enough;
+//!   name, with no configuration written, provided its manifest or install
+//!   record declares a supported compatibility contract;
 //! * `rebon plugin install <folder>` recorded it, with the manifest this
 //!   crate synthesised beside it, and an installed package is found by name
 //!   like any other.
@@ -83,7 +83,7 @@ pub fn mod_entry(
     all_tools: &[String],
 ) -> Result<ComposeEntry, String> {
     let mod_ = read_claude_mod(root)?;
-    Ok(entry_for_mod(id, &mod_, config_dir, extra, all_tools))
+    entry_for_mod(id, &mod_, config_dir, extra, all_tools)
 }
 
 pub fn entry_for_mod(
@@ -92,7 +92,9 @@ pub fn entry_for_mod(
     config_dir: &Path,
     extra: &Value,
     all_tools: &[String],
-) -> ComposeEntry {
+) -> Result<ComposeEntry, String> {
+    let compatibility = rebon_plugin_package::compatibility::resolve_mod(mod_, config_dir)
+        .map_err(|error| error.to_string())?;
     let manifest = kernel_manifest_for(mod_);
     let mut stored = stored_options(config_dir, &mod_.manifest.name).unwrap_or(Value::Null);
     if let (Some(into), Some(from)) = (stored.as_object_mut(), extra.as_object()) {
@@ -106,14 +108,18 @@ pub fn entry_for_mod(
     for warning in &mod_.scan.warnings {
         tracing::warn!(mod_ = %mod_.manifest.name, %warning, "mod scan");
     }
-    entry_for(
+    Ok(entry_for(
         &manifest,
         id,
         mod_.root.clone(),
         mod_.hooks_module.clone(),
         mod_config(mod_, options),
         all_tools,
-    )
+        rebon_plugin_protocol::PluginAdapter {
+            id: compatibility.adapter_id().into(),
+            revision: rebon_plugin_package::compatibility::ADAPTER_REVISION,
+        },
+    ))
 }
 
 /// Every mod folder this machine loads without being configured for it.
@@ -151,14 +157,13 @@ pub fn discovered_entries(
             ));
             continue;
         }
-        names.push(name.clone());
-        out.push(entry_for_mod(
-            &name,
-            &mod_,
-            config_dir,
-            &Value::Null,
-            all_tools,
-        ));
+        match entry_for_mod(&name, &mod_, config_dir, &Value::Null, all_tools) {
+            Ok(entry) => {
+                names.push(name);
+                out.push(entry);
+            }
+            Err(reason) => skipped.push(format!("{}: {reason}", plain_path(&root))),
+        }
     }
     out
 }
@@ -179,7 +184,7 @@ mod tests {
         std::fs::create_dir_all(root.join("hooks")).unwrap();
         std::fs::write(
             root.join(CLAUDE_PLUGIN_MANIFEST),
-            json!({ "name": name, "version": "0.1.0", "userConfig": { "prefix": { "type": "string", "default": "n=" } } }).to_string(),
+            json!({ "name": name, "version": "0.1.0", "rebon": {"format":"claude-mods","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-claude-mods-api","range":"^1"}]}, "userConfig": { "prefix": { "type": "string", "default": "n=" } } }).to_string(),
         )
         .unwrap();
         std::fs::write(
@@ -213,6 +218,135 @@ mod tests {
     }
 
     #[test]
+    fn a_mod_directory_needs_a_supported_contract_before_it_becomes_an_entry() {
+        for (case, message) in [
+            ("missing", "missing compatibility"),
+            ("format", "unsupported plugin format"),
+            ("sdk", "unsupported SDK"),
+            ("adapter", "unsupported adapter"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("mod");
+            write_mod(&root, "demo");
+            let path = root.join(CLAUDE_PLUGIN_MANIFEST);
+            let mut manifest: Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            match case {
+                "missing" => {
+                    manifest.as_object_mut().unwrap().remove("rebon");
+                }
+                "format" => manifest["rebon"]["formatVersion"] = json!(2),
+                "sdk" => manifest["rebon"]["sdk"][0]["range"] = json!("^2"),
+                "adapter" => manifest["rebon"]["adapterRevision"] = json!(2),
+                _ => unreachable!(),
+            }
+            std::fs::write(&path, manifest.to_string()).unwrap();
+            let error = mod_entry("demo", &root, &dir.path().join("config"), &Value::Null, &[])
+                .unwrap_err();
+            assert!(error.contains(message), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_marketplace_mod_uses_only_its_recorded_contract_and_unchanged_content() {
+        use rebon_plugin_package::marketplace::{
+            InstallKind, MarketplaceInstall, MarketplaceInstalls, ModCompatibilityRecord,
+        };
+        for (case, message) in [
+            ("current", None),
+            ("changed", Some("no longer match")),
+            ("legacy", None),
+            ("provenance", Some("provenance")),
+            ("identity", Some("runtime identity")),
+            ("elsewhere", Some("no installer record")),
+            ("future", Some("unsupported adapter")),
+            ("format", Some("unsupported plugin format")),
+            ("sdk", Some("unsupported SDK")),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("config");
+            let root = config.join("mods/demo");
+            write_mod(&root, "demo");
+            let path = root.join(CLAUDE_PLUGIN_MANIFEST);
+            let mut raw: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            raw.as_object_mut().unwrap().remove("rebon");
+            std::fs::write(&path, raw.to_string()).unwrap();
+            let mut mod_ = read_claude_mod(&root).unwrap();
+            mod_.declare_install_compatibility();
+            let mut install = MarketplaceInstall {
+                marketplace: "team".to_owned(),
+                plugin: "demo".to_owned(),
+                kind: InstallKind::Mod,
+                location: root.clone(),
+                version: None,
+                kernel_plugins: vec!["demo".to_owned()],
+                installed_at_ms: 1,
+                granted: Default::default(),
+                source_identity: Some(
+                    rebon_plugin_package::store::PluginSourceIdentity::Marketplace {
+                        catalog: rebon_plugin_package::marketplace::MarketplaceSource::Directory {
+                            path: dir.path().join("catalog"),
+                        },
+                        plugin: "demo".to_owned(),
+                        source: rebon_plugin_package::marketplace::PluginSource::Relative(
+                            "./mods/demo".to_owned(),
+                        ),
+                    },
+                ),
+                mod_compatibility: Some(ModCompatibilityRecord {
+                    manifest: rebon_plugin_package::plugin_manifest_for(&mod_),
+                    digest: rebon_plugin_package::integrity::compute_dir_digest(&root).unwrap(),
+                    first_seen: false,
+                }),
+            };
+            match case {
+                "changed" => std::fs::write(root.join("extra.js"), "changed").unwrap(),
+                "legacy" => install.mod_compatibility = None,
+                "provenance" => install.source_identity = None,
+                "identity" => install.kernel_plugins.clear(),
+                "elsewhere" => install.location = dir.path().to_path_buf(),
+                "future" | "format" | "sdk" => {
+                    let declaration = install
+                        .mod_compatibility
+                        .as_mut()
+                        .unwrap()
+                        .manifest
+                        .compatibility
+                        .as_mut()
+                        .unwrap();
+                    match case {
+                        "future" => declaration.adapter_revision = 99,
+                        "format" => declaration.format = "rebon-plugin".to_owned(),
+                        "sdk" => declaration.sdk[0].range = "^2".to_owned(),
+                        _ => unreachable!(),
+                    }
+                }
+                "current" => {}
+                _ => unreachable!(),
+            }
+            let mut installs = MarketplaceInstalls::default();
+            installs.by_id.insert("demo@team".to_owned(), install);
+            installs.save(&config).unwrap();
+            let result = mod_entry("demo", &root, &config, &Value::Null, &[]);
+            if let Some(message) = message {
+                let error = result.unwrap_err();
+                assert!(error.contains(message), "{case}: {error}");
+            } else {
+                let entry = result.unwrap();
+                assert_eq!(
+                    entry.adapter.id,
+                    if case == "legacy" {
+                        "legacy-1.9"
+                    } else {
+                        "claude-mods"
+                    }
+                );
+                assert_eq!(entry.adapter.revision, 1);
+            }
+        }
+    }
+
+    #[test]
     fn a_mod_entry_carries_the_ceiling_the_marker_and_the_stored_options() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("tally");
@@ -233,6 +367,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(entry.id, "tally");
+        assert_eq!(entry.adapter.id, "claude-mods");
+        assert_eq!(entry.adapter.revision, 1);
         assert_eq!(entry.entry, "hooks/register.ts");
         assert_eq!(entry.services, vec!["mod"]);
         assert_eq!(entry.commands, vec!["hi"]);

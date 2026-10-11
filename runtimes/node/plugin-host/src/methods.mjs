@@ -180,12 +180,22 @@ function commandDefinitions(value, where) {
   return Object.freeze(out);
 }
 
+export function pluginAdapter(input) {
+  shape(input, ['id', 'revision'], [], 'plugin adapter');
+  const id = string(input.id, 'adapter.id');
+  if (!Number.isInteger(input.revision) || input.revision < 0 || input.revision > 0xffffffff) {
+    throw new ProtocolError('[WRONG_SHAPE]', 'adapter.revision must be a u32');
+  }
+  return Object.freeze({ id, revision: input.revision });
+}
+
 export function pluginLoadRequest(input) {
-  shape(input, ['pluginId', 'root', 'entry'], ['services', 'eventTopics', 'publishedTopics', 'llmProviders', 'tools', 'commands', 'invokableTools', 'seats', 'config'], 'plugin/load payload');
+  shape(input, ['pluginId', 'root', 'entry', 'adapter'], ['services', 'eventTopics', 'publishedTopics', 'llmProviders', 'tools', 'commands', 'invokableTools', 'seats', 'config'], 'plugin/load payload');
   return Object.freeze({
     pluginId: validatePluginId(string(input.pluginId, 'pluginId')),
     root: validateAbsolutePath('root', string(input.root, 'root')),
     entry: validateRelativePath('entry', string(input.entry, 'entry')),
+    adapter: pluginAdapter(input.adapter),
     services: declarations(input.services, 'service', 'services'),
     eventTopics: declarations(input.eventTopics, 'topic', 'eventTopics'),
     // What it may publish, as opposed to what it listens to. Two powers, two

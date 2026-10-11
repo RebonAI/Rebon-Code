@@ -16,6 +16,7 @@ const marker = {
 
 const request = (over = {}) => ({
   pluginId: 'counter',
+  adapter: { id: 'claude-mods', revision: 1 },
   root: fixture,
   entry: 'hooks/register.tsx',
   services: ['mod'],
@@ -60,13 +61,14 @@ async function loadCounter() {
   return { loader, sealed };
 }
 
-test('a request without the marker is handed to the next loader', async () => {
-  let handed;
-  const loader = await createLoader({ next: async (req) => { handed = req; return 'from-next'; } });
-  const plain = { pluginId: 'other', root: fixture, entry: 'x.mjs', config: null };
+test('the mods loader refuses other ecosystems and missing config without falling back', async () => {
+  const loader = await createLoader({ next: async () => assert.fail('must not fall back') });
+  for (const adapter of [{ id: 'native', revision: 1 }, { id: 'cordis', revision: 1 }, { id: 'unknown', revision: 1 }, { id: 'claude-mods', revision: 2 }]) {
+    await assert.rejects(loader.load(request({ adapter })), { code: '[UNSUPPORTED_ADAPTER]' });
+  }
+  const plain = request({ config: null });
   assert.ok(!isModRequest(plain));
-  assert.equal(await loader.load(plain), 'from-next');
-  assert.equal(handed, plain);
+  await assert.rejects(loader.load(plain), { code: '[WRONG_SHAPE]' });
   assert.equal(await loader.unload('other'), false);
 });
 

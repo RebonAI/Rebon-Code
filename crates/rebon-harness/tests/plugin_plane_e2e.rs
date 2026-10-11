@@ -225,6 +225,10 @@ fn payload_entry(id: &str, module: &str, config: Value) -> ComposeEntry {
         id: id.to_owned(),
         root: plain(&repo().join("runtimes/node/compose-runtime/payload")),
         entry: module.to_owned(),
+        adapter: rebon_plugin_protocol::PluginAdapter {
+            id: "cordis".into(),
+            revision: 1,
+        },
         config,
         ..ComposeEntry::default()
     }
@@ -542,7 +546,7 @@ async fn the_marketplaces_dsh_packages_load_and_register_their_tools() {
             return;
         };
         let package = repo().join("marketplace/plugins").join(id);
-        let (declared_as, manifest) = read_package_manifest(&package.join(module))
+        let (declared_as, manifest, compatibility) = read_package_manifest(&package.join(module))
             .expect("the package declares a kernel plugin");
         assert_eq!(declared_as, id);
         let raw: Value = serde_json::from_slice(
@@ -562,6 +566,10 @@ async fn the_marketplaces_dsh_packages_load_and_register_their_tools() {
             manifest.entry.clone().expect("an entry module"),
             config,
             &["WebSearch".to_string(), "WebFetch".to_string()],
+            rebon_plugin_protocol::PluginAdapter {
+                id: compatibility.adapter_id().into(),
+                revision: rebon_plugin_package::compatibility::ADAPTER_REVISION,
+            },
         );
         fixture
             .plane
@@ -1283,11 +1291,15 @@ async fn the_example_package_registers_its_command() {
     };
 
     let module = repo().join("runtimes/node/plugins/examples/hello-command/plugin.mjs");
-    let (declared_as, manifest) =
+    let (declared_as, manifest, compatibility) =
         read_package_manifest(&module).expect("the example package declares a kernel plugin");
     assert_eq!(declared_as, "hello-command");
     let entry = ComposeEntry {
         id: declared_as,
+        adapter: rebon_plugin_protocol::PluginAdapter {
+            id: compatibility.adapter_id().into(),
+            revision: rebon_plugin_package::compatibility::ADAPTER_REVISION,
+        },
         root: plain(module.parent().expect("the package directory")),
         entry: manifest
             .entry
@@ -1426,6 +1438,10 @@ fn probe_entry(id: &str, tool: &str, container: Option<ContainerSpec>) -> Compos
         id: id.into(),
         root: plain(&root),
         entry: "probe.mjs".into(),
+        adapter: rebon_plugin_protocol::PluginAdapter {
+            id: "cordis".into(),
+            revision: 1,
+        },
         config: serde_json::json!({ "tool": tool }),
         tools: vec![tool.into()],
         container,
@@ -1705,6 +1721,10 @@ async fn a_dsh_plugin_s_commands_are_rebon_commands_that_answer_in_place() {
         id: "dsh-commands".into(),
         root: plain(&package),
         entry: "commands.mjs".into(),
+        adapter: rebon_plugin_protocol::PluginAdapter {
+            id: "cordis".into(),
+            revision: 1,
+        },
         commands: vec!["greet".into(), "refuse".into()],
         container: Some(ContainerSpec {
             id: "commands-box".into(),

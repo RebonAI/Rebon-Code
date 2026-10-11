@@ -29,6 +29,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context};
+use rebon_harness::rebon_plugin_package::compatibility::{
+    host_sdk_versions, npm_sdk_requirements, CompatibilityDeclaration, PluginFormat,
+    ADAPTER_REVISION, FORMAT_VERSION,
+};
 use rebon_harness::rebon_plugin_package::container::ContainerRequest;
 use serde_json::{json, Value};
 
@@ -319,6 +323,11 @@ pub fn skills_manifest(package: &Value, roots: &[String]) -> anyhow::Result<Valu
         "version": package.get("version").and_then(Value::as_str).unwrap_or("0.0.0"),
         "description": package.get("description").cloned().unwrap_or(Value::Null),
         "capabilities": { "skills": roots },
+        "compatibility": {
+            "format": "rebon-plugin", "formatVersion": FORMAT_VERSION,
+            "adapterRevision": ADAPTER_REVISION,
+            "sdk": [{"name": "rebon-plugin-api", "range": "^1"}]
+        },
         "metadata": {
             "upstream": package.get("name").cloned().unwrap_or(Value::Null),
             "upstreamVersion": package.get("version").cloned().unwrap_or(Value::Null),
@@ -390,6 +399,10 @@ pub fn adapt_with(
     )
     .with_context(|| format!("{} is not JSON", package_path.display()))?;
     let id = plugin_id_of(&package)?;
+    let declared = package
+        .get("rebon")
+        .map(|value| CompatibilityDeclaration::read(&id, Some(value), PluginFormat::DshNpm))
+        .transpose()?;
     let skills = skill_roots(dir);
     if !skills.is_empty() {
         std::fs::write(
@@ -404,7 +417,19 @@ pub fn adapt_with(
         });
     }
     let provided = provided_modules(compose_root)?;
-    let slim = slim_package(&package, &provided);
+    let mut compatibility = declared.unwrap_or_else(|| CompatibilityDeclaration {
+        format: PluginFormat::DshNpm.name().to_owned(),
+        format_version: FORMAT_VERSION,
+        adapter_revision: ADAPTER_REVISION,
+        sdk: Vec::new(),
+        dsh_snapshot: None,
+    });
+    compatibility
+        .sdk
+        .extend(npm_sdk_requirements(&id, &package, &provided)?);
+    compatibility.validate_sdk(&id, &host_sdk_versions())?;
+    let mut slim = slim_package(&package, &provided);
+    slim["rebon"] = serde_json::to_value(&compatibility)?;
     std::fs::write(&package_path, serde_json::to_vec_pretty(&slim)?)?;
 
     let has_dependencies = slim
@@ -419,6 +444,7 @@ pub fn adapt_with(
                 "--omit=dev",
                 "--legacy-peer-deps",
                 "--ignore-scripts",
+                "--no-bin-links",
                 "--no-audit",
                 "--no-fund",
                 "--no-package-lock",
@@ -493,7 +519,8 @@ pub fn adapt_with(
     if fetches_any_url(&answer) {
         request.network = vec![rebon_harness::rebon_plugin_package::container::ANY_HOST.to_owned()];
     }
-    let manifest = manifest_for(&package, &answer, &request, config)?;
+    let mut manifest = manifest_for(&package, &answer, &request, config)?;
+    manifest["compatibility"] = serde_json::to_value(compatibility)?;
     std::fs::write(
         dir.join("rebon-plugin.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -657,6 +684,148 @@ mod tests {
         assert!(
             parsed.capabilities.kernel_plugins.is_empty(),
             "nothing of it runs"
+        );
+    }
+
+    #[test]
+    fn incompatible_npm_packages_are_refused_before_writing_or_probing() {
+        use rebon_harness::rebon_plugin_package::compatibility::CompatibilityError;
+        let runtime =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtimes/node/compose-runtime");
+        for case in [
+            "unknown-sdk",
+            "incompatible-sdk",
+            "format",
+            "adapter",
+            "missing-sdk",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut package =
+                json!({"name":"@deepseek-ai/dsh-demo", "peerDependencies":{"cordis":"^4"}});
+            match case {
+                "unknown-sdk" => {
+                    package["peerDependencies"]["@deepseek-ai/dsh-session"] = json!("*")
+                }
+                "incompatible-sdk" => package["peerDependencies"]["cordis"] = json!("^4.0.0"),
+                "format" | "adapter" => {
+                    package["rebon"] =
+                        json!({"format":"dsh-npm","formatVersion":1,"adapterRevision":1,"sdk":[]});
+                    package["rebon"][if case == "format" {
+                        "formatVersion"
+                    } else {
+                        "adapterRevision"
+                    }] = json!(2);
+                }
+                "missing-sdk" => {
+                    package.as_object_mut().unwrap().remove("peerDependencies");
+                }
+                _ => unreachable!(),
+            }
+            let original = serde_json::to_vec(&package).unwrap();
+            std::fs::write(dir.path().join("package.json"), &original).unwrap();
+            let error = adapt_with(dir.path(), None, &dir.path().join("missing-node"), &runtime)
+                .unwrap_err();
+            let structured = error
+                .downcast_ref::<CompatibilityError>()
+                .expect("compatibility is checked before starting Node or npm");
+            assert!(matches!(
+                (case, structured),
+                (
+                    "unknown-sdk" | "incompatible-sdk",
+                    CompatibilityError::UnsupportedSdk { .. }
+                ) | ("format", CompatibilityError::UnsupportedFormat { .. })
+                    | ("adapter", CompatibilityError::UnsupportedAdapter { .. })
+                    | (
+                        "missing-sdk",
+                        CompatibilityError::MissingCompatibility { .. }
+                    )
+            ));
+            assert_eq!(
+                std::fs::read(dir.path().join("package.json")).unwrap(),
+                original
+            );
+            assert!(!dir.path().join("rebon-plugin.json").exists());
+            assert!(!dir.path().join("node_modules").exists());
+        }
+    }
+
+    #[test]
+    fn a_cordis_package_preserves_sdk_evidence_after_the_probe() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("dsh-compatibility-probe");
+        let Some(node) = std::env::var_os("REBON_TEST_NODE").map(PathBuf::from) else {
+            assert!(
+                std::env::var_os("REBON_REQUIRE_TEST_NODE").is_none(),
+                "REBON_TEST_NODE must be set"
+            );
+            eprintln!("skipping: set REBON_TEST_NODE");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let runtime =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtimes/node/compose-runtime");
+        std::fs::write(dir.path().join("package.json"), json!({
+            "name":"@deepseek-ai/dsh-demo", "version":"1.0.0", "type":"module", "main":"index.mjs",
+            "peerDependencies":{"cordis":"^4"}
+        }).to_string()).unwrap();
+        std::fs::write(
+            dir.path().join("index.mjs"),
+            "export function apply(ctx) {}\n",
+        )
+        .unwrap();
+        let adapted = adapt_with(dir.path(), None, &node, &runtime).unwrap();
+        assert_eq!(adapted.plugin_id, "dsh-demo");
+        let slim: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("package.json")).unwrap())
+                .unwrap();
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("rebon-plugin.json")).unwrap())
+                .unwrap();
+        assert!(slim.get("peerDependencies").is_none());
+        assert_eq!(slim["rebon"], manifest["compatibility"]);
+        assert_eq!(
+            manifest["compatibility"]["sdk"],
+            json!([{"name":"cordis","range":"^4"}])
+        );
+        let parsed =
+            rebon_harness::rebon_plugin_package::PluginManifest::load_from_dir(dir.path()).unwrap();
+        assert_eq!(
+            rebon_harness::rebon_plugin_package::compatibility::resolve_package(
+                dir.path(),
+                &parsed,
+                None
+            )
+            .unwrap(),
+            rebon_harness::rebon_plugin_package::compatibility::LoadCompatibility::Current(
+                PluginFormat::DshNpm
+            )
+        );
+    }
+
+    #[test]
+    fn static_skills_use_the_material_format_without_starting_node() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("skills/demo")).unwrap();
+        std::fs::write(dir.path().join("skills/demo/SKILL.md"), "demo").unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            json!({"name":"@deepseek-ai/dsh-skills", "version":"1"}).to_string(),
+        )
+        .unwrap();
+        let absent = dir.path().join("missing");
+        let adapted = adapt_with(dir.path(), None, &absent, &absent).unwrap();
+        assert_eq!(adapted.skills, vec!["skills"]);
+        let parsed =
+            rebon_harness::rebon_plugin_package::PluginManifest::load_from_dir(dir.path()).unwrap();
+        assert_eq!(
+            rebon_harness::rebon_plugin_package::compatibility::resolve_package(
+                dir.path(),
+                &parsed,
+                None
+            )
+            .unwrap(),
+            rebon_harness::rebon_plugin_package::compatibility::LoadCompatibility::Current(
+                PluginFormat::Rebon
+            )
         );
     }
 

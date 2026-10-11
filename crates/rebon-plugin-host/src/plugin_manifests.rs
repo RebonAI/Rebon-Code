@@ -40,8 +40,8 @@ use crate::plugin_plane::ComposeEntry;
 /// answer waiting to drift.
 pub use rebon_plugin_package::PLUGIN_MANIFEST_FILE;
 
-/// Turns a manifest plus one composition entry's configuration into the load
-/// request rebon will send.
+/// Turns a manifest plus one composition entry's configuration and explicitly
+/// selected adapter into the load request rebon will send.
 pub fn entry_for(
     manifest: &KernelPluginManifest,
     id: &str,
@@ -49,11 +49,13 @@ pub fn entry_for(
     entry: String,
     config: Value,
     all_tools: &[String],
+    adapter: rebon_plugin_protocol::PluginAdapter,
 ) -> ComposeEntry {
     ComposeEntry {
         id: id.to_owned(),
         root: plain_path(&root),
         entry,
+        adapter,
         config,
         services: manifest.services.clone(),
         event_topics: manifest.event_topics.clone(),
@@ -188,7 +190,14 @@ impl std::fmt::Display for ManifestProblem {
 /// have been giving all along.
 pub fn read_package_manifest(
     module: &Path,
-) -> Result<(String, KernelPluginManifest), ManifestProblem> {
+) -> Result<
+    (
+        String,
+        KernelPluginManifest,
+        rebon_plugin_package::compatibility::LoadCompatibility,
+    ),
+    ManifestProblem,
+> {
     let dir = module.parent().ok_or(ManifestProblem::Missing)?;
     let raw =
         std::fs::read(dir.join(PLUGIN_MANIFEST_FILE)).map_err(|_| ManifestProblem::Missing)?;
@@ -220,7 +229,9 @@ pub fn read_package_manifest(
     manifest
         .validate_for_package(name)
         .map_err(ManifestProblem::Refused)?;
-    Ok((name.clone(), manifest.clone()))
+    let compatibility = rebon_plugin_package::compatibility::resolve_package(dir, &package, None)
+        .map_err(|error| ManifestProblem::Refused(error.to_string()))?;
+    Ok((name.clone(), manifest.clone(), compatibility))
 }
 
 /// Whether a declaration's `entry` names this module file.
@@ -244,6 +255,16 @@ mod tests {
     use super::*;
 
     fn package(dir: &Path, body: &str) {
+        let body = match serde_json::from_str::<Value>(body) {
+            Ok(mut value) => {
+                value["compatibility"] = serde_json::json!({
+                    "format":"rebon-plugin","formatVersion":1,"adapterRevision":1,
+                    "sdk":[{"name":"rebon-plugin-api","range":"^1"}]
+                });
+                value.to_string()
+            }
+            Err(_) => body.to_owned(),
+        };
         std::fs::write(dir.join(PLUGIN_MANIFEST_FILE), body).unwrap();
     }
 
@@ -270,7 +291,7 @@ mod tests {
             }"#,
         );
 
-        let (name, manifest) = read_package_manifest(&dir.path().join("index.mjs")).unwrap();
+        let (name, manifest, _) = read_package_manifest(&dir.path().join("index.mjs")).unwrap();
         assert_eq!(name, "demo-plane");
         assert_eq!(manifest.services, vec!["echo".to_string()]);
         assert_eq!(
@@ -344,9 +365,9 @@ mod tests {
                  "first": { "entry": "one.mjs", "services": ["a"] },
                  "second": { "entry": "./nested/two.mjs", "services": ["b"] }}}}"#,
         );
-        let (first, _) = read_package_manifest(&dir.path().join("one.mjs")).unwrap();
+        let (first, _, _) = read_package_manifest(&dir.path().join("one.mjs")).unwrap();
         assert_eq!(first, "first");
-        let (second, manifest) = read_package_manifest(&dir.path().join("two.mjs")).unwrap();
+        let (second, manifest, _) = read_package_manifest(&dir.path().join("two.mjs")).unwrap();
         assert_eq!(second, "second");
         assert_eq!(manifest.services, vec!["b".to_string()]);
     }

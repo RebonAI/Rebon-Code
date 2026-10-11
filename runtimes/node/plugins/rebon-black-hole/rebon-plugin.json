@@ -1,6 +1,12 @@
 {
   "name": "rebon-black-hole",
   "version": "0.1.0",
+  "compatibility": {
+    "format": "rebon-plugin",
+    "formatVersion": 1,
+    "adapterRevision": 1,
+    "sdk": [{ "name": "rebon-plugin-api", "range": "^1" }]
+  },
   "description": "A window-wide gravitational black-hole lens that drifts in from the upper-right corner.",
   "capabilities": {
     "appVisualEffects": [

@@ -611,6 +611,10 @@ mod tests {
         let mut state = SupervisorState::new(7).unwrap();
         for plugin in ["plugin.a", "plugin.b"] {
             let request = PluginLoadRequest {
+                adapter: rebon_plugin_protocol::PluginAdapter {
+                    id: "native".into(),
+                    revision: 1,
+                },
                 plugin_id: plugin.into(),
                 root: "/pkg".into(),
                 entry: "index.mjs".into(),

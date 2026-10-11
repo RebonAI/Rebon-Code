@@ -221,6 +221,11 @@ impl PluginInstaller {
                 None => PluginSourceIdentity::local(Path::new(&source_label))?,
             };
             let manifest = PluginManifest::load_from_dir(&staged_root)?;
+            rebon_harness::rebon_plugin_package::compatibility::resolve_package(
+                &staged_root,
+                &manifest,
+                None,
+            )?;
             let runtime_ids: Vec<String> = manifest
                 .capabilities
                 .kernel_plugins
@@ -255,7 +260,8 @@ impl PluginInstaller {
                 }
             }
             ensure_self_contained(&staged_root, &manifest)?;
-            let digest = compute_dir_digest(&staged_root)?;
+            let digest =
+                rebon_harness::rebon_plugin_package::integrity::compute_dir_digest(&staged_root)?;
             Ok((manifest, digest, source_identity))
         })();
         let (staged_manifest, digest, source_identity) = match admitted {
@@ -485,7 +491,10 @@ impl PluginInstaller {
                         (_, false) => VerificationOutcome::Missing { path: dir },
                         (None, true) => VerificationOutcome::NoRecordedDigest,
                         (Some(recorded), true) => {
-                            let actual = compute_dir_digest(&dir)?;
+                            let actual =
+                                rebon_harness::rebon_plugin_package::integrity::compute_dir_digest(
+                                    &dir,
+                                )?;
                             if actual == *recorded {
                                 VerificationOutcome::Match
                             } else {
@@ -662,8 +671,7 @@ fn ensure_self_contained(
         );
     }
 
-    let mut found = Vec::new();
-    collect_files(root, root, &mut found)?;
+    let found = rebon_harness::rebon_plugin_package::integrity::package_files(root)?;
     let native: Vec<String> = found
         .into_iter()
         .map(|(relative, _)| relative)
@@ -704,47 +712,6 @@ pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
             fs::copy(&path, &dest).with_context(|| {
                 format!("failed to copy {} to {}", path.display(), dest.display())
             })?;
-        }
-    }
-    Ok(())
-}
-
-fn compute_dir_digest(root: &Path) -> anyhow::Result<String> {
-    let mut files = Vec::new();
-    collect_files(root, root, &mut files)?;
-    files.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut hasher = Sha256::new();
-    for (relative, path) in files {
-        hasher.update(relative.as_bytes());
-        hasher.update([0]);
-        let mut file = fs::File::open(&path)?;
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-        hasher.update([0]);
-    }
-    Ok(format!("sha256:{}", to_hex(&hasher.finalize())))
-}
-
-fn collect_files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> anyhow::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            collect_files(root, &path, out)?;
-        } else if metadata.is_file() {
-            let relative = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            out.push((relative, path));
         }
     }
     Ok(())
@@ -834,7 +801,7 @@ mod tests {
         std::fs::create_dir_all(package.join("skills/demo")).unwrap();
         std::fs::write(
             package.join("rebon-plugin.json"),
-            r#"{"name":"demo","version":"1.0.0","capabilities":{"skills":["skills/demo"]}}"#,
+            r#"{"name":"demo","version":"1.0.0","compatibility":{"format":"rebon-plugin","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-plugin-api","range":"^1"}]},"capabilities":{"skills":["skills/demo"]}}"#,
         )
         .unwrap();
         std::fs::write(package.join("skills/demo/SKILL.md"), "demo").unwrap();
@@ -861,12 +828,12 @@ mod tests {
         std::fs::create_dir_all(package.join("skills/demo")).unwrap();
         std::fs::write(package.join("skills/demo/SKILL.md"), "demo").unwrap();
         let write_manifest = |version: &str| {
-            std::fs::write(
-                package.join("rebon-plugin.json"),
-                format!(
-                    r#"{{"name":"demo","version":"{version}","capabilities":{{"skills":["skills/demo"]}}}}"#
-                ),
-            )
+            std::fs::write(package.join("rebon-plugin.json"), {
+                let mut manifest: serde_json::Value =
+                    serde_json::from_slice(DEMO_MANIFEST).unwrap();
+                manifest["version"] = serde_json::json!(version);
+                serde_json::to_vec(&manifest).unwrap()
+            })
             .unwrap();
         };
         let store = PluginStore::new(tmp.path().join("home"), cwd.clone());
@@ -910,7 +877,7 @@ mod tests {
         std::fs::create_dir_all(&package).unwrap();
         std::fs::write(
             package.join("rebon-plugin.json"),
-            r#"{"name":"visual-demo","version":"1.0.0","capabilities":{"appVisualEffects":[{"id":"black-hole","surface":"chatEmpty","kind":"blackHole"}]}}"#,
+            r#"{"name":"visual-demo","version":"1.0.0","compatibility":{"format":"rebon-plugin","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-plugin-api","range":"^1"}]},"capabilities":{"appVisualEffects":[{"id":"black-hole","surface":"chatEmpty","kind":"blackHole"}]}}"#,
         )
         .unwrap();
         let store = PluginStore::new(tmp.path().join("home"), cwd.clone());
@@ -959,10 +926,10 @@ mod tests {
     /// Declares a skill, so it may only be used by an archive that ships one:
     /// manifest loading checks that declared asset paths exist.
     const DEMO_MANIFEST: &[u8] =
-        br#"{"name":"demo","version":"1.0.0","capabilities":{"skills":["skills/demo"]}}"#;
+        br#"{"name":"demo","version":"1.0.0","compatibility":{"format":"rebon-plugin","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-plugin-api","range":"^1"}]},"capabilities":{"skills":["skills/demo"]}}"#;
     /// The same plugin with nothing declared, for archives whose payload is not
     /// what the test is about.
-    const PLAIN_MANIFEST: &[u8] = br#"{"name":"demo","version":"1.0.0"}"#;
+    const PLAIN_MANIFEST: &[u8] = br#"{"name":"demo","version":"1.0.0","compatibility":{"format":"rebon-plugin","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-plugin-api","range":"^1"}]}}"#;
 
     #[test]
     fn installs_from_a_package_archive() {
@@ -1134,7 +1101,7 @@ mod tests {
     fn a_declared_native_module_is_refused_as_not_yet_supported() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = EnvGuard::set_config_dir(&tmp.path().join("home"));
-        let manifest = br#"{"name":"demo","version":"1.0.0","requirements":{"nativeModules":["build/Release/fast.node"]}}"#;
+        let manifest = br#"{"name":"demo","version":"1.0.0","compatibility":{"format":"rebon-plugin","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-plugin-api","range":"^1"}]},"requirements":{"nativeModules":["build/Release/fast.node"]}}"#;
         let (archive, _store, installer) = archive_fixture(
             tmp.path(),
             &[
@@ -1275,6 +1242,64 @@ mod tests {
             .unwrap(),
             b"original"
         );
+    }
+
+    #[test]
+    fn compatibility_rejection_preserves_the_existing_install() {
+        use rebon_harness::rebon_plugin_package::{
+            compatibility::CompatibilityError, integrity::compute_dir_digest,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let _guard = EnvGuard::set_config_dir(&home);
+        let (archive, store, installer) =
+            archive_fixture(tmp.path(), &[("rebon-plugin.json", PLAIN_MANIFEST)]);
+        installer
+            .install(archive.to_str().unwrap(), PluginScope::User, None)
+            .unwrap();
+        let data =
+            rebon_harness::rebon_plugin_package::container::container_data_dir(&home, "demo");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("state.json"), b"retained").unwrap();
+        rebon_harness::rebon_plugin_package::container::ContainerGrants::default()
+            .save(&home)
+            .unwrap();
+        let before = compute_dir_digest(&home).unwrap();
+        let initial = store.load_state(PluginScope::User).unwrap();
+        for case in ["missing", "format", "adapter", "sdk"] {
+            let mut manifest: serde_json::Value = serde_json::from_slice(PLAIN_MANIFEST).unwrap();
+            manifest["version"] = serde_json::json!("1.1.0");
+            match case {
+                "missing" => {
+                    manifest.as_object_mut().unwrap().remove("compatibility");
+                }
+                "format" => manifest["compatibility"]["formatVersion"] = serde_json::json!(2),
+                "adapter" => manifest["compatibility"]["adapterRevision"] = serde_json::json!(2),
+                "sdk" => manifest["compatibility"]["sdk"][0]["range"] = serde_json::json!("^2"),
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec(&manifest).unwrap();
+            std::fs::write(
+                &archive,
+                super::super::package::tar_archive(&[("rebon-plugin.json", &bytes)]),
+            )
+            .unwrap();
+            let error = installer
+                .install(archive.to_str().unwrap(), PluginScope::User, None)
+                .unwrap_err();
+            let structured = error
+                .downcast_ref::<CompatibilityError>()
+                .expect("typed compatibility refusal");
+            assert!(matches!(
+                (case, structured),
+                ("missing", CompatibilityError::MissingCompatibility { .. })
+                    | ("format", CompatibilityError::UnsupportedFormat { .. })
+                    | ("adapter", CompatibilityError::UnsupportedAdapter { .. })
+                    | ("sdk", CompatibilityError::UnsupportedSdk { .. })
+            ));
+            assert_eq!(store.load_state(PluginScope::User).unwrap(), initial);
+            assert_eq!(compute_dir_digest(&home).unwrap(), before, "{case}");
+        }
     }
 
     #[test]

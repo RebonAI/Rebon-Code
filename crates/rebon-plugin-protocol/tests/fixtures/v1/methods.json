@@ -2,10 +2,26 @@
   "version": 1,
   "note": "Shared method-payload corpus. Rust reads it from tests/methods_corpus.rs and Node from test/methods.test.mjs; both must reach the same verdict and, on refusal, the same bracketed code. Validation order inside one payload is part of the contract, because it decides which code a payload with two problems reports.",
   "cases": [
+    { "name": "load_missing_adapter", "kind": "plugin_load", "payload": { "pluginId": "p", "root": "/pkg", "entry": "i.mjs" }, "code": "[MISSING_FIELD]" },
+    { "name": "load_adapter_null", "kind": "plugin_load", "payload": { "pluginId": "p", "root": "/pkg", "entry": "i.mjs", "adapter": null }, "code": "[WRONG_SHAPE]" },
+    { "name": "load_adapter_array", "kind": "plugin_load", "payload": { "pluginId": "p", "root": "/pkg", "entry": "i.mjs", "adapter": [] }, "code": "[WRONG_SHAPE]" },
+    { "name": "load_adapter_id_type", "kind": "plugin_load", "payload": { "pluginId": "p", "root": "/pkg", "entry": "i.mjs", "adapter": { "id": 1, "revision": 1 } }, "code": "[WRONG_SHAPE]" },
+    { "name": "load_adapter_missing_id", "kind": "plugin_load", "payload": { "pluginId": "p", "root": "/pkg", "entry": "i.mjs", "adapter": { "revision": 1 } }, "code": "[MISSING_FIELD]" },
+    { "name": "load_adapter_missing_revision", "kind": "plugin_load", "payload": { "pluginId": "p", "root": "/pkg", "entry": "i.mjs", "adapter": { "id": "native" } }, "code": "[MISSING_FIELD]" },
+    { "name": "load_adapter_revision_string", "kind": "plugin_load", "payload": { "pluginId": "p", "root": "/pkg", "entry": "i.mjs", "adapter": { "id": "native", "revision": "1" } }, "code": "[WRONG_SHAPE]" },
+    { "name": "load_adapter_revision_negative", "kind": "plugin_load", "payload": { "pluginId": "p", "root": "/pkg", "entry": "i.mjs", "adapter": { "id": "native", "revision": -1 } }, "code": "[WRONG_SHAPE]" },
+    { "name": "load_adapter_revision_fraction", "kind": "plugin_load", "payload": { "pluginId": "p", "root": "/pkg", "entry": "i.mjs", "adapter": { "id": "native", "revision": 1.5 } }, "code": "[WRONG_SHAPE]" },
+    { "name": "load_adapter_revision_overflow", "kind": "plugin_load", "payload": { "pluginId": "p", "root": "/pkg", "entry": "i.mjs", "adapter": { "id": "native", "revision": 4294967296 } }, "code": "[WRONG_SHAPE]" },
+    { "name": "load_adapter_unknown_field", "kind": "plugin_load", "payload": { "pluginId": "p", "root": "/pkg", "entry": "i.mjs", "adapter": { "id": "native", "revision": 1, "extra": true } }, "code": "[UNKNOWN_FIELD]" },
+    { "name": "load_adapter_future_is_wire_data", "kind": "plugin_load", "payload": { "pluginId": "p", "root": "/pkg", "entry": "i.mjs", "adapter": { "id": "future", "revision": 4294967295 } }, "accept": true },
+    { "name": "load_adapter_cordis", "kind": "plugin_load", "payload": { "pluginId": "p", "root": "/pkg", "entry": "i.mjs", "adapter": { "id": "cordis", "revision": 1 } }, "accept": true },
+    { "name": "load_adapter_mods", "kind": "plugin_load", "payload": { "pluginId": "p", "root": "/pkg", "entry": "i.mjs", "adapter": { "id": "claude-mods", "revision": 1 } }, "accept": true },
+    { "name": "load_adapter_legacy", "kind": "plugin_load", "payload": { "pluginId": "p", "root": "/pkg", "entry": "i.mjs", "adapter": { "id": "legacy-1.9", "revision": 1 } }, "accept": true },
     {
       "name": "load_minimal",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs"
@@ -16,6 +32,7 @@
       "name": "load_full",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs",
@@ -56,6 +73,7 @@
       "name": "load_unknown_field",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs",
@@ -67,6 +85,7 @@
       "name": "load_missing_entry",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a"
       },
       "code": "[MISSING_FIELD]"
@@ -75,6 +94,7 @@
       "name": "load_reserved_plugin_id",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "$rebon/platform",
         "root": "/packages/demo",
         "entry": "index.mjs"
@@ -85,6 +105,7 @@
       "name": "load_empty_plugin_id",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "",
         "root": "/packages/demo",
         "entry": "index.mjs"
@@ -95,6 +116,7 @@
       "name": "load_control_character_entry",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index\u0001.mjs"
@@ -105,6 +127,7 @@
       "name": "load_duplicate_service",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs",
@@ -119,6 +142,7 @@
       "name": "load_services_not_an_array",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs",
@@ -130,6 +154,7 @@
       "name": "load_plugin_id_not_a_string",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": 1,
         "root": "/packages/demo",
         "entry": "index.mjs"
@@ -140,6 +165,7 @@
       "name": "load_plugin_id_too_long",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "root": "/packages/demo",
         "entry": "index.mjs"
@@ -150,6 +176,7 @@
       "name": "load_reports_the_plugin_id_before_the_entry",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "",
         "root": "/packages/demo",
         "entry": ""
@@ -161,6 +188,7 @@
       "note": "43 characters, 129 UTF-8 bytes. A host measuring UTF-16 units would accept this and disagree with the other one.",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一",
         "root": "/packages/demo",
         "entry": "index.mjs"
@@ -171,6 +199,7 @@
       "name": "load_multibyte_plugin_id_within_the_byte_bound",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一一",
         "root": "/packages/demo",
         "entry": "index.mjs"
@@ -181,6 +210,7 @@
       "name": "load_relative_root",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "packages/demo",
         "entry": "index.mjs"
@@ -192,6 +222,7 @@
       "note": "A supervisor and its host always run on the same machine, so both spellings count as absolute regardless of which platform reads this corpus.",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "C:/packages/demo",
         "entry": "index.mjs"
@@ -202,6 +233,7 @@
       "name": "load_absolute_entry",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "/etc/passwd"
@@ -212,6 +244,7 @@
       "name": "load_entry_climbs_out",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "src/../../index.mjs"
@@ -223,6 +256,7 @@
       "note": "A backslash separates on Windows only, so this path would mean two different things on two machines.",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "src\\index.mjs"
@@ -233,6 +267,7 @@
       "name": "load_nested_entry",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "dist/src/index.mjs"
@@ -423,6 +458,7 @@
       "name": "load_tools_absent_is_empty",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs",
@@ -434,6 +470,7 @@
       "name": "load_tool_name_empty",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs",
@@ -447,6 +484,7 @@
       "name": "load_tool_declared_twice",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs",
@@ -526,6 +564,7 @@
       "name": "load_provider_declared_twice",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs",
@@ -625,6 +664,7 @@
       "name": "load_provided_tools",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs",
@@ -757,6 +797,7 @@
       "name": "load_seat_declared_twice",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs",
@@ -853,6 +894,7 @@
       "name": "load_published_topic_declared_twice",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs",
@@ -867,6 +909,7 @@
       "name": "load_published_topics_absent_is_empty",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs"
@@ -877,6 +920,7 @@
       "name": "load_published_topic_control_character",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs",
@@ -960,6 +1004,7 @@
       "name": "load_config_absent_is_null",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs"
@@ -970,6 +1015,7 @@
       "name": "load_config_may_be_any_json",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs",
@@ -1106,6 +1152,7 @@
       "name": "load_declares_commands",
       "kind": "plugin_load",
       "payload": {
+        "adapter": { "id": "native", "revision": 1 },
         "pluginId": "plugin.a",
         "root": "/packages/demo",
         "entry": "index.mjs",

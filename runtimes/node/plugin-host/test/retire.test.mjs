@@ -10,8 +10,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PluginHost } from '../src/host.mjs';
 
-const control = (call_id, method, payload = null) => ({ protocol_version: 1, host_epoch: 7, plugin_id: '$rebon/platform', scope_id: '$rebon/control', scope_generation: 0, call_id, message: { type: 'request', method, payload } });
-const scoped = (call_id, method, payload) => ({ protocol_version: 1, host_epoch: 7, plugin_id: 'plugin.a', scope_id: 'scope.a', scope_generation: 1, call_id, message: { type: 'request', method, payload } });
+const control = (call_id, method, payload = null) => ({ protocol_version: 2, host_epoch: 7, plugin_id: '$rebon/platform', scope_id: '$rebon/control', scope_generation: 0, call_id, message: { type: 'request', method, payload } });
+const scoped = (call_id, method, payload) => ({ protocol_version: 2, host_epoch: 7, plugin_id: 'plugin.a', scope_id: 'scope.a', scope_generation: 1, call_id, message: { type: 'request', method, payload } });
 const answered = (sent, call_id) => sent.filter((x) => x.message.type === 'terminal').find((x) => x.call_id === call_id)?.message;
 
 function harness() {
@@ -39,7 +39,7 @@ function harness() {
 
 async function ready(kit) {
   await kit.host.accept(control('i', 'platform/initialize'));
-  await kit.host.accept(control('l', 'plugin/load', { pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs', services: ['quick', 'slow'] }));
+  await kit.host.accept(control('l', 'plugin/load', { pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs', adapter: { id: 'native', revision: 1 }, services: ['quick', 'slow'] }));
   await kit.host.accept(scoped('o', 'scope/open', { workspace_root: 'C:/w' }));
   return kit;
 }
@@ -85,7 +85,7 @@ test('a host with no loader teardown still drains', async () => {
     load: async () => ({ services: [], eventTopics: [], serviceHandlers: new Map(), topicHandlers: new Map() }),
   });
   await host.accept(control('i', 'platform/initialize'));
-  await host.accept(control('l', 'plugin/load', { pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs' }));
+  await host.accept(control('l', 'plugin/load', { pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs', adapter: { id: 'native', revision: 1 } }));
   await host.accept(control('u', 'plugin/unload', { pluginId: 'plugin.a' }));
 
   assert.equal(answered(sent, 'u').status, 'success');

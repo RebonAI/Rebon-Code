@@ -58,6 +58,10 @@ export function activate(plugin) {
 
 fn load_request(root: String) -> PluginLoadRequest {
     PluginLoadRequest {
+        adapter: rebon_plugin_protocol::PluginAdapter {
+            id: "native".into(),
+            revision: 1,
+        },
         plugin_id: "plugin.demo".into(),
         root,
         entry: "index.mjs".into(),
@@ -75,6 +79,10 @@ fn load_request(root: String) -> PluginLoadRequest {
 
 fn listener_request(root: String) -> PluginLoadRequest {
     PluginLoadRequest {
+        adapter: rebon_plugin_protocol::PluginAdapter {
+            id: "native".into(),
+            revision: 1,
+        },
         plugin_id: "plugin.demo".into(),
         root,
         entry: "index.mjs".into(),
@@ -448,6 +456,10 @@ export function activate(plugin) {
 
 fn tool_request(root: String, tools: Vec<String>) -> PluginLoadRequest {
     PluginLoadRequest {
+        adapter: rebon_plugin_protocol::PluginAdapter {
+            id: "native".into(),
+            revision: 1,
+        },
         plugin_id: "plugin.demo".into(),
         root,
         entry: "index.mjs".into(),
@@ -638,6 +650,10 @@ export function activate(plugin) {
 
 fn streaming_request(root: String) -> PluginLoadRequest {
     PluginLoadRequest {
+        adapter: rebon_plugin_protocol::PluginAdapter {
+            id: "native".into(),
+            revision: 1,
+        },
         plugin_id: "plugin.demo".into(),
         root,
         entry: "index.mjs".into(),
@@ -844,6 +860,10 @@ export function activate(plugin) {
 
 fn llm_request(root: String) -> PluginLoadRequest {
     PluginLoadRequest {
+        adapter: rebon_plugin_protocol::PluginAdapter {
+            id: "native".into(),
+            revision: 1,
+        },
         plugin_id: "plugin.demo".into(),
         root,
         entry: "index.mjs".into(),
@@ -1034,6 +1054,10 @@ export function activate(plugin) {
 
 fn provider_request(root: String) -> PluginLoadRequest {
     PluginLoadRequest {
+        adapter: rebon_plugin_protocol::PluginAdapter {
+            id: "native".into(),
+            revision: 1,
+        },
         plugin_id: "plugin.demo".into(),
         root,
         entry: "index.mjs".into(),
@@ -1264,6 +1288,10 @@ impl SeatDispatcher for RecordingSeats {
 
 fn seat_request(root: String, seats: Vec<String>) -> PluginLoadRequest {
     PluginLoadRequest {
+        adapter: rebon_plugin_protocol::PluginAdapter {
+            id: "native".into(),
+            revision: 1,
+        },
         plugin_id: "plugin.demo".into(),
         root,
         entry: "index.mjs".into(),
@@ -1516,6 +1544,10 @@ impl EventPublisher for RecordingEvents {
 
 fn emit_request(root: String, published_topics: Vec<String>) -> PluginLoadRequest {
     PluginLoadRequest {
+        adapter: rebon_plugin_protocol::PluginAdapter {
+            id: "native".into(),
+            revision: 1,
+        },
         plugin_id: "plugin.demo".into(),
         root,
         entry: "index.mjs".into(),
@@ -1750,6 +1782,10 @@ export function activate(plugin) {
 
 fn stalling_request(root: String) -> PluginLoadRequest {
     PluginLoadRequest {
+        adapter: rebon_plugin_protocol::PluginAdapter {
+            id: "native".into(),
+            revision: 1,
+        },
         plugin_id: "plugin.demo".into(),
         root,
         entry: "index.mjs".into(),

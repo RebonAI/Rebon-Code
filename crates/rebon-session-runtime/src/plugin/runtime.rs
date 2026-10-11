@@ -274,6 +274,7 @@ mod tests {
             serde_json::json!({
                 "name": "fake-provider-plugin",
                 "version": "1.0.0",
+                "compatibility": {"format":"rebon-plugin","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-plugin-api","range":"^1"}]},
                 "capabilities": {
                     "modelProviders": {
                         "fake-provider": {
@@ -367,6 +368,7 @@ mod tests {
             serde_json::json!({
                 "name": "claudecode-plugin",
                 "version": "1.0.0",
+                "compatibility": {"format":"rebon-plugin","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-plugin-api","range":"^1"}]},
                 "requirements": {"externalCommands": ["claude-agent-acp"]},
                 "capabilities": {
                     "acpAgents": {

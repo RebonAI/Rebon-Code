@@ -47,6 +47,10 @@ fn package(dir: &std::path::Path) -> String {
 
 fn load_request(root: String) -> PluginLoadRequest {
     PluginLoadRequest {
+        adapter: rebon_plugin_protocol::PluginAdapter {
+            id: "native".into(),
+            revision: 1,
+        },
         plugin_id: ID.into(),
         root,
         entry: "index.mjs".into(),

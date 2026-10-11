@@ -115,6 +115,10 @@ async fn probe(
             plugin_id: "seat.probe".into(),
             root: dir.path().to_string_lossy().replace('\\', "/"),
             entry: "index.mjs".into(),
+            adapter: rebon_plugin_protocol::PluginAdapter {
+                id: "native".into(),
+                revision: 1,
+            },
             services: vec!["report".into()],
             event_topics: Vec::new(),
             published_topics: Vec::new(),

@@ -9,8 +9,8 @@ import assert from 'node:assert/strict';
 import { PluginHost } from '../src/host.mjs';
 import { identityOf, terminal } from '../src/protocol.mjs';
 
-const control = (call_id, method, payload = null) => ({ protocol_version: 1, host_epoch: 7, plugin_id: '$rebon/platform', scope_id: '$rebon/control', scope_generation: 0, call_id, message: { type: 'request', method, payload } });
-const scoped = (call_id, method, generation, payload) => ({ protocol_version: 1, host_epoch: 7, plugin_id: 'plugin.a', scope_id: 'scope.a', scope_generation: generation, call_id, message: { type: 'request', method, payload } });
+const control = (call_id, method, payload = null) => ({ protocol_version: 2, host_epoch: 7, plugin_id: '$rebon/platform', scope_id: '$rebon/control', scope_generation: 0, call_id, message: { type: 'request', method, payload } });
+const scoped = (call_id, method, generation, payload) => ({ protocol_version: 2, host_epoch: 7, plugin_id: 'plugin.a', scope_id: 'scope.a', scope_generation: generation, call_id, message: { type: 'request', method, payload } });
 
 /// A rebon that accepts published events, or refuses them the way a real one
 /// would when the topic reaches nobody.
@@ -55,7 +55,7 @@ const plainly = (value) => JSON.parse(JSON.stringify(value));
 async function ready(kit, publishedTopics = ['session']) {
   await kit.host.accept(control('i', 'platform/initialize'));
   await kit.host.accept(control('l', 'plugin/load', {
-    pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs',
+    pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs', adapter: { id: 'native', revision: 1 },
     services: ['announce', 'refused'], publishedTopics,
   }));
   await kit.host.accept(scoped('o', 'scope/open', 1, { workspace_root: 'C:/w' }));
@@ -97,7 +97,7 @@ test('listening to a topic does not grant publishing it', async () => {
   const kit = harness();
   await kit.host.accept(control('i', 'platform/initialize'));
   await kit.host.accept(control('l', 'plugin/load', {
-    pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs',
+    pluginId: 'plugin.a', root: '/pkg', entry: 'index.mjs', adapter: { id: 'native', revision: 1 },
     services: ['announce', 'refused'], eventTopics: ['session'],
   }));
   await kit.host.accept(scoped('o', 'scope/open', 1, { workspace_root: 'C:/w' }));

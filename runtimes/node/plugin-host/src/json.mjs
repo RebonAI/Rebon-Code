@@ -1,4 +1,4 @@
-import { ProtocolError, RawJsonNumber, validateEnvelope } from './protocol.mjs';
+import { PROTOCOL_VERSION, ProtocolError, RawJsonNumber, validateEnvelope } from './protocol.mjs';
 
 class RawNumber {
   constructor(raw) { this.raw = raw; Object.freeze(this); }
@@ -195,10 +195,10 @@ function materialize(value) {
 export function parseEnvelopeJson(text) {
   const value = new JsonParser(text).parse();
   if (!value || value instanceof RawNumber || Array.isArray(value) || typeof value !== 'object') throw new ProtocolError('wrong_shape', 'envelope must be an object');
-  if (!(value.protocol_version instanceof RawNumber) || value.protocol_version.raw !== '1') {
-    throw new ProtocolError('bad_version', 'protocol_version must be integer token 1');
+  if (!(value.protocol_version instanceof RawNumber) || value.protocol_version.raw !== String(PROTOCOL_VERSION)) {
+    throw new ProtocolError('bad_version', `protocol_version must be integer token ${PROTOCOL_VERSION}`);
   }
-  value.protocol_version = 1;
+  value.protocol_version = PROTOCOL_VERSION;
   for (const field of ['host_epoch', 'scope_generation']) {
     if (!(value[field] instanceof RawNumber)) throw new ProtocolError('unsafe_integer', `${field} must be a JSON number`);
     value[field] = parseSafeIntegerToken(value[field].raw, field);

@@ -130,6 +130,11 @@ deepseek-harness vendored plugins (https://github.com/deepseek-ai/deepseek-harne
   Vendored builds under runtimes/node/compose-runtime/payload/vendor/dsh/, each with
   its license file alongside as LICENSE-<name>. Licensed under the MIT
   License. Transpiled 1:1 from the repository's TypeScript sources.
+  The upstream commit was not recorded; upstream package versions are unknown.
+  The vendored content is identified by snapshot S1 (cordis adapter revision 1):
+    sha256:baa83e6917f79e67c213a00a2882848baa195a86d185dfab65d31831bdce3711
+  The snapshot hash covers relative file names and contents under vendor/dsh/,
+  with CRLF normalized to LF.
     timer (timer.js), logger-console (logger-console.js)
       Copyright (c) 2021-present Shigma
     timeout, llm-deepseek, the dsh-llm helper core (llm-core), scope,

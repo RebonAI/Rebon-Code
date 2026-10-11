@@ -78,6 +78,7 @@ test('a hooks module with suffix-less, .js and folder imports loads and runs', a
   const loader = await createLoader({ next: async () => { throw new Error('not a mod?'); } });
   const sealed = await loader.load({
     pluginId: 'imports',
+    adapter: { id: 'claude-mods', revision: 1 },
     root: path.join(fixtures, 'imports-mod'),
     entry: 'hooks/register.tsx',
     services: ['mod'],
@@ -107,6 +108,7 @@ test('an import of a file that is not a mod file is still refused', async () => 
     await assert.rejects(
       loader.load({
         pluginId: 'bad',
+        adapter: { id: 'claude-mods', revision: 1 },
         root,
         entry: 'hooks/register.ts',
         services: ['mod'],

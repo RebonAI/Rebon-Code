@@ -1,6 +1,13 @@
 {
   "name": "dsh-tool-web",
   "version": "0.1.0",
+  "compatibility": {
+    "format": "dsh-npm",
+    "formatVersion": 1,
+    "adapterRevision": 1,
+    "sdk": [{ "name": "@deepseek-ai/cordis", "range": "4.0.0-rc.8" }],
+    "dshSnapshot": "sha256:baa83e6917f79e67c213a00a2882848baa195a86d185dfab65d31831bdce3711"
+  },
   "description": "DeepSeek Harness web tools: web_search and web_fetch. Packaged from the DeepSeek Harness module Rebon vendors (@deepseek-ai/dsh-tool-web).",
   "license": "MIT",
   "capabilities": {

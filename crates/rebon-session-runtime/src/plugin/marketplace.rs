@@ -450,8 +450,13 @@ impl MarketplaceManager {
                     .config_home
                     .join(rebon_types::MODS_DIR)
                     .join(&entry.name);
-                let mod_ = rebon_harness::rebon_plugin_package::read_claude_mod(&folder)
+                let mut mod_ = rebon_harness::rebon_plugin_package::read_claude_mod(&folder)
                     .map_err(anyhow::Error::msg)?;
+                mod_.declare_install_compatibility();
+                let manifest = rebon_harness::rebon_plugin_package::plugin_manifest_for(&mod_);
+                rebon_harness::rebon_plugin_package::compatibility::resolve_package(
+                    &folder, &manifest, None,
+                )?;
                 let runtime_ids = vec![mod_.manifest.name];
                 let superseded = installs.ensure_source_available(
                     &source_identity,
@@ -481,7 +486,16 @@ impl MarketplaceManager {
                             target.display()
                         );
                 }
-                replace_dir(&folder, &target)?;
+                let staged = stage_dir(&folder, &target)?;
+                let mod_compatibility =
+                    rebon_harness::rebon_plugin_package::marketplace::ModCompatibilityRecord {
+                        manifest,
+                        first_seen: false,
+                        digest: rebon_harness::rebon_plugin_package::integrity::compute_dir_digest(
+                            &staged,
+                        )?,
+                    };
+                publish_staged_dir(&staged, &target)?;
                 for old_id in superseded {
                     installs.by_id.remove(&old_id);
                 }
@@ -505,6 +519,7 @@ impl MarketplaceManager {
                     version: entry.version.clone(),
                     kernel_plugins: runtime_ids,
                     source_identity: Some(source_identity.clone()),
+                    mod_compatibility: Some(mod_compatibility),
                     installed_at_ms: rebon_types::wall_clock_ms(),
                     // A mod declares nothing beyond its own folder.
                     granted: Default::default(),
@@ -550,6 +565,7 @@ impl MarketplaceManager {
                     version: Some(record.version.clone()),
                     kernel_plugins,
                     source_identity: Some(source_identity),
+                    mod_compatibility: None,
                     installed_at_ms: rebon_types::wall_clock_ms(),
                     granted: rebon_harness::rebon_plugin_package::container::ContainerGrants::load(
                         &self.config_home,
@@ -995,6 +1011,11 @@ fn http_get(url: &str) -> anyhow::Result<Vec<u8>> {
 /// Puts a copy of `src` at `dst`, replacing what is there, through a staged
 /// copy beside it so a failed copy leaves the old one.
 fn replace_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    let staged = stage_dir(src, dst)?;
+    publish_staged_dir(&staged, dst)
+}
+
+fn stage_dir(src: &Path, dst: &Path) -> anyhow::Result<PathBuf> {
     let parent = dst
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent", dst.display()))?;
@@ -1005,8 +1026,12 @@ fn replace_dir(src: &Path, dst: &Path) -> anyhow::Result<()> {
         rebon_types::wall_clock_ms()
     ));
     copy_dir_recursive(src, &stage)?;
+    Ok(stage)
+}
+
+fn publish_staged_dir(stage: &Path, dst: &Path) -> anyhow::Result<()> {
     remove_dir_if_present(dst)?;
-    std::fs::rename(&stage, dst).with_context(|| format!("moving {} into place", dst.display()))?;
+    std::fs::rename(stage, dst).with_context(|| format!("moving {} into place", dst.display()))?;
     Ok(())
 }
 
@@ -1170,6 +1195,7 @@ mod tests {
             &json!({
                 "name": name,
                 "version": "1.0.0",
+                "compatibility": {"format":"rebon-plugin","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-plugin-api","range":"^1"}]},
                 "capabilities": { "kernelPlugins": { name: { "entry": "plugin.mjs", "commands": ["hi"] } } }
             })
             .to_string(),
@@ -1183,6 +1209,7 @@ mod tests {
             &json!({
                 "name": name,
                 "version": "1.0.0",
+                "compatibility": {"format":"rebon-plugin","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-plugin-api","range":"^1"}]},
                 "capabilities": { "kernelPlugins": { name: { "entry": "plugin.mjs" } } },
                 "metadata": { "kernelPluginConfig": { name: { "allowParallelInProgress": false } } }
             })
@@ -1200,6 +1227,7 @@ mod tests {
             &json!({
                 "name": "search",
                 "version": "1.0.0",
+                "compatibility": {"format":"rebon-plugin","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-plugin-api","range":"^1"}]},
                 "capabilities": { "kernelPlugins": { "search": { "entry": "plugin.mjs" } } },
                 "container": { "network": ["api.exa.ai"], "env": ["EXA_API_KEY"] }
             })
@@ -1250,6 +1278,7 @@ mod tests {
             &json!({
                 "name": "search",
                 "version": "1.0.0",
+                "compatibility": {"format":"rebon-plugin","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-plugin-api","range":"^1"}]},
                 "capabilities": { "kernelPlugins": { "search": { "entry": "plugin.mjs" } } },
                 "container": { "network": ["api.exa.ai"] }
             })
@@ -1833,6 +1862,171 @@ mod tests {
         assert!(!error.contains("--replace-source"), "{error}");
         assert!(error.contains("greeter@m"), "{error}");
         assert!(!fx.home.join("mods/radar").exists());
+    }
+
+    #[test]
+    fn first_party_dsh_snapshot_packages_still_install() {
+        let _home =
+            rebon_tool::tasks::test_support::TestConfigHome::new("first-party-dsh-snapshot");
+        let fx = fixture();
+        let builtin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../marketplace");
+        let manager = manager(&fx).with_builtin(Some(builtin));
+        for name in [
+            "dsh-llm-deepseek",
+            "dsh-tool-todo",
+            "dsh-tool-web",
+            "dsh-web-search-exa",
+        ] {
+            let installed = manager
+                .install(&format!("{name}@rebon"), PluginScope::User)
+                .unwrap();
+            assert_eq!(installed.kind, InstallKind::Package);
+            assert_eq!(installed.kernel_plugins, vec![name]);
+        }
+        let store = PluginStore::new(fx.home.clone(), fx.work.clone());
+        let found =
+            rebon_harness::rebon_plugin_package::discovery::discover(&store, &[], &fx.work, true)
+                .unwrap();
+        assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+        assert_eq!(found.plugins.len(), 4);
+        assert!(found.plugins.iter().all(|plugin| plugin.compatibility
+            == rebon_harness::rebon_plugin_package::compatibility::LoadCompatibility::Current(
+                rebon_harness::rebon_plugin_package::compatibility::PluginFormat::DshNpm
+            )));
+    }
+
+    #[test]
+    fn an_upstream_mod_installs_without_rewriting_its_manifest() {
+        let _home =
+            rebon_tool::tasks::test_support::TestConfigHome::new("mod-synthesized-contract");
+        let fx = fixture();
+        let root = fx.work.join("market");
+        marketplace(&root, "team");
+        let source = root.join("mods/radar/.claude-plugin/plugin.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&source).unwrap()).unwrap();
+        manifest.as_object_mut().unwrap().remove("rebon");
+        let original = manifest.to_string();
+        write(&source, &original);
+        write(
+            &root.join("mods/radar/.git/config"),
+            "excluded checkout metadata",
+        );
+        write(
+            &root.join("mods/radar/.stage-old/leftover"),
+            "excluded staging files",
+        );
+        let manager = manager(&fx);
+        manager.add("./market").unwrap();
+        let installed = manager.install("radar@team", PluginScope::User).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(installed.location.join(".claude-plugin/plugin.json")).unwrap(),
+            original
+        );
+        assert_eq!(std::fs::read_to_string(source).unwrap(), original);
+        let recorded = manager
+            .installs()
+            .unwrap()
+            .by_id
+            .remove("radar@team")
+            .unwrap();
+        assert_eq!(recorded, installed);
+        let contract = recorded.mod_compatibility.as_ref().unwrap();
+        let declaration = contract.manifest.compatibility.as_ref().unwrap();
+        assert_eq!(declaration.format, "claude-mods");
+        assert_eq!(declaration.adapter_revision, 1);
+        assert_eq!(declaration.sdk[0].range, "^1");
+        let mod_ =
+            rebon_harness::rebon_plugin_package::read_claude_mod(&installed.location).unwrap();
+        assert!(mod_.compatibility.is_none());
+        assert_eq!(
+            rebon_harness::rebon_plugin_package::compatibility::resolve_mod(&mod_, &fx.home)
+                .unwrap(),
+            rebon_harness::rebon_plugin_package::compatibility::LoadCompatibility::Current(
+                rebon_harness::rebon_plugin_package::compatibility::PluginFormat::ClaudeMods
+            )
+        );
+    }
+
+    #[test]
+    fn a_local_upstream_mod_persists_its_synthesized_contract_in_the_store() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("local-mod-contract");
+        let fx = fixture();
+        let root = fx.work.join("mod");
+        write_mod(&root, "radar");
+        let installer = PluginInstaller::new(
+            PluginStore::new(fx.home.clone(), fx.work.clone()),
+            fx.work.clone(),
+            Vec::new(),
+        );
+        let record = installer
+            .install(&root.to_string_lossy(), PluginScope::User, None)
+            .unwrap();
+        let manifest = record.manifest.unwrap();
+        assert_eq!(
+            manifest.compatibility.as_ref().unwrap().format,
+            "claude-mods"
+        );
+        let discovered = rebon_harness::rebon_plugin_package::discovery::discover(
+            &PluginStore::new(fx.home.clone(), fx.work.clone()),
+            &[],
+            &fx.work,
+            true,
+        )
+        .unwrap();
+        assert!(discovered.warnings.is_empty(), "{:?}", discovered.warnings);
+        assert_eq!(
+            discovered.plugins[0].compatibility.adapter_id(),
+            "claude-mods"
+        );
+    }
+
+    #[test]
+    fn incompatible_mod_updates_preserve_records_data_and_grants() {
+        let _home =
+            rebon_tool::tasks::test_support::TestConfigHome::new("mod-compatibility-refusal");
+        let fx = fixture();
+        let root = fx.work.join("market");
+        marketplace(&root, "team");
+        let manager = manager(&fx);
+        manager.add("./market").unwrap();
+        manager.install("radar@team", PluginScope::User).unwrap();
+        let data = rebon_harness::rebon_plugin_package::container::container_data_dir(
+            &fx.home,
+            "mod-radar",
+        );
+        write(&data.join("state.txt"), "retained");
+        let before =
+            rebon_harness::rebon_plugin_package::integrity::compute_dir_digest(&fx.home).unwrap();
+        let path = root.join("mods/radar/.claude-plugin/plugin.json");
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for (case, message) in [
+            ("malformed", "unsupported plugin format"),
+            ("format", "unsupported plugin format"),
+            ("sdk", "unsupported SDK"),
+            ("adapter", "unsupported adapter"),
+        ] {
+            let mut manifest = original.clone();
+            manifest["rebon"] = json!({"format":"claude-mods","formatVersion":1,"adapterRevision":1,"sdk":[{"name":"rebon-claude-mods-api","range":"^1"}]});
+            match case {
+                "malformed" => manifest["rebon"] = json!(null),
+                "format" => manifest["rebon"]["formatVersion"] = json!(2),
+                "sdk" => manifest["rebon"]["sdk"][0]["range"] = json!("^2"),
+                "adapter" => manifest["rebon"]["adapterRevision"] = json!(2),
+                _ => unreachable!(),
+            }
+            write(&path, &manifest.to_string());
+            let error = manager
+                .install("radar@team", PluginScope::User)
+                .unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+            assert_eq!(
+                rebon_harness::rebon_plugin_package::integrity::compute_dir_digest(&fx.home)
+                    .unwrap(),
+                before
+            );
+        }
     }
 
     #[test]

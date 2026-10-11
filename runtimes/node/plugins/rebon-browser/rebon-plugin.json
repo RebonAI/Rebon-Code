@@ -1,6 +1,12 @@
 {
   "name": "rebon-browser",
   "version": "0.1.0",
+  "compatibility": {
+    "format": "rebon-plugin",
+    "formatVersion": 1,
+    "adapterRevision": 1,
+    "sdk": [{ "name": "rebon-plugin-api", "range": "^1" }]
+  },
   "description": "Control a dedicated Chrome or Edge tab group through the local Rebon browser extension.",
   "capabilities": {
     "mcpServers": {

@@ -21,12 +21,15 @@
 
 pub mod acp_agent_manifest;
 pub mod claude_mod;
+pub mod compatibility;
 pub mod container;
 pub mod discovery;
+pub mod integrity;
 pub mod manifest;
 pub mod marketplace;
 pub mod model_provider;
 pub mod model_provider_manifest;
+mod npm_range;
 pub mod security;
 pub mod store;
 

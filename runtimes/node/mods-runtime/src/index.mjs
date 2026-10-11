@@ -2,14 +2,15 @@
 //
 // A mod — a Claude Code plugin of function hooks, `.claude-plugin/plugin.json`
 // beside a `hooks/hooks.json` naming one hooks module — is a plane plugin of
-// a shape the host's own loader does not know. This decides it is one by
-// reading the load request, not the module: rebon marks the request's
-// `config.$claudeMod` when it synthesised the manifest from the plugin's
-// folder, so what loads here is exactly what rebon said it was loading.
+// a shape the host's own loader does not know. The explicit `claude-mods`
+// adapter selects it; `config.$claudeMod` only carries the scanned manifest
+// and options rebon synthesised from the plugin folder.
 //
-// `createLoader({ next })` is the host's contract: `next` is the loader a
-// request this one does not recognise is handed to, untouched.
+// `createLoader({ next })` follows the host loader contract, but this loader
+// executes only mods and never falls back to another ecosystem.
 import { Mod, MOD_SERVICE } from './mod.mjs';
+import { requireAdapter } from '../../plugin-host/src/loader.mjs';
+import { ProtocolError } from '../../plugin-host/src/protocol.mjs';
 
 export { MOD_SERVICE };
 export { transformJsx } from './jsx-transform.mjs';
@@ -22,16 +23,21 @@ const mods = new Map();
 /// The marker rebon puts on a mod's load request.
 export const MARKER = '$claudeMod';
 
-/// Whether a load request is a mod's.
+/// Whether the request carries mod configuration. This selects an ecosystem
+/// only for explicit legacy-1.9; modern mods merely validate their config here.
+/// Remove that selection heuristic with legacy-1.9 in the next major.
 export function isModRequest(request) {
   const marker = request?.config?.[MARKER];
   return marker !== null && typeof marker === 'object' && !Array.isArray(marker);
 }
 
-export async function createLoader({ next }) {
+export async function createLoader() {
   return {
     async load(request) {
-      if (!isModRequest(request)) return next(request);
+      requireAdapter(request.adapter, 'claude-mods');
+      if (!isModRequest(request)) {
+        throw new ProtocolError('[WRONG_SHAPE]', 'claude-mods requires config.$claudeMod');
+      }
       const mod = new Mod({
         pluginId: request.pluginId,
         root: request.root,

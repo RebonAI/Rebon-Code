@@ -1,6 +1,13 @@
 {
   "name": "dsh-tool-todo",
   "version": "0.1.0",
+  "compatibility": {
+    "format": "dsh-npm",
+    "formatVersion": 1,
+    "adapterRevision": 1,
+    "sdk": [{ "name": "@deepseek-ai/cordis", "range": "4.0.0-rc.8" }],
+    "dshSnapshot": "sha256:baa83e6917f79e67c213a00a2882848baa195a86d185dfab65d31831bdce3711"
+  },
   "description": "DeepSeek Harness todo list: a todo_write tool the model keeps its plan in. Packaged from the DeepSeek Harness module Rebon vendors (@deepseek-ai/dsh-tool-todo).",
   "license": "MIT",
   "capabilities": {

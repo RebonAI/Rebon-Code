@@ -13,6 +13,10 @@ fn load(plugin: &str) -> PluginLoadRequest {
         plugin_id: plugin.into(),
         root: "/packages/demo".into(),
         entry: "index.mjs".into(),
+        adapter: rebon_plugin_protocol::PluginAdapter {
+            id: "native".into(),
+            revision: 1,
+        },
         services: vec!["compose".into(), "render".into()],
         event_topics: vec!["session".into()],
         published_topics: vec!["compose:session/append".into()],
