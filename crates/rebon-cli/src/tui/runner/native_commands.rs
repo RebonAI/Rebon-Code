@@ -1204,14 +1204,13 @@ fn run_permissions(cx: Cx<'_>, command: &str) -> Option<bool> {
         if let Some(reason) =
             super::prompt_lifecycle::local_turn_rejection(app, session, active_prompt.as_ref())
         {
-            inject_system_message(app, "permissions", &reason);
-            app.follow_transcript_tail = true;
+            feedback(app, "permissions", &reason);
             return Some(false);
         }
     }
     let inputs = session_command_inputs_from_app(app, session.ui_mode);
     let output = execute_permissions_command(&inputs, cmd);
-    inject_system_message(app, "permissions", &output.text);
+    feedback(app, "permissions", &output.text);
     if !output.replay_requests.is_empty() {
         prepare_for_new_prompt_after_withdrawal(app, &mut session.engine_half.update_rx);
         *active_prompt = admit_permission_replay_turn(
@@ -1736,6 +1735,142 @@ fn run_plugin(cx: Cx<'_>, command: &str) -> Option<bool> {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    fn compact_permissions_feedback(app: &mut AppState) -> String {
+        use super::super::inline_commit_cursor::{
+            inline_commit_batch_cache, measure_inline_commit_batch, render_inline_commit_batch,
+            InlineCommitCursor,
+        };
+
+        let batches = InlineCommitCursor::default().prepare_batches(
+            app.rebon_tui.transcript.rows(),
+            app.rebon_tui.transcript.revision(),
+        );
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        let theme = rebon_tui::RenderTheme::plain();
+        let mut cache = inline_commit_batch_cache();
+        let height = measure_inline_commit_batch(app, &theme, batch, 100, &mut cache);
+        assert!(height > 0, "权限命令反馈被 Compact 渲染隐藏");
+        let area = ratatui::layout::Rect::new(0, 0, 100, height);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        assert_eq!(
+            render_inline_commit_batch(app, &theme, batch, area, &mut buffer, &mut cache),
+            height,
+        );
+        buffer.content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn permissions_list_feedback_is_visible_in_compact_modes() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("permissions-feedback");
+        let runtime = tokio::runtime::Runtime::new().expect("创建测试 runtime");
+        let mut session = super::super::test_support::make_test_tui_session();
+        for ui_mode in [UiMode::Inline, UiMode::Screen] {
+            session.ui_mode = ui_mode;
+            for has_denial in [false, true] {
+                let mut app = AppState::new();
+                app.ui_mode = ui_mode;
+                app.tool_output_verbosity = rebon_tui::ToolOutputVerbosity::Compact;
+                let id = has_denial.then(|| {
+                    app.auto_mode_denials
+                        .lock()
+                        .expect("denial store poisoned")
+                        .record(rebon_permissions::auto_mode_denials::AutoModeDenialInput {
+                            tool_use_id: "denied-call".into(),
+                            tool_name: "Bash".into(),
+                            tool_input: r#"{"command":"echo denied"}"#.into(),
+                            reason: "classifier blocked".into(),
+                            display: "Bash: echo denied".into(),
+                            timestamp_ms: 10,
+                            task_id: None,
+                            conversation_id: None,
+                        })
+                });
+                let mut text = "/permissions".to_string();
+                let mut active_prompt = None;
+                assert_eq!(
+                    native_dispatch(
+                        "permissions",
+                        &mut text,
+                        &mut app,
+                        &mut session,
+                        runtime.handle(),
+                        &mut active_prompt,
+                        ui_mode,
+                        0,
+                        0,
+                    ),
+                    Some(false),
+                );
+                assert!(active_prompt.is_none());
+                assert!(!app.is_loading);
+                assert!(app.follow_transcript_tail);
+                let visible = compact_permissions_feedback(&mut app);
+                if let Some(id) = id {
+                    assert!(visible.contains("[pending]"), "{visible}");
+                    assert!(visible.contains(&id), "{visible}");
+                    assert!(visible.contains("Bash: echo denied"), "{visible}");
+                } else {
+                    assert!(visible.contains("No auto-mode denials"), "{visible}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn permissions_retry_rejection_is_visible_without_consuming_denial() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("permissions-rejection");
+        let runtime = tokio::runtime::Runtime::new().expect("创建测试 runtime");
+        let mut session = super::super::test_support::make_test_tui_session();
+        session.session_id = "replaced-session".into();
+        for ui_mode in [UiMode::Inline, UiMode::Screen] {
+            session.ui_mode = ui_mode;
+            let mut app = AppState::new();
+            app.ui_mode = ui_mode;
+            app.tool_output_verbosity = rebon_tui::ToolOutputVerbosity::Compact;
+            let id = app
+                .auto_mode_denials
+                .lock()
+                .expect("denial store poisoned")
+                .record(rebon_permissions::auto_mode_denials::AutoModeDenialInput {
+                    tool_use_id: "denied-call".into(),
+                    tool_name: "Bash".into(),
+                    tool_input: r#"{"command":"echo denied"}"#.into(),
+                    reason: "classifier blocked".into(),
+                    display: "Bash: echo denied".into(),
+                    timestamp_ms: 10,
+                    task_id: None,
+                    conversation_id: None,
+                });
+            let mut text = format!("/permissions retry {id}");
+            let mut active_prompt = None;
+            assert_eq!(
+                native_dispatch(
+                    "permissions",
+                    &mut text,
+                    &mut app,
+                    &mut session,
+                    runtime.handle(),
+                    &mut active_prompt,
+                    ui_mode,
+                    0,
+                    0,
+                ),
+                Some(false),
+            );
+            assert!(active_prompt.is_none());
+            assert!(!app.is_loading);
+            let visible = compact_permissions_feedback(&mut app);
+            assert!(visible.contains("runtime is being replaced"), "{visible}");
+            let listing = execute_permissions_command(
+                &session_command_inputs_from_app(&app, ui_mode),
+                crate::session::commands::permissions::PermissionsCommand::List,
+            );
+            assert!(listing.text.contains("[pending]"), "{}", listing.text);
+            assert!(!listing.text.contains("[retried]"), "{}", listing.text);
+        }
+    }
 
     #[test]
     fn fast_command_success_updates_banner_without_starting_transcript() {
