@@ -733,7 +733,7 @@ pub fn build_request_body(request: &CreateMessageRequest) -> Value {
         .messages_with_transient_context()
         .into_iter()
         .filter(|msg| msg.role != Role::System)
-        .map(|message| message_to_wire(&message))
+        .filter_map(|message| message_to_wire(&message))
         .collect::<Vec<_>>();
     let mut tools = request
         .tools
@@ -821,7 +821,7 @@ fn ephemeral_cache_control() -> Value {
     serde_json::json!({"type": "ephemeral"})
 }
 
-fn message_to_wire(msg: &Message) -> Value {
+fn message_to_wire(msg: &Message) -> Option<Value> {
     use crate::types::ContentBlock;
     let role = match msg.role {
         Role::User => "user",
@@ -865,21 +865,19 @@ fn message_to_wire(msg: &Message) -> Value {
         .filter(|b| !is_unsendable_thinking(b))
         .filter(|b| !b.is_backend_bound_compaction())
         .collect();
-    let to_array = |blocks: &[&ContentBlock]| -> Value {
-        Value::Array(blocks.iter().map(|b| content_block_to_wire(b)).collect())
-    };
-    let content = if filtered.len() == 1 {
-        match filtered[0] {
-            ContentBlock::ToolResult(tr) if tr.content.is_empty() => Value::String(String::new()),
-            _ => to_array(&filtered),
-        }
-    } else {
-        to_array(&filtered)
-    };
-    serde_json::json!({
+    if filtered.is_empty() {
+        return None;
+    }
+    let content = Value::Array(
+        filtered
+            .iter()
+            .map(|block| content_block_to_wire(block))
+            .collect(),
+    );
+    Some(serde_json::json!({
         "role": role,
         "content": content,
-    })
+    }))
 }
 
 /// A thinking block Anthropic would reject on replay: it has no
@@ -1489,7 +1487,8 @@ mod tests {
         let wire = message_to_wire(&Message {
             role: Role::Assistant,
             content: message.content,
-        });
+        })
+        .unwrap();
         assert_eq!(wire["content"][0]["type"], "compaction");
         assert_eq!(
             wire["content"][0]["content"],
@@ -1713,6 +1712,83 @@ mod tests {
     }
 
     #[test]
+    fn build_request_body_omits_messages_without_replayable_content() {
+        use crate::types::{CompactionBlock, ContentBlock, ServerToolUseBlock, ThinkingBlock};
+
+        for content in [
+            vec![],
+            vec![ContentBlock::Thinking(ThinkingBlock {
+                thinking: "unsigned reasoning".into(),
+                signature: None,
+                data: None,
+            })],
+            vec![ContentBlock::Compaction(CompactionBlock {
+                content: None,
+                encrypted_content: Some("foreign-compaction".into()),
+            })],
+            vec![ContentBlock::ServerToolUse(ServerToolUseBlock {
+                id: "server-tool".into(),
+                name: "web_search".into(),
+                input: serde_json::json!({}),
+            })],
+        ] {
+            let mut request = CreateMessageRequest::simple("model", "first prompt");
+            request.messages.extend([
+                Message::assistant_text("first answer"),
+                Message::user_text("second prompt"),
+                Message::assistant_text("second answer"),
+                Message {
+                    role: Role::Assistant,
+                    content,
+                },
+                Message::user_text("continue"),
+            ]);
+            let history = request.messages.clone();
+            let body = build_request_body(&request);
+            let messages = body["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 5);
+            assert!(messages
+                .iter()
+                .all(|message| { !message["content"].as_array().unwrap().is_empty() }));
+            assert_eq!(messages[4]["content"][0]["text"], "continue");
+            assert_eq!(request.messages, history);
+        }
+    }
+
+    #[test]
+    fn build_request_body_preserves_empty_tool_result_pairing() {
+        use crate::types::{ContentBlock, ToolResultBlock, ToolResultContent, ToolUseBlock};
+
+        for content in [
+            ToolResultContent::text(""),
+            ToolResultContent::blocks(vec![]),
+        ] {
+            let mut request = CreateMessageRequest::simple("model", "run a tool");
+            request.messages.extend([
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse(ToolUseBlock {
+                        id: "tool-1".into(),
+                        name: "Bash".into(),
+                        input: serde_json::json!({"command": "true"}),
+                    })],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult(ToolResultBlock {
+                        tool_use_id: "tool-1".into(),
+                        content,
+                        is_error: false,
+                    })],
+                },
+            ]);
+            let body = build_request_body(&request);
+            assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
+            assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "tool-1");
+        }
+    }
+
+    #[test]
     fn message_to_wire_filters_out_server_tool_blocks() {
         use crate::types::{ContentBlock, ServerToolUseBlock, TextBlock, WebSearchResultBlock};
         let msg = Message {
@@ -1736,7 +1812,7 @@ mod tests {
                 }),
             ],
         };
-        let wire = message_to_wire(&msg);
+        let wire = message_to_wire(&msg).unwrap();
         let content = wire["content"].as_array().unwrap();
         // Only the two text blocks should survive; server tool
         // blocks must be filtered out.
@@ -1766,7 +1842,7 @@ mod tests {
                 }),
             ],
         };
-        let wire = message_to_wire(&msg);
+        let wire = message_to_wire(&msg).unwrap();
         let content = wire["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "compaction");
@@ -1805,7 +1881,7 @@ mod tests {
                 }),
             ],
         };
-        let wire = message_to_wire(&msg);
+        let wire = message_to_wire(&msg).unwrap();
         let content = wire["content"].as_array().unwrap();
         // The malformed thinking block is dropped; the other three survive.
         assert_eq!(content.len(), 3, "malformed thinking block must be dropped");

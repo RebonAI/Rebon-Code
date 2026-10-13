@@ -1529,7 +1529,7 @@ fn convert_user_message(msg: &Message) -> Value {
             _ => {}
         }
     }
-    if any_tool && text_parts.is_empty() {
+    if text_parts.is_empty() {
         return Value::Array(tool_results);
     }
     if any_tool {
@@ -2618,6 +2618,42 @@ mod tests {
             messages[1]["content"][0]["file"]["file_data"],
             "data:application/pdf;base64,JVBERi0="
         );
+    }
+
+    #[test]
+    fn build_openai_request_body_omits_empty_user_content() {
+        for content in [
+            vec![],
+            vec![ContentBlock::Thinking(crate::types::ThinkingBlock {
+                thinking: "unsupported user reasoning".into(),
+                signature: None,
+                data: None,
+            })],
+        ] {
+            let mut request = CreateMessageRequest::simple("model", "first prompt");
+            request.messages.extend([
+                Message::assistant_text("first answer"),
+                Message::user_text("second prompt"),
+                Message::assistant_text("second answer"),
+                Message {
+                    role: Role::User,
+                    content,
+                },
+                Message::user_text("continue"),
+            ]);
+            let body = build_openai_request_body(
+                &request,
+                &OpenAiCompatibleClientConfig::with_api_key("sk"),
+            );
+            let messages = body["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 5);
+            assert_eq!(messages[4]["content"], "continue");
+            assert!(messages.iter().all(|message| {
+                message["content"]
+                    .as_array()
+                    .is_none_or(|parts| !parts.is_empty())
+            }));
+        }
     }
 
     #[test]
