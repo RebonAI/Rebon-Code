@@ -642,7 +642,13 @@ ALL temporary-file uses belong here, including:\n\
 An explicit user request is the only exception allowing `/tmp`.\n\
 \n\
 This scratchpad belongs to the current session alone and is separate from the user's \
-project. You may use it freely; permission prompts are not required."
+project. You may use it freely; permission prompts are not required.\n\
+\n\
+The scratchpad is deleted when the session ends. Store only temporary files that can be \
+recreated or safely discarded, such as test scripts, intermediate output, and session-local \
+notes. Never create or store a Git worktree, source checkout, or durable task state inside \
+the scratchpad. Formal worktrees belong in a persistent directory outside it; Rebon-managed \
+worktrees use `<git-root>/.rebon/worktrees/`."
     )
 }
 
@@ -734,4 +740,18 @@ pub(super) fn language_section(language: &str) -> String {
          other communication with the user in {language}, but keep technical terms \
          and code identifiers in their original form."
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scratchpad_guidance_separates_temporary_files_from_worktrees() {
+        let prompt = scratchpad_section("session/scratchpad");
+        assert!(prompt.contains("deleted when the session ends"));
+        assert!(prompt.contains("Never create or store a Git worktree"));
+        assert!(prompt.contains(".rebon/worktrees"));
+        assert!(prompt.contains("recreated or safely discarded"));
+    }
 }

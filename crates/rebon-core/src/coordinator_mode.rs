@@ -1328,7 +1328,7 @@ pub fn coordinator_user_context(
 
     if let Some(scratchpad_dir) = scratchpad_dir.filter(|_| is_scratchpad_gate_enabled()) {
         content.push_str(&format!(
-            "\n\nScratchpad directory: {scratchpad_dir}\nWorkers can read and write here without permission prompts. Use this for durable cross-worker knowledge — structure files however fits the work."
+            "\n\nScratchpad directory: {scratchpad_dir}\nWorkers can read and write here without permission prompts. Use it only for temporary scripts, intermediate output, and session-local notes that can be recreated or discarded. It is deleted when the session ends. Keep worktrees, source checkouts, and durable task state in persistent directories outside the scratchpad; Rebon-managed worktrees use `<git-root>/.rebon/worktrees/`."
         ));
     }
 
@@ -1848,6 +1848,9 @@ mod tests {
             std::env::set_var("REBON_SCRATCHPAD", "1");
             let ctx = coordinator_user_context(true, false, &[], Some("/tmp/scratchpad")).unwrap();
             assert!(ctx.contains("Scratchpad directory: /tmp/scratchpad"));
+            assert!(ctx.contains("deleted when the session ends"));
+            assert!(ctx.contains("worktrees"));
+            assert!(!ctx.contains("durable cross-worker knowledge"));
 
             match previous {
                 Some(value) => std::env::set_var("REBON_SCRATCHPAD", value),
