@@ -374,6 +374,12 @@ fn parent_authorized_roots(context: &ToolContext, parent_cwd: &Path) -> Vec<Path
             roots.push(resolved);
         }
     }
+    for root in context.auto_approved_write_roots() {
+        let resolved = rebon_tool::path_scope::resolve_context_path(root, parent_cwd, context);
+        if !roots.contains(&resolved) {
+            roots.push(resolved);
+        }
+    }
     roots
 }
 
@@ -4919,6 +4925,88 @@ mod tests {
             decision.behavior,
             rebon_tools_core::PermissionBehavior::Allow
         ));
+    }
+
+    #[tokio::test]
+    async fn agent_tool_check_permissions_allows_scratchpad_delegation() {
+        let _home = TestConfigHome::new("agent-scratchpad-delegation");
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        let scratchpad = directory.path().join("session").join("scratchpad");
+        let nested = scratchpad.join("scripts");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        let tool = AgentTool::new();
+        let spawner = Arc::new(ScriptedSpawner::new(success_result()));
+
+        for mode in ["default", "auto"] {
+            let context = ToolContext::new()
+                .with_cwd(project.to_string_lossy())
+                .with_path_scope_roots([project.clone()])
+                .with_auto_approved_write_roots([scratchpad.clone()])
+                .with_permission_mode(mode)
+                .with_sub_agent_spawner(spawner.clone() as Arc<dyn SubAgentSpawner>);
+            for input in [
+                json!({
+                    "prompt": "prepare a temporary script",
+                    "allowed_roots": [nested.to_string_lossy()]
+                }),
+                json!({
+                    "prompt": "prepare a temporary script",
+                    "cwd": nested.to_string_lossy()
+                }),
+            ] {
+                let decision = tool.check_permissions(&input, &context).await.unwrap();
+                assert_eq!(
+                    decision.behavior,
+                    rebon_tools_core::PermissionBehavior::Allow
+                );
+                tool.call(input, &context).await.unwrap();
+            }
+        }
+        let calls = spawner
+            .calls
+            .lock()
+            .expect("scripted spawner calls poisoned");
+        assert_eq!(calls.len(), 4);
+        assert!(calls
+            .iter()
+            .all(|spec| spec.allowed_roots == vec![nested.clone()]));
+    }
+
+    #[tokio::test]
+    async fn agent_tool_check_permissions_keeps_scratchpad_siblings_external() {
+        let _home = TestConfigHome::new("agent-scratchpad-siblings");
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        let session = directory.path().join("session");
+        let scratchpad = session.join("scratchpad");
+        let sibling = session.join("other");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&scratchpad).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let context = ToolContext::new()
+            .with_cwd(project.to_string_lossy())
+            .with_auto_approved_write_roots([scratchpad.clone()]);
+        let tool = AgentTool::new();
+
+        for outside in [&sibling, &scratchpad.join("..").join("other")] {
+            let input = json!({
+                "prompt": "prepare a script",
+                "cwd": outside.to_string_lossy()
+            });
+            let decision = tool.check_permissions(&input, &context).await.unwrap();
+            assert_eq!(decision.behavior, rebon_tools_core::PermissionBehavior::Ask);
+            let mut spec = parse_input(&input).unwrap().sub_agent;
+            assert!(enforce_child_path_scope(tool.id(), &context, &mut spec, None).is_err());
+        }
+        let input = json!({
+            "prompt": "prepare a temporary script",
+            "allowed_roots": [session.to_string_lossy()]
+        });
+        let mut spec = parse_input(&input).unwrap().sub_agent;
+        enforce_child_path_scope(tool.id(), &context, &mut spec, None).unwrap();
+        assert_eq!(spec.allowed_roots, vec![scratchpad]);
     }
 
     #[tokio::test]
