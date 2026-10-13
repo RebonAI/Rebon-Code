@@ -345,7 +345,7 @@ mod tests {
         );
         assert_eq!(
             described("/update status|check|skip|channel <latest|stable>|auto <on|off|status>"),
-            "Manage local Rebon update checks"
+            "Check and install Rebon updates"
         );
     }
 
