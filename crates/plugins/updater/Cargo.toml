@@ -18,6 +18,8 @@ rebon-slash-commands.workspace = true
 # Update preferences live in the settings file, not here: this crate reads and
 # writes `UpdatePreferences` and never re-decides where the config home is.
 rebon-config.workspace = true
+rebon-tools-core.workspace = true
+semver = "1"
 
 anyhow.workspace = true
 clap.workspace = true

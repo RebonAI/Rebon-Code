@@ -1337,7 +1337,7 @@ fn run_update(cx: Cx<'_>, command: &str) -> Option<bool> {
     let cmd = rebon_plugin_updater::parse_update_command(command)?;
     let (app, session, handle, ..) = cx.split();
     accept(app, session, command);
-    handle_update_command(app, handle, cmd);
+    handle_update_command(app, handle, cmd, command);
     app.follow_transcript_tail = true;
     Some(false)
 }

@@ -32,11 +32,15 @@ pub struct UpdateCheckResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PackageNameError {}
+pub enum PackageNameError {
+    Invalid(String),
+}
 
 impl std::fmt::Display for PackageNameError {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {}
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(name) => write!(f, "invalid npm update package name: {name:?}"),
+        }
     }
 }
 
@@ -51,6 +55,21 @@ struct NpmRegistryMetadata {
 pub async fn check_for_update() -> anyhow::Result<UpdateCheckResult> {
     let prefs = rebon_config::load_update_preferences()?;
     check_for_update_with_preferences(reqwest::Client::new(), &prefs).await
+}
+
+/// An explicit request keeps the chosen channel but ignores notification-only
+/// preferences. It may update only the package whose launcher was validated.
+pub(crate) async fn check_for_manual_update() -> anyhow::Result<UpdateCheckResult> {
+    anyhow::ensure!(configured_package_name()? == "@rebon/cli", "manual npm updates require the installed @rebon/cli package; REBON_UPDATE_PACKAGE cannot redirect installation");
+    let prefs = manual_preferences(&rebon_config::load_update_preferences()?);
+    check_for_update_with_preferences(reqwest::Client::new(), &prefs).await
+}
+
+fn manual_preferences(prefs: &UpdatePreferences) -> UpdatePreferences {
+    UpdatePreferences {
+        channel: prefs.channel.clone(),
+        ..UpdatePreferences::default()
+    }
 }
 
 async fn check_for_update_with_preferences(
@@ -91,6 +110,8 @@ async fn check_for_update_with(
     let latest_version = latest_version_from_metadata(&metadata, tag).ok_or_else(|| {
         anyhow::anyhow!("npm metadata for {package_name} had no {tag:?} dist-tag")
     })?;
+    semver::Version::parse(&latest_version)
+        .map_err(|err| anyhow::anyhow!("invalid npm dist-tag version {latest_version:?}: {err}"))?;
     Ok(build_result(package_name, url, tag, latest_version, prefs))
 }
 
@@ -139,10 +160,35 @@ pub fn configured_package_name() -> Result<String, PackageNameError> {
     if let Ok(value) = std::env::var(PACKAGE_OVERRIDE_ENV) {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
+            validate_package_name(trimmed)?;
             return Ok(trimmed.to_string());
         }
     }
     default_package_name(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn validate_package_name(name: &str) -> Result<(), PackageNameError> {
+    fn part(value: &str) -> bool {
+        value
+            .as_bytes()
+            .first()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && value
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"._-".contains(&c))
+    }
+    let valid = if let Some(scoped) = name.strip_prefix('@') {
+        scoped
+            .split_once('/')
+            .is_some_and(|(scope, package)| part(scope) && part(package))
+    } else {
+        part(name)
+    };
+    if valid && name.len() <= 214 {
+        Ok(())
+    } else {
+        Err(PackageNameError::Invalid(name.to_string()))
+    }
 }
 
 pub fn default_package_name(_os: &str, _arch: &str) -> Result<String, PackageNameError> {
@@ -204,6 +250,48 @@ pub fn parse_metadata_and_decide_with_preferences(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_request_ignores_notification_preferences_but_keeps_channel() {
+        let prefs = UpdatePreferences {
+            disabled: true,
+            skipped_version: Some("99.0.0".into()),
+            dismissed_version: Some("99.0.0".into()),
+            channel: Some("stable".into()),
+            ..UpdatePreferences::default()
+        };
+        let manual = manual_preferences(&prefs);
+        assert!(!manual.disabled);
+        assert!(manual.skipped_version.is_none());
+        assert!(manual.dismissed_version.is_none());
+        let (latest, tag, decision) = parse_metadata_and_decide_with_preferences(
+            r#"{"dist-tags":{"latest":"100.0.0","stable":"99.0.0"}}"#,
+            &manual,
+            "1.0.0",
+        )
+        .unwrap();
+        assert_eq!(tag, "stable");
+        assert_eq!(latest, "99.0.0");
+        assert!(matches!(decision, UpdateDecision::Update { .. }));
+    }
+
+    #[test]
+    fn rejects_package_option_and_url_injection() {
+        for name in [
+            "--global",
+            "@rebon/cli;evil",
+            "file:/tmp/evil",
+            "https://evil/x",
+            "@rebon/cli@evil",
+            "../cli",
+            "a b",
+            "a\nb",
+            "@rebon/cli/extra",
+        ] {
+            assert!(validate_package_name(name).is_err(), "{name}");
+        }
+        assert!(validate_package_name("@rebon/cli").is_ok());
+    }
 
     #[test]
     fn uses_unified_default_package_name() {

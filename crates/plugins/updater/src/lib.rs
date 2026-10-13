@@ -49,6 +49,7 @@ use rebon_kernel::{Context, KernelError, Plugin, PluginDef, PluginHost, PluginKi
 pub mod check;
 pub mod cli;
 pub mod command;
+pub mod install;
 pub mod installation;
 pub mod seat;
 pub mod updater;
@@ -91,7 +92,7 @@ pub fn update_check_seat(ctx: &Context) -> Option<Arc<UpdateCheckSeat>> {
 /// only the terminal runs it, and narrowing that is a product decision, not
 /// this crate's.
 pub fn command_spec() -> CommandSpec {
-    CommandSpec::new("update", "Manage local Rebon update checks")
+    CommandSpec::new("update", "Check and install Rebon updates")
         .zh_aliases(["更新"])
         .hint("status|check|skip|channel <latest|stable>|auto <on|off|status>")
         .surfaces(Surfaces::LOCAL)

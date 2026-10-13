@@ -326,31 +326,46 @@ function resolveExecutable(packageInfo) {
   const info = packageInfo || readPackageInfo();
   const installed = readInstalledExecutable(info);
   if (installed) {
-    return { exe: installed, usedFallback: false, installError: null };
+    return { exe: installed, packageRoot: info.packageRoot, usedFallback: false, installError: null };
   }
 
   let installError = null;
   try {
     const managed = installManagedPackage(info);
     if (managed) {
-      return { exe: managed, usedFallback: false, installError: null };
+      return { exe: managed, packageRoot: info.packageRoot, usedFallback: false, installError: null };
     }
   } catch (error) {
     installError = error;
   }
 
   if (fs.existsSync(info.payloadPath)) {
-    return { exe: info.payloadPath, usedFallback: true, installError };
+    return { exe: info.payloadPath, packageRoot: info.packageRoot, usedFallback: true, installError };
   }
 
   return { exe: null, usedFallback: false, installError };
 }
 
 function spawnResolvedExecutable(resolved, argv, spawnImpl) {
+  const env = { ...process.env, REBON_CODE_MODE_NODE: process.execPath };
+  // The wrapper selected this platform package. Preserve that relationship,
+  // but replace its JS bin path with the executable we actually start.
+  delete env.REBON_NPM_INSTALL;
+  try {
+    const source = JSON.parse(process.env.REBON_NPM_INSTALL);
+    if (typeof source.platform === "string" && resolved.packageRoot &&
+        path.resolve(source.platform) === path.resolve(resolved.packageRoot)) {
+      env.REBON_NPM_INSTALL = JSON.stringify({
+        ...source, executable: resolved.exe, node: process.execPath,
+      });
+    }
+  } catch (_) {
+    // A standalone platform launcher has no wrapper provenance to forward.
+  }
   const child = spawnImpl(resolved.exe, argv, {
     stdio: "inherit",
     windowsHide: false,
-    env: { ...process.env, REBON_CODE_MODE_NODE: process.execPath },
+    env,
   });
 
   child.on("error", (error) => {

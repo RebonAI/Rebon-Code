@@ -22,6 +22,7 @@ use crate::installation::{
 /// One parsed `/update` line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateCommand {
+    Install,
     Status,
     Check,
     Skip,
@@ -60,14 +61,14 @@ impl UpdateCommandOutcome {
 pub fn parse_update_command(text: &str) -> Option<UpdateCommand> {
     let rest = strip_command_prefix(text, "update")?;
     if rest.is_empty() {
-        return Some(UpdateCommand::Status);
+        return Some(UpdateCommand::Install);
     }
     if !rest.starts_with(' ') {
         return None;
     }
     let args: Vec<&str> = rest.split_whitespace().collect();
     if args.is_empty() {
-        return Some(UpdateCommand::Status);
+        return Some(UpdateCommand::Install);
     }
     Some(match args[0].to_ascii_lowercase().as_str() {
         "status" if args.len() == 1 => UpdateCommand::Status,
@@ -106,6 +107,9 @@ pub fn run_update_command(
     handle: &tokio::runtime::Handle,
 ) -> UpdateCommandOutcome {
     match cmd {
+        UpdateCommand::Install => {
+            report_install_result(handle.block_on(crate::install::install_update(|_| {})))
+        }
         UpdateCommand::Status => UpdateCommandOutcome::say(format_update_status(notice)),
         UpdateCommand::Check => {
             let mut outcome = match handle.block_on(crate::check::check_for_update()) {
@@ -187,34 +191,76 @@ pub fn run_update_command(
 /// by `/update check` and by the front end draining the startup check, so the
 /// two cannot drift into describing the same result differently.
 pub fn report_check_result(result: crate::check::UpdateCheckResult) -> UpdateCommandOutcome {
-    if matches!(
-        result.decision,
-        crate::updater::update_decision::UpdateDecision::Update { .. }
-    ) {
-        let message = format!(
-            "Update available: {} {} (current {}). Manual update command (not run): {}",
-            result.package_name, result.latest_version, result.current_version, result.command
-        );
-        UpdateCommandOutcome {
-            messages: vec![message],
-            notice: NoticeChange::Set(UpdateNoticeState {
-                current_version: result.current_version,
-                latest_version: result.latest_version,
-                package_name: result.package_name,
-                command: result.command,
-                checked_at: result.checked_at,
-            }),
+    report_check_result_for_installation(result, &detect_current_installation())
+}
+
+fn report_check_result_for_installation(
+    result: crate::check::UpdateCheckResult,
+    installation: &crate::updater::InstallationDetection,
+) -> UpdateCommandOutcome {
+    use crate::updater::update_decision::UpdateDecision;
+    let message = match result.decision {
+        UpdateDecision::Update { .. } => {
+            return UpdateCommandOutcome {
+                messages: vec![format!(
+                    "Rebon {} -> {}\nUpdate available. {}",
+                    result.current_version,
+                    result.latest_version,
+                    crate::installation::update_action(installation),
+                )],
+                notice: NoticeChange::Set(UpdateNoticeState {
+                    current_version: result.current_version,
+                    latest_version: result.latest_version,
+                    package_name: result.package_name,
+                    command: result.command,
+                    checked_at: result.checked_at,
+                }),
+            };
         }
-    } else {
-        UpdateCommandOutcome::say(format!(
-            "No visible update: current={}, selected latest={}, decision={:?}.",
-            result.current_version, result.latest_version, result.decision
-        ))
+        UpdateDecision::AlreadyAtOrAboveLatest => {
+            format!("Rebon {} is up to date.", result.current_version)
+        }
+        UpdateDecision::AutoUpdatesDisabled => "Update checks are disabled.".to_string(),
+        UpdateDecision::NoCurrentVersion => {
+            "Cannot check for updates: the current version is unknown.".to_string()
+        }
+        UpdateDecision::NoLatestVersion => {
+            "Cannot check for updates: no published version was found.".to_string()
+        }
+        UpdateDecision::SkippedByMinimumVersion => format!(
+            "The update notice for Rebon {} is skipped or dismissed.\n{}",
+            result.latest_version,
+            crate::installation::update_action(installation),
+        ),
+    };
+    UpdateCommandOutcome::say(message)
+}
+
+pub fn report_install_result(
+    result: anyhow::Result<crate::install::ManualUpdateResult>,
+) -> UpdateCommandOutcome {
+    match result {
+        Ok(crate::install::ManualUpdateResult::Installed {
+            current_version,
+            latest_version,
+        }) => UpdateCommandOutcome {
+            messages: vec![format!(
+                "Rebon {current_version} -> {latest_version} installed.\nRestart Rebon to use the new version; this session is still running {current_version}."
+            )],
+            notice: NoticeChange::Clear,
+        },
+        Ok(crate::install::ManualUpdateResult::UpToDate { current_version }) => {
+            UpdateCommandOutcome {
+                messages: vec![format!("Rebon {current_version} is up to date.")],
+                notice: NoticeChange::Clear,
+            }
+        }
+        Err(error) => UpdateCommandOutcome::say(format!("Update failed: {error:#}")),
     }
 }
 
 pub fn update_usage_text() -> &'static str {
-    "Usage: /update [status|check|skip|channel <latest|stable>|auto <on|off|status>]"
+    "Usage: /update [status|check|skip|channel <latest|stable>|auto <on|off|status>]\nWithout arguments, /update checks and installs npm updates. Use /update check to check only."
 }
 
 pub fn apply_skip_update_preferences(prefs: &mut UpdatePreferences, latest: &str) {
@@ -244,9 +290,9 @@ pub fn save_update_auto_install_setting(enabled: bool) -> anyhow::Result<()> {
 
 pub fn auto_install_feedback(enabled: bool) -> &'static str {
     if enabled {
-        "Auto install updates: on. Preference saved; background runner registration is explicit via `rebon update service install`. Package installation remains inactive until installer support lands."
+        "Automatic installation is not available yet. Preference saved as on; use /update for a manual npm update."
     } else {
-        "Auto install updates: off."
+        "Automatic installation preference: off."
     }
 }
 
@@ -268,8 +314,20 @@ mod tests {
     }
 
     #[test]
+    fn bare_update_is_not_a_status_only_command() {
+        assert_ne!(parse_update_command("/update"), Some(UpdateCommand::Status));
+        assert_ne!(
+            parse_update_command("/update   "),
+            Some(UpdateCommand::Status)
+        );
+    }
+
+    #[test]
     fn update_command_parses_local_variants() {
-        assert_eq!(parse_update_command("/update"), Some(UpdateCommand::Status));
+        assert_eq!(
+            parse_update_command("/update"),
+            Some(UpdateCommand::Install)
+        );
         assert_eq!(
             parse_update_command("/update status"),
             Some(UpdateCommand::Status)
@@ -364,21 +422,27 @@ mod tests {
     /// check` produced it, and carries the notice the prompt hint is built
     /// from.
     #[test]
-    fn a_found_update_reports_one_line_and_a_notice() {
-        let outcome = report_check_result(UpdateCheckResult {
-            current_version: "1.0.0".to_string(),
-            latest_version: "1.1.0".to_string(),
-            package_name: "@rebon/cli".to_string(),
-            source: "https://registry.npmjs.org/@rebon%2fcli".to_string(),
-            command: "npm install -g @rebon/cli@latest".to_string(),
-            checked_at: SystemTime::UNIX_EPOCH,
-            decision: UpdateDecision::Update {
-                target_version: "1.1.0".to_string(),
+    fn a_found_update_reports_a_summary_and_a_notice() {
+        let outcome = report_check_result_for_installation(
+            UpdateCheckResult {
+                current_version: "1.0.0".to_string(),
+                latest_version: "1.1.0".to_string(),
+                package_name: "@rebon/cli".to_string(),
+                source: "https://registry.npmjs.org/@rebon%2fcli".to_string(),
+                command: "npm install -g @rebon/cli@latest".to_string(),
+                checked_at: SystemTime::UNIX_EPOCH,
+                decision: UpdateDecision::Update {
+                    target_version: "1.1.0".to_string(),
+                },
             },
-        });
+            &crate::updater::InstallationDetection {
+                installation_type: crate::updater::InstallationType::NpmGlobal,
+                evidence: "test npm installation".into(),
+            },
+        );
         assert_eq!(
             outcome.messages,
-            vec!["Update available: @rebon/cli 1.1.0 (current 1.0.0). Manual update command (not run): npm install -g @rebon/cli@latest".to_string()]
+            vec!["Rebon 1.0.0 -> 1.1.0\nUpdate available. Run /update to check and install. Restart Rebon after updating.".to_string()]
         );
         assert_eq!(outcome.notice, NoticeChange::Set(notice()));
     }
@@ -387,20 +451,79 @@ mod tests {
     /// that was already current never gets a hint pinned above its prompt.
     #[test]
     fn a_current_install_reports_no_notice() {
-        let outcome = report_check_result(UpdateCheckResult {
-            current_version: "1.1.0".to_string(),
-            latest_version: "1.1.0".to_string(),
-            package_name: "@rebon/cli".to_string(),
-            source: "test".to_string(),
-            command: "npm install -g @rebon/cli@latest".to_string(),
-            checked_at: SystemTime::UNIX_EPOCH,
-            decision: UpdateDecision::AlreadyAtOrAboveLatest,
-        });
+        let outcome = report_check_result_for_installation(
+            UpdateCheckResult {
+                current_version: "1.1.0".to_string(),
+                latest_version: "1.1.0".to_string(),
+                package_name: "@rebon/cli".to_string(),
+                source: "test".to_string(),
+                command: "npm install -g @rebon/cli@latest".to_string(),
+                checked_at: SystemTime::UNIX_EPOCH,
+                decision: UpdateDecision::AlreadyAtOrAboveLatest,
+            },
+            &crate::updater::InstallationDetection {
+                installation_type: crate::updater::InstallationType::NpmGlobal,
+                evidence: "test npm installation".into(),
+            },
+        );
         assert_eq!(
             outcome.messages,
-            vec!["No visible update: current=1.1.0, selected latest=1.1.0, decision=AlreadyAtOrAboveLatest.".to_string()]
+            vec!["Rebon 1.1.0 is up to date.".to_string()]
         );
         assert_eq!(outcome.notice, NoticeChange::Keep);
+    }
+
+    #[test]
+    fn check_suppressions_and_failures_are_readable_without_debug_fields() {
+        for (decision, expected) in [
+            (UpdateDecision::AutoUpdatesDisabled, "Update checks are disabled."),
+            (UpdateDecision::NoCurrentVersion, "Cannot check for updates: the current version is unknown."),
+            (UpdateDecision::NoLatestVersion, "Cannot check for updates: no published version was found."),
+            (UpdateDecision::SkippedByMinimumVersion, "The update notice for Rebon 1.1.0 is skipped or dismissed.\nUse the original installer to update this standalone installation."),
+        ] {
+            let outcome = report_check_result_for_installation(
+                UpdateCheckResult {
+                    current_version: "1.0.0".into(),
+                    latest_version: "1.1.0".into(),
+                    package_name: "@rebon/cli".into(),
+                    source: "test".into(),
+                    command: "npm install -g @rebon/cli@latest".into(),
+                    checked_at: SystemTime::UNIX_EPOCH,
+                    decision,
+                },
+                &crate::updater::InstallationDetection {
+                    installation_type: crate::updater::InstallationType::Native,
+                    evidence: "test standalone installation".into(),
+                },
+            );
+            assert_eq!(outcome.messages, vec![expected]);
+            assert_eq!(outcome.notice, NoticeChange::Keep);
+        }
+    }
+
+    #[test]
+    fn manual_update_results_distinguish_installation_from_the_running_version() {
+        let outcome = report_install_result(Ok(crate::install::ManualUpdateResult::Installed {
+            current_version: "1.0.0".to_string(),
+            latest_version: "1.1.0".to_string(),
+        }));
+        assert_eq!(outcome.notice, NoticeChange::Clear);
+        assert_eq!(outcome.messages, vec![
+            "Rebon 1.0.0 -> 1.1.0 installed.\nRestart Rebon to use the new version; this session is still running 1.0.0."
+        ]);
+
+        let outcome = report_install_result(Ok(crate::install::ManualUpdateResult::UpToDate {
+            current_version: "1.1.0".to_string(),
+        }));
+        assert_eq!(outcome.notice, NoticeChange::Clear);
+        assert_eq!(outcome.messages, vec!["Rebon 1.1.0 is up to date."]);
+
+        let outcome = report_install_result(Err(anyhow::anyhow!("npm exited with code 1")));
+        assert_eq!(outcome.notice, NoticeChange::Keep);
+        assert_eq!(
+            outcome.messages,
+            vec!["Update failed: npm exited with code 1"]
+        );
     }
 
     #[test]
@@ -465,16 +588,19 @@ mod tests {
         assert_eq!(prefs.dismissed_at_ms, Some(456));
         assert_eq!(
             auto_install_feedback(true),
-            "Auto install updates: on. Preference saved; background runner registration is explicit via `rebon update service install`. Package installation remains inactive until installer support lands."
+            "Automatic installation is not available yet. Preference saved as on; use /update for a manual npm update."
         );
-        assert_eq!(auto_install_feedback(false), "Auto install updates: off.");
+        assert_eq!(
+            auto_install_feedback(false),
+            "Automatic installation preference: off."
+        );
         let detection = crate::updater::InstallationDetection {
             installation_type: crate::updater::InstallationType::Development,
             evidence: "test target/debug path".to_string(),
         };
         let auto_status = format_auto_install_status(&prefs, &detection);
-        assert!(auto_status.contains("Auto install updates: on."));
-        assert!(auto_status.contains("installationSource: development"));
-        assert!(auto_status.contains("autoInstallSupported: no"));
+        assert!(auto_status.contains("Automatic installation: unavailable (preference on)"));
+        assert!(auto_status.contains("Installation: development"));
+        assert!(auto_status.contains("Update and rebuild your development checkout"));
     }
 }

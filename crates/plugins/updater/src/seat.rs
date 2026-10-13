@@ -29,8 +29,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::check::{check_for_update, UpdateCheckResult};
 
@@ -59,6 +59,31 @@ pub enum UpdateCheckPoll {
     Cancelled,
 }
 
+#[derive(Debug)]
+pub enum UpdateInstallPoll {
+    Idle,
+    Pending,
+    Progress(String),
+    Ready(anyhow::Result<crate::install::ManualUpdateResult>),
+    Cancelled,
+}
+
+enum InstallEvent {
+    Progress(String),
+    Finished(anyhow::Result<crate::install::ManualUpdateResult>),
+}
+
+struct PendingInstall {
+    id: u64,
+    receiver: mpsc::UnboundedReceiver<(u64, InstallEvent)>,
+}
+
+#[derive(Default)]
+struct InstallState {
+    next_id: u64,
+    pending: Option<PendingInstall>,
+}
+
 /// The process's one startup update check.
 pub struct UpdateCheckSeat {
     /// Set the first time [`UpdateCheckSeat::poll`] decides whether to run a
@@ -68,6 +93,7 @@ pub struct UpdateCheckSeat {
     decided: AtomicBool,
     /// The in-flight check's answer, until a front end takes it.
     pending: Mutex<Option<oneshot::Receiver<anyhow::Result<UpdateCheckResult>>>>,
+    install: Mutex<InstallState>,
 }
 
 impl Default for UpdateCheckSeat {
@@ -81,6 +107,7 @@ impl UpdateCheckSeat {
         Self {
             decided: AtomicBool::new(false),
             pending: Mutex::new(None),
+            install: Mutex::new(InstallState::default()),
         }
     }
 
@@ -143,6 +170,57 @@ impl UpdateCheckSeat {
         }
     }
 
+    pub fn start_install(&self, handle: &tokio::runtime::Handle) -> bool {
+        let mut state = self.install.lock().expect("update-install slot poisoned");
+        if state.pending.is_some() {
+            return false;
+        }
+        state.next_id += 1;
+        let id = state.next_id;
+        let (sender, receiver) = mpsc::unbounded_channel();
+        state.pending = Some(PendingInstall { id, receiver });
+        // 手动更新接管版本检查，避免旧的启动检查在安装后重新弹出通知。
+        self.decided.store(true, Ordering::Release);
+        self.pending
+            .lock()
+            .expect("update-check slot poisoned")
+            .take();
+        handle.spawn(async move {
+            let result = tokio::select! {
+                result = crate::install::install_update(|message| {
+                    let _ = sender.send((id, InstallEvent::Progress(message)));
+                }) => result,
+                _ = sender.closed() => return,
+            };
+            let _ = sender.send((id, InstallEvent::Finished(result)));
+        });
+        true
+    }
+
+    pub fn poll_install(&self) -> UpdateInstallPoll {
+        let mut state = self.install.lock().expect("update-install slot poisoned");
+        let Some(pending) = state.pending.as_mut() else {
+            return UpdateInstallPoll::Idle;
+        };
+        loop {
+            match pending.receiver.try_recv() {
+                Ok((id, _)) if id != pending.id => continue,
+                Ok((_, InstallEvent::Progress(message))) => {
+                    return UpdateInstallPoll::Progress(message);
+                }
+                Ok((_, InstallEvent::Finished(result))) => {
+                    state.pending = None;
+                    return UpdateInstallPoll::Ready(result);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => return UpdateInstallPoll::Pending,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    state.pending = None;
+                    return UpdateInstallPoll::Cancelled;
+                }
+            }
+        }
+    }
+
     /// Run one check now, for a user who asked for it rather than for startup.
     ///
     /// Separate from the startup slot on purpose: `/update check` reports its
@@ -156,6 +234,74 @@ impl UpdateCheckSeat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_progress_ignores_stale_events_and_finishes_once() {
+        let seat = UpdateCheckSeat::new();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        seat.install
+            .lock()
+            .expect("update-install slot poisoned")
+            .pending = Some(PendingInstall { id: 2, receiver });
+        sender
+            .send((1, InstallEvent::Progress("stale".into())))
+            .unwrap();
+        sender
+            .send((2, InstallEvent::Progress("Installing".into())))
+            .unwrap();
+        assert!(
+            matches!(seat.poll_install(), UpdateInstallPoll::Progress(message) if message == "Installing")
+        );
+        assert!(matches!(seat.poll_install(), UpdateInstallPoll::Pending));
+        sender
+            .send((
+                2,
+                InstallEvent::Finished(Ok(crate::install::ManualUpdateResult::UpToDate {
+                    current_version: "1.1.0".into(),
+                })),
+            ))
+            .unwrap();
+        assert!(matches!(
+            seat.poll_install(),
+            UpdateInstallPoll::Ready(Ok(_))
+        ));
+        assert!(matches!(seat.poll_install(), UpdateInstallPoll::Idle));
+    }
+
+    #[test]
+    fn an_active_install_rejects_duplicates_and_reports_disconnection() {
+        let seat = UpdateCheckSeat::new();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        seat.install
+            .lock()
+            .expect("update-install slot poisoned")
+            .pending = Some(PendingInstall { id: 1, receiver });
+        assert!(!seat.start_install(runtime.handle()));
+        drop(sender);
+        assert!(matches!(seat.poll_install(), UpdateInstallPoll::Cancelled));
+        assert!(matches!(seat.poll_install(), UpdateInstallPoll::Idle));
+    }
+
+    #[test]
+    fn install_failure_is_delivered_without_claiming_success() {
+        let seat = UpdateCheckSeat::new();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        seat.install
+            .lock()
+            .expect("update-install slot poisoned")
+            .pending = Some(PendingInstall { id: 1, receiver });
+        sender
+            .send((
+                1,
+                InstallEvent::Finished(Err(anyhow::anyhow!("npm failed"))),
+            ))
+            .unwrap();
+        assert!(
+            matches!(seat.poll_install(), UpdateInstallPoll::Ready(Err(error)) if error.to_string() == "npm failed")
+        );
+        assert!(matches!(seat.poll_install(), UpdateInstallPoll::Idle));
+    }
 
     /// The terminal's first drain is what asks npm, and every drain after it
     /// only reads: one request per process, however many frames follow.

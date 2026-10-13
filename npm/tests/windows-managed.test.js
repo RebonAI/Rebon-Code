@@ -165,10 +165,25 @@ function testLauncherSpawnsManifestExecutable() {
     let spawned = null;
     const fakeChild = new EventEmitter();
 
-    managed.spawnResolvedExecutable(resolved, ["--version"], (command, args, options) => {
-      spawned = { command, args, options };
-      return fakeChild;
+    const originalSource = process.env.REBON_NPM_INSTALL;
+    process.env.REBON_NPM_INSTALL = JSON.stringify({
+      wrapper: path.join(root, "node_modules", "@rebon", "cli"),
+      platform: packageRoot,
+      node: process.execPath,
     });
+    try {
+      managed.spawnResolvedExecutable(resolved, ["--version"], (command, args, options) => {
+        spawned = { command, args, options };
+        return fakeChild;
+      });
+    } finally {
+      if (originalSource === undefined) delete process.env.REBON_NPM_INSTALL;
+      else process.env.REBON_NPM_INSTALL = originalSource;
+    }
+    const source = JSON.parse(spawned.options.env.REBON_NPM_INSTALL);
+    assert.strictEqual(source.executable, resolved.exe);
+    assert.strictEqual(source.platform, packageRoot);
+    assert.strictEqual(source.node, process.execPath);
 
     assert.strictEqual(spawned.command, path.join(managed.managedBinDir(), "versions", "1.2.3", "rebon.exe"));
     assert.deepStrictEqual(spawned.args, ["--version"]);
@@ -179,6 +194,28 @@ function testLauncherSpawnsManifestExecutable() {
   });
 }
 
+function testLauncherDropsUnrelatedOrMalformedProvenance() {
+  withTempEnv((root) => {
+    const packageRoot = createPackage(root);
+    const resolved = managed.resolveExecutable(managed.readPackageInfo(packageRoot));
+    const previous = process.env.REBON_NPM_INSTALL;
+    try {
+      for (const raw of ["invalid", "null", JSON.stringify({ platform: path.join(root, "unrelated") })]) {
+        process.env.REBON_NPM_INSTALL = raw;
+        let env;
+        managed.spawnResolvedExecutable(resolved, [], (_command, _args, options) => {
+          env = options.env;
+          return new EventEmitter();
+        });
+        assert.strictEqual(env.REBON_NPM_INSTALL, undefined);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.REBON_NPM_INSTALL;
+      else process.env.REBON_NPM_INSTALL = previous;
+    }
+  });
+}
+
 const tests = [
   testInstallsFixedVersionLayout,
   testUsesBuildMetadataWhenPresent,
@@ -186,6 +223,7 @@ const tests = [
   testCleanupKeepsCurrentVersionDirectory,
   testFallsBackWhenCurrentVersionDirectoryCannotBeReplaced,
   testLauncherSpawnsManifestExecutable,
+  testLauncherDropsUnrelatedOrMalformedProvenance,
 ];
 
 for (const test of tests) {

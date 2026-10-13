@@ -76,7 +76,18 @@ const args = isJavaScript
 const child = spawn(command, args, {
   stdio: "inherit",
   windowsHide: false,
-  env: { ...process.env, REBON_CODE_MODE_NODE: process.execPath },
+  env: {
+    ...process.env,
+    REBON_CODE_MODE_NODE: process.execPath,
+    // Replace inherited hints: a nested launcher must describe its own install.
+    // Rust validates these paths and package manifests before using them.
+    REBON_NPM_INSTALL: JSON.stringify({
+      wrapper: path.resolve(__dirname, ".."),
+      platform: path.dirname(packageJsonPath),
+      executable: binTarget,
+      node: process.execPath,
+    }),
+  },
 });
 
 child.on("error", (error) => {
