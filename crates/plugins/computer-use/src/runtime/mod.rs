@@ -18,6 +18,8 @@ pub mod main_thread;
 mod protocol;
 mod session;
 
+#[cfg(target_os = "macos")]
+pub use backend::macos_permissions;
 pub use backend::{Backend, NativeBackend};
 pub use endpoint_file::{
     clear_endpoint_record, load_endpoint_record, store_endpoint_record, EndpointRecord,

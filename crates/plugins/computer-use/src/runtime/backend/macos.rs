@@ -12,8 +12,6 @@ use base64::Engine;
 use cocoa::base::{id, nil};
 use cocoa::foundation::{NSAutoreleasePool, NSString};
 use core_foundation::base::TCFType;
-use core_foundation::dictionary::CFDictionaryRef;
-use core_graphics::access::ScreenCaptureAccess;
 use core_graphics::color_space::CGColorSpace;
 use core_graphics::context::CGContext;
 use core_graphics::display::{
@@ -32,8 +30,9 @@ use foreign_types::ForeignType;
 use image::codecs::png::PngEncoder;
 use image::imageops::FilterType;
 use image::{ExtendedColorType, ImageEncoder, RgbaImage};
-use objc::{class, msg_send, sel, sel_impl};
+use objc::{msg_send, sel, sel_impl};
 
+use super::macos_permissions;
 use super::overlay::Overlay;
 use super::Backend;
 use crate::runtime::{
@@ -104,18 +103,7 @@ impl MacBackend {
     }
 
     fn permissions(&self) -> PermissionStatus {
-        PermissionStatus {
-            screen_recording: if ScreenCaptureAccess.preflight() {
-                PermissionState::Granted
-            } else {
-                PermissionState::Denied
-            },
-            accessibility: if unsafe { AXIsProcessTrusted() } {
-                PermissionState::Granted
-            } else {
-                PermissionState::Denied
-            },
-        }
+        macos_permissions::status()
     }
 
     fn clear_active_marker(&self) {
@@ -574,17 +562,8 @@ impl Backend for MacBackend {
     }
 
     fn request_permissions(&mut self) -> Result<StatusResponse, ComputerUseError> {
-        let _ = ScreenCaptureAccess.request();
-        unsafe {
-            let pool = NSAutoreleasePool::new(nil);
-            let key = NSString::alloc(nil).init_str("AXTrustedCheckOptionPrompt");
-            let yes: id = msg_send![class!(NSNumber), numberWithBool: true];
-            let options: id =
-                msg_send![class!(NSDictionary), dictionaryWithObject: yes forKey: key];
-            let _ = AXIsProcessTrustedWithOptions(options as CFDictionaryRef);
-            let _: () = msg_send![key, release];
-            let _: () = msg_send![pool, drain];
-        }
+        macos_permissions::request_screen_recording();
+        macos_permissions::request_accessibility();
         Ok(self.current_status())
     }
 
@@ -1101,8 +1080,6 @@ fn input_error() -> ComputerUseError {
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn AXIsProcessTrusted() -> bool;
-    fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;
     fn CGEventKeyboardSetUnicodeString(
         event: core_graphics::sys::CGEventRef,
         string_length: usize,
