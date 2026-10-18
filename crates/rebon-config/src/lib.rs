@@ -172,6 +172,71 @@ pub struct ModelTokenPricing {
     pub cache_write: f64,
 }
 
+impl ModelTokenPricing {
+    /// What one usage record, or a total of several, costs at these rates,
+    /// in USD.
+    ///
+    /// The one place token counts become money: `/cost` and the desktop's
+    /// session cost both price through it, so the two cannot disagree.
+    pub fn usd_for(&self, usage: &rebon_types::Usage) -> f64 {
+        let billed = BilledTokens::of(usage);
+        let cost = |tokens: u64, rate: f64| tokens as f64 * rate / 1_000_000.0;
+        cost(billed.input, self.input)
+            + cost(billed.output, self.output)
+            + cost(billed.cache_read, self.cache_read)
+            + cost(billed.cache_write, self.cache_write)
+    }
+}
+
+/// The four token counts a bill is made of, after the per-vendor shapes are
+/// reconciled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BilledTokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl BilledTokens {
+    /// Split one usage record into what each rate applies to.
+    ///
+    /// openai-shaped usage already counts hits and misses inside
+    /// `input_tokens`; only the hit slice moves to the cache-read rate, and
+    /// misses stay billed as plain input. Anthropic-shaped usage reports the
+    /// cache counts alongside `input_tokens` instead.
+    ///
+    /// One function because two callers price the same session in two
+    /// currencies, and a second copy of this arithmetic would eventually
+    /// disagree with the first.
+    pub fn of(usage: &rebon_types::Usage) -> Self {
+        let openai_shaped = usage.input_tokens > 0
+            && (usage.prompt_cache_hit_tokens > 0 || usage.prompt_cache_miss_tokens > 0);
+        Self {
+            input: u64::from(if openai_shaped {
+                usage
+                    .input_tokens
+                    .saturating_sub(usage.prompt_cache_hit_tokens)
+            } else {
+                usage.input_tokens
+            }),
+            output: u64::from(usage.output_tokens),
+            cache_read: u64::from(
+                usage
+                    .cache_read_input_tokens
+                    .saturating_add(usage.prompt_cache_hit_tokens),
+            ),
+            cache_write: u64::from(if openai_shaped {
+                usage.cache_creation_input_tokens
+            } else {
+                usage
+                    .cache_creation_input_tokens
+                    .saturating_add(usage.prompt_cache_miss_tokens)
+            }),
+        }
+    }
+}
+
 pub type ModelPricingCatalog = BTreeMap<String, BTreeMap<String, ModelTokenPricing>>;
 
 /// Built-in offline pricing.
@@ -266,6 +331,96 @@ pub fn resolve_model_pricing(
         cache_read: cost.cache_read.unwrap_or(input),
         cache_write: cost.cache_write.unwrap_or(input),
     })
+}
+
+#[cfg(test)]
+mod usage_pricing_tests {
+    use super::*;
+    use rebon_types::Usage;
+
+    const RATES: ModelTokenPricing = ModelTokenPricing {
+        input: 10.0,
+        output: 50.0,
+        cache_read: 1.0,
+        cache_write: 12.5,
+    };
+
+    fn usage(input: u32, output: u32, read: u32, write: u32, hit: u32, miss: u32) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: read,
+            cache_creation_input_tokens: write,
+            prompt_cache_hit_tokens: hit,
+            prompt_cache_miss_tokens: miss,
+            ..Usage::default()
+        }
+    }
+
+    fn billed(input: u64, output: u64, cache_read: u64, cache_write: u64) -> BilledTokens {
+        BilledTokens {
+            input,
+            output,
+            cache_read,
+            cache_write,
+        }
+    }
+
+    #[test]
+    fn anthropic_shape_bills_cache_counts_beside_input() {
+        assert_eq!(
+            BilledTokens::of(&usage(10, 20, 300, 40, 0, 0)),
+            billed(10, 20, 300, 40)
+        );
+    }
+
+    #[test]
+    fn openai_shape_moves_only_the_hit_slice_out_of_input() {
+        assert_eq!(
+            BilledTokens::of(&usage(1000, 5, 0, 0, 600, 400)),
+            billed(400, 5, 600, 0)
+        );
+    }
+
+    #[test]
+    fn openai_misses_alone_stay_plain_input() {
+        assert_eq!(
+            BilledTokens::of(&usage(1000, 5, 0, 7, 0, 400)),
+            billed(1000, 5, 0, 7)
+        );
+    }
+
+    #[test]
+    fn hits_without_input_are_anthropic_shaped() {
+        // No input to carve the hit slice out of: the miss counts as a write.
+        assert_eq!(
+            BilledTokens::of(&usage(0, 5, 2, 3, 600, 400)),
+            billed(0, 5, 602, 403)
+        );
+    }
+
+    #[test]
+    fn a_hit_larger_than_input_saturates() {
+        assert_eq!(BilledTokens::of(&usage(100, 0, 0, 0, 150, 0)).input, 0);
+    }
+
+    #[test]
+    fn usd_prices_every_category_per_million() {
+        let one_million_each = usage(1_000_000, 1_000_000, 1_000_000, 1_000_000, 0, 0);
+        assert!((RATES.usd_for(&one_million_each) - (10.0 + 50.0 + 1.0 + 12.5)).abs() < 1e-9);
+        assert_eq!(RATES.usd_for(&Usage::default()), 0.0);
+    }
+
+    #[test]
+    fn a_running_total_costs_what_its_records_cost() {
+        let records = [usage(10, 20, 300, 40, 0, 0), usage(7, 1, 900, 0, 0, 0)];
+        let mut total = Usage::default();
+        for r in records {
+            total.accumulate(r);
+        }
+        let separately: f64 = records.iter().map(|r| RATES.usd_for(r)).sum();
+        assert!((RATES.usd_for(&total) - separately).abs() < 1e-12);
+    }
 }
 
 #[cfg(test)]

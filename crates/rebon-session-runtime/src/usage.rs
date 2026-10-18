@@ -68,9 +68,10 @@ impl UsageLedger {
     /// twice would double it -- one call site per surface, and no call from
     /// anything that merely observes a turn.
     ///
-    /// The folding is [`add`], not `rebon_types::Usage::merge`: `merge` takes
-    /// the non-zero fields of the newer reading, which is what a stream of
-    /// deltas within one turn needs and the opposite of a running total.
+    /// The folding is [`Usage::accumulate`], not `rebon_types::Usage::merge`:
+    /// `merge` takes the non-zero fields of the newer reading, which is what a
+    /// stream of deltas within one turn needs and the opposite of a running
+    /// total.
     pub fn add_turn(
         &mut self,
         provider: impl Into<String>,
@@ -78,12 +79,12 @@ impl UsageLedger {
         usage: Usage,
     ) {
         self.last_turn = usage;
-        add(&mut self.total, usage);
+        self.total.accumulate(usage);
         let bucket = self
             .by_model
             .entry((provider.into(), model.into()))
             .or_default();
-        add(bucket, usage);
+        bucket.accumulate(usage);
     }
 
     /// What the model has reported so far *within* the turn that is running.
@@ -135,45 +136,6 @@ impl UsageLedger {
             started_at_ms: self.started_at_ms,
         }
     }
-}
-
-/// Add one turn's counters into a running total.
-///
-/// Saturating rather than wrapping: a session large enough to overflow these
-/// counters does not exist, and a pinned ceiling is a better failure than a
-/// total that wraps to zero and reads as a session that cost nothing.
-///
-/// The billed totals come from the `Usage` helpers rather than the reported
-/// fields, because what a provider bills for an input is not always what it
-/// reports as one.
-fn add(target: &mut Usage, usage: Usage) {
-    target.input_tokens = target.input_tokens.saturating_add(usage.input_tokens);
-    target.output_tokens = target.output_tokens.saturating_add(usage.output_tokens);
-    target.total_input_tokens = target
-        .total_input_tokens
-        .saturating_add(usage.billed_input_tokens());
-    target.total_output_tokens = target
-        .total_output_tokens
-        .saturating_add(usage.billed_output_tokens());
-    target.cache_read_input_tokens = target
-        .cache_read_input_tokens
-        .saturating_add(usage.cache_read_input_tokens);
-    target.cache_creation_input_tokens = target
-        .cache_creation_input_tokens
-        .saturating_add(usage.cache_creation_input_tokens);
-    target.prompt_cache_hit_tokens = target
-        .prompt_cache_hit_tokens
-        .saturating_add(usage.prompt_cache_hit_tokens);
-    target.prompt_cache_miss_tokens = target
-        .prompt_cache_miss_tokens
-        .saturating_add(usage.prompt_cache_miss_tokens);
-    // The count this ledger replaced folded eight counters and dropped this
-    // one. Nothing in the cli renders reasoning tokens from a total, so
-    // folding it changes no output; what it changes is that the count exists
-    // at all for whoever asks next.
-    target.reasoning_tokens = target
-        .reasoning_tokens
-        .saturating_add(usage.reasoning_tokens);
 }
 
 #[cfg(any(test, feature = "test-support"))]

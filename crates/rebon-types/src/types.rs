@@ -235,6 +235,145 @@ impl Usage {
             self.reasoning_tokens = other.reasoning_tokens;
         }
     }
+
+    /// Add one request's or turn's counters into a running total.
+    ///
+    /// Not [`Self::merge`]: `merge` takes the non-zero fields of the newer
+    /// reading, which is what a stream of deltas within one turn needs and
+    /// the opposite of a running total.
+    ///
+    /// Saturating rather than wrapping: a session large enough to overflow these
+    /// counters does not exist, and a pinned ceiling is a better failure than a
+    /// total that wraps to zero and reads as a session that cost nothing.
+    ///
+    /// The billed totals come from the `Usage` helpers rather than the reported
+    /// fields, because what a provider bills for an input is not always what it
+    /// reports as one.
+    pub fn accumulate(&mut self, usage: Usage) {
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.total_input_tokens = self
+            .total_input_tokens
+            .saturating_add(usage.billed_input_tokens());
+        self.total_output_tokens = self
+            .total_output_tokens
+            .saturating_add(usage.billed_output_tokens());
+        self.cache_read_input_tokens = self
+            .cache_read_input_tokens
+            .saturating_add(usage.cache_read_input_tokens);
+        self.cache_creation_input_tokens = self
+            .cache_creation_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
+        self.prompt_cache_hit_tokens = self
+            .prompt_cache_hit_tokens
+            .saturating_add(usage.prompt_cache_hit_tokens);
+        self.prompt_cache_miss_tokens = self
+            .prompt_cache_miss_tokens
+            .saturating_add(usage.prompt_cache_miss_tokens);
+        // The count this ledger replaced folded eight counters and dropped this
+        // one. Nothing in the cli renders reasoning tokens from a total, so
+        // folding it changes no output; what it changes is that the count exists
+        // at all for whoever asks next.
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(usage.reasoning_tokens);
+    }
+}
+
+#[cfg(test)]
+mod usage_accumulate_tests {
+    use super::*;
+
+    fn anthropic(input: u32, output: u32, read: u32, write: u32) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: read,
+            cache_creation_input_tokens: write,
+            ..Usage::default()
+        }
+    }
+
+    #[test]
+    fn every_counter_is_summed() {
+        let mut total = Usage::default();
+        total.accumulate(Usage {
+            prompt_cache_hit_tokens: 7,
+            prompt_cache_miss_tokens: 3,
+            reasoning_tokens: 5,
+            ..anthropic(10, 20, 30, 40)
+        });
+        total.accumulate(Usage {
+            prompt_cache_hit_tokens: 1,
+            prompt_cache_miss_tokens: 2,
+            reasoning_tokens: 4,
+            ..anthropic(1, 2, 3, 4)
+        });
+        assert_eq!(total.input_tokens, 11);
+        assert_eq!(total.output_tokens, 22);
+        assert_eq!(total.cache_read_input_tokens, 33);
+        assert_eq!(total.cache_creation_input_tokens, 44);
+        assert_eq!(total.prompt_cache_hit_tokens, 8);
+        assert_eq!(total.prompt_cache_miss_tokens, 5);
+        assert_eq!(total.reasoning_tokens, 9);
+    }
+
+    #[test]
+    fn billed_totals_come_from_the_billed_helpers() {
+        let mut total = Usage::default();
+        // Anthropic shape: the context is input plus both cache counts.
+        total.accumulate(anthropic(10, 20, 30, 40));
+        // OpenAI shape: input already holds its cached prefix.
+        total.accumulate(Usage {
+            input_tokens: 100,
+            output_tokens: 5,
+            prompt_cache_hit_tokens: 60,
+            prompt_cache_miss_tokens: 40,
+            ..Usage::default()
+        });
+        assert_eq!(total.total_input_tokens, 80 + 100);
+        assert_eq!(total.total_output_tokens, 25);
+    }
+
+    #[test]
+    fn a_reported_total_is_what_is_billed() {
+        let mut total = Usage::default();
+        total.accumulate(Usage {
+            total_input_tokens: 500,
+            total_output_tokens: 70,
+            ..anthropic(10, 20, 0, 0)
+        });
+        assert_eq!(
+            (total.total_input_tokens, total.total_output_tokens),
+            (500, 70)
+        );
+    }
+
+    #[test]
+    fn counters_pin_at_the_ceiling_instead_of_wrapping() {
+        let mut total = anthropic(u32::MAX - 1, u32::MAX, 0, 0);
+        total.accumulate(anthropic(5, 5, 0, 0));
+        assert_eq!(total.input_tokens, u32::MAX);
+        assert_eq!(total.output_tokens, u32::MAX);
+    }
+
+    #[test]
+    fn accumulating_nothing_changes_nothing() {
+        let mut total = anthropic(1, 2, 3, 4);
+        let before = total;
+        total.accumulate(Usage::default());
+        assert_eq!(total.input_tokens, before.input_tokens);
+        assert_eq!(
+            total.cache_creation_input_tokens,
+            before.cache_creation_input_tokens
+        );
+    }
+
+    #[test]
+    fn accumulate_adds_where_merge_replaces() {
+        let (mut summed, mut merged) = (anthropic(10, 1, 0, 0), anthropic(10, 1, 0, 0));
+        summed.accumulate(anthropic(4, 1, 0, 0));
+        merged.merge(&anthropic(4, 1, 0, 0));
+        assert_eq!((summed.input_tokens, merged.input_tokens), (14, 4));
+    }
 }
 
 #[cfg(test)]

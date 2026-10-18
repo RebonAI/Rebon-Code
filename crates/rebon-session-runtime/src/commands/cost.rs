@@ -136,7 +136,7 @@ fn codex_credit_summary(
             continue;
         };
         priced_any = true;
-        credits += usd_for(usage, &price) * CODEX_CREDITS_PER_USD;
+        credits += price.usd_for(usage) * CODEX_CREDITS_PER_USD;
     }
     if !priced_any {
         return None;
@@ -182,62 +182,6 @@ fn observed_cost_keys(
     }
 }
 
-/// The four token counts a bill is made of, after the per-vendor shapes are
-/// reconciled.
-struct BilledTokens {
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_write: u64,
-}
-
-/// Split one usage record into what each rate applies to.
-///
-/// openai-shaped usage already counts hits and misses inside
-/// `input_tokens`; only the hit slice moves to the cache-read rate, and
-/// misses stay billed as plain input. Anthropic-shaped usage reports the
-/// cache counts alongside `input_tokens` instead.
-///
-/// One function because two callers price the same session in two
-/// currencies, and a second copy of this arithmetic would eventually
-/// disagree with the first.
-fn billed_tokens(usage: &rebon_types::Usage) -> BilledTokens {
-    let openai_shaped = usage.input_tokens > 0
-        && (usage.prompt_cache_hit_tokens > 0 || usage.prompt_cache_miss_tokens > 0);
-    BilledTokens {
-        input: u64::from(if openai_shaped {
-            usage
-                .input_tokens
-                .saturating_sub(usage.prompt_cache_hit_tokens)
-        } else {
-            usage.input_tokens
-        }),
-        output: u64::from(usage.output_tokens),
-        cache_read: u64::from(
-            usage
-                .cache_read_input_tokens
-                .saturating_add(usage.prompt_cache_hit_tokens),
-        ),
-        cache_write: u64::from(if openai_shaped {
-            usage.cache_creation_input_tokens
-        } else {
-            usage
-                .cache_creation_input_tokens
-                .saturating_add(usage.prompt_cache_miss_tokens)
-        }),
-    }
-}
-
-/// What one usage record costs at these rates, in USD.
-fn usd_for(usage: &rebon_types::Usage, price: &crate::rebon_config::ModelTokenPricing) -> f64 {
-    let billed = billed_tokens(usage);
-    let cost = |tokens: u64, rate: f64| tokens as f64 * rate / 1_000_000.0;
-    cost(billed.input, price.input)
-        + cost(billed.output, price.output)
-        + cost(billed.cache_read, price.cache_read)
-        + cost(billed.cache_write, price.cache_write)
-}
-
 pub fn format_historical_usd_cost(
     usage_by_model: &std::collections::BTreeMap<(String, String), rebon_types::Usage>,
     fallback: (&str, &str, rebon_types::Usage),
@@ -262,12 +206,12 @@ pub fn format_historical_usd_cost(
             continue;
         };
 
-        let BilledTokens {
+        let crate::rebon_config::BilledTokens {
             input: input_tokens,
             output: output_tokens,
             cache_read: cache_read_tokens,
             cache_write: cache_write_tokens,
-        } = billed_tokens(usage);
+        } = crate::rebon_config::BilledTokens::of(usage);
         let cost = |tokens: u64, rate: f64| tokens as f64 * rate / 1_000_000.0;
         let input = cost(input_tokens, price.input);
         let output = cost(output_tokens, price.output);
