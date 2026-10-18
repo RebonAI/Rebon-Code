@@ -18,16 +18,21 @@
 //! scheduled this module for deletion one release after hosted
 //! sessions became the default; on 8/31 hosted went back to being opt-in
 //! (`--hosted`), so a plain `rebon` hosts its own session in-process again,
-//! holds its own lock, and publishes no endpoint. That makes this mailbox the
-//! desktop app's only way to reach the default session shape — the one it
-//! resolves as `OwnedOpaque` and reaches through files — rather than an escape
-//! hatch for `--local`. Hosted sessions still go through the endpoint, and the
-//! module stays inert for them: a mirror holds no lock. Revisit retirement only
-//! after the mirror's control and presentation faces are finished, hosted is
-//! the default again, and one release cycle has passed; retiring then still
-//! means deleting this module, the app's `send_foreground_command` fallback,
-//! the `<sid>.live.json` writer and its readers, and
-//! `rebon_session_host::foreground` together.
+//! holds its own lock, and publishes no *owner* endpoint. It does advertise a
+//! narrow loopback agent endpoint in `.live.json` (see
+//! `ForegroundControl::sync_agent_endpoint`), but control traffic still has no
+//! endpoint: that makes this mailbox the desktop app's only way to reach the default
+//! session shape — the one it resolves as `OwnedOpaque` and reaches through
+//! files — rather than an escape hatch for `--local`. Hosted sessions still go
+//! through the endpoint, and the module stays inert for them: a mirror holds
+//! no lock. Revisit retirement only after the mirror's control and presentation
+//! faces are finished, hosted is the default again, and one release cycle has
+//! passed; retiring then still means deleting this module, the app's
+//! `send_foreground_command` fallback, the `<sid>.live.json` writer and its
+//! readers, and `rebon_session_host::foreground` together.
+
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::runtime::Handle;
 
@@ -152,6 +157,13 @@ pub(super) fn execute_foreground_session_command(
 pub(super) struct ForegroundControl {
     mailbox: crate::background::ForegroundMailbox,
     command_handler: Option<ForegroundCommandHandler>,
+    /// Messages accepted by the loopback endpoint, waiting for the event loop.
+    agent_inbox: Arc<rebon_session_host::ForegroundAgentInbox>,
+    /// The listener, alive only while this session holds the lock.
+    agent_endpoint: Option<rebon_session_host::ForegroundAgentEndpoint>,
+    /// The session the listener was started for, so a session switch restarts
+    /// it on the new session's project directory instead of keeping the old.
+    agent_endpoint_session: Option<(PathBuf, String, String)>,
 }
 
 impl ForegroundControl {
@@ -159,6 +171,9 @@ impl ForegroundControl {
         Self {
             mailbox: crate::background::ForegroundMailbox::new(session),
             command_handler: None,
+            agent_inbox: Arc::new(rebon_session_host::ForegroundAgentInbox::new()),
+            agent_endpoint: None,
+            agent_endpoint_session: None,
         }
     }
 
@@ -176,8 +191,14 @@ impl ForegroundControl {
         &mut self,
         active_prompt: &Option<ActivePrompt>,
         pending_permission: &Option<PendingPermission>,
+        paused: bool,
     ) -> bool {
         let busy = active_prompt.is_some();
+        // The listener answers a sender before the event loop can act, so it
+        // needs the same two facts the status sidecar carries: a running turn
+        // takes the message, a paused terminal leaves it queued.
+        self.agent_inbox.set_busy(busy);
+        self.agent_inbox.set_blocked(paused);
         let pending_snapshot = pending_permission
             .as_ref()
             .map(|p| rebon_session_runtime::host::background_permission_snapshot(&p.outbound));
@@ -193,6 +214,96 @@ impl ForegroundControl {
         )
     }
 
+    /// Start, keep, or stop the loopback agent endpoint with the mailbox.
+    ///
+    /// A listener belongs to the process that holds the lock. Handing the
+    /// session to a worker drops the lock, and this drops the listener with it;
+    /// switching to another session's project directory restarts it there.
+    fn sync_agent_endpoint(&mut self, session: &TuiEngineSession) {
+        if !self.mailbox.enabled() {
+            self.stop_agent_endpoint();
+            return;
+        }
+        let identity = (
+            session.projects_root.clone(),
+            session.cwd.clone(),
+            session.session_id.clone(),
+        );
+        if self.agent_endpoint.is_some() && self.agent_endpoint_session.as_ref() == Some(&identity)
+        {
+            return;
+        }
+        self.stop_agent_endpoint();
+        // Remembered even when start fails: retrying every event-loop pass
+        // would bind and discard a port each time, and the mailbox capability
+        // is still advertised either way.
+        self.agent_endpoint_session = Some(identity.clone());
+        match rebon_session_host::ForegroundAgentEndpoint::start(
+            &identity.0,
+            &identity.1,
+            &identity.2,
+            self.agent_inbox.clone(),
+        ) {
+            Ok(endpoint) => {
+                self.mailbox.set_agent_endpoint(Some(endpoint.info()));
+                self.agent_endpoint = Some(endpoint);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    session_id = %identity.2,
+                    "rebon: could not start the foreground agent endpoint; the mailbox capability remains"
+                );
+                self.mailbox.set_agent_endpoint(None);
+            }
+        }
+    }
+
+    fn stop_agent_endpoint(&mut self) {
+        self.agent_endpoint = None;
+        self.agent_endpoint_session = None;
+        self.mailbox.set_agent_endpoint(None);
+    }
+
+    /// Move accepted agent messages into the turn they belong to.
+    ///
+    /// A running turn takes them at its next tool round; an idle session leaves
+    /// them where the idle-context trigger will start a turn from. Anything the
+    /// running turn never reached — it ended first, or it is an external agent
+    /// with no tool rounds at all — comes back out through
+    /// `take_pending_agent_messages` and joins the same idle path.
+    fn apply_pending_agent_messages(
+        &self,
+        app: &mut AppState,
+        session: &TuiEngineSession,
+        active_prompt: &Option<ActivePrompt>,
+    ) {
+        let pending = self.agent_inbox.take_pending();
+        if active_prompt.is_some() {
+            for envelope in pending {
+                let framed = rebon_session_host::frame_agent_message(&envelope);
+                session
+                    .engine_half
+                    .runtime
+                    .mid_turn_queue
+                    .enqueue_agent_message(framed);
+            }
+            return;
+        }
+        app.pending_agent_prompts.extend(
+            session
+                .engine_half
+                .runtime
+                .mid_turn_queue
+                .take_pending_agent_messages(),
+        );
+        app.pending_agent_prompts.extend(
+            pending
+                .into_iter()
+                .map(|envelope| rebon_session_host::frame_agent_message(&envelope)),
+        );
+    }
+
     /// Drain and apply every command queued for this session. Runs on the idle
     /// background-pipeline pass, so it never competes with hot key handling.
     #[allow(clippy::too_many_arguments)]
@@ -206,9 +317,11 @@ impl ForegroundControl {
         ui_mode: UiMode,
     ) {
         self.mailbox.sync_session(session);
+        self.sync_agent_endpoint(session);
         if !self.mailbox.enabled() {
             return;
         }
+        self.apply_pending_agent_messages(app, session, active_prompt);
         for claim in self.mailbox.claims() {
             let command_id = claim.envelope.command_id.clone();
             let is_run_command = matches!(
@@ -236,7 +349,11 @@ impl ForegroundControl {
                         });
                     self.mailbox.write_response(&response);
                 }
-                if self.publish(active_prompt, pending_permission) {
+                if self.publish(
+                    active_prompt,
+                    pending_permission,
+                    app.resume_dialog.is_some(),
+                ) {
                     self.mailbox.complete(&claim);
                 }
                 continue;
@@ -280,7 +397,11 @@ impl ForegroundControl {
             // The claim is removed only after the outcome is durably reflected in
             // the status acknowledgement. A crash before this point re-delivers
             // the claim at least once after restart.
-            if self.publish(active_prompt, pending_permission) {
+            if self.publish(
+                active_prompt,
+                pending_permission,
+                app.resume_dialog.is_some(),
+            ) {
                 self.mailbox.complete(&claim);
             }
         }
@@ -374,6 +495,16 @@ impl ForegroundControl {
                 // — that is what makes this take effect on the next tool call
                 // rather than the next session.
                 set_permission_mode_for_session(app, Some(session), parsed);
+                Ok(None)
+            }
+            command @ ForegroundCommand::AgentMessage { .. } => {
+                // The mailbox rung of the same delivery the endpoint serves.
+                // The inbox is shared, so a message id repeated across the two
+                // paths is still delivered once.
+                if let Some(envelope) = command.into_agent_message() {
+                    let _ = self.agent_inbox.accept(envelope);
+                    self.apply_pending_agent_messages(app, session, active_prompt);
+                }
                 Ok(None)
             }
         }
@@ -540,6 +671,135 @@ fn answer_ask_user_questions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A running turn takes an agent message at its next tool round, as the
+    /// framed text another agent wrote — never as a queued user submit.
+    #[tokio::test]
+    async fn an_agent_message_joins_a_running_turn_as_plain_framed_text() {
+        use rebon_core::query::{AttachmentPollPhase, AttachmentPollRequest, AttachmentPoller};
+
+        let mut session = super::super::test_support::make_test_tui_session();
+        let control = ForegroundControl::new(&session);
+        let mut app = AppState::new();
+        let handle = tokio::runtime::Handle::current();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let mut active = Some(ActivePrompt::new(rx, rebon_types::PromptCancel::new()));
+        let command = ForegroundCommand::AgentMessage {
+            message_id: "m-running".into(),
+            from_session_id: "sess-sender".into(),
+            from_agent: "main".into(),
+            from_cwd: None,
+            summary: Some("handoff".into()),
+            text: "please continue".into(),
+        };
+
+        let applied = control.apply(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active,
+            &mut None,
+            UiMode::Screen,
+            "cmd-agent-1",
+            command.clone(),
+        );
+        assert!(matches!(applied, Ok(None)), "got {applied:?}");
+        assert!(
+            app.pending_agent_prompts.is_empty(),
+            "a running turn does not wait for the idle trigger"
+        );
+        assert_eq!(session.engine_half.runtime.mid_turn_queue.pending_len(), 1);
+
+        let messages = session
+            .engine_half
+            .runtime
+            .mid_turn_queue
+            .poll(AttachmentPollRequest::new(
+                "session",
+                "turn",
+                1,
+                AttachmentPollPhase::Regular,
+            ));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, rebon_api::Role::User);
+        let text = serde_json::to_string(&messages[0]).unwrap();
+        assert!(text.contains("<teammate-message"), "{text}");
+        assert!(text.contains("please continue"), "{text}");
+        assert!(
+            !text.contains("rebon-queued-user-input"),
+            "an agent message must not carry the queued-user marker: {text}"
+        );
+        assert!(
+            app.input.is_empty(),
+            "nothing may appear in the prompt input"
+        );
+
+        // A retry with the same message id is answered but delivered once; the
+        // inbox is shared with the mailbox, which is what makes that hold across
+        // both transports.
+        let again = control.apply(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active,
+            &mut None,
+            UiMode::Screen,
+            "cmd-agent-2",
+            command,
+        );
+        assert!(matches!(again, Ok(None)), "got {again:?}");
+        assert_eq!(
+            session.engine_half.runtime.mid_turn_queue.pending_len(),
+            0,
+            "a duplicate id must not be queued a second time"
+        );
+    }
+
+    /// An idle session hands the message to the idle-context turn rather than
+    /// the prompt input: it waits in the model-context queue, which
+    /// `admit_idle_context_prompt` drains into the turn it starts. That path
+    /// admits the turn with `user_prompt: None` and commits no transcript row.
+    #[tokio::test]
+    async fn an_agent_message_at_an_idle_prompt_starts_a_context_turn() {
+        let mut session = super::super::test_support::make_test_tui_session();
+        let control = ForegroundControl::new(&session);
+        let mut app = AppState::new();
+        let handle = tokio::runtime::Handle::current();
+        let mut active = None;
+
+        let applied = control.apply(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active,
+            &mut None,
+            UiMode::Screen,
+            "cmd-agent-idle",
+            ForegroundCommand::AgentMessage {
+                message_id: "m-idle".into(),
+                from_session_id: "sess-sender".into(),
+                from_agent: "main".into(),
+                from_cwd: None,
+                summary: None,
+                text: "wake up".into(),
+            },
+        );
+        assert!(matches!(applied, Ok(None)), "got {applied:?}");
+        assert!(
+            session.engine_half.runtime.mid_turn_queue.pending_len() == 0,
+            "an idle session has no tool round to wait for"
+        );
+        assert_eq!(app.pending_agent_prompts.len(), 1);
+        assert!(app.pending_agent_prompts[0].starts_with("<teammate-message"));
+        assert!(app.pending_agent_prompts[0].contains("wake up"));
+        assert!(app.input.is_empty());
+
+        let expected = app.pending_agent_prompts[0].clone();
+        let context = super::super::context_prompts::drain_model_context_prompts(&mut app);
+        assert_eq!(context, vec![expected]);
+        assert!(app.pending_agent_prompts.is_empty());
+        assert!(context[0].contains("wake up"));
+    }
 
     /// `/compact` from the desktop app runs a ~30s provider call. Answering
     /// it inline would freeze the local TUI for a command its user never

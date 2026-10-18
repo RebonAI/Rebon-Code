@@ -57,6 +57,7 @@ pub mod compact;
 pub mod input_history;
 pub mod mcp;
 pub mod mid_turn_queue;
+pub mod peer_messenger;
 pub mod permission_answer;
 pub mod permission_policy;
 pub mod profile_proposal;

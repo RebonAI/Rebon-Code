@@ -1729,6 +1729,11 @@ fn assemble_session_build(parts: SessionAssemblyParts) -> anyhow::Result<Session
         skill_registry: skill_registry.clone(),
         team_manager: team_manager.clone(),
         task_runtime_controller,
+        peer_messenger: Arc::new(crate::peer_messenger::SessionPeerMessenger::new(
+            crate::host::cli_default_store(),
+            projects_root(),
+            crate::host::rebon_exe(),
+        )),
         tasks: tasks.clone(),
         task_registry_resolver: task_registry_resolver.clone(),
         live_policy_store: live_policy_store.clone(),

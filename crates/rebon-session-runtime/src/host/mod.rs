@@ -150,7 +150,7 @@ const TASK_BRIDGE_POLL_INTERVAL_MS: u64 = 100;
 ///
 /// The binary resolves its own config home the same way; this is not a second
 /// answer, it is the same one asked from the side that now owns the worker.
-fn cli_default_store() -> BackgroundStore {
+pub(crate) fn cli_default_store() -> BackgroundStore {
     BackgroundStore::new(crate::rebon_config::config_home_dir())
 }
 
@@ -160,6 +160,6 @@ fn cli_default_store() -> BackgroundStore {
 /// worker is what needs it now. The bare-name fallback is never spawned —
 /// `resolve_supervisor_exe` refuses a name with no path shape — so an
 /// unreadable executable path surfaces as that refusal instead.
-fn rebon_exe() -> PathBuf {
+pub(crate) fn rebon_exe() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rebon"))
 }

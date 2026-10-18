@@ -191,6 +191,8 @@ pub mod method {
     pub const SUBSCRIBE: &str = "_session/subscribe";
     /// Stop waiting for a call that is still running.
     pub const CANCEL_CALL: &str = "_session/cancel_call";
+    /// Deliver a message from an agent in another session.
+    pub const AGENT_MESSAGE: &str = "_session/agent_message";
     /// Ask the session's Claude Code mods one question.
     pub const MODS: &str = "_session/mods";
 
@@ -223,6 +225,7 @@ pub mod method {
         RELEASE_LEASE,
         SUBSCRIBE,
         CANCEL_CALL,
+        AGENT_MESSAGE,
         MODS,
         HELLO,
         TURN,
@@ -409,6 +412,24 @@ pub struct CancelCallParams {
     pub command_id: String,
 }
 
+/// [`method::AGENT_MESSAGE`].
+///
+/// `message_id` is the receiver's idempotency key; `from_cwd` and `summary`
+/// are optional so a sender with nothing to add sends nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMessageParams {
+    pub message_id: String,
+    pub from_session_id: String,
+    pub from_agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub text: String,
+}
+
 /// Whether a waiter was actually let go.
 ///
 /// Always an ok answer: cancelling a call that is not running is not a
@@ -592,6 +613,24 @@ pub fn method_and_params(
         R::CancelCall { command_id } => (
             method::CANCEL_CALL,
             serde_json::json!({ "commandId": command_id }),
+        ),
+        R::AgentMessage {
+            message_id,
+            from_session_id,
+            from_agent,
+            from_cwd,
+            summary,
+            text,
+        } => (
+            method::AGENT_MESSAGE,
+            serde_json::json!({
+                "messageId": message_id,
+                "fromSessionId": from_session_id,
+                "fromAgent": from_agent,
+                "fromCwd": from_cwd,
+                "summary": summary,
+                "text": text,
+            }),
         ),
         R::Subscribe { since } => (method::SUBSCRIBE, serde_json::json!({ "since": since })),
         R::Mods { call } => (method::MODS, serde_json::json!({ "call": call })),
@@ -933,7 +972,7 @@ mod tests {
         let mut unique = sorted.clone();
         unique.dedup();
         assert_eq!(sorted, unique, "a method name is listed twice");
-        assert_eq!(method::ALL.len(), 21);
+        assert_eq!(method::ALL.len(), 22);
     }
 
     /// `_session/steering` is not declared here on purpose: it already exists

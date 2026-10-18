@@ -58,8 +58,17 @@ pub struct TeammateSpawnSpec {
     pub wait_for_completion: bool,
     /// Parent permission broker used for sensitive permission prompts.
     pub permission_broker: Option<Arc<dyn PermissionBroker>>,
+    /// Session-owned auto-mode check for the messages this teammate sends.
+    ///
+    /// Separate from [`Self::permission_broker`] on purpose: outside workflow
+    /// lineage a teammate is given no prompting broker, but the session still
+    /// owns the classifier its messages must go through. Built from the
+    /// spawning tool context, never used to open a prompt.
+    pub auto_mode_gate: Option<Arc<dyn crate::AutoModeGate>>,
     /// Whether this teammate has no interactive permission consumer.
     pub permission_prompts_unavailable: bool,
+    /// The parent's peer messenger, so a teammate can message another session.
+    pub peer_messenger: Option<Arc<dyn crate::PeerMessenger>>,
 }
 
 impl std::fmt::Debug for TeammateSpawnSpec {
@@ -86,6 +95,7 @@ impl std::fmt::Debug for TeammateSpawnSpec {
             .field("agent_type_explicit", &self.agent_type_explicit)
             .field("wait_for_completion", &self.wait_for_completion)
             .field("has_permission_broker", &self.permission_broker.is_some())
+            .field("has_peer_messenger", &self.peer_messenger.is_some())
             .field(
                 "permission_prompts_unavailable",
                 &self.permission_prompts_unavailable,
@@ -111,6 +121,19 @@ pub struct TeammateRosterEntry {
     pub status: String,
     pub current_task: Option<String>,
     pub last_result: Option<String>,
+}
+
+/// How a successful send reaches its recipient, at the moment it was sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageDeliveryState {
+    /// The recipient is running and reads the message at its next tool round.
+    /// A turn that ends before that tool round leaves the message queued and
+    /// starts the next turn with it.
+    NextToolRound,
+    /// The recipient is idle; the message starts its next turn.
+    NextTurn,
+    /// The recipient had finished and was resumed with the message.
+    Resumed,
 }
 
 /// Result of a successful teammate spawn or dispatch.
@@ -142,6 +165,16 @@ pub trait TeamManager: Send + Sync {
     /// Return a lightweight roster for one main session.
     fn teammate_roster(&self, _session_id: &str) -> Vec<TeammateRosterEntry> {
         Vec::new()
+    }
+
+    /// How a message to `recipient` in `team_name` will be delivered, or
+    /// `None` when this manager cannot tell.
+    fn message_delivery_state(
+        &self,
+        _team_name: &str,
+        _recipient: &str,
+    ) -> Option<MessageDeliveryState> {
+        None
     }
 
     /// Send a plain-text message to a teammate.

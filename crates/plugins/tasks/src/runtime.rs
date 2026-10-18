@@ -759,10 +759,42 @@ pub struct TeammateIdentity {
     pub parent_session_id: String,
 }
 
+/// What a queued teammate request is for.
+///
+/// A dispatch is a turn of its own: it belongs to an Agent-tool call that
+/// registered a waiter and is handed off when that turn finishes. A message
+/// is user traffic; a running teammate may read it between tool rounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeammateRequestKind {
+    Dispatch,
+    Message,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TeammateRequest {
     pub request_id: String,
     pub message: String,
+    kind: TeammateRequestKind,
+}
+
+impl TeammateRequest {
+    /// A queued turn with a registered waiter (spawn or Agent-tool redispatch).
+    pub fn dispatch(request_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            request_id: request_id.into(),
+            message: message.into(),
+            kind: TeammateRequestKind::Dispatch,
+        }
+    }
+
+    /// User traffic that may be folded into a running turn.
+    pub fn message(request_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            request_id: request_id.into(),
+            message: message.into(),
+            kind: TeammateRequestKind::Message,
+        }
+    }
 }
 
 /// Typed fields for an `in_process_teammate` snapshot.
@@ -1335,6 +1367,7 @@ struct TaskRuntimeState {
     notification_generation: u64,
     message_generation: u64,
     leased_local_agent_messages: usize,
+    delivered_teammate_messages: Vec<String>,
     next_turn_id: u64,
     current_turn_id: Option<u64>,
     idle_since: Option<Instant>,
@@ -1349,6 +1382,7 @@ impl TaskRuntimeState {
             notification_generation: 0,
             message_generation: 0,
             leased_local_agent_messages: 0,
+            delivered_teammate_messages: Vec::new(),
             next_turn_id: 1,
             current_turn_id: None,
             idle_since: task_is_idle(snapshot).then(Instant::now),
@@ -4137,10 +4171,7 @@ pub fn inject_user_message_to_teammate(
     enqueue_teammate_request(
         registry,
         id,
-        TeammateRequest {
-            request_id: next_teammate_request_id(),
-            message,
-        },
+        TeammateRequest::message(next_teammate_request_id(), message),
     )
 }
 
@@ -4474,6 +4505,50 @@ pub fn take_pending_teammate_request(
 /// Pop the next pending user message from an in-process teammate queue.
 pub fn take_pending_user_message(registry: &TaskRegistry, id: &TaskId) -> Option<String> {
     take_pending_teammate_request(registry, id).map(|request| request.message)
+}
+
+/// Remove and return the queued user messages for an in-process teammate,
+/// oldest first, leaving Agent-tool dispatches in their original order.
+///
+/// Taking a message here is the moment a running turn delivered it, so the
+/// texts are recorded for [`take_delivered_teammate_messages`], which the
+/// teammate loop folds into that turn's conversation. A message that is never
+/// taken here stays queued and starts the next turn.
+pub fn take_pending_teammate_messages(registry: &TaskRegistry, id: &TaskId) -> Vec<String> {
+    let mut guard = registry.inner.lock().expect("task registry poisoned");
+    let Some(state) = guard.get_mut(id) else {
+        return Vec::new();
+    };
+    if state.snapshot.status.is_terminal() {
+        return Vec::new();
+    }
+    let TaskData::InProcessTeammate(data) = &mut state.snapshot.data else {
+        return Vec::new();
+    };
+    let mut messages = Vec::new();
+    data.pending_user_messages.retain(|request| {
+        if request.kind == TeammateRequestKind::Message {
+            messages.push(request.message.clone());
+            false
+        } else {
+            true
+        }
+    });
+    state
+        .runtime
+        .delivered_teammate_messages
+        .extend(messages.iter().cloned());
+    messages
+}
+
+/// Take the mid-turn messages a running in-process teammate has already been
+/// shown, in delivery order, so the finished turn can record them.
+pub fn take_delivered_teammate_messages(registry: &TaskRegistry, id: &TaskId) -> Vec<String> {
+    let mut guard = registry.inner.lock().expect("task registry poisoned");
+    let Some(state) = guard.get_mut(id) else {
+        return Vec::new();
+    };
+    std::mem::take(&mut state.runtime.delivered_teammate_messages)
 }
 
 pub fn revive_in_process_teammate_task(
@@ -6129,6 +6204,147 @@ mod tests {
     }
 
     #[test]
+    fn teammate_request_constructors_distinguish_dispatch_from_message() {
+        let dispatch = TeammateRequest::dispatch("dispatch-1", "run the task");
+        let message = TeammateRequest::message("message-1", "steer left");
+        assert_eq!(dispatch.kind, TeammateRequestKind::Dispatch);
+        assert_eq!(message.kind, TeammateRequestKind::Message);
+        assert_eq!(dispatch.request_id, "dispatch-1");
+        assert_eq!(dispatch.message, "run the task");
+        assert_eq!(message.request_id, "message-1");
+        assert_eq!(message.message, "steer left");
+    }
+
+    #[test]
+    fn take_pending_teammate_messages_drains_only_messages_in_order() {
+        let reg = TaskRegistry::new();
+        let id = register_in_process_teammate_task(&reg, teammate_spec("researcher"));
+        assert!(enqueue_teammate_request(
+            &reg,
+            &id,
+            TeammateRequest::dispatch("dispatch-1", "first dispatch"),
+        ));
+        assert!(inject_user_message_to_teammate(
+            &reg,
+            &id,
+            "first message".into()
+        ));
+        assert!(enqueue_teammate_request(
+            &reg,
+            &id,
+            TeammateRequest::dispatch("dispatch-2", "second dispatch"),
+        ));
+        assert!(inject_user_message_to_teammate(
+            &reg,
+            &id,
+            "second message".into()
+        ));
+
+        assert_eq!(
+            take_pending_teammate_messages(&reg, &id),
+            vec!["first message".to_string(), "second message".to_string()]
+        );
+
+        let snap = reg.snapshot(&id).unwrap();
+        let TaskData::InProcessTeammate(data) = &snap.data else {
+            panic!("expected teammate");
+        };
+        assert_eq!(
+            data.pending_user_messages
+                .iter()
+                .map(|request| (request.request_id.as_str(), request.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("dispatch-1", "first dispatch"),
+                ("dispatch-2", "second dispatch")
+            ]
+        );
+        assert!(take_pending_teammate_messages(&reg, &id).is_empty());
+    }
+
+    #[test]
+    fn take_pending_teammate_messages_ignores_terminal_and_non_teammate_tasks() {
+        let reg = TaskRegistry::new();
+        let teammate_id = register_in_process_teammate_task(&reg, teammate_spec("researcher"));
+        assert!(inject_user_message_to_teammate(
+            &reg,
+            &teammate_id,
+            "too late".into()
+        ));
+        assert!(finish_in_process_teammate(
+            &reg,
+            &teammate_id,
+            TaskStatus::Completed,
+            None,
+            None,
+        ));
+        assert!(take_pending_teammate_messages(&reg, &teammate_id).is_empty());
+
+        let local_id = TaskId::new("agent-local");
+        reg.insert(
+            local_id.clone(),
+            local_agent_snapshot("agent-local", TaskStatus::Running, false),
+            PromptCancel::new(),
+        );
+        assert!(take_pending_teammate_messages(&reg, &local_id).is_empty());
+    }
+
+    #[test]
+    fn take_pending_teammate_request_still_returns_the_oldest_of_either_kind() {
+        let reg = TaskRegistry::new();
+        let id = register_in_process_teammate_task(&reg, teammate_spec("researcher"));
+        assert!(enqueue_teammate_request(
+            &reg,
+            &id,
+            TeammateRequest::dispatch("dispatch-1", "dispatch first"),
+        ));
+        assert!(inject_user_message_to_teammate(
+            &reg,
+            &id,
+            "message second".into()
+        ));
+
+        let first = take_pending_teammate_request(&reg, &id).expect("dispatch");
+        assert_eq!(first.request_id, "dispatch-1");
+        assert_eq!(first.message, "dispatch first");
+        let second = take_pending_teammate_request(&reg, &id).expect("message");
+        assert_eq!(second.message, "message second");
+        assert!(take_pending_teammate_request(&reg, &id).is_none());
+    }
+
+    /// A message injected after the last mid-turn poll belongs to the next
+    /// turn: it is still queued and is not recorded against the finished one.
+    #[test]
+    fn an_undrained_message_stays_queued_for_the_next_turn() {
+        let reg = TaskRegistry::new();
+        let id = register_in_process_teammate_task(&reg, teammate_spec("researcher"));
+        assert!(inject_user_message_to_teammate(
+            &reg,
+            &id,
+            "before the last tool round".into()
+        ));
+        assert_eq!(
+            take_pending_teammate_messages(&reg, &id),
+            vec!["before the last tool round".to_string()]
+        );
+
+        assert!(inject_user_message_to_teammate(
+            &reg,
+            &id,
+            "after the last tool round".into()
+        ));
+        assert_eq!(
+            take_delivered_teammate_messages(&reg, &id),
+            vec!["before the last tool round".to_string()]
+        );
+        assert_eq!(
+            take_pending_teammate_request(&reg, &id).map(|request| request.message),
+            Some("after the last tool round".to_string())
+        );
+        assert!(take_delivered_teammate_messages(&reg, &id).is_empty());
+    }
+
+    #[test]
     fn revive_teammate_emits_the_retry_user_message() {
         let reg = TaskRegistry::new();
         let id = register_in_process_teammate_task(&reg, teammate_spec("researcher"));
@@ -6145,10 +6361,7 @@ mod tests {
             &reg,
             &id,
             PromptCancel::new(),
-            TeammateRequest {
-                request_id: "retry-1".into(),
-                message: "retry from UI".into(),
-            },
+            TeammateRequest::dispatch("retry-1", "retry from UI"),
         )
         .is_some());
 

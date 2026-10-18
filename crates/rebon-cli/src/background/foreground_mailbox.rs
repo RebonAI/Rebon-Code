@@ -22,9 +22,11 @@
 //! scheduled this for deletion one release after hosted sessions
 //! became the default; on 8/31 hosted went back to being opt-in (`--hosted`),
 //! so a plain `rebon` hosts its own session in-process again, holds its own
-//! lock, and publishes no endpoint. That makes this mailbox the desktop app's
-//! only way to reach the default session shape — the one it resolves as
-//! `OwnedOpaque` and reaches through files — rather than an escape hatch for
+//! lock, and publishes no *owner* endpoint. It does advertise a narrow
+//! agent-message endpoint in `.live.json`, but control commands still travel
+//! only through this mailbox: that makes it the desktop app's only way to reach
+//! the default session shape — the one it resolves as `OwnedOpaque` and
+//! reaches through files — rather than an escape hatch for
 //! `--local`. Hosted sessions still go through the endpoint, and this stays
 //! inert for them: a mirror holds no lock. Revisit retirement only after the
 //! mirror's control and presentation faces are finished, hosted is the default
@@ -135,6 +137,11 @@ pub(crate) struct ForegroundMailbox {
     /// Payloads of the most recent `RunCommand`s, so a redelivered claim can be
     /// answered from memory instead of leaving the client to time out.
     recent_command_responses: VecDeque<rebon_session_host::ForegroundCommandResponse>,
+    /// The desktop terminal that launched this process, read once at startup.
+    terminal_id: Option<String>,
+    /// The loopback listener this session accepts agent messages on, when one
+    /// started. Set by the terminal half after `enabled` is known.
+    agent_endpoint: Option<rebon_session_host::ForegroundAgentEndpointInfo>,
 }
 
 impl ForegroundMailbox {
@@ -152,7 +159,17 @@ impl ForegroundMailbox {
             last_command_error: None,
             recent_command_results: VecDeque::with_capacity(PROCESSED_HISTORY),
             recent_command_responses: VecDeque::with_capacity(COMMAND_RESPONSE_HISTORY),
+            terminal_id: rebon_session_host::terminal_id_from_env(),
+            agent_endpoint: None,
         }
+    }
+
+    /// Advertise (or withdraw) the endpoint the terminal half started.
+    pub(crate) fn set_agent_endpoint(
+        &mut self,
+        endpoint: Option<rebon_session_host::ForegroundAgentEndpointInfo>,
+    ) {
+        self.agent_endpoint = endpoint;
     }
 
     /// Whether this session is the authoritative owner, and therefore whether
@@ -191,6 +208,7 @@ impl ForegroundMailbox {
         self.last_command_error = None;
         self.recent_command_results.clear();
         self.recent_command_responses.clear();
+        self.agent_endpoint = None;
     }
 
     /// Everything queued for this session, claimed.
@@ -287,11 +305,18 @@ impl ForegroundMailbox {
         if !self.enabled {
             return false;
         }
-        let fp = foreground_status_fingerprint(
-            busy,
-            pending_permission,
-            ask_user_questions,
-            self.last_command_id.as_deref(),
+        let fp = format!(
+            "{}|{}",
+            foreground_status_fingerprint(
+                busy,
+                pending_permission,
+                ask_user_questions,
+                self.last_command_id.as_deref(),
+            ),
+            self.agent_endpoint
+                .as_ref()
+                .map(|endpoint| endpoint.port)
+                .unwrap_or(0),
         );
         let now = Instant::now();
         let heartbeat_due = self
@@ -313,6 +338,12 @@ impl ForegroundMailbox {
             last_command_at_ms: self.last_command_at_ms,
             last_command_error: self.last_command_error.clone(),
             recent_command_results: self.recent_command_results.iter().cloned().collect(),
+            terminal_id: self.terminal_id.clone(),
+            agent_endpoint: self.agent_endpoint.clone(),
+            // A live TUI drains `ForegroundCommand::AgentMessage` even when its
+            // listener could not bind, so the capability is advertised whenever
+            // the mailbox itself is.
+            capabilities: vec![rebon_session_host::AGENT_MESSAGE_CAPABILITY.to_string()],
         };
         let written = rebon_session_host::write_foreground_status(&self.projects_root, &status);
         if written {

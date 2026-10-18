@@ -1525,9 +1525,8 @@ mod tests {
                 pending_user_messages: pending
                     .into_iter()
                     .enumerate()
-                    .map(|(index, message)| TeammateRequest {
-                        request_id: format!("test-request-{index}"),
-                        message,
+                    .map(|(index, message)| {
+                        TeammateRequest::message(format!("test-request-{index}"), message)
                     })
                     .collect(),
                 tool_use_count: 0,

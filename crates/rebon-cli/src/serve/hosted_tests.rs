@@ -181,6 +181,7 @@ impl Owned {
                 job_id: Some(state.identity.job_id.clone()),
                 ipc_port: Some(ipc.port),
                 ipc_token: Some(ipc.token.clone()),
+                terminal_id: None,
                 started_at_ms: rebon_session_host::now_ms(),
             },
         )
@@ -849,6 +850,7 @@ async fn a_session_held_by_a_host_that_will_not_answer_is_refused_not_taken() {
             job_id: None,
             ipc_port: Some(dead_port),
             ipc_token: Some("nobody-home".into()),
+            terminal_id: None,
             started_at_ms: rebon_session_host::now_ms(),
         },
     )

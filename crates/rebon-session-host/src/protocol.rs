@@ -207,11 +207,12 @@ pub enum BackgroundIpcRequest {
     },
     /// Stop waiting on `command_id`: the client that sent it has given up.
     ///
-    /// The one permitted protocol increment, and it is additive inside this
-    /// enum rather than a second protocol. It exists because a timeout that
-    /// only drops the client's receiver leaves the owner working on something
-    /// nobody will read, and leaves the client unable to tell a slow answer
-    /// from a lost one.
+    /// An additive variant inside this enum rather than a second protocol,
+    /// which is the only kind of protocol increment that is permitted (see
+    /// [`Self::AgentMessage`] for the other one). It exists because a timeout
+    /// that only drops the client's receiver leaves the owner working on
+    /// something nobody will read, and leaves the client unable to tell a slow
+    /// answer from a lost one.
     ///
     /// It is *not* [`Self::Cancel`]: that fences and interrupts the running
     /// turn, while this releases one call. An operation that has not started
@@ -226,6 +227,26 @@ pub enum BackgroundIpcRequest {
     /// release its own.
     CancelCall {
         command_id: String,
+    },
+    /// One agent in another session sends this session a message.
+    ///
+    /// The receiving owner appends the framed text to its pending queue under
+    /// `message_id`, so a retry with the same id is not delivered twice. The
+    /// message may land in a running turn, start a new one, or wait in the
+    /// queue; the answer names which.
+    ///
+    /// Additive inside this enum for the reason [`Self::CancelCall`] is: an
+    /// owner that does not know it fails this one request and the envelope
+    /// version does not move.
+    AgentMessage {
+        message_id: String,
+        from_session_id: String,
+        from_agent: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        text: String,
     },
     /// One question for the Claude Code mods this owner loaded: what they
     /// put on screen since a version, draw a pane, a press, a mod command.

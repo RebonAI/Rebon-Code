@@ -615,6 +615,12 @@ pub struct AppState {
     /// the next prompt the model sees. Drained from the MCP stdio runtime and
     /// consumed by `spawn_prompt_turn`, bypassing slash-command parsing.
     pub pending_channel_prompts: Vec<String>,
+    /// Framed `<teammate-message>` text from another session's agent, waiting
+    /// for an idle turn. Unlike [`Self::pending_teammate_prompts`] these are
+    /// never committed to the transcript: the message is another agent's
+    /// output, not something the person typed, and the hosted worker delivers
+    /// it the same way — as context only, with no `user_prompt`.
+    pub pending_agent_prompts: Vec<String>,
     /// In-app text selection state. Replaces terminal-native selection
     /// which drifts when the TUI scrolls (content changes under fixed
     /// screen coordinates). Selection coordinates are in screen-space
@@ -963,6 +969,7 @@ impl AppState {
             effort_provider_kind: EffortProviderKind::Anthropic,
             pending_teammate_prompts: Vec::new(),
             pending_channel_prompts: Vec::new(),
+            pending_agent_prompts: Vec::new(),
             selection: rebon_tui::SelectionState::new(),
             selection_owner: SelectionOwner::Transcript,
             prev_scroll_offset: 0,

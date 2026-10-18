@@ -2094,6 +2094,47 @@ pub(crate) fn handle_background_ipc_request(
                 Err(err) => Err(request_error(err)),
             }
         }
+        BackgroundIpcRequest::AgentMessage {
+            message_id,
+            from_session_id,
+            from_agent,
+            from_cwd,
+            summary,
+            text,
+        } => {
+            let envelope = rebon_session_host::AgentMessageEnvelope {
+                message_id,
+                from_session_id,
+                from_agent,
+                from_cwd,
+                summary,
+                text,
+            };
+            match queue_live_background_agent_message(store, job_id, owner, &envelope) {
+                Ok(acceptance) => {
+                    let _ = store.append_event(
+                        job_id,
+                        "agent_message_received_ipc",
+                        serde_json::json!({
+                            "messageId": envelope.message_id,
+                            "fromSessionId": envelope.from_session_id,
+                            "fromAgent": envelope.from_agent,
+                            "delivery": acceptance.delivery,
+                            "duplicate": !acceptance.appended,
+                        }),
+                    );
+                    let result = rebon_session_host::AgentMessageResult {
+                        outcome: acceptance.delivery,
+                        duplicate: !acceptance.appended,
+                    };
+                    reply_with_data(
+                        &serde_json::to_value(result)
+                            .expect("an agent message result is plain data"),
+                    )
+                }
+                Err(err) => Err(request_error(err)),
+            }
+        }
         BackgroundIpcRequest::Lease { client_id, kind } => {
             let client_id = client_id.trim().to_string();
             if client_id.is_empty() {

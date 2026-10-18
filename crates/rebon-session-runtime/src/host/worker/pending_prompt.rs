@@ -155,6 +155,25 @@ pub(crate) fn claimed_pending_prompt(state: &BackgroundJobState) -> Option<&Pend
     claimed_pending_prompts(state).first()
 }
 
+/// The text this turn may offer a classifier as the user's own words.
+///
+/// `None` when there is nothing to offer, when the row is already durable after
+/// a crash, when the prompt is a coordinator report, and when it is a message
+/// from another agent: the auto-mode classifier reads this field as user
+/// intent, and another agent's message is not that.
+pub(crate) fn background_user_prompt(
+    state: &BackgroundJobState,
+    resume_saved_user: bool,
+) -> Option<String> {
+    claimed_pending_prompt(state)
+        .filter(|pending| {
+            !resume_saved_user
+                && pending.coordinator_report_paths.is_empty()
+                && !pending.is_agent_message()
+        })
+        .map(|pending| pending.text.clone())
+}
+
 #[derive(Debug)]
 pub(crate) struct BackgroundPendingPromptPoller {
     store: BackgroundStore,
@@ -337,7 +356,13 @@ pub(crate) fn spawn_background_steer_pump(
                 .await
             {
                 Ok(rebon_agent_core::SteerOutcome::Injected) => {
-                    publish_steered_pending_prompt(&update_publisher, &session_id, &prompt).await;
+                    // The steer blocks already carry the framed message; a
+                    // queued-user row would render it as something the user
+                    // typed, which it is not.
+                    if !prompt.is_agent_message() {
+                        publish_steered_pending_prompt(&update_publisher, &session_id, &prompt)
+                            .await;
+                    }
                 }
                 Ok(rebon_agent_core::SteerOutcome::TurnAlreadyOver) | Err(_) => {
                     if let Err(error) = poller.release_pending_prompt_claim(&session_id, &prompt.id)
@@ -399,6 +424,16 @@ pub(crate) async fn publish_steered_pending_prompt(
 }
 
 pub(crate) fn pending_prompt_attachment_message(prompt: &PendingPrompt) -> rebon_api::Message {
+    // An agent message is the framed `<teammate-message>` and nothing else: no
+    // queued-user marker (it is not user input) and no queued-message row.
+    if prompt.is_agent_message() {
+        return rebon_api::Message {
+            role: rebon_api::Role::User,
+            content: vec![rebon_api::ContentBlock::Text(rebon_api::TextBlock {
+                text: prompt.text.clone(),
+            })],
+        };
+    }
     let mut content = vec![rebon_api::ContentBlock::Text(rebon_api::TextBlock {
         text: prompt.text.clone(),
     })];
@@ -829,9 +864,20 @@ pub(crate) fn pending_prompt_transcript_state(
     else {
         return PendingPromptTranscriptState::Missing;
     };
-    let prompt_ids = claimed
-        .iter()
-        .map(|prompt| prompt.id.as_str())
-        .collect::<Vec<_>>();
-    pending_prompts_transcript_state_in_messages(&loaded.messages, &prompt_ids)
+    // The turn's head prompt produced a durable user row. A message another
+    // agent sent mid-turn is an injected attachment with its own generated
+    // uuid, so it is not expected to appear under its message id — only the
+    // head is checked, which is also what keeps the durability rule about
+    // "the prompt this turn started from" rather than every injection.
+    let mut prompt_ids = claimed.iter().map(|prompt| prompt.id.as_str());
+    let head = prompt_ids.next();
+    let mut ids: Vec<&str> = head.into_iter().collect();
+    ids.extend(
+        claimed
+            .iter()
+            .skip(1)
+            .filter(|prompt| !prompt.is_agent_message())
+            .map(|prompt| prompt.id.as_str()),
+    );
+    pending_prompts_transcript_state_in_messages(&loaded.messages, &ids)
 }
