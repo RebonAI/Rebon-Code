@@ -589,7 +589,71 @@ pub fn ensure_protocol_version(found: u32) -> ProtocolResult<()> {
     }
 }
 
+/// Text that stands in for an image or document dropped by
+/// [`CreateMessageRequestV1::omit_oldest_attachments`].
+pub const OMITTED_ATTACHMENT_TEXT: &str = "[attachment omitted: the request was too large for the \
+     model provider's transport. Read the file again if you still need it.]";
+
 impl CreateMessageRequestV1 {
+    /// Replace the oldest images and documents with [`OMITTED_ATTACHMENT_TEXT`]
+    /// until at least `bytes_to_free` bytes of attachment data are gone.
+    ///
+    /// The oldest go first because the newest are the ones the model is about
+    /// to look at. Returns how many were replaced; fewer bytes than asked are
+    /// freed only when no attachment is left.
+    pub fn omit_oldest_attachments(&mut self, bytes_to_free: usize) -> usize {
+        fn placeholder() -> String {
+            OMITTED_ATTACHMENT_TEXT.to_owned()
+        }
+        let mut freed = 0usize;
+        let mut omitted = 0usize;
+        for message in &mut self.messages {
+            for block in &mut message.content {
+                if freed >= bytes_to_free {
+                    return omitted;
+                }
+                match block {
+                    ContentBlockV1::Image { source } => {
+                        freed += source.data.len();
+                        *block = ContentBlockV1::Text {
+                            text: placeholder(),
+                        };
+                        omitted += 1;
+                    }
+                    ContentBlockV1::GeneratedImage { data, .. } => {
+                        freed += data.len();
+                        *block = ContentBlockV1::Text {
+                            text: placeholder(),
+                        };
+                        omitted += 1;
+                    }
+                    ContentBlockV1::ToolResult {
+                        content: ToolResultContentV1::Blocks(blocks),
+                        ..
+                    } => {
+                        for inner in blocks.iter_mut() {
+                            if freed >= bytes_to_free {
+                                return omitted;
+                            }
+                            let size = match inner {
+                                ToolResultContentBlockV1::Image { source } => source.data.len(),
+                                ToolResultContentBlockV1::Document { source } => source.data.len(),
+                                ToolResultContentBlockV1::Text { .. } => continue,
+                            };
+                            freed += size;
+                            *inner = ToolResultContentBlockV1::Text {
+                                text: placeholder(),
+                            };
+                            omitted += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        omitted
+    }
+
     pub fn from_request(request: &CreateMessageRequest) -> ProtocolResult<Self> {
         if request.context_management.is_some() {
             return Err(ModelProviderProtocolError::UnsupportedRequestField(
@@ -1049,6 +1113,50 @@ impl UsageV1 {
 mod tests {
     use super::*;
     use crate::types::{Tool, ToolChoice};
+
+    fn image_read_request(images: &[&str]) -> CreateMessageRequestV1 {
+        let mut messages = Vec::new();
+        for (index, data) in images.iter().enumerate() {
+            messages.push(serde_json::json!({"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": format!("call_{index}"),
+                "content": [
+                    {"type": "text", "text": format!("frame {index}")},
+                    {"type": "image", "source": {"type": "base64", "mediaType": "image/png", "data": data}},
+                ],
+            }]}));
+        }
+        serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": messages, "maxTokens": 16, "stream": true,
+        }))
+        .unwrap()
+    }
+
+    fn image_count(request: &CreateMessageRequestV1) -> usize {
+        serde_json::to_string(request)
+            .unwrap()
+            .matches("\"image\"")
+            .count()
+    }
+
+    #[test]
+    fn omitting_attachments_drops_the_oldest_first_and_stops_once_enough_is_freed() {
+        let mut request = image_read_request(&["AAAA", "BBBB", "CCCC"]);
+        assert_eq!(request.omit_oldest_attachments(5), 2);
+        let text = serde_json::to_string(&request).unwrap();
+        assert!(!text.contains("AAAA") && !text.contains("BBBB"));
+        assert!(text.contains("CCCC"), "the newest image stays");
+        assert!(text.contains("frame 0"), "the result's own text stays");
+        assert_eq!(text.matches(OMITTED_ATTACHMENT_TEXT).count(), 2);
+    }
+
+    #[test]
+    fn omitting_attachments_reports_zero_when_none_are_left() {
+        let mut request = image_read_request(&["AAAA"]);
+        assert_eq!(request.omit_oldest_attachments(usize::MAX), 1);
+        assert_eq!(image_count(&request), 0);
+        assert_eq!(request.omit_oldest_attachments(usize::MAX), 0);
+    }
 
     #[test]
     fn computer_use_runtime_capability_round_trips() {
