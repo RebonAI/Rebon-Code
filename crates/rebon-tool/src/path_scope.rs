@@ -80,13 +80,15 @@ pub(crate) fn enforce_write_path_policy(
     enforce_path_scope(tool, context, path, field, &roots, "file mutation", true)
 }
 
-/// The two files that carry a live session's control credentials, named as a
+/// The files that carry a live session's control credentials, named as a
 /// refusal would name them.
 ///
 /// A worker publishes its loopback port and token in exactly two places: the
 /// job record it runs from (`<config>/jobs/<id>/state.json`) and the descriptor
 /// beside the transcript (`<config>/projects/<project>/<sid>.owner.json`).
-/// Both sit under the user's own config directory, which file tools can
+/// A foreground terminal publishes its agent endpoint's token beside the
+/// transcript too (`<config>/projects/<project>/<sid>.agent-token`).
+/// All of them sit under the user's own config directory, which file tools can
 /// otherwise read like anything else — so with sessions hosted in workers, one
 /// `Read` is enough to drive somebody's live session: inject a prompt, answer
 /// a permission request, change the permission mode. The token is not really
@@ -117,6 +119,10 @@ fn session_credential_kind_under(path: &Path, config_home: &Path) -> Option<&'st
     if name.ends_with(".owner.json") && is_within_scope(&normalized, &config_home.join("projects"))
     {
         return Some("a session owner descriptor");
+    }
+    if name.ends_with(".agent-token") && is_within_scope(&normalized, &config_home.join("projects"))
+    {
+        return Some("a session agent-endpoint token");
     }
     if name == "state.json" && is_within_scope(&normalized, &config_home.join("jobs")) {
         return Some("a background job record");
@@ -391,6 +397,25 @@ mod tests {
         assert_eq!(
             session_credential_kind_under(Path::new("/config/jobs/bg-1/state.json"), &home),
             Some("a background job record")
+        );
+    }
+
+    /// A foreground terminal's agent endpoint authenticates with this file.
+    /// Reading it is enough to drive the session's next turn, so it is refused
+    /// exactly where the owner descriptor is.
+    #[test]
+    fn a_foreground_agent_token_is_refused() {
+        let home = PathBuf::from("/config");
+        assert_eq!(
+            session_credential_kind_under(
+                Path::new("/config/projects/f--repo/sess-1.agent-token"),
+                &home
+            ),
+            Some("a session agent-endpoint token")
+        );
+        assert_eq!(
+            session_credential_kind_under(Path::new("/config/elsewhere/sess-1.agent-token"), &home),
+            None
         );
     }
 

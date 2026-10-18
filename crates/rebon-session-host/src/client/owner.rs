@@ -743,6 +743,42 @@ impl OwnerHandle {
         Ok(result.outcome)
     }
 
+    /// Deliver a message from an agent in another session, and say where it
+    /// landed.
+    ///
+    /// The idempotency key is the envelope's `message_id`, not a command id:
+    /// the owner deduplicates on it, so a retry that used a fresh command id
+    /// would still not deliver the same message twice.
+    pub fn agent_message(
+        &self,
+        envelope: crate::AgentMessageEnvelope,
+        command_id: Option<String>,
+    ) -> anyhow::Result<crate::AgentMessageResult> {
+        let crate::AgentMessageEnvelope {
+            message_id,
+            from_session_id,
+            from_agent,
+            from_cwd,
+            summary,
+            text,
+        } = envelope;
+        let response = self.send(
+            BackgroundIpcRequest::AgentMessage {
+                message_id,
+                from_session_id,
+                from_agent,
+                from_cwd,
+                summary,
+                text,
+            },
+            command_id,
+        )?;
+        let data = response.data.ok_or_else(|| {
+            anyhow::anyhow!("the owner answered an agent message without an outcome")
+        })?;
+        Ok(serde_json::from_value(data)?)
+    }
+
     /// Interrupt the running turn, leaving the session and its host alive.
     ///
     /// `Ok(false)` means there was nothing in flight — a no-op, not a failure,
@@ -1118,6 +1154,14 @@ pub fn foreground_status_from_owner(
                 }]
             })
             .unwrap_or_default(),
+        // The owner's status snapshot does not carry a terminal label; the
+        // descriptor and the heartbeat beside it are where one is recorded.
+        terminal_id: None,
+        // A hosted owner is not a foreground mailbox: it has no listener to
+        // advertise here and no mailbox capability to promise. Its own
+        // descriptor is how it is reached.
+        agent_endpoint: None,
+        capabilities: Vec::new(),
     }
 }
 
@@ -1356,6 +1400,7 @@ mod tests {
             job_id: Some("job-1".to_string()),
             ipc_port: port,
             ipc_token: port.map(|_| "token".to_string()),
+            terminal_id: None,
             started_at_ms: 1,
         }
     }
@@ -1370,8 +1415,8 @@ mod tests {
     }
 
     /// A terminal hosting a session in its own process holds the lock and
-    /// publishes no endpoint. That is not a broken owner — it is the escape
-    /// hatch, and it must read as "someone has this", not as "free".
+    /// publishes no owner endpoint. That is not a broken owner — it is the
+    /// escape hatch, and it must read as "someone has this", not as "free".
     #[test]
     fn a_held_session_without_a_descriptor_is_opaque() {
         let tmp = tempdir("opaque");
@@ -2023,8 +2068,8 @@ mod tests {
         )
     }
 
-    /// A `--local` session is the one host that publishes no endpoint: it
-    /// holds the session's lock and nothing else. To every other process
+    /// A `--local` session is the one host that publishes no owner endpoint:
+    /// it holds the session's lock and nothing else. To every other process
     /// that reads as owned but opaque — not free, so nobody takes the
     /// session; not reachable, so nobody tries to drive it. Letting the lock go
     /// is what frees it.

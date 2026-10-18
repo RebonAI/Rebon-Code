@@ -3673,6 +3673,7 @@ fn pending_prompt_writes_and_appends_remain_strict() {
         enqueued_at_ms: now_ms(),
         claimed_turn_generation: None,
         completed_turn_generation: None,
+        origin: None,
     }];
     assert!(store.write_state(&invalid_id).is_err());
     assert_eq!(store.read_state(&state.identity.job_id).unwrap(), expected);
@@ -4449,4 +4450,126 @@ fn remove_job_rejects_active_and_invalid_ids() {
     assert!(invalid_err
         .to_string()
         .contains("invalid background job id"));
+}
+
+fn agent_message_envelope(message_id: &str, text: &str) -> crate::AgentMessageEnvelope {
+    crate::AgentMessageEnvelope {
+        message_id: message_id.into(),
+        from_session_id: "sess-sender".into(),
+        from_agent: "main".into(),
+        from_cwd: Some("F:/work/sender".into()),
+        summary: Some("handoff".into()),
+        text: text.into(),
+    }
+}
+
+/// A message appended for a session whose worker is gone must wait in the
+/// durable queue: nothing here may start a worker, because a message is not a
+/// turn somebody asked for.
+#[test]
+fn an_agent_message_is_queued_without_starting_a_worker() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.identity.session_id = Some("sess-message".into());
+    state.process.status = BackgroundJobStatus::Idle;
+    let job_id = state.identity.job_id.clone();
+    store.write_state(&state).unwrap();
+
+    let envelope = agent_message_envelope("m-store", "check the build");
+    let acceptance = append_agent_message_to_background_job(&store, &job_id, &envelope).unwrap();
+    assert!(acceptance.appended);
+    assert_eq!(acceptance.prompt.id, "m-store");
+    assert_eq!(
+        acceptance.prompt.text,
+        crate::frame_agent_message(&envelope)
+    );
+    assert_eq!(
+        acceptance.prompt.origin,
+        Some(crate::PendingPromptOrigin::AgentMessage {
+            from_session_id: "sess-sender".into(),
+            from_agent: "main".into(),
+        })
+    );
+    assert!(
+        !store.roster_path().exists(),
+        "queueing a message must not publish a supervisor roster"
+    );
+
+    let reloaded = store.read_state(&job_id).unwrap();
+    assert_eq!(reloaded.process.status, BackgroundJobStatus::Queued);
+    assert_eq!(reloaded.identity.pending_prompts.len(), 1);
+    assert_eq!(
+        reloaded.identity.pending_prompts[0].origin,
+        acceptance.prompt.origin
+    );
+
+    let duplicate = append_agent_message_to_background_job(&store, &job_id, &envelope).unwrap();
+    assert!(!duplicate.appended, "the same message id is delivered once");
+    assert_eq!(duplicate.queue_depth, 1);
+}
+
+/// The old atomic writer left `roster.json.<pid>-<seq>.tmp` files beside the
+/// roster. Writing a new roster clears the old litter and leaves a live
+/// writer's fresh temp file alone.
+#[test]
+fn writing_the_roster_sweeps_only_old_roster_temp_files() {
+    let (_dir, store) = store();
+    let daemon = store.daemon_dir();
+    std::fs::create_dir_all(&daemon).unwrap();
+    let aged = |name: &str, age: Option<std::time::Duration>| {
+        let path = daemon.join(name);
+        std::fs::write(&path, b"litter").unwrap();
+        if let Some(age) = age {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - age)
+                .unwrap();
+        }
+        path
+    };
+    let stale = aged(
+        "roster.json.123-4.tmp",
+        Some(std::time::Duration::from_secs(11 * 60)),
+    );
+    let stale_dot = aged(
+        ".roster.json.9-1.tmp",
+        Some(std::time::Duration::from_secs(24 * 60 * 60)),
+    );
+    let fresh = aged("roster.json.555-2.tmp", None);
+    let unrelated = aged(
+        "notes.txt",
+        Some(std::time::Duration::from_secs(24 * 60 * 60)),
+    );
+    let unrelated_tmp = aged(
+        "job.json.1-2.tmp",
+        Some(std::time::Duration::from_secs(24 * 60 * 60)),
+    );
+
+    store
+        .write_roster(&BackgroundRoster {
+            supervisor_pid: std::process::id(),
+            supervisor_pid_identity: process_identity(std::process::id()),
+            updated_at_ms: now_ms(),
+            jobs: Vec::new(),
+        })
+        .unwrap();
+
+    assert!(!stale.exists(), "an abandoned roster temp file is litter");
+    assert!(
+        !stale_dot.exists(),
+        "both spellings of the old temp name are swept"
+    );
+    assert!(
+        fresh.exists(),
+        "a live writer's fresh temp file is not litter"
+    );
+    assert!(unrelated.exists(), "only roster temp files are swept");
+    assert!(
+        unrelated_tmp.exists(),
+        "another atomic writer's temp file is not ours to delete"
+    );
 }

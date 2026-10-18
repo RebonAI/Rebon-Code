@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::*;
 use anyhow::Context;
@@ -469,6 +469,7 @@ impl BackgroundStore {
             .with_context(|| {
                 format!("failed to atomically replace roster at {}", path.display())
             })?;
+        sweep_stale_roster_temps(&self.daemon_dir());
         Ok(())
     }
 
@@ -2022,6 +2023,65 @@ fn append_background_pending_prompt(
     start_supervisor: bool,
     rebon_exe_path: &Path,
 ) -> anyhow::Result<PendingPromptAcceptance> {
+    append_pending_prompt_durably(
+        store,
+        job_id,
+        prompt,
+        start_supervisor.then_some(rebon_exe_path),
+        "reply_queued",
+        serde_json::json!({ "nonInterrupting": true }),
+    )
+}
+
+/// Append an agent message to a job's durable queue.
+///
+/// The queue write is the wake signal: the status moves to `Queued`, which a
+/// live supervisor and an idle worker both poll for. Nothing is spawned here —
+/// a message is delivered to a session that is already running, never used to
+/// resurrect one whose worker is gone.
+pub fn append_agent_message_to_background_job(
+    store: &BackgroundStore,
+    job_id: &str,
+    envelope: &crate::AgentMessageEnvelope,
+) -> anyhow::Result<PendingPromptAcceptance> {
+    let queued_at = now_ms();
+    let mut prompt = PendingPrompt::new(
+        envelope.message_id.clone(),
+        crate::frame_agent_message(envelope),
+        Vec::new(),
+        queued_at,
+    )?;
+    prompt.origin = Some(crate::PendingPromptOrigin::AgentMessage {
+        from_session_id: envelope.from_session_id.clone(),
+        from_agent: envelope.from_agent.clone(),
+    });
+    append_pending_prompt_durably(
+        store,
+        job_id,
+        prompt,
+        None,
+        "agent_message_queued",
+        serde_json::json!({
+            "fromSessionId": envelope.from_session_id,
+            "fromAgent": envelope.from_agent,
+        }),
+    )
+}
+
+/// The one pending-prompt append transaction.
+///
+/// `start_supervisor` is `Some(executable)` only for a prompt that must wake
+/// or launch a worker. An agent message passes `None`: it is appended to a
+/// session that is meant to be running, and starting one for it would turn a
+/// message into a new turn nobody asked for.
+fn append_pending_prompt_durably(
+    store: &BackgroundStore,
+    job_id: &str,
+    prompt: PendingPrompt,
+    start_supervisor: Option<&Path>,
+    event: &str,
+    mut event_data: serde_json::Value,
+) -> anyhow::Result<PendingPromptAcceptance> {
     let queued_at = prompt.enqueued_at_ms;
     let mut observed = store.read_state(job_id)?;
     store.reconcile_stale_pid(&mut observed)?;
@@ -2062,20 +2122,22 @@ fn append_background_pending_prompt(
         state.process.updated_at_ms = queued_at;
         Ok(acceptance)
     })?;
-    if start_supervisor && should_start_supervisor {
+    if let Some(rebon_exe_path) = start_supervisor.filter(|_| should_start_supervisor) {
         ensure_supervisor_running(store, rebon_exe_path)?;
     }
     if acceptance.appended {
-        store.append_event(
-            job_id,
-            "reply_queued",
-            serde_json::json!({
-                "resumed": should_start_supervisor,
-                "nonInterrupting": true,
-                "promptId": acceptance.prompt.id,
-                "queueDepth": acceptance.queue_depth,
-            }),
-        )?;
+        if let Some(fields) = event_data.as_object_mut() {
+            fields.insert("resumed".into(), serde_json::json!(should_start_supervisor));
+            fields.insert(
+                "promptId".into(),
+                serde_json::json!(acceptance.prompt.id.clone()),
+            );
+            fields.insert(
+                "queueDepth".into(),
+                serde_json::json!(acceptance.queue_depth),
+            );
+        }
+        store.append_event(job_id, event, event_data)?;
     }
     Ok(acceptance)
 }
@@ -3039,6 +3101,49 @@ pub fn detach_background_command(command: &mut Command) {
 /// spawn already carries `CREATE_NO_WINDOW`.
 #[cfg(not(unix))]
 pub fn detach_background_command(_command: &mut Command) {}
+
+/// How long a roster temp file is given before it is called abandoned.
+///
+/// Only a writer that died between creating and renaming it leaves one behind;
+/// an atomic replace holds the shared roster lock for milliseconds, so ten
+/// minutes cannot race a live write.
+const STALE_ROSTER_TMP_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// Drop the temp files an older atomic writer left in `daemon/`.
+///
+/// The writer that used to build the roster produced `roster.json.<pid>-<seq>.tmp`
+/// (and the dot-prefixed spelling) and did not clean up when it was killed
+/// between write and rename. There is nothing to recover from them — the roster
+/// is replaced whole — so they are swept whenever a replacement is written.
+/// Best-effort by contract: failing to remove someone else's litter must not
+/// fail the write that triggered it.
+fn sweep_stale_roster_temps(daemon_dir: &Path) {
+    let Ok(entries) = fs::read_dir(daemon_dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let is_roster_temp = name.ends_with(".tmp")
+            && (name.starts_with("roster.json.") || name.starts_with(".roster.json."));
+        if !is_roster_temp {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age < STALE_ROSTER_TMP_AGE {
+            continue;
+        }
+        let _ = fs::remove_file(entry.path());
+    }
+}
 
 #[cfg(test)]
 #[path = "store_tests.rs"]

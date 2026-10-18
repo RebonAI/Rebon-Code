@@ -36,6 +36,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::roster::{escape_xml_attr, escape_xml_text};
+use crate::runtime::{take_pending_teammate_messages, TaskId, TaskRegistry};
 use rebon_api::Message as ApiMessage;
 use rebon_core::attachment_seat::{
     MailboxIdentity, SeatAttachmentProducer, SessionAttachmentBinding,
@@ -280,11 +281,13 @@ impl SeatAttachmentProducer for MailboxAttachmentProducer {
 }
 
 /// Minimal [`AttachmentPoller`] for teammate workers — drains the
-/// file-backed team mailbox and emits only the `teammate_mailbox`
-/// attachment, skipping every session-state-backed producer (plan
-/// mode, date change, skill listing, task reminder, nested memory).
-/// Teammates don't have an ACP session record, so those producers
-/// have no input to read from; this poller stays deliberately narrow.
+/// file-backed team mailbox and, when built with
+/// [`TeammateMailboxPoller::with_pending_messages`], the user messages
+/// SendMessage queued for this turn. Emits only those two sources,
+/// skipping every session-state-backed producer (plan mode, date
+/// change, skill listing, task reminder, nested memory). Teammates
+/// don't have an ACP session record, so those producers have no input
+/// to read from; this poller stays deliberately narrow.
 ///
 /// Lifetime: built per-worker in `run_teammate_loop`, dropped when
 /// the worker finishes. Between-worker traffic (plan approval,
@@ -295,11 +298,35 @@ impl SeatAttachmentProducer for MailboxAttachmentProducer {
 /// authoritative.
 pub struct TeammateMailboxPoller {
     identity: MailboxIdentity,
+    pending_messages: Option<PendingTeammateMessages>,
+}
+
+/// A teammate's task queue, for messages SendMessage queued to a running
+/// turn. Delivered through the same poll as the file mailbox so both
+/// surfaces reach the model between tool rounds.
+struct PendingTeammateMessages {
+    registry: TaskRegistry,
+    task_id: TaskId,
 }
 
 impl TeammateMailboxPoller {
     pub fn new(identity: MailboxIdentity) -> Self {
-        Self { identity }
+        Self {
+            identity,
+            pending_messages: None,
+        }
+    }
+
+    /// Also drain SendMessage traffic queued for a running teammate turn.
+    pub fn with_pending_messages(
+        identity: MailboxIdentity,
+        registry: TaskRegistry,
+        task_id: TaskId,
+    ) -> Self {
+        Self {
+            identity,
+            pending_messages: Some(PendingTeammateMessages { registry, task_id }),
+        }
     }
 }
 
@@ -308,7 +335,15 @@ impl AttachmentPoller for TeammateMailboxPoller {
         if request.phase == AttachmentPollPhase::Eager {
             return Vec::new();
         }
-        teammate_mailbox(&drain_teammate_mailbox_for(&self.identity))
+        let mut messages = teammate_mailbox(&drain_teammate_mailbox_for(&self.identity));
+        if let Some(pending) = &self.pending_messages {
+            messages.extend(
+                take_pending_teammate_messages(&pending.registry, &pending.task_id)
+                    .into_iter()
+                    .map(ApiMessage::user_text),
+            );
+        }
+        messages
     }
 }
 
@@ -324,6 +359,52 @@ mod tests {
             next_iteration,
             AttachmentPollPhase::Regular,
         )
+    }
+
+    fn eager_request() -> AttachmentPollRequest<'static> {
+        AttachmentPollRequest::new("session", "turn", 0, AttachmentPollPhase::Eager)
+    }
+
+    fn register_poller_teammate(registry: &TaskRegistry, team: &str, agent: &str) -> TaskId {
+        use crate::runtime::{
+            register_in_process_teammate_task_with_cancel, InProcessTeammateTaskSpec,
+            TeammateIdentity,
+        };
+
+        let id = TaskId::new(format!("{agent}-poller-task"));
+        register_in_process_teammate_task_with_cancel(
+            registry,
+            InProcessTeammateTaskSpec {
+                id: id.clone(),
+                identity: TeammateIdentity {
+                    agent_id: format!("{agent}@{team}"),
+                    agent_name: agent.into(),
+                    team_name: team.into(),
+                    color: None,
+                    plan_mode_required: false,
+                    parent_session_id: "session-poller".into(),
+                },
+                prompt: "original task".into(),
+                model: None,
+                model_profile: None,
+                permission_mode: "default".into(),
+                agent_type: None,
+                description: None,
+            },
+            rebon_types::PromptCancel::new(),
+        );
+        id
+    }
+
+    fn api_text(message: &ApiMessage) -> &str {
+        message
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ApiContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     fn only_text(messages: &[ApiMessage]) -> String {
@@ -525,6 +606,102 @@ mod tests {
         );
 
         // Second poll yields nothing (regular already drained).
+        assert!(poller.poll(request(1)).is_empty());
+    }
+
+    #[test]
+    fn teammate_mailbox_poller_with_pending_messages_drains_both_sources_in_order() {
+        use crate::runtime::{
+            enqueue_teammate_request, inject_user_message_to_teammate, TaskData, TeammateRequest,
+        };
+        use rebon_tool::TeamMailboxMessage as WireMsg;
+
+        let _home =
+            rebon_tool::tasks::test_support::TestConfigHome::new("mailbox-pending-messages");
+        let team = "pending-message-team";
+        let agent = "worker-bee";
+        rebon_tool::write_mailbox_message(
+            team,
+            agent,
+            WireMsg {
+                from: "lead".into(),
+                text: "from the file mailbox".into(),
+                timestamp: "1".into(),
+                read: false,
+                color: None,
+                summary: None,
+            },
+        )
+        .expect("write mailbox message");
+
+        let registry = TaskRegistry::new();
+        let task_id = register_poller_teammate(&registry, team, agent);
+        assert!(inject_user_message_to_teammate(
+            &registry,
+            &task_id,
+            "first steer".into()
+        ));
+        assert!(enqueue_teammate_request(
+            &registry,
+            &task_id,
+            TeammateRequest::dispatch("dispatch-1", "agent dispatch"),
+        ));
+        assert!(inject_user_message_to_teammate(
+            &registry,
+            &task_id,
+            "second steer".into()
+        ));
+
+        let poller = TeammateMailboxPoller::with_pending_messages(
+            MailboxIdentity {
+                team_name: team.into(),
+                agent_name: agent.into(),
+            },
+            registry.clone(),
+            task_id.clone(),
+        );
+
+        // Eager phases must not consume either source.
+        assert!(poller.poll(eager_request()).is_empty());
+        assert_eq!(
+            rebon_tool::read_mailbox(team, agent)
+                .expect("read mailbox")
+                .iter()
+                .filter(|message| !message.read)
+                .count(),
+            1,
+            "the eager poll leaves the file mailbox unread"
+        );
+        let pending_after_eager = registry.snapshot(&task_id).unwrap();
+        let TaskData::InProcessTeammate(data) = &pending_after_eager.data else {
+            panic!("expected teammate");
+        };
+        assert_eq!(
+            data.pending_user_messages.len(),
+            3,
+            "the eager poll leaves the queue untouched"
+        );
+
+        let messages = poller.poll(request(0));
+        assert_eq!(messages.len(), 3, "mailbox attachment plus two messages");
+        assert!(only_text(&messages[..1]).contains("from the file mailbox"));
+        assert_eq!(api_text(&messages[1]), "first steer");
+        assert_eq!(api_text(&messages[2]), "second steer");
+
+        // The Agent-tool dispatch is not user traffic: it stays queued for
+        // its own turn, in its original position.
+        let pending_after_poll = registry.snapshot(&task_id).unwrap();
+        let TaskData::InProcessTeammate(data) = &pending_after_poll.data else {
+            panic!("expected teammate");
+        };
+        assert_eq!(
+            data.pending_user_messages
+                .iter()
+                .map(|request| (request.request_id.as_str(), request.message.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("dispatch-1", "agent dispatch")]
+        );
+
         assert!(poller.poll(request(1)).is_empty());
     }
 

@@ -36,7 +36,7 @@
 //!   provider has no fork.
 
 use crate::client::ModelClient;
-use crate::request::CreateMessageRequest;
+use crate::request::{CreateMessageRequest, ThinkingConfig};
 use crate::types::{ContentBlock, Message};
 
 /// Maximum length (in chars, not bytes) of the conversation text fed
@@ -145,7 +145,12 @@ pub async fn generate_session_title(
     let mut request =
         CreateMessageRequest::simple(model, trimmed).with_system(SESSION_TITLE_PROMPT);
     request.stream = false;
-    request.max_tokens = 128; // titles are short; cap hard.
+    // Titles are short; cap hard. Reasoning shares the output budget on
+    // OpenAI-style providers, so a provider configured for deep thinking
+    // (DeepSeek `max`) would spend all 128 tokens thinking and return no
+    // title. Compaction turns thinking off the same way.
+    request.max_tokens = 128;
+    request.thinking = Some(ThinkingConfig::Disabled);
 
     let message = match client.create_message(request).await {
         Ok(m) => m,
@@ -443,5 +448,16 @@ mod tests {
         let captured = mock.captured_requests();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].model, "small-title-model");
+    }
+
+    #[tokio::test]
+    async fn generate_turns_thinking_off_so_reasoning_cannot_eat_the_cap() {
+        let mock = Arc::new(MockModelClient::new());
+        mock.push_turn(mock_reply(r#"{"title": "anything"}"#));
+        let _ = generate_session_title(mock.as_ref(), "m", "conversation").await;
+
+        let captured = mock.captured_requests();
+        assert_eq!(captured[0].max_tokens, 128);
+        assert_eq!(captured[0].thinking, Some(ThinkingConfig::Disabled));
     }
 }

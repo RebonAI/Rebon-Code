@@ -530,6 +530,7 @@ pub const BUILTIN_TOOL_FACTS: &[BuiltinToolFacts] = &[
     facts("TaskUpdate", &["TaskUpdateTool"], ToolKind::Task, None),
     facts("TaskStop", &["TaskStopTool"], ToolKind::Task, None),
     facts("TodoWrite", &["TodoWriteTool"], ToolKind::Task, None),
+    facts("ListPeers", &["ListPeersTool"], ToolKind::Task, None),
     facts_showing("WebFetch", &["WebFetchTool"], ToolKind::Web, "url", "url"),
     facts_showing(
         "WebSearch",

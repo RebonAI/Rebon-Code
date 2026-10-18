@@ -1,6 +1,6 @@
 {
   "name": "deepseek-responses",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "DeepSeek Responses API model provider (deepseek-v4-pro, deepseek-flash) running as an llm/stream adapter on rebon's plugin plane.",
   "capabilities": {
     "modelProviders": {
@@ -37,5 +37,15 @@
         "displayName": "DeepSeek Responses"
       }
     }
+  },
+  "container": {
+    "network": [
+      "api.deepseek.com"
+    ],
+    "env": [
+      "DEEPSEEK_API_KEY",
+      "DEEPSEEK_BASE_URL",
+      "REBON_DEEPSEEK_DUMP"
+    ]
   }
 }

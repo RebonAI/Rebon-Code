@@ -594,6 +594,11 @@ pub struct SessionOwnerDescriptor {
     pub ipc_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipc_token: Option<String>,
+    /// The desktop terminal this session was started from, when it set
+    /// `REBON_TERMINAL_ID`. Descriptive only: a peer listing reports it so a
+    /// caller can recognise the window it came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
     pub started_at_ms: u64,
 }
 
@@ -7979,5 +7984,45 @@ mod tests {
         let after = load_session_history(&path).unwrap().stamp;
         assert_eq!(before.byte_len, after.byte_len);
         assert_ne!(before.sha256, after.sha256);
+    }
+
+    #[test]
+    fn owner_descriptor_terminal_id_is_optional_and_round_trips() {
+        let root_dir = temp_projects_root("owner-terminal-id");
+        let root = root_dir.path();
+        let cwd = "/work/owner";
+        let sid = "sess-owner";
+        let mut descriptor = SessionOwnerDescriptor {
+            version: SESSION_OWNER_VERSION,
+            pid: 42,
+            pid_identity: None,
+            surface: SessionOwnerSurface::Worker,
+            job_id: Some("job-1".into()),
+            ipc_port: None,
+            ipc_token: None,
+            terminal_id: Some("term-7".into()),
+            started_at_ms: 10,
+        };
+        write_session_owner(root, cwd, sid, &descriptor).unwrap();
+        let written = std::fs::read_to_string(session_owner_path(root, cwd, sid)).unwrap();
+        assert!(written.contains("\"terminalId\": \"term-7\""), "{written}");
+        assert_eq!(read_session_owner(root, cwd, sid).unwrap(), descriptor);
+
+        descriptor.terminal_id = None;
+        write_session_owner(root, cwd, sid, &descriptor).unwrap();
+        let written = std::fs::read_to_string(session_owner_path(root, cwd, sid)).unwrap();
+        assert!(!written.contains("terminalId"), "{written}");
+        assert_eq!(read_session_owner(root, cwd, sid).unwrap(), descriptor);
+
+        // A descriptor written before the field existed must still parse.
+        let old = format!(
+            "{{\"version\":{},\"pid\":42,\"surface\":\"worker\",\"jobId\":\"job-1\",\"startedAtMs\":10}}",
+            SESSION_OWNER_VERSION
+        );
+        std::fs::write(session_owner_path(root, cwd, sid), old).unwrap();
+        assert_eq!(
+            read_session_owner(root, cwd, sid).unwrap().terminal_id,
+            None
+        );
     }
 }

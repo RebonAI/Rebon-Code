@@ -766,6 +766,90 @@ fn a_lease_taken_over_acp_is_visible_in_the_status() {
     assert_eq!(leases, 0, "the lease outlived its release: {after}");
 }
 
+/// A message from another agent travels the extension spelling, decodes to the
+/// request the owner handles, and lands in the same durable queue a steer does.
+/// A retry carrying the same message id is answered with `duplicate` instead of
+/// a second copy.
+#[test]
+fn an_agent_message_over_acp_reaches_the_jobs_queue() {
+    let (_dir, store, state, ipc) = hosted_job();
+    store
+        .update_state(state.job_id(), |current| {
+            current.process.status = BackgroundJobStatus::Running;
+            Ok(())
+        })
+        .unwrap();
+    let mut peer = attached(&ipc);
+
+    let send = |peer: &mut Peer| {
+        peer.call(
+            "_session/agent_message",
+            serde_json::json!({
+                "messageId": "m-acp",
+                "fromSessionId": "sess-sender",
+                "fromAgent": "main",
+                "fromCwd": "F:/work/sender",
+                "summary": "handoff",
+                "text": "look at the build"
+            }),
+        )
+    };
+    let answer = send(&mut peer);
+    assert!(
+        answer.get("error").is_none(),
+        "the message was refused: {answer}"
+    );
+    assert_eq!(
+        answer["result"],
+        serde_json::json!({"outcome": "injected"}),
+        "a running turn takes it at its next tool round: {answer}"
+    );
+    assert!(
+        answer["result"].get("duplicate").is_none(),
+        "a first delivery is not reported as a duplicate: {answer}"
+    );
+
+    let envelope = rebon_session_host::AgentMessageEnvelope {
+        message_id: "m-acp".into(),
+        from_session_id: "sess-sender".into(),
+        from_agent: "main".into(),
+        from_cwd: Some("F:/work/sender".into()),
+        summary: Some("handoff".into()),
+        text: "look at the build".into(),
+    };
+    let reloaded = store.read_state(state.job_id()).unwrap();
+    assert_eq!(reloaded.identity.pending_prompts.len(), 1);
+    let prompt = &reloaded.identity.pending_prompts[0];
+    assert_eq!(prompt.id, "m-acp");
+    assert_eq!(
+        prompt.text,
+        rebon_session_host::frame_agent_message(&envelope)
+    );
+    assert_eq!(
+        prompt.origin,
+        Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
+            from_session_id: "sess-sender".into(),
+            from_agent: "main".into(),
+        })
+    );
+
+    let retried = send(&mut peer);
+    assert_eq!(
+        retried["result"],
+        serde_json::json!({"outcome": "injected", "duplicate": true}),
+        "the retry is answered, not delivered again: {retried}"
+    );
+    assert_eq!(
+        store
+            .read_state(state.job_id())
+            .unwrap()
+            .identity
+            .pending_prompts
+            .len(),
+        1
+    );
+}
+
 /// The permission mode a client sets is the one every other client then reads.
 #[test]
 fn a_permission_mode_set_over_acp_is_what_the_status_reports() {

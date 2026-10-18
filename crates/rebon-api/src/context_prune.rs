@@ -449,6 +449,26 @@ impl ContextBudget {
         self.auto_compact_threshold.load(Ordering::Relaxed)
     }
 
+    /// The trigger the window alone sets, before any absolute cap. A cap at
+    /// or above it changes nothing for this model.
+    pub fn window_auto_compact_threshold(&self) -> u32 {
+        auto_compact_threshold_for_window(self.context_window(), self.output_token_reserve())
+    }
+
+    /// Lowest trigger at which one more full-length reply can leave the
+    /// compaction without room.
+    ///
+    /// The trigger is checked against the last request's input, so a turn
+    /// that lands just under it still gets one more reply (up to the output
+    /// reserve) before compaction runs, and compaction then has to send that
+    /// history and get a summary back (`RESERVED_FOR_SUMMARY`). A trigger
+    /// above this point can see that request overflow the window, and the
+    /// engine falls back to truncating history instead of summarising it.
+    pub fn auto_compact_red_zone_start(&self) -> u32 {
+        self.input_token_budget()
+            .saturating_sub(RESERVED_FOR_SUMMARY)
+    }
+
     pub fn last_input_tokens(&self) -> u32 {
         self.last_input_tokens.load(Ordering::Relaxed)
     }
@@ -3391,6 +3411,37 @@ mod tests {
         assert_eq!(budget.auto_compact_threshold(), 353_400);
         assert!(!budget.should_auto_compact_for_tokens(353_399));
         assert!(budget.should_auto_compact_for_tokens(353_400));
+    }
+
+    #[test]
+    fn red_zone_starts_one_reply_and_one_summary_below_the_window() {
+        // 200k / 64k (an older-generation shape): 136k of input, less the summary reserve.
+        let small = ContextBudget::with_output_reserve(200_000, 64_000);
+        assert_eq!(small.auto_compact_red_zone_start(), 116_000);
+        // The window's own trigger sits inside it on a model this tight.
+        assert_eq!(small.window_auto_compact_threshold(), 129_200);
+        assert!(small.window_auto_compact_threshold() > small.auto_compact_red_zone_start());
+
+        // 1M / 128k: the default cap (244.8k) is far below the red zone.
+        let large = ContextBudget::with_output_reserve(1_000_000, 128_000);
+        assert_eq!(large.auto_compact_red_zone_start(), 852_000);
+        large.set_auto_compact_token_limit(Some(DEFAULT_AUTO_COMPACT_TOKEN_LIMIT));
+        assert!(large.auto_compact_threshold() < large.auto_compact_red_zone_start());
+    }
+
+    #[test]
+    fn window_threshold_ignores_the_cap_and_red_zone_never_underflows() {
+        let budget = ContextBudget::with_output_reserve(500_000, 128_000);
+        budget.set_auto_compact_token_limit(Some(100_000));
+        assert_eq!(budget.auto_compact_threshold(), 100_000);
+        assert_eq!(budget.window_auto_compact_threshold(), 353_400);
+        budget.set_auto_compact_token_limit(None);
+        assert_eq!(budget.auto_compact_threshold(), 353_400);
+
+        // A reserve that eats the whole window leaves no safe trigger at all.
+        let tiny = ContextBudget::with_output_reserve(16_000, 16_000);
+        assert_eq!(tiny.auto_compact_red_zone_start(), 0);
+        assert_eq!(tiny.window_auto_compact_threshold(), 0);
     }
 
     #[test]

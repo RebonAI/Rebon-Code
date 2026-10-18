@@ -194,6 +194,7 @@ pub(crate) fn publish_session_owner_descriptor(
         job_id: Some(job_id.to_string()),
         ipc_port: Some(ipc.port),
         ipc_token: Some(ipc.token.clone()),
+        terminal_id: rebon_session_host::terminal_id_from_env(),
         started_at_ms: now_ms(),
     };
     rebon_session::write_session_owner(projects_root, cwd, session_id, &descriptor).map_err(|err| {
@@ -1025,10 +1026,8 @@ fn build_background_prompt_request(
     agent_filter: Option<rebon_types::ToolFilterSpec>,
     resume_saved_user: bool,
 ) -> rebon_agent_core::PromptRequest {
-    // 只分类已领取的用户原文，不把 hook 附加内容或后台报告当成首次请求。
-    let user_prompt = claimed_pending_prompt(state)
-        .filter(|pending| !resume_saved_user && pending.coordinator_report_paths.is_empty())
-        .map(|pending| pending.text.clone());
+    // 只分类已领取的用户原文，不把 hook 附加内容、后台报告或另一个 agent 的消息当成首次请求。
+    let user_prompt = background_user_prompt(state, resume_saved_user);
     let durable_ultrawork_requested = rebon_acp::starts_with_ultrawork_command(&prompt);
     let skill_invocations = if resume_saved_user {
         // The user row is already durable; its skill, if it named one, was
@@ -1802,6 +1801,10 @@ async fn execute_background_job_inner(
     // provider under it and the thinking overrides below are resolved from
     // that provider's format.
     apply_recorded_model(&mut session, state, store).await;
+    // After the model, which may have brought a fresh budget. The app's
+    // auto-compact slider writes config.json while this worker is parked,
+    // and the person moving it expects the very next turn to honour it.
+    rebon_harness::refresh_auto_compact_token_limit(&session.model.prune_level);
 
     // Say which agent this turn runs under. The router lives in this process
     // and nothing asked it before, so `agent` was `None` in every snapshot the
@@ -1832,19 +1835,27 @@ async fn execute_background_job_inner(
     // for every hosted session — which is every session by default.
     // A recovered turn's user row is already durable:
     // its hook ran when the row was written.
-    let worktree = match run_user_prompt_submit_hook(
-        store,
-        state,
-        &mut session,
-        worktree,
-        handed_back,
-        &mut prompt,
-        resume_saved_user,
-    )
-    .await?
-    {
-        PromptSubmitDecision::Refused(outcome) => return Ok(outcome),
-        PromptSubmitDecision::Continue(worktree) => worktree,
+    // A turn started by another agent's message is not a user prompt, so it
+    // has no UserPromptSubmit to run. The hook exists to let a person's input
+    // be annotated or refused; both applied to a teammate message would make
+    // the hook speak for a user who typed nothing.
+    let worktree = if claimed_pending_prompt(state).is_some_and(PendingPrompt::is_agent_message) {
+        worktree
+    } else {
+        match run_user_prompt_submit_hook(
+            store,
+            state,
+            &mut session,
+            worktree,
+            handed_back,
+            &mut prompt,
+            resume_saved_user,
+        )
+        .await?
+        {
+            PromptSubmitDecision::Refused(outcome) => return Ok(outcome),
+            PromptSubmitDecision::Continue(worktree) => worktree,
+        }
     };
     // Borrowed out of `state`, so it is taken after the hook above has had its
     // mutable turn; nothing between there and here touches the attachments.

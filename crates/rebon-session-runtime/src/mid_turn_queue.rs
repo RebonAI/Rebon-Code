@@ -21,6 +21,15 @@ pub enum QueuedSubmitWithdrawal {
 pub struct MidTurnQueuedSubmitPoller {
     session_id: String,
     queue: Mutex<VecDeque<SubmitPayload>>,
+    /// Framed `<teammate-message>` text from a cross-session agent, waiting for
+    /// the next tool round.
+    ///
+    /// A separate queue from `queue` because the two are rendered differently:
+    /// a submit carries the queued-user marker and the UI's own idempotency
+    /// uuid, while an agent message is another agent's output and must arrive as
+    /// plain framed text, exactly as the hosted worker's
+    /// `pending_prompt_attachment_message` delivers it.
+    agent_messages: Mutex<VecDeque<String>>,
     consumed_user_message_uuids: Mutex<HashSet<String>>,
     /// Messages handed to a steer that has not answered yet, keyed by
     /// their uuid and holding the payload so every exit path can put
@@ -66,6 +75,7 @@ impl MidTurnQueuedSubmitPoller {
         Arc::new(Self {
             session_id: session_id.into(),
             queue: Mutex::new(VecDeque::new()),
+            agent_messages: Mutex::new(VecDeque::new()),
             consumed_user_message_uuids: Mutex::new(HashSet::new()),
             in_flight: Mutex::new(HashMap::new()),
             withdrawn_in_flight_uuids: Mutex::new(HashSet::new()),
@@ -359,6 +369,31 @@ impl MidTurnQueuedSubmitPoller {
         true
     }
 
+    /// Queue another agent's framed message for the running turn.
+    ///
+    /// The next tool round publishes it as a plain user message; the event loop
+    /// moves anything still here to the idle path when the turn ends, so a turn
+    /// that finishes before its next tool round does not strand the message.
+    pub fn enqueue_agent_message(&self, framed: String) {
+        self.agent_messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_back(framed);
+    }
+
+    /// Take back every agent message the running turn never injected.
+    ///
+    /// Called once the turn is over (or while the session is idle), so the
+    /// message can start a fresh turn instead of waiting for a tool round that
+    /// may never come — an external agent turn has none at all.
+    pub fn take_pending_agent_messages(&self) -> Vec<String> {
+        self.agent_messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect()
+    }
+
     pub fn remove_submit(&self, submit: &SubmitPayload) {
         let Some(uuid) = submit.user_message_uuid.as_deref() else {
             return;
@@ -460,6 +495,10 @@ impl MidTurnQueuedSubmitPoller {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             queue.clear();
         }
+        self.agent_messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.in_flight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -500,6 +539,11 @@ impl MidTurnQueuedSubmitPoller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len()
+            + self
+                .agent_messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
     }
 }
 
@@ -559,6 +603,16 @@ impl AttachmentPoller for MidTurnQueuedSubmitPoller {
             }
         }
 
+        let mut agent_messages = self
+            .agent_messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        messages.extend(agent_messages.drain(..).map(|text| ApiMessage {
+            role: rebon_api::Role::User,
+            content: vec![ApiContentBlock::Text(TextBlock { text })],
+        }));
+        drop(agent_messages);
+
         messages
     }
 }
@@ -587,6 +641,62 @@ mod tests {
             execution_policy: None,
             skill_invocations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_agent_message_is_injected_as_plain_framed_text() {
+        let poller = MidTurnQueuedSubmitPoller::new("session");
+        let frame = "<teammate-message teammate_id=\"main@session:s\" from_session=\"s\">\nhello\n</teammate-message>";
+        poller.enqueue_agent_message(frame.to_string());
+        assert_eq!(poller.pending_len(), 1);
+
+        let eager = AttachmentPollRequest::new("session", "turn", 1, AttachmentPollPhase::Eager);
+        assert!(
+            poller.poll(eager).is_empty(),
+            "the eager phase runs before the tool round this attachment belongs to"
+        );
+        assert_eq!(poller.pending_len(), 1);
+
+        let messages = poller.poll(request(1));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, Role::User);
+        assert_eq!(
+            messages[0].content.len(),
+            1,
+            "no marker block may ride along"
+        );
+        match &messages[0].content[0] {
+            ContentBlock::Text(text) => {
+                assert_eq!(text.text, frame);
+                assert!(
+                    !text.text.contains("rebon-queued-user-input"),
+                    "an agent message is not a queued user submit: {}",
+                    text.text
+                );
+            }
+            other => panic!("expected one text block, got {other:?}"),
+        }
+        assert_eq!(poller.pending_len(), 0);
+    }
+
+    #[test]
+    fn an_agent_message_the_turn_never_reached_is_taken_back_for_idle() {
+        let poller = MidTurnQueuedSubmitPoller::new("session");
+        poller.enqueue_agent_message("first".into());
+        poller.enqueue_agent_message("second".into());
+        assert_eq!(poller.pending_len(), 2);
+
+        assert_eq!(
+            poller.take_pending_agent_messages(),
+            vec!["first".to_string(), "second".to_string()]
+        );
+        assert_eq!(poller.pending_len(), 0);
+        assert!(poller.poll(request(1)).is_empty());
+
+        poller.enqueue_agent_message("third".into());
+        poller.clear_pending();
+        assert_eq!(poller.pending_len(), 0);
+        assert!(poller.take_pending_agent_messages().is_empty());
     }
 
     #[test]

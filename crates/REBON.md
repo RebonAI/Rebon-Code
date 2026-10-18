@@ -150,15 +150,20 @@ crate as `crates/rebon-<name>/`, a Rust feature plugin as
 - A background worker holds no interface state: the transcript `/context` and
   `/rewind` need is computed by the pure function `replayed_messages(entries)`.
 - **`rebon-session-host` is the session host's shared half, and only surfaces
-  may depend on it.** It is five pieces: `state` (the on-disk shape of
-  `~/.rebon/jobs/`, pinned byte for byte by `wire_contract_tests`), `store`
-  (transactions that stay consistent across processes), `protocol` (the local
-  control plane — there is **one**, and the only permitted increment is an
-  additive `CancelCall` inside the same enum), `client` (`SessionHostClient` /
-  `SessionHostConnection`, the four owner states, leases, subscriptions, the
-  prompt ladder) and `legacy_foreground` (the local terminal host's file
-  mailbox, kept indefinitely per RFC-0004 §16.23), plus the `supervisor` that
-  has moved in. The test is "is this code the host's, or some surface's":
+  may depend on it.** It is the on-disk and control-plane half of a host:
+  `state` (the on-disk shape of `~/.rebon/jobs/`, pinned byte for byte by
+  `wire_contract_tests`), `store` (transactions that stay consistent across
+  processes), `protocol` (the local control plane — there is **one**, and the
+  only permitted increment is an additive variant inside
+  `BackgroundIpcRequest`: the ones that exist are `CancelCall` and
+  `AgentMessage`, and they add no second protocol), `client`
+  (`SessionHostClient` / `SessionHostConnection`, the four owner states, leases,
+  subscriptions, the prompt and agent-message ladders), `legacy_foreground`
+  (the local terminal host's file mailbox, kept indefinitely per RFC-0004
+  §16.23), `agent_message` (the `<teammate-message>` envelope one session's
+  agent sends another) and `peers` (the running-session list, merged from the
+  job records and `.live.json` heartbeats), plus the `supervisor` that has
+  moved in. The test is "is this code the host's, or some surface's":
   `gh` fetching PR status and the updater plugin's Windows migration are a
   surface's, so they are injected hooks rather than dependencies. `cargo tree -i
   rebon-session-host` must show only `rebon-cli`, `rebon-app`,

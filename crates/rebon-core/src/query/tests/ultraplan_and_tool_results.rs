@@ -555,6 +555,57 @@ fn unknown_output_limit_does_not_subtract_a_second_output_reserve() {
 }
 
 #[test]
+fn top_effort_tiers_use_the_models_whole_output_limit() {
+    let handle = |output_limit| {
+        PruneLevelHandle::with_model_context_limits(
+            PruneLevel::Conservative,
+            1_000_000,
+            output_limit,
+            std::iter::empty::<(String, u32)>(),
+            std::iter::empty::<(String, u32)>(),
+        )
+    };
+    let deepseek = handle(384_000);
+    // xhigh and max reach the model's 384K; high and below keep their tier.
+    assert_eq!(
+        effort_max_tokens_for_model(128_000, Some(4), Some(&deepseek)),
+        384_000
+    );
+    assert_eq!(
+        effort_max_tokens_for_model(128_000, Some(3), Some(&deepseek)),
+        384_000
+    );
+    assert_eq!(
+        effort_max_tokens_for_model(64_000, Some(2), Some(&deepseek)),
+        64_000
+    );
+    // No ordinal (Anthropic budgets, no effort) is left alone.
+    assert_eq!(
+        effort_max_tokens_for_model(128_000, None, Some(&deepseek)),
+        128_000
+    );
+    // A smaller or unknown model limit never lowers the tier here; capping is
+    // `cap_max_tokens_for_model`'s job.
+    assert_eq!(
+        effort_max_tokens_for_model(128_000, Some(4), Some(&handle(64_000))),
+        128_000
+    );
+    assert_eq!(
+        effort_max_tokens_for_model(128_000, Some(4), Some(&handle(0))),
+        128_000
+    );
+    assert_eq!(effort_max_tokens_for_model(128_000, Some(4), None), 128_000);
+    // The raised ceiling still passes the model cap unchanged.
+    assert_eq!(
+        cap_max_tokens_for_model(
+            effort_max_tokens_for_model(128_000, Some(4), Some(&deepseek)),
+            Some(&deepseek)
+        ),
+        384_000
+    );
+}
+
+#[test]
 fn output_cap_policy_preserves_small_caps_and_only_halves_unknown_limits() {
     for (output_limit, requested, expected) in [
         (0, 128_000, 64_000),

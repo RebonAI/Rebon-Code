@@ -7,6 +7,7 @@
 mod support;
 
 mod acp_control_plane;
+mod agent_message;
 mod agent_runtime;
 mod cancel_call;
 mod ipc_commands;

@@ -29,8 +29,8 @@
 //!
 //! Nothing read off a model's name can do that job. Generation and variant
 //! are a reasonable prior right up until they are wrong, and they are
-//! wrong across generations: `gemini-3.8-flash` stands at rank 14 while
-//! `gemini-3.1-pro-preview` stands at 37, so "pro beats flash" and "newer
+//! wrong across generations: `gemini-3.8-flash` stands at rank 15 while
+//! `gemini-3.1-pro-preview` stands at 39, so "pro beats flash" and "newer
 //! beats older" disagree, and only one of them is measured. Price cannot
 //! do it either — `gpt-5.6-luna` at $1.20/M output and `gpt-5.6-sol` at
 //! $20/M declare identical effort vocabularies, and the cheapest model on
@@ -80,15 +80,16 @@ pub enum ModelTier {
 /// (`gemini-pro` spans 2.5 and 3.1), so the family names the line and
 /// [`generation`] reads the number off the model id. A family listed at
 /// `0.0` is one whose name already pins a single line (`gpt-astra`,
-/// `kimi-k3`), so there is no threshold left to apply.
+/// `gpt-sol`), so there is no threshold left to apply.
 ///
 /// The list stays short, and it may not contradict the board. A prior for
 /// a family whose rated members sit mid-table is not a prior, it is a
 /// wrong answer waiting for the next unrated sibling — which is why
-/// `gemini-pro` is absent (the board puts `gemini-3.1-pro-preview` at 37
-/// of 43) and why `claude-sonnet` starts at 5 rather than 4.5 (4.6 measured
-/// 28). `the_family_priors_do_not_contradict_the_board` enforces exactly
-/// that, so this list cannot quietly drift away from the evidence.
+/// `gemini-pro` is absent (the board puts `gemini-3.1-pro-preview` at 39
+/// of 52), why `claude-sonnet` starts at 5 rather than 4.5 (4.6 once
+/// measured 28 of 43), and why `kimi-k3` left the list when the board put
+/// it at 23 of 52. `the_family_priors_do_not_contradict_the_board` enforces
+/// exactly that, so this list cannot quietly drift away from the evidence.
 ///
 /// Coarse families stay out on their own account: `glm` spans a flagship
 /// and a 4.5-era air model, `gpt` spans fourteen models across four
@@ -97,7 +98,6 @@ const FRONTIER_FAMILIES: &[(&str, f32)] = &[
     // Each names one model line already.
     ("gpt-astra", 0.0),
     ("gpt-sol", 0.0),
-    ("kimi-k3", 0.0),
     // Claude names the variant; the generation is on the id
     // (`claude-opus-4-5` is 4.5, `claude-opus-5` is 5).
     ("claude-opus", 4.5),
@@ -206,8 +206,8 @@ const FRONTIER_STANDING: f64 = 0.25;
 ///
 /// 1. **A leaderboard has rated it.** Then that is the answer, and it
 ///    outranks any guess made from the name. This is the part a version
-///    rule cannot do: `gemini-3.8-flash` stands at rank 14 and
-///    `gemini-3.1-pro-preview` at 37, so the newer Flash is the better
+///    rule cannot do: `gemini-3.8-flash` stands at rank 15 and
+///    `gemini-3.1-pro-preview` at 39, so the newer Flash is the better
 ///    model and no reading of "pro beats flash" would have found that.
 /// 2. **No rating, but a family we have judged.** New models ship faster
 ///    than boards rate them; [`FRONTIER_FAMILIES`] is what carries a launch
@@ -267,9 +267,11 @@ mod tests {
         for model in [
             "gpt-6-astra",
             "gpt-5.6-sol",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-fable-5-1",
             "claude-opus-5",
             "claude-sonnet-5",
-            "kimi-k3",
         ] {
             assert_eq!(model_tier(model), ModelTier::Frontier, "{model}");
         }
@@ -278,7 +280,8 @@ mod tests {
             "gpt-5.6-luna",
             "gpt-5.6-terra",
             "gpt-5.4-mini",
-            "claude-haiku-4-5",
+            "claude-haiku-5-5",
+            "kimi-k3",
             "glm-5.3",
             "deepseek-v4-flash",
         ] {
@@ -291,8 +294,8 @@ mod tests {
     /// The case a name-based rule gets backwards.
     ///
     /// "Newer beats older" and "pro beats flash" both sound right, and both
-    /// fail here: the newer Flash stands at rank 14 on the agent board and
-    /// the older Pro at 37. Only the measurement knows.
+    /// fail here: the newer Flash stands at rank 15 on the agent board and
+    /// the older Pro at 39. Only the measurement knows.
     #[test]
     fn a_measured_standing_beats_what_the_name_suggests() {
         let flash = model_table::model(None, "gemini-3.8-flash").expect("in the table");
@@ -312,17 +315,37 @@ mod tests {
 
     /// A rated model does not get a second vote from its family.
     ///
-    /// `claude-sonnet-4-6` sits in a frontier family and clears the 4.5
-    /// generation gate; the board puts it at rank 28 of 43. The measurement
-    /// is what stands, or a stale judgement outlives the data that
-    /// disproved it.
+    /// Every model the board rates gets the board's verdict, whatever its
+    /// family's prior says; otherwise a stale judgement outlives the data
+    /// that disproved it. `kimi-k3` is the case in point: a listed frontier
+    /// line until the board put it at 23 of 52.
     #[test]
     fn the_family_table_does_not_override_a_measured_model() {
-        let row = model_table::model(None, "claude-sonnet-4-6").expect("in the table");
-        assert_eq!(row.family.as_deref(), Some("claude-sonnet"));
-        assert!(generation("claude-sonnet-4-6").unwrap() >= 4.5);
-        assert!(row.score.is_some(), "the board rates it");
-        assert_eq!(model_tier("claude-sonnet-4-6"), ModelTier::Working);
+        let mut rated = 0;
+        for vendor in ProviderVendor::ALL {
+            for model in model_table::models_for_vendor(*vendor) {
+                let Some(score) = model.score.as_ref() else {
+                    continue;
+                };
+                // The tier is looked up by id alone; judge only rows that
+                // lookup lands on, or a reseller's copy would be measured
+                // against another row's score.
+                let looked_up = model_table::model(None, &model.id).expect("in the table");
+                let same = |s: &model_table::Score| (s.rank, s.of) == (score.rank, score.of);
+                if !looked_up.score.as_ref().is_some_and(same) {
+                    continue;
+                }
+                rated += 1;
+                let expected = if score.standing() < FRONTIER_STANDING {
+                    ModelTier::Frontier
+                } else {
+                    ModelTier::Working
+                };
+                assert_eq!(model_tier(&model.id), expected, "{}", model.id);
+            }
+        }
+        assert!(rated > 0, "the snapshot carries board scores");
+        assert_eq!(model_tier("kimi-k3"), ModelTier::Working);
     }
 
     /// The family table still carries a model no board has reached.

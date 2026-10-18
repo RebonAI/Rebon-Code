@@ -1048,7 +1048,9 @@ fn session_pipeline(
         // is idle (no active prompt, no queued commands), auto-submit
         // the pending teammate messages as a new model turn.
         if app.resume_dialog.is_none()
-            && (!app.pending_channel_prompts.is_empty() || !app.pending_teammate_prompts.is_empty())
+            && (!app.pending_channel_prompts.is_empty()
+                || !app.pending_teammate_prompts.is_empty()
+                || !app.pending_agent_prompts.is_empty())
             && state.active_prompt.is_none()
             && app.queued_commands.is_empty()
         {
@@ -1110,7 +1112,11 @@ fn session_pipeline(
         sync_permission_view(app, &state.pending_permission);
         // Publish this session's live status (busy + pending permission) so
         // the desktop app can render controls for it. Throttled internally.
-        foreground_control.publish(&state.active_prompt, &state.pending_permission);
+        foreground_control.publish(
+            &state.active_prompt,
+            &state.pending_permission,
+            app.resume_dialog.is_some(),
+        );
         app.sync_task_snapshots(session.engine_half.tasks.snapshots());
         refresh_teams_dialog(app);
         refresh_agent_view_if_due(app);

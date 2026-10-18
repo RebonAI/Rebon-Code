@@ -64,7 +64,7 @@ fn seat() -> Option<&'static Arc<UiSeat>> {
 /// Open `/tasks` (or `/workflows`, which is the same panel with a kind
 /// filter) through the seat.
 ///
-/// `None` when the tasks plugin is off: its thirteen tools, its runtime
+/// `None` when the tasks plugin is off: its fourteen tools, its runtime
 /// and this panel go together, so a session without it has no background
 /// tasks to show.
 pub fn open_background_tasks(

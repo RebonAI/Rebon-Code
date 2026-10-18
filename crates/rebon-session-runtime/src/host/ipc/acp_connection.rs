@@ -623,6 +623,17 @@ fn translate(
                 command_id: params.command_id,
             }
         }
+        method::AGENT_MESSAGE => {
+            let params: ext::AgentMessageParams = decode(request_method, params)?;
+            BackgroundIpcRequest::AgentMessage {
+                message_id: params.message_id,
+                from_session_id: params.from_session_id,
+                from_agent: params.from_agent,
+                from_cwd: params.from_cwd,
+                summary: params.summary,
+                text: params.text,
+            }
+        }
         method::MODS => {
             let params: ext::ModsParams = decode(request_method, params)?;
             BackgroundIpcRequest::Mods { call: params.call }
@@ -926,6 +937,25 @@ mod tests {
                     command_id: "c-1".into(),
                 },
             ),
+            (
+                method::AGENT_MESSAGE,
+                json!({
+                    "messageId": "m-1",
+                    "fromSessionId": "s-1",
+                    "fromAgent": "main",
+                    "fromCwd": "/work",
+                    "summary": "the migration",
+                    "text": "please take a look",
+                }),
+                BackgroundIpcRequest::AgentMessage {
+                    message_id: "m-1".into(),
+                    from_session_id: "s-1".into(),
+                    from_agent: "main".into(),
+                    from_cwd: Some("/work".into()),
+                    summary: Some("the migration".into()),
+                    text: "please take a look".into(),
+                },
+            ),
         ]
     }
 
@@ -1108,6 +1138,14 @@ mod tests {
             },
             BackgroundIpcRequest::CancelCall {
                 command_id: "c-1".into(),
+            },
+            BackgroundIpcRequest::AgentMessage {
+                message_id: "m-1".into(),
+                from_session_id: "s-1".into(),
+                from_agent: "main".into(),
+                from_cwd: Some("/work".into()),
+                summary: Some("the migration".into()),
+                text: "please take a look".into(),
             },
         ];
         for request in requests {

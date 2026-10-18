@@ -1173,7 +1173,8 @@ fn resolve_env_runtime_model(overrides: &HarnessOverrides) -> anyhow::Result<Run
 ///
 /// Whatever the window, auto-compact fires no later than
 /// [`rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT`] tokens (Codex's
-/// 272k × 90%). `REBON_AUTO_COMPACT_TOKEN_LIMIT` replaces that cap; `0`
+/// 272k × 90%). `REBON_AUTO_COMPACT_TOKEN_LIMIT`, or failing that
+/// `autoCompactTokenLimit` in `config.json`, replaces that cap; `0`
 /// removes it so the trigger follows the window alone.
 pub fn prune_handle_from_env(
     format: &ProviderFormat,
@@ -1214,11 +1215,18 @@ pub fn prune_handle_from_env(
     if matches!(format, ProviderFormat::Anthropic) {
         handle.use_full_history_replay_microcompact_profile();
     }
-    handle
-        .budget
-        .set_auto_compact_token_limit(auto_compact_token_limit_from_env());
+    refresh_auto_compact_token_limit(&handle);
 
     handle
+}
+
+/// Re-read the auto-compact cap onto a session's budget. A live session
+/// calls this at the start of each turn, so a cap saved while it runs
+/// applies from its next turn rather than its next launch.
+pub fn refresh_auto_compact_token_limit(handle: &PruneLevelHandle) {
+    handle
+        .budget
+        .set_auto_compact_token_limit(configured_auto_compact_token_limit());
 }
 
 /// Configured context windows as the totals the context budget expects.
@@ -1251,24 +1259,43 @@ fn total_context_windows(
     (configured_window, model_windows)
 }
 
-fn auto_compact_token_limit_from_env() -> Option<u32> {
-    match std::env::var("REBON_AUTO_COMPACT_TOKEN_LIMIT") {
-        Ok(value) => match value.trim().parse::<u32>() {
-            Ok(0) => None,
-            Ok(limit) => {
-                tracing::info!(limit, "auto-compact token limit override from env");
-                Some(limit)
-            }
+/// Environment variable that overrides the saved auto-compact cap.
+pub const AUTO_COMPACT_TOKEN_LIMIT_ENV: &str = "REBON_AUTO_COMPACT_TOKEN_LIMIT";
+
+/// The auto-compact cap a session runs with: the env var, then the saved
+/// `autoCompactTokenLimit`, then the default cap. `None` means no cap.
+pub fn configured_auto_compact_token_limit() -> Option<u32> {
+    configured_auto_compact_token_limit_in_dir(&rebon_config::config_home_dir())
+}
+
+/// [`configured_auto_compact_token_limit`] against the `config.json` in
+/// `config_dir`.
+pub fn configured_auto_compact_token_limit_in_dir(config_dir: &std::path::Path) -> Option<u32> {
+    let env = std::env::var(AUTO_COMPACT_TOKEN_LIMIT_ENV).ok();
+    // The env var wins outright, so config.json is not read under it.
+    let saved = match env {
+        Some(_) => None,
+        None => rebon_config::saved_auto_compact_token_limit_in_dir(config_dir),
+    };
+    resolve_auto_compact_token_limit(env.as_deref(), saved)
+}
+
+fn resolve_auto_compact_token_limit(env: Option<&str>, saved: Option<u32>) -> Option<u32> {
+    let limit = match (env, saved) {
+        (Some(value), _) => match value.trim().parse::<u32>() {
+            Ok(limit) => limit,
             Err(_) => {
                 tracing::warn!(
                     value = %value,
-                    "REBON_AUTO_COMPACT_TOKEN_LIMIT is not a token count; using the default cap"
+                    "{AUTO_COMPACT_TOKEN_LIMIT_ENV} is not a token count; using the default cap"
                 );
-                Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT)
+                return Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT);
             }
         },
-        Err(_) => Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT),
-    }
+        (None, Some(limit)) => limit,
+        (None, None) => return Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT),
+    };
+    (limit != 0).then_some(limit)
 }
 
 fn prune_handle_from_model_config(
@@ -2168,39 +2195,97 @@ fn sys_info_windows() -> String {
     String::new()
 }
 
-/// Map a model ID to its marketing name.
+/// The model's marketing name, as the model table records it.
+///
+/// Read from the catalogue rather than a list kept here, so a model that
+/// ships shows its name as soon as the table carries it. Rebon's own
+/// `-pro` aliases are not catalogue ids, so they are named after the model
+/// they wrap.
 pub fn model_marketing_name(model: &str) -> Option<String> {
-    if model.contains("claude-opus-4-6") {
-        Some("Claude Opus 4.6 (1M context)".to_string())
-    } else if model.contains("claude-sonnet-4-6") {
-        Some("Claude Sonnet 4.6".to_string())
-    } else if model.contains("claude-opus-4-5") {
-        Some("Claude Opus 4.5".to_string())
-    } else if model.contains("claude-haiku-4") {
-        Some("Claude Haiku 4.5".to_string())
-    } else if let Some(base) = rebon_api::split_pro_model_alias(model) {
-        Some(match base {
+    if let Some(base) = rebon_api::split_pro_model_alias(model) {
+        return Some(match base {
             "gpt-5.6" | "gpt-5.6-sol" => "GPT-5.6 Pro".to_string(),
             "gpt-5.6-terra" => "GPT-5.6 Terra Pro".to_string(),
             "gpt-5.6-luna" => "GPT-5.6 Luna Pro".to_string(),
             other => format!("{other} (pro)"),
-        })
-    } else {
-        None
+        });
     }
+    let row = catalog_row_for_prompt(model)?;
+    marketing_name_from_catalog(&row.name)
 }
 
+/// The model's training cutoff, as "Month Year", from the model table.
 pub fn knowledge_cutoff(model: &str) -> Option<String> {
-    if model.contains("claude-sonnet-4-6") {
-        Some("August 2025".to_string())
-    } else if model.contains("claude-opus-4-6") || model.contains("claude-opus-4-5") {
-        Some("May 2025".to_string())
-    } else if model.contains("claude-haiku-4") {
-        Some("February 2025".to_string())
-    } else if model.contains("claude-opus-4") || model.contains("claude-sonnet-4") {
-        Some("January 2025".to_string())
-    } else {
-        None
+    let model = rebon_api::split_pro_model_alias(model).unwrap_or(model);
+    let row = catalog_row_for_prompt(model)?;
+    format_knowledge_cutoff(row.knowledge.as_deref()?)
+}
+
+/// The catalogue row the system prompt describes `model` with.
+///
+/// The model's own vendor answers first: resellers list the same ids under
+/// their own names and often without a cutoff. Ids that carry a reseller's
+/// or cloud's prefix (`anthropic/claude-…`, `us.anthropic.claude-…`) are
+/// retried without it.
+fn catalog_row_for_prompt(model: &str) -> Option<rebon_api::model_table::CatalogModel> {
+    let model = model.trim();
+    let after_slash = model.rsplit('/').next().unwrap_or(model);
+    let after_cloud = after_slash
+        .rsplit_once("anthropic.")
+        .map_or(after_slash, |(_, id)| id);
+    let candidates = [model, after_slash, after_cloud];
+    let first_party = rebon_api::ProviderVendor::ALL
+        .iter()
+        .filter(|vendor| !vendor.is_reseller())
+        .filter_map(|vendor| rebon_api::model_table::provider_id(*vendor));
+    for provider in first_party {
+        for id in candidates {
+            if let Some(row) = rebon_api::model_table::model(Some(provider), id) {
+                return Some(row);
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .find_map(|id| rebon_api::model_table::model(None, id))
+}
+
+/// A catalogue name as the prompt shows it: no "(latest)" alias marker, no
+/// "Vendor: " prefix a reseller puts in front.
+fn marketing_name_from_catalog(name: &str) -> Option<String> {
+    let name = name.trim();
+    let name = name.strip_suffix("(latest)").map_or(name, str::trim_end);
+    let name = name.split_once(": ").map_or(name, |(_, rest)| rest).trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// `2026-06` or `2026-01-31` as "June 2026" / "January 2026"; a bare year
+/// stays a year. Anything else is not a date this can vouch for.
+fn format_knowledge_cutoff(knowledge: &str) -> Option<String> {
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    let mut parts = knowledge.trim().split('-');
+    let year = parts
+        .next()
+        .filter(|year| year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()))?;
+    match parts.next() {
+        None => Some(year.to_string()),
+        Some(month) => {
+            let index: usize = month.parse().ok().filter(|m| (1..=12).contains(m))?;
+            Some(format!("{} {year}", MONTHS[index - 1]))
+        }
     }
 }
 
@@ -3780,6 +3865,10 @@ mod tests {
         let _env = EnvRestore::new(&["REBON_CONTEXT_WINDOW", "REBON_AUTO_COMPACT_TOKEN_LIMIT"]);
         std::env::remove_var("REBON_CONTEXT_WINDOW");
         std::env::remove_var("REBON_AUTO_COMPACT_TOKEN_LIMIT");
+        // The cap falls back to config.json; keep this machine's out of it.
+        // `TestConfigHome` holds the lock every config-home test shares.
+        let _config_home =
+            rebon_tool::tasks::test_support::TestConfigHome::new("auto-compact-codex");
         let build = |base_url: &str| {
             let output_limits =
                 std::collections::BTreeMap::from([("gpt-6-astra".to_string(), 128_000)]);
@@ -3825,6 +3914,7 @@ mod tests {
         let _env = EnvRestore::new(&["REBON_CONTEXT_WINDOW", "REBON_AUTO_COMPACT_TOKEN_LIMIT"]);
         std::env::remove_var("REBON_CONTEXT_WINDOW");
         std::env::remove_var("REBON_AUTO_COMPACT_TOKEN_LIMIT");
+        let _config_home = rebon_tool::tasks::test_support::TestConfigHome::new("auto-compact-cap");
         let build = || {
             prune_handle_from_env(
                 &ProviderFormat::OpenaiResponses,
@@ -3854,6 +3944,162 @@ mod tests {
 
         std::env::set_var("REBON_AUTO_COMPACT_TOKEN_LIMIT", "0");
         assert_eq!(build().budget.auto_compact_threshold(), 875_900);
+    }
+
+    #[test]
+    fn saved_auto_compact_cap_applies_and_the_env_var_beats_it() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::new(&["REBON_CONTEXT_WINDOW", "REBON_AUTO_COMPACT_TOKEN_LIMIT"]);
+        std::env::remove_var("REBON_CONTEXT_WINDOW");
+        std::env::remove_var("REBON_AUTO_COMPACT_TOKEN_LIMIT");
+        let config_home =
+            rebon_tool::tasks::test_support::TestConfigHome::new("auto-compact-saved");
+        let build = || {
+            prune_handle_from_env(
+                &ProviderFormat::OpenaiResponses,
+                rebon_api::ProviderVendor::OpenAi,
+                "gpt-6-sol",
+                None,
+                None,
+                std::iter::empty::<(String, u32)>(),
+                std::iter::empty::<(String, u32)>(),
+            )
+        };
+
+        rebon_config::save_auto_compact_token_limit_in_dir(config_home.path(), Some(150_000))
+            .unwrap();
+        let handle = build();
+        assert_eq!(handle.budget.auto_compact_threshold(), 150_000);
+
+        // A live session picks up a change on its next refresh.
+        rebon_config::save_auto_compact_token_limit_in_dir(config_home.path(), Some(0)).unwrap();
+        refresh_auto_compact_token_limit(&handle);
+        assert_eq!(handle.budget.auto_compact_threshold(), 875_900);
+        rebon_config::save_auto_compact_token_limit_in_dir(config_home.path(), None).unwrap();
+        refresh_auto_compact_token_limit(&handle);
+        assert_eq!(handle.budget.auto_compact_threshold(), 244_800);
+
+        rebon_config::save_auto_compact_token_limit_in_dir(config_home.path(), Some(150_000))
+            .unwrap();
+        std::env::set_var("REBON_AUTO_COMPACT_TOKEN_LIMIT", "90000");
+        refresh_auto_compact_token_limit(&handle);
+        assert_eq!(handle.budget.auto_compact_threshold(), 90_000);
+    }
+
+    #[test]
+    fn current_models_get_a_name_and_cutoff_from_the_model_table() {
+        for (model, name, cutoff) in [
+            ("claude-opus-5-5", "Claude Opus 5.5", "June 2026"),
+            ("claude-sonnet-5-5", "Claude Sonnet 5.5", "June 2026"),
+            ("claude-haiku-5-5", "Claude Haiku 5.5", "June 2026"),
+            ("claude-fable-5-1", "Claude Fable 5.1", "June 2026"),
+            ("claude-opus-5", "Claude Opus 5", "May 2026"),
+            ("claude-sonnet-4-6", "Claude Sonnet 4.6", "August 2025"),
+            // The vendor's row wins over a reseller's copy of the same id.
+            ("gpt-6-sol", "GPT-6 Sol", "April 2026"),
+            ("gpt-6.1-sol", "GPT-6.1 Sol", "April 2026"),
+            ("gpt-5.6-sol", "GPT-5.6 Sol", "February 2026"),
+            ("deepseek-flash", "DeepSeek V4.1 Flash 1017", "May 2025"),
+        ] {
+            assert_eq!(
+                model_marketing_name(model).as_deref(),
+                Some(name),
+                "{model}"
+            );
+            assert_eq!(knowledge_cutoff(model).as_deref(), Some(cutoff), "{model}");
+        }
+    }
+
+    #[test]
+    fn prefixed_snapshot_and_alias_ids_find_the_same_model() {
+        for model in [
+            "anthropic.claude-opus-5-5",
+            "us.anthropic.claude-opus-5-5",
+            "anthropic/claude-opus-5-5",
+            "claude-opus-5-5@20260922",
+            "CLAUDE-OPUS-5-5",
+        ] {
+            assert_eq!(
+                model_marketing_name(model).as_deref(),
+                Some("Claude Opus 5.5"),
+                "{model}"
+            );
+            assert_eq!(
+                knowledge_cutoff(model).as_deref(),
+                Some("June 2026"),
+                "{model}"
+            );
+        }
+        // A `-pro` alias keeps its own name and takes its base's cutoff.
+        assert_eq!(
+            model_marketing_name("gpt-5.6-sol-pro").as_deref(),
+            Some("GPT-5.6 Pro")
+        );
+        assert_eq!(
+            knowledge_cutoff("gpt-5.6-sol-pro").as_deref(),
+            Some("February 2026")
+        );
+    }
+
+    #[test]
+    fn an_unknown_model_or_missing_cutoff_says_nothing() {
+        assert_eq!(model_marketing_name("house-model-7"), None);
+        assert_eq!(knowledge_cutoff("house-model-7"), None);
+        assert_eq!(model_marketing_name(""), None);
+        // Listed, but the table records no cutoff for it.
+        assert!(model_marketing_name("claude-fable-5").is_some());
+        assert_eq!(knowledge_cutoff("claude-fable-5"), None);
+    }
+
+    #[test]
+    fn catalogue_names_and_dates_are_cleaned_for_the_prompt() {
+        assert_eq!(
+            marketing_name_from_catalog("Claude Opus 4.5 (latest)").as_deref(),
+            Some("Claude Opus 4.5")
+        );
+        assert_eq!(
+            marketing_name_from_catalog("Anthropic: Claude Opus 5.5").as_deref(),
+            Some("Claude Opus 5.5")
+        );
+        assert_eq!(marketing_name_from_catalog("  "), None);
+
+        assert_eq!(
+            format_knowledge_cutoff("2026-06").as_deref(),
+            Some("June 2026")
+        );
+        assert_eq!(
+            format_knowledge_cutoff("2026-01-31").as_deref(),
+            Some("January 2026")
+        );
+        assert_eq!(format_knowledge_cutoff("2025").as_deref(), Some("2025"));
+        for bad in ["", "June 2026", "2026-13", "2026-00", "26-06", "2026-xx"] {
+            assert_eq!(format_knowledge_cutoff(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn auto_compact_cap_resolution_covers_every_source() {
+        let default = Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT);
+        assert_eq!(resolve_auto_compact_token_limit(None, None), default);
+        assert_eq!(
+            resolve_auto_compact_token_limit(None, Some(120_000)),
+            Some(120_000)
+        );
+        assert_eq!(resolve_auto_compact_token_limit(None, Some(0)), None);
+        assert_eq!(
+            resolve_auto_compact_token_limit(Some(" 80000 "), Some(120_000)),
+            Some(80_000)
+        );
+        assert_eq!(
+            resolve_auto_compact_token_limit(Some("0"), Some(120_000)),
+            None
+        );
+        // A malformed env var is the default cap, not the saved value: the
+        // person set the variable, and it is the one being honoured.
+        assert_eq!(
+            resolve_auto_compact_token_limit(Some("lots"), Some(120_000)),
+            default
+        );
     }
 
     #[test]

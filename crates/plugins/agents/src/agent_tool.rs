@@ -840,6 +840,7 @@ impl Tool for AgentTool {
         let inherited_cwd = context.cwd().map(|cwd| cwd.to_string());
         parsed.sub_agent.frozen_parent_context = context.frozen_parent_context().cloned();
         parsed.sub_agent.permission_broker = context.permission_broker().cloned();
+        parsed.sub_agent.peer_messenger = context.peer_messenger().cloned();
         parsed.sub_agent.capability_context = current_ultraplan_state
             .as_ref()
             .and_then(|state| state.capability_context.clone())
@@ -1536,6 +1537,7 @@ fn parse_input(input: &Value) -> Result<ParsedAgentToolInput, String> {
             execution_policy: None,
             task_kind,
             permission_broker: None,
+            peer_messenger: None,
         },
         subagent_type,
         subagent_type_explicit,
@@ -2171,7 +2173,15 @@ impl AgentTool {
                         permission_broker: workflow_lineage
                             .then(|| context.permission_broker().cloned())
                             .flatten(),
+                        // The teammate's own broker is not the session broker
+                        // outside workflow lineage, so capture the session's
+                        // auto-mode gate here while the parent context is at
+                        // hand. It only judges messages; it never prompts.
+                        auto_mode_gate: context.permission_broker().and_then(|broker| {
+                            rebon_core::permission::sub_agent_auto_mode_gate_from(broker)
+                        }),
                         permission_prompts_unavailable: workflow_lineage,
+                        peer_messenger: context.peer_messenger().cloned(),
                     })
                     .await
                     .map_err(|err| ToolError::Execution {

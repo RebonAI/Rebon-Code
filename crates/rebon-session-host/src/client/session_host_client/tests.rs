@@ -598,6 +598,7 @@ fn a_prompt_for_an_unreachable_owner_is_refused_without_a_write() {
             job_id: Some("job-unreachable".to_string()),
             ipc_port: Some(dead_port()),
             ipc_token: Some("token".to_string()),
+            terminal_id: None,
             started_at_ms: 1,
         },
     )
@@ -689,5 +690,427 @@ fn a_prompt_for_a_session_with_no_owner_is_queued_for_the_worker() {
             .collect::<Vec<_>>(),
         vec!["and then this"],
         "the prompt is where the worker will look for it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Agent messages
+// ---------------------------------------------------------------------------
+
+fn message_runtime() -> crate::BackgroundRuntimeFields {
+    crate::BackgroundRuntimeFields {
+        provider: None,
+        model: None,
+        fast_mode: None,
+        channels: Vec::new(),
+        development_channels: Vec::new(),
+        provider_format: None,
+        ui_mode: None,
+        effort_level: None,
+        permission_mode: None,
+        capability_mode: rebon_types::AgentCapabilityMode::Normal,
+        settings: Vec::new(),
+        add_dirs: Vec::new(),
+        plugin_dirs: Vec::new(),
+        mcp_configs: Vec::new(),
+        strict_mcp_config: false,
+    }
+}
+
+fn message_envelope(message_id: &str, text: &str) -> crate::AgentMessageEnvelope {
+    crate::AgentMessageEnvelope {
+        message_id: message_id.into(),
+        from_session_id: "sess-sender".into(),
+        from_agent: "main".into(),
+        from_cwd: Some("F:/work/sender".into()),
+        summary: Some("handoff".into()),
+        text: text.into(),
+    }
+}
+
+fn message_job(
+    store: &BackgroundStore,
+    session_id: &str,
+    cwd: &str,
+    status: BackgroundJobStatus,
+) -> String {
+    let mut state = crate::BackgroundJobState::new(
+        "first".to_string(),
+        cwd.to_string(),
+        message_runtime(),
+        None,
+    );
+    state.identity.session_id = Some(session_id.to_string());
+    state.process.status = status;
+    let job_id = state.identity.job_id.clone();
+    store
+        .write_state(&state)
+        .expect("the job record is written");
+    job_id
+}
+
+/// A free session with a job record has no worker to hand the message to, so
+/// the message waits in the durable queue. It must not start a worker: a
+/// message is not a turn somebody asked for.
+#[test]
+fn an_agent_message_for_a_free_session_with_a_job_is_queued() {
+    let dir = tempfile::Builder::new()
+        .prefix("rebon-client-message-")
+        .tempdir()
+        .expect("tempdir");
+    let store = BackgroundStore::new(dir.path().join("store"));
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects root");
+    let job_id = message_job(
+        &store,
+        "sess-message",
+        "/work/message",
+        BackgroundJobStatus::Idle,
+    );
+    let client = SessionHostClient::new(store.clone(), &projects, rebon_exe());
+    let envelope = message_envelope("m-queue", "check the build");
+
+    assert_eq!(
+        client.send_agent_message("sess-message", envelope.clone()),
+        Ok(crate::AgentMessageResult {
+            outcome: crate::AgentMessageDelivery::Queued,
+            duplicate: false,
+        })
+    );
+
+    let reloaded = store.read_state(&job_id).expect("the job is still there");
+    assert_eq!(reloaded.process.status, BackgroundJobStatus::Queued);
+    assert_eq!(reloaded.identity.pending_prompts.len(), 1);
+    let prompt = &reloaded.identity.pending_prompts[0];
+    assert_eq!(prompt.id, "m-queue");
+    assert_eq!(prompt.text, crate::frame_agent_message(&envelope));
+    assert_eq!(
+        prompt.origin,
+        Some(crate::PendingPromptOrigin::AgentMessage {
+            from_session_id: "sess-sender".into(),
+            from_agent: "main".into(),
+        })
+    );
+    assert!(
+        !store.roster_path().exists(),
+        "queueing a message must not publish a supervisor roster"
+    );
+
+    assert_eq!(
+        client.send_agent_message("sess-message", envelope),
+        Ok(crate::AgentMessageResult {
+            outcome: crate::AgentMessageDelivery::Queued,
+            duplicate: true,
+        }),
+        "a retry is answered without a second delivery"
+    );
+}
+
+/// A foreground terminal is alive and owns the session lock, but this one
+/// advertises neither an agent endpoint nor the mailbox capability.
+/// "Unreachable" would send the caller looking for a dead process; this says
+/// what is actually true — it needs a newer Rebon or a fresh status.
+#[test]
+fn an_agent_message_for_a_foreground_terminal_without_a_channel_is_refused() {
+    let dir = tempfile::Builder::new()
+        .prefix("rebon-client-foreground-message-")
+        .tempdir()
+        .expect("tempdir");
+    let store = BackgroundStore::new(dir.path().join("store"));
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects root");
+    let cwd = "/work/foreground-message";
+    let session_id = "sess-foreground-message";
+    let _lock = rebon_session::try_acquire_session_active_lock(&projects, cwd, session_id)
+        .expect("probe")
+        .expect("free");
+    assert!(crate::write_foreground_status(
+        &projects,
+        &crate::ForegroundSessionStatus {
+            pid: std::process::id(),
+            session_id: session_id.into(),
+            cwd: cwd.into(),
+            heartbeat_ms: crate::now_ms(),
+            busy: false,
+            pending_permission: None,
+            ask_user_questions: None,
+            last_command_id: None,
+            last_command_at_ms: 0,
+            last_command_error: None,
+            recent_command_results: Vec::new(),
+            terminal_id: None,
+            agent_endpoint: None,
+            capabilities: Vec::new(),
+        }
+    ));
+
+    let client = SessionHostClient::new(store, &projects, rebon_exe());
+    assert_eq!(
+        client.send_agent_message(session_id, message_envelope("m-fg", "hello")),
+        Err(HostCallError::ForegroundTerminal)
+    );
+}
+
+/// The rung that exists for exactly this: a live foreground status names a
+/// loopback endpoint, and its answer says where the message landed.
+#[test]
+fn an_agent_message_reaches_a_foreground_agent_endpoint() {
+    let dir = tempfile::Builder::new()
+        .prefix("rebon-client-foreground-endpoint-")
+        .tempdir()
+        .expect("tempdir");
+    let store = BackgroundStore::new(dir.path().join("store"));
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects root");
+    let cwd = "/work/foreground-endpoint";
+    let session_id = "sess-foreground-endpoint";
+    let _lock = rebon_session::try_acquire_session_active_lock(&projects, cwd, session_id)
+        .expect("probe")
+        .expect("free");
+    let inbox = Arc::new(crate::ForegroundAgentInbox::new());
+    let endpoint = crate::ForegroundAgentEndpoint::start(&projects, cwd, session_id, inbox.clone())
+        .expect("the endpoint binds");
+    assert!(crate::write_foreground_status(
+        &projects,
+        &crate::ForegroundSessionStatus {
+            pid: std::process::id(),
+            session_id: session_id.into(),
+            cwd: cwd.into(),
+            heartbeat_ms: crate::now_ms(),
+            busy: false,
+            pending_permission: None,
+            ask_user_questions: None,
+            last_command_id: None,
+            last_command_at_ms: 0,
+            last_command_error: None,
+            recent_command_results: Vec::new(),
+            terminal_id: None,
+            agent_endpoint: Some(endpoint.info()),
+            // Deliberately no capability: the endpoint rung must work on its
+            // own, not because the mailbox happens to be advertised too.
+            capabilities: Vec::new(),
+        }
+    ));
+
+    let client = SessionHostClient::new(store, &projects, rebon_exe());
+    let result = client
+        .send_agent_message(session_id, message_envelope("m-endpoint", "hello"))
+        .expect("the endpoint accepts the message");
+    assert_eq!(result.outcome, crate::AgentMessageDelivery::StartedNewTurn);
+    assert!(!result.duplicate);
+    let pending = inbox.take_pending();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].message_id, "m-endpoint");
+
+    let duplicate = client
+        .send_agent_message(session_id, message_envelope("m-endpoint", "hello"))
+        .expect("the retry is answered");
+    assert!(duplicate.duplicate);
+    assert!(inbox.take_pending().is_empty());
+}
+
+/// A TUI whose listener could not bind still drains the mailbox, so the
+/// capability is the second rung. The mailbox itself delivers on the terminal's
+/// next pass, which is why this answer is `Queued`.
+#[test]
+fn an_agent_message_uses_the_capability_mailbox_rung() {
+    let dir = tempfile::Builder::new()
+        .prefix("rebon-client-foreground-mailbox-")
+        .tempdir()
+        .expect("tempdir");
+    let store = BackgroundStore::new(dir.path().join("store"));
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects root");
+    let cwd = "/work/foreground-mailbox";
+    let session_id = "sess-foreground-mailbox";
+    let _lock = rebon_session::try_acquire_session_active_lock(&projects, cwd, session_id)
+        .expect("probe")
+        .expect("free");
+    assert!(crate::write_foreground_status(
+        &projects,
+        &crate::ForegroundSessionStatus {
+            pid: std::process::id(),
+            session_id: session_id.into(),
+            cwd: cwd.into(),
+            heartbeat_ms: crate::now_ms(),
+            busy: false,
+            pending_permission: None,
+            ask_user_questions: None,
+            last_command_id: None,
+            last_command_at_ms: 0,
+            last_command_error: None,
+            recent_command_results: Vec::new(),
+            terminal_id: None,
+            agent_endpoint: None,
+            capabilities: vec![crate::AGENT_MESSAGE_CAPABILITY.to_string()],
+        }
+    ));
+
+    let client = SessionHostClient::new(store, &projects, rebon_exe());
+    let result = client
+        .send_agent_message(session_id, message_envelope("m-mailbox", "hello"))
+        .expect("the mailbox accepts the message");
+    assert_eq!(result.outcome, crate::AgentMessageDelivery::Queued);
+    assert!(!result.duplicate);
+
+    let claims = crate::drain_foreground_commands(&projects, cwd, session_id);
+    assert_eq!(claims.len(), 1);
+    match &claims[0].envelope.command {
+        crate::ForegroundCommand::AgentMessage {
+            message_id,
+            from_session_id,
+            text,
+            ..
+        } => {
+            assert_eq!(message_id, "m-mailbox");
+            assert_eq!(from_session_id, "sess-sender");
+            assert_eq!(text, "hello");
+        }
+        other => panic!("expected an agent message, got {other:?}"),
+    }
+}
+
+/// No record at all is not a foreground terminal and not a timeout: the
+/// session is simply not running.
+#[test]
+fn an_agent_message_for_an_unknown_session_is_a_clear_not_found() {
+    let dir = tempfile::Builder::new()
+        .prefix("rebon-client-message-missing-")
+        .tempdir()
+        .expect("tempdir");
+    let store = BackgroundStore::new(dir.path().join("store"));
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects root");
+    let client = SessionHostClient::new(store, &projects, rebon_exe());
+
+    let error = client
+        .send_agent_message("sess-missing", message_envelope("m-missing", "hello"))
+        .expect_err("an unknown session is not a target");
+    assert!(
+        matches!(&error, HostCallError::OwnerFence(message) if message.contains("no running session")),
+        "the error names the missing session: {error:?}"
+    );
+}
+
+/// An owner that is alive but does not answer is not a queue to write into:
+/// the worker that would claim the message is already running and unreachable.
+#[test]
+fn an_agent_message_for_an_unreachable_owner_is_refused_without_a_write() {
+    let dir = tempfile::Builder::new()
+        .prefix("rebon-client-message-unreachable-")
+        .tempdir()
+        .expect("tempdir");
+    let store = BackgroundStore::new(dir.path().join("store"));
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects root");
+    let cwd = "/work/unreachable-message";
+    let session_id = "sess-unreachable-message";
+    let job_id = message_job(&store, session_id, cwd, BackgroundJobStatus::Running);
+    let _lock = rebon_session::try_acquire_session_active_lock(&projects, cwd, session_id)
+        .expect("probe")
+        .expect("free");
+    rebon_session::write_session_owner(
+        &projects,
+        cwd,
+        session_id,
+        &rebon_session::SessionOwnerDescriptor {
+            version: rebon_session::SESSION_OWNER_VERSION,
+            pid: std::process::id(),
+            pid_identity: None,
+            surface: rebon_session::SessionOwnerSurface::Worker,
+            job_id: Some(job_id.clone()),
+            ipc_port: Some(dead_port()),
+            ipc_token: Some("token".to_string()),
+            terminal_id: None,
+            started_at_ms: 1,
+        },
+    )
+    .expect("descriptor");
+
+    let client = SessionHostClient::new(store.clone(), &projects, rebon_exe());
+    assert_eq!(
+        client.send_agent_message(session_id, message_envelope("m-dead", "hello")),
+        Err(HostCallError::HostUnanswered)
+    );
+    assert!(
+        store
+            .read_state(&job_id)
+            .unwrap()
+            .identity
+            .pending_prompts
+            .is_empty(),
+        "an unanswered owner leaves no pending prompt behind"
+    );
+}
+
+/// A reachable owner takes the message over its endpoint, and the client
+/// returns the owner's answer rather than guessing the outcome.
+#[test]
+fn an_agent_message_to_a_reachable_owner_uses_the_endpoint() {
+    let dir = tempfile::Builder::new()
+        .prefix("rebon-client-message-reachable-")
+        .tempdir()
+        .expect("tempdir");
+    let store = BackgroundStore::new(dir.path().join("store"));
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects root");
+    let cwd = "/work/reachable-message";
+    let session_id = "sess-reachable-message";
+    message_job(&store, session_id, cwd, BackgroundJobStatus::Running);
+    let _lock = rebon_session::try_acquire_session_active_lock(&projects, cwd, session_id)
+        .expect("probe")
+        .expect("free");
+    let owner = FakeOwner::serve(|request| match request {
+        BackgroundIpcRequest::AgentMessage { message_id, .. } if message_id == "m-ipc" => {
+            Answer::Reply(BackgroundIpcResponse::with_data(
+                &crate::AgentMessageResult {
+                    outcome: crate::AgentMessageDelivery::Injected,
+                    duplicate: false,
+                },
+            ))
+        }
+        _ => ok(),
+    });
+    rebon_session::write_session_owner(
+        &projects,
+        cwd,
+        session_id,
+        &rebon_session::SessionOwnerDescriptor {
+            version: rebon_session::SESSION_OWNER_VERSION,
+            pid: std::process::id(),
+            pid_identity: None,
+            surface: rebon_session::SessionOwnerSurface::Worker,
+            job_id: Some("job-reachable".to_string()),
+            ipc_port: Some(owner.port),
+            ipc_token: Some(owner.token.clone()),
+            terminal_id: None,
+            started_at_ms: 1,
+        },
+    )
+    .expect("descriptor");
+
+    let client = SessionHostClient::new(store, &projects, rebon_exe());
+    assert_eq!(
+        client.send_agent_message(session_id, message_envelope("m-ipc", "over the wire")),
+        Ok(crate::AgentMessageResult {
+            outcome: crate::AgentMessageDelivery::Injected,
+            duplicate: false,
+        })
+    );
+    assert!(
+        owner.requests().iter().any(|request| matches!(
+            request,
+            BackgroundIpcRequest::AgentMessage {
+                message_id,
+                from_session_id,
+                from_agent,
+                text,
+                ..
+            } if message_id == "m-ipc"
+                && from_session_id == "sess-sender"
+                && from_agent == "main"
+                && text == "over the wire"
+        )),
+        "the request the owner saw is the message itself"
     );
 }
