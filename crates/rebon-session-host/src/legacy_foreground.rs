@@ -379,6 +379,26 @@ pub struct ForegroundSessionStatus {
     /// because multiple producers may enqueue commands before the next status poll.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_command_results: Vec<ForegroundCommandResult>,
+    /// The desktop terminal this session was started from, when it set
+    /// `REBON_TERMINAL_ID`. Absent for a terminal not launched by the desktop
+    /// app, and for files written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+}
+
+/// Environment variable the desktop app sets in the terminals it launches.
+pub const TERMINAL_ID_ENV: &str = "REBON_TERMINAL_ID";
+
+/// The terminal a process was started from, when the desktop app named one.
+///
+/// Read once at startup and recorded in the session's ownership records; the
+/// value is a label, never an endpoint, so an empty or whitespace-only value
+/// means "no terminal" rather than a terminal named "".
+pub fn terminal_id_from_env() -> Option<String> {
+    std::env::var(TERMINAL_ID_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// `<project_dir>/<session_id>.inbox` — the command mailbox directory.
@@ -1292,6 +1312,7 @@ mod tests {
                 outcome: ForegroundCommandOutcome::Applied,
                 error: None,
             }],
+            terminal_id: None,
         };
         write_foreground_status(&root, &status);
         let read = read_foreground_status(&root, &status.cwd, &status.session_id).unwrap();
@@ -1333,6 +1354,7 @@ mod tests {
             last_command_at_ms: 0,
             last_command_error: None,
             recent_command_results: Vec::new(),
+            terminal_id: None,
         };
         let path = foreground_status_path(&root, &cwd, &status.session_id);
         assert!(
@@ -1371,5 +1393,41 @@ mod tests {
         assert!(read.last_command_id.is_none());
         assert_eq!(read.last_command_at_ms, 0);
         assert!(read.recent_command_results.is_empty());
+        assert!(read.terminal_id.is_none());
+    }
+
+    #[test]
+    fn terminal_id_round_trips_and_is_omitted_when_absent() {
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        let cwd = "/work/proj";
+        let sid = "sess-terminal";
+        let mut status = ForegroundSessionStatus {
+            pid: 1234,
+            session_id: sid.into(),
+            cwd: cwd.into(),
+            heartbeat_ms: now_ms(),
+            busy: false,
+            pending_permission: None,
+            ask_user_questions: None,
+            last_command_id: None,
+            last_command_at_ms: 0,
+            last_command_error: None,
+            recent_command_results: Vec::new(),
+            terminal_id: Some("term-9".into()),
+        };
+        assert!(write_foreground_status(&root, &status));
+        let path = foreground_status_path(&root, cwd, sid);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("\"terminalId\":\"term-9\""), "{written}");
+        assert_eq!(
+            read_foreground_status(&root, cwd, sid).unwrap().terminal_id,
+            Some("term-9".into())
+        );
+
+        status.terminal_id = None;
+        assert!(write_foreground_status(&root, &status));
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("terminalId"), "{written}");
     }
 }

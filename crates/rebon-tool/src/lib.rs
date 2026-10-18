@@ -657,6 +657,56 @@ pub trait TaskRuntimeController: Send + Sync {
     fn monitor_finished(&self, _session_id: &str, _completion: MonitorTaskCompletion) {}
 }
 
+/// Another session running on this machine, as the tools see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerInfo {
+    pub session_id: String,
+    pub name: Option<String>,
+    pub cwd: String,
+    /// `"hosted"` or `"foreground"`.
+    pub kind: String,
+    pub busy: bool,
+    pub reachable: bool,
+    pub terminal_id: Option<String>,
+}
+
+/// One plain-text message addressed to another session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerMessage {
+    pub from_session_id: String,
+    pub from_agent: String,
+    pub from_cwd: Option<String>,
+    pub summary: Option<String>,
+    pub text: String,
+}
+
+/// Where a cross-session message ended up, as the target's owner reported it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerDelivery {
+    /// Appended to a turn that was already running.
+    Injected,
+    /// The target was idle, so receiving it started a new turn.
+    StartedTurn,
+    /// Left in the target's pending queue.
+    Queued,
+}
+
+/// What a tool uses to reach the session host without depending on it.
+///
+/// Implemented by the surface that owns the host client; `rebon-tool` only
+/// names the seam, which is why the task tools can list and message peers
+/// while `rebon-session-host` stays out of their dependency graph.
+#[async_trait]
+pub trait PeerMessenger: Send + Sync {
+    async fn list_peers(&self, exclude_session_id: Option<&str>) -> Result<Vec<PeerInfo>, String>;
+
+    async fn send(
+        &self,
+        target_session_id: &str,
+        message: PeerMessage,
+    ) -> Result<PeerDelivery, String>;
+}
+
 #[derive(Clone, Default)]
 pub struct SharedCoordinatorMode {
     inner: Arc<AtomicBool>,
@@ -842,6 +892,12 @@ pub struct AutoModeContext {
     pub classifier_transcript: Option<Arc<str>>,
 }
 
+/// The surface-owned peer messenger attached to a [`ToolContext`].
+#[derive(Clone, Default)]
+struct PeerContext {
+    messenger: Option<Arc<dyn PeerMessenger>>,
+}
+
 #[derive(Clone, Default)]
 pub struct ToolContext {
     tool_use_id: Option<String>,
@@ -925,6 +981,7 @@ impl std::fmt::Debug for ToolContext {
                 "has_task_runtime_controller",
                 &self.task_runtime_controller().is_some(),
             )
+            .field("has_peer_messenger", &self.peer_messenger().is_some())
             .field("has_queue_controller", &self.queue_controller().is_some())
             .field("team_identity", &self.team_identity())
             .field(
@@ -1272,6 +1329,13 @@ impl ToolContext {
         self
     }
 
+    /// Attach a [`PeerMessenger`] so task tools can list and message the other
+    /// sessions running on this machine without depending on the session host.
+    pub fn with_peer_messenger(mut self, messenger: Arc<dyn PeerMessenger>) -> Self {
+        self.update_extension::<PeerContext>(|peer| peer.messenger = Some(messenger));
+        self
+    }
+
     /// Attach a [`QueueController`] so a queue coordinator session can read the
     /// outline it is steering without depending on the app that owns it.
     pub fn with_queue_controller(mut self, controller: Arc<dyn QueueController>) -> Self {
@@ -1440,6 +1504,11 @@ impl ToolContext {
     /// Borrow the injected task runtime controller, if any.
     pub fn task_runtime_controller(&self) -> Option<&Arc<dyn TaskRuntimeController>> {
         self.extension::<TaskContext>()?.runtime_controller.as_ref()
+    }
+
+    /// Borrow the injected peer messenger, if any.
+    pub fn peer_messenger(&self) -> Option<&Arc<dyn PeerMessenger>> {
+        self.extension::<PeerContext>()?.messenger.as_ref()
     }
 
     /// Borrow the injected queue controller, if any.
@@ -4675,6 +4744,38 @@ mod tests {
             context.with_tool_use_id("tool-use-1").task_list_id(),
             "list-1"
         );
+    }
+
+    struct StubPeerMessenger;
+
+    #[async_trait]
+    impl PeerMessenger for StubPeerMessenger {
+        async fn list_peers(
+            &self,
+            _exclude_session_id: Option<&str>,
+        ) -> Result<Vec<PeerInfo>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn send(
+            &self,
+            _target_session_id: &str,
+            _message: PeerMessage,
+        ) -> Result<PeerDelivery, String> {
+            Ok(PeerDelivery::Injected)
+        }
+    }
+
+    #[test]
+    fn peer_extension_round_trips() {
+        assert!(ToolContext::new().peer_messenger().is_none());
+
+        let context = ToolContext::new().with_peer_messenger(Arc::new(StubPeerMessenger));
+        assert!(context.peer_messenger().is_some());
+        assert!(context
+            .with_tool_use_id("tool-use-1")
+            .peer_messenger()
+            .is_some());
     }
 
     #[test]

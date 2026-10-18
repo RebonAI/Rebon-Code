@@ -1439,6 +1439,9 @@ fn build_teammate_turn(
                     spec.additional_working_directories.clone(),
                 );
             }
+            if let Some(messenger) = spec.peer_messenger.clone() {
+                tool_context = tool_context.with_peer_messenger(messenger);
+            }
             tool_context
         },
         turn_hook: None,
@@ -2512,6 +2515,7 @@ mod tests {
             permission_broker: None,
             auto_mode_gate: None,
             permission_prompts_unavailable: true,
+            peer_messenger: None,
         }
     }
 
@@ -2690,6 +2694,7 @@ mod tests {
                 permission_broker: None,
                 auto_mode_gate: None,
                 permission_prompts_unavailable: true,
+                peer_messenger: None,
             })
             .await
             .unwrap();
@@ -2784,6 +2789,7 @@ mod tests {
                 permission_broker: None,
                 auto_mode_gate: None,
                 permission_prompts_unavailable: true,
+                peer_messenger: None,
             })
             .await
             .unwrap();
@@ -3506,6 +3512,7 @@ mod tests {
                 permission_broker: None,
                 auto_mode_gate: None,
                 permission_prompts_unavailable: false,
+                peer_messenger: None,
             })
             .await
             .unwrap_err();
@@ -3607,6 +3614,7 @@ mod tests {
                 permission_broker: None,
                 auto_mode_gate: None,
                 permission_prompts_unavailable: true,
+                peer_messenger: None,
             })
             .await
             .unwrap();

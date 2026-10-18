@@ -1,12 +1,12 @@
 //! `tasks`: the feature plugin that puts the task, team and queue tools on
 //! the process tool seat.
 //!
-//! Thirteen tools in three groups that share one idea — work this session
+//! Fourteen tools in three groups that share one idea — work this session
 //! tracks that outlives a single turn:
 //!
 //! - the task list (`TaskCreate`, `TaskGet`, `TaskList`, `TaskUpdate`,
 //!   `TaskStop`) and its pre-Task predecessor `TodoWrite`;
-//! - the team (`TeamCreate`, `TeamDelete`, `SendMessage`);
+//! - the team (`TeamCreate`, `TeamDelete`, `SendMessage`, `ListPeers`);
 //! - the Agent Queue a coordinator drives (`QueuePlan`, `QueueVerdict`,
 //!   `QueueDispatch`, `QueueBlock`).
 //!
@@ -27,7 +27,7 @@
 //! | `todo_write` (the todo store) | the TUI's task pane renders it directly |
 //! | `queue` (`QueueContext`) | `ToolContext` hands out the controller the coordinator sets |
 //!
-//! Turning the plugin off takes all thirteen tools and three attachment
+//! Turning the plugin off takes all fourteen tools and three attachment
 //! producers off their process seats. Task runtime state and stores already
 //! created by the session are untouched: the model just loses the plugin
 //! surfaces that read and write them.
@@ -48,6 +48,7 @@ use rebon_kernel::{Context, KernelError, Plugin, PluginDef, PluginHost, PluginKi
 use rebon_ui_seat::{DialogDef, UiSeatService};
 
 pub mod attachments;
+pub mod list_peers;
 pub mod mailbox;
 pub mod queue_dispatch;
 pub mod queue_plan;
@@ -70,6 +71,7 @@ pub mod ui;
 pub mod workflow_progress;
 
 pub use attachments::{TaskAttachmentPoller, TaskAttachmentProducer};
+pub use list_peers::{ListPeersTool, LIST_PEERS_TOOL_NAME};
 pub use mailbox::{
     drain_teammate_mailbox_for, MailboxAttachmentPoller, MailboxAttachmentProducer,
     TeammateMailboxMessage, TeammateMailboxPoller,
@@ -111,7 +113,7 @@ const ROSTER_PROVIDER_ID: &str = "tasks/roster";
 /// Attachment-seat provider id for the periodic task nudge.
 const REMINDER_PROVIDER_ID: &str = "tasks/reminder";
 
-/// The thirteen tools, in registration order.
+/// The fourteen tools, in registration order.
 ///
 /// Public so a test that needs the whole builtin catalogue on a bare
 /// [`rebon_core::Engine`] can register them without standing up a kernel.
@@ -126,6 +128,7 @@ pub fn tools() -> Vec<Arc<dyn rebon_tool::Tool>> {
         Arc::new(TeamCreateTool),
         Arc::new(TeamDeleteTool),
         Arc::new(SendMessageTool),
+        Arc::new(ListPeersTool),
         Arc::new(QueuePlanTool),
         Arc::new(QueueVerdictTool),
         Arc::new(QueueDispatchTool),
@@ -144,6 +147,7 @@ pub const TOOL_NAMES: &[&str] = &[
     TEAM_CREATE_TOOL_NAME,
     TEAM_DELETE_TOOL_NAME,
     SEND_MESSAGE_TOOL_NAME,
+    LIST_PEERS_TOOL_NAME,
     QUEUE_PLAN_TOOL_NAME,
     QUEUE_VERDICT_TOOL_NAME,
     QUEUE_DISPATCH_TOOL_NAME,
@@ -334,8 +338,8 @@ mod tests {
     /// `TodoWrite` and the five `Task*` tools are each other's off switch —
     /// `is_todo_v2_enabled()` decides which half a session sees, and the
     /// seat honours `is_enabled()`. So no one environment resolves all
-    /// thirteen; the twelve that are live by default are here and
-    /// [`the_switch_reaches_todo_write_too`] covers the thirteenth.
+    /// fourteen; the thirteen that are live by default are here and
+    /// [`the_switch_reaches_todo_write_too`] covers the fourteenth.
     const DEFAULT_ON: &[&str] = &[
         TASK_CREATE_TOOL_NAME,
         TASK_GET_TOOL_NAME,
@@ -345,6 +349,7 @@ mod tests {
         TEAM_CREATE_TOOL_NAME,
         TEAM_DELETE_TOOL_NAME,
         SEND_MESSAGE_TOOL_NAME,
+        LIST_PEERS_TOOL_NAME,
         QUEUE_PLAN_TOOL_NAME,
         QUEUE_VERDICT_TOOL_NAME,
         QUEUE_DISPATCH_TOOL_NAME,
@@ -475,8 +480,8 @@ mod tests {
         let (kernel, registry) = boot();
         let seat = seat(&kernel);
 
-        assert_eq!(TOOL_NAMES.len(), 13);
-        assert_eq!(DEFAULT_ON.len(), 12);
+        assert_eq!(TOOL_NAMES.len(), 14);
+        assert_eq!(DEFAULT_ON.len(), 13);
         for name in DEFAULT_ON {
             assert!(
                 seat.resolve(name, None).unwrap().is_some(),
@@ -627,7 +632,7 @@ mod tests {
         assert_eq!(attachment_seat.provider_ids(), all);
     }
 
-    /// The thirteenth tool. In a non-interactive session the halves swap:
+    /// The fourteenth tool. In a non-interactive session the halves swap:
     /// `TodoWrite` is the live one and the five `Task*` tools are not. The
     /// plugin switch still governs both halves.
     #[test]
@@ -655,7 +660,7 @@ mod tests {
     }
 
     /// Each crate pins its own tools against the shared facts table, and the
-    /// six `ToolKind::Task` tools are this one's. Without it, a name or kind
+    /// seven `ToolKind::Task` tools are this one's. Without it, a name or kind
     /// could drift on one side unnoticed.
     #[test]
     fn the_kinded_tools_match_the_shared_facts_table() {
@@ -666,6 +671,7 @@ mod tests {
             Arc::new(TaskUpdateTool),
             Arc::new(TaskStopTool),
             Arc::new(TodoWriteTool),
+            Arc::new(ListPeersTool),
         ];
         for tool in kinded {
             assert_eq!(

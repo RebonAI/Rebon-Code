@@ -194,6 +194,7 @@ pub(crate) fn publish_session_owner_descriptor(
         job_id: Some(job_id.to_string()),
         ipc_port: Some(ipc.port),
         ipc_token: Some(ipc.token.clone()),
+        terminal_id: rebon_session_host::terminal_id_from_env(),
         started_at_ms: now_ms(),
     };
     rebon_session::write_session_owner(projects_root, cwd, session_id, &descriptor).map_err(|err| {

@@ -67,6 +67,8 @@ pub struct TeammateSpawnSpec {
     pub auto_mode_gate: Option<Arc<dyn crate::AutoModeGate>>,
     /// Whether this teammate has no interactive permission consumer.
     pub permission_prompts_unavailable: bool,
+    /// The parent's peer messenger, so a teammate can message another session.
+    pub peer_messenger: Option<Arc<dyn crate::PeerMessenger>>,
 }
 
 impl std::fmt::Debug for TeammateSpawnSpec {
@@ -93,6 +95,7 @@ impl std::fmt::Debug for TeammateSpawnSpec {
             .field("agent_type_explicit", &self.agent_type_explicit)
             .field("wait_for_completion", &self.wait_for_completion)
             .field("has_permission_broker", &self.permission_broker.is_some())
+            .field("has_peer_messenger", &self.peer_messenger.is_some())
             .field(
                 "permission_prompts_unavailable",
                 &self.permission_prompts_unavailable,

@@ -2,7 +2,7 @@
 //!
 //! `/tasks`, `/workflows` and `/teams` each open a dialog whose state and
 //! reducer live next door in [`crate::ui`], over data only the task runtime
-//! has. Turning `plugins.tasks.enabled` off takes the thirteen tools and
+//! has. Turning `plugins.tasks.enabled` off takes the fourteen tools and
 //! every one of those surfaces with it, so these three have to go too —
 //! which is why they are registered here, on the command seat.
 //!

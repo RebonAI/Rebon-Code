@@ -55,8 +55,9 @@ pub struct PeerSession {
     pub reachable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
-    /// Reserved for the foreground endpoint a later task adds. `None` today,
-    /// and `None` is the truth rather than a placeholder.
+    /// The desktop terminal the session was started from, when its owner
+    /// record carries one (`REBON_TERMINAL_ID`). A label for recognition, not
+    /// an endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
 }
@@ -172,7 +173,9 @@ impl PeerDirectory {
             ),
             reachable: !unreachable_endpoint,
             job_id: Some(job.job_id().to_string()),
-            terminal_id: None,
+            terminal_id: descriptor
+                .as_ref()
+                .and_then(|descriptor| descriptor.terminal_id.clone()),
         })
     }
 
@@ -208,7 +211,7 @@ impl PeerDirectory {
             busy: status.busy,
             reachable: false,
             job_id: None,
-            terminal_id: None,
+            terminal_id: status.terminal_id,
         })
     }
 }
@@ -275,6 +278,7 @@ mod tests {
             last_command_at_ms: 0,
             last_command_error: None,
             recent_command_results: Vec::new(),
+            terminal_id: None,
         }
     }
 
@@ -335,6 +339,60 @@ mod tests {
         assert!(!peers[0].reachable);
         assert_eq!(peers[0].job_id, None);
         assert_eq!(peers[0].terminal_id, None);
+    }
+
+    /// The terminal label is additive: each record reports the one it named.
+    #[test]
+    fn the_terminal_label_comes_from_the_record_that_holds_it() {
+        let (_dir, store, projects_root) = store_and_projects();
+        let job_id = host_job(&store, "sess-hosted", "F:/work/hosted");
+        rebon_session::write_session_owner(
+            &projects_root,
+            "F:/work/hosted",
+            "sess-hosted",
+            &rebon_session::SessionOwnerDescriptor {
+                version: rebon_session::SESSION_OWNER_VERSION,
+                pid: 1,
+                pid_identity: None,
+                surface: rebon_session::SessionOwnerSurface::Worker,
+                job_id: Some(job_id),
+                ipc_port: None,
+                ipc_token: None,
+                terminal_id: Some("term-hosted".into()),
+                started_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let _hosted_lock = rebon_session::try_acquire_session_active_lock(
+            &projects_root,
+            "F:/work/hosted",
+            "sess-hosted",
+        )
+        .expect("the lock probe works")
+        .expect("the session lock is free");
+
+        let mut status = foreground_status("sess-foreground", "F:/work/foreground");
+        status.terminal_id = Some("term-foreground".into());
+        assert!(crate::write_foreground_status(&projects_root, &status));
+        let _foreground_lock = rebon_session::try_acquire_session_active_lock(
+            &projects_root,
+            &status.cwd,
+            &status.session_id,
+        )
+        .expect("the lock probe works")
+        .expect("the session lock is free");
+
+        let peers = PeerDirectory::new(store, &projects_root).list();
+        let hosted = peers
+            .iter()
+            .find(|peer| peer.session_id == "sess-hosted")
+            .expect("the hosted session is listed");
+        assert_eq!(hosted.terminal_id.as_deref(), Some("term-hosted"));
+        let foreground = peers
+            .iter()
+            .find(|peer| peer.session_id == "sess-foreground")
+            .expect("the foreground session is listed");
+        assert_eq!(foreground.terminal_id.as_deref(), Some("term-foreground"));
     }
 
     #[test]

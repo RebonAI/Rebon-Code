@@ -387,6 +387,9 @@ pub struct EngineQueryExecutor {
     extensions: rebon_tool::Extensions,
     team_manager: Option<Arc<dyn TeamManager>>,
     task_runtime_controller: Option<Arc<dyn TaskRuntimeController>>,
+    /// Reaches the other sessions running on this machine. Supplied by the
+    /// surface that owns the session host; `None` on a surface with no peers.
+    peer_messenger: Option<Arc<dyn rebon_tool::PeerMessenger>>,
     queue_controller: Option<Arc<dyn rebon_tool::QueueController>>,
     escalation_resolver: Option<rebon_tool::EscalationResolver>,
     policy_store: Option<crate::policy::PolicyStore>,
@@ -742,6 +745,7 @@ impl EngineQueryExecutor {
             extensions: rebon_tool::Extensions::default(),
             team_manager: self.team_manager.clone(),
             task_runtime_controller: self.task_runtime_controller.clone(),
+            peer_messenger: self.peer_messenger.clone(),
             queue_controller: self.queue_controller.clone(),
             escalation_resolver: self.escalation_resolver.clone(),
             policy_store: self.policy_store.clone(),
@@ -799,6 +803,7 @@ impl EngineQueryExecutor {
             extensions: runtime.extensions,
             team_manager: self.team_manager.clone(),
             task_runtime_controller: self.task_runtime_controller.clone(),
+            peer_messenger: self.peer_messenger.clone(),
             queue_controller: self.queue_controller.clone(),
             escalation_resolver: self.escalation_resolver.clone(),
             policy_store: self.policy_store.clone(),
@@ -861,6 +866,7 @@ impl EngineQueryExecutor {
             extensions: rebon_tool::Extensions::default(),
             team_manager: None,
             task_runtime_controller: None,
+            peer_messenger: None,
             queue_controller: None,
             escalation_resolver: None,
             policy_store: None,
@@ -1263,6 +1269,13 @@ impl EngineQueryExecutor {
         self
     }
 
+    /// Attach a [`rebon_tool::PeerMessenger`] so task tools can list and message
+    /// the other sessions running on this machine.
+    pub fn with_peer_messenger(mut self, messenger: Arc<dyn rebon_tool::PeerMessenger>) -> Self {
+        self.peer_messenger = Some(messenger);
+        self
+    }
+
     /// Attach a [`rebon_tool::QueueController`] so a queue coordinator session
     /// can read the outline it steers.
     pub fn with_queue_controller(
@@ -1428,6 +1441,9 @@ impl EngineQueryExecutor {
         }
         if let Some(controller) = &self.task_runtime_controller {
             ctx = ctx.with_task_runtime_controller(controller.clone());
+        }
+        if let Some(messenger) = &self.peer_messenger {
+            ctx = ctx.with_peer_messenger(messenger.clone());
         }
         if let Some(controller) = &self.queue_controller {
             ctx = ctx.with_queue_controller(controller.clone());

@@ -135,6 +135,8 @@ pub(crate) struct ForegroundMailbox {
     /// Payloads of the most recent `RunCommand`s, so a redelivered claim can be
     /// answered from memory instead of leaving the client to time out.
     recent_command_responses: VecDeque<rebon_session_host::ForegroundCommandResponse>,
+    /// The desktop terminal that launched this process, read once at startup.
+    terminal_id: Option<String>,
 }
 
 impl ForegroundMailbox {
@@ -152,6 +154,7 @@ impl ForegroundMailbox {
             last_command_error: None,
             recent_command_results: VecDeque::with_capacity(PROCESSED_HISTORY),
             recent_command_responses: VecDeque::with_capacity(COMMAND_RESPONSE_HISTORY),
+            terminal_id: rebon_session_host::terminal_id_from_env(),
         }
     }
 
@@ -313,6 +316,7 @@ impl ForegroundMailbox {
             last_command_at_ms: self.last_command_at_ms,
             last_command_error: self.last_command_error.clone(),
             recent_command_results: self.recent_command_results.iter().cloned().collect(),
+            terminal_id: self.terminal_id.clone(),
         };
         let written = rebon_session_host::write_foreground_status(&self.projects_root, &status);
         if written {

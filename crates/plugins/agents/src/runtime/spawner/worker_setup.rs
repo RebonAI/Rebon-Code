@@ -521,6 +521,9 @@ impl EngineSubAgentSpawner {
         if let Some(cwd) = spec.cwd.as_deref() {
             child_context = child_context.with_cwd(cwd.to_string());
         }
+        if let Some(messenger) = spec.peer_messenger.clone() {
+            child_context = child_context.with_peer_messenger(messenger);
+        }
         // Worktree isolation follows the creation chain, never the shape of
         // `cwd`: `spec.cwd` can come straight from the Agent tool call, so a
         // parent could otherwise name a lookalike `.rebon/worktrees/…` path

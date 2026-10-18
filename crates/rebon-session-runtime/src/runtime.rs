@@ -433,6 +433,8 @@ pub struct EngineCoreInputs {
     /// manager and the team tools answer "no team runtime here".
     pub team_manager: Option<Arc<dyn TeamManager>>,
     pub task_runtime_controller: Arc<dyn TaskRuntimeController>,
+    /// Reaches the other sessions running on this machine.
+    pub peer_messenger: Arc<dyn rebon_tool::PeerMessenger>,
     pub tasks: Arc<TaskRegistry>,
     pub task_registry_resolver: TaskRegistryResolver,
     pub live_policy_store: PolicyStore,
@@ -614,6 +616,7 @@ fn build_engine_core(inputs: EngineCoreInputs) -> EngineCore {
         skill_registry,
         team_manager,
         task_runtime_controller,
+        peer_messenger,
         tasks,
         task_registry_resolver,
         live_policy_store,
@@ -673,6 +676,7 @@ fn build_engine_core(inputs: EngineCoreInputs) -> EngineCore {
         .with_sub_agent_spawner(sub_agent_spawner)
         .with_turn_skill_catalog(Arc::new(RegistrySkillCatalog::new(skill_registry.clone())))
         .with_task_runtime_controller(task_runtime_controller)
+        .with_peer_messenger(peer_messenger)
         .with_queue_controller(std::sync::Arc::new(
             crate::queue_controller::PublishedQueueController,
         ))

@@ -598,6 +598,7 @@ fn a_prompt_for_an_unreachable_owner_is_refused_without_a_write() {
             job_id: Some("job-unreachable".to_string()),
             ipc_port: Some(dead_port()),
             ipc_token: Some("token".to_string()),
+            terminal_id: None,
             started_at_ms: 1,
         },
     )
@@ -836,6 +837,7 @@ fn an_agent_message_for_a_foreground_terminal_says_it_cannot_receive_yet() {
             last_command_at_ms: 0,
             last_command_error: None,
             recent_command_results: Vec::new(),
+            terminal_id: None,
         }
     ));
 
@@ -897,6 +899,7 @@ fn an_agent_message_for_an_unreachable_owner_is_refused_without_a_write() {
             job_id: Some(job_id.clone()),
             ipc_port: Some(dead_port()),
             ipc_token: Some("token".to_string()),
+            terminal_id: None,
             started_at_ms: 1,
         },
     )
@@ -958,6 +961,7 @@ fn an_agent_message_to_a_reachable_owner_uses_the_endpoint() {
             job_id: Some("job-reachable".to_string()),
             ipc_port: Some(owner.port),
             ipc_token: Some(owner.token.clone()),
+            terminal_id: None,
             started_at_ms: 1,
         },
     )

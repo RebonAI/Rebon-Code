@@ -512,6 +512,9 @@ pub struct SubAgentSpec {
     pub task_kind: Option<SubAgentTaskKind>,
     /// Parent turn broker used only for sensitive sub-agent permission prompts.
     pub permission_broker: Option<Arc<dyn crate::PermissionBroker>>,
+    /// The parent session's peer messenger, so a worker can message another
+    /// session the same way its creator can.
+    pub peer_messenger: Option<Arc<dyn crate::PeerMessenger>>,
 }
 
 /// Default agentic iteration cap for sub-agents. Raised above the
@@ -550,6 +553,7 @@ impl SubAgentSpec {
             execution_policy: None,
             task_kind: None,
             permission_broker: None,
+            peer_messenger: None,
         }
     }
 }

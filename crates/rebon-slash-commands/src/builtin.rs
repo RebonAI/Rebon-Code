@@ -259,7 +259,7 @@ pub fn builtin_command_table() -> Vec<CommandSpec> {
             .category(Category::Agent)
             .surfaces(Surfaces::TUI_ONLY),
         // `/tasks`, `/workflows` and `/teams` are not here: the tasks plugin
-        // registers them on the command seat beside the thirteen tools that
+        // registers them on the command seat beside the fourteen tools that
         // create the work they show. Turning that plugin off takes the commands
         // with it.
         // Its own entry rather than an alias of `/tasks`: in the terminal the

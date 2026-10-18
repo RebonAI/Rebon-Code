@@ -5761,6 +5761,7 @@ mod tests {
                 execution_policy: None,
                 task_kind: None,
                 permission_broker: None,
+                peer_messenger: None,
             })
             .await
             .unwrap();
@@ -6097,6 +6098,7 @@ mod tests {
                 execution_policy: None,
                 task_kind: None,
                 permission_broker: None,
+                peer_messenger: None,
             })
             .await
             .unwrap();
@@ -6165,6 +6167,7 @@ mod tests {
                 execution_policy: None,
                 task_kind: None,
                 permission_broker: None,
+                peer_messenger: None,
             })
             .await
             .unwrap();
@@ -6234,6 +6237,7 @@ mod tests {
                 execution_policy: None,
                 task_kind: None,
                 permission_broker: None,
+                peer_messenger: None,
             })
             .await
             .unwrap();
@@ -6403,6 +6407,7 @@ mod tests {
                 execution_policy: None,
                 task_kind: None,
                 permission_broker: None,
+                peer_messenger: None,
             })
             .await
             .err()
@@ -6522,6 +6527,7 @@ mod tests {
                 execution_policy: None,
                 task_kind: None,
                 permission_broker: None,
+                peer_messenger: None,
             })
             .await
             .unwrap();
@@ -6582,6 +6588,7 @@ mod tests {
                 execution_policy: None,
                 task_kind: None,
                 permission_broker: None,
+                peer_messenger: None,
             })
             .await
             .unwrap();
@@ -6711,6 +6718,7 @@ mod tests {
                         execution_policy: None,
                         task_kind: None,
                         permission_broker: None,
+                        peer_messenger: None,
                     })
                     .await;
                 let seen = recorded.lock().unwrap().clone();
@@ -6917,6 +6925,7 @@ mod tests {
                 execution_policy: None,
                 task_kind: None,
                 permission_broker: None,
+                peer_messenger: None,
             })
             .await
             .unwrap();

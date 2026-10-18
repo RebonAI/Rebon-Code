@@ -1154,6 +1154,9 @@ pub fn foreground_status_from_owner(
                 }]
             })
             .unwrap_or_default(),
+        // The owner's status snapshot does not carry a terminal label; the
+        // descriptor and the heartbeat beside it are where one is recorded.
+        terminal_id: None,
     }
 }
 
@@ -1392,6 +1395,7 @@ mod tests {
             job_id: Some("job-1".to_string()),
             ipc_port: port,
             ipc_token: port.map(|_| "token".to_string()),
+            terminal_id: None,
             started_at_ms: 1,
         }
     }
