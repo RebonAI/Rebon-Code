@@ -21,6 +21,32 @@ pub(super) fn cap_max_tokens_for_model(max_tokens: u32, handle: Option<&PruneLev
     max_tokens.min(output_limit)
 }
 
+/// Lowest OpenAI-style effort ordinal (`xhigh`) whose ceiling is the model's
+/// own output limit rather than the fixed tier.
+const FULL_OUTPUT_EFFORT_ORDINAL: u8 = 3;
+
+/// The per-turn output ceiling an OpenAI-style effort asks for.
+///
+/// The fixed tiers (`rebon_api::effort_to_openai_max_tokens`) stop at 128K,
+/// but on these providers the ceiling also covers hidden reasoning, so a model
+/// that can emit more (DeepSeek: 384K) had its deepest thinking cut at
+/// `xhigh`/`max`. Those two tiers mean "as much as the model allows", so they
+/// take the model's known output limit when it is larger. The context budget
+/// already reserves that limit for output (`hard_context_guard_target`), so
+/// this takes nothing from replayed history. Lower tiers and an unknown limit
+/// keep the tier value.
+pub(super) fn effort_max_tokens_for_model(
+    max_tokens: u32,
+    reasoning_ordinal: Option<u8>,
+    handle: Option<&PruneLevelHandle>,
+) -> u32 {
+    let top_tier = reasoning_ordinal.is_some_and(|ordinal| ordinal >= FULL_OUTPUT_EFFORT_ORDINAL);
+    match handle {
+        Some(handle) if top_tier => max_tokens.max(handle.budget.output_token_reserve()),
+        _ => max_tokens,
+    }
+}
+
 pub(super) fn hard_context_guard_target(
     handle: Option<&PruneLevelHandle>,
     max_tokens: u32,
