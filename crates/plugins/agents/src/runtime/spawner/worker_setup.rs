@@ -480,7 +480,14 @@ impl EngineSubAgentSpawner {
                     })
             })
         };
-        let worker_permission_broker = Arc::new(
+        // Messages this sub-agent sends are the session's call: when the
+        // session is in auto mode the classifier judges them, through the gate
+        // built from the same parent chain the sensitive broker came from. The
+        // broker never asks its delegate for these tools — a background worker
+        // has nobody to answer an interactive prompt.
+        let auto_mode_gate =
+            rebon_core::permission::sub_agent_auto_mode_gate_from(&sensitive_permission_broker);
+        let mut worker_permission_broker =
             AutoApproveExceptSensitivePermissionBroker::with_background_probe(
                 sensitive_permission_broker,
                 background_probe,
@@ -491,8 +498,11 @@ impl EngineSubAgentSpawner {
             // parent runtime has an interactive prompt surface. Note
             // this reads the parent-level flag, NOT the child context
             // flag below, which ORs in `registry_run_in_background`.
-            .with_background_deletion_ask(!permission_prompts_unavailable),
-        );
+            .with_background_deletion_ask(!permission_prompts_unavailable);
+        if let Some(gate) = auto_mode_gate {
+            worker_permission_broker = worker_permission_broker.with_auto_mode_gate(gate);
+        }
+        let worker_permission_broker = Arc::new(worker_permission_broker);
         let mut child_context = rebon_tool::ToolContext::new()
             .with_permission_broker(worker_permission_broker)
             .with_agent_id(agent_id.clone())

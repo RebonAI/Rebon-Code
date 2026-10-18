@@ -2171,6 +2171,13 @@ impl AgentTool {
                         permission_broker: workflow_lineage
                             .then(|| context.permission_broker().cloned())
                             .flatten(),
+                        // The teammate's own broker is not the session broker
+                        // outside workflow lineage, so capture the session's
+                        // auto-mode gate here while the parent context is at
+                        // hand. It only judges messages; it never prompts.
+                        auto_mode_gate: context.permission_broker().and_then(|broker| {
+                            rebon_core::permission::sub_agent_auto_mode_gate_from(broker)
+                        }),
                         permission_prompts_unavailable: workflow_lineage,
                     })
                     .await

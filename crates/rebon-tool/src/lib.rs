@@ -2260,6 +2260,42 @@ impl PermissionBroker for AutoApprovePermissionBroker {
     }
 }
 
+/// What the owning session's auto-mode classifier says about a message an
+/// agent worker wants to send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoModeGateVerdict {
+    /// The owning session is not in auto mode, so the worker's broker keeps
+    /// its ordinary behaviour.
+    NotInAuto,
+    /// The classifier allowed the call.
+    Allowed,
+    /// The classifier refused the call, or the call would have needed a user
+    /// prompt the worker cannot raise. The reason goes back to the model.
+    Denied(String),
+}
+
+/// Session-owned auto-mode check for the message tools a worker runs.
+///
+/// A worker broker cannot delegate an `Ask` to the session broker: that broker
+/// reads the session's live mode, and outside auto mode it would open an
+/// interactive prompt no background worker can answer. The gate lets the
+/// session make the decision while the worker only ever runs or refuses.
+#[async_trait]
+pub trait AutoModeGate: Send + Sync {
+    async fn check(
+        &self,
+        tool: &dyn Tool,
+        input: &Value,
+        context: &ToolContext,
+    ) -> AutoModeGateVerdict;
+}
+
+/// Tools that carry a message from one agent to another. Only these calls are
+/// put to a worker's auto-mode gate.
+pub fn is_agent_message_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "SendMessage" | "group_send")
+}
+
 #[derive(Clone)]
 pub struct AutoApproveExceptSensitivePermissionBroker {
     delegate: Arc<dyn PermissionBroker>,
@@ -2283,6 +2319,11 @@ pub struct AutoApproveExceptSensitivePermissionBroker {
     /// when the parent runtime actually has an interactive prompt
     /// surface; every other sensitive class keeps the hard deny.
     background_deletion_ask: bool,
+    /// The owning session's auto-mode check for agent message tools. When a
+    /// worker sends a message, the session that owns the classifier decides
+    /// whether it may go out; the delegate is never asked, because a
+    /// background worker has nobody to answer its prompt.
+    auto_mode_gate: Option<Arc<dyn AutoModeGate>>,
 }
 
 impl AutoApproveExceptSensitivePermissionBroker {
@@ -2292,6 +2333,7 @@ impl AutoApproveExceptSensitivePermissionBroker {
             background_probe: None,
             exempt_deletion_root: None,
             background_deletion_ask: false,
+            auto_mode_gate: None,
         }
     }
 
@@ -2304,6 +2346,7 @@ impl AutoApproveExceptSensitivePermissionBroker {
             background_probe: Some(background_probe),
             exempt_deletion_root: None,
             background_deletion_ask: false,
+            auto_mode_gate: None,
         }
     }
 
@@ -2320,6 +2363,12 @@ impl AutoApproveExceptSensitivePermissionBroker {
     /// interactive prompt surface — the worker blocks on the answer.
     pub fn with_background_deletion_ask(mut self, enabled: bool) -> Self {
         self.background_deletion_ask = enabled;
+        self
+    }
+
+    /// Install the session-owned auto-mode gate for agent message tools.
+    pub fn with_auto_mode_gate(mut self, gate: Arc<dyn AutoModeGate>) -> Self {
+        self.auto_mode_gate = Some(gate);
         self
     }
 
@@ -2345,6 +2394,29 @@ impl PermissionBroker for AutoApproveExceptSensitivePermissionBroker {
         decision: PermissionDecision,
     ) -> ToolResult<Value> {
         let check_input = decision.updated_input.as_ref().unwrap_or(&input);
+        // A message this worker sends is the owning session's call, not the
+        // worker's: run it past that session's auto-mode gate whatever the
+        // decision said. `NotInAuto` falls through to the worker's ordinary
+        // approval path; the delegate is never consulted for these tools.
+        if decision.behavior != PermissionBehavior::Deny
+            && is_agent_message_tool(tool.id().as_str())
+        {
+            if let Some(gate) = self.auto_mode_gate.as_ref() {
+                match gate.check(tool, check_input, context).await {
+                    AutoModeGateVerdict::NotInAuto => {}
+                    AutoModeGateVerdict::Allowed => {
+                        let effective_input = decision.updated_input.unwrap_or(input);
+                        return tool.call(effective_input, context).await;
+                    }
+                    AutoModeGateVerdict::Denied(reason) => {
+                        return Err(ToolError::PermissionDenied {
+                            tool: tool.id(),
+                            reason,
+                        });
+                    }
+                }
+            }
+        }
         // Agents the runtime placed in their own worktree are exempt: the
         // tree is not shared, so there is no other-agent work a Git command
         // could destroy. This reads the explicit creation-time flag, never
@@ -3940,6 +4012,316 @@ mod tests {
         assert_eq!(output, input);
         assert_eq!(delegate_calls.load(Ordering::SeqCst), 0);
         assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct MessageEchoTool {
+        name: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for MessageEchoTool {
+        fn id(&self) -> ToolId {
+            ToolId::new(self.name)
+        }
+
+        fn description(&self) -> &str {
+            "message echo tool"
+        }
+
+        fn input_schema(&self) -> ToolInputSchema {
+            serde_json::json!({"type":"object"})
+        }
+
+        async fn call(&self, input: Value, _context: &ToolContext) -> ToolResult<Value> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(input)
+        }
+    }
+
+    struct FixedVerdictGate {
+        verdict: AutoModeGateVerdict,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AutoModeGate for FixedVerdictGate {
+        async fn check(
+            &self,
+            _tool: &dyn Tool,
+            _input: &Value,
+            _context: &ToolContext,
+        ) -> AutoModeGateVerdict {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.verdict.clone()
+        }
+    }
+
+    fn message_tool(name: &'static str, calls: Arc<AtomicUsize>) -> MessageEchoTool {
+        MessageEchoTool { name, calls }
+    }
+
+    fn gated_broker(
+        delegate_calls: Arc<AtomicUsize>,
+        gate_calls: Arc<AtomicUsize>,
+        verdict: AutoModeGateVerdict,
+    ) -> AutoApproveExceptSensitivePermissionBroker {
+        AutoApproveExceptSensitivePermissionBroker::new(Arc::new(CountingDenyBroker {
+            calls: delegate_calls,
+        }))
+        .with_auto_mode_gate(Arc::new(FixedVerdictGate {
+            verdict,
+            calls: gate_calls,
+        }))
+    }
+
+    fn message_ask_decision(input: &Value) -> PermissionDecision {
+        PermissionDecision::ask(
+            PermissionRequest::new("Send a message", "An agent wants to send a message"),
+            Some(input.clone()),
+        )
+    }
+
+    #[test]
+    fn only_agent_message_tools_are_gated() {
+        assert!(is_agent_message_tool("SendMessage"));
+        assert!(is_agent_message_tool("group_send"));
+        assert!(!is_agent_message_tool("SendMessageTool"));
+        assert!(!is_agent_message_tool("group_inbox"));
+        assert!(!is_agent_message_tool("Bash"));
+    }
+
+    #[tokio::test]
+    async fn message_gate_allowed_runs_the_tool_for_an_allow_decision() {
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let delegate_calls = Arc::new(AtomicUsize::new(0));
+        let gate_calls = Arc::new(AtomicUsize::new(0));
+        let tool = message_tool("SendMessage", tool_calls.clone());
+        let input = serde_json::json!({"to": "researcher", "message": "start"});
+        let broker = gated_broker(
+            delegate_calls.clone(),
+            gate_calls.clone(),
+            AutoModeGateVerdict::Allowed,
+        );
+
+        let output = broker
+            .resolve(
+                &tool,
+                input.clone(),
+                &ToolContext::new(),
+                PermissionDecision::allow(input.clone()),
+            )
+            .await
+            .expect("the gate allowed the message");
+
+        assert_eq!(output, input);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(delegate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn message_gate_allowed_runs_the_tool_for_an_ask_decision() {
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let delegate_calls = Arc::new(AtomicUsize::new(0));
+        let gate_calls = Arc::new(AtomicUsize::new(0));
+        let tool = message_tool("group_send", tool_calls.clone());
+        let input = serde_json::json!({"to": "user", "text": "done"});
+        let broker = gated_broker(
+            delegate_calls.clone(),
+            gate_calls.clone(),
+            AutoModeGateVerdict::Allowed,
+        );
+
+        let output = broker
+            .resolve(
+                &tool,
+                input.clone(),
+                &ToolContext::new(),
+                message_ask_decision(&input),
+            )
+            .await
+            .expect("the gate allowed the message");
+
+        assert_eq!(output, input);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(delegate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn message_gate_denied_refuses_an_ask_decision() {
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let delegate_calls = Arc::new(AtomicUsize::new(0));
+        let gate_calls = Arc::new(AtomicUsize::new(0));
+        let tool = message_tool("SendMessage", tool_calls.clone());
+        let input = serde_json::json!({"to": "researcher", "message": "leak"});
+        let broker = gated_broker(
+            delegate_calls.clone(),
+            gate_calls.clone(),
+            AutoModeGateVerdict::Denied("messages may not leave the team".into()),
+        );
+
+        let result = broker
+            .resolve(
+                &tool,
+                input.clone(),
+                &ToolContext::new(),
+                message_ask_decision(&input),
+            )
+            .await;
+
+        match result {
+            Err(ToolError::PermissionDenied { reason, .. }) => {
+                assert_eq!(reason, "messages may not leave the team");
+            }
+            other => panic!("expected a permission denial, got {other:?}"),
+        }
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(delegate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn message_gate_denied_refuses_an_allow_decision() {
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let delegate_calls = Arc::new(AtomicUsize::new(0));
+        let gate_calls = Arc::new(AtomicUsize::new(0));
+        let tool = message_tool("group_send", tool_calls.clone());
+        let input = serde_json::json!({"to": "user", "text": "hello"});
+        let broker = gated_broker(
+            delegate_calls.clone(),
+            gate_calls.clone(),
+            AutoModeGateVerdict::Denied("not now".into()),
+        );
+
+        let result = broker
+            .resolve(
+                &tool,
+                input.clone(),
+                &ToolContext::new(),
+                PermissionDecision::allow(input.clone()),
+            )
+            .await;
+
+        assert!(matches!(result, Err(ToolError::PermissionDenied { .. })));
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(delegate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn message_gate_not_in_auto_keeps_the_ordinary_auto_approval() {
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let delegate_calls = Arc::new(AtomicUsize::new(0));
+        let gate_calls = Arc::new(AtomicUsize::new(0));
+        let tool = message_tool("SendMessage", tool_calls.clone());
+        let input = serde_json::json!({"to": "researcher", "message": "start"});
+        let broker = gated_broker(
+            delegate_calls.clone(),
+            gate_calls.clone(),
+            AutoModeGateVerdict::NotInAuto,
+        );
+
+        let output = broker
+            .resolve(
+                &tool,
+                input.clone(),
+                &ToolContext::new(),
+                message_ask_decision(&input),
+            )
+            .await
+            .expect("outside auto mode the worker auto-approves as before");
+
+        assert_eq!(output, input);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(delegate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn deny_decision_skips_the_message_gate() {
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let delegate_calls = Arc::new(AtomicUsize::new(0));
+        let gate_calls = Arc::new(AtomicUsize::new(0));
+        let tool = message_tool("SendMessage", tool_calls.clone());
+        let input = serde_json::json!({"to": "researcher", "message": "start"});
+        let broker = gated_broker(
+            delegate_calls.clone(),
+            gate_calls.clone(),
+            AutoModeGateVerdict::Allowed,
+        );
+
+        let result = broker
+            .resolve(
+                &tool,
+                input.clone(),
+                &ToolContext::new(),
+                PermissionDecision::deny("denied by a rule"),
+            )
+            .await;
+
+        assert!(matches!(result, Err(ToolError::PermissionDenied { .. })));
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(delegate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn non_message_tools_skip_the_auto_mode_gate() {
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let delegate_calls = Arc::new(AtomicUsize::new(0));
+        let gate_calls = Arc::new(AtomicUsize::new(0));
+        let tool = ShellEchoTool {
+            calls: tool_calls.clone(),
+        };
+        let input = serde_json::json!({"command": "git status"});
+        let broker = gated_broker(
+            delegate_calls.clone(),
+            gate_calls.clone(),
+            AutoModeGateVerdict::Denied("never called".into()),
+        );
+
+        let output = broker
+            .resolve(
+                &tool,
+                input.clone(),
+                &ToolContext::new(),
+                PermissionDecision::allow(input.clone()),
+            )
+            .await
+            .expect("non-message tools keep their ordinary path");
+
+        assert_eq!(output, input);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(delegate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn message_tool_without_a_gate_behaves_as_before() {
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let delegate_calls = Arc::new(AtomicUsize::new(0));
+        let tool = message_tool("SendMessage", tool_calls.clone());
+        let input = serde_json::json!({"to": "researcher", "message": "start"});
+        let broker =
+            AutoApproveExceptSensitivePermissionBroker::new(Arc::new(CountingDenyBroker {
+                calls: delegate_calls.clone(),
+            }));
+
+        let output = broker
+            .resolve(
+                &tool,
+                input.clone(),
+                &ToolContext::new(),
+                message_ask_decision(&input),
+            )
+            .await
+            .expect("without a gate the worker auto-approves as before");
+
+        assert_eq!(output, input);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(delegate_calls.load(Ordering::SeqCst), 0);
     }
 
     struct CountingAskTool {

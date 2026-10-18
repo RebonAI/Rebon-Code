@@ -1382,13 +1382,25 @@ fn build_teammate_turn(
                 .is_none_or(|snap| snap.is_backgrounded)
         })
     };
-    let worker_permission_broker = std::sync::Arc::new(
+    // Messages this teammate sends are the session's call: when the session
+    // is in auto mode the classifier judges them. The gate is captured at
+    // spawn time because a teammate outside workflow lineage carries no
+    // prompting broker to derive it from; the fallback covers specs built
+    // with only a broker. The broker never asks its delegate for these tools
+    // — a background teammate has nobody to answer an interactive prompt.
+    let auto_mode_gate = spec.auto_mode_gate.clone().or_else(|| {
+        rebon_core::permission::sub_agent_auto_mode_gate_from(&sensitive_permission_broker)
+    });
+    let mut worker_permission_broker =
         AutoApproveExceptSensitivePermissionBroker::with_background_probe(
             sensitive_permission_broker,
             background_probe,
         )
-        .with_background_deletion_ask(!spec.permission_prompts_unavailable),
-    );
+        .with_background_deletion_ask(!spec.permission_prompts_unavailable);
+    if let Some(gate) = auto_mode_gate {
+        worker_permission_broker = worker_permission_broker.with_auto_mode_gate(gate);
+    }
+    let worker_permission_broker = std::sync::Arc::new(worker_permission_broker);
     let escalation_client = registry.escalation_registry().worker_client(
         identity.agent_id.clone(),
         Some(format!("@{}", identity.agent_name)),
@@ -2498,6 +2510,7 @@ mod tests {
             agent_type_explicit: true,
             wait_for_completion: false,
             permission_broker: None,
+            auto_mode_gate: None,
             permission_prompts_unavailable: true,
         }
     }
@@ -2675,6 +2688,7 @@ mod tests {
                 agent_type_explicit: false,
                 wait_for_completion: false,
                 permission_broker: None,
+                auto_mode_gate: None,
                 permission_prompts_unavailable: true,
             })
             .await
@@ -2768,6 +2782,7 @@ mod tests {
                 agent_type_explicit: false,
                 wait_for_completion: false,
                 permission_broker: None,
+                auto_mode_gate: None,
                 permission_prompts_unavailable: true,
             })
             .await
@@ -3489,6 +3504,7 @@ mod tests {
                 agent_type_explicit: false,
                 wait_for_completion: false,
                 permission_broker: None,
+                auto_mode_gate: None,
                 permission_prompts_unavailable: false,
             })
             .await
@@ -3589,6 +3605,7 @@ mod tests {
                 agent_type_explicit: false,
                 wait_for_completion: false,
                 permission_broker: None,
+                auto_mode_gate: None,
                 permission_prompts_unavailable: true,
             })
             .await

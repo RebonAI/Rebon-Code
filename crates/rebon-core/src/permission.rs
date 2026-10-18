@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 use rebon_permissions::{
     auto_mode_denials::AutoModeDenialInput, denial_sink::AutoModeHooks, types::PermissionMode,
 };
-use rebon_tool::{PermissionBroker, Tool, ToolContext};
+use rebon_tool::{AutoModeGate, AutoModeGateVerdict, PermissionBroker, Tool, ToolContext};
 use rebon_tools_core::{
     PermissionBehavior, PermissionDecision, PermissionRequest, ToolError, ToolKind, ToolResult,
 };
@@ -1584,6 +1584,139 @@ pub fn sub_agent_sensitive_permission_broker_from(
             store, base,
         ))),
         None => Some(base),
+    }
+}
+
+/// Build the auto-mode gate a sub-agent or teammate uses for the messages it
+/// sends, from the parent turn's broker chain.
+///
+/// The gate reads the owning session's live mode and classifier state on every
+/// check, so a worker only ever runs a message the session's auto mode allowed
+/// or refuses it outright — it never opens an interactive prompt.
+///
+/// Returns `None` when the chain has no prompt broker carrying that state
+/// (a test broker, an external plugin client): the worker then keeps its
+/// ordinary auto-approval behaviour. The `true` unwrap also reaches through a
+/// parent worker's own `AutoApproveExceptSensitivePermissionBroker`, which is
+/// what a nested sub-agent hands us.
+pub fn sub_agent_auto_mode_gate_from(
+    broker: &Arc<dyn PermissionBroker>,
+) -> Option<Arc<dyn AutoModeGate>> {
+    let base = user_prompt_permission_broker_from_inner(broker, true)?;
+    Some(Arc::new(SubAgentAutoModeGate { broker: base }))
+}
+
+/// The worker-side gate. It holds the session's prompt broker and asks the
+/// same `auto_mode_gate` the main session uses, so verdict caching, the
+/// classifier timeout and the `/permissions` record cannot drift between the
+/// two paths.
+struct SubAgentAutoModeGate {
+    broker: Arc<dyn PermissionBroker>,
+}
+
+fn worker_gate_verdict(
+    outcome: AutoModeGateOutcome,
+    channel: Option<&ChannelPermissionBroker>,
+    hooks: &AutoModeHooks,
+    tool_name: &str,
+    input: &Value,
+    context: &ToolContext,
+) -> AutoModeGateVerdict {
+    match outcome {
+        AutoModeGateOutcome::Run(source) => {
+            if let Some(channel) = channel {
+                channel.emit_auto_mode_allowed(context, source);
+            }
+            AutoModeGateVerdict::Allowed
+        }
+        AutoModeGateOutcome::Deny { reason, fresh } => {
+            // Only a first-time denial appends a `/permissions` record, the
+            // same rule `ask_through_auto_gate` follows for the main session.
+            if fresh {
+                let record = build_denial_input(tool_name, context, input, Some(&reason));
+                let _ = hooks.sink.record(record);
+            }
+            AutoModeGateVerdict::Denied(reason)
+        }
+        // The gate wanted a human. A background worker has no prompt surface,
+        // so refuse rather than block forever.
+        AutoModeGateOutcome::Ask => {
+            AutoModeGateVerdict::Denied(worker_message_needs_approval_reason())
+        }
+    }
+}
+
+fn worker_message_needs_approval_reason() -> String {
+    "this message needs explicit user approval before it can be sent, which a background \
+     agent cannot request. The message was NOT sent. Do not retry it; continue with the \
+     rest of the task without it."
+        .to_string()
+}
+
+#[async_trait]
+impl AutoModeGate for SubAgentAutoModeGate {
+    async fn check(
+        &self,
+        tool: &dyn Tool,
+        input: &Value,
+        context: &ToolContext,
+    ) -> AutoModeGateVerdict {
+        if let Some(channel) = self
+            .broker
+            .as_any()
+            .downcast_ref::<ChannelPermissionBroker>()
+        {
+            let Some(hooks) = channel.current_hooks() else {
+                return AutoModeGateVerdict::NotInAuto;
+            };
+            if !hooks.auto_gates(hooks.current_mode()) {
+                return AutoModeGateVerdict::NotInAuto;
+            }
+            let rules = channel.permission_rules();
+            let outcome = ChannelPermissionBroker::auto_mode_gate(
+                tool.id().as_str(),
+                input,
+                context,
+                &hooks,
+                channel.current_classifier(),
+                &rules,
+            )
+            .await;
+            return worker_gate_verdict(
+                outcome,
+                Some(channel),
+                &hooks,
+                tool.id().as_str(),
+                input,
+                context,
+            );
+        }
+        // The ACP broker carries the same auto-mode hooks and classifier; only
+        // the human-approval transport differs, and a worker never reaches it.
+        if let Some(acp) = self
+            .broker
+            .as_any()
+            .downcast_ref::<crate::AcpPermissionBroker>()
+        {
+            let Some(hooks) = acp.hooks.as_ref() else {
+                return AutoModeGateVerdict::NotInAuto;
+            };
+            if !hooks.auto_gates(hooks.current_mode()) {
+                return AutoModeGateVerdict::NotInAuto;
+            }
+            let rules = acp.permission_rules();
+            let outcome = ChannelPermissionBroker::auto_mode_gate(
+                tool.id().as_str(),
+                input,
+                context,
+                hooks,
+                acp.auto_mode_classifier.clone(),
+                &rules,
+            )
+            .await;
+            return worker_gate_verdict(outcome, None, hooks, tool.id().as_str(), input, context);
+        }
+        AutoModeGateVerdict::NotInAuto
     }
 }
 
@@ -3235,6 +3368,222 @@ mod tests {
         let sensitive = sub_agent_sensitive_permission_broker_from(&inner, false)
             .expect("bare channel broker should pass through");
         assert!(sensitive.as_any().is::<ChannelPermissionBroker>());
+    }
+
+    // ── Worker auto-mode gate ─────────────────────────────────────
+
+    #[test]
+    fn sub_agent_auto_mode_gate_unwraps_policy_and_worker_layers() {
+        let (channel, _rx) = ChannelPermissionBroker::new("sess-parent");
+        let rules = Arc::new(crate::policy::RulesBasedPermissionBroker::new(
+            crate::policy::PolicyStore::new(),
+            Arc::new(channel) as Arc<dyn PermissionBroker>,
+        )) as Arc<dyn PermissionBroker>;
+        // A nested sub-agent hands us the parent worker's auto-approval
+        // broker, not the session broker behind it.
+        let worker = Arc::new(rebon_tool::AutoApproveExceptSensitivePermissionBroker::new(
+            rules,
+        )) as Arc<dyn PermissionBroker>;
+
+        assert!(sub_agent_auto_mode_gate_from(&worker).is_some());
+    }
+
+    #[test]
+    fn sub_agent_auto_mode_gate_is_absent_without_a_classifier_broker() {
+        let broker: Arc<dyn PermissionBroker> = Arc::new(rebon_tool::DenyAskPermissionBroker);
+
+        assert!(sub_agent_auto_mode_gate_from(&broker).is_none());
+    }
+
+    fn message_gate(broker: ChannelPermissionBroker) -> Arc<dyn AutoModeGate> {
+        let broker: Arc<dyn PermissionBroker> = Arc::new(broker);
+        sub_agent_auto_mode_gate_from(&broker).expect("channel broker yields a gate")
+    }
+
+    fn sub_agent_message_input() -> Value {
+        json!({"to": "researcher", "message": "start on task 1"})
+    }
+
+    #[tokio::test]
+    async fn sub_agent_message_gate_allows_in_auto_mode_without_prompting() {
+        let (broker, mut rx) = ChannelPermissionBroker::new("sess-auto");
+        let (hooks, sink) = hooks_with_mode(PermissionMode::Auto);
+        broker.set_auto_mode_hooks(Some(hooks));
+        let classifier = Arc::new(RecordingClassifier::new(FixedClassifierResult::Outcome(
+            AutoModeClassifierOutcome::Allow {
+                reason: "A coordination message between team members.".to_owned(),
+                stage: AutoModeClassifierStage::Fast,
+            },
+        )));
+        broker.set_auto_mode_classifier(Some(classifier.clone()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<crate::query::QueryEvent>();
+        broker.set_query_event_tx(Some(event_tx));
+        let gate = message_gate(broker);
+
+        let input = sub_agent_message_input();
+        let verdict = gate
+            .check(
+                &NamedEchoTool("SendMessage"),
+                &input,
+                &ToolContext::new().with_tool_use_id("t-message"),
+            )
+            .await;
+
+        assert_eq!(verdict, AutoModeGateVerdict::Allowed);
+        assert_eq!(classifier.call_count(), 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "the classifier answered, not a dialog"
+        );
+        assert_eq!(sink.store().lock().unwrap().len(), 0);
+        match event_rx
+            .try_recv()
+            .expect("auto mode must announce the run")
+        {
+            crate::query::QueryEvent::ToolAutoModeAllowed {
+                tool_use_id,
+                source,
+            } => {
+                assert_eq!(tool_use_id, "t-message");
+                assert_eq!(source, AutoModeAllowSource::Classifier);
+            }
+            other => panic!("expected ToolAutoModeAllowed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sub_agent_message_gate_records_a_classifier_denial() {
+        let (broker, mut rx) = ChannelPermissionBroker::new("sess-auto");
+        let (hooks, sink) = hooks_with_mode(PermissionMode::Auto);
+        broker.set_auto_mode_hooks(Some(hooks));
+        let classifier = Arc::new(RecordingClassifier::new(FixedClassifierResult::Outcome(
+            AutoModeClassifierOutcome::Block {
+                reason: "Sends project data to an outside recipient.".to_owned(),
+                category: None,
+            },
+        )));
+        broker.set_auto_mode_classifier(Some(classifier.clone()));
+        let gate = message_gate(broker);
+
+        let verdict = gate
+            .check(
+                &NamedEchoTool("group_send"),
+                &sub_agent_message_input(),
+                &ToolContext::new().with_tool_use_id("t-message"),
+            )
+            .await;
+
+        let AutoModeGateVerdict::Denied(reason) = verdict else {
+            panic!("the classifier's block must deny the message, got {verdict:?}");
+        };
+        assert!(reason.contains("outside recipient"), "{reason}");
+        assert_eq!(classifier.call_count(), 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "a refusal is not a dialog, and never a prompt"
+        );
+        assert_eq!(sink.store().lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sub_agent_message_gate_is_inert_outside_auto_mode() {
+        let (broker, mut rx) = ChannelPermissionBroker::new("sess-default");
+        let (hooks, sink) = hooks_with_mode(PermissionMode::Default);
+        broker.set_auto_mode_hooks(Some(hooks));
+        let classifier = Arc::new(RecordingClassifier::new(FixedClassifierResult::Outcome(
+            AutoModeClassifierOutcome::Allow {
+                reason: "Would be allowed in auto mode.".to_owned(),
+                stage: AutoModeClassifierStage::Fast,
+            },
+        )));
+        broker.set_auto_mode_classifier(Some(classifier.clone()));
+        let gate = message_gate(broker);
+
+        let verdict = gate
+            .check(
+                &NamedEchoTool("SendMessage"),
+                &sub_agent_message_input(),
+                &ToolContext::new(),
+            )
+            .await;
+
+        assert_eq!(verdict, AutoModeGateVerdict::NotInAuto);
+        assert_eq!(classifier.call_count(), 0);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sink.store().lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn sub_agent_message_gate_runs_under_plan_entered_from_auto() {
+        let (broker, mut rx) = ChannelPermissionBroker::new("sess-plan-auto");
+        let (hooks, _sink) = plan_hooks(Some(PermissionMode::Auto));
+        broker.set_auto_mode_hooks(Some(hooks));
+        let classifier = Arc::new(RecordingClassifier::new(FixedClassifierResult::Outcome(
+            AutoModeClassifierOutcome::Allow {
+                reason: "A coordination message between team members.".to_owned(),
+                stage: AutoModeClassifierStage::Fast,
+            },
+        )));
+        broker.set_auto_mode_classifier(Some(classifier.clone()));
+        let gate = message_gate(broker);
+
+        let verdict = gate
+            .check(
+                &NamedEchoTool("SendMessage"),
+                &sub_agent_message_input(),
+                &ToolContext::new(),
+            )
+            .await;
+
+        assert_eq!(verdict, AutoModeGateVerdict::Allowed);
+        assert_eq!(classifier.call_count(), 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "no dialog on the plan-from-auto path"
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_agent_message_gate_denies_when_it_would_need_the_user() {
+        let (broker, mut rx) = ChannelPermissionBroker::new("sess-auto");
+        let (hooks, _sink, mode_cell) = hooks_with_mode_cell(PermissionMode::Auto);
+        broker.set_auto_mode_hooks(Some(hooks));
+        let classifier = Arc::new(BlockingAllowClassifier {
+            started: Notify::new(),
+            release: Notify::new(),
+        });
+        broker.set_auto_mode_classifier(Some(classifier.clone()));
+        let gate = message_gate(broker);
+
+        let input = sub_agent_message_input();
+        let context = ToolContext::new().with_tool_use_id("t-message");
+        let handle = tokio::spawn({
+            let gate = gate.clone();
+            let input = input.clone();
+            let context = context.clone();
+            async move {
+                gate.check(&NamedEchoTool("SendMessage"), &input, &context)
+                    .await
+            }
+        });
+
+        classifier.started.notified().await;
+        *mode_cell.lock().expect("mode cell poisoned") = PermissionMode::Default;
+        classifier.release.notify_one();
+
+        let verdict = handle.await.expect("gate task");
+        let AutoModeGateVerdict::Denied(reason) = verdict else {
+            panic!("a gate that falls through to the user must deny, got {verdict:?}");
+        };
+        assert!(
+            reason.contains("background agent cannot request"),
+            "{reason}"
+        );
+        assert!(reason.contains("Do not retry"), "{reason}");
+        assert!(
+            rx.try_recv().is_err(),
+            "a background worker must never be left waiting on a prompt"
+        );
     }
 
     // ── bypassPermissions ─────────────────────────────────────────

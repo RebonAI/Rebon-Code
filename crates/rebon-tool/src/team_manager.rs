@@ -58,6 +58,13 @@ pub struct TeammateSpawnSpec {
     pub wait_for_completion: bool,
     /// Parent permission broker used for sensitive permission prompts.
     pub permission_broker: Option<Arc<dyn PermissionBroker>>,
+    /// Session-owned auto-mode check for the messages this teammate sends.
+    ///
+    /// Separate from [`Self::permission_broker`] on purpose: outside workflow
+    /// lineage a teammate is given no prompting broker, but the session still
+    /// owns the classifier its messages must go through. Built from the
+    /// spawning tool context, never used to open a prompt.
+    pub auto_mode_gate: Option<Arc<dyn crate::AutoModeGate>>,
     /// Whether this teammate has no interactive permission consumer.
     pub permission_prompts_unavailable: bool,
 }
