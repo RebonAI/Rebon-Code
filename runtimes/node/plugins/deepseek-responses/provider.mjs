@@ -306,7 +306,18 @@ export function buildInput(messages) {
           ...message.content.filter((block) => block.type !== "tool_result"),
         ]
       : message.content;
+    // Images from tool results wait until every output in this message has
+    // been sent. A user message between two outputs ends the tool round early,
+    // and DeepSeek then rejects the turn with "No tool output found for tool
+    // call <id>" for the calls still waiting — e.g. two images read in parallel.
+    let toolImageParts = [];
+    const flushToolImages = () => {
+      if (toolImageParts.length === 0) return;
+      input.push({ role: "user", content: toolImageParts });
+      toolImageParts = [];
+    };
     for (const block of blocks) {
+      if (block.type !== "tool_result") flushToolImages();
       switch (block.type) {
         case "text":
           textParts.push(block.text);
@@ -345,17 +356,15 @@ export function buildInput(messages) {
           });
           if (images.length > 0) {
             // The call's output stays the text string and its images follow in
-            // a user message of their own — the shape the built-in Responses
-            // path sends, and the only role an image is accepted in.
-            input.push({
-              role: "user",
-              content: [
-                ...lines
-                  .filter((line) => line !== "")
-                  .map((line) => ({ type: "input_text", text: line })),
-                ...images.map(imageInputPart),
-              ],
-            });
+            // a user message — the shape the built-in Responses path sends,
+            // and the only role an image is accepted in. That message is held
+            // back by flushToolImages until all outputs are in.
+            toolImageParts.push(
+              ...lines
+                .filter((line) => line !== "")
+                .map((line) => ({ type: "input_text", text: line })),
+              ...images.map(imageInputPart),
+            );
           }
           break;
         }
@@ -384,6 +393,7 @@ export function buildInput(messages) {
           break;
       }
     }
+    flushToolImages();
     flushRun();
   }
   return input;
