@@ -320,6 +320,34 @@ function testRequestTranslation() {
     "an image-only tool result carries both images and no text parts",
   );
 
+  // Two images read in parallel, results in completion order. A user message
+  // between the two outputs made DeepSeek 400 with "No tool output found".
+  assertEq(
+    buildInput([
+      {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "call_01_b", content: [image("BBBB")], is_error: false },
+          { type: "tool_result", tool_use_id: "call_00_a", content: [image("AAAA")], is_error: false },
+          { type: "text", text: "go on" },
+        ],
+      },
+    ]),
+    [
+      { type: "function_call_output", call_id: "call_01_b", output: "" },
+      { type: "function_call_output", call_id: "call_00_a", output: "" },
+      {
+        role: "user",
+        content: [
+          { type: "input_image", image_url: "data:image/png;base64,BBBB" },
+          { type: "input_image", image_url: "data:image/png;base64,AAAA" },
+        ],
+      },
+      { role: "user", content: [{ type: "input_text", text: "go on" }] },
+    ],
+    "parallel image results send every output before any image message",
+  );
+
   assertEq(
     buildInput([
       {
