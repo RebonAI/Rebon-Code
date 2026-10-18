@@ -75,7 +75,7 @@
 //!   translation implemented — deferred until we actually have such
 //!   a provider.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -94,10 +94,12 @@ use crate::error::{ModelError, ModelResult};
 use crate::events::{
     ContentBlockDelta, ContentBlockStart, MessageDeltaFields, StreamEvent, StreamEventStream,
 };
+use crate::openai::OpenAiRequestOptions;
 use crate::provider::{classify_http_error, ChatProvider, UniversalModelClient};
 use crate::request::CreateMessageRequest;
 use crate::sse::{decode_sse_stream, SseDecoder, SseFrame};
 use crate::types::{StopReason, Usage};
+use crate::vendor::ProviderVendor;
 use crate::ServiceTierHandle;
 
 /// Configuration for an [`OpenAiResponsesProvider`].
@@ -136,6 +138,15 @@ pub struct OpenAiResponsesClientConfig {
     pub use_websocket: bool,
     /// Optional runtime switch for OpenAI `service_tier: "priority"`.
     pub service_tier: Option<ServiceTierHandle>,
+    /// Who is behind the endpoint. [`ProviderVendor::DeepSeek`] switches the
+    /// request and stream to DeepSeek's dialect (see
+    /// [`deepseek`]); `Unknown` falls back to recognising `base_url`.
+    pub vendor: ProviderVendor,
+    /// Provider-level request body options. Only DeepSeek's dialect reads
+    /// them today.
+    pub request_options: OpenAiRequestOptions,
+    /// Per-model request body options, layered over `request_options`.
+    pub model_request_options: BTreeMap<String, OpenAiRequestOptions>,
 }
 
 impl Default for OpenAiResponsesClientConfig {
@@ -150,6 +161,44 @@ impl Default for OpenAiResponsesClientConfig {
             prompt_cache_retention: None,
             use_websocket: false,
             service_tier: None,
+            vendor: ProviderVendor::Unknown,
+            request_options: OpenAiRequestOptions::default(),
+            model_request_options: BTreeMap::new(),
+        }
+    }
+}
+
+impl OpenAiResponsesClientConfig {
+    /// Whether this endpoint speaks DeepSeek's dialect: the entry's vendor
+    /// says so, or nothing was pinned and the host is DeepSeek's.
+    pub fn is_deepseek(&self) -> bool {
+        match self.vendor {
+            ProviderVendor::DeepSeek => true,
+            ProviderVendor::Unknown => {
+                ProviderVendor::detect(&self.base_url) == ProviderVendor::DeepSeek
+            }
+            _ => false,
+        }
+    }
+
+    /// Fill what a DeepSeek entry left out: the key from `DEEPSEEK_API_KEY`,
+    /// the address from `DEEPSEEK_BASE_URL` and then the official endpoint.
+    /// An unset base URL must not fall through to this config's own default,
+    /// which is the ChatGPT Codex backend.
+    pub fn apply_deepseek_defaults(&mut self) {
+        let env = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        };
+        if self.api_key.trim().is_empty() {
+            if let Some(key) = env("DEEPSEEK_API_KEY") {
+                self.api_key = key;
+            }
+        }
+        if self.base_url.trim().is_empty() || self.base_url == Self::default().base_url {
+            self.base_url = env("DEEPSEEK_BASE_URL")
+                .unwrap_or_else(|| deepseek::DEEPSEEK_DEFAULT_BASE_URL.to_string());
         }
     }
 }
@@ -802,6 +851,9 @@ impl OpenAiResponsesProvider {
     /// — the stream parser then sees zero events and every request
     /// dies with "stream ended before response.completed".
     fn endpoint(&self) -> String {
+        if self.config.is_deepseek() {
+            return deepseek::deepseek_endpoint(&self.config.base_url);
+        }
         responses_endpoint_for_base(&self.config.base_url)
     }
 
@@ -1328,8 +1380,13 @@ impl ChatProvider for OpenAiResponsesProvider {
                 .expect("openai-responses auth mutex poisoned")
                 .refresher
                 .is_some();
+        let deepseek = self.config.is_deepseek();
         ModelCapabilities {
             codex_oauth_web_search,
+            // DeepSeek takes `tool_choice` and was measured with Anchored
+            // Minimal; the OpenAI and Codex paths send neither.
+            forced_tool_choice: deepseek,
+            anchored_minimal: deepseek,
             requires_inline_transient_context: true,
             output_budget_includes_reasoning: true,
             accepts_unsigned_thinking_replay: true,
@@ -1411,7 +1468,9 @@ impl ChatProvider for OpenAiResponsesProvider {
         // which replica answers (observed: 0 or a ~9k-token head on most
         // requests of a 300k-token session). Going back to the WebSocket
         // costs one full replay, after which deltas resume.
-        if self.config.use_websocket && !self.websocket_unavailable() {
+        // DeepSeek is stateless: there is no response chain to delta against.
+        if self.config.use_websocket && !self.config.is_deepseek() && !self.websocket_unavailable()
+        {
             return self.send_message_stream_ws(http, request).await;
         }
 
@@ -1437,19 +1496,39 @@ impl OpenAiResponsesProvider {
             .as_ref()
             .and_then(|trace| trace.prompt_cache_key.as_deref())
             .unwrap_or(&self.prompt_cache_key);
-        let body = build_responses_request_body_with_service_tier(
-            &request,
-            is_codex,
-            effective_prompt_cache_key,
-            None,
-            self.config.service_tier.as_ref(),
-        );
-        let request_fingerprint = responses_request_fingerprint_with_service_tier(
-            &request,
-            is_codex,
-            effective_prompt_cache_key,
-            self.config.service_tier.as_ref(),
-        );
+        let deepseek = self.config.is_deepseek();
+        let (body, request_fingerprint) = if deepseek {
+            let body = deepseek::build_deepseek_request_body(
+                &request,
+                request
+                    .cache_trace_context
+                    .as_ref()
+                    .and_then(|trace| trace.prompt_cache_key.as_deref()),
+                &self.config.request_options,
+                self.config.model_request_options.get(&request.model),
+            );
+            deepseek::dump_request_body(&body);
+            let mut fingerprint = body.clone();
+            if let Value::Object(map) = &mut fingerprint {
+                map.remove("input");
+            }
+            (body, fingerprint)
+        } else {
+            let body = build_responses_request_body_with_service_tier(
+                &request,
+                is_codex,
+                effective_prompt_cache_key,
+                None,
+                self.config.service_tier.as_ref(),
+            );
+            let fingerprint = responses_request_fingerprint_with_service_tier(
+                &request,
+                is_codex,
+                effective_prompt_cache_key,
+                self.config.service_tier.as_ref(),
+            );
+            (body, fingerprint)
+        };
         emit_openai_request_shape_trace(
             &request,
             effective_prompt_cache_key,
@@ -1483,10 +1562,15 @@ impl OpenAiResponsesProvider {
             .bytes_stream()
             .map_err(|e| ModelError::Http(format!("body stream: {e}")));
 
+        let translator = if deepseek {
+            OpenAiResponsesTranslator::for_deepseek()
+        } else {
+            OpenAiResponsesTranslator::default()
+        };
         Ok(decode_sse_stream(
             Box::pin(byte_stream),
             ResponsesSseDecoder {
-                translator: OpenAiResponsesTranslator::default(),
+                translator,
                 last_response_id: None,
             },
         ))
@@ -1543,6 +1627,7 @@ pub fn openai_responses_client_with_http(
     UniversalModelClient::with_http_client(Arc::new(OpenAiResponsesProvider::new(config)), http)
 }
 
+pub mod deepseek;
 mod request_body;
 use request_body::build_responses_request_body_with_input_and_service_tier;
 pub use request_body::{
@@ -1603,6 +1688,13 @@ pub struct OpenAiResponsesTranslator {
     // item snapshot instead of a trailing delta event.
     block_buffers: HashMap<usize, String>,
     reasoning_parts: HashMap<usize, ReasoningPartState>,
+    /// DeepSeek's dialect: plaintext `reasoning_text`, `custom_tool_call`,
+    /// and `web_search_call` items whose action arrives only at done.
+    deepseek: bool,
+    /// Blocks opened for a `custom_tool_call`. Their input is buffered and
+    /// emitted once at close, because rebon parses the joined `partial_json`
+    /// at block stop and a custom tool's input is free text.
+    custom_tool_blocks: HashSet<usize>,
 }
 
 #[derive(Debug)]
@@ -1627,6 +1719,14 @@ enum BlockKind {
 }
 
 impl OpenAiResponsesTranslator {
+    /// A translator for DeepSeek's Responses stream.
+    pub fn for_deepseek() -> Self {
+        Self {
+            deepseek: true,
+            ..Self::default()
+        }
+    }
+
     /// Feed one SSE frame (an already-parsed `{event, data}` pair)
     /// into the translator. Events become available via
     /// [`Self::next_pending`].
@@ -1640,6 +1740,18 @@ impl OpenAiResponsesTranslator {
                 "responses api frame parse: {e} for event={event_type} data={data}"
             ))
         })?;
+        // A server that sends no `event:` lines still names the event in
+        // the payload's `type`.
+        let event_type = if event_type.is_empty() {
+            payload
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            event_type.to_string()
+        };
+        let event_type = event_type.as_str();
 
         match event_type {
             "response.created" => self.handle_response_created(&payload),
@@ -1655,6 +1767,14 @@ impl OpenAiResponsesTranslator {
             "response.reasoning_summary_part.added" => {
                 self.handle_reasoning_part_added(&payload);
             }
+            "response.reasoning_text.delta" => self.handle_reasoning_text_delta(&payload),
+            "response.reasoning_text.done" => {
+                self.patch_done_suffix(&payload, BlockKind::Reasoning, |thinking| {
+                    ContentBlockDelta::ThinkingDelta { thinking }
+                });
+            }
+            "response.custom_tool_call_input.delta" => self.handle_custom_input_delta(&payload),
+            "response.custom_tool_call_input.done" => self.handle_custom_input_done(&payload),
             "response.image_generation_call.partial_image" => {
                 self.handle_image_partial(&payload);
             }
@@ -1793,6 +1913,7 @@ impl OpenAiResponsesTranslator {
         }
         // Close any still-open current block.
         if let Some(current) = self.current_block.take() {
+            self.flush_custom_tool_input(current.block_index, None);
             self.pending.push(StreamEvent::ContentBlockStop {
                 index: current.block_index,
             });
@@ -1943,6 +2064,38 @@ impl OpenAiResponsesTranslator {
                     .map(String::from);
                 let _ = self.ensure_image_generation_block(payload, status);
             }
+            "custom_tool_call" => {
+                let call_id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = item
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                self.pending.push(StreamEvent::ContentBlockStart {
+                    index: block_index,
+                    content_block: ContentBlockStart::ToolUse { id: call_id, name },
+                });
+                self.current_block = Some(CurrentBlock {
+                    block_index,
+                    kind: BlockKind::ToolUse,
+                });
+                self.block_buffers.insert(block_index, String::new());
+                self.custom_tool_blocks.insert(block_index);
+                self.has_tool_call = true;
+                if let Some(idx) = output_index {
+                    self.open_items.insert(idx, block_index);
+                }
+            }
+            "web_search_call" if self.deepseek => {
+                // DeepSeek fills in the search action only at done, and the
+                // action is what history replays, so the block opens there.
+                self.next_block_index -= 1;
+            }
             "web_search_call" => {
                 // Server-side web search. Extract the search query
                 // from the item and emit as a ServerToolUse block.
@@ -2073,6 +2226,112 @@ impl OpenAiResponsesTranslator {
 
     fn handle_image_generation_status(&mut self, payload: &Value, status: &str) {
         let _ = self.ensure_image_generation_block(payload, Some(status.to_string()));
+    }
+
+    /// DeepSeek's plaintext reasoning, streamed into the open reasoning block.
+    fn handle_reasoning_text_delta(&mut self, payload: &Value) {
+        let Some(delta) = payload.get("delta").and_then(|v| v.as_str()) else {
+            return;
+        };
+        if delta.is_empty() {
+            return;
+        }
+        let Some(current) = self
+            .current_block
+            .filter(|c| c.kind == BlockKind::Reasoning)
+        else {
+            tracing::debug!("responses api: reasoning_text delta with no open reasoning block");
+            return;
+        };
+        self.block_buffers
+            .entry(current.block_index)
+            .or_default()
+            .push_str(delta);
+        self.pending.push(StreamEvent::ContentBlockDelta {
+            index: current.block_index,
+            delta: ContentBlockDelta::ThinkingDelta {
+                thinking: delta.to_string(),
+            },
+        });
+    }
+
+    fn open_custom_tool_block(&self) -> Option<usize> {
+        self.current_block
+            .map(|c| c.block_index)
+            .filter(|index| self.custom_tool_blocks.contains(index))
+    }
+
+    fn handle_custom_input_delta(&mut self, payload: &Value) {
+        let Some(delta) = payload.get("delta").and_then(|v| v.as_str()) else {
+            return;
+        };
+        if let Some(index) = self.open_custom_tool_block() {
+            self.block_buffers.entry(index).or_default().push_str(delta);
+        }
+    }
+
+    fn handle_custom_input_done(&mut self, payload: &Value) {
+        let Some(full) = payload.get("input").and_then(|v| v.as_str()) else {
+            return;
+        };
+        if let Some(index) = self.open_custom_tool_block() {
+            let buffer = self.block_buffers.entry(index).or_default();
+            if full.starts_with(buffer.as_str()) {
+                *buffer = full.to_string();
+            }
+        }
+    }
+
+    /// Emit a custom tool call's input as one JSON delta: an input that is a
+    /// JSON object passes through, anything else becomes `{"input": raw}`.
+    /// `full` is the item's own `input` at done, used when no delta came.
+    fn flush_custom_tool_input(&mut self, block_index: usize, full: Option<String>) {
+        if !self.custom_tool_blocks.remove(&block_index) {
+            return;
+        }
+        let mut raw = self.block_buffers.remove(&block_index).unwrap_or_default();
+        if let Some(full) = full.filter(|full| full.starts_with(&raw)) {
+            raw = full;
+        }
+        let trimmed = raw.trim();
+        let is_object = serde_json::from_str::<Value>(trimmed)
+            .map(|value| value.is_object())
+            .unwrap_or(false);
+        let partial_json = if is_object {
+            trimmed.to_string()
+        } else {
+            json!({ "input": raw }).to_string()
+        };
+        self.pending.push(StreamEvent::ContentBlockDelta {
+            index: block_index,
+            delta: ContentBlockDelta::InputJsonDelta { partial_json },
+        });
+    }
+
+    /// A finished DeepSeek `web_search_call`, opened and closed at once with
+    /// its action as the input history will replay.
+    fn open_deepseek_web_search(&mut self, payload: &Value) {
+        self.ensure_started();
+        let Some(item) = payload.get("item") else {
+            return;
+        };
+        let index = self.next_block_index;
+        self.next_block_index += 1;
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| format!("ws-{index}"));
+        let input = item.get("action").cloned().unwrap_or_else(|| json!({}));
+        self.pending.push(StreamEvent::ContentBlockStart {
+            index,
+            content_block: ContentBlockStart::ServerToolUse {
+                id,
+                name: "web_search".to_string(),
+                input,
+            },
+        });
+        self.pending.push(StreamEvent::ContentBlockStop { index });
     }
 
     fn handle_text_delta(&mut self, payload: &Value) {
@@ -2461,6 +2720,16 @@ impl OpenAiResponsesTranslator {
     }
 
     fn handle_output_item_done(&mut self, payload: &Value) {
+        if self.deepseek
+            && payload
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(|v| v.as_str())
+                == Some("web_search_call")
+        {
+            self.open_deepseek_web_search(payload);
+            return;
+        }
         // Prefer the explicit `output_index` mapping so out-of-
         // order dones close the right block.
         let output_index = payload
@@ -2547,6 +2816,14 @@ impl OpenAiResponsesTranslator {
                             partial_json: delta,
                         },
                     ),
+                    "custom_tool_call" => {
+                        let full = payload
+                            .get("item")
+                            .and_then(|item| item.get("input"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
+                        self.flush_custom_tool_input(block_index, full);
+                    }
                     "reasoning" => {
                         self.patch_done_suffix_for_block(
                             block_index,
@@ -2703,6 +2980,13 @@ impl OpenAiResponsesTranslator {
         if reason == "max_output_tokens" {
             self.merge_response_usage(payload);
             self.finalize_with_stop_reason(StopReason::MaxTokens);
+            return Ok(());
+        }
+        // DeepSeek ends a filtered answer as incomplete. Resending the same
+        // request cannot help, so it is a refusal rather than a retry.
+        if self.deepseek && reason.contains("content_filter") {
+            self.merge_response_usage(payload);
+            self.finalize_with_stop_reason(StopReason::Refusal);
             return Ok(());
         }
 
@@ -4442,6 +4726,228 @@ mod tests {
         translator
             .push_frame(event, &serde_json::to_string(&data).unwrap())
             .expect("push_frame should succeed for valid payloads");
+    }
+
+    fn deepseek_turn(frames: &[(&str, Value)]) -> Vec<StreamEvent> {
+        let mut t = OpenAiResponsesTranslator::for_deepseek();
+        for (event, data) in frames {
+            push(&mut t, event, data.clone());
+        }
+        drain(&mut t)
+    }
+
+    fn deltas(events: &[StreamEvent]) -> Vec<ContentBlockDelta> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockDelta { delta, .. } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn stop_reason(events: &[StreamEvent]) -> Option<StopReason> {
+        events.iter().find_map(|event| match event {
+            StreamEvent::MessageDelta { delta } => delta.stop_reason.clone(),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn deepseek_reasoning_text_streams_as_thinking() {
+        let events = deepseek_turn(&[
+            (
+                "response.created",
+                json!({"response": {"id": "r", "model": "deepseek-v4-pro"}}),
+            ),
+            (
+                "response.output_item.added",
+                json!({"output_index": 0, "item": {"id": "rs", "type": "reasoning"}}),
+            ),
+            (
+                "response.reasoning_text.delta",
+                json!({"item_id": "rs", "delta": "hm"}),
+            ),
+            (
+                "response.reasoning_text.done",
+                json!({"item_id": "rs", "text": "hmm"}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"output_index": 0, "item": {"id": "rs", "type": "reasoning"}}),
+            ),
+            ("response.completed", json!({"response": {}})),
+        ]);
+        let thinking: String = deltas(&events)
+            .into_iter()
+            .filter_map(|delta| match delta {
+                ContentBlockDelta::ThinkingDelta { thinking } => Some(thinking),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, "hmm", "the done event patches the missing tail");
+        assert_eq!(stop_reason(&events), Some(StopReason::EndTurn));
+    }
+
+    #[test]
+    fn frames_without_an_event_line_use_the_payload_type() {
+        let events = deepseek_turn(&[
+            (
+                "",
+                json!({"type": "response.created", "response": {"id": "r"}}),
+            ),
+            (
+                "",
+                json!({"type": "response.output_item.added", "output_index": 0,
+                        "item": {"id": "m", "type": "message"}}),
+            ),
+            (
+                "",
+                json!({"type": "response.output_text.delta", "item_id": "m", "delta": "ok"}),
+            ),
+            ("", json!({"type": "response.completed", "response": {}})),
+        ]);
+        assert!(deltas(&events).contains(&ContentBlockDelta::TextDelta { text: "ok".into() }));
+        assert_eq!(stop_reason(&events), Some(StopReason::EndTurn));
+    }
+
+    #[test]
+    fn deepseek_custom_tool_input_is_emitted_once_as_json() {
+        let events = deepseek_turn(&[
+            ("response.created", json!({"response": {"id": "r"}})),
+            (
+                "response.output_item.added",
+                json!({"output_index": 0,
+                "item": {"id": "ct", "type": "custom_tool_call", "call_id": "call_1", "name": "apply_patch"}}),
+            ),
+            (
+                "response.custom_tool_call_input.delta",
+                json!({"item_id": "ct", "delta": "*** Begin"}),
+            ),
+            (
+                "response.custom_tool_call_input.delta",
+                json!({"item_id": "ct", "delta": " Patch"}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"output_index": 0, "item": {"id": "ct", "type": "custom_tool_call"}}),
+            ),
+            ("response.completed", json!({"response": {}})),
+        ]);
+        assert_eq!(
+            deltas(&events),
+            vec![ContentBlockDelta::InputJsonDelta {
+                partial_json: json!({"input": "*** Begin Patch"}).to_string()
+            }]
+        );
+        assert_eq!(stop_reason(&events), Some(StopReason::ToolUse));
+
+        let object = deepseek_turn(&[
+            (
+                "response.output_item.added",
+                json!({"output_index": 0,
+                "item": {"id": "ct", "type": "custom_tool_call", "call_id": "call_2", "name": "t"}}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"output_index": 0,
+                "item": {"id": "ct", "type": "custom_tool_call", "input": " {\"a\":1} "}}),
+            ),
+            ("response.completed", json!({"response": {}})),
+        ]);
+        assert_eq!(
+            deltas(&object),
+            vec![ContentBlockDelta::InputJsonDelta {
+                partial_json: "{\"a\":1}".into()
+            }],
+            "a JSON-object input passes through, taken from the done item"
+        );
+    }
+
+    #[test]
+    fn deepseek_web_search_opens_at_done_with_its_action() {
+        let events = deepseek_turn(&[
+            ("response.created", json!({"response": {"id": "r"}})),
+            (
+                "response.output_item.added",
+                json!({"output_index": 0, "item": {"id": "ws_1", "type": "web_search_call"}}),
+            ),
+            (
+                "response.output_item.done",
+                json!({"output_index": 0, "item": {"id": "ws_1", "type": "web_search_call",
+                "action": {"type": "search", "query": "rust"}}}),
+            ),
+            ("response.completed", json!({"response": {}})),
+        ]);
+        let starts: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockStart { content_block, .. } => Some(content_block.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![ContentBlockStart::ServerToolUse {
+                id: "ws_1".into(),
+                name: "web_search".into(),
+                input: json!({"type": "search", "query": "rust"}),
+            }]
+        );
+        assert_eq!(
+            stop_reason(&events),
+            Some(StopReason::EndTurn),
+            "a search alone is not a tool turn"
+        );
+    }
+
+    #[test]
+    fn deepseek_content_filter_is_a_refusal_not_a_retry() {
+        let mut t = OpenAiResponsesTranslator::for_deepseek();
+        push(&mut t, "response.created", json!({"response": {"id": "r"}}));
+        push(
+            &mut t,
+            "response.incomplete",
+            json!({"response": {"incomplete_details": {"reason": "content_filter"}}}),
+        );
+        assert_eq!(stop_reason(&drain(&mut t)), Some(StopReason::Refusal));
+
+        let mut openai = OpenAiResponsesTranslator::default();
+        let result = openai.push_frame(
+            "response.incomplete",
+            &json!({"response": {"incomplete_details": {"reason": "content_filter"}}}).to_string(),
+        );
+        assert!(result.is_err(), "the OpenAI path is unchanged");
+    }
+
+    #[test]
+    fn deepseek_host_gets_its_dialect_endpoint_and_capabilities() {
+        let provider = OpenAiResponsesProvider::new(OpenAiResponsesClientConfig::with_base_url(
+            "https://api.deepseek.com",
+            "sk",
+        ));
+        assert_eq!(provider.endpoint(), "https://api.deepseek.com/responses");
+        let caps = provider.capabilities();
+        assert!(caps.forced_tool_choice && caps.anchored_minimal);
+        assert!(caps.output_budget_includes_reasoning && caps.accepts_unsigned_thinking_replay);
+        assert!(!caps.remote_compaction_v2);
+
+        let mut pinned =
+            OpenAiResponsesClientConfig::with_base_url("https://relay.example/v1", "sk");
+        pinned.vendor = ProviderVendor::DeepSeek;
+        assert_eq!(
+            OpenAiResponsesProvider::new(pinned).endpoint(),
+            "https://relay.example/v1/responses",
+            "a pinned relay keeps its own path"
+        );
+
+        let openai = OpenAiResponsesProvider::new(OpenAiResponsesClientConfig::with_base_url(
+            "https://api.openai.com",
+            "sk",
+        ));
+        assert!(
+            !openai.capabilities().forced_tool_choice && !openai.capabilities().anchored_minimal
+        );
     }
 
     #[test]
@@ -6532,6 +7038,9 @@ mod tests {
             prompt_cache_retention: None,
             use_websocket: true,
             service_tier: None,
+            vendor: ProviderVendor::Unknown,
+            request_options: OpenAiRequestOptions::default(),
+            model_request_options: BTreeMap::new(),
         }
     }
 

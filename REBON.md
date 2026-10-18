@@ -407,7 +407,12 @@ rebon-tools-core.  rebon-types ─▶ rebon-tools-core; rebon-session ─▶ bot
   the body to that dialect last, so a `thinking` object a config wrote
   for DeepSeek still comes out as `enable_thinking` for Qwen. Every row
   cites the vendor's documentation page. Do not add a
-  `contains(".deepseek.com")` anywhere; add a row.
+  `contains(".deepseek.com")` anywhere; add a row. The Responses wire
+  has one vendor dialect, DeepSeek's (stateless, plaintext reasoning
+  replayed on tool-call turns, tool outputs ahead of any user item), in
+  `rebon-api/src/openai_responses/deepseek.rs`; it is chosen from
+  `OpenAiResponsesClientConfig::vendor` the same way. It used to be the
+  `deepseek-responses` plugin, and `deepseek` is now a reserved id.
 - **Provider runtimes are cached, not rebuilt per call.** A sub-agent that
   names a provider resolves through
   `rebon-provider/src/provider_runtime_cache.rs`, keyed by case-folded

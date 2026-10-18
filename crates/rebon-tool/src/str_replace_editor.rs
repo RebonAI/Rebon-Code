@@ -4,7 +4,7 @@
 //! DeepSeek Harness' `@deepseek-ai/dsh-tool-str-replace-editor` so the first
 //! request of an anchored session carries the exact tool identity the upstream
 //! measurement depends on. That text is MIT-licensed; the notice lives in
-//! `runtimes/node/plugins/deepseek-responses/NOTICE`.
+//! `crates/rebon-core/NOTICE-DEEPSEEK-HARNESS`.
 //!
 //! Execution is a translation layer, not a second editor: `view` delegates to
 //! [`ReadTool`], `create` and `insert` to [`WriteTool`], and `str_replace` to

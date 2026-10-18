@@ -800,6 +800,8 @@ pub fn installed_external_provider_ids_in(
         .model_provider_ids()
         .into_iter()
         .filter(|id| !matches!(id.as_str(), "openai" | "openai-responses" | "anthropic"))
+        // A retired plugin left on disk must not take its old entry back.
+        .filter(|id| !is_retired_plugin_provider_id(id))
         .collect()
 }
 
@@ -1519,6 +1521,8 @@ pub struct OpenAIOAuthTokens {
 }
 
 pub mod account_login;
+pub mod deepseek_migration;
+pub use deepseek_migration::{is_retired_plugin_provider_id, migrate_deepseek_plugin};
 pub mod paths;
 pub mod profile_store;
 pub mod provider_store;
@@ -3346,7 +3350,9 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         display_name: "DeepSeek",
         vendor: V::DeepSeek,
         region: PresetRegion::China,
-        format: "openai",
+        // The Responses dialect is built in for DeepSeek (reasoning replay,
+        // Anchored Minimal); Chat Completions stays available as `openai`.
+        format: "openai-responses",
         base_url: "https://api.deepseek.com",
         anthropic_base_url: Some("https://api.deepseek.com/anthropic"),
         default_model: "deepseek-flash",
@@ -10292,7 +10298,7 @@ mod tests {
     #[test]
     fn provider_presets_include_current_defaults() {
         let preset = provider_preset_by_id("deepseek").unwrap();
-        assert_eq!(preset.format, "openai");
+        assert_eq!(preset.format, "openai-responses");
         assert_eq!(preset.base_url, "https://api.deepseek.com");
         assert_eq!(preset.default_model, "deepseek-flash");
         assert_eq!(preset.api_key_env, "DEEPSEEK_API_KEY");
@@ -10765,7 +10771,7 @@ mod tests {
         let info = add_custom_provider_from_preset_in(tmp.path(), "DeepSeek", "$DEEPSEEK_API_KEY")
             .unwrap();
         assert_eq!(info.name, "deepseek");
-        assert_eq!(info.format, "openai");
+        assert_eq!(info.format, "openai-responses");
         assert_eq!(info.base_url, "https://api.deepseek.com");
         assert_eq!(info.api_key, "$DEEPSEEK_API_KEY");
         assert_eq!(info.model, "deepseek-flash");

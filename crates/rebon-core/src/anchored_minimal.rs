@@ -11,7 +11,7 @@
 //! anchored 5/5 at the adapter-default output budget.
 //!
 //! The persona text and both tool schemas are copied from DeepSeek Harness
-//! (MIT). The notice lives in `runtimes/node/plugins/deepseek-responses/NOTICE`.
+//! (MIT). The notice lives in `crates/rebon-core/NOTICE-DEEPSEEK-HARNESS`.
 //!
 //! Execution is Rebon's own: `bash` resolves to `BashTool` through its alias
 //! and `str_replace_editor` to the translating

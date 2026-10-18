@@ -331,7 +331,7 @@ pub fn is_reserved_provider_id(id: &str) -> bool {
         BUILTIN_OPENAI_PROVIDER_ID
             | BUILTIN_OPENAI_RESPONSES_PROVIDER_ID
             | BUILTIN_ANTHROPIC_PROVIDER_ID
-    )
+    ) || rebon_config::is_retired_plugin_provider_id(id)
 }
 
 fn build_builtin_client(
@@ -376,6 +376,15 @@ fn build_builtin_client(
             config.use_websocket = resolved.use_websocket;
             config.extra_headers = resolved.extra_headers;
             config.service_tier = context.service_tier;
+            // The vendor picks the wire dialect (DeepSeek's differs from
+            // OpenAI's in body, history and stream); the request options are
+            // the entry's escape hatch for that dialect.
+            config.vendor = resolved.vendor;
+            config.request_options = resolved.request_options;
+            config.model_request_options = resolved.model_request_options;
+            if resolved.vendor == rebon_api::ProviderVendor::DeepSeek {
+                config.apply_deepseek_defaults();
+            }
             let provider = OpenAiResponsesProvider::new(config);
             let provider = if let Some(rn) = context.retry_notifier {
                 provider.with_retry_notifier(rn)

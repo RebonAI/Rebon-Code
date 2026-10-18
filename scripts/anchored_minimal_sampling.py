@@ -30,7 +30,7 @@ point `--cwd` at a scratch checkout.
 
 Usage:
   python scripts/anchored_minimal_sampling.py -n 10 \
-      --provider deepseek-responses --model v4-pro --effort max \
+      --provider deepseek --model v4-pro --effort max \
       --prompt "look my diff" --out runs/anchor-2026-08-16
 
   # A/B against Normal, 5 each:
@@ -383,7 +383,7 @@ def main() -> int:
         default="minimal",
         help="sample Minimal, Normal, or both as a matched control",
     )
-    parser.add_argument("--provider", help="custom provider id, e.g. deepseek-responses")
+    parser.add_argument("--provider", help="custom provider id, e.g. deepseek")
     parser.add_argument("--model", help="model name, e.g. v4-pro")
     parser.add_argument(
         "--effort", choices=["low", "medium", "high", "xhigh", "max"], help="reasoning effort"

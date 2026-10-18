@@ -1600,6 +1600,13 @@ pub fn build_compact_provider(
         return None;
     }
     match resolved.format {
+        // DeepSeek has no `/responses/compact`: its summaries are an ordinary
+        // turn on the `small` profile model, as they were under the plugin.
+        ProviderFormat::OpenaiResponses
+            if resolved.vendor == rebon_api::ProviderVendor::DeepSeek =>
+        {
+            build_model_compact_provider(config_dir, resolved, small_model, service_tier)
+        }
         ProviderFormat::OpenaiResponses => {
             let compact_model = compact_model_for_provider(small_model, &resolved.model);
             let provider = rebon_api::RemoteCompactProvider::new(
@@ -1648,6 +1655,25 @@ fn build_model_compact_provider(
                     .with_reasoning_effort(reasoning_effort),
             ))
         }
+        ProviderFormat::OpenaiResponses
+            if resolved.vendor == rebon_api::ProviderVendor::DeepSeek =>
+        {
+            let mut config = OpenAiResponsesClientConfig::with_api_key(resolved.api_key.clone());
+            if !resolved.base_url.is_empty() {
+                config.base_url = resolved.base_url.clone();
+            }
+            config.vendor = resolved.vendor;
+            config.request_options = resolved.request_options.clone();
+            config.model_request_options = resolved.model_request_options.clone();
+            config.apply_deepseek_defaults();
+            let client: Arc<dyn ModelClient> = Arc::new(UniversalModelClient::new(Arc::new(
+                OpenAiResponsesProvider::new(config),
+            )));
+            Some(Arc::new(
+                rebon_api::ModelCompactProvider::new(client, &compact_model)
+                    .with_reasoning_effort(reasoning_effort),
+            ))
+        }
         ProviderFormat::OpenaiResponses => Some(responses_model_compact_provider(
             &resolved.base_url,
             &resolved.api_key,
@@ -1691,6 +1717,12 @@ pub fn build_compact_fallback_provider(
         return None;
     }
     match resolved.format {
+        // DeepSeek's first rung is already the model summary.
+        ProviderFormat::OpenaiResponses
+            if resolved.vendor == rebon_api::ProviderVendor::DeepSeek =>
+        {
+            None
+        }
         ProviderFormat::OpenaiResponses => {
             build_model_compact_provider(config_dir, resolved, small_model, service_tier)
         }
@@ -3642,6 +3674,43 @@ mod tests {
     /// 404s as well, so a guaranteed-404 fallback left blind truncation as the
     /// only outcome: one 8-hour benchmark trial had its 690-message history
     /// cut to 11 mid-task and started over.
+    /// DeepSeek serves no `/responses/compact`, so its compaction is a plain
+    /// summary turn on DeepSeek's own `/responses`, with no `/v1` inserted.
+    #[tokio::test]
+    async fn deepseek_compaction_is_a_summary_turn_on_its_responses_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(record_one_request_line(listener));
+
+        let mut resolved = responses_provider(format!("http://{addr}"));
+        resolved.vendor = rebon_api::ProviderVendor::DeepSeek;
+        resolved.model = "deepseek-v4-pro".into();
+        assert!(
+            build_compact_fallback_provider(Path::new("."), &resolved, "deepseek-flash", None)
+                .is_none()
+        );
+        let provider = build_compact_provider(Path::new("."), &resolved, "deepseek-flash", None)
+            .expect("DeepSeek has a compaction provider");
+
+        let messages = vec![
+            rebon_api::Message::user_text("q1"),
+            rebon_api::Message::assistant_text("a1"),
+            rebon_api::Message::user_text("q2"),
+            rebon_api::Message::assistant_text("a2"),
+        ];
+        let _ = provider
+            .compact(
+                &messages,
+                None,
+                1,
+                None,
+                &rebon_api::CompactSummaryOptions::default(),
+            )
+            .await;
+
+        assert_eq!(server.await.unwrap(), "POST /responses HTTP/1.1");
+    }
+
     #[tokio::test]
     async fn responses_compact_fallback_posts_to_the_responses_endpoint() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

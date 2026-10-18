@@ -305,58 +305,6 @@ mod tests {
         assert!(provider.capabilities.forced_tool_choice);
     }
 
-    /// The in-repo `runtimes/node/plugins/deepseek-responses` package must always pass the
-    /// real manifest validation chain (identifier rules, and the plane
-    /// transport's entry actually being a module inside the package).
-    #[test]
-    fn in_repo_deepseek_responses_plugin_materializes() {
-        let repo_plugin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../runtimes/node/plugins/deepseek-responses");
-        assert!(
-            repo_plugin.join("rebon-plugin.json").is_file(),
-            "plugin manifest missing at {repo_plugin:?}"
-        );
-        let tmp = tempfile::tempdir().unwrap();
-        let contributions = resolve_runtime_contributions(&PluginRuntimeOptions {
-            cwd: tmp.path().join("project"),
-            config_home: tmp.path().join("home"),
-            plugin_dirs: vec![repo_plugin],
-            rebon_exe: Some(PathBuf::from("/bin/rebon")),
-        })
-        .unwrap();
-
-        assert_eq!(contributions.model_providers.len(), 1);
-        let provider = &contributions.model_providers[0];
-        assert_eq!(provider.id, "deepseek");
-        assert_eq!(provider.default_model.as_deref(), Some("deepseek-v4-pro"));
-        // The `small` profile drives compaction summaries; it stays on Flash so
-        // a Pro default does not make every compaction cost Pro output rates.
-        assert_eq!(provider.profiles.get("small"), Some("deepseek-flash"));
-        assert_eq!(
-            provider
-                .models
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            vec!["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"]
-        );
-        assert_eq!(
-            provider.models["deepseek-v4-pro"].context_window,
-            Some(1_000_000)
-        );
-        assert!(provider.capabilities.forced_tool_choice);
-        assert!(provider.capabilities.reasoning_text);
-        assert!(provider.capabilities.custom_tool_call);
-        assert!(provider.capabilities.web_search);
-        assert!(provider.capabilities.anchored_minimal);
-        assert!(!provider.capabilities.stateful_responses);
-        assert!(!provider.capabilities.remote_compaction);
-        let crate::plugin::model_provider_manifest::MaterializedModelProviderTransport::Plugin(
-            plugin,
-        ) = &provider.transport;
-        assert_eq!(plugin.entry, "provider.mjs");
-    }
-
     #[test]
     fn plugin_dir_materializes_acp_agent_contribution() {
         let tmp = tempfile::tempdir().unwrap();
