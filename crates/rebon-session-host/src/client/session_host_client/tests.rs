@@ -806,11 +806,12 @@ fn an_agent_message_for_a_free_session_with_a_job_is_queued() {
     );
 }
 
-/// A foreground terminal is alive, owns the session lock, and publishes no
-/// endpoint. "Unreachable" would send the caller looking for a dead process;
-/// this says what is actually true and that the fix is coming.
+/// A foreground terminal is alive and owns the session lock, but this one
+/// advertises neither an agent endpoint nor the mailbox capability.
+/// "Unreachable" would send the caller looking for a dead process; this says
+/// what is actually true — it needs a newer Rebon or a fresh status.
 #[test]
-fn an_agent_message_for_a_foreground_terminal_says_it_cannot_receive_yet() {
+fn an_agent_message_for_a_foreground_terminal_without_a_channel_is_refused() {
     let dir = tempfile::Builder::new()
         .prefix("rebon-client-foreground-message-")
         .tempdir()
@@ -838,6 +839,8 @@ fn an_agent_message_for_a_foreground_terminal_says_it_cannot_receive_yet() {
             last_command_error: None,
             recent_command_results: Vec::new(),
             terminal_id: None,
+            agent_endpoint: None,
+            capabilities: Vec::new(),
         }
     ));
 
@@ -846,6 +849,125 @@ fn an_agent_message_for_a_foreground_terminal_says_it_cannot_receive_yet() {
         client.send_agent_message(session_id, message_envelope("m-fg", "hello")),
         Err(HostCallError::ForegroundTerminal)
     );
+}
+
+/// The rung that exists for exactly this: a live foreground status names a
+/// loopback endpoint, and its answer says where the message landed.
+#[test]
+fn an_agent_message_reaches_a_foreground_agent_endpoint() {
+    let dir = tempfile::Builder::new()
+        .prefix("rebon-client-foreground-endpoint-")
+        .tempdir()
+        .expect("tempdir");
+    let store = BackgroundStore::new(dir.path().join("store"));
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects root");
+    let cwd = "/work/foreground-endpoint";
+    let session_id = "sess-foreground-endpoint";
+    let _lock = rebon_session::try_acquire_session_active_lock(&projects, cwd, session_id)
+        .expect("probe")
+        .expect("free");
+    let inbox = Arc::new(crate::ForegroundAgentInbox::new());
+    let endpoint = crate::ForegroundAgentEndpoint::start(&projects, cwd, session_id, inbox.clone())
+        .expect("the endpoint binds");
+    assert!(crate::write_foreground_status(
+        &projects,
+        &crate::ForegroundSessionStatus {
+            pid: std::process::id(),
+            session_id: session_id.into(),
+            cwd: cwd.into(),
+            heartbeat_ms: crate::now_ms(),
+            busy: false,
+            pending_permission: None,
+            ask_user_questions: None,
+            last_command_id: None,
+            last_command_at_ms: 0,
+            last_command_error: None,
+            recent_command_results: Vec::new(),
+            terminal_id: None,
+            agent_endpoint: Some(endpoint.info()),
+            // Deliberately no capability: the endpoint rung must work on its
+            // own, not because the mailbox happens to be advertised too.
+            capabilities: Vec::new(),
+        }
+    ));
+
+    let client = SessionHostClient::new(store, &projects, rebon_exe());
+    let result = client
+        .send_agent_message(session_id, message_envelope("m-endpoint", "hello"))
+        .expect("the endpoint accepts the message");
+    assert_eq!(result.outcome, crate::AgentMessageDelivery::StartedNewTurn);
+    assert!(!result.duplicate);
+    let pending = inbox.take_pending();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].message_id, "m-endpoint");
+
+    let duplicate = client
+        .send_agent_message(session_id, message_envelope("m-endpoint", "hello"))
+        .expect("the retry is answered");
+    assert!(duplicate.duplicate);
+    assert!(inbox.take_pending().is_empty());
+}
+
+/// A TUI whose listener could not bind still drains the mailbox, so the
+/// capability is the second rung. The mailbox itself delivers on the terminal's
+/// next pass, which is why this answer is `Queued`.
+#[test]
+fn an_agent_message_uses_the_capability_mailbox_rung() {
+    let dir = tempfile::Builder::new()
+        .prefix("rebon-client-foreground-mailbox-")
+        .tempdir()
+        .expect("tempdir");
+    let store = BackgroundStore::new(dir.path().join("store"));
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects root");
+    let cwd = "/work/foreground-mailbox";
+    let session_id = "sess-foreground-mailbox";
+    let _lock = rebon_session::try_acquire_session_active_lock(&projects, cwd, session_id)
+        .expect("probe")
+        .expect("free");
+    assert!(crate::write_foreground_status(
+        &projects,
+        &crate::ForegroundSessionStatus {
+            pid: std::process::id(),
+            session_id: session_id.into(),
+            cwd: cwd.into(),
+            heartbeat_ms: crate::now_ms(),
+            busy: false,
+            pending_permission: None,
+            ask_user_questions: None,
+            last_command_id: None,
+            last_command_at_ms: 0,
+            last_command_error: None,
+            recent_command_results: Vec::new(),
+            terminal_id: None,
+            agent_endpoint: None,
+            capabilities: vec![crate::AGENT_MESSAGE_CAPABILITY.to_string()],
+        }
+    ));
+
+    let client = SessionHostClient::new(store, &projects, rebon_exe());
+    let result = client
+        .send_agent_message(session_id, message_envelope("m-mailbox", "hello"))
+        .expect("the mailbox accepts the message");
+    assert_eq!(result.outcome, crate::AgentMessageDelivery::Queued);
+    assert!(!result.duplicate);
+
+    let claims = crate::drain_foreground_commands(&projects, cwd, session_id);
+    assert_eq!(claims.len(), 1);
+    match &claims[0].envelope.command {
+        crate::ForegroundCommand::AgentMessage {
+            message_id,
+            from_session_id,
+            text,
+            ..
+        } => {
+            assert_eq!(message_id, "m-mailbox");
+            assert_eq!(from_session_id, "sess-sender");
+            assert_eq!(text, "hello");
+        }
+        other => panic!("expected an agent message, got {other:?}"),
+    }
 }
 
 /// No record at all is not a foreground terminal and not a timeout: the

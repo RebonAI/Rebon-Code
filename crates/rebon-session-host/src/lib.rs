@@ -47,6 +47,9 @@ mod day;
 mod dispatch_prompt;
 mod executable_quiesce;
 mod existing_session;
+/// The loopback listener a plain foreground TUI offers for cross-session agent
+/// messages, beside (not instead of) the file mailbox.
+pub mod foreground_agent_endpoint;
 mod global_stats;
 pub mod journal;
 /// The file mailbox a local terminal host is still commanded through. Kept
@@ -97,6 +100,9 @@ pub use executable_quiesce::{
     terminate_processes_running_executable, ExecutableQuiesceReport,
 };
 pub use existing_session::mark_existing_background_session_idle;
+pub use foreground_agent_endpoint::{
+    ForegroundAgentEndpoint, ForegroundAgentInbox, ForegroundAgentSink,
+};
 pub use global_stats::{
     collect_global_stats, load_cached_default_global_stats, refresh_default_global_stats,
     refresh_default_global_stats_if_stale, DailyTokenActivity, GlobalStats, ModelUsageStats,
@@ -104,14 +110,16 @@ pub use global_stats::{
 pub use legacy_foreground::{
     ask_user_questions_from_permission, build_ask_user_question_updated_input,
     clear_foreground_status, complete_foreground_command, drain_foreground_commands,
-    foreground_command_response_path, foreground_inbox_dir, foreground_status_path,
-    read_foreground_command_response, read_foreground_status, read_foreground_status_file,
-    run_foreground_command, send_foreground_command, terminal_id_from_env,
-    write_foreground_command_response, write_foreground_status, ForegroundCommand,
+    foreground_agent_token_path, foreground_command_response_path, foreground_inbox_dir,
+    foreground_status_path, read_foreground_command_response, read_foreground_status,
+    read_foreground_status_file, run_foreground_command, send_foreground_command,
+    terminal_id_from_env, write_foreground_agent_token, write_foreground_command_response,
+    write_foreground_status, ForegroundAgentEndpointInfo, ForegroundCommand,
     ForegroundCommandClaim, ForegroundCommandEnvelope, ForegroundCommandOutcome,
     ForegroundCommandResponse, ForegroundCommandResult, ForegroundQuestion,
     ForegroundQuestionAnswer, ForegroundQuestionOption, ForegroundSessionStatus,
-    FOREGROUND_PROTOCOL_VERSION, FOREGROUND_STATUS_SUFFIX, TERMINAL_ID_ENV,
+    AGENT_MESSAGE_CAPABILITY, FOREGROUND_AGENT_TOKEN_SUFFIX, FOREGROUND_PROTOCOL_VERSION,
+    FOREGROUND_STATUS_SUFFIX, TERMINAL_ID_ENV,
 };
 // `client::owner` and `client::session_host_client` keep their old crate-root
 // paths, so grouping them under `client/` moved no caller.

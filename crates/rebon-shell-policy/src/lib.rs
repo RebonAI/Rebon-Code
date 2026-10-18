@@ -59,7 +59,7 @@ pub enum HardSensitiveReason {
     /// (dynamic interpreter, malformed heredoc, oversized body, …).
     UnanalyzableScriptInvocation,
     /// Names a file carrying a live session's loopback endpoint and token —
-    /// `<config>/jobs/**/state.json` or `**/*.owner.json`.
+    /// `<config>/jobs/**/state.json`, `**/*.owner.json`, or `**/*.agent-token`.
     SessionCredentialAccess,
 }
 
@@ -105,7 +105,7 @@ pub fn is_session_credential_access_command(tool_name: &str, input: &Value) -> b
         return false;
     };
     let command = command.to_ascii_lowercase();
-    if command.contains(".owner.json") {
+    if command.contains(".owner.json") || command.contains(".agent-token") {
         return true;
     }
     // `state.json` on its own is an ordinary name in plenty of projects, so it
@@ -5113,6 +5113,8 @@ mod tests {
             "cat ~/.rebon/jobs/bg-1a04/state.json",
             "type C:\\Users\\me\\.rebon\\jobs\\bg-1a04\\state.json",
             "grep -o 'ipcToken' ~/.rebon/projects/f--repo/sess-1.owner.json",
+            "cat ~/.rebon/projects/f--repo/sess-1.agent-token",
+            "Get-Content C:\\\\Users\\\\me\\\\.rebon\\\\projects\\\\p\\\\sess-1.agent-token",
             "python -c \"print(open('/home/me/.rebon/jobs/bg-1/state.json').read())\"",
             "jq .ipcPort jobs/bg-1/state.json",
         ] {

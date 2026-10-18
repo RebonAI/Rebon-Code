@@ -88,12 +88,14 @@ pub enum HostCallError {
     SessionFailure,
     /// The connection could not be made or was lost.
     Transport(String),
-    /// The session is owned by a foreground terminal that publishes no
-    /// endpoint, so there is nothing to deliver a message to yet.
+    /// The session is owned by a foreground terminal that advertises neither
+    /// a loopback agent endpoint nor the mailbox capability, so there is
+    /// nothing this client can deliver a message to.
     ///
     /// Distinct from [`Self::HostUnanswered`] on purpose: that one means an
-    /// endpoint exists and is wedged, which a retry can survive. This one is a
-    /// capability that has not shipped, and retrying it changes nothing.
+    /// endpoint exists and is wedged, which a retry can survive. This one is
+    /// the terminal being older (or its status stale), and retrying it changes
+    /// nothing.
     ForegroundTerminal,
     /// The owner refused and said why, in words meant for the user.
     ///
@@ -157,7 +159,7 @@ impl std::fmt::Display for HostCallError {
             Self::InvalidRequest => f.write_str("the session owner could not read the request"),
             Self::SessionFailure => f.write_str("the session behind this owner has failed"),
             Self::ForegroundTerminal => f.write_str(
-                "the target is a foreground terminal session, which cannot receive agent messages yet",
+                "the target is a foreground terminal session that advertises no agent-message endpoint and no agent-message capability",
             ),
             Self::Transport(err) => write!(f, "could not reach the session owner: {err}"),
             Self::Refused(err) => f.write_str(err),
@@ -404,8 +406,10 @@ impl SessionHostClient {
     /// that is already running, so no rung starts a worker: the durable append
     /// writes the message and moves the job to `Queued`, which an already-live
     /// supervisor or parked worker acts on. And an owner that publishes no
-    /// endpoint at all — a foreground terminal, the common local case — is
-    /// reported as exactly that rather than as a timeout or a missing session.
+    /// control endpoint at all — a foreground terminal, the common local case —
+    /// is reached through the two agent-message rungs its `.live.json`
+    /// advertises; only a terminal that advertises neither is reported as
+    /// exactly that rather than as a timeout or a missing session.
     pub fn send_agent_message(
         &self,
         session_id: &str,
@@ -443,27 +447,114 @@ impl SessionHostClient {
                 .agent_message(envelope, None)
                 .map_err(|err| HostCallError::Refused(err.to_string())),
             OwnerState::OwnedUnreachable { .. } => Err(HostCallError::HostUnanswered),
-            OwnerState::Free | OwnerState::OwnedOpaque { .. } => {
-                let Some(job) = job else {
-                    return match owner {
-                        OwnerState::OwnedOpaque { .. } => Err(HostCallError::ForegroundTerminal),
-                        _ => Err(HostCallError::OwnerFence(format!(
-                            "no running session `{session_id}`"
-                        ))),
-                    };
+            // The lock says a foreground terminal holds it. Its `.live.json`
+            // is where that terminal advertises the two ways it can take a
+            // message; neither is a job record, and a job that also exists for
+            // this session belongs to a process that is not the lock holder.
+            OwnerState::OwnedOpaque { .. } => {
+                if let Some(result) = self.deliver_to_foreground(&cwd, session_id, &envelope) {
+                    return result;
+                }
+                match job {
+                    Some(job) => self.queue_agent_message_in_job(&job, &envelope),
+                    None => Err(HostCallError::ForegroundTerminal),
+                }
+            }
+            OwnerState::Free => match job {
+                Some(job) => self.queue_agent_message_in_job(&job, &envelope),
+                None => Err(HostCallError::OwnerFence(format!(
+                    "no running session `{session_id}`"
+                ))),
+            },
+        }
+    }
+
+    /// The foreground rungs of the agent-message ladder, in order: the
+    /// session's advertised loopback endpoint, then its mailbox when the
+    /// status promises an `agent_message` capability. `None` means the
+    /// terminal advertised neither, and the caller keeps the distinct
+    /// "foreground terminal cannot receive" failure.
+    ///
+    /// An endpoint whose token file cannot be read is treated as absent rather
+    /// than as a failure: the same status also carries the capability, and the
+    /// mailbox is the path that still works. A token that is readable but whose
+    /// endpoint does not answer is a real failure and is returned as one — the
+    /// terminal is wedged, and quietly rerouting to a mailbox it will not drain
+    /// would hide that.
+    fn deliver_to_foreground(
+        &self,
+        cwd: &str,
+        session_id: &str,
+        envelope: &crate::AgentMessageEnvelope,
+    ) -> Option<Result<crate::AgentMessageResult, HostCallError>> {
+        let status =
+            crate::legacy_foreground::read_foreground_status(&self.projects_root, cwd, session_id)?;
+        if let Some(endpoint) = status.agent_endpoint.as_ref() {
+            if let Ok(token) = std::fs::read_to_string(&endpoint.token_path) {
+                let owner = OwnerHandle {
+                    session_id: session_id.to_string(),
+                    job_id: None,
+                    pid: status.pid,
+                    port: endpoint.port,
+                    token: token.trim().to_string(),
+                    surface: rebon_session::SessionOwnerSurface::Local,
                 };
-                let acceptance = crate::append_agent_message_to_background_job(
-                    &self.store,
-                    job.job_id(),
-                    &envelope,
-                )
-                .map_err(|err| HostCallError::Refused(err.to_string()))?;
-                Ok(crate::AgentMessageResult {
-                    outcome: crate::AgentMessageDelivery::Queued,
-                    duplicate: !acceptance.appended,
-                })
+                return Some(
+                    owner
+                        .agent_message(envelope.clone(), None)
+                        .map_err(|error| HostCallError::Refused(error.to_string())),
+                );
             }
         }
+        if status
+            .capabilities
+            .iter()
+            .any(|capability| capability == crate::AGENT_MESSAGE_CAPABILITY)
+        {
+            let command = foreground_agent_message_command(envelope);
+            return Some(
+                crate::send_foreground_command(&self.projects_root, cwd, session_id, &command)
+                    .map(|_| crate::AgentMessageResult {
+                        // The mailbox is fire-and-forget; the TUI answers where
+                        // it landed in its next status ack, not on this call.
+                        outcome: crate::AgentMessageDelivery::Queued,
+                        duplicate: false,
+                    })
+                    .map_err(|error| {
+                        HostCallError::Transport(format!(
+                            "could not queue an agent message in the foreground mailbox: {error}"
+                        ))
+                    }),
+            );
+        }
+        None
+    }
+
+    fn queue_agent_message_in_job(
+        &self,
+        job: &crate::BackgroundJobState,
+        envelope: &crate::AgentMessageEnvelope,
+    ) -> Result<crate::AgentMessageResult, HostCallError> {
+        let acceptance =
+            crate::append_agent_message_to_background_job(&self.store, job.job_id(), envelope)
+                .map_err(|err| HostCallError::Refused(err.to_string()))?;
+        Ok(crate::AgentMessageResult {
+            outcome: crate::AgentMessageDelivery::Queued,
+            duplicate: !acceptance.appended,
+        })
+    }
+}
+
+fn foreground_agent_message_command(
+    envelope: &crate::AgentMessageEnvelope,
+) -> crate::ForegroundCommand {
+    crate::ForegroundCommand::AgentMessage {
+        message_id: envelope.message_id.clone(),
+        from_session_id: envelope.from_session_id.clone(),
+        from_agent: envelope.from_agent.clone(),
+        from_cwd: envelope.from_cwd.clone(),
+        summary: envelope.summary.clone(),
+        text: envelope.text.clone(),
     }
 }
 

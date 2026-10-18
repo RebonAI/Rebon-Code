@@ -117,12 +117,13 @@ fn delivery(outcome: AgentMessageDelivery) -> PeerDelivery {
 /// The owner's refusal, in words the model can act on.
 ///
 /// `ForegroundTerminal` is the one the host already knows is permanent: a
-/// terminal publishes no endpoint, so retrying it changes nothing. The rest
-/// keep the transport's own sentence, which names what was wrong.
+/// terminal that advertises neither an agent endpoint nor the mailbox
+/// capability publishes no owner endpoint either, so retrying changes nothing.
+/// The rest keep the transport's own sentence, which names what was wrong.
 fn describe_send_error(target_session_id: &str, error: HostCallError) -> String {
     match error {
         HostCallError::ForegroundTerminal => format!(
-            "session {target_session_id} is held by a foreground terminal, which cannot receive agent messages yet"
+            "session {target_session_id} is held by a foreground terminal that advertises no agent-message endpoint or capability; it may need a newer Rebon"
         ),
         other => format!("could not send to session {target_session_id}: {other}"),
     }
@@ -147,6 +148,8 @@ mod tests {
             last_command_error: None,
             recent_command_results: Vec::new(),
             terminal_id: Some("term-7".into()),
+            agent_endpoint: None,
+            capabilities: Vec::new(),
         }
     }
 

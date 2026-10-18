@@ -21,6 +21,7 @@ pub(super) fn drain_model_context_prompts(app: &mut AppState) -> Vec<String> {
     let mut context = Vec::new();
     context.extend(app.pending_channel_prompts.drain(..));
     context.extend(app.pending_teammate_prompts.drain(..));
+    context.extend(app.pending_agent_prompts.drain(..));
     context
 }
 

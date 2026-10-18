@@ -106,8 +106,7 @@ fn message_of(error: &HostCallError) -> String {
         HostCallError::InvalidRequest => "the request could not be decoded".to_string(),
         HostCallError::SessionFailure => "the session behind this owner had failed".to_string(),
         HostCallError::ForegroundTerminal => {
-            "the target is a foreground terminal session, which cannot receive agent messages yet"
-                .to_string()
+            "the target is a foreground terminal session that advertises no agent-message endpoint and no agent-message capability".to_string()
         }
         HostCallError::Transport(detail) => detail.clone(),
         HostCallError::Refused(detail) => detail.clone(),

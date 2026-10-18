@@ -36,7 +36,8 @@
 //! **Retirement withdrawn — kept indefinitely.** An earlier plan scheduled this
 //! module for deletion once hosted sessions had been the default for a release;
 //! on 8/31 hosted went back to opt-in (`--hosted`), so a plain `rebon` holds
-//! its own lock and publishes no endpoint, and this mailbox is the desktop
+//! its own lock and publishes no owner endpoint (only the narrow agent
+//! endpoint advertised in `.live.json`), and this mailbox is the desktop
 //! app's only path to that default session shape. Revisit only after the
 //! mirror's control and presentation faces are done, hosted is the default
 //! again, and one release cycle has passed.
@@ -115,6 +116,27 @@ pub enum ForegroundCommand {
     /// turn. A foreground TUI holds one long-lived session, so the mode has to
     /// arrive as a command and land on the live mode cell to take effect at all.
     SetPermissionMode { mode: String },
+    /// One agent in another session sends this session a message.
+    ///
+    /// The mailbox rung of the client ladder: a foreground TUI that advertises
+    /// [`AGENT_MESSAGE_CAPABILITY`] handles it exactly as its loopback agent
+    /// endpoint handles the same envelope. `message_id` is the idempotency key,
+    /// so a retried command is delivered once even though it arrives under a
+    /// fresh command id.
+    ///
+    /// Additive inside this enum, so [`FOREGROUND_PROTOCOL_VERSION`] does not
+    /// move: an older CLI fails to decode this one file and drops it, which is
+    /// why the sender checks the advertised capability first.
+    AgentMessage {
+        message_id: String,
+        from_session_id: String,
+        from_agent: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        text: String,
+    },
 }
 
 /// One option of an interactive question, mirrored from the engine's
@@ -341,6 +363,31 @@ pub struct ForegroundCommandEnvelope {
     pub command: ForegroundCommand,
 }
 
+/// The capability a live foreground TUI advertises when its mailbox accepts
+/// [`ForegroundCommand::AgentMessage`].
+///
+/// Separate from [`ForegroundSessionStatus::agent_endpoint`] because the two
+/// arrivals are independent: a TUI that could not bind its listener still
+/// drains the mailbox, and an older CLI that predates this capability drops a
+/// message file it cannot parse. A sender that sees neither leaves the message
+/// undelivered and says so instead of writing it into that void.
+pub const AGENT_MESSAGE_CAPABILITY: &str = "agent_message";
+
+/// Where a foreground TUI's agent endpoint listens, and where its token is.
+///
+/// The token is not inlined here. `.live.json` is a status file many readers
+/// open to render a peer list; a credential read out of it would be a
+/// credential read by the model's own file tools. It lives in a sibling file
+/// the path tools refuse, the same way `owner.json`'s token does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForegroundAgentEndpointInfo {
+    pub port: u16,
+    /// Absolute path of the private token file
+    /// ([`foreground_agent_token_path`]) this endpoint authenticates against.
+    pub token_path: String,
+}
+
 /// Status a live foreground session publishes so an external controller can
 /// render controls (and a permission prompt) for it. Authoritative liveness is
 /// the session's OS advisory lock, with `heartbeat_ms` as a freshness hint.
@@ -384,6 +431,17 @@ pub struct ForegroundSessionStatus {
     /// app, and for files written before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
+    /// The loopback listener this session accepts agent messages on.
+    ///
+    /// Absent when the listener could not start, on a build that predates it,
+    /// and on every status written by a hosted owner's projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_endpoint: Option<ForegroundAgentEndpointInfo>,
+    /// What this publisher can deliver that its predecessor could not. Today
+    /// only [`AGENT_MESSAGE_CAPABILITY`], and empty on every status written
+    /// before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 /// Environment variable the desktop app sets in the terminals it launches.
@@ -418,6 +476,42 @@ pub fn foreground_status_path(projects_root: &Path, cwd: &str, session_id: &str)
     let mut p = rebon_session::project_dir_path(projects_root, cwd);
     p.push(format!("{session_id}{FOREGROUND_STATUS_SUFFIX}"));
     p
+}
+
+/// Filename suffix of a foreground agent endpoint's token file.
+pub const FOREGROUND_AGENT_TOKEN_SUFFIX: &str = ".agent-token";
+
+/// `<project_dir>/<session_id>.agent-token` — the bearer token for a
+/// foreground session's agent endpoint.
+///
+/// Beside the transcript and the status sidecar, like `owner.json`, and refused
+/// by the file tools for the same reason (`rebon-tool` matches the suffix under
+/// the projects root).
+pub fn foreground_agent_token_path(projects_root: &Path, cwd: &str, session_id: &str) -> PathBuf {
+    let mut p = rebon_session::project_dir_path(projects_root, cwd);
+    p.push(format!("{session_id}{FOREGROUND_AGENT_TOKEN_SUFFIX}"));
+    p
+}
+
+/// Write the endpoint token to its private file, returning the path published
+/// in the status sidecar.
+///
+/// `write_private_file_atomically` makes the staging file owner-only on Unix
+/// before the secret is written; on Windows the profile ACL already covers the
+/// project directory. The endpoint writes this before it publishes its port, so
+/// a reader never learns where to connect before it can authenticate.
+pub fn write_foreground_agent_token(
+    projects_root: &Path,
+    cwd: &str,
+    session_id: &str,
+    token: &str,
+) -> std::io::Result<PathBuf> {
+    let path = foreground_agent_token_path(projects_root, cwd, session_id);
+    if let Some(parent) = path.parent() {
+        create_dir_all_private(parent)?;
+    }
+    rebon_session::write_private_file_atomically(&path, token.as_bytes())?;
+    Ok(path)
 }
 
 /// `<project_dir>/<session_id>.command-results/<command_id>.json`.
@@ -1313,6 +1407,8 @@ mod tests {
                 error: None,
             }],
             terminal_id: None,
+            agent_endpoint: None,
+            capabilities: Vec::new(),
         };
         write_foreground_status(&root, &status);
         let read = read_foreground_status(&root, &status.cwd, &status.session_id).unwrap();
@@ -1355,6 +1451,8 @@ mod tests {
             last_command_error: None,
             recent_command_results: Vec::new(),
             terminal_id: None,
+            agent_endpoint: None,
+            capabilities: Vec::new(),
         };
         let path = foreground_status_path(&root, &cwd, &status.session_id);
         assert!(
@@ -1394,6 +1492,8 @@ mod tests {
         assert_eq!(read.last_command_at_ms, 0);
         assert!(read.recent_command_results.is_empty());
         assert!(read.terminal_id.is_none());
+        assert!(read.agent_endpoint.is_none());
+        assert!(read.capabilities.is_empty());
     }
 
     #[test]
@@ -1415,6 +1515,8 @@ mod tests {
             last_command_error: None,
             recent_command_results: Vec::new(),
             terminal_id: Some("term-9".into()),
+            agent_endpoint: None,
+            capabilities: Vec::new(),
         };
         assert!(write_foreground_status(&root, &status));
         let path = foreground_status_path(&root, cwd, sid);
@@ -1429,5 +1531,87 @@ mod tests {
         assert!(write_foreground_status(&root, &status));
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("terminalId"), "{written}");
+    }
+
+    #[test]
+    fn agent_endpoint_and_capabilities_round_trip_and_are_omitted_when_absent() {
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        let cwd = "/work/proj";
+        let sid = "sess-agent-endpoint";
+        let mut status = ForegroundSessionStatus {
+            pid: 1234,
+            session_id: sid.into(),
+            cwd: cwd.into(),
+            heartbeat_ms: now_ms(),
+            busy: false,
+            pending_permission: None,
+            ask_user_questions: None,
+            last_command_id: None,
+            last_command_at_ms: 0,
+            last_command_error: None,
+            recent_command_results: Vec::new(),
+            terminal_id: None,
+            agent_endpoint: Some(ForegroundAgentEndpointInfo {
+                port: 41_337,
+                token_path: "/home/u/.rebon/projects/p/sess.agent-token".into(),
+            }),
+            capabilities: vec![AGENT_MESSAGE_CAPABILITY.into()],
+        };
+        assert!(write_foreground_status(&root, &status));
+        let path = foreground_status_path(&root, cwd, sid);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("\"agentEndpoint\""), "{written}");
+        assert!(written.contains("\"port\":41337"), "{written}");
+        assert!(written.contains("\"tokenPath\""), "{written}");
+        assert!(
+            written.contains("\"capabilities\":[\"agent_message\"]"),
+            "{written}"
+        );
+        assert_eq!(read_foreground_status(&root, cwd, sid).unwrap(), status);
+
+        status.agent_endpoint = None;
+        status.capabilities.clear();
+        assert!(write_foreground_status(&root, &status));
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("agentEndpoint"), "{written}");
+        assert!(!written.contains("capabilities"), "{written}");
+    }
+
+    #[test]
+    fn an_agent_message_command_round_trips_through_the_mailbox() {
+        let root_dir = tmp_root();
+        let root = root_dir.path().to_path_buf();
+        let cwd = "/work/proj";
+        let sid = "sess-agent-mailbox";
+        let command = ForegroundCommand::AgentMessage {
+            message_id: "m-1".into(),
+            from_session_id: "sess-sender".into(),
+            from_agent: "main".into(),
+            from_cwd: Some("/work/sender".into()),
+            summary: Some("handoff".into()),
+            text: "please continue".into(),
+        };
+        send_foreground_command(&root, cwd, sid, &command).unwrap();
+
+        let drained = drain_foreground_commands(&root, cwd, sid);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].envelope.version, FOREGROUND_PROTOCOL_VERSION);
+        assert_eq!(
+            drained[0].envelope.command, command,
+            "the mailbox is one-version; a new kind is understood by a new TUI only"
+        );
+        assert_eq!(
+            drained[0].envelope.command.clone().into_agent_message(),
+            Some(crate::AgentMessageEnvelope {
+                message_id: "m-1".into(),
+                from_session_id: "sess-sender".into(),
+                from_agent: "main".into(),
+                from_cwd: Some("/work/sender".into()),
+                summary: Some("handoff".into()),
+                text: "please continue".into(),
+            })
+        );
+        complete_foreground_command(&drained[0]).unwrap();
     }
 }

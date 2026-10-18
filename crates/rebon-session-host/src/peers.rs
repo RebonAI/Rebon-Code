@@ -34,8 +34,9 @@ pub enum PeerKind {
     /// A session hosted by a background worker, reachable through its owner
     /// descriptor (or through its job record when the worker is starting).
     Hosted,
-    /// A session held by a foreground terminal. It publishes a heartbeat and
-    /// no endpoint, so it cannot be sent an agent message yet.
+    /// A session held by a foreground terminal. It reaches peers either through
+    /// the loopback agent endpoint it advertises in `.live.json` or, when that
+    /// listener could not start, through the mailbox its capability names.
     Foreground,
 }
 
@@ -199,6 +200,7 @@ impl PeerDirectory {
         if !rebon_session::is_session_active(&self.projects_root, &status.cwd, &status.session_id) {
             return None;
         }
+        let reachable = foreground_agent_reachable(&status);
         Some(PeerSession {
             name: rebon_session::load_session_title(
                 &self.projects_root,
@@ -209,11 +211,42 @@ impl PeerDirectory {
             cwd: status.cwd,
             kind: PeerKind::Foreground,
             busy: status.busy,
-            reachable: false,
+            reachable,
             job_id: None,
             terminal_id: status.terminal_id,
         })
     }
+}
+
+/// Whether a foreground status names a way to take an agent message.
+///
+/// The capability is the strong answer: the mailbox is drained by a build that
+/// understands the command, and no network probe is needed to say so. An
+/// endpoint with no capability is asked directly, because a listener that
+/// crashed while its process kept the lock must not be advertised as reachable.
+fn foreground_agent_reachable(status: &ForegroundSessionStatus) -> bool {
+    if status
+        .capabilities
+        .iter()
+        .any(|capability| capability == crate::AGENT_MESSAGE_CAPABILITY)
+    {
+        return true;
+    }
+    let Some(endpoint) = status.agent_endpoint.as_ref() else {
+        return false;
+    };
+    let Ok(token) = std::fs::read_to_string(&endpoint.token_path) else {
+        return false;
+    };
+    let owner = OwnerHandle {
+        session_id: status.session_id.clone(),
+        job_id: None,
+        pid: status.pid,
+        port: endpoint.port,
+        token: token.trim().to_string(),
+        surface: rebon_session::SessionOwnerSurface::Local,
+    };
+    owner.ping()
 }
 
 #[cfg(test)]
@@ -279,6 +312,8 @@ mod tests {
             last_command_error: None,
             recent_command_results: Vec::new(),
             terminal_id: None,
+            agent_endpoint: None,
+            capabilities: Vec::new(),
         }
     }
 
@@ -339,6 +374,66 @@ mod tests {
         assert!(!peers[0].reachable);
         assert_eq!(peers[0].job_id, None);
         assert_eq!(peers[0].terminal_id, None);
+    }
+
+    /// A new TUI drains its mailbox for agent messages even when its listener
+    /// could not bind; the capability is what it promises.
+    #[test]
+    fn a_foreground_capability_makes_the_peer_reachable() {
+        let (_dir, store, projects_root) = store_and_projects();
+        let mut status = foreground_status("sess-capable", "F:/work/capable");
+        status.capabilities = vec![crate::AGENT_MESSAGE_CAPABILITY.to_string()];
+        assert!(crate::write_foreground_status(&projects_root, &status));
+        let _lock = rebon_session::try_acquire_session_active_lock(
+            &projects_root,
+            &status.cwd,
+            &status.session_id,
+        )
+        .expect("the lock probe works")
+        .expect("the session lock is free");
+
+        let peers = PeerDirectory::new(store, &projects_root).list();
+        assert_eq!(peers.len(), 1);
+        assert!(peers[0].reachable);
+    }
+
+    /// An endpoint with no capability is asked directly rather than assumed:
+    /// a status that still names a dead port is stale data, not a live peer.
+    #[test]
+    fn a_foreground_endpoint_is_reachable_only_while_it_answers() {
+        let (_dir, store, projects_root) = store_and_projects();
+        let cwd = "F:/work/listening";
+        let session_id = "sess-listening";
+        let inbox = std::sync::Arc::new(crate::ForegroundAgentInbox::new());
+        let endpoint =
+            crate::ForegroundAgentEndpoint::start(&projects_root, cwd, session_id, inbox)
+                .expect("the endpoint binds");
+        let mut status = foreground_status(session_id, cwd);
+        status.agent_endpoint = Some(endpoint.info());
+        assert!(crate::write_foreground_status(&projects_root, &status));
+        let _lock = rebon_session::try_acquire_session_active_lock(&projects_root, cwd, session_id)
+            .expect("the lock probe works")
+            .expect("the session lock is free");
+
+        let peers = PeerDirectory::new(store.clone(), &projects_root).list();
+        assert_eq!(peers.len(), 1);
+        assert!(peers[0].reachable);
+
+        let token_path = endpoint.info().token_path;
+        drop(endpoint);
+        let dead_port = {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a loopback port");
+            listener.local_addr().expect("the bound address").port()
+        };
+        let mut stale = status;
+        stale.agent_endpoint = Some(crate::ForegroundAgentEndpointInfo {
+            port: dead_port,
+            token_path,
+        });
+        assert!(crate::write_foreground_status(&projects_root, &stale));
+        let peers = PeerDirectory::new(store, &projects_root).list();
+        assert_eq!(peers.len(), 1);
+        assert!(!peers[0].reachable);
     }
 
     /// The terminal label is additive: each record reports the one it named.

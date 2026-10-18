@@ -1157,6 +1157,11 @@ pub fn foreground_status_from_owner(
         // The owner's status snapshot does not carry a terminal label; the
         // descriptor and the heartbeat beside it are where one is recorded.
         terminal_id: None,
+        // A hosted owner is not a foreground mailbox: it has no listener to
+        // advertise here and no mailbox capability to promise. Its own
+        // descriptor is how it is reached.
+        agent_endpoint: None,
+        capabilities: Vec::new(),
     }
 }
 
@@ -1410,8 +1415,8 @@ mod tests {
     }
 
     /// A terminal hosting a session in its own process holds the lock and
-    /// publishes no endpoint. That is not a broken owner — it is the escape
-    /// hatch, and it must read as "someone has this", not as "free".
+    /// publishes no owner endpoint. That is not a broken owner — it is the
+    /// escape hatch, and it must read as "someone has this", not as "free".
     #[test]
     fn a_held_session_without_a_descriptor_is_opaque() {
         let tmp = tempdir("opaque");
@@ -2063,8 +2068,8 @@ mod tests {
         )
     }
 
-    /// A `--local` session is the one host that publishes no endpoint: it
-    /// holds the session's lock and nothing else. To every other process
+    /// A `--local` session is the one host that publishes no owner endpoint:
+    /// it holds the session's lock and nothing else. To every other process
     /// that reads as owned but opaque — not free, so nobody takes the
     /// session; not reachable, so nobody tries to drive it. Letting the lock go
     /// is what frees it.
