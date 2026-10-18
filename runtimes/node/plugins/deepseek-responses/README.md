@@ -46,6 +46,13 @@ Without a configured entry the plugin falls back to the `DEEPSEEK_API_KEY`
 and `DEEPSEEK_BASE_URL` environment variables (default base URL
 `https://api.deepseek.com`; the plugin appends `/responses`).
 
+The plugin runs in a container with no network by default. Its manifest
+asks for `api.deepseek.com` plus the variables above and
+`REBON_DEEPSEEK_DUMP`, and installing it grants exactly that. A different
+`baseUrl` host (a gateway) is not covered: add it to the
+`pkg-deepseek-responses` entry in `~/.rebon/plugins/grants.json`, or every
+request fails before it leaves the machine.
+
 ## Minimal mode
 
 When this provider is selected with Rebon's **Minimal** capability mode, it
@@ -191,9 +198,19 @@ stateless and silently ignores unsupported parameters):
 - The stable system prompt is sent as `instructions`; per-turn transient
   context uses Rebon's canonical runtime-context user message at the input
   tail, so changing runtime state does not invalidate the reusable prefix.
-- Reasoning effort passes through natively (`low`/`medium`/`high`/`xhigh`/
-  `max` are all accepted upstream); an explicit thinking-disabled request
-  maps to `reasoning.effort: "none"`.
+- Reasoning is sent only through the Responses `reasoning` object. `xhigh`
+  is translated to `max` — the endpoint reads `none`/`low`/`high`/`max` and
+  would otherwise run an `xhigh` request as `high` — while `minimal`/`medium`
+  are forwarded for the endpoint's documented fallbacks. An explicit
+  thinking-disabled request maps to `reasoning.effort: "none"`.
+- Chat Completions-style provider options — `reasoning_effort` and
+  `thinking: { type }` in `options.body` / `options.extraBody`, which is what
+  Rebon's `thinkingEnabled` / `thinkingEffort` config writes — are never sent
+  upstream; they are translated into `reasoning` instead. Precedence, highest
+  first: an explicit `reasoning` object in `options.body` / `options.extraBody`
+  (the escape hatch), the turn's own thinking switch or effort, per-model
+  options, connection options. When no source sets an effort, no `reasoning`
+  field is sent and the server default applies.
 - Replayed thinking is sent back as a `reasoning` item **on turns that carry a
   tool call**, and dropped on plain turns. This is not an optimisation choice:
   in thinking mode the API rejects a tool-call turn whose reasoning was not
@@ -234,6 +251,9 @@ a 400; documents become placeholder text wherever they appear.
 If the DeepSeek dialect drifts, `options.body` / `options.extraBody` /
 `options.omitBodyFields` on the provider entry (also per-model under
 `models.<id>.options`) patch the outgoing request without a plugin release.
+The chat-style reasoning keys are the exception: they are consumed and
+re-expressed as `reasoning`, where an explicit `reasoning` object remains the
+escape hatch.
 
 ## Gateways with keyed prefix caches
 
