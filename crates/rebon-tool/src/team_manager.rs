@@ -113,6 +113,17 @@ pub struct TeammateRosterEntry {
     pub last_result: Option<String>,
 }
 
+/// How a successful send reaches its recipient, at the moment it was sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageDeliveryState {
+    /// The recipient is running and reads the message at its next tool round.
+    NextToolRound,
+    /// The recipient is idle; the message starts its next turn.
+    NextTurn,
+    /// The recipient had finished and was resumed with the message.
+    Resumed,
+}
+
 /// Result of a successful teammate spawn or dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TeammateSpawnResult {
@@ -142,6 +153,16 @@ pub trait TeamManager: Send + Sync {
     /// Return a lightweight roster for one main session.
     fn teammate_roster(&self, _session_id: &str) -> Vec<TeammateRosterEntry> {
         Vec::new()
+    }
+
+    /// How a message to `recipient` in `team_name` will be delivered, or
+    /// `None` when this manager cannot tell.
+    fn message_delivery_state(
+        &self,
+        _team_name: &str,
+        _recipient: &str,
+    ) -> Option<MessageDeliveryState> {
+        None
     }
 
     /// Send a plain-text message to a teammate.

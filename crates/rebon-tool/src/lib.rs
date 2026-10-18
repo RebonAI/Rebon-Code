@@ -365,8 +365,9 @@ pub use team_mailbox::{
     write_mailbox_message, TeamMailboxMessage,
 };
 pub use team_manager::{
-    TeamManager, TeamManagerRequest, TeamManagerService, TeamManagerSource, TeammateHandoff,
-    TeammateRosterEntry, TeammateSpawnResult, TeammateSpawnSpec, TEAM_MANAGER_SERVICE,
+    MessageDeliveryState, TeamManager, TeamManagerRequest, TeamManagerService, TeamManagerSource,
+    TeammateHandoff, TeammateRosterEntry, TeammateSpawnResult, TeammateSpawnSpec,
+    TEAM_MANAGER_SERVICE,
 };
 pub use tool_search::{
     is_tool_search_enabled, ToolSearchIndex, ToolSearchTool, TOOL_SEARCH_TOOL_NAME,

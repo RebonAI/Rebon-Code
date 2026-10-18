@@ -2,17 +2,18 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use rebon_tool::{
-    default_team_name, read_team_file, write_mailbox_message, TeamMailboxMessage, TeamManager,
-    Tool, ToolContext,
+    default_team_name, read_team_file, write_mailbox_message, MessageDeliveryState,
+    TeamMailboxMessage, TeamManager, Tool, ToolContext,
 };
 use rebon_tools_core::{
-    validation_outcome_from, ToolError, ToolErrorPresentation, ToolId, ToolInputSchema, ToolResult,
-    ValidationOutcome,
+    validation_outcome_from, PermissionDecision, PermissionRequest, ToolError,
+    ToolErrorPresentation, ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
 };
 
 pub const SEND_MESSAGE_TOOL_NAME: &str = "SendMessage";
 const INVALID_INPUT_CODE: i64 = 400;
 const TEAM_LEAD_NAME: &str = "team-lead";
+const PERMISSION_MESSAGE_PREVIEW_CHARS: usize = 200;
 
 fn message_delivery_error(message: impl Into<String>) -> ToolErrorPresentation {
     ToolErrorPresentation::new(
@@ -51,6 +52,125 @@ enum MessagePayload {
         approve: bool,
         feedback: Option<String>,
     },
+}
+
+fn message_preview(text: &str) -> String {
+    let mut chars = text.chars();
+    let preview = chars
+        .by_ref()
+        .take(PERMISSION_MESSAGE_PREVIEW_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
+}
+
+fn payload_description(payload: &MessagePayload) -> String {
+    match payload {
+        MessagePayload::Text(text) => format!("Message: {}", message_preview(text)),
+        MessagePayload::ShutdownRequest { reason } => match reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+        {
+            Some(reason) => format!("Payload: shutdown_request (reason: {reason})"),
+            None => "Payload: shutdown_request".to_string(),
+        },
+        MessagePayload::ShutdownResponse {
+            request_id,
+            approve,
+            reason,
+        } => {
+            let verdict = if *approve { "approve" } else { "reject" };
+            match reason
+                .as_deref()
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+            {
+                Some(reason) => format!(
+                    "Payload: shutdown_response ({verdict}, request {request_id}, reason: {reason})"
+                ),
+                None => format!("Payload: shutdown_response ({verdict}, request {request_id})"),
+            }
+        }
+        MessagePayload::PlanApprovalResponse {
+            request_id,
+            approve,
+            feedback,
+        } => {
+            let verdict = if *approve { "approve" } else { "reject" };
+            match feedback
+                .as_deref()
+                .map(str::trim)
+                .filter(|feedback| !feedback.is_empty())
+            {
+                Some(feedback) => format!(
+                    "Payload: plan_approval_response ({verdict}, request {request_id}, feedback: {feedback})"
+                ),
+                None => {
+                    format!("Payload: plan_approval_response ({verdict}, request {request_id})")
+                }
+            }
+        }
+    }
+}
+
+fn send_message_permission_request(parsed: &SendMessageInput) -> PermissionRequest {
+    let mut message = format!("This agent wants to send a message to \"{}\".", parsed.to);
+    if let Some(summary) = parsed
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+    {
+        message.push_str(&format!("\n\nSummary: {summary}"));
+    }
+    message.push_str(&format!("\n\n{}", payload_description(&parsed.payload)));
+    PermissionRequest::new(format!("Send a message to {}", parsed.to), message)
+}
+
+/// What a successful send tells the model about delivery timing. The
+/// distinction matters: a running teammate reads the message at its next tool
+/// round, while an idle or finished one is resumed by it.
+fn recipient_delivery_note(
+    manager: Option<&std::sync::Arc<dyn TeamManager>>,
+    team_name: &str,
+    session_id: Option<&str>,
+    recipient: &str,
+) -> &'static str {
+    const UNKNOWN: &str =
+        "It will receive it at its next tool round, or when it next starts a turn if it is idle.";
+    let Some(manager) = manager else {
+        return UNKNOWN;
+    };
+    if let Some(state) = manager.message_delivery_state(team_name, recipient) {
+        return match state {
+            MessageDeliveryState::NextToolRound => {
+                "It is running and will receive it at its next tool round."
+            }
+            MessageDeliveryState::NextTurn => "It is idle, so the message starts its next turn.",
+            MessageDeliveryState::Resumed => {
+                "It had finished, so it was resumed with this message."
+            }
+        };
+    }
+    let Some(session_id) = session_id else {
+        return UNKNOWN;
+    };
+    match manager
+        .teammate_roster(session_id)
+        .into_iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(recipient))
+        .map(|entry| entry.status)
+        .as_deref()
+    {
+        Some("running") => "It is running and will receive it at its next tool round.",
+        Some("idle") => "It is idle, so the message starts its next turn.",
+        Some(_) => "It had finished, so it was resumed with this message.",
+        None => UNKNOWN,
+    }
 }
 
 #[async_trait]
@@ -138,8 +258,19 @@ impl Tool for SendMessageTool {
         })
     }
 
-    fn needs_permission(&self, _input: &Value) -> bool {
-        true
+    async fn check_permissions(
+        &self,
+        input: &Value,
+        context: &ToolContext,
+    ) -> ToolResult<PermissionDecision> {
+        let parsed = parse_input(input)?;
+        if context.permission_mode().as_deref() != Some("auto") {
+            return Ok(PermissionDecision::allow(input.clone()));
+        }
+        Ok(PermissionDecision::ask(
+            send_message_permission_request(&parsed),
+            Some(input.clone()),
+        ))
     }
 
     async fn validate_input(
@@ -263,11 +394,16 @@ impl Tool for SendMessageTool {
             }
             return Ok(json!({
                 "success": true,
-                "message": format!("Message broadcast to {} teammate(s)", recipients.len()),
+                "message": format!(
+                    "Message broadcast to {} teammate(s). Each recipient will receive it at its next tool round; an idle recipient starts its next turn with it.",
+                    recipients.len()
+                ),
                 "recipients": recipients,
             }));
         }
 
+        let delivery_note =
+            recipient_delivery_note(context.team_manager(), &team_name, session_id, &parsed.to);
         self.deliver_message(
             context.team_manager(),
             &team_name,
@@ -284,7 +420,7 @@ impl Tool for SendMessageTool {
 
         Ok(json!({
             "success": true,
-            "message": format!("Message sent to {}", parsed.to),
+            "message": format!("Message sent to {}. {delivery_note}", parsed.to),
             "target": parsed.to,
         }))
     }
@@ -321,7 +457,10 @@ impl SendMessageTool {
                 })?;
             return Ok(json!({
                 "success": true,
-                "message": format!("Message queued for task {}", parsed.to),
+                "message": format!(
+                    "Message queued for task {}. It will receive it at its next tool round, or when it next starts a turn if it is idle.",
+                    parsed.to
+                ),
                 "target": parsed.to,
                 "mode": "runtime",
             }));
@@ -339,7 +478,10 @@ impl SendMessageTool {
             })?;
         Ok(json!({
             "success": true,
-            "message": format!("Message queued for task {}", parsed.to),
+            "message": format!(
+                "Message queued for task {}. It will receive it at its next tool round, or when it next starts a turn if it is idle.",
+                parsed.to
+            ),
             "target": parsed.to,
         }))
     }
@@ -619,8 +761,8 @@ fn current_timestamp() -> String {
 mod tests {
     use super::*;
     use rebon_tool::{
-        clear_current_team_name, StopTaskOutcome, TaskRuntimeController, TeammateSpawnResult,
-        TeammateSpawnSpec,
+        clear_current_team_name, StopTaskOutcome, TaskRuntimeController, TeammateRosterEntry,
+        TeammateSpawnResult, TeammateSpawnSpec,
     };
     use std::sync::{Arc, Mutex};
 
@@ -628,6 +770,7 @@ mod tests {
         sent: Mutex<Vec<(String, String, String)>>,
         task_messages: Mutex<Vec<(String, String)>>,
         shutdowns: Mutex<Vec<(String, String)>>,
+        roster: Vec<TeammateRosterEntry>,
     }
 
     #[async_trait]
@@ -662,6 +805,10 @@ mod tests {
                 .unwrap()
                 .push((task_id.into(), message));
             Ok(())
+        }
+
+        fn teammate_roster(&self, _session_id: &str) -> Vec<TeammateRosterEntry> {
+            self.roster.clone()
         }
 
         async fn request_shutdown(
@@ -700,6 +847,7 @@ mod tests {
             sent: Mutex::new(Vec::new()),
             task_messages: Mutex::new(Vec::new()),
             shutdowns: Mutex::new(Vec::new()),
+            roster: Vec::new(),
         });
         let context = ToolContext::new()
             .with_team_manager(manager.clone() as Arc<dyn TeamManager>)
@@ -720,6 +868,202 @@ mod tests {
         assert_eq!(out["success"], json!(true));
         let sent = manager.sent.lock().unwrap();
         assert_eq!(sent[0].1, "bob");
+    }
+
+    fn roster_entry(status: &str) -> TeammateRosterEntry {
+        TeammateRosterEntry {
+            name: "bob".into(),
+            agent_type: None,
+            description: None,
+            status: status.into(),
+            current_task: None,
+            last_result: None,
+        }
+    }
+
+    fn team_context_with_roster(status: &str) -> (Arc<ScriptedTeamManager>, ToolContext) {
+        let manager = Arc::new(ScriptedTeamManager {
+            sent: Mutex::new(Vec::new()),
+            task_messages: Mutex::new(Vec::new()),
+            shutdowns: Mutex::new(Vec::new()),
+            roster: vec![roster_entry(status)],
+        });
+        let context = ToolContext::new()
+            .with_session_id("session-timing")
+            .with_team_manager(manager.clone() as Arc<dyn TeamManager>)
+            .with_team_identity(rebon_tool::TeamIdentityContext {
+                agent_id: "alice@alpha".into(),
+                agent_name: "alice".into(),
+                team_name: "alpha".into(),
+                permission_mode: Some("default".into()),
+            });
+        (manager, context)
+    }
+
+    #[tokio::test]
+    async fn permission_gate_asks_in_auto_mode_with_a_useful_request() {
+        let tool = SendMessageTool;
+        let long_text = format!("{}TAIL", "a".repeat(300));
+        let input = json!({
+            "to": "bob",
+            "summary": "handoff",
+            "message": long_text,
+        });
+        let context = ToolContext::new().with_permission_mode("auto");
+        let decision = tool.check_permissions(&input, &context).await.unwrap();
+        assert_eq!(decision.behavior, rebon_tools_core::PermissionBehavior::Ask);
+        let request = decision.request.expect("auto mode must carry a request");
+        assert!(request.message.contains("bob"), "{}", request.message);
+        assert!(request.message.contains("handoff"), "{}", request.message);
+        assert!(
+            request.message.contains(&"a".repeat(200)),
+            "{}",
+            request.message
+        );
+        assert!(request.message.contains('…'), "{}", request.message);
+        assert!(
+            !request.message.contains("TAIL"),
+            "long text must be truncated: {}",
+            request.message
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_gate_describes_structured_payloads_in_auto_mode() {
+        let tool = SendMessageTool;
+        let context = ToolContext::new().with_permission_mode("auto");
+        let input = json!({
+            "to": "bob",
+            "message": {"type": "shutdown_request", "reason": "work is done"},
+        });
+        let decision = tool.check_permissions(&input, &context).await.unwrap();
+        assert_eq!(decision.behavior, rebon_tools_core::PermissionBehavior::Ask);
+        let request = decision.request.expect("auto mode must carry a request");
+        assert!(
+            request.message.contains("shutdown_request"),
+            "{}",
+            request.message
+        );
+        assert!(request.message.contains("bob"), "{}", request.message);
+
+        let input = json!({
+            "to": "team-lead",
+            "message": {
+                "type": "plan_approval_response",
+                "request_id": "plan-1",
+                "approve": false,
+                "feedback": "add tests",
+            },
+        });
+        let decision = tool.check_permissions(&input, &context).await.unwrap();
+        let request = decision.request.expect("auto mode must carry a request");
+        assert!(
+            request.message.contains("plan_approval_response"),
+            "{}",
+            request.message
+        );
+        assert!(request.message.contains("add tests"), "{}", request.message);
+    }
+
+    #[tokio::test]
+    async fn permission_gate_allows_every_other_mode() {
+        let tool = SendMessageTool;
+        let input = json!({"to": "bob", "message": "take task 2"});
+        let modes = [
+            Some("default"),
+            Some("acceptEdits"),
+            Some("plan"),
+            Some("bypassPermissions"),
+            Some("dontAsk"),
+            Some("bubble"),
+            None,
+        ];
+        for mode in modes {
+            let context = match mode {
+                Some(mode) => ToolContext::new().with_permission_mode(mode),
+                None => ToolContext::new(),
+            };
+            let decision = tool.check_permissions(&input, &context).await.unwrap();
+            assert_eq!(
+                decision.behavior,
+                rebon_tools_core::PermissionBehavior::Allow,
+                "mode {mode:?} must not prompt"
+            );
+            assert_eq!(decision.updated_input, Some(input.clone()));
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_gate_reports_invalid_input_instead_of_asking() {
+        let tool = SendMessageTool;
+        let context = ToolContext::new().with_permission_mode("auto");
+        let error = tool
+            .check_permissions(&json!({"message": "missing recipient"}), &context)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidInput { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn send_result_says_a_running_recipient_reads_it_next_tool_round() {
+        let (_manager, context) = team_context_with_roster("running");
+        let out = SendMessageTool
+            .call(json!({"to": "bob", "message": "take task 2"}), &context)
+            .await
+            .unwrap();
+        let message = out["message"].as_str().unwrap();
+        assert!(message.contains("at its next tool round"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn send_result_says_an_idle_recipient_starts_its_next_turn() {
+        let (_manager, context) = team_context_with_roster("idle");
+        let out = SendMessageTool
+            .call(json!({"to": "bob", "message": "take task 2"}), &context)
+            .await
+            .unwrap();
+        let message = out["message"].as_str().unwrap();
+        assert!(message.contains("starts its next turn"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn send_result_says_a_finished_recipient_is_resumed() {
+        let (_manager, context) = team_context_with_roster("failed-restartable");
+        let out = SendMessageTool
+            .call(json!({"to": "bob", "message": "take task 2"}), &context)
+            .await
+            .unwrap();
+        let message = out["message"].as_str().unwrap();
+        assert!(message.contains("resumed with this message"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn send_result_tells_when_a_lead_mailbox_is_read() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("sm-lead-timing");
+        clear_current_team_name();
+        let manager = Arc::new(ScriptedTeamManager {
+            sent: Mutex::new(Vec::new()),
+            task_messages: Mutex::new(Vec::new()),
+            shutdowns: Mutex::new(Vec::new()),
+            roster: Vec::new(),
+        });
+        let context = ToolContext::new()
+            .with_team_manager(manager as Arc<dyn TeamManager>)
+            .with_team_identity(rebon_tool::TeamIdentityContext {
+                agent_id: "alice@alpha".into(),
+                agent_name: "alice".into(),
+                team_name: "alpha".into(),
+                permission_mode: Some("default".into()),
+            });
+        let out = SendMessageTool
+            .call(json!({"to": "team-lead", "message": "done"}), &context)
+            .await
+            .unwrap();
+        let message = out["message"].as_str().unwrap();
+        assert!(
+            message.contains("when it next starts a turn if it is idle"),
+            "{message}"
+        );
     }
 
     #[tokio::test]
@@ -754,6 +1098,7 @@ mod tests {
             sent: Mutex::new(Vec::new()),
             task_messages: Mutex::new(Vec::new()),
             shutdowns: Mutex::new(Vec::new()),
+            roster: Vec::new(),
         });
         let context = ToolContext::new()
             .with_session_id(session_id)
@@ -819,6 +1164,7 @@ mod tests {
             sent: Mutex::new(Vec::new()),
             task_messages: Mutex::new(Vec::new()),
             shutdowns: Mutex::new(Vec::new()),
+            roster: Vec::new(),
         });
         let context = ToolContext::new()
             .with_session_id("session-b")
@@ -890,6 +1236,10 @@ mod tests {
             .unwrap();
         assert_eq!(out["success"], json!(true));
         assert_eq!(out["mode"], json!("runtime"));
+        assert!(out["message"]
+            .as_str()
+            .unwrap()
+            .contains("at its next tool round"));
         let messages = controller
             .messages
             .lock()
@@ -962,6 +1312,7 @@ mod tests {
             sent: Mutex::new(Vec::new()),
             task_messages: Mutex::new(Vec::new()),
             shutdowns: Mutex::new(Vec::new()),
+            roster: Vec::new(),
         });
         let context = ToolContext::new().with_team_manager(manager.clone() as Arc<dyn TeamManager>);
         let tool = SendMessageTool;
@@ -973,6 +1324,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out["success"], json!(true));
+        assert!(out["message"]
+            .as_str()
+            .unwrap()
+            .contains("at its next tool round"));
         let messages = manager.task_messages.lock().unwrap();
         assert_eq!(
             messages[0],
@@ -986,6 +1341,7 @@ mod tests {
             sent: Mutex::new(Vec::new()),
             task_messages: Mutex::new(Vec::new()),
             shutdowns: Mutex::new(Vec::new()),
+            roster: Vec::new(),
         });
         let context = ToolContext::new()
             .with_team_manager(manager.clone() as Arc<dyn TeamManager>)

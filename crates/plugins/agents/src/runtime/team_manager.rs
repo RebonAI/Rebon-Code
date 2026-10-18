@@ -15,9 +15,9 @@ use rebon_tool::{
     drain_unread_mailbox, format_agent_id, is_session_default_team_name, mailbox_notification,
     read_team_file, remove_member_by_agent_id, remove_session_default_team, sanitize_team_name,
     set_team_member_active, set_team_member_mode, write_mailbox_message,
-    AutoApproveExceptSensitivePermissionBroker, SharedToolFilter, TeamIdentityContext,
-    TeamMailboxMessage, TeamManager, TeamMember, TeammateHandoff, TeammateRosterEntry,
-    TeammateSpawnResult, TeammateSpawnSpec, ToolContext, ToolFilter,
+    AutoApproveExceptSensitivePermissionBroker, MessageDeliveryState, SharedToolFilter,
+    TeamIdentityContext, TeamMailboxMessage, TeamManager, TeamMember, TeammateHandoff,
+    TeammateRosterEntry, TeammateSpawnResult, TeammateSpawnSpec, ToolContext, ToolFilter,
 };
 use rebon_tools_core::ToolErrorPresentation;
 use rebon_types::{ModelProfileMap, PromptCancel, SubAgentModelConfig};
@@ -1083,6 +1083,24 @@ impl TeamManager for InProcessTeamManager {
         entries
     }
 
+    fn message_delivery_state(
+        &self,
+        team_name: &str,
+        recipient: &str,
+    ) -> Option<MessageDeliveryState> {
+        let snapshot = self.find_team_teammate_snapshot(team_name, recipient)?;
+        let TaskData::InProcessTeammate(data) = &snapshot.data else {
+            return None;
+        };
+        if snapshot.status.is_terminal() {
+            Some(MessageDeliveryState::Resumed)
+        } else if data.is_idle {
+            Some(MessageDeliveryState::NextTurn)
+        } else {
+            Some(MessageDeliveryState::NextToolRound)
+        }
+    }
+
     fn close_session(&self, session_id: &str) {
         let _dispatch = self
             .dispatch_lock
@@ -2049,53 +2067,79 @@ async fn try_read_mailbox_prompt(
     snapshot: &TaskSnapshot,
 ) -> Option<String> {
     let unread = drain_unread_mailbox(team_name, agent_name).ok()?;
-    if let Some(message) = unread.into_iter().next() {
-        if let Ok(response) = serde_json::from_str::<PlanApprovalResponse>(&message.text) {
-            if response.kind == "plan_approval_response" {
-                let _ = set_in_process_teammate_awaiting_plan_approval(registry, task_id, false);
-                if response.approved {
-                    let next_mode = response
-                        .permission_mode
-                        .clone()
-                        .unwrap_or_else(|| "default".into());
-                    let _ = set_in_process_teammate_permission_mode(
-                        registry,
-                        task_id,
-                        next_mode.clone(),
-                    );
-                    let _ = set_team_member_mode(team_name, agent_name, &next_mode);
-                    let prompt = match &snapshot.data {
-                        TaskData::InProcessTeammate(data) => format!(
-                            "Your plan approval request {} was approved. Proceed with implementation.\n\nOriginal task:\n{}",
-                            response.request_id, data.prompt
-                        ),
-                        _ => format!(
-                            "Your plan approval request {} was approved. Proceed with implementation.",
-                            response.request_id
-                        ),
-                    };
-                    return Some(prompt);
-                }
-
-                let feedback = response
-                    .feedback
-                    .unwrap_or_else(|| "Please revise your plan.".into());
-                let prompt = match &snapshot.data {
-                    TaskData::InProcessTeammate(data) => format!(
-                        "Your plan approval request {} was rejected. Revise the plan and call ExitPlanMode again.\n\nFeedback: {}\n\nOriginal task:\n{}",
-                        response.request_id, feedback, data.prompt
-                    ),
-                    _ => format!(
-                        "Your plan approval request {} was rejected. Revise the plan and call ExitPlanMode again.\n\nFeedback: {}",
-                        response.request_id, feedback
-                    ),
-                };
-                return Some(prompt);
-            }
-        }
-        return Some(message.text);
+    if unread.is_empty() {
+        return None;
     }
-    None
+    // The drain already marked every message read, so every one of them has
+    // to be delivered in this prompt; returning only the first would lose the
+    // rest.
+    let prompts = unread
+        .into_iter()
+        .map(|message| {
+            plan_approval_prompt(
+                registry,
+                task_id,
+                team_name,
+                agent_name,
+                snapshot,
+                &message.text,
+            )
+            .unwrap_or(message.text)
+        })
+        .collect::<Vec<_>>();
+    Some(prompts.join("\n\n"))
+}
+
+/// The fresh worker prompt for a `plan_approval_response`, or `None` for a
+/// plain message. This stays the authoritative handler for plan approvals: it
+/// clears `awaiting_plan_approval` and applies the approved permission mode.
+fn plan_approval_prompt(
+    registry: &TaskRegistry,
+    task_id: &TaskId,
+    team_name: &str,
+    agent_name: &str,
+    snapshot: &TaskSnapshot,
+    text: &str,
+) -> Option<String> {
+    let response = serde_json::from_str::<PlanApprovalResponse>(text).ok()?;
+    if response.kind != "plan_approval_response" {
+        return None;
+    }
+    let _ = set_in_process_teammate_awaiting_plan_approval(registry, task_id, false);
+    if response.approved {
+        let next_mode = response
+            .permission_mode
+            .clone()
+            .unwrap_or_else(|| "default".into());
+        let _ = set_in_process_teammate_permission_mode(registry, task_id, next_mode.clone());
+        let _ = set_team_member_mode(team_name, agent_name, &next_mode);
+        let prompt = match &snapshot.data {
+            TaskData::InProcessTeammate(data) => format!(
+                "Your plan approval request {} was approved. Proceed with implementation.\n\nOriginal task:\n{}",
+                response.request_id, data.prompt
+            ),
+            _ => format!(
+                "Your plan approval request {} was approved. Proceed with implementation.",
+                response.request_id
+            ),
+        };
+        return Some(prompt);
+    }
+
+    let feedback = response
+        .feedback
+        .unwrap_or_else(|| "Please revise your plan.".into());
+    let prompt = match &snapshot.data {
+        TaskData::InProcessTeammate(data) => format!(
+            "Your plan approval request {} was rejected. Revise the plan and call ExitPlanMode again.\n\nFeedback: {}\n\nOriginal task:\n{}",
+            response.request_id, feedback, data.prompt
+        ),
+        _ => format!(
+            "Your plan approval request {} was rejected. Revise the plan and call ExitPlanMode again.\n\nFeedback: {}",
+            response.request_id, feedback
+        ),
+    };
+    Some(prompt)
 }
 
 struct SessionTeamManagerEntry {
@@ -2238,6 +2282,17 @@ impl TeamManager for SessionTaskTeamManager {
         self.manager_for(session_id)
             .map(|manager| manager.teammate_roster(session_id))
             .unwrap_or_default()
+    }
+
+    fn message_delivery_state(
+        &self,
+        team_name: &str,
+        recipient: &str,
+    ) -> Option<MessageDeliveryState> {
+        let session_id = Self::session_for_team(team_name).ok()?;
+        self.manager_for(&session_id)
+            .ok()?
+            .message_delivery_state(team_name, recipient)
     }
 
     async fn send_message(
@@ -3548,5 +3603,142 @@ mod tests {
 
         let snap = registry.snapshot(&TaskId::new(result.task_id)).unwrap();
         assert_eq!(snap.kind, TaskKind::InProcessTeammate);
+    }
+
+    fn register_mailbox_teammate(
+        registry: &TaskRegistry,
+        team_name: &str,
+        agent_name: &str,
+    ) -> (TaskId, TaskSnapshot) {
+        let task_id = TaskId::new(format!("{agent_name}-mailbox-task"));
+        register_in_process_teammate_task_with_cancel(
+            registry,
+            InProcessTeammateTaskSpec {
+                id: task_id.clone(),
+                identity: TeammateIdentity {
+                    agent_id: format!("{agent_name}@{team_name}"),
+                    agent_name: agent_name.into(),
+                    team_name: team_name.into(),
+                    color: None,
+                    plan_mode_required: false,
+                    parent_session_id: "session-mailbox".into(),
+                },
+                prompt: "original task".into(),
+                model: None,
+                model_profile: None,
+                permission_mode: "plan".into(),
+                agent_type: None,
+                description: None,
+            },
+            PromptCancel::new(),
+        );
+        let snapshot = registry
+            .snapshot(&task_id)
+            .expect("registered teammate snapshot");
+        (task_id, snapshot)
+    }
+
+    fn write_mailbox_text(team_name: &str, agent_name: &str, text: &str) {
+        write_mailbox_message(
+            team_name,
+            agent_name,
+            TeamMailboxMessage {
+                from: "team-lead".into(),
+                text: text.into(),
+                timestamp: now_wall_ms().to_string(),
+                read: false,
+                color: None,
+                summary: None,
+            },
+        )
+        .expect("write mailbox message");
+    }
+
+    #[tokio::test]
+    async fn message_delivery_state_tracks_running_idle_and_finished_teammates() {
+        let _home = TestHome::new("delivery-state");
+        write_test_team("alpha");
+        let registry = TaskRegistry::new();
+        let (task_id, _) = register_mailbox_teammate(&registry, "alpha", "alice");
+        let manager = InProcessTeamManager::new(
+            Arc::new(Engine::with_builtin_tools()),
+            Arc::new(MockModelClient::new()),
+            registry.clone(),
+            "mock",
+        );
+
+        assert_eq!(
+            manager.message_delivery_state("alpha", "alice"),
+            Some(MessageDeliveryState::NextToolRound)
+        );
+        mark_in_process_teammate_idle(&registry, &task_id, None);
+        assert_eq!(
+            manager.message_delivery_state("alpha", "alice"),
+            Some(MessageDeliveryState::NextTurn)
+        );
+        finish_in_process_teammate(&registry, &task_id, TaskStatus::Completed, None, None);
+        assert_eq!(
+            manager.message_delivery_state("alpha", "alice"),
+            Some(MessageDeliveryState::Resumed)
+        );
+        assert_eq!(manager.message_delivery_state("alpha", "nobody"), None);
+    }
+
+    #[tokio::test]
+    async fn every_plain_mailbox_message_is_delivered_in_order() {
+        let _home = TestHome::new("mailbox-batch");
+        let registry = TaskRegistry::new();
+        let (task_id, snapshot) = register_mailbox_teammate(&registry, "alpha", "alice");
+        write_mailbox_text("alpha", "alice", "first instruction");
+        write_mailbox_text("alpha", "alice", "second instruction");
+
+        let prompt = try_read_mailbox_prompt(&registry, &task_id, "alpha", "alice", &snapshot)
+            .await
+            .expect("unread messages must produce a prompt");
+
+        assert!(prompt.contains("first instruction"), "{prompt}");
+        assert!(prompt.contains("second instruction"), "{prompt}");
+        assert!(
+            prompt.find("first instruction") < prompt.find("second instruction"),
+            "{prompt}"
+        );
+        let mailbox = rebon_tool::read_mailbox("alpha", "alice").expect("read mailbox");
+        assert!(
+            mailbox.iter().all(|message| message.read),
+            "every delivered message must be marked read"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_approval_keeps_its_handling_while_plain_messages_are_delivered() {
+        let _home = TestHome::new("mailbox-plan-approval");
+        write_test_team("alpha");
+        let registry = TaskRegistry::new();
+        let (task_id, snapshot) = register_mailbox_teammate(&registry, "alpha", "alice");
+        write_mailbox_text(
+            "alpha",
+            "alice",
+            r#"{"type":"plan_approval_response","requestId":"plan-1","approved":true,"permissionMode":"default"}"#,
+        );
+        write_mailbox_text("alpha", "alice", "follow-up instruction");
+
+        let prompt = try_read_mailbox_prompt(&registry, &task_id, "alpha", "alice", &snapshot)
+            .await
+            .expect("the plan approval and the plain message must both be delivered");
+
+        assert!(
+            prompt.contains("plan approval request plan-1 was approved"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Original task:\noriginal task"), "{prompt}");
+        assert!(prompt.contains("follow-up instruction"), "{prompt}");
+        let updated = registry.snapshot(&task_id).expect("teammate snapshot");
+        match &updated.data {
+            TaskData::InProcessTeammate(data) => {
+                assert!(!data.awaiting_plan_approval);
+                assert_eq!(data.permission_mode, "default");
+            }
+            _ => panic!("expected an in-process teammate"),
+        }
     }
 }
