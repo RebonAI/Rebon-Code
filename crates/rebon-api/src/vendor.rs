@@ -286,6 +286,9 @@ const fn known(
 /// a model it cannot call.
 const OPENAI_MODELS: &[KnownModel] = &[
     known("gpt-5.6-sol", 1_050_000, Some(128_000)),
+    // models.dev (2026-10-18): GPT-6.1 Sol, released 2026-09-29, same
+    // 1,050,000 / 128,000 limits as the rest of the GPT-6 line.
+    known("gpt-6.1-sol", 1_050_000, Some(128_000)),
     // developers.openai.com/api/docs/models/gpt-6-astra (2026-09-05):
     // 1,050,000 context window, 128,000 max output tokens.
     known("gpt-6-astra", 1_050_000, Some(128_000)),
@@ -299,18 +302,21 @@ const OPENAI_MODELS: &[KnownModel] = &[
     known("gpt-5.5", 1_050_000, Some(128_000)),
 ];
 
-/// platform.claude.com/docs/en/about-claude/models/overview.
+/// platform.claude.com/docs/en/about-claude/models/overview. The 4.5
+/// generation is retired and left out; every model still served has a 1M
+/// window and 128k of output.
 const ANTHROPIC_MODELS: &[KnownModel] = &[
+    known("claude-opus-5-5", 1_000_000, Some(128_000)),
+    known("claude-sonnet-5-5", 1_000_000, Some(128_000)),
+    known("claude-haiku-5-5", 1_000_000, Some(128_000)),
+    known("claude-fable-5-1", 1_000_000, Some(128_000)),
     known("claude-opus-5", 1_000_000, Some(128_000)),
     known("claude-sonnet-5", 1_000_000, Some(128_000)),
     known("claude-fable-5", 1_000_000, Some(128_000)),
-    known("claude-haiku-4-5", 200_000, Some(64_000)),
     known("claude-opus-4-8", 1_000_000, Some(128_000)),
     known("claude-opus-4-7", 1_000_000, Some(128_000)),
     known("claude-opus-4-6", 1_000_000, Some(128_000)),
     known("claude-sonnet-4-6", 1_000_000, Some(128_000)),
-    known("claude-opus-4-5", 200_000, Some(64_000)),
-    known("claude-sonnet-4-5", 200_000, Some(64_000)),
 ];
 
 /// ai.google.dev/gemini-api/docs/models.
@@ -904,8 +910,8 @@ impl ProviderVendor {
     /// The documented limits for `model`, if this vendor's catalogue (or,
     /// for a reseller, any catalogue) lists it. Matching is
     /// case-insensitive and tolerates a dated snapshot suffix
-    /// (`claude-sonnet-4-5-20250929` finds `claude-sonnet-4-5`; a Vertex
-    /// `@20250929` suffix likewise).
+    /// (`claude-sonnet-4-6-20260217` finds `claude-sonnet-4-6`; a Vertex
+    /// `@20260217` suffix likewise).
     pub fn known_model(self, model: &str) -> Option<KnownModel> {
         let wanted = model.trim().to_ascii_lowercase();
         if wanted.is_empty() {
@@ -1619,8 +1625,13 @@ mod tests {
         assert_eq!(ProviderVendor::OpenAi.known_models()[0].id, "gpt-5.6-sol");
         assert_eq!(
             ProviderVendor::Anthropic.known_models()[0].id,
-            "claude-opus-5"
+            "claude-opus-5-5"
         );
+        // The retired 4.5 generation is gone from the built-in list.
+        assert!(ProviderVendor::Anthropic
+            .known_models()
+            .iter()
+            .all(|model| !model.id.ends_with("-4-5")));
         assert_eq!(
             ProviderVendor::DeepSeek.known_models()[0].id,
             "deepseek-v4-pro"
@@ -1631,13 +1642,18 @@ mod tests {
     #[test]
     fn known_model_lookup_tolerates_snapshots_and_resellers() {
         let sonnet = ProviderVendor::Anthropic
-            .known_model("claude-sonnet-4-5-20250929")
+            .known_model("claude-sonnet-4-6-20260217")
             .unwrap();
-        assert_eq!(sonnet.context_window, 200_000);
+        assert_eq!(sonnet.id, "claude-sonnet-4-6");
         let vertex = ProviderVendor::Anthropic
-            .known_model("claude-sonnet-4-5@20250929")
+            .known_model("claude-sonnet-4-6@20260217")
             .unwrap();
-        assert_eq!(vertex.id, "claude-sonnet-4-5");
+        assert_eq!(vertex.id, "claude-sonnet-4-6");
+        // A point release is its own row, not a "snapshot" of the major:
+        // `claude-opus-5-5` ends in `-5`, which the date rule would accept.
+        for id in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"] {
+            assert_eq!(ProviderVendor::Anthropic.known_model(id).unwrap().id, id);
+        }
         let deepseek = ProviderVendor::DeepSeek
             .known_model("DeepSeek-V4-Pro")
             .unwrap();

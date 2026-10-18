@@ -719,11 +719,7 @@ mod tests {
     /// been established. Listing them is the point: a new conflict fails
     /// the test below, and a resolved one has to be struck from here.
     const KNOWN_LIMIT_CONFLICTS: &[(&str, &str)] = &[
-        // 200K standard vs the 1M beta context.
-        ("claude-sonnet-4-5", "context"),
         ("doubao-seed-evolving", "context"),
-        ("qwen3.7-plus", "output"),
-        ("kimi-k3", "output"),
         ("MiniMax-M2.7", "output"),
         ("MiniMax-M2.7-highspeed", "output"),
         ("MiniMax-M2.5", "output"),
