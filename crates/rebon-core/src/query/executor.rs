@@ -4083,6 +4083,13 @@ impl EngineQueryExecutor {
         let configured_max_tokens = cap_max_tokens_for_model(
             frame
                 .per_turn_max_tokens
+                .map(|max_tokens| {
+                    effort_max_tokens_for_model(
+                        max_tokens,
+                        frame.per_turn_reasoning_ordinal,
+                        frame.prune_level.as_ref(),
+                    )
+                })
                 .unwrap_or_else(|| self.default_max_tokens(frame.prune_level.as_ref())),
             frame.prune_level.as_ref(),
         );

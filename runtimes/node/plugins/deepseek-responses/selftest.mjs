@@ -10,7 +10,8 @@
 // the provider runs on the shared plugin host, not one of its own.
 
 import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -21,6 +22,7 @@ import {
   buildRequestBody,
   errorTypeForStatus,
   ResponseEventTranslator,
+  stringifyJson,
   translateReasoningEffort,
   translateUsage,
   withTransientContext,
@@ -41,6 +43,23 @@ function assertEq(actual, expected, label) {
   const a = JSON.stringify(actual);
   const b = JSON.stringify(expected);
   assert(a === b, `${label}\n  actual:   ${a}\n  expected: ${b}`);
+}
+
+/// Mirrors the plugin host's `RawJsonNumber`: the original token stays in
+/// `raw`, and `toJSON` refuses to guess. Redefined here rather than imported
+/// because the plugin cannot reach host internals and the selftest has to run
+/// without the host on the path.
+class HostRawNumber {
+  constructor(raw) {
+    this.raw = raw;
+    Object.freeze(this);
+  }
+  valueOf() {
+    return Number(this.raw);
+  }
+  toJSON() {
+    throw new Error("raw JSON number cannot be emitted without an explicit schema conversion");
+  }
 }
 
 // ── Part 1: translation units ───────────────────────────────────────
@@ -121,7 +140,7 @@ function testRequestTranslation() {
   assertEq(body.store, false, "store:false always");
   assertEq(body.stream, true, "stream:true always");
   assertEq(body.tool_choice, "required", "toolChoice any → required");
-  assertEq(body.reasoning, { effort: "xhigh" }, "xhigh passes through natively");
+  assertEq(body.reasoning, { effort: "max" }, "xhigh is sent as the highest accepted effort (max)");
   assertEq(body.tools.length, 2, "function tool + web_search tool");
   assertEq(body.tools[1], { type: "web_search" }, "webSearch config enables tool");
 
@@ -375,8 +394,13 @@ function testRequestTranslation() {
     "web_search_result dropped from replay, text kept",
   );
 
-  assertEq(translateReasoningEffort("max"), "max", "max passes through natively");
+  assertEq(translateReasoningEffort("max"), "max", "max passes through");
   assertEq(translateReasoningEffort("low"), "low", "low passes");
+  assertEq(translateReasoningEffort("high"), "high", "high passes");
+  assertEq(translateReasoningEffort("none"), "none", "none passes");
+  assertEq(translateReasoningEffort("medium"), "medium", "medium passes (the server maps it)");
+  assertEq(translateReasoningEffort("minimal"), "minimal", "minimal passes (the server maps it)");
+  assertEq(translateReasoningEffort("xhigh"), "max", "xhigh → max (the server would run it as high)");
   assertEq(translateReasoningEffort(undefined), undefined, "absent effort omitted");
 
   const disabledThinking = buildRequestBody(
@@ -580,6 +604,131 @@ function testRequestTranslation() {
     invalidPresetError.includes('must be "off" or "seeded"'),
     "invalid seeded preset values fail request translation",
   );
+}
+
+function testRawJsonNumbers() {
+  const plain = {
+    text: 'quote " backslash \\ newline \n unicode é',
+    integer: 42,
+    fraction: 0.5,
+    exponent: 1e21,
+    negativeZero: -0,
+    flag: true,
+    nothing: null,
+    list: [1, "two", null, { three: 3 }, undefined],
+    skipped: undefined,
+  };
+  assertEq(
+    stringifyJson(plain),
+    JSON.stringify(plain),
+    "plain values serialize exactly as JSON.stringify",
+  );
+
+  assertEq(stringifyJson(new HostRawNumber("0.95")), "0.95", "wrapped fraction keeps its token");
+  assertEq(stringifyJson(new HostRawNumber("1e-7")), "1e-7", "wrapped exponent keeps its token");
+  assertEq(
+    stringifyJson(new HostRawNumber("12345678901234567890")),
+    "12345678901234567890",
+    "wrapped unsafe integer keeps every digit",
+  );
+  assertEq(
+    stringifyJson({ a: [new HostRawNumber("-0.5"), new HostRawNumber("2E+3")] }),
+    '{"a":[-0.5,2E+3]}',
+    "wrapped numbers survive nesting",
+  );
+
+  assertEq(
+    stringifyJson({ raw: "0.95", nested: { raw: "1e3" } }),
+    '{"raw":"0.95","nested":{"raw":"1e3"}}',
+    "ordinary raw fields stay data",
+  );
+
+  const big = "12345678901234567890";
+  const request = {
+    model: "deepseek-v4-flash",
+    temperature: new HostRawNumber("0.95"),
+    maxTokens: 64,
+    stream: true,
+    tools: [
+      {
+        name: "mcp",
+        description: "tool",
+        inputSchema: {
+          type: "object",
+          properties: { ratio: { type: "number", minimum: new HostRawNumber("0.5") } },
+        },
+      },
+    ],
+    messages: [
+      { role: "user", content: [{ type: "text", text: "go" }] },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "call_raw",
+            name: "mcp",
+            input: { minimum: new HostRawNumber("0.5"), big: new HostRawNumber(big), raw: "kept" },
+          },
+        ],
+      },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_raw", content: "done" }] },
+    ],
+  };
+  const connection = {
+    requestOptions: {
+      extraBody: { top_p: new HostRawNumber("0.95"), payload: { raw: "0.95" } },
+    },
+  };
+  const body = buildRequestBody(request, connection);
+  const text = stringifyJson(body);
+  assert(text.includes('"temperature":0.95'), "request body carries the wrapped temperature token");
+  assert(text.includes('"top_p":0.95'), "extraBody keeps its wrapped number token");
+  assert(text.includes('"minimum":0.5'), "a tool schema minimum keeps its fractional token");
+  assert(
+    text.includes('"payload":{"raw":"0.95"}'),
+    "extraBody's ordinary raw field stays an object",
+  );
+
+  const functionCall = body.input.find((item) => item.type === "function_call");
+  assertEq(
+    functionCall.arguments,
+    `{"minimum":0.5,"big":${big},"raw":"kept"}`,
+    "replayed tool-call arguments keep the wrapped token and the ordinary raw field",
+  );
+}
+
+async function testDumpSerialization() {
+  const dir = mkdtempSync(join(tmpdir(), "rebon-deepseek-dump-"));
+  const path = join(dir, "requests.jsonl");
+  process.env.REBON_DEEPSEEK_DUMP = path;
+  try {
+    buildRequestBody(
+      {
+        model: "deepseek-v4-flash",
+        messages: [],
+        maxTokens: 8,
+        stream: true,
+        temperature: new HostRawNumber("0.95"),
+      },
+      null,
+    );
+    const deadline = Date.now() + 2000;
+    let dump = "";
+    while (!dump && Date.now() < deadline) {
+      try {
+        dump = readFileSync(path, "utf8");
+      } catch {
+        dump = "";
+      }
+      if (!dump) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert(dump.includes('"temperature":0.95'), "request dump keeps the wrapped number token");
+    assert(!dump.includes('"raw":"0.95"'), "request dump does not leak the wrapper");
+  } finally {
+    delete process.env.REBON_DEEPSEEK_DUMP;
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 function testStreamTranslation() {
@@ -827,6 +976,118 @@ function testResumedToolResults() {
   );
 }
 
+function testReasoningRequestOptions() {
+  const request = (extra = {}) => ({
+    model: "deepseek-v4-pro",
+    messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+    stream: true,
+    ...extra,
+  });
+
+  const configured = buildRequestBody(request(), {
+    requestOptions: {
+      body: { reasoning_effort: "xhigh" },
+      extraBody: { thinking: { type: "enabled" }, top_p: 0.9 },
+    },
+  });
+  assertEq(
+    configured.reasoning,
+    { effort: "max" },
+    "configured thinkingEffort xhigh → reasoning.effort max",
+  );
+  assert(!("reasoning_effort" in configured), "chat-style reasoning_effort is not sent upstream");
+  assert(!("thinking" in configured), "chat-style thinking switch is not sent upstream");
+  assertEq(configured.top_p, 0.9, "unrelated request-option fields still merge");
+
+  const disabled = buildRequestBody(request(), {
+    requestOptions: {
+      body: { reasoning_effort: "max" },
+      extraBody: { thinking: { type: "disabled" } },
+    },
+  });
+  assertEq(disabled.reasoning, { effort: "none" }, "options thinking disabled → effort none");
+
+  const perModelDisabled = buildRequestBody(request(), {
+    modelRequestOptions: { "deepseek-v4-pro": { extraBody: { thinking: { type: "disabled" } } } },
+  });
+  assertEq(
+    perModelDisabled.reasoning,
+    { effort: "none" },
+    "per-model thinking disabled → effort none",
+  );
+
+  const extraBodyEffort = buildRequestBody(request(), {
+    requestOptions: { extraBody: { reasoning_effort: "max" } },
+  });
+  assertEq(extraBodyEffort.reasoning, { effort: "max" }, "extraBody reasoning_effort is consumed too");
+
+  const perModelWins = buildRequestBody(request(), {
+    requestOptions: { body: { reasoning_effort: "low" } },
+    modelRequestOptions: { "deepseek-v4-pro": { body: { reasoning_effort: "xhigh" } } },
+  });
+  assertEq(perModelWins.reasoning, { effort: "max" }, "per-model options outrank connection options");
+
+  const turnWins = buildRequestBody(request({ reasoningEffort: "low" }), {
+    requestOptions: { body: { reasoning_effort: "max" } },
+    modelRequestOptions: { "deepseek-v4-pro": { body: { reasoning_effort: "max" } } },
+  });
+  assertEq(turnWins.reasoning, { effort: "low" }, "the turn's effort outranks request options");
+
+  const turnDisabled = buildRequestBody(
+    request({ reasoningEffort: "max", thinking: { type: "disabled" } }),
+    { requestOptions: { body: { reasoning_effort: "low" } } },
+  );
+  assertEq(
+    turnDisabled.reasoning,
+    { effort: "none" },
+    "thinking disabled outranks the turn's effort",
+  );
+
+  const explicitWins = buildRequestBody(request({ reasoningEffort: "low" }), {
+    requestOptions: {
+      body: { reasoning_effort: "low" },
+      extraBody: { thinking: { type: "disabled" } },
+    },
+    modelRequestOptions: {
+      "deepseek-v4-pro": { body: { reasoning: { effort: "xhigh", summary: "auto" } } },
+    },
+  });
+  assertEq(
+    explicitWins.reasoning,
+    { effort: "max", summary: "auto" },
+    "explicit reasoning wins over the turn and is translated too",
+  );
+  assert(
+    !("reasoning_effort" in explicitWins) && !("thinking" in explicitWins),
+    "explicit reasoning leaves no chat-style fields",
+  );
+
+  const explicitFromConnection = buildRequestBody(request({ reasoningEffort: "low" }), {
+    requestOptions: {
+      body: { reasoning: { effort: "low" } },
+      extraBody: { reasoning: { effort: "xhigh" } },
+    },
+  });
+  assertEq(
+    explicitFromConnection.reasoning,
+    { effort: "max" },
+    "extraBody reasoning wins over body reasoning and outranks the turn",
+  );
+
+  const plain = buildRequestBody(request(), { requestOptions: { body: { top_p: 0.5 } } });
+  assert(!("reasoning" in plain), "no effort anywhere → no reasoning field (server default)");
+
+  const retention = buildRequestBody(request(), {
+    requestOptions: { extraBody: { prompt_cache_retention: "24h" } },
+  });
+  assertEq(retention.prompt_cache_retention, "24h", "extraBody retention still merges");
+
+  const omitted = buildRequestBody(request({ reasoningEffort: "high" }), {
+    requestOptions: { omitBodyFields: ["reasoning"] },
+  });
+  assert(!("reasoning" in omitted), "omitBodyFields still removes the generated reasoning");
+}
+
 // ── Part 2: end-to-end against a mock SSE server ────────────────────
 
 const SSE_SCRIPT = [
@@ -849,7 +1110,7 @@ function startMockServer(seen) {
       let body = "";
       req.on("data", (chunk) => (body += chunk));
       req.on("end", () => {
-        seen.push({ url: req.url, auth: req.headers.authorization, body: JSON.parse(body) });
+        seen.push({ url: req.url, auth: req.headers.authorization, body: JSON.parse(body), text: body });
         if (req.url !== "/responses") {
           res.writeHead(404).end();
           return;
@@ -989,6 +1250,48 @@ async function testEndToEnd() {
     );
   }
 
+  // Host raw numbers: wrappers in the request and in extraBody reach the wire
+  // as the exact tokens the host received.
+  {
+    const [payload, ctx] = turn("deepseek-v4-flash", new AbortController().signal);
+    payload.connection = {
+      ...connection,
+      requestOptions: { extraBody: { top_p: new HostRawNumber("0.95") } },
+    };
+    payload.request.temperature = new HostRawNumber("0.7");
+    payload.request.messages = [
+      { role: "user", content: [{ type: "text", text: "start" }] },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "call_raw",
+            name: "mcp",
+            input: { minimum: new HostRawNumber("0.5"), big: new HostRawNumber("12345678901234567890"), raw: "kept" },
+          },
+        ],
+      },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_raw", content: "done" }] },
+      { role: "user", content: [{ type: "text", text: "continue" }] },
+    ];
+    const rawEvents = [];
+    ctx.emit = async (event) => rawEvents.push(event);
+    await registered.handler(payload, ctx);
+    assert(!rawEvents.some((event) => event.type === "error"), "e2e: raw numbers never fail the turn");
+    const sent = seen.at(-1);
+    assertEq(sent.body.temperature, 0.7, "e2e: wrapped temperature crosses the wire");
+    assertEq(sent.body.top_p, 0.95, "e2e: wrapped extraBody value crosses the wire");
+    assert(sent.text.includes('"temperature":0.7'), "e2e: temperature keeps its exact token");
+    assert(sent.text.includes('"top_p":0.95'), "e2e: extraBody keeps its exact token");
+    const call = sent.body.input.find((item) => item.type === "function_call");
+    assertEq(
+      call.arguments,
+      '{"minimum":0.5,"big":12345678901234567890,"raw":"kept"}',
+      "e2e: replayed tool-call arguments keep the exact number text",
+    );
+  }
+
   // Cancel: a turn the host stops reading aborts, and emits no terminal.
   {
     const controller = new AbortController();
@@ -1012,8 +1315,11 @@ async function testEndToEnd() {
 // ── Runner ──────────────────────────────────────────────────────────
 
 testRequestTranslation();
+testReasoningRequestOptions();
+testRawJsonNumbers();
 testResumedToolResults();
 testStreamTranslation();
+await testDumpSerialization();
 await testEndToEnd();
 
 if (failures > 0) {

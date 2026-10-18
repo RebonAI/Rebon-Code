@@ -53,19 +53,155 @@ const RUNTIME_CAPABILITIES = {
 
 // ── Request translation ─────────────────────────────────────────────
 
-// DeepSeek accepts the full effort range natively (none / minimal / low /
-// medium / high / xhigh / max); Rebon's five tiers pass through unchanged.
+// The Responses endpoint reads effort `none` / `low` / `high` / `max` and
+// maps `minimal` -> low, `medium` -> high itself. `xhigh` is the exception
+// that has to be translated here: left to the server it would run as `high`,
+// not as the highest tier the user picked, so it is sent as `max`.
 export function translateReasoningEffort(effort) {
   switch (effort) {
+    case "none":
+    case "minimal":
     case "low":
     case "medium":
     case "high":
-    case "xhigh":
     case "max":
       return effort;
+    case "xhigh":
+      return "max";
     default:
       return undefined;
   }
+}
+
+// Request-option keys that Rebon's config layer writes in Chat Completions
+// spelling. The Responses endpoint ignores both chat-style fields, so the
+// plugin reads them here — re-expressing them as `reasoning` — and keeps them
+// out of the generic body merge. `reasoning` itself is the documented escape
+// hatch and is applied separately too, so an explicit object can outrank what
+// the turn carries.
+const REASONING_OPTION_FIELDS = new Set(["reasoning", "reasoning_effort", "thinking"]);
+
+/// Translate an effort, keeping a value the table does not know: options are
+/// the user's escape hatch for dialect drift, so an unknown effort is sent as
+/// written rather than dropped.
+function translatedEffort(effort) {
+  const translated = translateReasoningEffort(effort);
+  return translated === undefined ? effort : translated;
+}
+
+/// Reads reasoning settings from one options level without mutating a body.
+/// `body` then `extraBody` merge in that order, as every other option field
+/// does, so the later value wins within a level.
+function reasoningOptions(options) {
+  if (!options || typeof options !== "object") return {};
+  let explicit;
+  let effort;
+  let thinkingType;
+  for (const layer of [options.body, options.extraBody]) {
+    if (!layer || typeof layer !== "object") continue;
+    if (Object.hasOwn(layer, "reasoning")) explicit = layer.reasoning;
+    if (Object.hasOwn(layer, "reasoning_effort")) effort = layer.reasoning_effort;
+    if (Object.hasOwn(layer, "thinking")) thinkingType = layer.thinking?.type;
+  }
+  return { explicit, effort: thinkingType === "disabled" ? "none" : effort };
+}
+
+/// An explicit `reasoning` object is the user's escape hatch: send it as
+/// written, except that its `effort` still goes through the wire translation
+/// (xhigh has to reach the server as max). Non-objects pass through untouched.
+function explicitReasoningValue(reasoning) {
+  if (!reasoning || typeof reasoning !== "object" || Array.isArray(reasoning)) {
+    return reasoning;
+  }
+  if (!Object.hasOwn(reasoning, "effort")) return reasoning;
+  return { ...reasoning, effort: translatedEffort(reasoning.effort) };
+}
+
+/// The `reasoning` body value for this turn. Precedence, highest first: an
+/// explicit options `reasoning` object, the turn's own disabled thinking or
+/// effort, per-model options, connection options. `undefined` means send no
+/// `reasoning` field at all and let the server use its default.
+function resolveReasoning(request, connection) {
+  const modelOptions = connection?.modelRequestOptions?.[request.model];
+  const model = reasoningOptions(modelOptions);
+  const connectionOptions = reasoningOptions(connection?.requestOptions);
+  const explicit = model.explicit !== undefined ? model.explicit : connectionOptions.explicit;
+  if (explicit !== undefined) {
+    return { explicit: true, value: explicitReasoningValue(explicit) };
+  }
+  const turnEffort =
+    request.thinking?.type === "disabled"
+      ? "none"
+      : translateReasoningEffort(request.reasoningEffort);
+  const optionEffort =
+    model.effort !== undefined
+      ? translatedEffort(model.effort)
+      : connectionOptions.effort !== undefined
+        ? translatedEffort(connectionOptions.effort)
+        : undefined;
+  const effort = turnEffort !== undefined ? turnEffort : optionEffort;
+  return effort === undefined ? undefined : { explicit: false, value: { effort } };
+}
+
+/// The exact JSON number token the host received, or undefined for anything
+/// else.
+///
+/// The host cannot hand a fraction, an exponent or an integer past 2^53 over
+/// as a JS number without rounding its text, so it hands over a wrapper that
+/// carries the original token in `raw` and a `toJSON` that refuses to guess.
+/// This package cannot import host internals and has to work against hosts
+/// already released, so the wrapper is recognised by shape. A user's own
+/// object can carry a `raw` field, but JSON cannot carry a function, so
+/// requiring `toJSON` — and a valid number token — leaves ordinary data
+/// untouched.
+const RAW_NUMBER_TEXT = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$/;
+
+function hostRawNumberText(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (typeof value.toJSON !== "function" || typeof value.raw !== "string") return undefined;
+  return RAW_NUMBER_TEXT.test(value.raw) ? value.raw : undefined;
+}
+
+/// `JSON.stringify` for values that may carry host raw numbers.
+///
+/// Every serialization of host-supplied data goes through here — the upstream
+/// request body, tool-call arguments replayed from history and the
+/// `REBON_DEEPSEEK_DUMP` request dump — so a wrapped number reaches the wire
+/// as the token it arrived as instead of being rounded through a double or
+/// failing the turn from `toJSON`. Everything else keeps `JSON.stringify`'s
+/// semantics, including `toJSON` on ordinary objects.
+///
+/// `seen` detects cycles the way `JSON.stringify` does; callers never pass it.
+/// Exported so the offline selftest can exercise the encoder directly.
+export function stringifyJson(value, seen = new Set()) {
+  const rawNumber = hostRawNumberText(value);
+  if (rawNumber !== undefined) return rawNumber;
+  if (value !== null && typeof value === "object" && typeof value.toJSON === "function") {
+    return stringifyJson(value.toJSON(), seen);
+  }
+  if (value === undefined || typeof value === "function" || typeof value === "symbol") {
+    return undefined;
+  }
+  if (value === null) return "null";
+  if (typeof value === "boolean") return String(value);
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : "null";
+  if (typeof value === "bigint") throw new TypeError("Do not know how to serialize a BigInt");
+  if (seen.has(value)) throw new TypeError("Converting circular structure to JSON");
+  seen.add(value);
+  const parts = [];
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      parts.push(stringifyJson(value[index], seen) ?? "null");
+    }
+  } else {
+    for (const key of Object.keys(value)) {
+      const encoded = stringifyJson(value[key], seen);
+      if (encoded !== undefined) parts.push(`${JSON.stringify(key)}:${encoded}`);
+    }
+  }
+  seen.delete(value);
+  return Array.isArray(value) ? `[${parts.join(",")}]` : `{${parts.join(",")}}`;
 }
 
 /// Splits a tool result into the text lines of its `function_call_output` and
@@ -196,7 +332,7 @@ export function buildInput(messages) {
             type: "function_call",
             call_id: block.id,
             name: block.name,
-            arguments: JSON.stringify(block.input ?? {}),
+            arguments: stringifyJson(block.input ?? {}),
           });
           break;
         case "tool_result": {
@@ -272,17 +408,18 @@ function translateToolChoice(choice) {
 /// `omitBodyFields` removes generated fields, then `body` and `extraBody`
 /// merge on top (same order as Rebon's built-in OpenAI options). Keys are
 /// DeepSeek wire names, giving users an escape hatch for dialect drift
-/// without a plugin release.
+/// without a plugin release. Reasoning fields are resolved separately by
+/// `resolveReasoning`, so they never reach the body raw.
 export function applyRequestOptions(body, options) {
   if (!options || typeof options !== "object") return body;
   for (const field of options.omitBodyFields ?? []) {
     delete body[field];
   }
-  for (const [key, value] of Object.entries(options.body ?? {})) {
-    if (key !== ANCHORED_PRESET_OPTION) body[key] = value;
-  }
-  for (const [key, value] of Object.entries(options.extraBody ?? {})) {
-    if (key !== ANCHORED_PRESET_OPTION) body[key] = value;
+  for (const layer of [options.body, options.extraBody]) {
+    for (const [key, value] of Object.entries(layer ?? {})) {
+      if (key === ANCHORED_PRESET_OPTION || REASONING_OPTION_FIELDS.has(key)) continue;
+      body[key] = value;
+    }
   }
   return body;
 }
@@ -322,7 +459,7 @@ export function resolveAnchoredPreset(request, connection) {
   }
   if (configured !== SEEDED_PRESET) {
     throw new Error(
-      `${ANCHORED_PRESET_OPTION} must be "off" or "${SEEDED_PRESET}", got ${JSON.stringify(configured)}`,
+      `${ANCHORED_PRESET_OPTION} must be "off" or "${SEEDED_PRESET}", got ${stringifyJson(configured)}`,
     );
   }
   return configured;
@@ -370,7 +507,7 @@ function usesSeededStandard(request, connection) {
 function dumpRequestBody(body) {
   const path = process.env.REBON_DEEPSEEK_DUMP;
   if (!path) return;
-  const line = `${JSON.stringify({ at: new Date().toISOString(), body })}\n`;
+  const line = `${stringifyJson({ at: new Date().toISOString(), body })}\n`;
   import("node:fs")
     .then(({ appendFileSync }) => appendFileSync(path, line))
     .catch((err) =>
@@ -410,14 +547,12 @@ export function buildRequestBody(request, connection) {
   if (tools.length > 0) body.tools = tools;
   const toolChoice = translateToolChoice(request.toolChoice);
   if (toolChoice !== undefined) body.tool_choice = toolChoice;
-  if (request.thinking?.type === "disabled") {
-    // effort "none" disables thinking mode — used by compact summarisation
-    // requests so the summary does not burn reasoning tokens.
-    body.reasoning = { effort: "none" };
-  } else {
-    const effort = translateReasoningEffort(request.reasoningEffort);
-    if (effort) body.reasoning = { effort };
-  }
+  // The turn's thinking switch and effort, with request-option fallbacks; see
+  // resolveReasoning for the precedence. Effort "none" disables thinking mode
+  // and is what compact summarisation requests use so the summary does not
+  // burn reasoning tokens.
+  const reasoning = resolveReasoning(request, connection);
+  if (reasoning) body.reasoning = reasoning.value;
   // Deliberately dropped: stopSequences (unsupported by /responses),
   // metadata, thinking budgets, reasoningMode/Summary.
   //
@@ -435,6 +570,9 @@ export function buildRequestBody(request, connection) {
   applyRequestOptions(body, connection?.requestOptions);
   const modelOptions = connection?.modelRequestOptions?.[request.model];
   applyRequestOptions(body, modelOptions);
+  // The explicit escape hatch is re-applied after the merge, so neither
+  // `omitBodyFields: ["reasoning"]` nor a later option level can erase it.
+  if (reasoning?.explicit) body.reasoning = reasoning.value;
   if (seededStandard) delete body.instructions;
   dumpRequestBody(body);
   return body;
@@ -823,7 +961,7 @@ class Provider {
       response = await fetch(this.responsesUrl(), {
         method: "POST",
         headers: this.headers(),
-        body: JSON.stringify(body),
+        body: stringifyJson(body),
         signal,
       });
     } catch (err) {
