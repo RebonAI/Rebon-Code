@@ -1369,11 +1369,10 @@ mod tests {
         }
     }
 
-    /// Pins the exact frame shapes emitted by the in-repo
-    /// `runtimes/node/plugins/deepseek-responses/provider.mjs` plugin. With
-    /// `deny_unknown_fields` on every DTO, a field-name drift between the
-    /// plugin and these types is a fatal runtime protocol error — keep this
-    /// test and the plugin's selftest in sync when evolving either side.
+    /// Pins the frame shapes a model-provider plugin emits, as the DeepSeek
+    /// plugin did before DeepSeek moved in-tree. With `deny_unknown_fields` on
+    /// every DTO, a field-name drift between a plugin and these types is a
+    /// fatal runtime protocol error, so the shapes stay pinned here.
     #[test]
     fn deepseek_plugin_frame_shapes_deserialize() {
         let events = [

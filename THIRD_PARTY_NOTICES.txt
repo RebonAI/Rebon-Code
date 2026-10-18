@@ -179,15 +179,14 @@ The middle-truncation algorithm for shell output is ported from the
   Licensed under the Apache License, Version 2.0
   (https://www.apache.org/licenses/LICENSE-2.0).
 
-DeepSeek Harness (runtimes/node/plugins/deepseek-responses,
-crates/rebon-core/src/anchored_minimal.rs,
+DeepSeek Harness (crates/rebon-core/src/anchored_minimal.rs,
 crates/rebon-tool/src/str_replace_editor.rs)
 ---------------------------------------------
 
 Persona text, tool descriptions and parameter schemas of the DeepSeek
-Harness Minimal preset are reproduced; see runtimes/node/plugins/deepseek-responses/NOTICE
+Harness Minimal preset are reproduced; see crates/rebon-core/NOTICE-DEEPSEEK-HARNESS
 and the MIT permission notice in
-runtimes/node/plugins/deepseek-responses/LICENSE-DEEPSEEK-HARNESS.
+crates/rebon-core/LICENSE-DEEPSEEK-HARNESS.
 
 OpenAI Codex imagegen skill (crates/plugins/image-gen/skill/imagegen)
 ---------------------------------------------------------------------

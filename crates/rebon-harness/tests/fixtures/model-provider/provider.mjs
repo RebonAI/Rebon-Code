@@ -1,6 +1,6 @@
 // A package model provider on the plugin plane, as small as the contract allows.
 //
-// Stands in for a real one (`runtimes/node/plugins/deepseek-responses`) in the e2e test: it
+// Stands in for a real package provider in the e2e test: it
 // speaks the same `rebon.modelProvider` v1 payload vocabulary — a
 // `ModelProviderTurnV1` in, `StreamEventV1` chunks out — without needing an
 // upstream API to talk to.

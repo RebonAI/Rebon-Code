@@ -3230,7 +3230,7 @@ mod tests {
             state.provider_form.base_url.value,
             "https://api.deepseek.com"
         );
-        assert_eq!(state.provider_form.format(), "openai");
+        assert_eq!(state.provider_form.format(), "openai-responses");
         assert_eq!(state.provider_form.model.value, "deepseek-flash");
     }
 
@@ -3277,7 +3277,7 @@ mod tests {
             state.provider_form.base_url.value,
             "https://api.deepseek.com"
         );
-        assert_eq!(state.provider_form.format(), "openai");
+        assert_eq!(state.provider_form.format(), "openai-responses");
         assert_eq!(state.provider_form.model.value, "deepseek-flash");
 
         let outcome = handle_key(&mut state, &key(KeyCode::Enter));
@@ -3351,7 +3351,7 @@ mod tests {
                 name: "deepseek".into(),
                 api_key: "$DS".into(),
                 base_url: "https://api.deepseek.com".into(),
-                format: "openai".into(),
+                format: "openai-responses".into(),
                 model: "deepseek-flash".into(),
             }
         );
@@ -3624,15 +3624,16 @@ mod tests {
     fn format_field_cycles_on_left_right() {
         let mut state = state_on_provider_panel();
         state.provider_field_focus = ProviderField::Format;
-        assert_eq!(state.provider_form.format(), "openai");
-        let _ = handle_key(&mut state, &key(KeyCode::Right));
+        // The DeepSeek preset opens on Responses.
         assert_eq!(state.provider_form.format(), "openai-responses");
         let _ = handle_key(&mut state, &key(KeyCode::Right));
         assert_eq!(state.provider_form.format(), "anthropic");
         let _ = handle_key(&mut state, &key(KeyCode::Right));
         assert_eq!(state.provider_form.format(), "openai");
+        let _ = handle_key(&mut state, &key(KeyCode::Right));
+        assert_eq!(state.provider_form.format(), "openai-responses");
         let _ = handle_key(&mut state, &key(KeyCode::Left));
-        assert_eq!(state.provider_form.format(), "anthropic");
+        assert_eq!(state.provider_form.format(), "openai");
     }
 
     #[test]

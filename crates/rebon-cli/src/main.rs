@@ -1691,6 +1691,10 @@ async fn route_main() -> anyhow::Result<()> {
     // route resolves one. Reversible and non-fatal: a failure leaves
     // `config.json` authoritative.
     rebon_config::migrate_providers_to_store();
+    // DeepSeek's Responses API is built in now: an entry the retired
+    // `deepseek-responses` plugin served moves to the built-in client and the
+    // plugin is uninstalled. Non-fatal; a failure retries next start.
+    rebon_config::migrate_deepseek_plugin();
     match route {
         StartupRoute::AgentView => {
             init_tracing(true);
