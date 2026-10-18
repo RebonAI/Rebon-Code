@@ -53,7 +53,7 @@ use rebon_api::model_provider_protocol::{
     ProviderConnectionConfigV1, StreamEventV1, MODEL_PROVIDER_PROTOCOL_VERSION,
 };
 use rebon_api::{CreateMessageRequest, ModelClient, ModelError, ModelResult, StreamEventStream};
-use rebon_plugin_protocol::Payload;
+use rebon_plugin_protocol::{Payload, DEFAULT_MAX_FRAME_BYTES};
 use rebon_plugin_supervisor::{PluginHostSupervisor, ServiceStream, StreamEvent};
 use tokio::sync::mpsc;
 
@@ -227,6 +227,48 @@ impl PlaneModelProviderClient {
 /// A counter rather than a uuid: the name only has to be unique among the
 /// clients one process opens against one host, and a readable one is worth
 /// more in a log line than an unguessable one.
+/// Room left in a frame for the call envelope around the turn: identity,
+/// method and provider name. They are a few hundred bytes; this is generous.
+const FRAME_ENVELOPE_HEADROOM: usize = 64 * 1024;
+
+/// Make the turn fit in one plugin frame, dropping the oldest images and
+/// documents if it does not.
+///
+/// A whole turn — history, base64 images and all — travels as one frame, and
+/// the frame has a fixed limit. Without this, a session that has read enough
+/// images fails every turn with "NDJSON frame exceeds the configured limit"
+/// and cannot recover. Only this request is trimmed; the history keeps its
+/// images.
+fn fit_turn_in_frame(provider: &str, turn: &mut ModelProviderTurnV1) -> ModelResult<()> {
+    let limit = DEFAULT_MAX_FRAME_BYTES - FRAME_ENVELOPE_HEADROOM;
+    let mut omitted = 0usize;
+    loop {
+        let size = serde_json::to_vec(&*turn)
+            .map_err(|error| ModelError::other(error.to_string()))?
+            .len();
+        if size <= limit {
+            break;
+        }
+        let dropped = turn.request.omit_oldest_attachments(size - limit);
+        if dropped == 0 {
+            return Err(ModelError::other(format!(
+                "model provider `{provider}`: the request is {size} bytes, over the \
+                 {DEFAULT_MAX_FRAME_BYTES}-byte plugin frame limit even without images; \
+                 run /compact to shrink the conversation"
+            )));
+        }
+        omitted += dropped;
+    }
+    if omitted > 0 {
+        tracing::warn!(
+            provider,
+            omitted,
+            "omitted the oldest attachments so the turn fits in one plugin frame"
+        );
+    }
+    Ok(())
+}
+
 fn next_scope_id(provider: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -255,12 +297,13 @@ impl ModelClient for PlaneModelProviderClient {
         &self,
         request: CreateMessageRequest,
     ) -> ModelResult<StreamEventStream> {
-        let turn = ModelProviderTurnV1 {
+        let mut turn = ModelProviderTurnV1 {
             protocol_version: MODEL_PROVIDER_PROTOCOL_VERSION,
             connection: self.config.connection.clone(),
             request: CreateMessageRequestV1::from_request(&request)
                 .map_err(|error| ModelError::other(error.to_string()))?,
         };
+        fit_turn_in_frame(&self.config.provider_id, &mut turn)?;
         tracing::trace!(
             provider = %self.config.provider_id,
             source = %self.config.source,
@@ -428,5 +471,60 @@ impl Drop for PlaneTurn {
         tokio::spawn(async move {
             let _ = supervisor.cancel(&call_id).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod frame_fit_tests {
+    use super::*;
+
+    fn turn_with_images(count: usize, image_bytes: usize) -> ModelProviderTurnV1 {
+        let data = "A".repeat(image_bytes);
+        let messages: Vec<_> = (0..count)
+            .map(|index| {
+                serde_json::json!({"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": format!("call_{index}"),
+                    "content": [{"type": "image", "source": {
+                        "type": "base64", "mediaType": "image/png", "data": data,
+                    }}],
+                }]})
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "protocolVersion": MODEL_PROVIDER_PROTOCOL_VERSION,
+            "request": {"model": "m", "messages": messages, "maxTokens": 16, "stream": true},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_turn_that_fits_is_left_alone() {
+        let mut turn = turn_with_images(2, 1024);
+        let before = turn.clone();
+        fit_turn_in_frame("p", &mut turn).unwrap();
+        assert_eq!(turn, before);
+    }
+
+    #[test]
+    fn an_oversized_turn_drops_old_images_until_it_fits() {
+        // 15 images of 1 MiB each: well over the 8 MiB frame.
+        let mut turn = turn_with_images(15, 1024 * 1024);
+        fit_turn_in_frame("p", &mut turn).unwrap();
+        let text = serde_json::to_string(&turn).unwrap();
+        assert!(text.len() <= DEFAULT_MAX_FRAME_BYTES - FRAME_ENVELOPE_HEADROOM);
+        let kept = text.matches("\"image\"").count();
+        assert!((1..15).contains(&kept), "kept {kept} images");
+        // The kept ones are the newest: the last result still has its image.
+        let last = &turn.request.messages.last().unwrap().content[0];
+        assert!(serde_json::to_string(last).unwrap().contains("\"image\""));
+    }
+
+    #[test]
+    fn an_oversized_turn_without_images_is_a_clear_error() {
+        let mut turn = turn_with_images(0, 0);
+        turn.request.system = Some("x".repeat(DEFAULT_MAX_FRAME_BYTES));
+        let error = fit_turn_in_frame("p", &mut turn).unwrap_err().to_string();
+        assert!(error.contains("/compact"), "{error}");
     }
 }
