@@ -148,7 +148,7 @@ fn recipient_delivery_note(
     if let Some(state) = manager.message_delivery_state(team_name, recipient) {
         return match state {
             MessageDeliveryState::NextToolRound => {
-                "It is running and will receive it at its next tool round."
+                "It is running and will receive it at its next tool round, or when its current turn ends if it finishes first."
             }
             MessageDeliveryState::NextTurn => "It is idle, so the message starts its next turn.",
             MessageDeliveryState::Resumed => {
@@ -166,7 +166,9 @@ fn recipient_delivery_note(
         .map(|entry| entry.status)
         .as_deref()
     {
-        Some("running") => "It is running and will receive it at its next tool round.",
+        Some("running") => {
+            "It is running and will receive it at its next tool round, or when its current turn ends if it finishes first."
+        }
         Some("idle") => "It is idle, so the message starts its next turn.",
         Some(_) => "It had finished, so it was resumed with this message.",
         None => UNKNOWN,
@@ -395,7 +397,7 @@ impl Tool for SendMessageTool {
             return Ok(json!({
                 "success": true,
                 "message": format!(
-                    "Message broadcast to {} teammate(s). Each recipient will receive it at its next tool round; an idle recipient starts its next turn with it.",
+                    "Message broadcast to {} teammate(s). Each recipient will receive it at its next tool round, or when its current turn ends; an idle recipient starts its next turn with it.",
                     recipients.len()
                 ),
                 "recipients": recipients,

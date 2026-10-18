@@ -82,6 +82,7 @@ pub use queue_verdict::{QueueVerdictTool, QUEUE_VERDICT_TOOL_NAME};
 pub use roster::{
     render_teammate_roster_context, RosterAttachmentPoller, RosterAttachmentProducer,
 };
+pub use runtime::take_pending_teammate_messages;
 pub use send_message::{SendMessageTool, SEND_MESSAGE_TOOL_NAME};
 pub use task_create::{TaskCreateTool, TASK_CREATE_TOOL_NAME};
 pub use task_get::{TaskGetTool, TASK_GET_TOOL_NAME};

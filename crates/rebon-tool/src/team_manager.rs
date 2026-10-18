@@ -117,6 +117,8 @@ pub struct TeammateRosterEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageDeliveryState {
     /// The recipient is running and reads the message at its next tool round.
+    /// A turn that ends before that tool round leaves the message queued and
+    /// starts the next turn with it.
     NextToolRound,
     /// The recipient is idle; the message starts its next turn.
     NextTurn,

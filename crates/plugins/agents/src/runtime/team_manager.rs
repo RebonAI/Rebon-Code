@@ -37,10 +37,10 @@ use rebon_plugin_tasks::runtime::{
     push_in_process_teammate_turn_prompt, register_in_process_teammate_task_with_cancel,
     request_teammate_shutdown, revive_in_process_teammate_task, send_message_to_local_agent_task,
     set_in_process_teammate_awaiting_plan_approval, set_in_process_teammate_current_task,
-    set_in_process_teammate_permission_mode, take_pending_teammate_request,
-    upsert_bounded_agent_thinking, InProcessTeammateTaskSpec, LocalAgentTranscriptEntry, TaskData,
-    TaskId, TaskKind, TaskLiveEventKind, TaskRegistry, TaskSnapshot, TaskStatus, TaskTurnToken,
-    TeammateIdentity, TeammateRequest,
+    set_in_process_teammate_permission_mode, take_delivered_teammate_messages,
+    take_pending_teammate_request, upsert_bounded_agent_thinking, InProcessTeammateTaskSpec,
+    LocalAgentTranscriptEntry, TaskData, TaskId, TaskKind, TaskLiveEventKind, TaskRegistry,
+    TaskSnapshot, TaskStatus, TaskTurnToken, TeammateIdentity, TeammateRequest,
 };
 
 const TEAM_LEAD_NAME: &str = "team-lead";
@@ -722,10 +722,7 @@ impl TeamManager for InProcessTeamManager {
                 }
 
                 let request_id = self.next_request_id(&task_id);
-                let request = TeammateRequest {
-                    request_id: request_id.clone(),
-                    message: spec.prompt.clone(),
-                };
+                let request = TeammateRequest::dispatch(request_id.clone(), spec.prompt.clone());
                 let waiter = self.register_waiter(&request_id, spec.wait_for_completion);
 
                 if existing.status.is_terminal() {
@@ -796,10 +793,7 @@ impl TeamManager for InProcessTeamManager {
                     description: spec.description.clone(),
                 };
                 let request_id = self.next_request_id(&task_id);
-                let request = TeammateRequest {
-                    request_id: request_id.clone(),
-                    message: spec.prompt.clone(),
-                };
+                let request = TeammateRequest::dispatch(request_id.clone(), spec.prompt.clone());
                 let waiter = self.register_waiter(&request_id, spec.wait_for_completion);
 
                 let cwd = spec.cwd.clone().unwrap_or_else(|| {
@@ -893,10 +887,7 @@ impl TeamManager for InProcessTeamManager {
                         "The teammate runtime recipe is no longer available in this session. Redispatch it with the Agent tool.".to_string(),
                     ));
                 };
-                let request = TeammateRequest {
-                    request_id: self.next_request_id(&task_id),
-                    message,
-                };
+                let request = TeammateRequest::message(self.next_request_id(&task_id), message);
                 let cancel = PromptCancel::new();
                 let Some(identity) = revive_in_process_teammate_task(
                     &self.registry,
@@ -1328,19 +1319,25 @@ fn build_teammate_turn(
     turn_messages.push(turn_user_message.clone());
     // Mid-turn teammate_mailbox drain: gives the running worker
     // visibility into inter-agent traffic without waiting for
-    // this iteration of `run_teammate_loop` to end. Structured
-    // protocol messages stay filtered inside
-    // `drain_teammate_mailbox_for`, so `try_read_mailbox_prompt`
-    // remains the authoritative handler for plan_approval_response
-    // (it needs to clear `awaiting_plan_approval` and format a
-    // fresh worker prompt).
+    // this iteration of `run_teammate_loop` to end. The poller also
+    // drains SendMessage traffic queued for this teammate, so a
+    // running teammate reads it at its next tool round instead of
+    // after the whole turn. Structured protocol messages stay
+    // filtered inside `drain_teammate_mailbox_for`, so
+    // `try_read_mailbox_prompt` remains the authoritative handler for
+    // plan_approval_response (it needs to clear
+    // `awaiting_plan_approval` and format a fresh worker prompt).
     let attachment_poller: std::sync::Arc<dyn rebon_core::query::AttachmentPoller> =
-        std::sync::Arc::new(rebon_plugin_tasks::TeammateMailboxPoller::new(
-            rebon_core::attachment_seat::MailboxIdentity {
-                team_name: identity.team_name.clone(),
-                agent_name: identity.agent_name.clone(),
-            },
-        ));
+        std::sync::Arc::new(
+            rebon_plugin_tasks::TeammateMailboxPoller::with_pending_messages(
+                rebon_core::attachment_seat::MailboxIdentity {
+                    team_name: identity.team_name.clone(),
+                    agent_name: identity.agent_name.clone(),
+                },
+                registry.clone(),
+                task_id.clone(),
+            ),
+        );
     // Same borrowed-parent/forked-child shape as the sub-agent
     // spawner: the teammate gets its own session when the client
     // can isolate one, and never resets the shared one when it
@@ -1463,9 +1460,11 @@ fn build_teammate_turn(
 /// Record one finished teammate turn.
 ///
 /// The handoff is what the requester is waiting on, so it is built from the
-/// worker's result and delivered before the transcript is trimmed. The
-/// conversation keeps at most 64 messages: a teammate is long-lived and this
-/// is the only bound on its context.
+/// worker's result and delivered before the transcript is trimmed. Messages
+/// the turn read between tool rounds are recorded after the turn prompt in
+/// delivery order, so the next turn still sees them. The conversation keeps
+/// at most 64 messages: a teammate is long-lived and this is the only bound
+/// on its context.
 #[allow(clippy::too_many_arguments)]
 fn record_teammate_turn(
     registry: &TaskRegistry,
@@ -1510,6 +1509,9 @@ fn record_teammate_turn(
         error: result.error.clone(),
     };
     conversation.push(turn_user_message);
+    for message in take_delivered_teammate_messages(registry, task_id) {
+        conversation.push(rebon_api::Message::user_text(message));
+    }
     if !result.final_text.trim().is_empty() {
         conversation.push(rebon_api::Message::assistant_text(
             result.final_text.clone(),
@@ -3682,6 +3684,81 @@ mod tests {
             Some(MessageDeliveryState::Resumed)
         );
         assert_eq!(manager.message_delivery_state("alpha", "nobody"), None);
+    }
+
+    /// A message delivered between tool rounds belongs to the turn that read
+    /// it: it lands in the conversation between that turn's prompt and reply,
+    /// and it is gone from the queue so it cannot start a second turn.
+    #[test]
+    fn a_message_delivered_mid_turn_stays_in_the_next_turns_conversation() {
+        let _home = TestHome::new("mid-turn-conversation");
+        let registry = TaskRegistry::new();
+        let (task_id, snapshot) = register_mailbox_teammate(&registry, "alpha", "alice");
+        let TaskData::InProcessTeammate(data) = &snapshot.data else {
+            panic!("expected teammate");
+        };
+        let identity = data.identity.clone();
+        let waiters = Arc::new(Mutex::new(HashMap::new()));
+        let mut conversation = Vec::new();
+
+        assert!(inject_user_message_to_teammate(
+            &registry,
+            &task_id,
+            "steer left".into()
+        ));
+        assert_eq!(
+            rebon_plugin_tasks::take_pending_teammate_messages(&registry, &task_id),
+            vec!["steer left".to_string()],
+            "the running turn's poller delivers the message"
+        );
+
+        let result = WorkerResult {
+            status: WorkerStatus::Completed,
+            final_text: "finished".into(),
+            stop_reason: None,
+            total_usage: Usage::default(),
+            cumulative_output_tokens: 0,
+            tool_calls: Vec::new(),
+            context_reset_occurred: false,
+            error: None,
+        };
+        record_teammate_turn(
+            &registry,
+            &task_id,
+            &identity,
+            &waiters,
+            &mut conversation,
+            rebon_api::Message::user_text("do the work"),
+            None,
+            &result,
+        );
+
+        let texts = conversation.iter().map(message_text).collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            vec![Some("do the work"), Some("steer left"), Some("finished")]
+        );
+
+        assert!(
+            take_pending_teammate_request(&registry, &task_id).is_none(),
+            "a mid-turn message must not start a second turn"
+        );
+
+        let updated = registry.snapshot(&task_id).expect("teammate snapshot");
+        let TaskData::InProcessTeammate(data) = &updated.data else {
+            panic!("expected teammate");
+        };
+        assert_eq!(
+            data.transcript
+                .iter()
+                .filter(|entry| matches!(
+                    entry,
+                    LocalAgentTranscriptEntry::User { text } if text == "steer left"
+                ))
+                .count(),
+            1,
+            "the inject echo is the only transcript copy"
+        );
     }
 
     #[tokio::test]
