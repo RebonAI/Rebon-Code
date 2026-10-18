@@ -386,6 +386,11 @@ pub const SERVICE_TIER_CONFIG_KEY: &str = "serviceTier";
 pub const FEATURES_CONFIG_KEY: &str = "features";
 /// Feature flag key for fast mode inside [`FEATURES_CONFIG_KEY`].
 pub const FAST_MODE_FEATURE_KEY: &str = "fastMode";
+/// Top-level config key for the auto-compact token cap. A count caps the
+/// trigger at that many input tokens, `0` removes the cap so the trigger
+/// follows the model's window alone, and no key means the engine's default
+/// cap. `REBON_AUTO_COMPACT_TOKEN_LIMIT` overrides it.
+pub const AUTO_COMPACT_TOKEN_LIMIT_CONFIG_KEY: &str = "autoCompactTokenLimit";
 /// Top-level config key for update preferences and dismissals.
 pub const UPDATES_CONFIG_KEY: &str = "updates";
 /// Top-level config key for Agent View UI preferences.
@@ -5125,6 +5130,57 @@ pub fn save_fast_mode_enabled(enabled: bool) -> anyhow::Result<()> {
     save_fast_mode_enabled_in_dir(&config_home_dir(), enabled)
 }
 
+/// The saved auto-compact token cap, exactly as stored (`0` included).
+/// `None` when the key is absent; a value that is not a token count is
+/// reported and read as absent, so the engine falls back to its default.
+pub fn saved_auto_compact_token_limit() -> Option<u32> {
+    saved_auto_compact_token_limit_in_dir(&config_home_dir())
+}
+
+pub fn saved_auto_compact_token_limit_in_dir(config_dir: &Path) -> Option<u32> {
+    let config = match read_config_roundtrip(config_dir) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::debug!(%error, "auto-compact limit: config.json unreadable");
+            return None;
+        }
+    };
+    let value = config.extra.get(AUTO_COMPACT_TOKEN_LIMIT_CONFIG_KEY)?;
+    let limit = value.as_u64().and_then(|limit| u32::try_from(limit).ok());
+    if limit.is_none() {
+        tracing::warn!(
+            %value,
+            "{AUTO_COMPACT_TOKEN_LIMIT_CONFIG_KEY} is not a token count; using the default cap"
+        );
+    }
+    limit
+}
+
+/// Save the auto-compact token cap; `None` removes the key so the engine's
+/// default cap applies again.
+pub fn save_auto_compact_token_limit(limit: Option<u32>) -> anyhow::Result<()> {
+    save_auto_compact_token_limit_in_dir(&config_home_dir(), limit)
+}
+
+pub fn save_auto_compact_token_limit_in_dir(
+    config_dir: &Path,
+    limit: Option<u32>,
+) -> anyhow::Result<()> {
+    let mut config = read_config_roundtrip(config_dir)?;
+    match limit {
+        Some(limit) => {
+            config.extra.insert(
+                AUTO_COMPACT_TOKEN_LIMIT_CONFIG_KEY.to_string(),
+                serde_json::Value::from(limit),
+            );
+        }
+        None => {
+            config.extra.remove(AUTO_COMPACT_TOKEN_LIMIT_CONFIG_KEY);
+        }
+    }
+    write_config_roundtrip(config_dir, &config)
+}
+
 pub fn save_ui_mode(mode: &str) -> anyhow::Result<()> {
     save_ui_mode_in_dir(&config_home_dir(), mode)
 }
@@ -9375,6 +9431,57 @@ mod tests {
         assert!(parsed.get("serviceTier").is_none());
         assert!(parsed["features"].get("fastMode").is_none());
         assert_eq!(parsed["features"]["otherFlag"], true);
+    }
+
+    #[test]
+    fn auto_compact_limit_round_trips_and_keeps_other_keys() {
+        let tmp = TempDir::new().unwrap();
+        write_config(tmp.path(), r#"{"theme":"dark","customProviders":[]}"#);
+        assert_eq!(saved_auto_compact_token_limit_in_dir(tmp.path()), None);
+
+        save_auto_compact_token_limit_in_dir(tmp.path(), Some(120_000)).unwrap();
+        assert_eq!(
+            saved_auto_compact_token_limit_in_dir(tmp.path()),
+            Some(120_000)
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_json_path(tmp.path())).unwrap())
+                .unwrap();
+        assert_eq!(parsed["autoCompactTokenLimit"], 120_000);
+        assert_eq!(parsed["theme"], "dark");
+
+        // `0` is a value of its own ("no cap"), not the same as no key.
+        save_auto_compact_token_limit_in_dir(tmp.path(), Some(0)).unwrap();
+        assert_eq!(saved_auto_compact_token_limit_in_dir(tmp.path()), Some(0));
+
+        save_auto_compact_token_limit_in_dir(tmp.path(), None).unwrap();
+        assert_eq!(saved_auto_compact_token_limit_in_dir(tmp.path()), None);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(config_json_path(tmp.path())).unwrap())
+                .unwrap();
+        assert!(parsed.get("autoCompactTokenLimit").is_none());
+        assert_eq!(parsed["theme"], "dark");
+    }
+
+    #[test]
+    fn auto_compact_limit_that_is_not_a_token_count_reads_as_absent() {
+        let tmp = TempDir::new().unwrap();
+        for raw in [
+            r#"{"autoCompactTokenLimit":"lots"}"#,
+            r#"{"autoCompactTokenLimit":-5}"#,
+            r#"{"autoCompactTokenLimit":1.5}"#,
+            r#"{"autoCompactTokenLimit":99999999999}"#,
+        ] {
+            write_config(tmp.path(), raw);
+            assert_eq!(
+                saved_auto_compact_token_limit_in_dir(tmp.path()),
+                None,
+                "{raw}"
+            );
+        }
+        // A missing config home reads as "no value", not an error.
+        let missing = tmp.path().join("nope");
+        assert_eq!(saved_auto_compact_token_limit_in_dir(&missing), None);
     }
 
     #[test]

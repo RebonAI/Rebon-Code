@@ -1173,7 +1173,8 @@ fn resolve_env_runtime_model(overrides: &HarnessOverrides) -> anyhow::Result<Run
 ///
 /// Whatever the window, auto-compact fires no later than
 /// [`rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT`] tokens (Codex's
-/// 272k × 90%). `REBON_AUTO_COMPACT_TOKEN_LIMIT` replaces that cap; `0`
+/// 272k × 90%). `REBON_AUTO_COMPACT_TOKEN_LIMIT`, or failing that
+/// `autoCompactTokenLimit` in `config.json`, replaces that cap; `0`
 /// removes it so the trigger follows the window alone.
 pub fn prune_handle_from_env(
     format: &ProviderFormat,
@@ -1214,11 +1215,18 @@ pub fn prune_handle_from_env(
     if matches!(format, ProviderFormat::Anthropic) {
         handle.use_full_history_replay_microcompact_profile();
     }
-    handle
-        .budget
-        .set_auto_compact_token_limit(auto_compact_token_limit_from_env());
+    refresh_auto_compact_token_limit(&handle);
 
     handle
+}
+
+/// Re-read the auto-compact cap onto a session's budget. A live session
+/// calls this at the start of each turn, so a cap saved while it runs
+/// applies from its next turn rather than its next launch.
+pub fn refresh_auto_compact_token_limit(handle: &PruneLevelHandle) {
+    handle
+        .budget
+        .set_auto_compact_token_limit(configured_auto_compact_token_limit());
 }
 
 /// Configured context windows as the totals the context budget expects.
@@ -1251,24 +1259,43 @@ fn total_context_windows(
     (configured_window, model_windows)
 }
 
-fn auto_compact_token_limit_from_env() -> Option<u32> {
-    match std::env::var("REBON_AUTO_COMPACT_TOKEN_LIMIT") {
-        Ok(value) => match value.trim().parse::<u32>() {
-            Ok(0) => None,
-            Ok(limit) => {
-                tracing::info!(limit, "auto-compact token limit override from env");
-                Some(limit)
-            }
+/// Environment variable that overrides the saved auto-compact cap.
+pub const AUTO_COMPACT_TOKEN_LIMIT_ENV: &str = "REBON_AUTO_COMPACT_TOKEN_LIMIT";
+
+/// The auto-compact cap a session runs with: the env var, then the saved
+/// `autoCompactTokenLimit`, then the default cap. `None` means no cap.
+pub fn configured_auto_compact_token_limit() -> Option<u32> {
+    configured_auto_compact_token_limit_in_dir(&rebon_config::config_home_dir())
+}
+
+/// [`configured_auto_compact_token_limit`] against the `config.json` in
+/// `config_dir`.
+pub fn configured_auto_compact_token_limit_in_dir(config_dir: &std::path::Path) -> Option<u32> {
+    let env = std::env::var(AUTO_COMPACT_TOKEN_LIMIT_ENV).ok();
+    // The env var wins outright, so config.json is not read under it.
+    let saved = match env {
+        Some(_) => None,
+        None => rebon_config::saved_auto_compact_token_limit_in_dir(config_dir),
+    };
+    resolve_auto_compact_token_limit(env.as_deref(), saved)
+}
+
+fn resolve_auto_compact_token_limit(env: Option<&str>, saved: Option<u32>) -> Option<u32> {
+    let limit = match (env, saved) {
+        (Some(value), _) => match value.trim().parse::<u32>() {
+            Ok(limit) => limit,
             Err(_) => {
                 tracing::warn!(
                     value = %value,
-                    "REBON_AUTO_COMPACT_TOKEN_LIMIT is not a token count; using the default cap"
+                    "{AUTO_COMPACT_TOKEN_LIMIT_ENV} is not a token count; using the default cap"
                 );
-                Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT)
+                return Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT);
             }
         },
-        Err(_) => Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT),
-    }
+        (None, Some(limit)) => limit,
+        (None, None) => return Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT),
+    };
+    (limit != 0).then_some(limit)
 }
 
 fn prune_handle_from_model_config(
@@ -3838,6 +3865,10 @@ mod tests {
         let _env = EnvRestore::new(&["REBON_CONTEXT_WINDOW", "REBON_AUTO_COMPACT_TOKEN_LIMIT"]);
         std::env::remove_var("REBON_CONTEXT_WINDOW");
         std::env::remove_var("REBON_AUTO_COMPACT_TOKEN_LIMIT");
+        // The cap falls back to config.json; keep this machine's out of it.
+        // `TestConfigHome` holds the lock every config-home test shares.
+        let _config_home =
+            rebon_tool::tasks::test_support::TestConfigHome::new("auto-compact-codex");
         let build = |base_url: &str| {
             let output_limits =
                 std::collections::BTreeMap::from([("gpt-6-astra".to_string(), 128_000)]);
@@ -3883,6 +3914,7 @@ mod tests {
         let _env = EnvRestore::new(&["REBON_CONTEXT_WINDOW", "REBON_AUTO_COMPACT_TOKEN_LIMIT"]);
         std::env::remove_var("REBON_CONTEXT_WINDOW");
         std::env::remove_var("REBON_AUTO_COMPACT_TOKEN_LIMIT");
+        let _config_home = rebon_tool::tasks::test_support::TestConfigHome::new("auto-compact-cap");
         let build = || {
             prune_handle_from_env(
                 &ProviderFormat::OpenaiResponses,
@@ -3912,6 +3944,46 @@ mod tests {
 
         std::env::set_var("REBON_AUTO_COMPACT_TOKEN_LIMIT", "0");
         assert_eq!(build().budget.auto_compact_threshold(), 875_900);
+    }
+
+    #[test]
+    fn saved_auto_compact_cap_applies_and_the_env_var_beats_it() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::new(&["REBON_CONTEXT_WINDOW", "REBON_AUTO_COMPACT_TOKEN_LIMIT"]);
+        std::env::remove_var("REBON_CONTEXT_WINDOW");
+        std::env::remove_var("REBON_AUTO_COMPACT_TOKEN_LIMIT");
+        let config_home =
+            rebon_tool::tasks::test_support::TestConfigHome::new("auto-compact-saved");
+        let build = || {
+            prune_handle_from_env(
+                &ProviderFormat::OpenaiResponses,
+                rebon_api::ProviderVendor::OpenAi,
+                "gpt-6-sol",
+                None,
+                None,
+                std::iter::empty::<(String, u32)>(),
+                std::iter::empty::<(String, u32)>(),
+            )
+        };
+
+        rebon_config::save_auto_compact_token_limit_in_dir(config_home.path(), Some(150_000))
+            .unwrap();
+        let handle = build();
+        assert_eq!(handle.budget.auto_compact_threshold(), 150_000);
+
+        // A live session picks up a change on its next refresh.
+        rebon_config::save_auto_compact_token_limit_in_dir(config_home.path(), Some(0)).unwrap();
+        refresh_auto_compact_token_limit(&handle);
+        assert_eq!(handle.budget.auto_compact_threshold(), 875_900);
+        rebon_config::save_auto_compact_token_limit_in_dir(config_home.path(), None).unwrap();
+        refresh_auto_compact_token_limit(&handle);
+        assert_eq!(handle.budget.auto_compact_threshold(), 244_800);
+
+        rebon_config::save_auto_compact_token_limit_in_dir(config_home.path(), Some(150_000))
+            .unwrap();
+        std::env::set_var("REBON_AUTO_COMPACT_TOKEN_LIMIT", "90000");
+        refresh_auto_compact_token_limit(&handle);
+        assert_eq!(handle.budget.auto_compact_threshold(), 90_000);
     }
 
     #[test]
@@ -4003,6 +4075,31 @@ mod tests {
         for bad in ["", "June 2026", "2026-13", "2026-00", "26-06", "2026-xx"] {
             assert_eq!(format_knowledge_cutoff(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn auto_compact_cap_resolution_covers_every_source() {
+        let default = Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT);
+        assert_eq!(resolve_auto_compact_token_limit(None, None), default);
+        assert_eq!(
+            resolve_auto_compact_token_limit(None, Some(120_000)),
+            Some(120_000)
+        );
+        assert_eq!(resolve_auto_compact_token_limit(None, Some(0)), None);
+        assert_eq!(
+            resolve_auto_compact_token_limit(Some(" 80000 "), Some(120_000)),
+            Some(80_000)
+        );
+        assert_eq!(
+            resolve_auto_compact_token_limit(Some("0"), Some(120_000)),
+            None
+        );
+        // A malformed env var is the default cap, not the saved value: the
+        // person set the variable, and it is the one being honoured.
+        assert_eq!(
+            resolve_auto_compact_token_limit(Some("lots"), Some(120_000)),
+            default
+        );
     }
 
     #[test]

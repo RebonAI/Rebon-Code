@@ -1802,6 +1802,10 @@ async fn execute_background_job_inner(
     // provider under it and the thinking overrides below are resolved from
     // that provider's format.
     apply_recorded_model(&mut session, state, store).await;
+    // After the model, which may have brought a fresh budget. The app's
+    // auto-compact slider writes config.json while this worker is parked,
+    // and the person moving it expects the very next turn to honour it.
+    rebon_harness::refresh_auto_compact_token_limit(&session.model.prune_level);
 
     // Say which agent this turn runs under. The router lives in this process
     // and nothing asked it before, so `agent` was `None` in every snapshot the
