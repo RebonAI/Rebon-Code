@@ -743,6 +743,42 @@ impl OwnerHandle {
         Ok(result.outcome)
     }
 
+    /// Deliver a message from an agent in another session, and say where it
+    /// landed.
+    ///
+    /// The idempotency key is the envelope's `message_id`, not a command id:
+    /// the owner deduplicates on it, so a retry that used a fresh command id
+    /// would still not deliver the same message twice.
+    pub fn agent_message(
+        &self,
+        envelope: crate::AgentMessageEnvelope,
+        command_id: Option<String>,
+    ) -> anyhow::Result<crate::AgentMessageResult> {
+        let crate::AgentMessageEnvelope {
+            message_id,
+            from_session_id,
+            from_agent,
+            from_cwd,
+            summary,
+            text,
+        } = envelope;
+        let response = self.send(
+            BackgroundIpcRequest::AgentMessage {
+                message_id,
+                from_session_id,
+                from_agent,
+                from_cwd,
+                summary,
+                text,
+            },
+            command_id,
+        )?;
+        let data = response.data.ok_or_else(|| {
+            anyhow::anyhow!("the owner answered an agent message without an outcome")
+        })?;
+        Ok(serde_json::from_value(data)?)
+    }
+
     /// Interrupt the running turn, leaving the session and its host alive.
     ///
     /// `Ok(false)` means there was nothing in flight — a no-op, not a failure,

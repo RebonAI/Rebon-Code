@@ -38,6 +38,9 @@
 use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// A message from an agent in another Rebon session, and the
+/// `<teammate-message>` frame it is delivered under.
+pub mod agent_message;
 mod attach_job;
 pub mod client;
 mod day;
@@ -50,6 +53,10 @@ pub mod journal;
 /// indefinitely, and named for what it is: it predates the
 /// endpoint and is not wired to worker IPC.
 mod legacy_foreground;
+/// The sessions running on this machine right now, merged from the records
+/// that already exist: hosted job records and foreground `.live.json`
+/// heartbeats.
+pub mod peers;
 mod process_liveness;
 pub mod protocol;
 mod respawned_job;
@@ -98,12 +105,12 @@ pub use legacy_foreground::{
     ask_user_questions_from_permission, build_ask_user_question_updated_input,
     clear_foreground_status, complete_foreground_command, drain_foreground_commands,
     foreground_command_response_path, foreground_inbox_dir, foreground_status_path,
-    read_foreground_command_response, read_foreground_status, run_foreground_command,
-    send_foreground_command, write_foreground_command_response, write_foreground_status,
-    ForegroundCommand, ForegroundCommandClaim, ForegroundCommandEnvelope, ForegroundCommandOutcome,
-    ForegroundCommandResponse, ForegroundCommandResult, ForegroundQuestion,
-    ForegroundQuestionAnswer, ForegroundQuestionOption, ForegroundSessionStatus,
-    FOREGROUND_PROTOCOL_VERSION, FOREGROUND_STATUS_SUFFIX,
+    read_foreground_command_response, read_foreground_status, read_foreground_status_file,
+    run_foreground_command, send_foreground_command, write_foreground_command_response,
+    write_foreground_status, ForegroundCommand, ForegroundCommandClaim, ForegroundCommandEnvelope,
+    ForegroundCommandOutcome, ForegroundCommandResponse, ForegroundCommandResult,
+    ForegroundQuestion, ForegroundQuestionAnswer, ForegroundQuestionOption,
+    ForegroundSessionStatus, FOREGROUND_PROTOCOL_VERSION, FOREGROUND_STATUS_SUFFIX,
 };
 // `client::owner` and `client::session_host_client` keep their old crate-root
 // paths, so grouping them under `client/` moved no caller.
@@ -119,6 +126,10 @@ pub use stream_watermark::{drain_updates, event_log_line_stamp, DrainOutcome, St
 // The three modules, re-exported flat so that every path outside this crate is
 // the one it always was. Nothing moved on the wire or on disk; only which file
 // an item is declared in changed.
+pub use agent_message::{
+    frame_agent_message, AgentMessageDelivery, AgentMessageEnvelope, AgentMessageResult,
+};
+pub use peers::{PeerDirectory, PeerKind, PeerSession};
 pub use protocol::*;
 pub use state::*;
 pub use store::*;

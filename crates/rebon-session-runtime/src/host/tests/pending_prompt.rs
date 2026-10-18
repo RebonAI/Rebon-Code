@@ -446,6 +446,64 @@ async fn background_steer_pump_delivers_fifo_and_publishes_echoes() {
     ipc.cancel.cancel();
 }
 
+/// A message from another agent is steered as the framed text, but it is not a
+/// queued user row: nothing a person typed produced it.
+#[tokio::test]
+async fn background_steer_pump_does_not_echo_an_agent_message_as_user_input() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.process.status = BackgroundJobStatus::Running;
+    state.process.turn_generation = 3;
+    state.identity.session_id = Some("sess-steer-agent".into());
+    let ipc = start_background_ipc_server(&store, &state.identity.job_id).unwrap();
+    install_ipc_owner(&mut state, &ipc);
+    let envelope = rebon_session_host::AgentMessageEnvelope {
+        message_id: "m-steer".into(),
+        from_session_id: "sess-other".into(),
+        from_agent: "main".into(),
+        from_cwd: None,
+        summary: None,
+        text: "take the next step".into(),
+    };
+    let frame = rebon_session_host::frame_agent_message(&envelope);
+    let mut prompt = pending_prompt("m-steer", &frame, Vec::new());
+    prompt.origin = Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
+        from_session_id: "sess-other".into(),
+        from_agent: "main".into(),
+    });
+    state.identity.pending_prompts = vec![prompt];
+    store.write_state(&state).unwrap();
+
+    let poller = BackgroundPendingPromptPoller::new(store.clone(), &state, &ipc);
+    let (agents, calls, mut sent) = test_steering_agents(
+        vec![Ok(rebon_agent_core::SteerOutcome::Injected)],
+        "sess-steer-agent",
+        None,
+    );
+    let (publisher, mut update_rx) = rebon_agent_core::ChannelSessionUpdatePublisher::new();
+    let publisher: Arc<dyn rebon_agent_core::SessionUpdatePublisher> = Arc::new(publisher);
+    let pump = spawn_background_steer_pump(agents, poller, publisher, "sess-steer-agent".into());
+
+    let delivered = tokio::time::timeout(Duration::from_secs(2), sent.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivered, "m-steer");
+    pump.stop().await;
+
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![("m-steer".to_string(), frame, 0)]
+    );
+    assert!(
+        update_rx.try_recv().is_err(),
+        "a teammate message must not be published as a queued user message"
+    );
+    ipc.cancel.cancel();
+}
+
 #[tokio::test]
 async fn background_steer_pump_releases_undelivered_claims() {
     let outcomes = [

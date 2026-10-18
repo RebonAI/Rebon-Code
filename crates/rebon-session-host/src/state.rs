@@ -74,6 +74,23 @@ impl BackgroundJobStatus {
     }
 }
 
+/// Where a pending prompt came from, when it was not typed by the user.
+///
+/// The distinction changes what the poller may do with it: a message another
+/// agent sent is framed `<teammate-message>` text and must not be wrapped in
+/// the queued-user-input marker or shown as a queued user message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PendingPromptOrigin {
+    /// Another Rebon session's agent sent this through the control plane.
+    AgentMessage {
+        #[serde(rename = "fromSessionId")]
+        from_session_id: String,
+        #[serde(rename = "fromAgent")]
+        from_agent: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingPrompt {
@@ -88,6 +105,10 @@ pub struct PendingPrompt {
     pub claimed_turn_generation: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_turn_generation: Option<u64>,
+    /// Skipped when absent so every job record written before this field
+    /// existed stays byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<PendingPromptOrigin>,
 }
 
 impl PendingPrompt {
@@ -110,7 +131,17 @@ impl PendingPrompt {
             enqueued_at_ms,
             claimed_turn_generation: None,
             completed_turn_generation: None,
+            origin: None,
         })
+    }
+
+    /// Whether this prompt is a message another agent sent.
+    ///
+    /// The poller and the turn builder both branch on this: agent text reaches
+    /// the model as the framed `<teammate-message>` alone, and never fills
+    /// `user_prompt`, which the auto-mode classifier reads as user intent.
+    pub fn is_agent_message(&self) -> bool {
+        matches!(self.origin, Some(PendingPromptOrigin::AgentMessage { .. }))
     }
 }
 
@@ -281,6 +312,23 @@ fn recover_pending_prompt_item(value: serde_json::Value, index: usize) -> Option
             None
         }
     };
+    // An origin this build cannot read is not treated as "no origin": that
+    // would turn another agent's message into user input, which is the one
+    // misreading the field exists to prevent. The prompt is dropped instead.
+    let origin = match object.remove("origin") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(value) => match serde_json::from_value::<PendingPromptOrigin>(value) {
+            Ok(origin) => Some(origin),
+            Err(error) => {
+                tracing::warn!(
+                    pending_prompt_index = index,
+                    %error,
+                    "skipping pending prompt with an unreadable origin"
+                );
+                return None;
+            }
+        },
+    };
 
     Some(PendingPrompt {
         id,
@@ -290,6 +338,7 @@ fn recover_pending_prompt_item(value: serde_json::Value, index: usize) -> Option
         enqueued_at_ms,
         claimed_turn_generation,
         completed_turn_generation,
+        origin,
     })
 }
 
@@ -309,6 +358,7 @@ fn recover_pending_prompt_text(text: String, index: usize) -> Option<PendingProm
         enqueued_at_ms: 0,
         claimed_turn_generation: None,
         completed_turn_generation: None,
+        origin: None,
     })
 }
 
@@ -1298,6 +1348,7 @@ impl BackgroundJobState {
             if existing.text != prompt.text
                 || existing.images != prompt.images
                 || existing.coordinator_report_paths != prompt.coordinator_report_paths
+                || existing.origin != prompt.origin
             {
                 anyhow::bail!(
                     "pending prompt id `{}` was already used for different content",

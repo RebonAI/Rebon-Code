@@ -569,8 +569,68 @@ pub fn read_foreground_status(
     cwd: &str,
     session_id: &str,
 ) -> Option<ForegroundSessionStatus> {
-    let bytes = std::fs::read(foreground_status_path(projects_root, cwd, session_id)).ok()?;
+    read_foreground_status_file(&foreground_status_path(projects_root, cwd, session_id))
+}
+
+/// [`read_foreground_status`] for a caller that already found the file — the
+/// peer scan walks project directories and has no `cwd` to key on until it has
+/// read one.
+pub fn read_foreground_status_file(path: &Path) -> Option<ForegroundSessionStatus> {
+    let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// Every status sidecar published under the projects root.
+///
+/// The caller owns the freshness rule: the peer scan drops stale heartbeats,
+/// while a client that only needs a session's cwd can read one that has stopped
+/// beating and let the session lock decide liveness.
+pub fn read_foreground_statuses(projects_root: &Path) -> Vec<ForegroundSessionStatus> {
+    let entries = match std::fs::read_dir(projects_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                root = %projects_root.display(),
+                "rebon: could not scan project directories for foreground status files"
+            );
+            return Vec::new();
+        }
+    };
+    let mut statuses = Vec::new();
+    for project_dir in entries.flatten().map(|entry| entry.path()) {
+        if !project_dir.is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&project_dir) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(FOREGROUND_STATUS_SUFFIX))
+            {
+                continue;
+            }
+            if let Some(status) = read_foreground_status_file(&path) {
+                statuses.push(status);
+            }
+        }
+    }
+    statuses
+}
+
+/// The sidecar a session published, found by session id rather than by cwd.
+pub fn find_foreground_status(
+    projects_root: &Path,
+    session_id: &str,
+) -> Option<ForegroundSessionStatus> {
+    read_foreground_statuses(projects_root)
+        .into_iter()
+        .find(|status| status.session_id == session_id)
 }
 
 // ─── foreground (TUI) side ─────────────────────────────────────────────────

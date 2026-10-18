@@ -53,6 +53,7 @@ fn kind_of(error: &HostCallError) -> &'static str {
         HostCallError::HostUnanswered => "hostUnanswered",
         HostCallError::InvalidRequest => "invalidRequest",
         HostCallError::SessionFailure => "sessionFailure",
+        HostCallError::ForegroundTerminal => "foregroundTerminal",
         HostCallError::Transport(_) => "transport",
         HostCallError::Refused(_) => "refused",
     }
@@ -75,6 +76,7 @@ fn code_of(error: &HostCallError) -> i32 {
         // reach it" and "it is on its way out and stopped taking work" lead to
         // the same next move. `data.kind` still separates them for a log.
         HostCallError::Transport(_) | HostCallError::OwnerClosing => error_code::OWNER_UNREACHABLE,
+        HostCallError::ForegroundTerminal => error_code::OWNER_UNREACHABLE,
         HostCallError::PermissionRejected => error_code::PERMISSION_REJECTED,
         // Its own code, not the catch-all: a client branches on it. A call
         // released half way may be worth retrying; a refusal is a decision and
@@ -103,6 +105,10 @@ fn message_of(error: &HostCallError) -> String {
         }
         HostCallError::InvalidRequest => "the request could not be decoded".to_string(),
         HostCallError::SessionFailure => "the session behind this owner had failed".to_string(),
+        HostCallError::ForegroundTerminal => {
+            "the target is a foreground terminal session, which cannot receive agent messages yet"
+                .to_string()
+        }
         HostCallError::Transport(detail) => detail.clone(),
         HostCallError::Refused(detail) => detail.clone(),
     }
@@ -138,6 +144,7 @@ pub fn from_json_rpc(error: &JsonRpcError) -> HostCallError {
                 "hostUnanswered" => return HostCallError::HostUnanswered,
                 "invalidRequest" => return HostCallError::InvalidRequest,
                 "sessionFailure" => return HostCallError::SessionFailure,
+                "foregroundTerminal" => return HostCallError::ForegroundTerminal,
                 "transport" => return HostCallError::Transport(error.message.clone()),
                 "refused" => return HostCallError::Refused(error.message.clone()),
                 // A kind from a newer owner. Fall through to the code, which
@@ -181,6 +188,7 @@ mod tests {
             HostCallError::HostUnanswered,
             HostCallError::InvalidRequest,
             HostCallError::SessionFailure,
+            HostCallError::ForegroundTerminal,
             HostCallError::Transport("connection reset".to_string()),
             HostCallError::Refused("the owner said no".to_string()),
         ]
@@ -205,7 +213,7 @@ mod tests {
     /// variant makes this red rather than quietly skipping the round trip.
     #[test]
     fn every_variant_is_covered() {
-        assert_eq!(every_variant().len(), 12);
+        assert_eq!(every_variant().len(), 13);
         let mut kinds: Vec<&str> = every_variant().iter().map(kind_of).collect();
         kinds.sort_unstable();
         let mut unique = kinds.clone();

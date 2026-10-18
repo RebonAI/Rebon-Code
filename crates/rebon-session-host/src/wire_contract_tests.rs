@@ -136,6 +136,7 @@ fn fully_populated_job() -> BackgroundJobState {
                 enqueued_at_ms: 1_700_000_000_100,
                 claimed_turn_generation: Some(3),
                 completed_turn_generation: Some(4),
+                origin: None,
             }],
             coordinator_report_grants: vec!["/reports/one.md".to_string()],
             runtime: BackgroundRuntimeFields {
@@ -518,8 +519,8 @@ fn an_unknown_field_does_not_reject_the_record() {
 /// Every request variant, in the encoding a peer parses.
 ///
 /// Listed one per line rather than derived from the enum so that adding a
-/// variant is a visible edit here: exactly one addition is permitted
-/// (`CancelCall`) and nothing else.
+/// variant is a visible edit here: only additive variants inside this enum are
+/// permitted (`CancelCall` and `AgentMessage`), and nothing else.
 ///
 /// Note the case: `#[serde(rename_all = "camelCase")]` on an enum renames the
 /// *variant* tags, not the fields inside a struct variant, so `taskId` is
@@ -650,17 +651,28 @@ fn every_request_variant_has_the_encoding_it_has_today() {
             },
             r#"{"releaseLease":{"client_id":"tui-1","deliberate":true}}"#,
         ),
-        // The one permitted addition to this enum, landed by the client.
-        // Additive inside this enum: an owner that does not know it fails this
-        // one request and the envelope version does not move.
+        // Additive inside this enum, landed by the client: an owner that does
+        // not know one of these fails that one request and the envelope
+        // version does not move.
         (
             BackgroundIpcRequest::CancelCall {
                 command_id: "cmd-7".to_string(),
             },
             r#"{"cancelCall":{"command_id":"cmd-7"}}"#,
         ),
+        (
+            BackgroundIpcRequest::AgentMessage {
+                message_id: "m1".to_string(),
+                from_session_id: "s1".to_string(),
+                from_agent: "main".to_string(),
+                from_cwd: None,
+                summary: None,
+                text: "hi".to_string(),
+            },
+            r#"{"agentMessage":{"from_agent":"main","from_session_id":"s1","message_id":"m1","text":"hi"}}"#,
+        ),
     ];
-    assert_eq!(cases.len(), 20, "one case per request variant");
+    assert_eq!(cases.len(), 21, "one case per request variant");
     for (request, expected) in cases {
         assert_eq!(canonical_of(&request), expected, "{request:?}");
         let decoded: BackgroundIpcRequest =
