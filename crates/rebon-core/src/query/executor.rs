@@ -1412,6 +1412,7 @@ impl EngineQueryExecutor {
             .with_additional_working_directories(additional_working_directories)
             .with_coordinator_mode(coordinator_mode)
             .with_coordinator_report_paths(coordinator_report_paths)
+            .with_scratchpad_dir(scratchpad_root.clone())
             .with_auto_approved_write_roots([scratchpad_root]);
         if let Some(state) = self.server_state.clone() {
             let session_id = session_id.to_string();

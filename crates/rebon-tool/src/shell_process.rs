@@ -3,12 +3,15 @@ use crate::{
     MonitorEventDisposition, MonitorTaskCompletion, MonitorTaskCompletionStatus, MonitorTaskSource,
     MonitorTaskSpec, TaskRuntimeController, ToolContext,
 };
-use rebon_tools_core::{ProcessTreeGuard, ToolError, ToolId, ToolResult};
+use rebon_tools_core::{ProcessTreeGuard, ToolError, ToolId, ToolProgressUpdate, ToolResult};
 use rebon_types::PromptCancel;
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::fs::File;
 use std::io;
+use std::io::Write as _;
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -17,7 +20,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout, Duration, Instant};
+use tokio::time::{sleep, timeout_at, Duration, Instant};
 #[cfg(windows)]
 use windows_sys::Win32::Globalization::{
     GetACP, GetOEMCP, IsDBCSLeadByteEx, MultiByteToWideChar, CP_UTF8,
@@ -26,8 +29,17 @@ use windows_sys::Win32::Globalization::{
 const INVALID_INPUT_CODE: i64 = 400;
 const UNKNOWN_SHELL_CODE: i64 = 404;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
-const OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
-const OUTPUT_RESPONSE_BYTES: usize = 64 * 1024;
+/// Output kept in memory for the tail a wait or a completion notification
+/// shows. The full output is in the shell's output file.
+const TAIL_BUFFER_BYTES: usize = 64 * 1024;
+/// How much of that tail one response carries.
+const TAIL_RESPONSE_BYTES: usize = 16 * 1024;
+const TAIL_RESPONSE_LINES: usize = 100;
+/// Past this, output is still tailed but no longer written to the file, so
+/// a runaway process cannot fill the disk.
+const OUTPUT_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const OUTPUT_FILE_LIMIT_NOTE: &str =
+    "\n[rebon: the output file reached its 64 MiB limit; later output was not written]\n";
 const MONITOR_LINE_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_RUNNING_SHELLS_PER_OWNER: usize = 16;
 const MAX_COMPLETED_SHELLS_PER_OWNER: usize = 64;
@@ -293,6 +305,20 @@ impl ShellProcessRegistry {
         };
 
         let shell_id = self.unique_shell_id(tool_name, registration.is_monitor())?;
+        // Monitors push their events as notifications; only a background
+        // shell has output the model reads back, so only it gets a file.
+        let output_file = if registration.is_monitor() {
+            None
+        } else {
+            match create_output_file(context, &shell_id) {
+                Ok(output_file) => Some(output_file),
+                Err(err) => {
+                    let _ = process_tree.terminate();
+                    let _ = child.wait().await;
+                    return Err(execution_error(tool_name, err));
+                }
+            }
+        };
         let entry = Arc::new(ShellEntry::new(
             shell_id.clone(),
             owner.clone(),
@@ -303,6 +329,7 @@ impl ShellProcessRegistry {
             context.task_runtime_controller().cloned(),
             PromptCancel::new(),
             registration,
+            output_file,
         ));
 
         let capacity_exceeded = {
@@ -347,7 +374,7 @@ impl ShellProcessRegistry {
             timeout_ms,
         ));
 
-        Ok(entry.summary_value())
+        Ok(entry.launch_value())
     }
 
     pub(crate) fn list(&self, context: &ToolContext, caller: &str) -> ToolResult<Value> {
@@ -367,12 +394,19 @@ impl ShellProcessRegistry {
         Ok(json!({ "shells": shells }))
     }
 
-    pub(crate) async fn output(
+    /// Block until the shell exits or `wait_timeout_ms` passes, then report
+    /// its status and the tail of its output. With `wait` false it reports
+    /// at once.
+    ///
+    /// A wait does not return on new output, only on exit: returning on the
+    /// first chunk turned every wait on a chatty build into a model
+    /// round-trip every few seconds. The output itself is in the file; this
+    /// is for the moment the model needs the result.
+    pub(crate) async fn wait(
         &self,
         context: &ToolContext,
         caller: &str,
         shell_id: &str,
-        cursor: u64,
         wait: bool,
         wait_timeout_ms: u64,
     ) -> ToolResult<Value> {
@@ -380,36 +414,31 @@ impl ShellProcessRegistry {
         if entry.registration.is_monitor() {
             return Err(monitor_output_error(caller, shell_id));
         }
+        // Subscribe before the first check, so an exit between the check
+        // and the wait still wakes it.
         let mut changes = entry.changes.subscribe();
-        let deadline = Instant::now() + Duration::from_millis(wait_timeout_ms);
-
-        // A wait collects output until the deadline, like Codex's
-        // `write_stdin` poll: returning on the first chunk turned every wait
-        // on a chatty build into a model round-trip every few seconds, each
-        // one resending the whole conversation. It ends early only when there
-        // is nothing more to wait for (the process finished) or no room left
-        // (the response already holds `OUTPUT_RESPONSE_BYTES`).
-        loop {
-            let snapshot = entry.output_snapshot(cursor, caller)?;
-            if !wait || snapshot.completed || snapshot.has_more {
-                let fully_observed = snapshot.completed && !snapshot.has_more;
-                let value = snapshot.into_value(false);
-                if fully_observed {
-                    entry.mark_observed();
+        let mut wait_timed_out = false;
+        if wait && !entry.is_completed() {
+            // Shown on the tool card while the wait runs, so it names the
+            // command being waited on instead of an opaque shellId.
+            context.emit_progress(
+                ToolProgressUpdate::new("shell_wait")
+                    .with_payload(entry.waiting_value(wait_timeout_ms)),
+            );
+            let deadline = Instant::now() + Duration::from_millis(wait_timeout_ms);
+            while !entry.is_completed() {
+                match timeout_at(deadline, changes.changed()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) | Err(_) => break,
                 }
-                return Ok(value);
             }
-
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(snapshot.into_value(true));
-            }
-            let remaining = deadline.saturating_duration_since(now);
-            match timeout(remaining, changes.changed()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) | Err(_) => return Ok(snapshot.into_value(true)),
-            }
+            wait_timed_out = !entry.is_completed();
         }
+        let (value, completed) = entry.result_value(wait_timed_out);
+        if completed {
+            entry.mark_observed();
+        }
+        Ok(value)
     }
 
     pub(crate) fn stop(
@@ -542,6 +571,18 @@ struct ShellEntry {
     registration: ShellTaskRegistration,
     monitor_line_buffer: Mutex<String>,
     observed: AtomicBool,
+    /// Where the full output goes. `None` for a Monitor.
+    output_path: Option<PathBuf>,
+}
+
+impl Drop for ShellEntry {
+    /// The file lives as long as the shell is known: once the registry
+    /// forgets the shell, nothing can point the model at it again.
+    fn drop(&mut self) {
+        if let Some(path) = &self.output_path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 impl ShellEntry {
@@ -556,8 +597,13 @@ impl ShellEntry {
         task_runtime_controller: Option<Arc<dyn TaskRuntimeController>>,
         task_cancel: PromptCancel,
         registration: ShellTaskRegistration,
+        output_file: Option<(PathBuf, File)>,
     ) -> Self {
         let (changes, _) = watch::channel(0);
+        let (output_path, file) = match output_file {
+            Some((path, file)) => (Some(path), Some(file)),
+            None => (None, None),
+        };
         Self {
             shell_id,
             owner,
@@ -565,7 +611,10 @@ impl ShellEntry {
             command,
             started_at_ms: now_ms(),
             timeout_ms,
-            state: Mutex::new(ShellState::default()),
+            state: Mutex::new(ShellState {
+                file,
+                ..ShellState::default()
+            }),
             changes,
             process_tree,
             task_runtime_controller,
@@ -573,7 +622,14 @@ impl ShellEntry {
             registration,
             monitor_line_buffer: Mutex::new(String::new()),
             observed: AtomicBool::new(false),
+            output_path,
         }
+    }
+
+    fn output_path_text(&self) -> Option<String> {
+        self.output_path
+            .as_ref()
+            .map(|path| path.display().to_string())
     }
 
     fn register_task(&self) {
@@ -633,23 +689,18 @@ impl ShellEntry {
         if text.is_empty() {
             return;
         }
-        let monitor_text =
-            (stream == "stdout" && self.registration.is_monitor()).then(|| text.clone());
+        let is_monitor = self.registration.is_monitor();
+        let monitor_text = (stream == "stdout" && is_monitor).then(|| text.clone());
+        // One lock for the file and the tail, so both see the two streams'
+        // chunks in the same order.
         let mut state = lock(&self.state);
-        let cursor = state.next_cursor;
-        state.next_cursor = state.next_cursor.saturating_add(1);
-        state.buffered_bytes = state.buffered_bytes.saturating_add(text.len());
-        state.events.push_back(ShellOutputEvent {
-            cursor,
-            stream,
-            text,
-        });
-        while state.buffered_bytes > OUTPUT_BUFFER_BYTES {
-            let Some(removed) = state.events.pop_front() else {
-                break;
-            };
-            state.buffered_bytes = state.buffered_bytes.saturating_sub(removed.text.len());
-            state.output_truncated = true;
+        state.output_bytes = state.output_bytes.saturating_add(text.len() as u64);
+        state.write_to_file(&text);
+        if is_monitor && stream == "stderr" {
+            push_bounded(&mut state.stderr_tail, &text, TAIL_BUFFER_BYTES);
+        }
+        if push_bounded(&mut state.tail, &text, TAIL_BUFFER_BYTES) {
+            state.tail_dropped = true;
         }
         drop(state);
         if let Some(text) = monitor_text {
@@ -803,9 +854,6 @@ impl ShellEntry {
         drop(state);
 
         if let Some(controller) = self.task_runtime_controller.as_ref() {
-            let snapshot = self
-                .output_snapshot(0, self.tool_name)
-                .expect("cursor zero is valid for a completed shell");
             match &self.registration {
                 ShellTaskRegistration::BackgroundShell => {
                     let completion_status = match status {
@@ -819,16 +867,28 @@ impl ShellEntry {
                             unreachable!("finished shell must have a terminal status")
                         }
                     };
+                    let completion = {
+                        let state = lock(&self.state);
+                        let (output_tail, tail_cut) = response_tail(&state.tail);
+                        BackgroundShellTaskCompletion {
+                            shell_id: self.shell_id.clone(),
+                            status: completion_status,
+                            completed_at_ms,
+                            exit_code: state.exit_code,
+                            output_tail,
+                            tail_truncated: tail_cut || state.tail_dropped,
+                            output_path: self.output_path_text().unwrap_or_default(),
+                            output_bytes: state.output_bytes,
+                            error: state.error.clone(),
+                            observed: self.observed.load(Ordering::Acquire),
+                        }
+                    };
                     controller.background_shell_finished(
                         self.owner
                             .session_id
                             .as_deref()
                             .expect("runtime-controlled shell has a session id"),
-                        snapshot.into_task_completion(
-                            completion_status,
-                            completed_at_ms,
-                            self.observed.load(Ordering::Acquire),
-                        ),
+                        completion,
                     );
                 }
                 ShellTaskRegistration::Monitor { .. } => {
@@ -842,21 +902,28 @@ impl ShellEntry {
                             unreachable!("finished monitor must have a terminal status")
                         }
                     };
-                    // Monitor completions report stderr only, so the
-                    // interleaving sketch has nothing to describe.
-                    let (_, stderr, _) = merge_output_events(&snapshot.events);
+                    // Monitor completions report stderr only: stdout already
+                    // went out line by line as events.
+                    let (stderr, exit_code, error) = {
+                        let state = lock(&self.state);
+                        (
+                            state.stderr_tail.clone(),
+                            state.exit_code,
+                            state.error.clone(),
+                        )
+                    };
                     controller.monitor_finished(
                         self.owner
                             .session_id
                             .as_deref()
                             .expect("runtime-controlled monitor has a session id"),
                         MonitorTaskCompletion {
-                            task_id: snapshot.shell_id,
+                            task_id: self.shell_id.clone(),
                             status: completion_status,
                             completed_at_ms,
-                            exit_code: snapshot.exit_code,
+                            exit_code,
                             stderr: (!stderr.is_empty()).then_some(stderr),
-                            error: snapshot.error,
+                            error,
                         },
                     );
                 }
@@ -892,12 +959,7 @@ impl ShellEntry {
 
     fn summary_value(&self) -> Value {
         let state = lock(&self.state);
-        let oldest_cursor = state
-            .events
-            .front()
-            .map(|event| event.cursor)
-            .unwrap_or(state.next_cursor);
-        json!({
+        let mut value = json!({
             "shellId": self.shell_id,
             "tool": self.tool_name,
             "command": self.command,
@@ -908,67 +970,95 @@ impl ShellEntry {
             "exitCode": state.exit_code,
             "timedOut": state.timed_out,
             "stopRequested": state.stop_requested,
-            "oldestCursor": oldest_cursor,
-            "endCursor": state.next_cursor,
-            "outputTruncated": state.output_truncated,
-        })
+            "outputBytes": state.output_bytes,
+        });
+        if let Some(path) = self.output_path_text() {
+            value["outputPath"] = Value::String(path);
+        }
+        value
     }
 
-    fn output_snapshot(&self, cursor: u64, caller: &str) -> ToolResult<ShellOutputSnapshot> {
+    /// The launch result: the summary plus where the output goes and how to
+    /// get the result, said at the moment the model needs it.
+    fn launch_value(&self) -> Value {
+        let mut value = self.summary_value();
+        if self.output_path.is_some() {
+            let notified = self.task_runtime_controller.is_some() && self.owner.session_id.is_some();
+            let note = if notified {
+                "Running in the background. Its output streams to outputPath: read it with \
+                 Read or search it with Grep. A task notification announces its exit, so keep \
+                 working. To block until it exits instead, call ShellOutput with this shellId \
+                 and a timeout."
+            } else {
+                "Running in the background. Its output streams to outputPath: read it with \
+                 Read or search it with Grep. To block until it exits, call ShellOutput with \
+                 this shellId and a timeout."
+            };
+            value["note"] = Value::String(note.to_string());
+        }
+        value
+    }
+
+    /// Progress payload while a wait is in flight.
+    fn waiting_value(&self, wait_timeout_ms: u64) -> Value {
+        let mut value = json!({
+            "shellId": self.shell_id,
+            "command": truncate_command_field(&self.command),
+            "status": lock(&self.state).status.as_str(),
+            "waiting": true,
+            "waitTimeoutMs": wait_timeout_ms,
+        });
+        if let Some(path) = self.output_path_text() {
+            value["outputPath"] = Value::String(path);
+        }
+        value
+    }
+
+    /// The ShellOutput result for one shell, and whether it has finished.
+    /// Flags are emitted only when set, so a plain result stays short.
+    fn result_value(&self, wait_timed_out: bool) -> (Value, bool) {
         let state = lock(&self.state);
-        if cursor > state.next_cursor {
-            return Err(ToolError::InvalidInput {
-                tool: ToolId::new(caller),
-                reason: format!(
-                    "cursor {cursor} is beyond the current end cursor {}",
-                    state.next_cursor
-                ),
-                error_code: Some(INVALID_INPUT_CODE),
-            });
+        let completed = state.status.is_terminal();
+        let mut value = json!({
+            "shellId": self.shell_id,
+            "command": truncate_command_field(&self.command),
+            "status": state.status.as_str(),
+            "completed": completed,
+            "outputBytes": state.output_bytes,
+        });
+        let object = value.as_object_mut().expect("result_value builds an object");
+        if let Some(exit_code) = state.exit_code {
+            object.insert("exitCode".into(), json!(exit_code));
         }
-
-        let oldest_cursor = state
-            .events
-            .front()
-            .map(|event| event.cursor)
-            .unwrap_or(state.next_cursor);
-        let cursor_truncated = cursor < oldest_cursor;
-        let effective_cursor = cursor.max(oldest_cursor);
-        let mut events = Vec::new();
-        let mut response_bytes = 0usize;
-        let mut next_cursor = effective_cursor;
-
-        for event in state
-            .events
-            .iter()
-            .filter(|event| event.cursor >= effective_cursor)
-        {
-            if !events.is_empty()
-                && response_bytes.saturating_add(event.text.len()) > OUTPUT_RESPONSE_BYTES
-            {
-                break;
+        if let Some(error) = &state.error {
+            object.insert("error".into(), Value::String(error.clone()));
+        }
+        for (key, flag) in [
+            ("timedOut", state.timed_out),
+            ("stopRequested", state.stop_requested),
+            ("waitTimedOut", wait_timed_out),
+        ] {
+            if flag {
+                object.insert(key.into(), Value::Bool(true));
             }
-            response_bytes = response_bytes.saturating_add(event.text.len());
-            next_cursor = event.cursor.saturating_add(1);
-            events.push(event.clone());
         }
-
-        Ok(ShellOutputSnapshot {
-            shell_id: self.shell_id.clone(),
-            command: self.command.clone(),
-            status: state.status,
-            completed: state.status.is_terminal(),
-            exit_code: state.exit_code,
-            timed_out: state.timed_out,
-            stop_requested: state.stop_requested,
-            error: state.error.clone(),
-            requested_cursor: cursor,
-            oldest_cursor,
-            next_cursor,
-            cursor_truncated,
-            has_more: next_cursor < state.next_cursor,
-            events,
-        })
+        if let Some(path) = self.output_path_text() {
+            object.insert("outputPath".into(), Value::String(path));
+        }
+        let (tail, cut) = response_tail(&state.tail);
+        if !tail.is_empty() {
+            object.insert("outputTail".into(), Value::String(tail));
+        }
+        if cut || state.tail_dropped {
+            object.insert("tailTruncated".into(), Value::Bool(true));
+        }
+        if state.file_truncated {
+            object.insert("outputFileTruncated".into(), Value::Bool(true));
+        }
+        if let Some(error) = &state.file_error {
+            object.insert("outputFileError".into(), Value::String(error.clone()));
+        }
+        (value, completed)
     }
 
     fn bump_change(&self) {
@@ -976,13 +1066,6 @@ impl ShellEntry {
             *version = version.wrapping_add(1);
         });
     }
-}
-
-#[derive(Debug, Clone)]
-struct ShellOutputEvent {
-    cursor: u64,
-    stream: &'static str,
-    text: String,
 }
 
 /// Chars of the originating command echoed back in `ShellOutput`/`ShellStop`
@@ -1001,136 +1084,76 @@ fn truncate_command_field(command: &str) -> String {
     }
 }
 
-struct ShellOutputSnapshot {
-    shell_id: String,
-    command: String,
-    status: ShellStatus,
-    completed: bool,
-    exit_code: Option<i32>,
-    timed_out: bool,
-    stop_requested: bool,
-    error: Option<String>,
-    requested_cursor: u64,
-    oldest_cursor: u64,
-    next_cursor: u64,
-    cursor_truncated: bool,
-    has_more: bool,
-    events: Vec<ShellOutputEvent>,
+/// Append `text`, then drop whole characters from the front until the
+/// buffer fits `max_bytes`. Returns whether anything was dropped.
+fn push_bounded(buffer: &mut String, text: &str, max_bytes: usize) -> bool {
+    buffer.push_str(text);
+    if buffer.len() <= max_bytes {
+        return false;
+    }
+    let mut start = buffer.len() - max_bytes;
+    while !buffer.is_char_boundary(start) {
+        start += 1;
+    }
+    buffer.drain(..start);
+    true
 }
 
-impl ShellOutputSnapshot {
-    /// Model-facing response. New text arrives as per-stream merged strings —
-    /// `output` (stdout) and `stderr` — instead of a per-chunk `events`
-    /// array, matching the foreground Bash/PowerShell result shape. Flag
-    /// fields are emitted only when set, so a poll that finds nothing stays
-    /// a handful of tokens instead of a wall of defaults.
-    fn into_value(self, wait_timed_out: bool) -> Value {
-        let (output, stderr, stream_order) = merge_output_events(&self.events);
-        let mut value = json!({
-            "shellId": self.shell_id,
-            "command": truncate_command_field(&self.command),
-            "status": self.status.as_str(),
-            "completed": self.completed,
-            "nextCursor": self.next_cursor,
-        });
-        let object = value.as_object_mut().expect("into_value builds an object");
-        if !output.is_empty() {
-            object.insert("output".into(), Value::String(output));
-        }
-        if !stderr.is_empty() {
-            object.insert("stderr".into(), Value::String(stderr));
-        }
-        if let Some(exit_code) = self.exit_code {
-            object.insert("exitCode".into(), json!(exit_code));
-        }
-        if let Some(error) = self.error {
-            object.insert("error".into(), Value::String(error));
-        }
-        for (key, flag) in [
-            ("timedOut", self.timed_out),
-            ("stopRequested", self.stop_requested),
-            ("hasMore", self.has_more),
-            ("waitTimedOut", wait_timed_out),
-        ] {
-            if flag {
-                object.insert(key.into(), Value::Bool(true));
+/// The end of `tail` a response carries: at most [`TAIL_RESPONSE_LINES`]
+/// lines and [`TAIL_RESPONSE_BYTES`] bytes, starting on a line boundary when
+/// it had to cut. Returns the text and whether it cut anything.
+fn response_tail(tail: &str) -> (String, bool) {
+    let mut start = tail.len().saturating_sub(TAIL_RESPONSE_BYTES);
+    while !tail.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut cut = start > 0;
+    let mut slice = &tail[start..];
+    if cut {
+        // Drop the partial first line, unless it is the only line there is.
+        if let Some(newline) = slice.find('\n') {
+            if newline + 1 < slice.len() {
+                slice = &slice[newline + 1..];
             }
         }
-        if self.cursor_truncated {
-            object.insert("cursorTruncated".into(), Value::Bool(true));
-            object.insert("oldestCursor".into(), json!(self.oldest_cursor));
-            object.insert("requestedCursor".into(), json!(self.requested_cursor));
-        }
-        // Present only when the two streams genuinely interleaved in this
-        // poll's slice. `output` / `stderr` above are built from the same
-        // events, so the sketch's per-stream line counts match them exactly
-        // — including when the ring buffer has already dropped the oldest
-        // events, since both are derived after that eviction.
-        if let Some(sketch) = stream_order {
-            object.insert(
-                rebon_tools_core::shell_stream_order::STREAM_ORDER_KEY.into(),
-                Value::String(sketch),
-            );
-        }
-        value
     }
+    let body = slice.strip_suffix('\n').unwrap_or(slice);
+    if let Some((newline, _)) = body.rmatch_indices('\n').nth(TAIL_RESPONSE_LINES - 1) {
+        slice = &slice[newline + 1..];
+        cut = true;
+    }
+    (slice.to_string(), cut)
+}
 
-    fn into_task_completion(
-        self,
-        status: BackgroundShellCompletionStatus,
-        completed_at_ms: u64,
-        observed: bool,
-    ) -> BackgroundShellTaskCompletion {
-        let (output, stderr, stream_order) = merge_output_events(&self.events);
-        BackgroundShellTaskCompletion {
-            shell_id: self.shell_id,
-            status,
-            completed_at_ms,
-            exit_code: self.exit_code,
-            output,
-            stderr,
-            stream_order,
-            error: self.error,
-            next_cursor: self.next_cursor,
-            has_more: self.has_more,
-            cursor_truncated: self.cursor_truncated,
-            oldest_cursor: self.oldest_cursor,
-            observed,
-        }
+/// Where background shells write their output: the session scratchpad when
+/// there is one, so Read needs no prompt and sub-agents can read it too.
+fn output_dir(context: &ToolContext) -> PathBuf {
+    match context.scratchpad_dir() {
+        Some(dir) => dir.join("shells"),
+        None => std::env::temp_dir().join("rebon").join("shells"),
     }
 }
 
-/// Split the arrival-ordered chunks into the two per-stream strings the
-/// result reports, plus the `shell_stream_order` sketch describing how
-/// they interleaved.
-///
-/// Unlike the foreground tools, a background shell reads raw byte chunks
-/// rather than lines, so a chunk can end mid-line and a line can span
-/// several chunks. `line_streams_from_chunks` handles that re-splitting
-/// and guarantees the sketch's per-stream line counts match what
-/// `stream_display_lines` yields over the strings built here — which is
-/// what the renderer checks before replaying the order.
-///
-/// The sketch is `None` whenever it would carry no information (a single
-/// stream, or stdout entirely before stderr).
-fn merge_output_events(events: &[ShellOutputEvent]) -> (String, String, Option<String>) {
-    let mut output = String::new();
-    let mut stderr = String::new();
-    for event in events {
-        if event.stream == "stderr" {
-            stderr.push_str(&event.text);
-        } else {
-            output.push_str(&event.text);
-        }
-    }
-    let stream_order = rebon_tools_core::shell_stream_order::encode(
-        rebon_tools_core::shell_stream_order::line_streams_from_chunks(
-            events
-                .iter()
-                .map(|event| (event.stream == "stderr", event.text.as_str())),
-        ),
-    );
-    (output, stderr, stream_order)
+fn create_output_file(context: &ToolContext, shell_id: &str) -> anyhow::Result<(PathBuf, File)> {
+    let dir = output_dir(context);
+    std::fs::create_dir_all(&dir).map_err(|err| {
+        anyhow::anyhow!(
+            "could not create the background output directory `{}`: {err}",
+            dir.display()
+        )
+    })?;
+    let path = dir.join(format!("{shell_id}.output"));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "could not create the background output file `{}`: {err}",
+                path.display()
+            )
+        })?;
+    Ok((path, file))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1167,10 +1190,18 @@ impl ShellStatus {
 
 struct ShellState {
     status: ShellStatus,
-    events: VecDeque<ShellOutputEvent>,
-    buffered_bytes: usize,
-    next_cursor: u64,
-    output_truncated: bool,
+    /// The newest combined output, bounded by [`TAIL_BUFFER_BYTES`].
+    tail: String,
+    /// True once `tail` has dropped output from its front.
+    tail_dropped: bool,
+    /// A Monitor's stderr, which its completion reports.
+    stderr_tail: String,
+    output_bytes: u64,
+    /// The output file, open until a write fails or the size cap is hit.
+    file: Option<File>,
+    file_bytes: u64,
+    file_truncated: bool,
+    file_error: Option<String>,
     exit_code: Option<i32>,
     timed_out: bool,
     stop_requested: bool,
@@ -1183,16 +1214,60 @@ impl Default for ShellState {
     fn default() -> Self {
         Self {
             status: ShellStatus::Running,
-            events: VecDeque::new(),
-            buffered_bytes: 0,
-            next_cursor: 0,
-            output_truncated: false,
+            tail: String::new(),
+            tail_dropped: false,
+            stderr_tail: String::new(),
+            output_bytes: 0,
+            file: None,
+            file_bytes: 0,
+            file_truncated: false,
+            file_error: None,
             exit_code: None,
             timed_out: false,
             stop_requested: false,
             auto_stopped: false,
             error: None,
             completed_at_ms: None,
+        }
+    }
+}
+
+impl ShellState {
+    /// Append to the output file. A failed write or the size cap closes the
+    /// file for good; the shell itself carries on either way.
+    fn write_to_file(&mut self, text: &str) {
+        let Some(file) = self.file.as_mut() else {
+            return;
+        };
+        let room = OUTPUT_FILE_MAX_BYTES.saturating_sub(self.file_bytes);
+        let (chunk, hit_cap) = if text.len() as u64 > room {
+            let mut end = usize::try_from(room).unwrap_or(usize::MAX).min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            (&text[..end], true)
+        } else {
+            (text, false)
+        };
+        let written = file.write_all(chunk.as_bytes()).and_then(|()| {
+            if hit_cap {
+                file.write_all(OUTPUT_FILE_LIMIT_NOTE.as_bytes())
+            } else {
+                Ok(())
+            }
+        });
+        match written {
+            Ok(()) => {
+                self.file_bytes = self.file_bytes.saturating_add(chunk.len() as u64);
+                if hit_cap {
+                    self.file_truncated = true;
+                    self.file = None;
+                }
+            }
+            Err(err) => {
+                self.file_error = Some(format!("could not write the output file: {err}"));
+                self.file = None;
+            }
         }
     }
 }
@@ -1776,105 +1851,66 @@ mod tests {
         ToolContext::new().with_session_id(session_id)
     }
 
-    fn event(cursor: u64, stream: &'static str, text: &str) -> ShellOutputEvent {
-        ShellOutputEvent {
-            cursor,
-            stream,
-            text: text.to_string(),
-        }
-    }
-
-    /// The whole point of the sketch: feeding it back through `interleave`
-    /// with the very strings `merge_output_events` produced must reproduce
-    /// the order the chunks arrived in. This is what guards the two line
-    /// counts against drifting apart — including when a line spans chunks
-    /// or a chunk carries several lines.
     #[test]
-    fn merge_output_events_sketch_round_trips_through_interleave() {
-        use rebon_tools_core::shell_stream_order::{interleave, stream_display_lines};
+    fn response_tail_keeps_the_last_lines_on_a_line_boundary() {
+        // Short output comes back whole.
+        assert_eq!(response_tail("a\nb\n"), ("a\nb\n".to_string(), false));
+        assert_eq!(response_tail(""), (String::new(), false));
 
-        let cases: Vec<(&str, Vec<ShellOutputEvent>, Vec<&str>)> = vec![
-            (
-                "cargo shape: stderr progress before stdout results",
-                vec![
-                    event(0, "stderr", "Compiling rebon-tool\nFinished\n"),
-                    event(1, "stdout", "running 1 test\ntest result: ok.\n"),
-                ],
-                vec![
-                    "Compiling rebon-tool",
-                    "Finished",
-                    "running 1 test",
-                    "test result: ok.",
-                ],
-            ),
-            (
-                "a line split across two chunks on the same stream",
-                vec![
-                    event(0, "stdout", "par"),
-                    event(1, "stderr", "err done\n"),
-                    event(2, "stdout", "tial\n"),
-                ],
-                vec!["err done", "partial"],
-            ),
-            (
-                "alternating single lines",
-                vec![
-                    event(0, "stdout", "o1\n"),
-                    event(1, "stderr", "e1\n"),
-                    event(2, "stdout", "o2\n"),
-                ],
-                vec!["o1", "e1", "o2"],
-            ),
-            (
-                "trailing line with no final newline",
-                vec![event(0, "stderr", "warn\n"), event(1, "stdout", "no eol")],
-                vec!["warn", "no eol"],
-            ),
-            (
-                "interior blank lines are real output",
-                vec![event(0, "stderr", "e\n"), event(1, "stdout", "a\n\nb\n")],
-                vec!["e", "a", "", "b"],
-            ),
-        ];
+        // Too many lines: the newest TAIL_RESPONSE_LINES survive.
+        let many: String = (0..TAIL_RESPONSE_LINES + 20)
+            .map(|i| format!("line {i}\n"))
+            .collect();
+        let (tail, cut) = response_tail(&many);
+        assert!(cut);
+        assert_eq!(tail.lines().count(), TAIL_RESPONSE_LINES);
+        assert!(tail.starts_with("line 20\n"), "{tail:?}");
+        assert!(tail.ends_with(&format!("line {}\n", TAIL_RESPONSE_LINES + 19)));
 
-        for (label, events, expected) in cases {
-            let (output, stderr, sketch) = merge_output_events(&events);
-            let sketch = sketch.unwrap_or_else(|| panic!("{label}: expected a sketch"));
-            let merged = interleave(
-                &sketch,
-                &stream_display_lines(&output),
-                &stream_display_lines(&stderr),
-            )
-            .unwrap_or_else(|| panic!("{label}: sketch {sketch:?} failed its own count check"));
-            assert_eq!(merged, expected, "{label} (sketch {sketch:?})");
-        }
+        // Too many bytes: cut, and start on a whole line.
+        let wide: String = (0..40).map(|i| format!("{i:04}{}\n", "x".repeat(1000))).collect();
+        let (tail, cut) = response_tail(&wide);
+        assert!(cut);
+        assert!(tail.len() <= TAIL_RESPONSE_BYTES);
+        assert!(tail.ends_with("x\n"));
+        assert!(tail.as_bytes()[0].is_ascii_digit(), "starts mid-line: {tail:?}");
+
+        // One enormous line is still shown rather than dropped, cut on a
+        // character boundary.
+        let huge = "中".repeat(TAIL_RESPONSE_BYTES);
+        let (tail, cut) = response_tail(&huge);
+        assert!(cut);
+        assert!(!tail.is_empty() && tail.len() <= TAIL_RESPONSE_BYTES);
     }
 
     #[test]
-    fn merge_output_events_omits_the_sketch_when_it_adds_nothing() {
-        // Single stream — concatenation already is arrival order.
-        assert_eq!(merge_output_events(&[event(0, "stdout", "a\nb\n")]).2, None);
-        assert_eq!(merge_output_events(&[event(0, "stderr", "x\n")]).2, None);
-        // stdout entirely before stderr is exactly the fallback's shape.
+    fn push_bounded_drops_whole_characters_from_the_front() {
+        let mut buffer = String::new();
+        assert!(!push_bounded(&mut buffer, "abc", 4));
+        assert!(push_bounded(&mut buffer, "中", 4));
+        assert_eq!(buffer, "c中");
+        // Cutting one byte would split "中"; the whole character goes.
+        assert!(push_bounded(&mut buffer, "de", 4));
+        assert_eq!(buffer, "de");
+    }
+
+    #[test]
+    fn output_file_stops_at_its_cap_with_a_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sh_cap.output");
+        let mut state = ShellState {
+            file: Some(File::create(&path).unwrap()),
+            file_bytes: OUTPUT_FILE_MAX_BYTES - 3,
+            ..ShellState::default()
+        };
+        state.write_to_file("abcdef");
+        state.write_to_file("never written");
+        assert!(state.file_truncated);
+        assert!(state.file.is_none());
         assert_eq!(
-            merge_output_events(&[event(0, "stdout", "a\n"), event(1, "stderr", "x\n")]).2,
-            None
+            std::fs::read_to_string(&path).unwrap(),
+            format!("abc{OUTPUT_FILE_LIMIT_NOTE}")
         );
-        // Nothing at all.
-        assert_eq!(merge_output_events(&[]).2, None);
-    }
-
-    #[test]
-    fn merge_output_events_keeps_the_per_stream_strings_byte_exact() {
-        // The model-facing fields must not change shape just because the
-        // sketch is now computed alongside them.
-        let (output, stderr, _) = merge_output_events(&[
-            event(0, "stderr", "e1\n"),
-            event(1, "stdout", "o1\n"),
-            event(2, "stderr", "e2\n"),
-        ]);
-        assert_eq!(output, "o1\n");
-        assert_eq!(stderr, "e1\ne2\n");
     }
 
     #[derive(Default)]
@@ -2093,60 +2129,44 @@ mod tests {
         result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
-    async fn wait_for_nested_process_id(
-        registry: &ShellProcessRegistry,
-        shell_id: &str,
-    ) -> (u32, u64) {
-        let mut cursor = 0;
-        let mut output = String::new();
+    /// Read the nested process id out of the shell's output file, the way
+    /// the model reads a background shell now.
+    async fn wait_for_nested_process_id(registry: &ShellProcessRegistry, shell_id: &str) -> u32 {
+        let started = Instant::now();
         loop {
-            let update = registry
-                .output(
-                    &context("session-a"),
-                    "ShellOutput",
-                    shell_id,
-                    cursor,
-                    true,
-                    5_000,
-                )
+            let status = registry
+                .wait(&context("session-a"), "ShellOutput", shell_id, false, 0)
                 .await
                 .unwrap();
-            output.push_str(update["output"].as_str().unwrap_or(""));
-            cursor = update["nextCursor"].as_u64().unwrap();
+            let path = status["outputPath"].as_str().expect("outputPath").to_owned();
+            let output = std::fs::read_to_string(&path).unwrap_or_default();
             if let Some(rest) = output.split("CHILD_PID=").nth(1) {
                 if let Some(raw_pid) = rest
                     .split(|character: char| !character.is_ascii_digit())
                     .next()
                     .filter(|value| !value.is_empty())
                 {
-                    return (raw_pid.parse().unwrap(), cursor);
+                    return raw_pid.parse().unwrap();
                 }
             }
             assert_ne!(
-                update["completed"], true,
+                status["completed"], true,
                 "nested process id was not emitted"
             );
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "no CHILD_PID line in {path}"
+            );
+            sleep(Duration::from_millis(20)).await;
         }
     }
 
-    async fn wait_for_completion(
-        registry: &ShellProcessRegistry,
-        shell_id: &str,
-        mut cursor: u64,
-    ) -> Value {
+    async fn wait_for_completion(registry: &ShellProcessRegistry, shell_id: &str) -> Value {
         loop {
             let update = registry
-                .output(
-                    &context("session-a"),
-                    "ShellOutput",
-                    shell_id,
-                    cursor,
-                    true,
-                    5_000,
-                )
+                .wait(&context("session-a"), "ShellOutput", shell_id, true, 5_000)
                 .await
                 .unwrap();
-            cursor = update["nextCursor"].as_u64().unwrap();
             if update["completed"] == true {
                 return update;
             }
@@ -2256,8 +2276,14 @@ mod tests {
             .await
             .unwrap();
         let shell_id = started["shellId"].as_str().unwrap().to_string();
+        // With a runtime to deliver it, the launch note promises a
+        // notification.
+        assert!(started["note"]
+            .as_str()
+            .unwrap()
+            .contains("task notification"));
 
-        let completion = wait_for_completion(&registry, &shell_id, 0).await;
+        let completion = wait_for_completion(&registry, &shell_id).await;
         assert_eq!(completion["status"], "exited");
 
         let started = lock(&controller.started);
@@ -2270,7 +2296,10 @@ mod tests {
         assert_eq!(finished.len(), 1);
         assert_eq!(finished[0].shell_id, shell_id);
         assert_eq!(finished[0].status, BackgroundShellCompletionStatus::Exited);
-        assert!(finished[0].output.contains("hello"));
+        assert!(finished[0].output_tail.contains("hello"));
+        assert!(!finished[0].tail_truncated);
+        assert_eq!(finished[0].output_path, completion["outputPath"]);
+        assert!(finished[0].output_bytes > 0);
         assert!(!finished[0].observed);
         drop(finished);
 
@@ -2296,7 +2325,7 @@ mod tests {
         let shell_id = started["shellId"].as_str().unwrap().to_string();
         lock(&controller.cancels)[0].cancel();
 
-        let completion = wait_for_completion(&registry, &shell_id, 0).await;
+        let completion = wait_for_completion(&registry, &shell_id).await;
         assert_eq!(completion["status"], "stopped");
         assert_eq!(completion["stopRequested"], true);
         let finished = lock(&controller.finished);
@@ -2305,10 +2334,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_captures_incremental_output_and_completion() {
+    async fn spawn_streams_output_to_a_file_and_a_wait_returns_its_tail() {
         let _env = crate::test_env::hold_env();
         let registry = ShellProcessRegistry::new();
-        let result = registry
+        let launched = registry
             .spawn(
                 &context("session-a"),
                 configured_command(two_lines_script()),
@@ -2318,43 +2347,33 @@ mod tests {
             )
             .await
             .unwrap();
-        let shell_id = result["shellId"].as_str().unwrap();
-        let output = registry
-            .output(
-                &context("session-a"),
-                "ShellOutput",
-                shell_id,
-                0,
-                true,
-                5_000,
-            )
-            .await
-            .unwrap();
-        assert!(!output["output"].as_str().unwrap().is_empty());
+        let shell_id = launched["shellId"].as_str().unwrap();
+        let path = PathBuf::from(launched["outputPath"].as_str().expect("launch names the file"));
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            format!("{shell_id}.output")
+        );
+        let note = launched["note"].as_str().unwrap();
+        assert!(note.contains("Read") && note.contains("ShellOutput"), "{note}");
+        // The cursor fields are gone from the launch result.
+        for absent in ["oldestCursor", "endCursor", "outputTruncated"] {
+            assert!(launched.get(absent).is_none(), "{absent} in {launched}");
+        }
 
-        let mut cursor = output["nextCursor"].as_u64().unwrap();
-        let completed = loop {
-            let next = registry
-                .output(
-                    &context("session-a"),
-                    "ShellOutput",
-                    shell_id,
-                    cursor,
-                    true,
-                    5_000,
-                )
-                .await
-                .unwrap();
-            cursor = next["nextCursor"].as_u64().unwrap();
-            if next["completed"] == true {
-                break next;
-            }
-        };
+        let completed = wait_for_completion(&registry, shell_id).await;
         assert_eq!(completed["status"], "exited");
+        assert_eq!(completed["exitCode"], 0);
+        assert_eq!(completed["outputPath"], launched["outputPath"]);
+        let tail = completed["outputTail"].as_str().unwrap();
+        assert!(tail.contains("first") && tail.contains("second"), "{tail:?}");
+
+        let file = std::fs::read_to_string(&path).unwrap();
+        assert!(file.contains("first") && file.contains("second"), "{file:?}");
+        assert_eq!(completed["outputBytes"], file.len() as u64);
     }
 
     #[tokio::test]
-    async fn output_value_merges_text_and_omits_default_fields() {
+    async fn wait_result_omits_default_fields() {
         let _env = crate::test_env::hold_env();
         let registry = ShellProcessRegistry::new();
         let result = registry
@@ -2368,69 +2387,40 @@ mod tests {
             .await
             .unwrap();
         let shell_id = result["shellId"].as_str().unwrap();
-        wait_for_completion(&registry, shell_id, 0).await;
+        wait_for_completion(&registry, shell_id).await;
 
-        // Re-read the whole buffer from cursor 0 once the shell is done.
         let full = registry
-            .output(
-                &context("session-a"),
-                "ShellOutput",
-                shell_id,
-                0,
-                false,
-                100,
-            )
+            .wait(&context("session-a"), "ShellOutput", shell_id, false, 0)
             .await
             .unwrap();
-        let text = full["output"].as_str().unwrap();
-        assert!(text.contains("first"), "{text:?}");
-        assert!(text.contains("second"), "{text:?}");
         assert_eq!(full["status"], "exited");
         assert_eq!(full["completed"], true);
-        assert_eq!(full["exitCode"], 0);
         assert_eq!(full["command"], "test");
-        assert!(full["nextCursor"].as_u64().unwrap() > 0);
-
-        // The per-chunk events array and always-default flags are gone —
-        // a poll response stays compact for the model.
         let object = full.as_object().unwrap();
         for absent in [
-            "events",
+            "output",
             "stderr",
-            "requestedCursor",
-            "oldestCursor",
-            "endCursor",
+            "events",
+            "nextCursor",
             "timedOut",
             "stopRequested",
             "error",
-            "hasMore",
             "waitTimedOut",
-            "cursorTruncated",
+            "tailTruncated",
+            "outputFileTruncated",
+            "outputFileError",
         ] {
             assert!(
                 !object.contains_key(absent),
                 "`{absent}` should be omitted from {object:?}"
             );
         }
-
-        // A caught-up poll carries no `output` key at all.
-        let cursor = full["nextCursor"].as_u64().unwrap();
-        let caught_up = registry
-            .output(
-                &context("session-a"),
-                "ShellOutput",
-                shell_id,
-                cursor,
-                false,
-                100,
-            )
-            .await
-            .unwrap();
-        assert!(!caught_up.as_object().unwrap().contains_key("output"));
     }
 
+    /// stderr goes to the same file and tail, in arrival order, the way a
+    /// terminal shows it.
     #[tokio::test]
-    async fn output_value_separates_stderr_stream() {
+    async fn stderr_lands_in_the_same_file_and_tail() {
         let _env = crate::test_env::hold_env();
         let registry = ShellProcessRegistry::new();
         let result = registry
@@ -2444,24 +2434,58 @@ mod tests {
             .await
             .unwrap();
         let shell_id = result["shellId"].as_str().unwrap();
-        wait_for_completion(&registry, shell_id, 0).await;
+        let completed = wait_for_completion(&registry, shell_id).await;
+        assert!(completed["outputTail"].as_str().unwrap().contains("oops"));
+        let file = std::fs::read_to_string(completed["outputPath"].as_str().unwrap()).unwrap();
+        assert!(file.contains("oops"), "{file:?}");
+    }
 
-        let full = registry
-            .output(
-                &context("session-a"),
-                "ShellOutput",
-                shell_id,
-                0,
-                false,
-                100,
+    #[tokio::test]
+    async fn output_files_go_under_the_session_scratchpad() {
+        let _env = crate::test_env::hold_env();
+        let scratchpad = tempfile::tempdir().unwrap();
+        let registry = ShellProcessRegistry::new();
+        let launched = registry
+            .spawn(
+                &context("session-a").with_scratchpad_dir(scratchpad.path()),
+                configured_command(one_line_script()),
+                "Bash",
+                "test".into(),
+                None,
             )
             .await
             .unwrap();
-        assert!(full["stderr"].as_str().unwrap().contains("oops"));
-        assert!(
-            !full.as_object().unwrap().contains_key("output"),
-            "stderr-only shells must not fabricate a stdout `output` field: {full:?}"
-        );
+        let path = PathBuf::from(launched["outputPath"].as_str().unwrap());
+        assert_eq!(path.parent().unwrap(), scratchpad.path().join("shells"));
+        wait_for_completion(&registry, launched["shellId"].as_str().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn output_file_is_removed_once_the_registry_forgets_the_shell() {
+        let _env = crate::test_env::hold_env();
+        let registry = ShellProcessRegistry::new();
+        let launched = registry
+            .spawn(
+                &context("session-a"),
+                configured_command(one_line_script()),
+                "Bash",
+                "test".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        let path = PathBuf::from(launched["outputPath"].as_str().unwrap());
+        wait_for_completion(&registry, launched["shellId"].as_str().unwrap()).await;
+        assert!(path.exists());
+
+        drop(registry);
+        for _ in 0..100 {
+            if !path.exists() {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("{} outlived its shell", path.display());
     }
 
     #[tokio::test]
@@ -2480,7 +2504,7 @@ mod tests {
             .unwrap();
         let shell_id = result["shellId"].as_str().unwrap();
         let error = registry
-            .output(&context("session-b"), "ShellOutput", shell_id, 0, false, 1)
+            .wait(&context("session-b"), "ShellOutput", shell_id, false, 1)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("unknown shellId"));
@@ -2510,17 +2534,7 @@ mod tests {
         assert_eq!(first["alreadyRequested"], false);
         assert_eq!(second["alreadyRequested"], true);
 
-        let completed = registry
-            .output(
-                &context("session-a"),
-                "ShellOutput",
-                shell_id,
-                0,
-                true,
-                5_000,
-            )
-            .await
-            .unwrap();
+        let completed = wait_for_completion(&registry, shell_id).await;
         assert_eq!(completed["status"], "stopped");
     }
 
@@ -2539,17 +2553,7 @@ mod tests {
             .await
             .unwrap();
         let shell_id = result["shellId"].as_str().unwrap();
-        let completed = registry
-            .output(
-                &context("session-a"),
-                "ShellOutput",
-                shell_id,
-                0,
-                true,
-                5_000,
-            )
-            .await
-            .unwrap();
+        let completed = wait_for_completion(&registry, shell_id).await;
         assert_eq!(completed["status"], "timed_out");
         assert_eq!(completed["timedOut"], true);
     }
@@ -2616,23 +2620,66 @@ mod tests {
             .unwrap();
         let shell_id = result["shellId"].as_str().unwrap();
         let output = registry
-            .output(&context("session-a"), "ShellOutput", shell_id, 0, true, 25)
+            .wait(&context("session-a"), "ShellOutput", shell_id, true, 25)
             .await
             .unwrap();
         assert_eq!(output["waitTimedOut"], true);
         assert_eq!(output["status"], "running");
+        assert_eq!(output["completed"], false);
         registry
             .stop(&context("session-a"), "ShellStop", shell_id)
             .unwrap();
-        let completed = wait_for_completion(&registry, shell_id, 0).await;
+        let completed = wait_for_completion(&registry, shell_id).await;
         assert_eq!(completed["status"], "stopped");
     }
 
-    /// A wait on a process that prints steadily must last until its deadline
-    /// and hand back everything printed meanwhile. Returning on the first
-    /// chunk made each wait on a build a model round-trip every few seconds.
+    /// A wait while the process is running tells the tool card which
+    /// command it is waiting on, before any result exists.
     #[tokio::test]
-    async fn output_wait_collects_until_the_deadline_instead_of_the_first_chunk() {
+    async fn wait_reports_the_command_it_waits_on_as_progress() {
+        let _env = crate::test_env::hold_env();
+        let registry = ShellProcessRegistry::new();
+        let result = registry
+            .spawn(
+                &context("session-a"),
+                configured_command(long_running_script()),
+                "PowerShell",
+                "cargo build --release".into(),
+                None,
+            )
+            .await
+            .unwrap();
+        let shell_id = result["shellId"].as_str().unwrap();
+        let (progress_context, mut progress) = context("session-a").with_progress("toolu_wait");
+        registry
+            .wait(&progress_context, "ShellOutput", shell_id, true, 25)
+            .await
+            .unwrap();
+        let update = progress.try_recv().expect("a wait emits progress");
+        assert_eq!(update.kind, "shell_wait");
+        let payload = update.payload.unwrap();
+        assert_eq!(payload["command"], "cargo build --release");
+        assert_eq!(payload["waiting"], true);
+        assert_eq!(payload["waitTimeoutMs"], 25);
+
+        // A status check does not block, so it has nothing to announce.
+        registry
+            .wait(&progress_context, "ShellOutput", shell_id, false, 25)
+            .await
+            .unwrap();
+        assert!(progress.try_recv().is_err());
+
+        registry
+            .stop(&context("session-a"), "ShellStop", shell_id)
+            .unwrap();
+        wait_for_completion(&registry, shell_id).await;
+    }
+
+    /// A wait on a process that prints steadily must last until its deadline,
+    /// not return on new output. Returning on the first chunk made each wait
+    /// on a build a model round-trip every few seconds.
+    #[tokio::test]
+    async fn wait_lasts_until_the_deadline_instead_of_the_first_chunk() {
         let _env = crate::test_env::hold_env();
         let registry = ShellProcessRegistry::new();
         let result = registry
@@ -2650,16 +2697,18 @@ mod tests {
         // Start the timed wait once the process is demonstrably printing, so
         // a slow shell start-up cannot eat the window under test.
         let started = tokio::time::Instant::now();
-        let cursor = loop {
+        let ticks_before = loop {
             let poll = registry
-                .output(&context("session-a"), "ShellOutput", shell_id, 0, false, 0)
+                .wait(&context("session-a"), "ShellOutput", shell_id, false, 0)
                 .await
                 .unwrap();
-            if poll["output"]
+            let ticks = poll["outputTail"]
                 .as_str()
-                .is_some_and(|out| out.contains("tick"))
-            {
-                break poll["nextCursor"].as_u64().unwrap();
+                .unwrap_or("")
+                .matches("tick")
+                .count();
+            if ticks > 0 {
+                break ticks;
             }
             assert!(
                 started.elapsed() < Duration::from_secs(20),
@@ -2670,14 +2719,7 @@ mod tests {
 
         let waited = tokio::time::Instant::now();
         let output = registry
-            .output(
-                &context("session-a"),
-                "ShellOutput",
-                shell_id,
-                cursor,
-                true,
-                1_500,
-            )
+            .wait(&context("session-a"), "ShellOutput", shell_id, true, 1_500)
             .await
             .unwrap();
         let elapsed = waited.elapsed();
@@ -2687,20 +2729,20 @@ mod tests {
             elapsed >= Duration::from_millis(1_400),
             "returned after {elapsed:?}"
         );
-        let ticks = output["output"]
+        let ticks = output["outputTail"]
             .as_str()
             .unwrap_or("")
             .matches("tick")
             .count();
         assert!(
-            ticks >= 3,
+            ticks >= ticks_before + 3,
             "expected the ticks printed during the wait: {output}"
         );
 
         registry
             .stop(&context("session-a"), "ShellStop", shell_id)
             .unwrap();
-        wait_for_completion(&registry, shell_id, 0).await;
+        wait_for_completion(&registry, shell_id).await;
     }
 
     #[tokio::test]
@@ -2718,13 +2760,13 @@ mod tests {
             .await
             .unwrap();
         let shell_id = result["shellId"].as_str().unwrap();
-        let (nested_process_id, cursor) = wait_for_nested_process_id(&registry, shell_id).await;
+        let nested_process_id = wait_for_nested_process_id(&registry, shell_id).await;
         assert!(process_is_alive(nested_process_id));
 
         registry
             .stop(&context("session-a"), "ShellStop", shell_id)
             .unwrap();
-        let completed = wait_for_completion(&registry, shell_id, cursor).await;
+        let completed = wait_for_completion(&registry, shell_id).await;
         assert_eq!(completed["status"], "stopped");
         assert_process_exits(nested_process_id).await;
     }
@@ -2744,7 +2786,7 @@ mod tests {
             .await
             .unwrap();
         let shell_id = result["shellId"].as_str().unwrap();
-        let (nested_process_id, _) = wait_for_nested_process_id(&registry, shell_id).await;
+        let nested_process_id = wait_for_nested_process_id(&registry, shell_id).await;
         assert!(process_is_alive(nested_process_id));
 
         drop(registry);
@@ -2818,7 +2860,7 @@ mod tests {
 
         for wait in [false, true] {
             match registry
-                .output(&context, "ShellOutput", &task_id, 0, wait, 1_000)
+                .wait(&context, "ShellOutput", &task_id, wait, 1_000)
                 .await
                 .unwrap_err()
             {
@@ -2909,8 +2951,13 @@ mod tests {
         assert_eq!(completion.status, MonitorTaskCompletionStatus::AutoStopped);
     }
 
+    /// Output past the in-memory tail is still all in the file, and the
+    /// result says the tail is only the end of it.
     #[test]
-    fn output_ring_reports_stale_cursors() {
+    fn long_output_keeps_everything_in_the_file_and_flags_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sh_test.output");
+        let file = File::create(&path).unwrap();
         let process_tree = Arc::new(ProcessTreeControl::finished_without_a_tree());
         let entry = ShellEntry::new(
             "sh_test".into(),
@@ -2925,13 +2972,24 @@ mod tests {
             None,
             PromptCancel::new(),
             ShellTaskRegistration::BackgroundShell,
+            Some((path.clone(), file)),
         );
-        for _ in 0..140 {
-            entry.push_output("stdout", "x".repeat(READ_CHUNK_BYTES));
+        let line = format!("{}\n", "x".repeat(99));
+        let chunks = 140 * READ_CHUNK_BYTES / line.len();
+        for _ in 0..chunks {
+            entry.push_output("stdout", line.clone());
         }
-        let snapshot = entry.output_snapshot(0, "ShellOutput").unwrap();
-        assert!(snapshot.cursor_truncated);
-        assert!(snapshot.oldest_cursor > 0);
-        assert!(snapshot.has_more);
+        let (value, completed) = entry.result_value(false);
+        assert!(!completed);
+        assert_eq!(value["tailTruncated"], true);
+        assert_eq!(value["outputBytes"], (chunks * line.len()) as u64);
+        assert!(value["outputTail"].as_str().unwrap().len() <= TAIL_RESPONSE_BYTES);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (chunks * line.len()) as u64
+        );
+
+        drop(entry);
+        assert!(!path.exists(), "the file goes with its entry");
     }
 }

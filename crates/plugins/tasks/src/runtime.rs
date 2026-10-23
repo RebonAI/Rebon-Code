@@ -1750,14 +1750,11 @@ impl TaskRuntimeController for TaskRegistryRuntimeController {
             status,
             completed_at_ms,
             exit_code,
-            output,
-            stderr,
-            stream_order,
+            output_tail,
+            tail_truncated,
+            output_path,
+            output_bytes,
             error,
-            next_cursor,
-            has_more,
-            cursor_truncated,
-            oldest_cursor,
             observed,
         } = completion;
         let id = TaskId::new(shell_id.clone());
@@ -1784,28 +1781,24 @@ impl TaskRuntimeController for TaskRegistryRuntimeController {
                 error.or_else(|| Some("background shell failed".to_string())),
             ),
         };
-        let last_progress = shell_progress_tail(if output.is_empty() { &stderr } else { &output });
+        let last_progress = shell_progress_tail(&output_tail);
+        // Mirrors the `ShellOutput` result shape, so one renderer reads both.
         let mut result = serde_json::Map::new();
         result.insert("shellId".into(), Value::String(shell_id));
         result.insert("status".into(), Value::String(status.as_str().to_string()));
         result.insert("completed".into(), Value::Bool(true));
-        result.insert("nextCursor".into(), Value::from(next_cursor));
         if let Some(exit_code) = exit_code {
             result.insert("exitCode".into(), Value::from(exit_code));
         }
-        if !output.is_empty() {
-            result.insert("output".into(), Value::String(output));
+        if !output_path.is_empty() {
+            result.insert("outputPath".into(), Value::String(output_path));
         }
-        if !stderr.is_empty() {
-            result.insert("stderr".into(), Value::String(stderr));
+        result.insert("outputBytes".into(), Value::from(output_bytes));
+        if !output_tail.is_empty() {
+            result.insert("outputTail".into(), Value::String(output_tail));
         }
-        // Mirrors the `ShellOutput` poll shape so the finished card replays
-        // the same arrival order the live polls did.
-        if let Some(sketch) = stream_order {
-            result.insert(
-                rebon_tools_core::shell_stream_order::STREAM_ORDER_KEY.into(),
-                Value::String(sketch),
-            );
+        if tail_truncated {
+            result.insert("tailTruncated".into(), Value::Bool(true));
         }
         if let Some(error) = error.as_ref() {
             result.insert("error".into(), Value::String(error.clone()));
@@ -1815,14 +1808,6 @@ impl TaskRuntimeController for TaskRegistryRuntimeController {
         }
         if status == BackgroundShellCompletionStatus::Stopped {
             result.insert("stopRequested".into(), Value::Bool(true));
-        }
-        if has_more {
-            result.insert("hasMore".into(), Value::Bool(true));
-        }
-        if cursor_truncated {
-            result.insert("cursorTruncated".into(), Value::Bool(true));
-            result.insert("oldestCursor".into(), Value::from(oldest_cursor));
-            result.insert("requestedCursor".into(), Value::from(0));
         }
         registry.update(&id, |snapshot| {
             snapshot.status = task_status;
@@ -3384,43 +3369,30 @@ fn build_local_shell_notification_xml(snap: &TaskSnapshot) -> String {
     if let Some(exit_code) = exit_code {
         message.push_str(&format!("\n<exit-code>{exit_code}</exit-code>"));
     }
-    for (json_key, xml_key) in [
-        ("output", "output"),
-        ("stderr", "stderr"),
-        ("error", "error"),
-    ] {
-        if let Some(text) = result
-            .and_then(|value| value.get(json_key))
+    let result_text = |key: &str| {
+        result
+            .and_then(|value| value.get(key))
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
-        {
-            message.push_str(&format!("\n<{xml_key}>{}</{xml_key}>", xml_escape(text)));
-        }
+    };
+    if let Some(error) = result_text("error") {
+        message.push_str(&format!("\n<error>{}</error>", xml_escape(error)));
     }
-    if result
-        .and_then(|value| value.get("cursorTruncated"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        message.push_str("\n<cursor-truncated>true</cursor-truncated>");
-        if let Some(oldest_cursor) = result
-            .and_then(|value| value.get("oldestCursor"))
-            .and_then(Value::as_u64)
-        {
-            message.push_str(&format!("\n<oldest-cursor>{oldest_cursor}</oldest-cursor>"));
-        }
+    let output_path = result_text("outputPath");
+    if let Some(path) = output_path {
+        message.push_str(&format!("\n<output-file>{}</output-file>", xml_escape(path)));
     }
-    if result
-        .and_then(|value| value.get("hasMore"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        message.push_str("\n<has-more>true</has-more>");
-        if let Some(next_cursor) = result
-            .and_then(|value| value.get("nextCursor"))
-            .and_then(Value::as_u64)
-        {
-            message.push_str(&format!("\n<next-cursor>{next_cursor}</next-cursor>"));
+    if let Some(tail) = result_text("outputTail") {
+        message.push_str(&format!("\n<output-tail>{}</output-tail>", xml_escape(tail)));
+        let tail_truncated = result
+            .and_then(|value| value.get("tailTruncated"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if tail_truncated && output_path.is_some() {
+            message.push_str(
+                "\n<note>Only the end of the output is shown. Read output-file for the rest, \
+                 or Grep it.</note>",
+            );
         }
     }
     if let Some(duration_ms) = snap
@@ -5672,14 +5644,11 @@ mod tests {
                 status: BackgroundShellCompletionStatus::Exited,
                 completed_at_ms: 52,
                 exit_code: Some(101),
-                output: "checking".into(),
-                stderr: "type error".into(),
-                stream_order: None,
+                output_tail: "checking\ntype error".into(),
+                tail_truncated: true,
+                output_path: "/tmp/shells/sh_test.output".into(),
+                output_bytes: 4096,
                 error: None,
-                next_cursor: 2,
-                has_more: false,
-                cursor_truncated: true,
-                oldest_cursor: 4,
                 observed: false,
             },
         );
@@ -5704,10 +5673,12 @@ mod tests {
         assert!(message.contains("<task-type>local_shell</task-type>"));
         assert!(message.contains("<shell-id>sh_test</shell-id>"));
         assert!(message.contains("<exit-code>101</exit-code>"));
-        assert!(message.contains("<output>checking</output>"));
-        assert!(message.contains("<stderr>type error</stderr>"));
-        assert!(message.contains("<cursor-truncated>true</cursor-truncated>"));
-        assert!(message.contains("<oldest-cursor>4</oldest-cursor>"));
+        assert!(message.contains("<output-file>/tmp/shells/sh_test.output</output-file>"));
+        assert!(message.contains("<output-tail>checking\ntype error</output-tail>"));
+        assert!(message.contains("Read output-file for the rest"));
+        // The notification no longer points the model at cursor reads.
+        assert!(!message.contains("cursor"), "{message}");
+        assert_eq!(finished.result.as_ref().unwrap()["outputBytes"], 4096);
 
         controller.background_shell_observed("session-a", "sh_test");
         assert!(registry
@@ -5747,14 +5718,11 @@ mod tests {
                 status: BackgroundShellCompletionStatus::Exited,
                 completed_at_ms: 20,
                 exit_code: Some(0),
-                output: "ok".into(),
-                stderr: String::new(),
-                stream_order: None,
+                output_tail: "ok".into(),
+                tail_truncated: false,
+                output_path: "/tmp/shells/sh_shared.output".into(),
+                output_bytes: 2,
                 error: None,
-                next_cursor: 1,
-                has_more: false,
-                cursor_truncated: false,
-                oldest_cursor: 0,
                 observed: false,
             },
         );
@@ -5813,14 +5781,11 @@ mod tests {
                     status: shell_status,
                     completed_at_ms: 20,
                     exit_code,
-                    output: String::new(),
-                    stderr: String::new(),
-                    stream_order: None,
+                    output_tail: String::new(),
+                    tail_truncated: false,
+                    output_path: String::new(),
+                    output_bytes: 0,
                     error: None,
-                    next_cursor: 0,
-                    has_more: false,
-                    cursor_truncated: false,
-                    oldest_cursor: 0,
                     observed: false,
                 },
             );

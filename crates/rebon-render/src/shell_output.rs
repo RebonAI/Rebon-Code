@@ -54,10 +54,11 @@ pub fn shell_management_body_lines_from_value(
 }
 
 /// Header summary override for `ShellOutput` / `ShellStop`: the command
-/// that originally started the shell (echoed back in the tool result),
-/// which reads far better than the opaque shellId. Returns `None` while
-/// no result is available yet — or for older transcripts whose results
-/// carry no `command` — so callers keep their input-based summary.
+/// that originally started the shell (echoed back in the tool result, and
+/// in the progress a wait sends while it blocks), which reads far better
+/// than the opaque shellId. Returns `None` while neither is available — or
+/// for older transcripts whose results carry no `command` — so callers keep
+/// their input-based summary.
 pub fn shell_management_header_summary(
     tool_name: &str,
     raw_output: &HashMap<String, Value>,
@@ -108,7 +109,26 @@ fn shell_management_body_lines_impl(
             if let Some(shells) = result.get("shells").and_then(Value::as_array) {
                 return Some(shell_list_lines(shells));
             }
+            // The progress payload a wait sends while it blocks.
+            if flag(result, "waiting") {
+                let mut line = "waiting for it to exit".to_string();
+                if let Some(timeout_ms) = result.get("waitTimeoutMs").and_then(Value::as_u64) {
+                    line.push_str(&format!(" · up to {}", format_wait(timeout_ms)));
+                }
+                return Some(vec![line]);
+            }
             let status = result.get("status").and_then(Value::as_str)?;
+            // Current results carry the end of the combined output; the
+            // full text is in the file at `outputPath`.
+            if let Some(tail) = result.get("outputTail").and_then(Value::as_str) {
+                let mut lines = vec![shell_wait_status_line(status, result, tail.is_empty())];
+                lines.extend(text_block_lines(tail));
+                return Some(lines);
+            }
+            if result.get("outputPath").is_some() {
+                return Some(vec![shell_wait_status_line(status, result, true)]);
+            }
+            // Older transcripts: per-stream text read by cursor.
             let (output, stderr) = stream_texts(result);
             let mut lines = vec![shell_output_status_line(
                 status,
@@ -192,6 +212,38 @@ fn shell_output_status_line(status: &str, result: ResultObject<'_>, no_new_outpu
         line.push_str(" · earlier output dropped");
     }
     line
+}
+
+/// Leading status line for a wait result.
+fn shell_wait_status_line(status: &str, result: ResultObject<'_>, no_output: bool) -> String {
+    let mut line = status_label(status, result.get("exitCode").and_then(Value::as_i64));
+    if let Some(error) = result
+        .get("error")
+        .and_then(Value::as_str)
+        .map(first_line)
+        .filter(|error| !error.is_empty())
+    {
+        line.push_str(&format!(" · {error}"));
+    }
+    if flag(result, "waitTimedOut") {
+        line.push_str(" · wait timed out");
+    }
+    if no_output {
+        line.push_str(" · no output");
+    } else if flag(result, "tailTruncated") {
+        line.push_str(" · end of output");
+    }
+    line
+}
+
+/// `45s`, `5m`, `2m 30s`.
+fn format_wait(timeout_ms: u64) -> String {
+    let seconds = timeout_ms.div_ceil(1000);
+    match (seconds / 60, seconds % 60) {
+        (0, s) => format!("{s}s"),
+        (m, 0) => format!("{m}m"),
+        (m, s) => format!("{m}m {s}s"),
+    }
 }
 
 fn shell_stop_status_line(status: &str, result: ResultObject<'_>) -> String {
@@ -458,6 +510,72 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn wait_result_shows_status_then_the_output_tail() {
+        let lines = lines_for(
+            "ShellOutput",
+            json!({
+                "shellId": "sh_1",
+                "command": "cargo test",
+                "status": "exited",
+                "completed": true,
+                "exitCode": 101,
+                "outputPath": "/tmp/shells/sh_1.output",
+                "outputBytes": 90000,
+                "outputTail": "test a ... FAILED\ntest result: FAILED\n",
+                "tailTruncated": true
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "exited (code 101) · end of output",
+                "test a ... FAILED",
+                "test result: FAILED",
+            ]
+        );
+    }
+
+    #[test]
+    fn wait_result_that_timed_out_says_so() {
+        let lines = lines_for(
+            "ShellOutput",
+            json!({
+                "status": "running",
+                "completed": false,
+                "waitTimedOut": true,
+                "outputPath": "/tmp/shells/sh_1.output",
+                "outputBytes": 0
+            }),
+        )
+        .unwrap();
+        assert_eq!(lines, vec!["running · wait timed out · no output"]);
+    }
+
+    /// While a wait blocks, its card shows what it is doing and, through the
+    /// header, which command it waits on.
+    #[test]
+    fn wait_in_progress_names_the_command_and_the_limit() {
+        let progress = json!({
+            "shellId": "sh_1",
+            "command": "cargo build --release",
+            "status": "running",
+            "waiting": true,
+            "waitTimeoutMs": 300000
+        });
+        assert_eq!(
+            lines_for("ShellOutput", progress.clone()).unwrap(),
+            vec!["waiting for it to exit · up to 5m"]
+        );
+        assert_eq!(
+            shell_management_header_summary_from_value("ShellOutput", &progress).as_deref(),
+            Some("cargo build --release")
+        );
+        assert_eq!(format_wait(90_000), "1m 30s");
+        assert_eq!(format_wait(5_000), "5s");
     }
 
     #[test]

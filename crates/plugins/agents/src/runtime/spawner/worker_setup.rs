@@ -556,6 +556,11 @@ impl EngineSubAgentSpawner {
         child_context = child_context
             .with_path_scope_roots(path_scope_roots)
             .with_auto_approved_write_roots(auto_approved_write_roots);
+        // Background shells write their output files here, inside the
+        // worker's read scope.
+        if let Some(root) = scratchpad_root {
+            child_context = child_context.with_scratchpad_dir(root.clone());
+        }
         if is_verification_agent {
             child_context = child_context.with_write_scope_roots(
                 scratchpad_root
