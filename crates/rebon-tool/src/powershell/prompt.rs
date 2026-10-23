@@ -118,12 +118,13 @@ const EXECUTION_NOTES: &str = "Usage notes:\n\
  - The `command` argument is required. `description` is a short active-voice summary shown to \
 the user in the approval prompt.\n\
  - `timeout` is in milliseconds (default 60000, max 600000). Set `run_in_background: true` for \
-a long-running command instead of raising the timeout: the call returns a `shellId` \
-immediately; keep working instead of polling. To block until it finishes, make one \
-ShellOutput call with wait=true and a long timeout (up to 300000 ms), which returns when the \
-process exits; ShellStop terminates it. To react to a stream of events or wait for an \
-external condition, load the deferred Monitor tool with ToolSearch instead of polling a \
-background shell with ShellOutput.\n\
+a long-running command instead of raising the timeout: the call returns a `shellId` and an \
+`outputPath` immediately; keep working instead of polling. The output streams to the file at \
+`outputPath`: read it with Read or search it with Grep, at any time. To block until it \
+finishes, make one ShellOutput call with its shellId and a long timeout (up to 300000 ms); it \
+returns the exit status and the last lines of output. ShellStop terminates it. To react to a \
+stream of events or wait for an external condition, load the deferred Monitor tool with \
+ToolSearch instead of re-reading a background shell's output.\n\
  - Environment changes do not persist between calls — each call is a fresh `-NoProfile` \
 process. Anything that must apply to a later command has to be repeated in that command. The \
 one common case worth doing inline is an MSVC environment: import the module and call the \
@@ -166,8 +167,9 @@ pub fn build_model_description(edition: PowerShellEdition) -> String {
          {chaining} Spawned with `-NoProfile -NonInteractive` and no stdin, so interactive \
          cmdlets (`Read-Host`, `Get-Credential`) will fail — pass `-Confirm:$false` to \
          destructive cmdlets. Supports `timeout` in milliseconds (up to 600000) and \
-         `run_in_background`; background calls return a `shellId` for ShellOutput/ShellStop; \
-         do not poll them: one ShellOutput wait with a long timeout blocks until exit. For event streams or waiting on \
+         `run_in_background`; background calls return a `shellId` and an `outputPath` whose \
+         file you read with Read or Grep; do not poll them: one ShellOutput call with the \
+         shellId and a long timeout blocks until exit. For event streams or waiting on \
          an external condition, load the deferred Monitor tool with ToolSearch."
     )
 }

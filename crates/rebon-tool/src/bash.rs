@@ -84,12 +84,13 @@ commands fail.\n\
 /// Describes the `run_in_background` parameter.
 const BASH_BACKGROUND_USAGE_NOTE: &str = " - Use `run_in_background` for long-running commands \
 you want to watch (builds, test suites, dev servers you will read output from) without appending '&'. \
-The call returns a `shellId` immediately; keep working instead of polling. To block until it \
-finishes, make one ShellOutput call with wait=true and a long timeout (up to 300000 ms), which \
-returns when the process exits. Use ShellOutput to list shells or read incremental output you \
-need, and use ShellStop to terminate the process tree. To react to a stream of events (log lines, \
-status changes) or wait for an external condition, load the deferred Monitor tool with ToolSearch \
-instead of polling a background shell with ShellOutput. Background shells are killed when the session ends and are not persisted across Rebon \
+The call returns a `shellId` and an `outputPath` immediately; keep working instead of polling. \
+The output streams to the file at `outputPath`: read it with Read or search it with Grep, at any \
+time. To block until the process exits, make one ShellOutput call with its shellId and a long \
+timeout (up to 300000 ms); it returns the exit status and the last lines of output. ShellStop \
+terminates the process tree. To react to a stream of events (log lines, status changes) or wait \
+for an external condition, load the deferred Monitor tool with ToolSearch instead of re-reading a \
+background shell's output. Background shells are killed when the session ends and are not persisted across Rebon \
 restarts. If a process must outlive this session — a server or daemon that will be checked after you \
 finish — do NOT use `run_in_background`; start it detached from a normal foreground call instead, \
 e.g. `nohup <cmd> >/dev/null 2>&1 &` (or `setsid <cmd> >/dev/null 2>&1 &`), then verify it is up.";
@@ -222,11 +223,12 @@ const BASH_MODEL_DESCRIPTION: &str = "Executes a given bash command and returns 
 \n\
 Use this for system commands and terminal operations that require shell execution. Prefer \
 dedicated file/search/edit tools when available. Supports `timeout` in milliseconds (up to \
-600000) and `run_in_background` for long-running commands. Background calls return a `shellId`; \
-do not poll them. To block until one finishes, make one ShellOutput call with wait=true and a \
-long timeout (up to 300000 ms); use ShellStop to terminate them. To react to a stream of events (log lines, status \
+600000) and `run_in_background` for long-running commands. Background calls return a `shellId` \
+and an `outputPath`; the output streams to that file, so read it with Read or Grep instead of \
+polling. To block until one finishes, make one ShellOutput call with its shellId and a long \
+timeout (up to 300000 ms); use ShellStop to terminate them. To react to a stream of events (log lines, status \
 changes) or wait for an external condition, load the deferred Monitor tool with ToolSearch \
-instead of polling a background shell with ShellOutput.";
+instead of re-reading a background shell's output.";
 
 impl BashTool {
     pub fn new() -> Self {
@@ -1381,31 +1383,23 @@ mod tests {
             .unwrap();
         let shell_id = started["shellId"].as_str().unwrap().to_owned();
         assert_eq!(started["timeoutMs"], Value::Null);
+        let output_path = started["outputPath"].as_str().unwrap().to_owned();
 
-        let mut cursor = 0;
-        let mut output = String::new();
-        loop {
+        // The call models write: a timeout and no `wait`.
+        let completed = loop {
             let update = crate::ShellOutputTool
-                .call(
-                    json!({
-                        "shellId": shell_id,
-                        "cursor": cursor,
-                        "wait": true,
-                        "timeout": 5_000
-                    }),
-                    &context,
-                )
+                .call(json!({ "shellId": shell_id, "timeout": 5_000 }), &context)
                 .await
                 .unwrap();
-            output.push_str(update["output"].as_str().unwrap_or(""));
-            cursor = update["nextCursor"].as_u64().unwrap();
             if update["completed"] == true {
-                break;
+                break update;
             }
-        }
+        };
 
-        assert!(output.contains("first"));
-        assert!(output.contains("second"));
+        let tail = completed["outputTail"].as_str().unwrap();
+        assert!(tail.contains("first") && tail.contains("second"), "{tail:?}");
+        let file = std::fs::read_to_string(&output_path).unwrap();
+        assert!(file.contains("first") && file.contains("second"), "{file:?}");
     }
 
     #[tokio::test]
@@ -1513,7 +1507,8 @@ mod tests {
     fn description_contains_background_usage_note() {
         let desc = BashTool::new().description;
         assert!(desc.contains("run_in_background"));
-        assert!(desc.contains("returns a `shellId` immediately"));
+        assert!(desc.contains("returns a `shellId` and an `outputPath` immediately"));
+        assert!(desc.contains("read it with Read"));
         assert!(desc.contains("without appending '&'"));
         assert!(desc.contains("ShellOutput"));
         assert!(desc.contains("ShellStop"));

@@ -1000,31 +1000,24 @@ mod tests {
         let shell_id = started["shellId"].as_str().unwrap().to_owned();
         assert_eq!(started["timeoutMs"], Value::Null);
 
-        let mut cursor = 0;
-        let mut output = String::new();
-        loop {
+        let output_path = started["outputPath"].as_str().unwrap().to_owned();
+        let completed = loop {
             let update = crate::ShellOutputTool
-                .call(
-                    json!({
-                        "shellId": shell_id,
-                        "cursor": cursor,
-                        "wait": true,
-                        "timeout": 5_000
-                    }),
-                    &context,
-                )
+                .call(json!({ "shellId": shell_id, "timeout": 5_000 }), &context)
                 .await
                 .unwrap();
-            output.push_str(update["output"].as_str().unwrap_or(""));
-            cursor = update["nextCursor"].as_u64().unwrap();
             if update["completed"] == true {
-                break;
+                break update;
             }
-        }
+        };
 
+        let output = completed["outputTail"].as_str().unwrap();
         assert!(output.contains("first"));
         assert!(output.contains("成功"), "{output:?}");
         assert!(output.contains("second"));
+        // The file holds the decoded text, UTF-8, not the console code page.
+        let file = std::fs::read_to_string(&output_path).unwrap();
+        assert!(file.contains("成功"), "{file:?}");
     }
 
     #[cfg(windows)]

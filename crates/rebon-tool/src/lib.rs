@@ -442,18 +442,15 @@ pub struct BackgroundShellTaskCompletion {
     pub status: BackgroundShellCompletionStatus,
     pub completed_at_ms: u64,
     pub exit_code: Option<i32>,
-    pub output: String,
-    pub stderr: String,
-    /// `shell_stream_order` sketch describing how `output` and `stderr`
-    /// interleaved, so the completed card can be rendered in arrival
-    /// order instead of stdout-then-stderr. `None` when the two did not
-    /// genuinely interleave (the sketch would say nothing new).
-    pub stream_order: Option<String>,
+    /// The end of the combined stdout/stderr, in the order it arrived.
+    pub output_tail: String,
+    /// True when `output_tail` is not the whole output.
+    pub tail_truncated: bool,
+    /// The file holding the full output.
+    pub output_path: String,
+    /// Total bytes of output the shell produced.
+    pub output_bytes: u64,
     pub error: Option<String>,
-    pub next_cursor: u64,
-    pub has_more: bool,
-    pub cursor_truncated: bool,
-    pub oldest_cursor: u64,
     pub observed: bool,
 }
 
@@ -886,6 +883,12 @@ pub struct CoordinatorContext {
     pub report_paths: Vec<PathBuf>,
 }
 
+/// The session scratchpad, carried in the [`Extensions`] bag.
+#[derive(Clone, Default)]
+struct ScratchpadContext {
+    dir: Option<PathBuf>,
+}
+
 /// Auto-mode classifier state carried in the [`Extensions`] bag.
 #[derive(Clone, Default)]
 pub struct AutoModeContext {
@@ -1274,6 +1277,18 @@ impl ToolContext {
 
     pub fn auto_approved_write_roots(&self) -> &[PathBuf] {
         &self.auto_approved_write_roots
+    }
+
+    /// The session scratchpad directory. Background shells write their
+    /// output files under it, so the model can Read them without a prompt.
+    pub fn with_scratchpad_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        self.update_extension::<ScratchpadContext>(|scratchpad| scratchpad.dir = Some(dir));
+        self
+    }
+
+    pub fn scratchpad_dir(&self) -> Option<&std::path::Path> {
+        self.extension::<ScratchpadContext>()?.dir.as_deref()
     }
 
     /// Attach a [`SubAgentSpawner`] — used by `AgentTool` to

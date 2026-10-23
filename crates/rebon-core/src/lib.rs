@@ -1651,21 +1651,17 @@ mod tests {
             .unwrap();
         let shell_id = started["shellId"].as_str().unwrap().to_owned();
         assert_eq!(started["timeoutMs"], Value::Null);
+        let output_path = started["outputPath"].as_str().unwrap().to_owned();
 
-        let output = engine
-            .invoke_tool(
-                "ShellOutput",
-                json!({
-                    "shellId": shell_id,
-                    "cursor": 0,
-                    "wait": true,
-                    "timeout": 5_000
-                }),
-                &context,
-            )
-            .await
-            .unwrap();
-        assert!(output["output"].as_str().unwrap().contains("ready"));
+        // The output is read from the file, as the model reads it with Read.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !std::fs::read_to_string(&output_path)
+            .unwrap_or_default()
+            .contains("ready")
+        {
+            assert!(std::time::Instant::now() < deadline, "no `ready` in {output_path}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
 
         let stopped = engine
             .invoke_tool("ShellStop", json!({ "shellId": shell_id }), &context)
@@ -1673,27 +1669,21 @@ mod tests {
             .unwrap();
         assert_eq!(stopped["stopRequested"], true);
 
-        let mut cursor = output["nextCursor"].as_u64().unwrap();
         let completed = loop {
             let next = engine
                 .invoke_tool(
                     "ShellOutput",
-                    json!({
-                        "shellId": shell_id,
-                        "cursor": cursor,
-                        "wait": true,
-                        "timeout": 5_000
-                    }),
+                    json!({ "shellId": shell_id, "timeout": 5_000 }),
                     &context,
                 )
                 .await
                 .unwrap();
-            cursor = next["nextCursor"].as_u64().unwrap();
             if next["completed"] == true {
                 break next;
             }
         };
         assert_eq!(completed["status"], "stopped");
+        assert!(completed["outputTail"].as_str().unwrap().contains("ready"));
     }
 
     #[tokio::test]

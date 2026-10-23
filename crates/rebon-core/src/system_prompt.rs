@@ -1207,7 +1207,10 @@ mod tests {
 
         let cannot = session_specific_guidance_section(&tools, &[], false).unwrap();
         assert!(cannot.contains("cannot wake you"), "{cannot}");
-        assert!(cannot.contains("wait=true and a long timeout"), "{cannot}");
+        assert!(
+            cannot.contains("with its shellId and a long timeout"),
+            "{cannot}"
+        );
 
         let no_shell = session_specific_guidance_section(&[], &[], true).unwrap();
         assert!(!no_shell.contains("background shell"), "{no_shell}");

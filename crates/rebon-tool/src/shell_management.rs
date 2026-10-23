@@ -26,7 +26,6 @@ pub struct ShellStopTool;
 #[derive(Debug)]
 struct ShellOutputInput {
     shell_id: Option<String>,
-    cursor: u64,
     wait: bool,
     timeout_ms: u64,
 }
@@ -38,13 +37,14 @@ impl Tool for ShellOutputTool {
     }
 
     fn description(&self) -> &str {
-        "Lists background Bash/PowerShell shells or reads their incremental output. Omit shellId \
-         to list shells visible in the current session/agent. With shellId, new text arrives in \
-         `output` (stdout) and `stderr`; pass the returned nextCursor to avoid duplicate output. \
-         wait=true blocks until the process exits or `timeout` elapses (5s to 300s) and returns \
-         everything printed meanwhile; it does not return on the first new line. To block on a \
-         build or test run, make one call with a long timeout rather than many short ones. \
-         Monitor tasks are not readable here: their events arrive as task notifications."
+        "Lists background Bash/PowerShell shells, or waits for one to exit. Omit shellId to list \
+         the shells of this session/agent with their status and outputPath. With shellId, blocks \
+         until that shell exits or `timeout` passes, then returns its status, exit code, the last \
+         lines of its output (`outputTail`) and `outputPath`. It returns on exit, not on new \
+         output: to wait for a build or test run, make one call with a long timeout rather than \
+         many short ones. wait=false returns the status at once. A shell's full output is the \
+         file at outputPath: read it with Read or search it with Grep. Monitor tasks are not \
+         handled here: their events arrive as task notifications."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -53,22 +53,15 @@ impl Tool for ShellOutputTool {
             "properties": {
                 "shellId": {
                     "type": "string",
-                    "description": "Background shell ID. Omit to list visible shells."
-                },
-                "cursor": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "Incremental output cursor returned by a previous call."
-                },
-                "wait": {
-                    "type": "boolean",
-                    "description": "Block until the process exits or the timeout elapses, collecting output meanwhile."
+                    "description": "Background shell ID. Omit to list shells."
                 },
                 "timeout": {
                     "type": "integer",
-                    "minimum": 1,
-                    "maximum": MAX_WAIT_TIMEOUT_MS,
-                    "description": "Maximum wait time in milliseconds (values under 5000 wait 5000); only valid with wait=true."
+                    "description": "Longest to wait for the shell to exit, in milliseconds. Default 30000; values are kept within 5000 to 300000."
+                },
+                "wait": {
+                    "type": "boolean",
+                    "description": "Default true. false returns the current status at once instead of waiting."
                 }
             },
             "additionalProperties": false
@@ -97,11 +90,10 @@ impl Tool for ShellOutputTool {
         match parsed.shell_id {
             Some(shell_id) => {
                 registry
-                    .output(
+                    .wait(
                         context,
                         SHELL_OUTPUT_TOOL_NAME,
                         &shell_id,
-                        parsed.cursor,
                         parsed.wait,
                         parsed.timeout_ms,
                     )
@@ -159,40 +151,19 @@ impl Tool for ShellStopTool {
 fn parse_shell_output_input(input: &Value) -> ToolResult<ShellOutputInput> {
     let object = object_input(input, SHELL_OUTPUT_TOOL_NAME)?;
     let shell_id = optional_non_empty_string(object, "shellId", SHELL_OUTPUT_TOOL_NAME)?;
-    let has_cursor = object.contains_key("cursor");
-    let has_wait = object.contains_key("wait");
-    let has_timeout = object.contains_key("timeout");
-
-    if shell_id.is_none() && (has_cursor || has_wait || has_timeout) {
-        return Err(invalid_input(
-            SHELL_OUTPUT_TOOL_NAME,
-            "`cursor`, `wait`, and `timeout` require `shellId`",
-        ));
-    }
-
-    let cursor = optional_u64(object, "cursor", SHELL_OUTPUT_TOOL_NAME)?.unwrap_or(0);
-    let wait = optional_bool(object, "wait", SHELL_OUTPUT_TOOL_NAME)?.unwrap_or(false);
-    let timeout_ms =
-        optional_u64(object, "timeout", SHELL_OUTPUT_TOOL_NAME)?.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
-
-    if has_timeout && !wait {
-        return Err(invalid_input(
-            SHELL_OUTPUT_TOOL_NAME,
-            "`timeout` is only valid when `wait` is true",
-        ));
-    }
-    if timeout_ms == 0 || timeout_ms > MAX_WAIT_TIMEOUT_MS {
-        return Err(invalid_input(
-            SHELL_OUTPUT_TOOL_NAME,
-            format!("`timeout` must be between 1 and {MAX_WAIT_TIMEOUT_MS}ms"),
-        ));
-    }
+    // Every combination below means one thing, so none is refused: a
+    // timeout alone is a wait, a timeout with wait=false is a status check,
+    // and an out-of-range timeout is the nearest one in range. Rejecting
+    // these cost a round-trip each time a model wrote the natural call.
+    let wait = optional_bool(object, "wait", SHELL_OUTPUT_TOOL_NAME)?.unwrap_or(true);
+    let timeout_ms = optional_u64(object, "timeout", SHELL_OUTPUT_TOOL_NAME)?
+        .unwrap_or(DEFAULT_WAIT_TIMEOUT_MS)
+        .clamp(MIN_WAIT_TIMEOUT_MS, MAX_WAIT_TIMEOUT_MS);
 
     Ok(ShellOutputInput {
         shell_id,
-        cursor,
         wait,
-        timeout_ms: timeout_ms.max(MIN_WAIT_TIMEOUT_MS),
+        timeout_ms,
     })
 }
 
@@ -295,41 +266,60 @@ mod tests {
         assert!(result.is_valid());
     }
 
-    #[tokio::test]
-    async fn shell_output_rejects_management_fields_without_shell_id() {
-        let result = ShellOutputTool
-            .validate_input(&json!({ "wait": true }), &ToolContext::new())
-            .await
-            .unwrap();
-        assert!(!result.is_valid());
+    /// A timeout on its own is the call models write most; it means "wait
+    /// this long", and refusing it was the whole bug.
+    #[test]
+    fn shell_output_treats_a_timeout_alone_as_a_wait() {
+        let parsed =
+            parse_shell_output_input(&json!({ "shellId": "sh_test", "timeout": 120_000 })).unwrap();
+        assert!(parsed.wait);
+        assert_eq!(parsed.timeout_ms, 120_000);
+    }
+
+    #[test]
+    fn shell_output_waits_by_default() {
+        let parsed = parse_shell_output_input(&json!({ "shellId": "sh_test" })).unwrap();
+        assert!(parsed.wait);
+        assert_eq!(parsed.timeout_ms, DEFAULT_WAIT_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn shell_output_wait_false_is_a_status_check_even_with_a_timeout() {
+        let parsed = parse_shell_output_input(
+            &json!({ "shellId": "sh_test", "wait": false, "timeout": 60_000 }),
+        )
+        .unwrap();
+        assert!(!parsed.wait);
+    }
+
+    #[test]
+    fn shell_output_keeps_timeouts_in_range_instead_of_refusing_them() {
+        for (asked, kept) in [
+            (0, MIN_WAIT_TIMEOUT_MS),
+            (100, MIN_WAIT_TIMEOUT_MS),
+            (MAX_WAIT_TIMEOUT_MS + 1, MAX_WAIT_TIMEOUT_MS),
+            (u64::MAX, MAX_WAIT_TIMEOUT_MS),
+        ] {
+            let parsed =
+                parse_shell_output_input(&json!({ "shellId": "sh_test", "timeout": asked }))
+                    .unwrap();
+            assert_eq!(parsed.timeout_ms, kept, "timeout {asked}");
+        }
     }
 
     #[tokio::test]
-    async fn shell_output_rejects_timeout_without_wait() {
-        let result = ShellOutputTool
-            .validate_input(
-                &json!({ "shellId": "sh_test", "timeout": 100 }),
-                &ToolContext::new(),
-            )
-            .await
-            .unwrap();
-        assert!(!result.is_valid());
-    }
-
-    #[tokio::test]
-    async fn shell_output_rejects_wait_timeout_above_limit() {
-        let result = ShellOutputTool
-            .validate_input(
-                &json!({
-                    "shellId": "sh_test",
-                    "wait": true,
-                    "timeout": MAX_WAIT_TIMEOUT_MS + 1
-                }),
-                &ToolContext::new(),
-            )
-            .await
-            .unwrap();
-        assert!(!result.is_valid());
+    async fn shell_output_still_rejects_wrongly_typed_fields() {
+        for input in [
+            json!({ "shellId": "sh_test", "timeout": "soon" }),
+            json!({ "shellId": "sh_test", "wait": "yes" }),
+            json!({ "shellId": 7 }),
+        ] {
+            let result = ShellOutputTool
+                .validate_input(&input, &ToolContext::new())
+                .await
+                .unwrap();
+            assert!(!result.is_valid(), "{input}");
+        }
     }
 
     #[tokio::test]

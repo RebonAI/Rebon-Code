@@ -541,7 +541,7 @@ ShellOutput calls or Sleep."
             bullets.push(
                 " - This session cannot wake you after your turn ends, and background shells \
                  stop when it does. To wait for a background shell, make one ShellOutput call \
-                 with wait=true and a long timeout (up to 300000 ms); it blocks until the \
+                 with its shellId and a long timeout (up to 300000 ms); it blocks until the \
                  process exits. Never poll it with repeated short ShellOutput calls or Sleep."
                     .to_string(),
             );
@@ -597,7 +597,7 @@ pub fn sub_agent_notes_section() -> &'static str {
 - Use absolute file paths exclusively: an Agent thread's cwd is reset between \
 bash calls.\n\
 - A background shell you start does not wake you when it finishes and stops when your run \
-ends. To wait for it, make one ShellOutput call with wait=true and a long timeout (up to \
+ends. To wait for it, make one ShellOutput call with its shellId and a long timeout (up to \
 300000 ms); never poll it with repeated short calls.\n\
 - Give task-relevant file paths in your final reply, always absolute and never relative. \
 Quote code only if its exact text matters, such as a discovered bug or a function \
