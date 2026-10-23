@@ -71,6 +71,21 @@ struct RawMcpServerConfig {
     oauth: Option<serde_json::Value>,
     cwd: Option<String>,
     timeout_ms: Option<u64>,
+    /// `"disabled": true` parks a server without deleting it: it is skipped
+    /// before it is read any further, so a parked entry that would not
+    /// parse as a server cannot fail the rest.
+    #[serde(default)]
+    disabled: bool,
+    /// `"shared": false` keeps a stdio server to one session: each session
+    /// starts its own instead of using the one the shared host runs. For a
+    /// server that keeps state per client.
+    shared: Option<bool>,
+}
+
+impl RawMcpServerConfig {
+    fn is_enabled(&self) -> bool {
+        !self.disabled
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -217,6 +232,7 @@ fn parse_json_mcp_servers(
     let servers = parse_mcp_server_map_value(value, source)?;
     servers
         .into_iter()
+        .filter(|(_, raw_config)| raw_config.is_enabled())
         .map(|(name, raw_config)| server_config_from_raw(name, raw_config, source.to_string()))
         .collect()
 }
@@ -265,6 +281,7 @@ fn parse_user_mcp_servers(path: &Path) -> anyhow::Result<Vec<CollectedStdioServe
     envelope
         .mcp_servers
         .into_iter()
+        .filter(|(_, raw_config)| raw_config.is_enabled())
         .map(|(name, raw_config)| server_config_from_raw(name, raw_config, source.clone()))
         .collect()
 }
@@ -377,6 +394,7 @@ fn server_config_from_raw(
     config.env = raw.env.into_iter().collect();
     config.cwd = raw.cwd;
     config.request_timeout = raw.timeout_ms.map(Duration::from_millis);
+    config.shared = raw.shared.unwrap_or(true);
     Ok(CollectedMcpServerConfig {
         config: McpServerConfig::Stdio(config),
         source,
@@ -399,7 +417,9 @@ fn parse_approved_project_mcp_servers(
     project
         .mcp_servers
         .into_iter()
-        .filter(|(name, _)| project_server_is_approved(name, &settings))
+        .filter(|(name, raw_config)| {
+            raw_config.is_enabled() && project_server_is_approved(name, &settings)
+        })
         .map(|(name, raw_config)| server_config_from_raw(name, raw_config, source.clone()))
         .collect()
 }
@@ -498,6 +518,34 @@ mod tests {
     }
 
     #[test]
+    fn stdio_servers_are_shared_unless_they_say_otherwise() {
+        let temp = tempfile::tempdir().unwrap();
+        let raw = r#"{
+            "mcpServers": {
+                "plain": { "command": "node" },
+                "own": { "command": "node", "shared": false },
+                "said": { "command": "node", "shared": true }
+            }
+        }"#;
+        let configs = collect_mcp_configs_from_sources(temp.path(), Some(raw)).unwrap();
+        let shared: Vec<(String, bool)> = configs
+            .iter()
+            .map(|item| {
+                let config = as_stdio(&item.config);
+                (config.name.clone(), config.shared)
+            })
+            .collect();
+        assert_eq!(
+            shared,
+            vec![
+                ("own".to_string(), false),
+                ("plain".to_string(), true),
+                ("said".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
     fn json_env_supports_windows_command_path_and_args_with_spaces() {
         let temp = tempfile::tempdir().unwrap();
         let raw = r#"{
@@ -568,6 +616,87 @@ mod tests {
         assert!(configs
             .iter()
             .all(|item| item.source.ends_with("config.json#mcpServers")));
+    }
+
+    #[test]
+    fn user_config_skips_disabled_servers_and_keeps_the_rest() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        write_file(
+            &config_path,
+            r#"{
+                "mcpServers": {
+                    "parked": {"command": "node", "disabled": true},
+                    "explicit-on": {"command": "node", "disabled": false},
+                    "on": {"type": "http", "url": "https://example.test/mcp"}
+                }
+            }"#,
+        );
+
+        let configs = collect_mcp_configs_from_sources_with_user_config(
+            temp.path(),
+            Some(&config_path),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(collected_names(&configs), vec!["explicit-on", "on"]);
+    }
+
+    #[test]
+    fn a_disabled_server_that_would_not_parse_does_not_fail_the_others() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        write_file(
+            &config_path,
+            r#"{
+                "mcpServers": {
+                    "no-command": {"args": ["x"], "disabled": true},
+                    "oauth": {"type": "http", "url": "https://a.test", "oauth": {}, "disabled": true},
+                    "websocket": {"type": "ws", "url": "ws://a.test", "disabled": true},
+                    "fine": {"command": "node"}
+                }
+            }"#,
+        );
+
+        let configs = collect_mcp_configs_from_sources_with_user_config(
+            temp.path(),
+            Some(&config_path),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(collected_names(&configs), vec!["fine"]);
+    }
+
+    #[test]
+    fn a_disabled_flag_of_the_wrong_type_is_still_a_schema_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let raw = r#"{"mcpServers": {"x": {"command": "node", "disabled": "yes"}}}"#;
+        let error = collect_mcp_configs_from_sources(temp.path(), Some(raw)).unwrap_err();
+        assert!(format!("{error:#}").contains("invalid MCP server schema"));
+    }
+
+    #[test]
+    fn json_env_and_project_servers_honor_disabled_too() {
+        let temp = tempfile::tempdir().unwrap();
+        write_file(
+            &temp.path().join(".mcp.json"),
+            r#"{"mcpServers": {
+                "project-on": {"command": "node"},
+                "project-off": {"command": "node", "disabled": true}
+            }}"#,
+        );
+        write_file(
+            &temp.path().join(".rebon").join("settings.local.json"),
+            r#"{"enableAllProjectMcpServers":true}"#,
+        );
+        let raw =
+            r#"{"env-on": {"command": "node"}, "env-off": {"command": "node", "disabled": true}}"#;
+
+        let configs = collect_mcp_configs_from_sources(temp.path(), Some(raw)).unwrap();
+
+        assert_eq!(collected_names(&configs), vec!["env-on", "project-on"]);
     }
 
     #[test]

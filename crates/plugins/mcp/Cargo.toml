@@ -21,6 +21,12 @@ tokio.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
 futures-util.workspace = true
+# The shared host: its lock, its published address and token, and the config
+# home it lives under.
+fs2.workspace = true
+serde.workspace = true
+rebon-session.workspace = true
+rebon-types.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

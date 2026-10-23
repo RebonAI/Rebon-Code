@@ -379,6 +379,39 @@ pub struct McpLoadRequest {
     pub mcp_configs: Vec<String>,
     pub strict_mcp_config: bool,
     pub plugin_mcp_configs: Vec<crate::mcp_config::PluginMcpConfig>,
+    /// What the config files said when this was asked, from
+    /// [`configured_servers_fingerprint`]. Without it a stack held across
+    /// turns kept a server the user had since turned off, and never gained
+    /// one they had added, until the worker itself went away.
+    pub servers_fingerprint: u64,
+}
+
+/// The servers `config.json`, the project's `.mcp.json` and the rest would
+/// give a session right now, reduced to a number. An unreadable config gets
+/// its error's, so fixing it counts as a change too.
+pub fn configured_servers_fingerprint(
+    cwd: &Path,
+    mcp_configs: &[String],
+    strict_mcp_config: bool,
+    plugin_mcp_configs: &[crate::mcp_config::PluginMcpConfig],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let collected = crate::mcp_config::collect_default_mcp_configs_with_plugin_overrides(
+        cwd,
+        mcp_configs,
+        strict_mcp_config,
+        plugin_mcp_configs,
+    );
+    let text = match collected {
+        Ok(configs) => format!(
+            "{:?}",
+            configs.iter().map(|c| &c.config).collect::<Vec<_>>()
+        ),
+        Err(error) => format!("error: {error:#}"),
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// The MCP stack a process runs a session's tools against.
@@ -419,6 +452,7 @@ impl McpLoadRequest {
             mcp_configs: Vec::new(),
             strict_mcp_config: false,
             plugin_mcp_configs: Vec::new(),
+            servers_fingerprint: 0,
         }
     }
 }
@@ -608,5 +642,45 @@ impl SessionMcp {
             load_rx,
             request: McpLoadRequest::for_test(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::configured_servers_fingerprint;
+
+    /// A path, not inline JSON, so the test changes the file under one name
+    /// the way a person editing `config.json` does.
+    fn fingerprint_of(dir: &std::path::Path, contents: &str) -> u64 {
+        let path = dir.join("servers.json");
+        std::fs::write(&path, contents).unwrap();
+        configured_servers_fingerprint(dir, &[path.to_string_lossy().into_owned()], true, &[])
+    }
+
+    #[test]
+    fn the_fingerprint_follows_what_the_config_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let on = r#"{"mcpServers": {"fs": {"command": "node"}}}"#;
+        let first = fingerprint_of(dir.path(), on);
+        assert_eq!(
+            fingerprint_of(dir.path(), on),
+            first,
+            "same config, same number"
+        );
+        let off = r#"{"mcpServers": {"fs": {"command": "node", "disabled": true}}}"#;
+        assert_ne!(
+            fingerprint_of(dir.path(), off),
+            first,
+            "turning one off is a change"
+        );
+        let unshared = r#"{"mcpServers": {"fs": {"command": "node", "shared": false}}}"#;
+        assert_ne!(fingerprint_of(dir.path(), unshared), first);
+        let broken = fingerprint_of(dir.path(), "{ not json");
+        assert_ne!(broken, first, "a broken config is a change too");
+        assert_eq!(
+            fingerprint_of(dir.path(), on),
+            first,
+            "and fixing it changes it back"
+        );
     }
 }

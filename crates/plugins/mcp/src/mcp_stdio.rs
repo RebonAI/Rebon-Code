@@ -38,7 +38,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
@@ -48,8 +48,8 @@ use crate::runtime::{
 use async_trait::async_trait;
 use rebon_tools_core::ProcessTreeGuard;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStderr, Command};
 use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 
@@ -60,7 +60,7 @@ use rebon_tool::{
 
 /// `CREATE_NO_WINDOW` — prevents a visible console on Windows.
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Configuration for one stdio-backed MCP server.
 #[derive(Debug, Clone)]
@@ -78,6 +78,10 @@ pub struct StdioServerConfig {
     pub cwd: Option<String>,
     /// Per-request timeout. Defaults to 30 seconds when `None`.
     pub request_timeout: Option<Duration>,
+    /// Whether sessions may use one process for this server between them
+    /// (see [`crate::shared_host`]). `"shared": false` in the config turns it
+    /// off for a server that keeps state per client.
+    pub shared: bool,
 }
 
 impl StdioServerConfig {
@@ -90,20 +94,34 @@ impl StdioServerConfig {
             env: Vec::new(),
             cwd: None,
             request_timeout: None,
+            shared: true,
         }
     }
 
-    fn effective_timeout(&self) -> Duration {
+    pub(crate) fn effective_timeout(&self) -> Duration {
         self.request_timeout
             .unwrap_or_else(|| Duration::from_secs(30))
     }
 }
 
+/// The connection is up.
+const LIVE: u8 = 0;
+/// The connection went away without anyone asking: the server exited or the
+/// shared host did. A shared server is attached again on its next use.
+const LOST: u8 = 1;
+/// The shared host stopped the server because it was turned off. It stays
+/// down, and out of the session's tools, until someone reconnects it.
+const STOPPED: u8 = 2;
+
 /// Runtime state for one live server connection.
 struct StdioServer {
     config: StdioServerConfig,
-    stdin: Mutex<ChildStdin>,
+    /// The child's stdin, or the shared host's socket.
+    stdin: Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
+    /// `None` for a shared server: the host owns the process.
     child: Mutex<Option<Child>>,
+    shared: bool,
+    state: AtomicU8,
     /// Kills every descendant of the server process when the server is
     /// torn down (or this handle is dropped). `Child::kill` /
     /// `kill_on_drop` only reach the direct child; MCP servers that
@@ -126,7 +144,7 @@ struct StdioServer {
 /// this caller reaches the child's raw identifier, and what it calls a
 /// child that has none.
 #[cfg(windows)]
-fn guard_process_tree(child: &Child) -> std::io::Result<ProcessTreeGuard> {
+pub(crate) fn guard_process_tree(child: &Child) -> std::io::Result<ProcessTreeGuard> {
     let handle = child
         .raw_handle()
         .ok_or_else(|| std::io::Error::other("child process has no process handle"))?;
@@ -138,7 +156,7 @@ fn guard_process_tree(child: &Child) -> std::io::Result<ProcessTreeGuard> {
 }
 
 #[cfg(unix)]
-fn guard_process_tree(child: &Child) -> std::io::Result<ProcessTreeGuard> {
+pub(crate) fn guard_process_tree(child: &Child) -> std::io::Result<ProcessTreeGuard> {
     let process_id = child
         .id()
         .ok_or_else(|| std::io::Error::other("child process has no pid"))?;
@@ -149,13 +167,13 @@ fn guard_process_tree(child: &Child) -> std::io::Result<ProcessTreeGuard> {
 /// tree can be signalled at once. Windows needs no spawn-time setup —
 /// job membership is inherited automatically.
 #[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
+pub(crate) fn configure_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.as_std_mut().process_group(0);
 }
 
 #[cfg(windows)]
-fn configure_process_group(_command: &mut Command) {}
+pub(crate) fn configure_process_group(_command: &mut Command) {}
 
 impl std::fmt::Debug for StdioServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -191,17 +209,33 @@ pub struct StdioMcpClient {
     disconnected: Arc<Mutex<HashMap<String, StdioServerConfig>>>,
     channel_entries: Arc<Vec<ChannelEntry>>,
     channel_queue: Arc<StdMutex<VecDeque<String>>>,
+    /// A test's own host, used whatever the process has installed.
+    #[cfg(test)]
+    share_through: Option<std::path::PathBuf>,
+}
+
+/// Where a server's messages go: its own child, or the shared host.
+struct Connection {
+    writer: Box<dyn AsyncWrite + Send + Unpin>,
+    reader: Box<dyn AsyncRead + Send + Unpin>,
+    stderr: Option<ChildStderr>,
+    child: Option<Child>,
+    process_tree: Option<ProcessTreeGuard>,
+    shared: bool,
 }
 
 impl StdioMcpClient {
     /// Construct an empty client. Servers are added on demand via
     /// [`Self::add_server`].
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sharing_through(dir: std::path::PathBuf) -> Self {
         Self {
-            servers: Arc::new(Mutex::new(HashMap::new())),
-            disconnected: Arc::new(Mutex::new(HashMap::new())),
-            channel_entries: Arc::new(Vec::new()),
-            channel_queue: Arc::new(StdMutex::new(VecDeque::new())),
+            share_through: Some(dir),
+            ..Self::default()
         }
     }
 
@@ -212,11 +246,68 @@ impl StdioMcpClient {
     /// advertises the channel capability and the core gate allows it.
     pub fn with_channel_entries(channel_entries: Vec<ChannelEntry>) -> Self {
         Self {
-            servers: Arc::new(Mutex::new(HashMap::new())),
-            disconnected: Arc::new(Mutex::new(HashMap::new())),
             channel_entries: Arc::new(channel_entries),
-            channel_queue: Arc::new(StdMutex::new(VecDeque::new())),
+            ..Self::default()
         }
+    }
+
+    fn shares(&self, config: &StdioServerConfig) -> bool {
+        #[cfg(test)]
+        if self.share_through.is_some() {
+            return config.shared;
+        }
+        crate::shared_host::should_share(config)
+    }
+
+    async fn attach_shared(
+        &self,
+        config: &StdioServerConfig,
+    ) -> Result<crate::shared_host::Attached, crate::shared_host::AttachError> {
+        #[cfg(test)]
+        if let Some(dir) = &self.share_through {
+            let spec = crate::shared_host::spec_for(config)
+                .map_err(|error| crate::shared_host::AttachError::Unavailable(error.to_string()))?;
+            return crate::shared_host::attach_in(dir, &spec, None).await;
+        }
+        crate::shared_host::attach(config).await
+    }
+
+    /// Through the shared host when the server may be shared and the host
+    /// can be had; otherwise a child of this process, as before sharing.
+    async fn open_connection(
+        &self,
+        config: &StdioServerConfig,
+    ) -> Result<Connection, McpClientError> {
+        if self.shares(config) {
+            match self.attach_shared(config).await {
+                Ok(attached) => {
+                    tracing::debug!(
+                        server = %config.name,
+                        pid = ?attached.pid,
+                        "stdio mcp: attached to the shared server"
+                    );
+                    return Ok(Connection {
+                        writer: Box::new(attached.writer),
+                        reader: Box::new(attached.reader),
+                        stderr: None,
+                        child: None,
+                        process_tree: None,
+                        shared: true,
+                    });
+                }
+                Err(crate::shared_host::AttachError::Server(error)) => {
+                    return Err(McpClientError::Transport(error));
+                }
+                Err(crate::shared_host::AttachError::Unavailable(reason)) => {
+                    tracing::warn!(
+                        server = %config.name,
+                        reason = %reason,
+                        "stdio mcp: shared host unavailable; starting the server in this session"
+                    );
+                }
+            }
+        }
+        spawn_child(config)
     }
 
     /// Spawn a new server and run the `initialize` handshake.
@@ -244,52 +335,27 @@ impl StdioMcpClient {
             shutdown_server(existing).await;
         }
 
-        let mut cmd = Command::new(&config.command);
-        cmd.args(&config.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(windows)]
-        cmd.creation_flags(CREATE_NO_WINDOW);
-        configure_process_group(&mut cmd);
-        for (key, value) in &config.env {
-            cmd.env(key, value);
-        }
-        if let Some(cwd) = &config.cwd {
-            cmd.current_dir(cwd);
-        }
-        let mut child = cmd
-            .spawn()
-            .map_err(|err| McpClientError::Transport(format!("spawn failed: {err}")))?;
-        let process_tree = match guard_process_tree(&child) {
-            Ok(guard) => Some(guard),
-            Err(err) => {
-                tracing::warn!(
-                    server = %config.name,
-                    error = %err,
-                    "stdio mcp: failed to guard server process tree; descendants may outlive the session"
-                );
-                None
-            }
-        };
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| McpClientError::Transport("no stdin on child".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| McpClientError::Transport("no stdout on child".into()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| McpClientError::Transport("no stderr on child".into()))?;
+        tokio::pin!(cancel);
+        let connection = tokio::select! {
+            biased;
+            _ = &mut cancel => Err(McpClientError::Transport("[STALE_PROVIDER] MCP construction cancelled".into())),
+            result = self.open_connection(&config) => result,
+        }?;
+        let Connection {
+            writer,
+            reader,
+            stderr,
+            child,
+            process_tree,
+            shared,
+        } = connection;
 
         let server = Arc::new(StdioServer {
             config: config.clone(),
-            stdin: Mutex::new(stdin),
-            child: Mutex::new(Some(child)),
+            stdin: Mutex::new(writer),
+            child: Mutex::new(child),
+            shared,
+            state: AtomicU8::new(LIVE),
             process_tree: StdMutex::new(process_tree),
             next_id: AtomicI64::new(1),
             pending: Mutex::new(HashMap::new()),
@@ -311,17 +377,20 @@ impl StdioMcpClient {
         let reader_server = Arc::downgrade(&server);
         let reader_name = config.name.clone();
         let reader_handle = tokio::spawn(async move {
-            run_reader(reader_server, reader_name, stdout).await;
+            run_reader(reader_server, reader_name, reader).await;
         });
         *server.reader_handle.lock().await = Some(reader_handle);
 
         // Spawn a bounded stderr drain so verbose servers cannot block
-        // while writing diagnostics to their stderr pipe.
-        let stderr_server_name = config.name.clone();
-        let stderr_handle = tokio::spawn(async move {
-            drain_stderr(stderr_server_name, stderr).await;
-        });
-        *server.stderr_handle.lock().await = Some(stderr_handle);
+        // while writing diagnostics to their stderr pipe. A shared server's
+        // stderr is the host's to drain.
+        if let Some(stderr) = stderr {
+            let stderr_server_name = config.name.clone();
+            let stderr_handle = tokio::spawn(async move {
+                drain_stderr(stderr_server_name, stderr).await;
+            });
+            *server.stderr_handle.lock().await = Some(stderr_handle);
+        }
 
         // Run the initialize handshake + send the initialized
         // notification. Failures tear the server down.
@@ -329,7 +398,7 @@ impl StdioMcpClient {
         // task awaits shutdown_server, including child wait and reader joins.
         let initialized = tokio::select! {
             biased;
-            _ = cancel => Err(McpClientError::Transport("[STALE_PROVIDER] MCP construction cancelled".into())),
+            _ = &mut cancel => Err(McpClientError::Transport("[STALE_PROVIDER] MCP construction cancelled".into())),
             result = initialize_server(&server, &self.channel_entries) => result,
         };
         if let Err(err) = initialized {
@@ -399,15 +468,87 @@ impl StdioMcpClient {
     async fn get_server(&self, name: &str) -> Option<Arc<StdioServer>> {
         self.servers.lock().await.get(name).cloned()
     }
+
+    /// The server, attached again first when it is shared and its
+    /// connection went away; an error when it was turned off.
+    async fn usable_server(&self, name: &str) -> Result<Arc<StdioServer>, McpClientError> {
+        let server = self
+            .get_server(name)
+            .await
+            .ok_or_else(|| McpClientError::UnknownServer(name.to_string()))?;
+        match server.state.load(Ordering::Acquire) {
+            STOPPED => Err(McpClientError::Transport(format!(
+                "MCP server `{name}` was turned off"
+            ))),
+            LOST if server.shared => {
+                drop(server);
+                McpClient::reconnect_server(self, name).await?;
+                self.get_server(name)
+                    .await
+                    .ok_or_else(|| McpClientError::UnknownServer(name.to_string()))
+            }
+            _ => Ok(server),
+        }
+    }
+}
+
+/// Start the server as a child of this process.
+fn spawn_child(config: &StdioServerConfig) -> Result<Connection, McpClientError> {
+    let mut cmd = Command::new(&config.command);
+    cmd.args(&config.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    configure_process_group(&mut cmd);
+    for (key, value) in &config.env {
+        cmd.env(key, value);
+    }
+    if let Some(cwd) = &config.cwd {
+        cmd.current_dir(cwd);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| McpClientError::Transport(format!("spawn failed: {err}")))?;
+    let process_tree = match guard_process_tree(&child) {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            tracing::warn!(
+                server = %config.name,
+                error = %err,
+                "stdio mcp: failed to guard server process tree; descendants may outlive the session"
+            );
+            None
+        }
+    };
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| McpClientError::Transport("no stdin on child".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| McpClientError::Transport("no stdout on child".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| McpClientError::Transport("no stderr on child".into()))?;
+    Ok(Connection {
+        writer: Box::new(stdin),
+        reader: Box::new(stdout),
+        stderr: Some(stderr),
+        child: Some(child),
+        process_tree,
+        shared: false,
+    })
 }
 
 #[async_trait]
 impl McpClient for StdioMcpClient {
     async fn call_tool(&self, call: McpToolCall) -> Result<McpToolResult, McpClientError> {
-        let server = self
-            .get_server(&call.server)
-            .await
-            .ok_or_else(|| McpClientError::UnknownServer(call.server.clone()))?;
+        let server = self.usable_server(&call.server).await?;
 
         let response = send_request(
             &server,
@@ -448,7 +589,7 @@ impl McpClient for StdioMcpClient {
     }
 
     async fn list_tool_definitions(&self, server: &str) -> Option<Vec<McpToolDefinition>> {
-        let state = self.get_server(server).await?;
+        let state = self.usable_server(server).await.ok()?;
         if let Some(cached) = state.tools_cache.lock().await.clone() {
             return Some(cached);
         }
@@ -465,6 +606,9 @@ impl McpClient for StdioMcpClient {
         } else {
             None
         }?;
+        if state.state.load(Ordering::Acquire) == STOPPED {
+            return None;
+        }
         let cached = if let Ok(guard) = state.tools_cache.try_lock() {
             guard.clone()
         } else {
@@ -475,7 +619,11 @@ impl McpClient for StdioMcpClient {
 
     fn server_names(&self) -> Vec<String> {
         let mut names = if let Ok(guard) = self.servers.try_lock() {
-            guard.keys().cloned().collect::<Vec<_>>()
+            guard
+                .iter()
+                .filter(|(_, server)| server.state.load(Ordering::Acquire) != STOPPED)
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
@@ -691,7 +839,7 @@ async fn write_frame(server: &Arc<StdioServer>, frame: &Value) -> Result<(), Mcp
 async fn run_reader(
     server: Weak<StdioServer>,
     server_name: String,
-    stdout: tokio::process::ChildStdout,
+    stdout: Box<dyn AsyncRead + Send + Unpin>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     loop {
@@ -721,6 +869,7 @@ async fn run_reader(
             }
             Ok(None) => {
                 if let Some(server) = server.upgrade() {
+                    mark_lost(&server);
                     fail_pending_requests(
                         &server,
                         McpClientError::Transport("stdio mcp reader reached EOF".into()),
@@ -741,6 +890,7 @@ async fn run_reader(
                     "stdio mcp reader exiting on read error"
                 );
                 if let Some(server) = server.upgrade() {
+                    mark_lost(&server);
                     fail_pending_requests(&server, McpClientError::Transport(message)).await;
                 }
                 break;
@@ -776,6 +926,16 @@ async fn dispatch_reader_message(server: &Arc<StdioServer>, value: Value) {
                 .unwrap_or("<non-string>");
             if method == crate::runtime::CHANNEL_NOTIFICATION_METHOD {
                 handle_channel_notification(server, value.get("params"));
+            } else if method == crate::shared_host::STOPPED_METHOD && server.shared {
+                server.state.store(STOPPED, Ordering::Release);
+                fail_pending_requests(
+                    server,
+                    McpClientError::Transport(format!(
+                        "MCP server `{}` was turned off",
+                        server.config.name
+                    )),
+                )
+                .await;
             } else {
                 tracing::debug!(
                     server = %server.config.name,
@@ -864,6 +1024,14 @@ async fn send_jsonrpc_error_response(
     write_frame(server, &frame).await
 }
 
+/// A connection that ended on its own. A stop the host announced first stays
+/// a stop.
+fn mark_lost(server: &StdioServer) {
+    let _ = server
+        .state
+        .compare_exchange(LIVE, LOST, Ordering::AcqRel, Ordering::Acquire);
+}
+
 async fn fail_pending_requests(server: &Arc<StdioServer>, err: McpClientError) {
     let pending = std::mem::take(&mut *server.pending.lock().await);
     for (_, tx) in pending {
@@ -947,6 +1115,14 @@ async fn cancel_server(server: Arc<StdioServer>) -> CancelledServer {
     let stderr = server.stderr_handle.lock().await.take();
     if let Some(handle) = stderr.as_ref() {
         handle.abort();
+    }
+    // A shared server is not ours to kill: hanging up detaches this session
+    // and leaves the process to the host. `try_lock`, because a write stuck
+    // behind the lock must not hold the cancel up.
+    if server.shared {
+        if let Ok(mut socket) = server.stdin.try_lock() {
+            let _ = socket.shutdown().await;
+        }
     }
     let mut child = server.child.lock().await.take();
     if let Some(child) = child.as_mut() {

@@ -342,6 +342,11 @@ enum Command {
     /// arguments — see `rebon_acp_client::fs_mcp`.
     #[command(name = "__acp-fs-mcp", hide = true)]
     AcpFsMcp,
+    /// Hidden host that runs the stdio MCP servers sessions share, one
+    /// process per server however many sessions use it. Started by the first
+    /// session that needs it; see `rebon_plugin_mcp::shared_host`.
+    #[command(name = "__mcp-host", hide = true)]
+    McpHost,
     /// Deprecated shell for `rebon-browser-mcp`. Removed in 0.26.
     #[command(name = "browser-mcp", hide = true)]
     BrowserMcp {
@@ -1177,6 +1182,7 @@ async fn run_headless_command(command: Command) -> anyhow::Result<()> {
         // stdout is the MCP channel; anything this process logs goes
         // to stderr via the non-TUI tracing default.
         Command::AcpFsMcp => rebon_acp_client::fs_mcp::run_bridge().await,
+        Command::McpHost => rebon_plugin_mcp::shared_host::run_host().await,
         // stdout is the MCP connection here too; this route logs to stderr.
         // The jobs it starts are the supervisor's, gated exactly as `--bg`.
         Command::Mcp { command } => {
@@ -1616,6 +1622,22 @@ fn validate_cli_combinations(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Every session this process runs shares stdio MCP servers through a host
+/// that is this same executable, so the host always speaks this build's
+/// protocol.
+fn install_shared_mcp_host_launcher() {
+    if let Ok(program) = std::env::current_exe() {
+        rebon_plugin_mcp::shared_host::install_launcher(
+            rebon_plugin_mcp::shared_host::HostLauncher {
+                program,
+                args: vec![MCP_HOST_SUBCOMMAND.into()],
+            },
+        );
+    }
+}
+
+const MCP_HOST_SUBCOMMAND: &str = "__mcp-host";
+
 fn command_uses_tui_tracing(command: &Command) -> bool {
     matches!(command, Command::Attach { .. })
 }
@@ -1663,6 +1685,7 @@ async fn route_main() -> anyhow::Result<()> {
     let startup_started = std::time::Instant::now();
     let mut cli = Cli::parse();
     let route = classify_cli_startup(&cli)?;
+    install_shared_mcp_host_launcher();
     let cwd_scope = match cli.cwd.as_ref() {
         Some(cwd) => {
             let canonical = cwd
@@ -2968,6 +2991,14 @@ mod tests {
                 job_id: "bg-1".to_string()
             })
         );
+    }
+
+    #[test]
+    fn hidden_mcp_host_parses_under_the_name_the_launcher_uses() {
+        let cli = Cli::parse_from(["rebon", MCP_HOST_SUBCOMMAND]);
+        assert_eq!(cli.command, Some(Command::McpHost));
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains(MCP_HOST_SUBCOMMAND));
     }
 
     #[test]

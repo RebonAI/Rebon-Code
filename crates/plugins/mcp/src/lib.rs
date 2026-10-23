@@ -20,6 +20,7 @@ pub mod mcp_sse;
 pub mod mcp_stdio;
 pub mod runtime;
 mod session;
+pub mod shared_host;
 mod turn_tools;
 
 pub use mcp::{AggregateMcpClient, InMemoryMcpClient, McpProxyTool, McpTool};

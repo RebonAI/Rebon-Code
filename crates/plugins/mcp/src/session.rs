@@ -294,6 +294,7 @@ async fn build_session_mcp_client(
                             env: env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                             cwd: cwd.clone(),
                             request_timeout: None,
+                            shared: true,
                         },
                         cancelled(cancel.clone()),
                     )

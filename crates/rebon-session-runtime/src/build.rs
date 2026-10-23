@@ -915,6 +915,12 @@ async fn attach_session_mcp(
                     mcp_configs: runtime_mcp_configs.to_vec(),
                     strict_mcp_config: runtime_strict_mcp_config,
                     plugin_mcp_configs: plugin_mcp_configs.to_vec(),
+                    servers_fingerprint: crate::mcp::configured_servers_fingerprint(
+                        startup_cwd,
+                        runtime_mcp_configs,
+                        runtime_strict_mcp_config,
+                        plugin_mcp_configs,
+                    ),
                 },
             )
             .await,
