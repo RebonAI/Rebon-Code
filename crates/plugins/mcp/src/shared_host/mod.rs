@@ -14,12 +14,13 @@
 //!   server in a process that has not installed a [`HostLauncher`] or runs with
 //!   `REBON_MCP_NO_SHARE=1`. Those start the old way.
 //! * **Stopping one** — [`stop_shared_server`] stops a server for every
-//!   session at once. Stopped as [`StopReason::Disabled`], sessions drop it and
+//!   session at once, or for the sessions of one project when it is told
+//!   which. Stopped as [`StopReason::Disabled`], sessions drop it and
 //!   its tools; as [`StopReason::Restart`], they keep it and attach to a fresh
 //!   process the next time they use it — which is also what happens when a
 //!   server or the host itself goes away on its own.
-//! * **Finding the host** — it holds `host-v1.lock` under [`host_dir`] and
-//!   publishes its loopback port and a token in `host-v1.json`. A session that
+//! * **Finding the host** — it holds `host-v2.lock` under [`host_dir`] and
+//!   publishes its loopback port and a token in `host-v2.json`. A session that
 //!   finds none starts one and waits for it; losing candidates exit.
 
 mod client;

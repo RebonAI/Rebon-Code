@@ -108,7 +108,7 @@ async fn the_first_session_starts_the_host_and_the_next_one_shares_it() {
     first.shutdown().await;
     second.shutdown().await;
     // Grace, then idle: the server goes and the host after it.
-    let info = host_dir.join("host-v1.json");
+    let info = host_dir.join("host-v2.json");
     let mut gone = false;
     for _ in 0..200 {
         if !info.exists() {

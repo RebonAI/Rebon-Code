@@ -12,10 +12,13 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever a message below changes shape. A host on another schema
 /// is not used, and its lock is a different file, so two can run side by side
 /// while an old one drains.
-pub(crate) const HOST_SCHEMA: u32 = 1;
+///
+/// 2: `stop` can name a project. A schema-1 host would have read past the
+/// field and stopped the server in every project.
+pub(crate) const HOST_SCHEMA: u32 = 2;
 
-pub(crate) const INFO_FILE: &str = "host-v1.json";
-pub(crate) const LOCK_FILE: &str = "host-v1.lock";
+pub(crate) const INFO_FILE: &str = "host-v2.json";
+pub(crate) const LOCK_FILE: &str = "host-v2.lock";
 pub(crate) const LOG_FILE: &str = "host.log";
 
 /// Sent by the host to every session on a server it stopped for good, just
@@ -94,6 +97,20 @@ impl ServerSpec {
     }
 }
 
+/// Whether two spellings name the same directory: separators, a trailing
+/// one and, on Windows, letter case aside. Lexical on purpose — the host
+/// compares what sessions reported, and one of them may be gone.
+pub(crate) fn same_dir(a: &str, b: &str) -> bool {
+    let a = Path::new(a).components();
+    let b = Path::new(b).components();
+    if cfg!(windows) {
+        a.map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+            .eq(b.map(|part| part.as_os_str().to_string_lossy().to_lowercase()))
+    } else {
+        a.eq(b)
+    }
+}
+
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {
@@ -117,9 +134,18 @@ pub enum StopReason {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub(crate) enum Request {
-    Attach { spec: ServerSpec },
+    Attach {
+        spec: ServerSpec,
+    },
     List,
-    Stop { name: String, reason: StopReason },
+    Stop {
+        name: String,
+        reason: StopReason,
+        /// Only the processes running in this directory; every one when
+        /// absent.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
     Shutdown,
 }
 
@@ -142,6 +168,14 @@ pub struct SharedServerInfo {
     /// warm for the next one.
     pub sessions: usize,
     pub started_at_ms: u64,
+}
+
+impl SharedServerInfo {
+    /// Whether this process runs in `dir`, as a project-scoped stop would
+    /// decide it.
+    pub fn runs_in(&self, dir: &Path) -> bool {
+        same_dir(&self.cwd, &dir.to_string_lossy())
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -239,11 +273,49 @@ mod tests {
             request: Request::Stop {
                 name: "fs".into(),
                 reason: StopReason::Restart,
+                cwd: None,
             },
         };
         let text = serde_json::to_string(&hello).unwrap();
         assert!(text.contains("\"op\":\"stop\""), "{text}");
+        assert!(!text.contains("cwd"), "no project, no field: {text}");
         let back: Hello = serde_json::from_str(&text).unwrap();
         assert_eq!(back.request, hello.request);
+
+        let scoped = Request::Stop {
+            name: "fs".into(),
+            reason: StopReason::Disabled,
+            cwd: Some("/work".into()),
+        };
+        let text = serde_json::to_string(&scoped).unwrap();
+        assert!(text.contains("\"cwd\":\"/work\""), "{text}");
+        assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), scoped);
+    }
+
+    #[test]
+    fn a_listed_server_runs_in_the_directory_a_stop_would_match() {
+        let info = SharedServerInfo {
+            name: "fs".into(),
+            command: "npx".into(),
+            args: Vec::new(),
+            cwd: "/work/app".into(),
+            pid: None,
+            sessions: 0,
+            started_at_ms: 0,
+        };
+        assert!(info.runs_in(Path::new("/work/app/")));
+        assert!(!info.runs_in(Path::new("/work")));
+    }
+
+    #[test]
+    fn same_dir_ignores_spelling_but_not_place() {
+        assert!(same_dir("/work/app", "/work/app/"));
+        assert!(!same_dir("/work/app", "/work/app2"));
+        assert!(!same_dir("/work/app", "/work"));
+        #[cfg(windows)]
+        {
+            assert!(same_dir(r"C:\Work\App", "c:/work/app"));
+            assert!(!same_dir(r"C:\work\app", r"D:\work\app"));
+        }
     }
 }

@@ -31,8 +31,8 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use super::protocol::{
-    host_dir, load_host_info, store_host_info, Hello, HostInfo, Reply, Request, ServerSpec,
-    SharedServerInfo, StopReason, HOST_SCHEMA, INFO_FILE, LOCK_FILE, STOPPED_METHOD,
+    host_dir, load_host_info, same_dir, store_host_info, Hello, HostInfo, Reply, Request,
+    ServerSpec, SharedServerInfo, StopReason, HOST_SCHEMA, INFO_FILE, LOCK_FILE, STOPPED_METHOD,
 };
 
 /// A connection that never says who it is must not keep the host alive.
@@ -252,10 +252,14 @@ impl Host {
         servers
     }
 
-    async fn stop_named(&self, name: &str, reason: StopReason) -> usize {
+    /// Stop the servers called `name`; with `cwd`, only the ones running
+    /// there.
+    async fn stop_named(&self, name: &str, reason: StopReason, cwd: Option<&str>) -> usize {
         let named: Vec<Arc<Server>> = lock(&self.servers)
             .values()
-            .filter(|server| server.spec.name == name)
+            .filter(|server| {
+                server.spec.name == name && cwd.is_none_or(|cwd| same_dir(&server.spec.cwd, cwd))
+            })
             .cloned()
             .collect();
         let mut stopped = 0;
@@ -624,8 +628,8 @@ async fn handle_connection(host: Arc<Host>, stream: TcpStream) {
             )
             .await;
         }
-        Request::Stop { name, reason } => {
-            let stopped = host.stop_named(&name, reason).await;
+        Request::Stop { name, reason, cwd } => {
+            let stopped = host.stop_named(&name, reason, cwd.as_deref()).await;
             let _ = reply(
                 &mut write,
                 &Reply {

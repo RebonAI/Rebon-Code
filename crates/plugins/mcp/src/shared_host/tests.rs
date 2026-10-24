@@ -213,7 +213,7 @@ async fn turning_a_server_off_takes_it_out_of_every_session() {
     let b = fx.attached(fx.config()).await;
     pid_of(&a).await;
     assert_eq!(
-        stop_in(fx.host.path(), "who", StopReason::Disabled).unwrap(),
+        stop_in(fx.host.path(), "who", StopReason::Disabled, None).unwrap(),
         1
     );
     for session in [&a, &b] {
@@ -235,6 +235,61 @@ async fn turning_a_server_off_takes_it_out_of_every_session() {
     pid_of(&a).await;
 }
 
+/// Turning a server off in one project stops that project's process and no
+/// other: a session elsewhere keeps the server and its process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turning_a_server_off_in_one_project_leaves_the_others_running() {
+    let Some(fx) = Fixture::new(Duration::from_secs(60)).await else {
+        return;
+    };
+    let here = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let in_dir = |dir: &std::path::Path| {
+        let mut config = fx.config();
+        config.cwd = Some(dir.to_string_lossy().into_owned());
+        config
+    };
+    let a = fx.attached(in_dir(here.path())).await;
+    let b = fx.attached(in_dir(elsewhere.path())).await;
+    pid_of(&a).await;
+    let kept = pid_of(&b).await;
+    assert_eq!(list_in(fx.host.path()).unwrap().len(), 2);
+
+    let missing = here.path().join("not-a-project");
+    assert_eq!(
+        stop_in(fx.host.path(), "who", StopReason::Disabled, Some(&missing)).unwrap(),
+        0,
+        "a directory nothing runs in stops nothing"
+    );
+    assert_eq!(
+        stop_in(
+            fx.host.path(),
+            "who",
+            StopReason::Disabled,
+            Some(here.path())
+        )
+        .unwrap(),
+        1
+    );
+    let mut gone = false;
+    for _ in 0..100 {
+        if a.server_names().is_empty() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(gone, "the project's session still lists the server");
+    assert_eq!(b.server_names(), vec!["who".to_string()]);
+    assert_eq!(pid_of(&b).await, kept, "the other project kept its process");
+    let listed = list_in(fx.host.path()).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(super::protocol::same_dir(
+        &listed[0].cwd,
+        &elsewhere.path().to_string_lossy()
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restart_gives_sessions_a_fresh_process_on_their_next_call() {
     let Some(fx) = Fixture::new(Duration::from_secs(60)).await else {
@@ -244,7 +299,7 @@ async fn a_restart_gives_sessions_a_fresh_process_on_their_next_call() {
     let b = fx.attached(fx.config()).await;
     let before = pid_of(&a).await;
     assert_eq!(
-        stop_in(fx.host.path(), "who", StopReason::Restart).unwrap(),
+        stop_in(fx.host.path(), "who", StopReason::Restart, None).unwrap(),
         1
     );
     tokio::time::sleep(Duration::from_millis(100)).await;

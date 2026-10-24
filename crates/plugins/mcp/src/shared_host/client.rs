@@ -284,10 +284,18 @@ pub fn list_shared_servers() -> anyhow::Result<Vec<SharedServerInfo>> {
     list_in(&host_dir()?)
 }
 
-/// Stop every process the host runs for the server called `name`, in every
-/// project. Returns how many it stopped; zero when no host is running.
-pub fn stop_shared_server(name: &str, reason: StopReason) -> anyhow::Result<usize> {
-    stop_in(&host_dir()?, name, reason)
+/// Stop the processes the host runs for the server called `name`: the one
+/// running in `project` when given, else every one. Returns how many it
+/// stopped; zero when no host is running.
+///
+/// A server with a `cwd` of its own runs there whichever project started
+/// it, so naming a project never stops it.
+pub fn stop_shared_server(
+    name: &str,
+    reason: StopReason,
+    project: Option<&Path>,
+) -> anyhow::Result<usize> {
+    stop_in(&host_dir()?, name, reason, project)
 }
 
 /// Ask the host to stop all its servers and leave. `false` when none ran.
@@ -301,12 +309,18 @@ pub(crate) fn list_in(dir: &Path) -> anyhow::Result<Vec<SharedServerInfo>> {
         .unwrap_or_default())
 }
 
-pub(crate) fn stop_in(dir: &Path, name: &str, reason: StopReason) -> anyhow::Result<usize> {
+pub(crate) fn stop_in(
+    dir: &Path,
+    name: &str,
+    reason: StopReason,
+    project: Option<&Path>,
+) -> anyhow::Result<usize> {
     Ok(control(
         dir,
         Request::Stop {
             name: name.to_string(),
             reason,
+            cwd: project.map(|path| path.to_string_lossy().into_owned()),
         },
     )?
     .and_then(|reply| reply.stopped)
@@ -380,6 +394,9 @@ mod tests {
     fn no_host_means_nothing_to_list_or_stop() {
         let dir = tempfile::tempdir().unwrap();
         assert!(list_in(dir.path()).unwrap().is_empty());
-        assert_eq!(stop_in(dir.path(), "fs", StopReason::Disabled).unwrap(), 0);
+        assert_eq!(
+            stop_in(dir.path(), "fs", StopReason::Disabled, None).unwrap(),
+            0
+        );
     }
 }
