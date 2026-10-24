@@ -66,6 +66,66 @@ pub enum PermissionKind {
     /// Edit / Write — show the diff the call will apply instead of its raw
     /// arguments. Answers exactly like [`PermissionKind::Generic`].
     FileChange(FileChangePreview),
+    /// Agent asking to work outside the authorized directories — show what
+    /// the agent is for and which directories it wants, not its raw call.
+    /// Answers exactly like [`PermissionKind::Generic`].
+    AgentDirectories(AgentDirectoryRequest),
+}
+
+/// The few facts an Agent directory request is decided on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentDirectoryRequest {
+    /// What the agent is for: its `description`, or the start of its prompt.
+    pub task: String,
+    /// Secondary facts on one dim line: a non-default agent type and the
+    /// directory the agent starts in.
+    pub detail: Option<String>,
+    /// The directories the approval would grant.
+    pub roots: Vec<String>,
+    /// Consequences beyond the directories: restricted tools, a worktree
+    /// branch that will be merged back.
+    pub notes: Vec<String>,
+}
+
+/// Rows of the Agent directory dialog body. Render and height measurement
+/// both build them here so the two cannot disagree on the line count.
+fn agent_directory_rows(request: &AgentDirectoryRequest, width: u16) -> Vec<Line<'static>> {
+    let ds = rebon_design_system::theme::get_active_theme();
+    let dim = Style::default().fg(parse_theme_color(ds.inactive));
+    let text = Style::default().fg(parse_theme_color(ds.text));
+    let content_width = usize::from(width.saturating_sub(1)).max(1);
+    let indented_width = usize::from(width.saturating_sub(3)).max(1);
+    let mut rows = Vec::new();
+    let mut push = |line: String, indent: &'static str, style: Style| {
+        rows.push(Line::from(vec![
+            Span::raw(indent),
+            Span::styled(line, style),
+        ]));
+    };
+    for line in wrap_display_columns(&request.task, content_width) {
+        push(line, " ", text.add_modifier(Modifier::BOLD));
+    }
+    if let Some(detail) = request.detail.as_deref() {
+        for line in wrap_display_columns(detail, content_width) {
+            push(line, " ", dim);
+        }
+    }
+    push(String::new(), "", dim);
+    push("Wants access to:".to_string(), " ", dim);
+    for root in &request.roots {
+        for line in wrap_display_columns(root, indented_width) {
+            push(line, "   ", text);
+        }
+    }
+    if !request.notes.is_empty() {
+        push(String::new(), "", dim);
+        for note in &request.notes {
+            for line in wrap_display_columns(note, content_width) {
+                push(line, " ", dim);
+            }
+        }
+    }
+    rows
 }
 
 /// A file edit or write that is waiting for permission, kept as the texts
@@ -964,6 +1024,11 @@ pub fn render_permission_inline_with_cursor(
         }
         PermissionKind::FileChange(preview) => {
             all_lines.extend(file_change_rows(preview, area.width));
+            all_lines.push(Line::from(""));
+            render_standard_options(view, &mut all_lines);
+        }
+        PermissionKind::AgentDirectories(request) => {
+            all_lines.extend(agent_directory_rows(request, area.width));
             all_lines.push(Line::from(""));
             render_standard_options(view, &mut all_lines);
         }
@@ -2195,6 +2260,14 @@ fn permission_body_line_count(view: &PermissionModalView, width: u16) -> u16 {
                 .min(u16::MAX as usize) as u16;
             let option_lines = view.options.len().max(1).min(u16::MAX as usize) as u16;
             // body + blank + options + blank + hint
+            body.saturating_add(option_lines).saturating_add(3)
+        }
+        PermissionKind::AgentDirectories(request) => {
+            let body = agent_directory_rows(request, width)
+                .len()
+                .min(u16::MAX as usize) as u16;
+            let option_lines = view.options.len().max(1).min(u16::MAX as usize) as u16;
+            // Same frame as FileChange: body + blank + options + blank + hint.
             body.saturating_add(option_lines).saturating_add(3)
         }
         _ => {
@@ -3851,6 +3924,39 @@ mod style_tests {
             );
             assert!(!joined.contains("old_string"), "{joined}");
             assert!(joined.contains("Allow once"), "{joined}");
+        }
+    }
+
+    #[test]
+    fn agent_directory_prompt_lists_the_task_then_the_directories() {
+        let mut v = view("Allow agent access to other directories?", 0);
+        v.kind = PermissionKind::AgentDirectories(AgentDirectoryRequest {
+            task: "在共同目录授权边界实现网络".into(),
+            detail: Some("starts in F:/dev/sandbox-v2".into()),
+            roots: vec![
+                "F:/dev/sandbox-v2/runtime-x-net".into(),
+                "C:/Users/bon/.cargo/registry/src".into(),
+            ],
+            notes: vec!["Tools: Read, Grep".into()],
+        });
+        for width in [24u16, 80, 120] {
+            let height = measure_permission_inline(&v, width);
+            let area = Rect::new(0, 0, width, height + 8);
+            let mut buf = Buffer::empty(area);
+            let painted = render_permission_inline(&v, area, &mut buf, 0);
+            assert_eq!(painted, height, "width {width}");
+            let text: Vec<String> = (0..painted).map(|y| row(&buf, y)).collect();
+            let joined = text.join("\n");
+            let flat = joined.replace(['\n', ' '], "");
+            assert!(flat.contains("在共同目录授权边界实现网络"), "{joined}");
+            assert!(flat.contains("Wantsaccessto:"), "{joined}");
+            assert!(flat.contains("F:/dev/sandbox-v2/runtime-x-net"), "{joined}");
+            assert!(flat.contains("Tools:Read,Grep"), "{joined}");
+            assert!(joined.contains("Allow once"), "{joined}");
+            // The task comes before the directories it is asking for.
+            let task_at = flat.find("在共同目录").unwrap();
+            let roots_at = flat.find("Wantsaccessto").unwrap();
+            assert!(task_at < roots_at, "{joined}");
         }
     }
 

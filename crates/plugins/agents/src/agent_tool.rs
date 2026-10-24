@@ -714,6 +714,14 @@ impl Tool for AgentTool {
                 "kind": AGENT_EXTERNAL_PATH_AUTHORIZATION_KIND,
                 "authorized_path_roots": paths,
                 "agent_type": scope.agent_type,
+                // Only a restricted tool set is worth a line in the dialog;
+                // "all available tools" is the default and says nothing.
+                "tools": scope
+                    .tool_filter
+                    .as_ref()
+                    .map(ToolFilter::describe_allowed)
+                    .filter(|tools| tools != "*"),
+                "may_create_worktree": scope.may_create_worktree,
             })),
             Some(input.clone()),
         ))

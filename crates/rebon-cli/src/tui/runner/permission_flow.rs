@@ -242,6 +242,9 @@ pub(super) fn build_pending_permission(
         "Edit" | "Write" => file_change_preview(&tool_name, outbound.tool_input.as_ref())
             .map(PermissionKind::FileChange)
             .unwrap_or(PermissionKind::Generic),
+        "Agent" => agent_directory_request(&outbound)
+            .map(PermissionKind::AgentDirectories)
+            .unwrap_or(PermissionKind::Generic),
         _ => PermissionKind::Generic,
     };
 
@@ -293,6 +296,10 @@ pub(super) fn build_pending_permission(
         PermissionKind::FileChange(preview) => (
             permission_title(&tool_name),
             format!("{} {}", preview.verb, preview.path),
+        ),
+        PermissionKind::AgentDirectories(request) => (
+            "Allow agent access to other directories?".to_string(),
+            format!("{}\n{}", request.task, request.roots.join("\n")),
         ),
         PermissionKind::Generic => {
             let display_tool_name = if tool_name == "InvokeDeferredTool" {
@@ -441,6 +448,90 @@ pub(super) fn tool_summary_for_permission(app: &AppState, tool_call_id: &str) ->
     } else {
         Some(format!("{display_name}({summary})"))
     }
+}
+
+/// Longest task line the Agent dialog shows when the call has no
+/// `description` and the prompt stands in for it.
+const AGENT_PERMISSION_TASK_CHARS: usize = 80;
+
+/// The Agent directory request, cut down to what the decision needs: what
+/// the agent is for, where it starts, and which directories it wants. The
+/// prompt, isolation and other raw arguments stay in the transcript.
+///
+/// `None` for any Agent prompt that is not a directory request, which then
+/// keeps the generic dialog.
+fn agent_directory_request(
+    outbound: &OutboundPermissionQuery,
+) -> Option<crate::tui::permission_modal::AgentDirectoryRequest> {
+    let metadata = outbound.metadata.as_ref()?;
+    if metadata.get("kind").and_then(Value::as_str)
+        != Some(rebon_tool::AGENT_EXTERNAL_PATH_AUTHORIZATION_KIND)
+    {
+        return None;
+    }
+    let roots: Vec<String> = metadata
+        .get("authorized_path_roots")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .map(str::to_string)
+        .collect();
+    if roots.is_empty() {
+        return None;
+    }
+    let input = outbound.tool_input.as_ref().and_then(Value::as_object);
+    let field = |key: &str| {
+        input
+            .and_then(|input| input.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let task = field("description")
+        .map(str::to_string)
+        .or_else(|| {
+            let flat = field("prompt")?
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut task: String = flat.chars().take(AGENT_PERMISSION_TASK_CHARS).collect();
+            if flat.chars().count() > AGENT_PERMISSION_TASK_CHARS {
+                task.push('…');
+            }
+            Some(task)
+        })
+        .unwrap_or_else(|| "Agent".to_string());
+    let agent_type = metadata
+        .get("agent_type")
+        .and_then(Value::as_str)
+        .or_else(|| field("subagent_type"))
+        .map(str::trim)
+        .filter(|agent_type| !agent_type.is_empty() && *agent_type != "general-purpose");
+    let starts_in = field("cwd").map(|cwd| {
+        format!(
+            "starts in {}",
+            rebon_render::display_path::display_path(cwd)
+        )
+    });
+    let detail = [agent_type.map(str::to_string), starts_in]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let mut notes = Vec::new();
+    if let Some(tools) = metadata.get("tools").and_then(Value::as_str) {
+        notes.push(format!("Tools: {tools}"));
+    }
+    if metadata.get("may_create_worktree").and_then(Value::as_bool) == Some(true) {
+        notes.push("Works on a new Git branch and merges it back when done.".to_string());
+    }
+    Some(crate::tui::permission_modal::AgentDirectoryRequest {
+        task,
+        detail: (!detail.is_empty()).then(|| detail.join(" · ")),
+        roots,
+        notes,
+    })
 }
 
 fn get_str_field(input: Option<&HashMap<String, serde_json::Value>>, key: &str) -> Option<String> {
@@ -1989,6 +2080,87 @@ mod tests {
             "two verdicts, and no rule the ask surface cannot remember"
         );
         drop(response_rx);
+    }
+
+    fn agent_directory_query(metadata: serde_json::Value) -> OutboundPermissionQuery {
+        let mut query = sample_query();
+        query.tool_name = "Agent".into();
+        query.message = "general-purpose wants to run outside the current authorized roots".into();
+        query.tool_input = Some(json!({
+            "description": "Implement networking",
+            "subagent_type": "general-purpose",
+            "cwd": "F:/dev/sandbox-v2",
+            "isolation": "none",
+            "allowed_roots": ["F:/dev/sandbox-v2/briefs", "F:/dev/sandbox-v2/boa"],
+            "run_in_background": true,
+            "prompt": format!("Implement the network stage. {}", "x".repeat(400)),
+        }));
+        query.metadata = Some(metadata);
+        query
+    }
+
+    #[test]
+    fn agent_directory_request_keeps_only_task_start_and_directories() {
+        let query = agent_directory_query(json!({
+            "kind": rebon_tool::AGENT_EXTERNAL_PATH_AUTHORIZATION_KIND,
+            "authorized_path_roots": ["F:/dev/sandbox-v2/briefs", "F:/dev/sandbox-v2/boa"],
+            "agent_type": "general-purpose",
+            "tools": null,
+            "may_create_worktree": false,
+        }));
+
+        let pending = build_pending_permission(&AppState::new(), query);
+
+        assert_eq!(
+            pending.view.title,
+            "Allow agent access to other directories?"
+        );
+        let PermissionKind::AgentDirectories(request) = &pending.view.kind else {
+            panic!(
+                "expected the Agent directory dialog, got {:?}",
+                pending.view.kind
+            );
+        };
+        assert_eq!(request.task, "Implement networking");
+        // The default agent type is not worth a word; where it starts is.
+        assert_eq!(
+            request.detail.as_deref(),
+            Some("starts in F:/dev/sandbox-v2")
+        );
+        assert_eq!(
+            request.roots,
+            vec!["F:/dev/sandbox-v2/briefs", "F:/dev/sandbox-v2/boa"]
+        );
+        assert!(request.notes.is_empty(), "{:?}", request.notes);
+    }
+
+    #[test]
+    fn agent_directory_request_names_restrictions_that_change_the_decision() {
+        let query = agent_directory_query(json!({
+            "kind": rebon_tool::AGENT_EXTERNAL_PATH_AUTHORIZATION_KIND,
+            "authorized_path_roots": ["F:/other"],
+            "agent_type": "Explore",
+            "tools": "Read, Grep",
+            "may_create_worktree": true,
+        }));
+
+        let pending = build_pending_permission(&AppState::new(), query);
+
+        let PermissionKind::AgentDirectories(request) = &pending.view.kind else {
+            panic!("expected the Agent directory dialog");
+        };
+        assert_eq!(
+            request.detail.as_deref(),
+            Some("Explore · starts in F:/dev/sandbox-v2")
+        );
+        assert_eq!(request.notes.len(), 2);
+        assert_eq!(request.notes[0], "Tools: Read, Grep");
+    }
+
+    #[test]
+    fn agent_prompt_without_directory_metadata_keeps_the_generic_dialog() {
+        let pending = build_pending_permission(&AppState::new(), agent_directory_query(json!({})));
+        assert!(matches!(pending.view.kind, PermissionKind::Generic));
     }
 
     #[test]
