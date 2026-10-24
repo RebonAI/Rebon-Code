@@ -683,4 +683,32 @@ mod tests {
             "and fixing it changes it back"
         );
     }
+
+    /// Switching a server off in one project reaches a stack held in that
+    /// project on its next turn, and leaves the other projects' alone.
+    #[test]
+    fn the_fingerprint_follows_a_project_switching_a_server_off() {
+        let home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-project-fp");
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"mcpServers": {"fs": {"command": "node"}}}"#,
+        )
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let of = |dir: &std::path::Path| configured_servers_fingerprint(dir, &[], false, &[]);
+        let before = of(project.path());
+        let other_before = of(other.path());
+
+        let settings = project.path().join(".rebon");
+        std::fs::create_dir_all(&settings).unwrap();
+        std::fs::write(
+            settings.join("settings.local.json"),
+            r#"{"disabledMcpServers": ["fs"]}"#,
+        )
+        .unwrap();
+
+        assert_ne!(of(project.path()), before);
+        assert_eq!(of(other.path()), other_before);
+    }
 }

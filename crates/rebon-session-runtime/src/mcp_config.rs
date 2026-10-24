@@ -88,6 +88,7 @@ impl RawMcpServerConfig {
     }
 }
 
+/// The MCP half of a project's `.rebon/settings.local.json`.
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct LocalMcpSettings {
@@ -97,6 +98,20 @@ struct LocalMcpSettings {
     enabled_mcpjson_servers: Vec<String>,
     #[serde(default)]
     disabled_mcpjson_servers: Vec<String>,
+    /// Servers switched off in this project only, by name: a user-level
+    /// (`config.json`) server and a `.mcp.json` one alike. The other
+    /// projects keep them.
+    #[serde(default)]
+    disabled_mcp_servers: Vec<String>,
+}
+
+impl LocalMcpSettings {
+    /// Whether this project switched `name` off for itself.
+    fn turns_off(&self, name: &str) -> bool {
+        self.disabled_mcp_servers
+            .iter()
+            .any(|disabled| disabled == name)
+    }
 }
 
 /// Only `rebon-cli`'s tests name this; see the visibility rule in `crates/REBON.md`.
@@ -173,8 +188,21 @@ fn collect_mcp_configs_from_sources_with_user_config(
     let mut collected = Vec::new();
     let mut seen: HashMap<String, String> = HashMap::new();
 
-    if let Some(path) = user_config_path {
-        for item in parse_user_mcp_servers(path)? {
+    let user = match user_config_path {
+        Some(path) => read_user_mcp_servers(path)?,
+        None => None,
+    };
+    let project = read_project_mcp_servers(cwd)?;
+    // Read only when there is a server it could approve or switch off, so a
+    // project with no servers at all is not failed by its settings file.
+    let settings = if user.is_some() || project.is_some() {
+        load_local_mcp_settings(cwd)?
+    } else {
+        LocalMcpSettings::default()
+    };
+
+    if let Some(user) = user {
+        for item in user.collect(|name| !settings.turns_off(name))? {
             push_unique(&mut collected, &mut seen, item)?;
         }
     }
@@ -185,11 +213,36 @@ fn collect_mcp_configs_from_sources_with_user_config(
         }
     }
 
-    for item in parse_approved_project_mcp_servers(cwd)? {
-        push_unique(&mut collected, &mut seen, item)?;
+    if let Some(project) = project {
+        for item in project.collect(|name| project_server_is_approved(name, &settings))? {
+            push_unique(&mut collected, &mut seen, item)?;
+        }
     }
 
     Ok(collected)
+}
+
+/// One file's `mcpServers`, read but not yet turned into servers.
+struct ServerFile {
+    source: String,
+    servers: BTreeMap<String, RawMcpServerConfig>,
+}
+
+impl ServerFile {
+    /// The entries that are on and that `wanted` keeps. Both are decided
+    /// before an entry is read any further, so one that is off cannot fail
+    /// the rest by not parsing.
+    fn collect(
+        self,
+        wanted: impl Fn(&str) -> bool,
+    ) -> anyhow::Result<Vec<CollectedStdioServerConfig>> {
+        let source = self.source;
+        self.servers
+            .into_iter()
+            .filter(|(name, raw_config)| raw_config.is_enabled() && wanted(name))
+            .map(|(name, raw_config)| server_config_from_raw(name, raw_config, source.clone()))
+            .collect()
+    }
 }
 
 fn push_unique(
@@ -260,10 +313,11 @@ fn parse_flag_mcp_configs(
     Ok(configs)
 }
 
-fn parse_user_mcp_servers(path: &Path) -> anyhow::Result<Vec<CollectedStdioServerConfig>> {
+/// `config.json`'s servers; `None` when it has no `mcpServers` or no file.
+fn read_user_mcp_servers(path: &Path) -> anyhow::Result<Option<ServerFile>> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
     };
     let value: serde_json::Value = serde_json::from_slice(&bytes)
@@ -272,18 +326,16 @@ fn parse_user_mcp_servers(path: &Path) -> anyhow::Result<Vec<CollectedStdioServe
         .as_object()
         .ok_or_else(|| anyhow!("user config {} must be a JSON object", path.display()))?;
     if !object.contains_key("mcpServers") {
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
     let source = format!("{}#mcpServers", path.display());
     let envelope: McpConfigEnvelope = serde_json::from_value(value)
         .with_context(|| format!("invalid MCP server schema in {source}"))?;
-    envelope
-        .mcp_servers
-        .into_iter()
-        .filter(|(_, raw_config)| raw_config.is_enabled())
-        .map(|(name, raw_config)| server_config_from_raw(name, raw_config, source.clone()))
-        .collect()
+    Ok(Some(ServerFile {
+        source,
+        servers: envelope.mcp_servers,
+    }))
 }
 
 fn parse_plugin_mcp_configs(
@@ -401,27 +453,20 @@ fn server_config_from_raw(
     })
 }
 
-fn parse_approved_project_mcp_servers(
-    cwd: &Path,
-) -> anyhow::Result<Vec<CollectedStdioServerConfig>> {
+/// The project's `.mcp.json`; `None` when it has none.
+fn read_project_mcp_servers(cwd: &Path) -> anyhow::Result<Option<ServerFile>> {
     let path = cwd.join(".mcp.json");
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
     };
     let project: McpConfigEnvelope = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse project MCP config {}", path.display()))?;
-    let settings = load_local_mcp_settings(cwd)?;
-    let source = path.display().to_string();
-    project
-        .mcp_servers
-        .into_iter()
-        .filter(|(name, raw_config)| {
-            raw_config.is_enabled() && project_server_is_approved(name, &settings)
-        })
-        .map(|(name, raw_config)| server_config_from_raw(name, raw_config, source.clone()))
-        .collect()
+    Ok(Some(ServerFile {
+        source: path.display().to_string(),
+        servers: project.mcp_servers,
+    }))
 }
 
 fn load_local_mcp_settings(cwd: &Path) -> anyhow::Result<LocalMcpSettings> {
@@ -442,10 +487,11 @@ fn load_local_mcp_settings(cwd: &Path) -> anyhow::Result<LocalMcpSettings> {
 }
 
 fn project_server_is_approved(name: &str, settings: &LocalMcpSettings) -> bool {
-    if settings
-        .disabled_mcpjson_servers
-        .iter()
-        .any(|disabled| disabled == name)
+    if settings.turns_off(name)
+        || settings
+            .disabled_mcpjson_servers
+            .iter()
+            .any(|disabled| disabled == name)
     {
         return false;
     }
@@ -1239,6 +1285,134 @@ mod tests {
         assert!(message.contains("failed to parse project MCP config"));
         assert!(message.contains(".mcp.json"));
         assert!(message.contains("invalid type") || message.contains("expected u64"));
+    }
+
+    /// A `config.json` with two user servers, and a project directory.
+    fn user_servers_and_project() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("home").join("config.json");
+        write_file(
+            &config_path,
+            r#"{"mcpServers": {
+                "fs": {"command": "node"},
+                "docs": {"type": "http", "url": "https://example.test/mcp"}
+            }}"#,
+        );
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        (temp, config_path, project)
+    }
+
+    fn collect_in(project: &Path, config_path: &Path) -> anyhow::Result<Vec<String>> {
+        collect_mcp_configs_from_sources_with_user_config(project, Some(config_path), None)
+            .map(|configs| collected_names(&configs))
+    }
+
+    #[test]
+    fn a_project_can_switch_off_a_user_server_for_itself_only() {
+        let (temp, config_path, project) = user_servers_and_project();
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        write_file(
+            &project.join(".rebon").join("settings.local.json"),
+            r#"{"disabledMcpServers": ["fs"]}"#,
+        );
+
+        assert_eq!(collect_in(&project, &config_path).unwrap(), vec!["docs"]);
+        assert_eq!(
+            collect_in(&other, &config_path).unwrap(),
+            vec!["docs", "fs"],
+            "another project keeps it"
+        );
+    }
+
+    #[test]
+    fn switching_a_project_server_off_beats_every_approval() {
+        let temp = tempfile::tempdir().unwrap();
+        write_file(
+            &temp.path().join(".mcp.json"),
+            r#"{"mcpServers": {
+                "listed": {"command": "node"},
+                "all": {"command": "node"},
+                "kept": {"command": "node"}
+            }}"#,
+        );
+        write_file(
+            &temp.path().join(".rebon/settings.local.json"),
+            r#"{
+                "enableAllProjectMcpServers": true,
+                "enabledMcpjsonServers": ["listed"],
+                "disabledMcpServers": ["listed", "all"]
+            }"#,
+        );
+
+        let configs = collect_mcp_configs_from_sources(temp.path(), None).unwrap();
+
+        assert_eq!(collected_names(&configs), vec!["kept"]);
+    }
+
+    #[test]
+    fn a_user_server_switched_off_here_is_not_read_any_further() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.json");
+        write_file(
+            &config_path,
+            r#"{"mcpServers": {
+                "broken": {"command": "node", "headersHelper": "x"},
+                "fine": {"command": "node"}
+            }}"#,
+        );
+        assert!(
+            collect_in(temp.path(), &config_path).is_err(),
+            "the broken entry fails the load while it is on"
+        );
+        write_file(
+            &temp.path().join(".rebon/settings.local.json"),
+            r#"{"disabledMcpServers": ["broken"]}"#,
+        );
+
+        assert_eq!(collect_in(temp.path(), &config_path).unwrap(), vec!["fine"]);
+    }
+
+    #[test]
+    fn the_project_switch_leaves_servers_given_on_purpose_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        write_file(
+            &temp.path().join(".rebon/settings.local.json"),
+            r#"{"disabledMcpServers": ["env-server", "flag-server"]}"#,
+        );
+        let env = r#"{"env-server": {"command": "node"}}"#;
+        let configs = collect_mcp_configs_from_sources(temp.path(), Some(env)).unwrap();
+        assert_eq!(collected_names(&configs), vec!["env-server"]);
+
+        // Not strict, so the project's settings are in play.
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-flag-scope");
+        let flag = r#"{"mcpServers": {"flag-server": {"command": "node"}}}"#.to_string();
+        let configs =
+            collect_default_mcp_configs_with_overrides(temp.path(), &[flag], false).unwrap();
+        assert_eq!(collected_names(&configs), vec!["flag-server"]);
+    }
+
+    #[test]
+    fn the_settings_file_is_read_only_when_a_server_could_depend_on_it() {
+        let (temp, config_path, project) = user_servers_and_project();
+        write_file(
+            &project.join(".rebon/settings.local.json"),
+            r#"{"disabledMcpServers": "fs"}"#,
+        );
+        let nothing = temp.path().join("nothing.json");
+        write_file(&nothing, r#"{"theme": "dark"}"#);
+
+        assert_eq!(
+            collect_in(&project, &nothing).unwrap(),
+            Vec::<String>::new(),
+            "no server anywhere: the broken file decides nothing"
+        );
+        let error = collect_in(&project, &config_path).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("settings.local.json"),
+            "with servers to decide about, a broken file is not skipped: {error:#}"
+        );
     }
 
     #[test]
