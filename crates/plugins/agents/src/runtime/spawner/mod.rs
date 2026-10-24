@@ -401,6 +401,13 @@ async fn run_persistent_agent_actor(
         let mut followup_spec = base_spec.clone();
         followup_spec.prompt =
             persistent_agent_followup_prompt(&snapshot, message_lease.messages());
+        followup_worktree_placement(
+            &mut followup_spec,
+            snapshot
+                .result
+                .as_ref()
+                .and_then(|result| result.get("git")),
+        );
         if let Some(metadata) = followup_spec.metadata.as_object_mut() {
             metadata.insert(PERSISTENT_AGENT_MANAGED_KEY.into(), Value::Bool(true));
         }
@@ -438,6 +445,53 @@ async fn run_persistent_agent_actor(
             }
         }
     }
+}
+
+/// Place a worktree worker's follow-up turn.
+///
+/// A completed turn merges the worker's worktree and removes it, so the
+/// placement the actor captured at spawn time can point at a directory that
+/// no longer exists. The latest turn's git record decides instead: a worktree
+/// still on disk (integration deferred, or the turn did not complete) is
+/// where the work continues; a removed one means the changes are already in
+/// the source tree, so the follow-up opens a fresh worktree from there.
+/// Workers that never had a worktree are left untouched.
+fn followup_worktree_placement(spec: &mut SubAgentSpec, last_git: Option<&Value>) {
+    let Some(git) = last_git
+        .filter(|git| git.is_object())
+        .or_else(|| spec.metadata.get("__runtime_git"))
+        .cloned()
+    else {
+        return;
+    };
+    let path = |key: &str| {
+        git.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    let Some(worktree) = path("worktree_path") else {
+        return;
+    };
+    let Some(metadata) = spec.metadata.as_object_mut() else {
+        return;
+    };
+    if worktree.is_dir() {
+        metadata.insert("__runtime_git".into(), git.clone());
+        spec.cwd = Some(worktree.to_string_lossy().to_string());
+        spec.allowed_roots = vec![worktree];
+        spec.runtime_isolated_worktree = true;
+        return;
+    }
+    metadata.remove("__runtime_git");
+    let Some(source) = path("source_worktree") else {
+        return;
+    };
+    metadata.insert("isolation".into(), Value::String("worktree".into()));
+    spec.cwd = Some(source.to_string_lossy().to_string());
+    spec.allowed_roots = vec![source];
+    spec.runtime_isolated_worktree = false;
 }
 
 async fn wait_for_new_local_agent_message(
@@ -2701,6 +2755,87 @@ mod tests {
     };
     use serde_json::{json, Value};
     use std::process::Command;
+
+    fn worktree_followup_spec(worktree: &Path, source: &Path) -> SubAgentSpec {
+        SubAgentSpec {
+            prompt: "go".into(),
+            model: None,
+            model_profile: None,
+            provider: None,
+            context: None,
+            cache_strategy: None,
+            frozen_parent_context: None,
+            system: None,
+            tool_filter: None,
+            max_iterations: 3,
+            metadata: json!({
+                "__runtime_git": {
+                    "worktree_path": worktree.to_string_lossy(),
+                    "source_worktree": source.to_string_lossy(),
+                }
+            }),
+            run_in_background: true,
+            permission_prompts_unavailable: false,
+            workflow_nesting_depth: 0,
+            cwd: Some(worktree.to_string_lossy().to_string()),
+            runtime_isolated_worktree: true,
+            allowed_roots: vec![worktree.to_path_buf()],
+            capability_context: None,
+            ultraplan_run_repository: None,
+            task_list_id: None,
+            execution_policy: None,
+            task_kind: None,
+            permission_broker: None,
+            peer_messenger: None,
+        }
+    }
+
+    #[test]
+    fn followup_reopens_a_fresh_worktree_after_the_last_one_was_merged() {
+        let source = tempfile::tempdir().unwrap();
+        let removed = source.path().join("gone-worktree");
+        let mut spec = worktree_followup_spec(&removed, source.path());
+
+        followup_worktree_placement(&mut spec, None);
+
+        assert!(spec.metadata.get("__runtime_git").is_none());
+        assert_eq!(spec.metadata["isolation"], "worktree");
+        assert_eq!(spec.cwd.as_deref(), source.path().to_str());
+        assert_eq!(spec.allowed_roots, vec![source.path().to_path_buf()]);
+        assert!(!spec.runtime_isolated_worktree);
+    }
+
+    #[test]
+    fn followup_continues_in_a_preserved_worktree_from_the_latest_turn() {
+        let source = tempfile::tempdir().unwrap();
+        let preserved = tempfile::tempdir().unwrap();
+        let removed = source.path().join("first-worktree");
+        let mut spec = worktree_followup_spec(&removed, source.path());
+        let last_git = json!({
+            "worktree_path": preserved.path().to_string_lossy(),
+            "source_worktree": source.path().to_string_lossy(),
+            "worktree_preserved": true,
+        });
+
+        followup_worktree_placement(&mut spec, Some(&last_git));
+
+        assert_eq!(spec.metadata["__runtime_git"], last_git);
+        assert_eq!(spec.cwd.as_deref(), preserved.path().to_str());
+        assert_eq!(spec.allowed_roots, vec![preserved.path().to_path_buf()]);
+        assert!(spec.runtime_isolated_worktree);
+    }
+
+    #[test]
+    fn followup_leaves_workers_without_a_worktree_alone() {
+        let mut spec = worktree_followup_spec(Path::new("F:/repo"), Path::new("F:/repo"));
+        spec.metadata = json!({});
+        spec.runtime_isolated_worktree = false;
+
+        followup_worktree_placement(&mut spec, Some(&Value::Null));
+
+        assert_eq!(spec.metadata, json!({}));
+        assert_eq!(spec.cwd.as_deref(), Some("F:/repo"));
+    }
 
     #[test]
     fn tool_finish_keeps_history_separate_from_running_activity() {

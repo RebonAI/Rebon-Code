@@ -737,10 +737,15 @@ impl EngineSubAgentSpawner {
     /// Settle placement: persistent actor, scratchpad and worktree.
     ///
     /// These three decisions are entangled and have to be taken in this order.
-    /// A worktree request rules out the persistent actor, the scratchpad has to
-    /// be resolved before worktree preparation rewrites `spec.cwd`, and the
-    /// worktree itself is prepared last because it is the only step that
-    /// touches the filesystem.
+    /// The scratchpad has to be resolved before worktree preparation rewrites
+    /// `spec.cwd`, and the worktree itself is prepared last because it is the
+    /// only step that touches the filesystem.
+    ///
+    /// A worktree worker gets a persistent actor like any other: its worktree
+    /// is merged and removed when a turn completes, so each follow-up turn
+    /// either continues in a preserved worktree or opens a fresh one from the
+    /// source tree (see `followup_worktree_placement`). Without the actor the
+    /// worker went terminal after one turn and `SendMessage` could not reach it.
     pub(super) fn resolve_worker_placement(
         &self,
         spec: &mut SubAgentSpec,
@@ -758,18 +763,8 @@ impl EngineSubAgentSpawner {
             .as_ref()
             .map(|mode| mode.get())
             .unwrap_or_else(rebon_core::coordinator_mode::coordinator_mode_from_env_default);
-        let worktree_requested = spec
-            .metadata
-            .get("isolation")
-            .and_then(Value::as_str)
-            .is_some_and(|mode| mode.eq_ignore_ascii_case("worktree"))
-            || spec.metadata.get("__runtime_git").is_some()
-            || (is_coord_for_actor
-                && self.coordinator_use_worktree
-                && task_kind == SubAgentTaskKind::Implementation);
         let should_spawn_persistent_actor = self.task_registry.is_some()
             && !actor_managed
-            && !worktree_requested
             && !rebon_tool::WorkflowNesting::at(spec.workflow_nesting_depth).is_within_workflow()
             && !is_explore_agent_type(agent_type.as_deref());
         let keep_runtime_resumable = actor_managed || should_spawn_persistent_actor;
