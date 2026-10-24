@@ -696,7 +696,7 @@ impl ChannelPermissionBroker {
                 );
                 let detail = category
                     .as_deref()
-                    .filter(|category| !reason.starts_with(&format!("[{category}]")))
+                    .filter(|category| !reason_opens_with_category(&reason, category))
                     .map(|category| format!("[{category}] {reason}"))
                     .unwrap_or(reason);
                 deny_via_cache(
@@ -899,6 +899,22 @@ fn auto_mode_classifier_failure_reason(detail: &str) -> String {
 /// Model-facing denial message. Names the flagged behavior and the
 /// legitimate ways forward so the agent adjusts instead of blindly
 /// retrying: rewrite, skip, or escalate to the user.
+/// Whether a classifier reason already opens with its rule's `[Category]`,
+/// spelled loosely: the model writes `[Auto-Mode Bypass]` for the rule
+/// `Auto Mode Bypass`, and prefixing again printed the label twice.
+fn reason_opens_with_category(reason: &str, category: &str) -> bool {
+    fn normalized(text: &str) -> String {
+        text.chars()
+            .filter(|ch| ch.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+    reason
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .is_some_and(|(label, _)| normalized(label) == normalized(category))
+}
+
 fn auto_mode_deny_reason(detail: &str) -> String {
     format!(
         "auto mode denied this call without asking the user: {detail}. \
@@ -5031,6 +5047,26 @@ mod tests {
         assert!(reason.contains("timed out"), "{reason}");
         assert!(rx.try_recv().is_err(), "classifier timeout must not prompt");
         assert_eq!(sink.store().lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deny_reason_label_is_not_repeated_when_spelled_differently() {
+        assert!(reason_opens_with_category(
+            "[Auto-Mode Bypass] Relaunching the agent",
+            "Auto Mode Bypass"
+        ));
+        assert!(reason_opens_with_category(
+            "[auto mode bypass] x",
+            "Auto-Mode Bypass"
+        ));
+        assert!(!reason_opens_with_category(
+            "Relaunching [Auto Mode Bypass]",
+            "Auto Mode Bypass"
+        ));
+        assert!(!reason_opens_with_category(
+            "[Exfil Scouting] x",
+            "Auto Mode Bypass"
+        ));
     }
 
     #[test]
