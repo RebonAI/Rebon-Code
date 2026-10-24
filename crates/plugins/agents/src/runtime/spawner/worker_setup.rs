@@ -532,8 +532,9 @@ impl EngineSubAgentSpawner {
         // The mandated report file lives under the config home
         // (`~/.rebon/tasks/`), which is outside every project root and
         // outside any worktree `prepare_runtime_worktree` just created —
-        // and that call REPLACES `allowed_roots`, so a coordinator cannot
-        // authorize the path from the Agent call either. Without this
+        // and that call drops every root holding the source tree, so a
+        // coordinator cannot rely on authorizing the path from the Agent
+        // call either. Without this
         // carve-out the worker is ordered to Write a path its own ACL
         // rejects, then fails for "report file is missing". Scope it to
         // the single file, not the whole tasks directory: one worker has

@@ -474,23 +474,38 @@ fn followup_worktree_placement(spec: &mut SubAgentSpec, last_git: Option<&Value>
     let Some(worktree) = path("worktree_path") else {
         return;
     };
+    let source = path("source_worktree");
+    // Roots unrelated to either tree (briefs, sibling repos) carry over to
+    // every turn; only the tree the turn works in changes.
+    let other_roots: Vec<PathBuf> = spec
+        .allowed_roots
+        .iter()
+        .filter(|root| {
+            let touches = |tree: &Path| {
+                rebon_tool::path_scope::path_is_within_root(tree, root)
+                    || rebon_tool::path_scope::path_is_within_root(root, tree)
+            };
+            !touches(&worktree) && !source.as_deref().is_some_and(touches)
+        })
+        .cloned()
+        .collect();
     let Some(metadata) = spec.metadata.as_object_mut() else {
         return;
     };
     if worktree.is_dir() {
         metadata.insert("__runtime_git".into(), git.clone());
         spec.cwd = Some(worktree.to_string_lossy().to_string());
-        spec.allowed_roots = vec![worktree];
+        spec.allowed_roots = std::iter::once(worktree).chain(other_roots).collect();
         spec.runtime_isolated_worktree = true;
         return;
     }
     metadata.remove("__runtime_git");
-    let Some(source) = path("source_worktree") else {
+    let Some(source) = source else {
         return;
     };
     metadata.insert("isolation".into(), Value::String("worktree".into()));
     spec.cwd = Some(source.to_string_lossy().to_string());
-    spec.allowed_roots = vec![source];
+    spec.allowed_roots = std::iter::once(source).chain(other_roots).collect();
     spec.runtime_isolated_worktree = false;
 }
 
@@ -1317,7 +1332,11 @@ fn prepare_runtime_worktree(
     ) {
         Ok(info) => {
             spec.cwd = Some(info.worktree_path.to_string_lossy().to_string());
-            spec.allowed_roots = vec![info.worktree_path.clone()];
+            spec.allowed_roots = isolated_worktree_roots(
+                &spec.allowed_roots,
+                &info.source_worktree,
+                &info.worktree_path,
+            );
             // The runtime just created this tree for this worker alone.
             spec.runtime_isolated_worktree = true;
             Ok(Some(SubAgentGitMetadata::from_worktree_info(&info)))
@@ -1348,6 +1367,77 @@ fn prepare_runtime_worktree(
             Ok(None)
         }
     }
+}
+
+/// Most entries one root holding the source tree may expand into; past it
+/// the root is dropped as before rather than listed entry by entry.
+const ISOLATED_ROOT_EXPANSION_LIMIT: usize = 512;
+
+/// Roots for a worker moved into its own worktree.
+///
+/// The shared source tree is the one thing isolation takes away; the
+/// worktree stands in for it. A root inside the source tree goes (the
+/// worktree covers it). A root that holds the source tree — the parent
+/// folder of several repos — keeps everything in it except the source tree:
+/// it expands into the entries beside each step down to the source. Roots
+/// that have nothing to do with the source tree stay as they are.
+///
+/// Dropping all of them left an isolated worker unable to read the inputs
+/// its parent had granted, and relaunching it with wider roots changed
+/// nothing because they were dropped again.
+fn isolated_worktree_roots(roots: &[PathBuf], source: &Path, worktree: &Path) -> Vec<PathBuf> {
+    let mut isolated = vec![worktree.to_path_buf()];
+    let push = |root: PathBuf, isolated: &mut Vec<PathBuf>| {
+        if !isolated.contains(&root) {
+            isolated.push(root);
+        }
+    };
+    for root in roots {
+        if rebon_tool::path_scope::path_is_within_root(root, source) {
+            continue;
+        }
+        if !rebon_tool::path_scope::path_is_within_root(source, root) {
+            push(root.clone(), &mut isolated);
+            continue;
+        }
+        match entries_beside_source(root, source) {
+            Some(entries) => {
+                for entry in entries {
+                    push(entry, &mut isolated);
+                }
+            }
+            None => tracing::warn!(
+                root = %root.display(),
+                source = %source.display(),
+                "isolated worker loses a root that holds its source tree: too many entries to keep"
+            ),
+        }
+    }
+    isolated
+}
+
+/// Everything under `root` except `source` and the directories leading to
+/// it, as a list of roots. `None` when that would exceed
+/// [`ISOLATED_ROOT_EXPANSION_LIMIT`] or a level cannot be read.
+fn entries_beside_source(root: &Path, source: &Path) -> Option<Vec<PathBuf>> {
+    let mut entries = Vec::new();
+    let mut level = root.to_path_buf();
+    while !rebon_tool::path_scope::path_is_within_root(&level, source) {
+        let mut next = None;
+        for entry in std::fs::read_dir(&level).ok()?.flatten() {
+            let path = entry.path();
+            if rebon_tool::path_scope::path_is_within_root(source, &path) {
+                next = Some(path);
+            } else {
+                entries.push(path);
+                if entries.len() > ISOLATED_ROOT_EXPANSION_LIMIT {
+                    return None;
+                }
+            }
+        }
+        level = next?;
+    }
+    Some(entries)
 }
 
 fn build_spawner_worktree_slug(agent_id: &str) -> String {
@@ -2823,6 +2913,60 @@ mod tests {
         assert_eq!(spec.cwd.as_deref(), preserved.path().to_str());
         assert_eq!(spec.allowed_roots, vec![preserved.path().to_path_buf()]);
         assert!(spec.runtime_isolated_worktree);
+    }
+
+    #[test]
+    fn isolation_keeps_roots_that_do_not_touch_the_source_tree() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let sandbox = tempfile::tempdir().unwrap();
+        let source = sandbox.path().join("runtime-x-net");
+        let worktree = source.join(".rebon").join("worktrees").join("agent-1");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::create_dir_all(sandbox.path().join("briefs")).unwrap();
+        std::fs::create_dir_all(sandbox.path().join("boa")).unwrap();
+        std::fs::write(sandbox.path().join("notes.md"), "x").unwrap();
+        let roots = vec![
+            source.clone(),
+            source.join("src"),
+            elsewhere.path().to_path_buf(),
+        ];
+
+        let isolated = isolated_worktree_roots(&roots, &source, &worktree);
+
+        assert_eq!(
+            isolated,
+            vec![worktree.clone(), elsewhere.path().to_path_buf()]
+        );
+
+        // The folder holding the source tree keeps everything beside it.
+        let mut isolated =
+            isolated_worktree_roots(&[sandbox.path().to_path_buf()], &source, &worktree);
+        isolated.sort();
+        let mut expected = vec![
+            worktree,
+            sandbox.path().join("boa"),
+            sandbox.path().join("briefs"),
+            sandbox.path().join("notes.md"),
+        ];
+        expected.sort();
+        assert_eq!(isolated, expected);
+    }
+
+    #[test]
+    fn followup_keeps_the_roots_beside_the_worktree() {
+        let source = tempfile::tempdir().unwrap();
+        let briefs = tempfile::tempdir().unwrap();
+        let removed = source.path().join("gone-worktree");
+        let mut spec = worktree_followup_spec(&removed, source.path());
+        spec.allowed_roots.push(briefs.path().to_path_buf());
+
+        followup_worktree_placement(&mut spec, None);
+
+        assert_eq!(
+            spec.allowed_roots,
+            vec![source.path().to_path_buf(), briefs.path().to_path_buf()]
+        );
     }
 
     #[test]
