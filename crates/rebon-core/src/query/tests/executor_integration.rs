@@ -1120,3 +1120,95 @@ async fn streamed_generated_image_is_kept_in_persisted_and_reloaded_executor_his
     assert_eq!(image["data"], "aGlzdG9yeQ==");
     assert!(image.get("saved_path").is_none());
 }
+
+/// Esc with a message queued: the TUI starts the next turn the moment it
+/// cancels the running one, before that turn has stored what it wrote. The
+/// next turn has to wait for it, or it reads the history from before the
+/// cancel, parents its own prompt to the old tail and leaves the cancelled
+/// request on a dead branch — so "continue with what I asked" finds nothing.
+#[tokio::test]
+async fn turn_started_right_after_a_cancel_still_sees_the_cancelled_request() {
+    let started = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let engine = build_engine_with(Arc::new(HangingTool {
+        started: started.clone(),
+        dropped: dropped.clone(),
+    }));
+    let client = Arc::new(MockModelClient::new());
+    client.push_turn(tool_turn("msg_tool", "Hanging", "toolu_hang", "{}"));
+    client.push_turn(text_turn("msg_side", "answered the side question"));
+    let model_client: Arc<dyn ModelClient> = client.clone();
+    let projects_root_dir = temp_projects_root("cancel_then_queued_turn");
+    let projects_root = projects_root_dir.path();
+    let state = Arc::new(rebon_session_state::ServerState::new());
+    let cwd = projects_root.to_string_lossy().to_string();
+    let session = state.create_session(cwd.clone(), Vec::new());
+    let executor = Arc::new(
+        EngineQueryExecutor::new(engine, model_client, projects_root, "mock-model")
+            .with_server_state(state.clone()),
+    );
+    let request = |text: &str, cancel: CancelToken| PromptRequest {
+        user_prompt: None,
+        effort_is_session_default: false,
+        session_id: session.id.clone(),
+        cwd: cwd.clone(),
+        prompt: vec![AcpContentBlock::Text(TextContent {
+            text: text.into(),
+            annotations: None,
+        })],
+        mcp_servers: Vec::new(),
+        update_publisher: None,
+        permission_publisher: None,
+        cancel,
+        thinking_budget: None,
+        max_tokens: None,
+        reasoning_effort_ordinal: None,
+        additional_working_directories: Vec::new(),
+        coordinator_mode: None,
+        coordinator_report_paths: Vec::new(),
+        user_message_uuid: None,
+        background_agent_system: None,
+        background_agent_tool_filter: None,
+        execution_policy: None,
+        replay_requests: Vec::new(),
+        skill_invocations: Vec::new(),
+    };
+
+    let cancel = CancelToken::new();
+    let first = request("implement the network stage", cancel.clone());
+    let running = executor.clone();
+    let execution = tokio::spawn(async move { running.execute(first).await });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("tool should start");
+
+    // Cancel and start the queued message at once, as the TUI does.
+    cancel.cancel();
+    let queued = executor.execute(request(
+        "does that search walk the whole repo?",
+        CancelToken::new(),
+    ));
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), queued)
+        .await
+        .expect("the queued turn should run once the cancelled one settles")
+        .expect("the queued turn should succeed");
+    assert_eq!(outcome.stop_reason, AcpStopReason::EndTurn);
+    let cancelled = execution.await.expect("executor task should not panic");
+    assert!(matches!(cancelled, Err(PromptExecutorError::Cancelled)));
+
+    let captured = client.captured_requests();
+    let last =
+        serde_json::to_string(&captured.last().expect("queued turn request").messages).unwrap();
+    assert!(
+        last.contains("implement the network stage"),
+        "the cancelled request must stay in the history: {last}"
+    );
+    assert!(
+        last.contains("does that search walk the whole repo?"),
+        "{last}"
+    );
+}

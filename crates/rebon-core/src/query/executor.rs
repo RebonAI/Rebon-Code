@@ -4503,12 +4503,68 @@ impl<'a> TurnEventLoop<'a> {
     }
 }
 
+/// Longest a turn waits for the same session's previous turn to settle.
+/// A cancelled turn normally stores its rows within milliseconds; one stuck
+/// in a tool that ignores cancellation must not hold the session forever, so
+/// past this the new turn goes ahead as it did before the wait existed.
+const SESSION_TURN_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// One turn at a time per session.
+///
+/// Esc with a message queued cancels the running turn and starts the next
+/// one at once, while the cancelled turn is still storing its partial reply,
+/// its interrupted tool results and the interrupt marker. A next turn that
+/// read the history first parented its prompt to the tail from before the
+/// cancel; the chain then forked, the newer branch won, and the cancelled
+/// request vanished from every later turn. Waiting here closes that window
+/// for every caller — TUI, ACP, headless — not only the one that races.
+///
+/// Keyed by projects root and session id, and held weakly, so finished
+/// sessions leave nothing behind.
+async fn acquire_session_turn_slot(
+    projects_root: &std::path::Path,
+    session_id: &str,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    type Slots =
+        std::collections::HashMap<(PathBuf, String), std::sync::Weak<tokio::sync::Mutex<()>>>;
+    static SLOTS: std::sync::OnceLock<std::sync::Mutex<Slots>> = std::sync::OnceLock::new();
+    let slot = {
+        let mut slots = SLOTS
+            .get_or_init(Default::default)
+            .lock()
+            .expect("session turn slots poisoned");
+        slots.retain(|_, slot| slot.strong_count() > 0);
+        let key = (projects_root.to_path_buf(), session_id.to_string());
+        match slots.get(&key).and_then(std::sync::Weak::upgrade) {
+            Some(slot) => slot,
+            None => {
+                let slot = Arc::new(tokio::sync::Mutex::new(()));
+                slots.insert(key, Arc::downgrade(&slot));
+                slot
+            }
+        }
+    };
+    match tokio::time::timeout(SESSION_TURN_SETTLE_TIMEOUT, slot.lock_owned()).await {
+        Ok(guard) => Some(guard),
+        Err(_) => {
+            tracing::warn!(
+                session_id,
+                "previous turn of this session did not settle; starting the next turn anyway"
+            );
+            None
+        }
+    }
+}
+
 #[async_trait]
 impl PromptExecutor for EngineQueryExecutor {
     async fn execute(
         &self,
         mut request: PromptRequest,
     ) -> Result<PromptOutcome, PromptExecutorError> {
+        // Held to the end of the turn, so the next turn of this session reads
+        // a history that already holds everything this one stored.
+        let _turn_slot = acquire_session_turn_slot(&self.projects_root, &request.session_id).await;
         let upstream = self.engine.upstream_tool_context();
         let routed = if let Some(runtime) = self
             .runtime_model
