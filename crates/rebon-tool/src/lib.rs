@@ -2403,10 +2403,10 @@ pub struct AutoApproveExceptSensitivePermissionBroker {
     /// when the parent runtime actually has an interactive prompt
     /// surface; every other sensitive class keeps the hard deny.
     background_deletion_ask: bool,
-    /// The owning session's auto-mode check for agent message tools. When a
-    /// worker sends a message, the session that owns the classifier decides
-    /// whether it may go out; the delegate is never asked, because a
-    /// background worker has nobody to answer its prompt.
+    /// The owning session's auto-mode check for agent message tools, and for a
+    /// background worker's Agent directory request. The session that owns the
+    /// classifier decides; the delegate is never asked, because a background
+    /// worker has nobody to answer its prompt.
     auto_mode_gate: Option<Arc<dyn AutoModeGate>>,
 }
 
@@ -2567,6 +2567,38 @@ impl PermissionBroker for AutoApproveExceptSensitivePermissionBroker {
                 if context.permission_prompts_unavailable()
                     || self.background_probe.as_ref().is_some_and(|probe| probe())
                 {
+                    // A background worker's Agent directory request is an
+                    // ordinary approval: under auto mode the owning session's
+                    // classifier answers it, and an allow grants the
+                    // requested roots exactly as the dialog's "Allow" would.
+                    // Outside auto mode nobody can answer, so it is refused
+                    // below as before.
+                    if tool.id().as_str() == AGENT_TOOL_NAME {
+                        if let Some(gate) = self.auto_mode_gate.as_ref() {
+                            match gate.check(tool, check_input, context).await {
+                                AutoModeGateVerdict::NotInAuto => {}
+                                AutoModeGateVerdict::Allowed => {
+                                    let granted = decision.request.as_ref().and_then(|request| {
+                                        context_with_permission_authorized_paths(
+                                            AGENT_TOOL_NAME,
+                                            context,
+                                            request,
+                                        )
+                                    });
+                                    let effective_input = decision.updated_input.unwrap_or(input);
+                                    return tool
+                                        .call(effective_input, granted.as_ref().unwrap_or(context))
+                                        .await;
+                                }
+                                AutoModeGateVerdict::Denied(reason) => {
+                                    return Err(ToolError::PermissionDenied {
+                                        tool: tool.id(),
+                                        reason,
+                                    });
+                                }
+                            }
+                        }
+                    }
                     // A backgrounded worker's *file deletion* may still
                     // ask: the request floats to the frontend as a
                     // permission modal and the worker blocks on the
@@ -4164,6 +4196,91 @@ mod tests {
             PermissionRequest::new("Send a message", "An agent wants to send a message"),
             Some(input.clone()),
         )
+    }
+
+    struct AgentRootsTool;
+
+    #[async_trait]
+    impl Tool for AgentRootsTool {
+        fn id(&self) -> ToolId {
+            ToolId::new(AGENT_TOOL_NAME)
+        }
+
+        fn description(&self) -> &str {
+            "agent roots tool"
+        }
+
+        fn input_schema(&self) -> ToolInputSchema {
+            serde_json::json!({"type":"object"})
+        }
+
+        async fn call(&self, _input: Value, context: &ToolContext) -> ToolResult<Value> {
+            Ok(serde_json::json!(context.additional_working_directories()))
+        }
+    }
+
+    fn agent_directory_decision() -> PermissionDecision {
+        PermissionDecision::ask(
+            PermissionRequest::new("Authorize agent directory", "Approve F:/other?")
+                .with_options(["allow_once", "reject_once"])
+                .with_metadata(serde_json::json!({
+                    "kind": AGENT_EXTERNAL_PATH_AUTHORIZATION_KIND,
+                    "authorized_path_roots": ["F:/other"]
+                })),
+            Some(serde_json::json!({"prompt": "work in F:/other"})),
+        )
+    }
+
+    #[tokio::test]
+    async fn background_worker_agent_request_is_answered_by_auto_mode() {
+        let delegate_calls = Arc::new(AtomicUsize::new(0));
+        let gate_calls = Arc::new(AtomicUsize::new(0));
+        let broker = gated_broker(
+            delegate_calls.clone(),
+            gate_calls.clone(),
+            AutoModeGateVerdict::Allowed,
+        );
+        let context = ToolContext::new().with_permission_prompts_unavailable(true);
+
+        let output = broker
+            .resolve(
+                &AgentRootsTool,
+                serde_json::json!({"prompt": "work in F:/other"}),
+                &context,
+                agent_directory_decision(),
+            )
+            .await
+            .expect("auto mode allowed the delegation");
+
+        assert_eq!(output, serde_json::json!(["F:/other"]));
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(delegate_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn background_worker_agent_request_is_still_refused_outside_auto_mode() {
+        let delegate_calls = Arc::new(AtomicUsize::new(0));
+        let gate_calls = Arc::new(AtomicUsize::new(0));
+        let broker = gated_broker(
+            delegate_calls.clone(),
+            gate_calls.clone(),
+            AutoModeGateVerdict::NotInAuto,
+        );
+        let context = ToolContext::new().with_permission_prompts_unavailable(true);
+
+        let err = broker
+            .resolve(
+                &AgentRootsTool,
+                serde_json::json!({"prompt": "work in F:/other"}),
+                &context,
+                agent_directory_decision(),
+            )
+            .await
+            .expect_err("nobody can answer the prompt");
+
+        assert!(matches!(err, ToolError::PermissionDenied { .. }));
+        assert_eq!(gate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(delegate_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

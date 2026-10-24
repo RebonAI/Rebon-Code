@@ -1317,8 +1317,21 @@ impl PermissionBroker for ChannelPermissionBroker {
                                 source.unwrap_or(AutoModeAllowSource::Unspecified),
                             );
                         }
+                        // A mode that answers the prompt grants what the prompt
+                        // asked for: an Agent directory request run on a
+                        // classifier verdict or under bypass gets the same
+                        // roots an "Allow" click would have given it.
+                        let granted = decision.request.as_ref().and_then(|request| {
+                            rebon_tool::context_with_permission_authorized_paths(
+                                tool.id().as_str(),
+                                context,
+                                request,
+                            )
+                        });
                         let effective_input = decision.updated_input.unwrap_or(input);
-                        return tool.call(effective_input, context).await;
+                        return tool
+                            .call(effective_input, granted.as_ref().unwrap_or(context))
+                            .await;
                     }
                     ModeAskOutcome::Deny(reason) => {
                         return Err(ToolError::PermissionDenied {
@@ -1787,8 +1800,12 @@ fn user_prompt_permission_broker_from_inner(
 
 // ── Helpers ──────────────────────────────────────────────────────
 
+/// Tools whose permission answer is user data, not an approval: no mode may
+/// answer it on the user's behalf. `Agent` is not one of them — its directory
+/// request is an ordinary approval, so auto mode classifies it and bypass runs
+/// it, applying the requested roots exactly as an "Allow" click would.
 fn requires_permission_broker_response(tool_name: &str) -> bool {
-    matches!(tool_name, "AskUserQuestion" | "Agent")
+    matches!(tool_name, "AskUserQuestion")
 }
 
 /// The pre-run workflow review — a plan-approval step whose answer can carry
@@ -5017,9 +5034,58 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_requires_agent_authorization_response() {
-        assert!(requires_permission_broker_response("Agent"));
+    fn auto_mode_classifies_agent_authorization_but_not_questions() {
+        assert!(!requires_permission_broker_response("Agent"));
         assert!(requires_permission_broker_response("AskUserQuestion"));
+    }
+
+    /// An Agent directory request that auto mode allows must reach the tool
+    /// with the requested roots granted, as the dialog's "Allow" would.
+    #[tokio::test]
+    async fn auto_mode_allow_applies_agent_authorized_paths() {
+        let (broker, mut rx) = ChannelPermissionBroker::new("sess-agent-auto");
+        let (hooks, _sink) = hooks_with_mode(PermissionMode::Auto);
+        broker.set_auto_mode_hooks(Some(hooks));
+        let classifier = Arc::new(RecordingClassifier::new(FixedClassifierResult::Outcome(
+            AutoModeClassifierOutcome::Allow {
+                reason: "The user asked for this delegation.".to_owned(),
+                stage: AutoModeClassifierStage::Fast,
+            },
+        )));
+        broker.set_auto_mode_classifier(Some(classifier.clone()));
+        let tool = ContextRootsTool;
+        let context = ToolContext::new()
+            .with_tool_use_id("t-agent-auto")
+            .with_additional_working_directories(["F:/existing"]);
+        let decision = PermissionDecision::ask(
+            PermissionRequest::new("Authorize agent directory", "Approve F:/other?")
+                .with_options(["allow_once", "reject_once"])
+                .with_metadata(json!({
+                    "kind": rebon_tool::AGENT_EXTERNAL_PATH_AUTHORIZATION_KIND,
+                    "authorized_path_roots": ["F:/other"]
+                })),
+            Some(json!({"prompt": "work in F:/other"})),
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            broker.resolve(
+                &tool,
+                json!({"prompt": "work in F:/other"}),
+                &context,
+                decision,
+            ),
+        )
+        .await
+        .expect("auto mode must not wait on a dialog for Agent")
+        .expect("classifier allow should run the Agent call");
+
+        assert_eq!(result, json!(["F:/existing", "F:/other"]));
+        assert_eq!(classifier.call_count(), 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "auto mode must not prompt for Agent"
+        );
     }
 
     /// The workflow review is a plan-approval step: every prompting mode

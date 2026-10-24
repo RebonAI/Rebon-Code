@@ -296,8 +296,19 @@ impl PermissionBroker for AcpPermissionBroker {
                 .await
                 {
                     crate::permission::ModeAskOutcome::Run(_) => {
+                        // Same grant an "Allow" answer would carry: see the
+                        // TUI broker's `Run` arm.
+                        let granted = decision.request.as_ref().and_then(|request| {
+                            rebon_tool::context_with_permission_authorized_paths(
+                                tool.id().as_str(),
+                                context,
+                                request,
+                            )
+                        });
                         let effective_input = decision.updated_input.unwrap_or(input);
-                        return tool.call(effective_input, context).await;
+                        return tool
+                            .call(effective_input, granted.as_ref().unwrap_or(context))
+                            .await;
                     }
                     crate::permission::ModeAskOutcome::Deny(reason) => {
                         return Err(ToolError::PermissionDenied {
