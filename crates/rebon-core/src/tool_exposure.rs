@@ -80,10 +80,11 @@ impl BuiltinToolExposurePolicy {
                 }
             }
 
-            "Mcp" | "Monitor" | "SaveMemory" | "SendMessage" | "CronCreate" | "CronList"
-            | "CronDelete" | "Sleep" | "TeamCreate" | "TeamDelete" | "WebSearch" | "WebFetch" => {
-                ToolExposure::Deferred
-            }
+            // `ListPeers` only finds a session for `SendMessage` to reach, so it
+            // is loaded with it rather than sent in every session's tool list.
+            "Mcp" | "Monitor" | "SaveMemory" | "SendMessage" | "ListPeers" | "CronCreate"
+            | "CronList" | "CronDelete" | "Sleep" | "TeamCreate" | "TeamDelete" | "WebSearch"
+            | "WebFetch" => ToolExposure::Deferred,
 
             name if name.starts_with("mcp__") => {
                 if tool.should_defer() {

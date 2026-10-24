@@ -5984,3 +5984,48 @@ fn shell_output_poll_without_new_output_renders_single_status_line() {
     assert!(snap.contains("running · no new output"), "{snap:?}");
     assert!(!snap.contains("waitTimedOut"), "{snap:?}");
 }
+
+#[test]
+fn argumentless_tool_header_does_not_repeat_its_own_name() {
+    for verbosity in [
+        ToolOutputVerbosity::Compact,
+        ToolOutputVerbosity::Normal,
+        ToolOutputVerbosity::Verbose,
+    ] {
+        let mut tool = streaming_tool_with_raw_output(
+            streaming_tool(
+                "peers-1",
+                "ListPeers",
+                ToolKind::Other,
+                ToolCallStatus::Completed,
+                vec![],
+            ),
+            vec![("peers", json!([]))],
+        );
+        tool.title = Some("ListPeers".into());
+        let mut overlay = StreamingOverlay::new();
+        overlay.upsert_streaming_tool_use(tool);
+        let mut buf = new_buf(80, 12);
+        render_streaming_overlay(
+            &overlay,
+            Rect::new(0, 0, 80, 12),
+            &mut buf,
+            &RenderTheme::plain(),
+            verbosity,
+        );
+        let snap = (0..12)
+            .map(|y| row_text(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(snap.contains("ListPeers"), "{verbosity:?}: {snap}");
+        assert!(
+            !snap.contains("ListPeers (ListPeers)"),
+            "{verbosity:?}: {snap}"
+        );
+        assert_eq!(
+            snap.matches("ListPeers").count(),
+            1,
+            "{verbosity:?}: {snap}"
+        );
+    }
+}

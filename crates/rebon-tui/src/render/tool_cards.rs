@@ -593,7 +593,13 @@ fn build_streaming_tool_header(
                         .filter(|s| !s.is_empty())
                 }
             })
-            .or_else(|| tool.title.clone())
+            // A title that is only the tool's own name says nothing the
+            // header does not already: `ListPeers (ListPeers)`.
+            .or_else(|| {
+                tool.title
+                    .clone()
+                    .filter(|title| !title_is_tool_name(title, name, display_name))
+            })
             .unwrap_or_default()
             .replace('\r', " ")
             .replace('\n', " ")
@@ -705,6 +711,13 @@ struct StreamingToolBodyContext<'a> {
     is_completed_skill: bool,
 }
 
+/// Whether a tool row's title is just the tool's own name, which a header or
+/// body line would only repeat.
+fn title_is_tool_name(title: &str, name: &str, display_name: &str) -> bool {
+    let title = title.trim();
+    title == name || title == display_name
+}
+
 fn streaming_tool_title_differing_from_header(
     tool: &crate::streaming::StreamingToolUse,
     is_web_search: bool,
@@ -713,6 +726,10 @@ fn streaming_tool_title_differing_from_header(
         return None;
     }
     tool.title.as_ref().and_then(|title| {
+        let display_name = streaming_tool_display_name(&tool.tool_name, tool.raw_input.as_ref());
+        if title_is_tool_name(title, &tool.tool_name, display_name) {
+            return None;
+        }
         let header_summary = tool
             .raw_input
             .as_ref()
