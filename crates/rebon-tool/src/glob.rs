@@ -1,27 +1,31 @@
+use crate::search_walk::{self, WalkLimits};
 use crate::{Tool, ToolContext};
 use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
-use ignore::WalkBuilder;
 use rebon_tools_core::{
     validation_outcome_from, ToolError, ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
 };
 use serde_json::{json, Value};
 use std::cmp::Ordering;
 use std::fs;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::{Instant, SystemTime};
 
 const GLOB_TOOL_NAME: &str = "Glob";
-// Matches grep.rs — `.git`/`.svn`/etc. are noise even when the user forgot
-// to gitignore them. Glob inherits the same exclusions so e.g.
-// `**/HEAD` over a repo root doesn't dump internal refs.
-const VCS_DIRECTORIES_TO_EXCLUDE: &[&str] = &[".git", ".svn", ".hg", ".bzr", ".jj", ".sl"];
-const DESCRIPTION: &str = "- Fast file pattern matching tool that works with any codebase size
+const DESCRIPTION: &str = "- Fast file pattern matching tool
 - Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\"
 - Returns matching file paths sorted by modification time
+- `*` and `**/*` match every file recursively; set `path` to the narrowest directory you need (default: the working directory). Do not run broad patterns on parent folders, drive roots, or build output (target/, node_modules/, a CARGO_TARGET_DIR); those are skipped below `path`, and the walk stops after 100k entries or 10s
 - Use this tool when you need to find files by name patterns
 - When you are doing an open ended search that may require multiple rounds of globbing and grepping, use the Agent tool instead";
 const DEFAULT_LIMIT: usize = 100;
+/// Matches collected (each costing a metadata read) before the walk stops.
+/// Generous next to the 100 returned, so the newest-first order is real for
+/// any search specific enough to be useful.
+const MAX_COLLECTED_MATCHES: usize = DEFAULT_LIMIT * 10;
 const INVALID_INPUT_CODE: i64 = 400;
 const MISSING_DIRECTORY_CODE: i64 = 1;
 const NOT_DIRECTORY_CODE: i64 = 2;
@@ -97,54 +101,69 @@ impl Tool for GlobTool {
     }
 
     async fn call(&self, input: Value, context: &ToolContext) -> ToolResult<Value> {
-        let parsed = parse_input(&input)?;
-        let cwd = resolve_cwd(self.id(), context)?;
-        let search_root = parsed
-            .path
-            .as_ref()
-            .map(|path| crate::path_scope::resolve_context_path(path, &cwd, context))
-            .unwrap_or_else(|| cwd.clone());
-        crate::path_scope::enforce_read_path_policy(self.id(), context, &search_root, "path")?;
-        let matcher = build_matcher(&parsed.pattern)?;
-        let start = SystemTime::now();
+        run_glob(input, context, WalkLimits::default(), MAX_COLLECTED_MATCHES).await
+    }
+}
 
-        let mut matches = Vec::new();
-        let mut truncated = false;
+async fn run_glob(
+    input: Value,
+    context: &ToolContext,
+    limits: WalkLimits,
+    max_matches: usize,
+) -> ToolResult<Value> {
+    let tool = ToolId::new(GLOB_TOOL_NAME);
+    let parsed = parse_input(&input)?;
+    let cwd = resolve_cwd(tool.clone(), context)?;
+    let search_root = parsed
+        .path
+        .as_ref()
+        .map(|path| crate::path_scope::resolve_context_path(path, &cwd, context))
+        .unwrap_or_else(|| cwd.clone());
+    crate::path_scope::enforce_read_path_policy(tool.clone(), context, &search_root, "path")?;
+    let matcher = build_matcher(&parsed.pattern)?;
 
-        // Same walker swap as grep.rs: defer traversal + gitignore semantics
-        // to the `ignore` crate so `**/*.ts` doesn't accidentally enumerate a
-        // 200k-file `node_modules`. `hidden(false)` keeps dotfile matches
-        // reachable, and the VCS `filter_entry` is the belt-and-braces layer
-        // for repos that don't gitignore `.svn`/`.hg`.
-        let walker = WalkBuilder::new(&search_root)
-            .hidden(false)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .ignore(true)
-            .parents(true)
-            .follow_links(false)
-            .filter_entry(|entry| {
-                if entry.depth() == 0 {
-                    return true;
-                }
-                let name = entry.file_name().to_string_lossy();
-                !VCS_DIRECTORIES_TO_EXCLUDE
-                    .iter()
-                    .any(|item| item == &name.as_ref())
-            })
-            .build();
+    // Off the async worker, so a big tree neither pins a tokio thread nor
+    // outlives an interrupt: dropping this future stops the walk.
+    search_walk::run_cancellable(tool, move |stop| {
+        Ok(glob_blocking(
+            &search_root,
+            &cwd,
+            &matcher,
+            &limits,
+            max_matches,
+            &stop,
+        ))
+    })
+    .await
+}
 
-        for entry in walker.filter_map(Result::ok) {
+fn glob_blocking(
+    search_root: &Path,
+    cwd: &Path,
+    matcher: &GlobMatcher,
+    limits: &WalkLimits,
+    max_matches: usize,
+    stop: &Arc<AtomicBool>,
+) -> Value {
+    let start = Instant::now();
+    let mut matches = Vec::new();
+
+    // Traversal and gitignore semantics come from the `ignore` crate (see
+    // `search_walk`), so `**/*.ts` doesn't enumerate a 200k-file
+    // `node_modules`; `hidden(false)` keeps dotfile matches reachable.
+    let summary = search_walk::walk(
+        search_root,
+        limits,
+        stop,
+        |_| {},
+        |entry| {
             if entry.file_type().map(|ft| ft.is_file()) != Some(true) {
-                continue;
+                return ControlFlow::Continue(());
             }
-
             let candidate = entry.into_path();
-            if !matches_pattern(&candidate, &search_root, &matcher) {
-                continue;
+            if !matches_pattern(&candidate, search_root, matcher) {
+                return ControlFlow::Continue(());
             }
-
             let modified = fs::metadata(&candidate)
                 .ok()
                 .and_then(|meta| meta.modified().ok());
@@ -152,29 +171,48 @@ impl Tool for GlobTool {
                 path: candidate,
                 modified,
             });
-
-            if matches.len() > DEFAULT_LIMIT {
-                truncated = true;
+            // One past the cap, so stopping here means more matches exist.
+            if matches.len() > max_matches {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
             }
+        },
+    );
+
+    let incomplete = match summary.stopped {
+        Some(search_walk::WalkStop::Visitor) => {
+            matches.truncate(max_matches);
+            Some(format!(
+                "Stopped after {max_matches} matches under {}; the newest of those are shown, \
+                 not of every match. Use a more specific pattern or narrow `path`.",
+                search_root.display()
+            ))
         }
+        _ => summary.incomplete_note(search_root, limits),
+    };
+    let truncated = matches.len() > DEFAULT_LIMIT || incomplete.is_some();
 
-        matches.sort_by(compare_matches);
+    matches.sort_by(compare_matches);
 
-        let filenames: Vec<String> = matches
-            .into_iter()
-            .take(DEFAULT_LIMIT)
-            .map(|m| display_path(&m.path, &cwd, &search_root))
-            .collect();
+    let filenames: Vec<String> = matches
+        .into_iter()
+        .take(DEFAULT_LIMIT)
+        .map(|m| display_path(&m.path, cwd, search_root))
+        .collect();
 
-        let duration_ms = start.elapsed().unwrap_or(Duration::ZERO).as_millis() as u64;
+    let duration_ms = start.elapsed().as_millis() as u64;
 
-        Ok(json!({
-            "durationMs": duration_ms,
-            "numFiles": filenames.len(),
-            "filenames": filenames,
-            "truncated": truncated,
-        }))
+    let mut out = json!({
+        "durationMs": duration_ms,
+        "numFiles": filenames.len(),
+        "filenames": filenames,
+        "truncated": truncated,
+    });
+    if let Some(note) = incomplete {
+        out["searchIncomplete"] = json!(note);
     }
+    out
 }
 
 /// The verdict on a parsed request's search root, for `validate_input`.
@@ -307,6 +345,7 @@ fn display_path(path: &Path, cwd: &Path, root: &Path) -> String {
 mod tests {
     use super::*;
     use crate::Tool;
+    use std::time::Duration;
 
     struct TempDir {
         inner: tempfile::TempDir,
@@ -526,5 +565,194 @@ mod tests {
             !names.iter().any(|n| n.starts_with(".git/")),
             "VCS metadata must stay filtered: {names:?}"
         );
+    }
+
+    fn filenames(out: &Value) -> Vec<String> {
+        out["filenames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    async fn glob_in(dir: &Path, pattern: &str) -> Value {
+        tool()
+            .call(
+                json!({ "pattern": pattern, "path": dir.to_string_lossy() }),
+                &ToolContext::new(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cargo_target_dir_is_skipped_outside_git_but_searchable_explicitly() {
+        // No `.git` anywhere: nothing gitignores the build output, so the
+        // `.rustc_info.json` marker alone has to keep it out of the walk.
+        let dir = TempDir::new();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src").join("lib.rs"), "").unwrap();
+        let target = dir.path().join("shared-target");
+        fs::create_dir_all(target.join("debug")).unwrap();
+        fs::write(target.join(".rustc_info.json"), "{}").unwrap();
+        fs::write(target.join("debug").join("build.rs"), "").unwrap();
+
+        let out = glob_in(dir.path(), "**/*.rs").await;
+        assert_eq!(filenames(&out), vec!["src/lib.rs".to_owned()]);
+        assert!(out.get("searchIncomplete").is_none(), "{out}");
+
+        let out = glob_in(&target, "**/*.rs").await;
+        assert_eq!(filenames(&out), vec!["debug/build.rs".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn node_modules_below_the_root_is_skipped() {
+        let dir = TempDir::new();
+        let vendored = dir.path().join("web").join("node_modules").join("dep");
+        fs::create_dir_all(&vendored).unwrap();
+        fs::write(vendored.join("index.js"), "").unwrap();
+        fs::write(dir.path().join("web").join("app.js"), "").unwrap();
+
+        let out = glob_in(dir.path(), "**/*.js").await;
+        assert_eq!(filenames(&out), vec!["web/app.js".to_owned()]);
+
+        let out = glob_in(&dir.path().join("web").join("node_modules"), "**/*.js").await;
+        assert_eq!(filenames(&out), vec!["dep/index.js".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn gitignore_applies_outside_a_repo() {
+        // A folder of repos with its own `.gitignore` but no `.git`.
+        let dir = TempDir::new();
+        fs::write(dir.path().join(".gitignore"), "dist/\n").unwrap();
+        fs::create_dir_all(dir.path().join("dist")).unwrap();
+        fs::write(dir.path().join("dist").join("bundle.js"), "").unwrap();
+        fs::write(dir.path().join("app.js"), "").unwrap();
+
+        let out = glob_in(dir.path(), "**/*.js").await;
+        assert_eq!(filenames(&out), vec!["app.js".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_gitignore_above_the_repo_root_does_not_hide_repo_files() {
+        // `outer/.gitignore` says `bin/`, but `repo` is its own checkout:
+        // git would not apply the outer file there, and neither do we.
+        let dir = TempDir::new();
+        fs::write(dir.path().join(".gitignore"), "bin/\n").unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join("src").join("bin")).unwrap();
+        fs::write(repo.join("src").join("bin").join("main.rs"), "").unwrap();
+
+        let out = glob_in(&repo, "**/*.rs").await;
+        assert_eq!(filenames(&out), vec!["src/bin/main.rs".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_walk_over_the_entry_cap_says_the_search_is_incomplete() {
+        let dir = TempDir::new();
+        for idx in 0..20 {
+            fs::write(dir.path().join(format!("f{idx}.txt")), "x").unwrap();
+        }
+        let limits = WalkLimits {
+            max_entries: 5,
+            ..WalkLimits::default()
+        };
+
+        let out = run_glob(
+            json!({ "pattern": "*", "path": dir.path().to_string_lossy() }),
+            &ToolContext::new(),
+            limits,
+            MAX_COLLECTED_MATCHES,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out["truncated"], json!(true));
+        let note = out["searchIncomplete"].as_str().unwrap();
+        assert!(note.contains("5 entries"), "{note}");
+        assert!(note.contains("Narrow `path`"), "{note}");
+        // Root plus four files were visited; what was found still comes back.
+        assert_eq!(out["numFiles"], json!(4));
+    }
+
+    #[tokio::test]
+    async fn collection_stops_at_the_match_cap() {
+        let dir = TempDir::new();
+        for idx in 0..10 {
+            fs::write(dir.path().join(format!("f{idx}.txt")), "x").unwrap();
+        }
+
+        let out = run_glob(
+            json!({ "pattern": "*.txt", "path": dir.path().to_string_lossy() }),
+            &ToolContext::new(),
+            WalkLimits::default(),
+            3,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out["numFiles"], json!(3));
+        assert_eq!(out["truncated"], json!(true));
+        let note = out["searchIncomplete"].as_str().unwrap();
+        assert!(note.contains("3 matches"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn exactly_the_match_cap_is_not_incomplete() {
+        let dir = TempDir::new();
+        for idx in 0..3 {
+            fs::write(dir.path().join(format!("f{idx}.txt")), "x").unwrap();
+        }
+
+        let out = run_glob(
+            json!({ "pattern": "*.txt", "path": dir.path().to_string_lossy() }),
+            &ToolContext::new(),
+            WalkLimits::default(),
+            3,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out["numFiles"], json!(3));
+        assert_eq!(out["truncated"], json!(false));
+        assert!(out.get("searchIncomplete").is_none(), "{out}");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_call_stops_the_blocking_walk() {
+        // 300 entries at 20ms each is a 6s walk if nothing stops it.
+        let dir = TempDir::new();
+        for idx in 0..300 {
+            fs::write(dir.path().join(format!("f{idx}.txt")), "x").unwrap();
+        }
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let limits = WalkLimits {
+            probe: Some(Arc::new(search_walk::WalkProbe {
+                on_entry: Box::new(|| std::thread::sleep(Duration::from_millis(20))),
+                on_finish: Box::new(move |summary| {
+                    let _ = finished_tx.send(*summary);
+                }),
+            })),
+            ..WalkLimits::default()
+        };
+
+        let context = ToolContext::new();
+        let call = run_glob(
+            json!({ "pattern": "**/*", "path": dir.path().to_string_lossy() }),
+            &context,
+            limits,
+            MAX_COLLECTED_MATCHES,
+        );
+        // Timing out drops the call future, as the turn's cancel does.
+        let timed_out = tokio::time::timeout(Duration::from_millis(150), call).await;
+        assert!(timed_out.is_err(), "the walk must still be running");
+
+        let summary = finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the blocking walk must stop soon after the call is dropped");
+        assert_eq!(summary.stopped, Some(search_walk::WalkStop::Cancelled));
+        assert!(summary.visited < 300, "{summary:?}");
     }
 }

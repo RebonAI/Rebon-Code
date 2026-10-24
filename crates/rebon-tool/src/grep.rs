@@ -1,23 +1,25 @@
 use crate::edit::optional_bool;
+use crate::search_walk::{self, WalkLimits};
 use crate::{Tool, ToolContext};
 use async_trait::async_trait;
 use globset::{Glob, GlobMatcher};
 use ignore::types::{Types, TypesBuilder};
-use ignore::{DirEntry, WalkBuilder};
 use rebon_tools_core::{
     validation_outcome_from, ToolError, ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
 };
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 const GREP_TOOL_NAME: &str = "Grep";
 const INVALID_INPUT_CODE: i64 = 400;
 const PATH_NOT_FOUND_CODE: i64 = 1;
 const DEFAULT_HEAD_LIMIT: usize = 250;
-const VCS_DIRECTORIES_TO_EXCLUDE: &[&str] = &[".git", ".svn", ".hg", ".bzr", ".jj", ".sl"];
 
 // Same limit as ripgrep's `--max-columns 500`.
 // Lines longer than this still count as matches (file still reported in
@@ -127,8 +129,14 @@ impl Tool for GrepTool {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string" },
-                "path": { "type": "string" },
-                "glob": { "type": "string" },
+                "path": {
+                    "type": "string",
+                    "description": "File or directory to search (default: the working directory). Use the narrowest one you need, not a parent folder, drive root or build output; the walk stops after 100k entries or 10s."
+                },
+                "glob": {
+                    "type": "string",
+                    "description": "Filter files by glob, matched against the path relative to `path` (e.g. \"*.rs\"). It filters results, not the walk: narrow `path` to search less."
+                },
                 "output_mode": {
                     "type": "string",
                     "enum": ["content", "files_with_matches", "count"]
@@ -169,95 +177,199 @@ impl Tool for GrepTool {
     }
 
     async fn call(&self, input: Value, context: &ToolContext) -> ToolResult<Value> {
-        let parsed = parse_input(&input)?;
-        let regex = RegexBuilder::new(&parsed.pattern)
-            .case_insensitive(parsed.case_insensitive)
-            // Only meaningful in multiline mode, where the haystack is the
-            // whole file: it keeps `^`/`$` anchored per line instead of to
-            // the file's two ends.
-            .multi_line(parsed.multiline)
-            .build()
-            .map_err(|err| ToolError::InvalidInput {
-                tool: self.id(),
-                reason: format!("Invalid regex pattern `{}`: {err}", parsed.pattern),
-                error_code: Some(INVALID_INPUT_CODE),
-            })?;
+        run_grep(input, context, WalkLimits::default()).await
+    }
+}
 
-        let cwd = resolve_cwd(self.id(), context)?;
-        let search_root = parsed
-            .path
-            .as_ref()
-            .map(|path| crate::path_scope::resolve_context_path(path, &cwd, context))
-            .unwrap_or_else(|| cwd.clone());
-        crate::path_scope::enforce_read_path_policy(self.id(), context, &search_root, "path")?;
-        let glob_matcher = build_glob_matcher(parsed.glob.as_deref())?;
-        let type_matcher = build_type_matcher(parsed.file_type.as_deref())?;
-        let files = collect_files(&search_root, glob_matcher.as_ref(), type_matcher.as_ref())?;
+async fn run_grep(input: Value, context: &ToolContext, limits: WalkLimits) -> ToolResult<Value> {
+    let tool = ToolId::new(GREP_TOOL_NAME);
+    let parsed = parse_input(&input)?;
+    let regex = RegexBuilder::new(&parsed.pattern)
+        .case_insensitive(parsed.case_insensitive)
+        // Only meaningful in multiline mode, where the haystack is the
+        // whole file: it keeps `^`/`$` anchored per line instead of to
+        // the file's two ends.
+        .multi_line(parsed.multiline)
+        .build()
+        .map_err(|err| ToolError::InvalidInput {
+            tool: tool.clone(),
+            reason: format!("Invalid regex pattern `{}`: {err}", parsed.pattern),
+            error_code: Some(INVALID_INPUT_CODE),
+        })?;
+
+    let cwd = resolve_cwd(tool.clone(), context)?;
+    let search_root = parsed
+        .path
+        .as_ref()
+        .map(|path| crate::path_scope::resolve_context_path(path, &cwd, context))
+        .unwrap_or_else(|| cwd.clone());
+    crate::path_scope::enforce_read_path_policy(tool.clone(), context, &search_root, "path")?;
+    let glob_matcher = build_glob_matcher(parsed.glob.as_deref())?;
+    let type_matcher = build_type_matcher(parsed.file_type.as_deref())?;
+
+    // The walk and every file read run off the async worker; dropping this
+    // future (an interrupt) stops them at the next entry.
+    search_walk::run_cancellable(tool, move |stop| {
+        let search = GrepSearch {
+            parsed: &parsed,
+            regex: &regex,
+            cwd: &cwd,
+            search_root: &search_root,
+        };
+        Ok(search.run(glob_matcher.as_ref(), type_matcher, &limits, &stop))
+    })
+    .await
+}
+
+/// One Grep request, resolved and ready to run on the blocking pool.
+struct GrepSearch<'a> {
+    parsed: &'a GrepInput,
+    regex: &'a Regex,
+    cwd: &'a Path,
+    search_root: &'a Path,
+}
+
+impl GrepSearch<'_> {
+    fn run(
+        &self,
+        glob: Option<&GlobMatcher>,
+        types: Option<Types>,
+        limits: &WalkLimits,
+        stop: &Arc<AtomicBool>,
+    ) -> Value {
+        let root = self.search_root;
         let mut matched_lines = Vec::new();
         let mut file_counts = Vec::new();
 
-        for file in files {
-            let text = match fs::read_to_string(&file) {
-                Ok(text) => text,
-                Err(_) => continue,
-            };
-            let lines: Vec<&str> = text.lines().collect();
-
-            // The 1-based line numbers the pattern landed on. A multiline
-            // match claims every line it spans, so context expansion and the
-            // line-oriented output below work the same either way.
-            let mut hit_lines: BTreeSet<usize> = BTreeSet::new();
-            let count = if parsed.multiline {
-                let mut matches = 0;
-                for found in regex.find_iter(&text) {
-                    matches += 1;
-                    let first = line_of_offset(&text, found.start());
-                    let last = line_of_offset(&text, found.end().saturating_sub(1).max(found.start()));
-                    for line_number in first..=last {
-                        hit_lines.insert(line_number);
+        let summary = if root.is_file() {
+            self.search_file(root.to_path_buf(), &mut matched_lines, &mut file_counts);
+            None
+        } else {
+            // `ignore::WalkBuilder` is what ripgrep drives internally, so this
+            // gives `.gitignore`/`.ignore`/global-excludes respect — the
+            // single biggest reason a naive `walkdir` over a monorepo falls
+            // over on `node_modules`/`target`/`dist`. Files are searched as
+            // they are walked, so the limits cover the reads too.
+            Some(search_walk::walk(
+                root,
+                limits,
+                stop,
+                |builder| {
+                    if let Some(types) = types {
+                        builder.types(types);
                     }
-                }
-                matches
-            } else {
-                for (idx, line) in lines.iter().enumerate() {
-                    if regex.is_match(line) {
-                        hit_lines.insert(idx + 1);
+                    builder.max_filesize(Some(MAX_FILE_BYTES));
+                },
+                |entry| {
+                    if entry.file_type().map(|ft| ft.is_file()) != Some(true) {
+                        return ControlFlow::Continue(());
                     }
-                }
-                hit_lines.len()
-            };
+                    let candidate = entry.into_path();
+                    if let Some(matcher) = glob {
+                        let normalized = candidate
+                            .strip_prefix(root)
+                            .unwrap_or(&candidate)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        if !matcher.is_match(&normalized) {
+                            return ControlFlow::Continue(());
+                        }
+                    }
+                    // A search reads what it walks over, so a session
+                    // credential inside the tree would come back as matched
+                    // lines — the same content `Read` refuses. Left out of
+                    // the walk rather than failing the search, since the
+                    // caller asked about a directory, not about this file.
+                    if crate::path_scope::is_session_credential_path(&candidate) {
+                        return ControlFlow::Continue(());
+                    }
+                    self.search_file(candidate, &mut matched_lines, &mut file_counts);
+                    ControlFlow::Continue(())
+                },
+            ))
+        };
 
-            if count == 0 {
-                continue;
+        let mut out = self.render(matched_lines, file_counts);
+        if let Some(note) = summary.and_then(|summary| summary.incomplete_note(root, limits)) {
+            out["truncated"] = json!(true);
+            out["searchIncomplete"] = json!(note);
+        }
+        out
+    }
+
+    fn search_file(
+        &self,
+        file: PathBuf,
+        matched_lines: &mut Vec<MatchLine>,
+        file_counts: &mut Vec<FileMatch>,
+    ) {
+        let parsed = self.parsed;
+        let regex = self.regex;
+        let text = match fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(_) => return,
+        };
+        let lines: Vec<&str> = text.lines().collect();
+
+        // The 1-based line numbers the pattern landed on. A multiline
+        // match claims every line it spans, so context expansion and the
+        // line-oriented output below work the same either way.
+        let mut hit_lines: BTreeSet<usize> = BTreeSet::new();
+        let count = if parsed.multiline {
+            let mut matches = 0;
+            for found in regex.find_iter(&text) {
+                matches += 1;
+                let first = line_of_offset(&text, found.start());
+                let last = line_of_offset(&text, found.end().saturating_sub(1).max(found.start()));
+                for line_number in first..=last {
+                    hit_lines.insert(line_number);
+                }
             }
-
-            // Context shapes `content` output only: `count` stays a count of
-            // matches, and `files_with_matches` never reads these rows.
-            if parsed.output_mode == OutputMode::Content {
-                let mut wanted: BTreeMap<usize, LineKind> = BTreeMap::new();
-                for &line_number in &hit_lines {
-                    let first = line_number.saturating_sub(parsed.before_context).max(1);
-                    let last = line_number
-                        .saturating_add(parsed.after_context)
-                        .min(lines.len());
-                    for neighbour in first..=last {
-                        wanted.entry(neighbour).or_insert(LineKind::Context);
-                    }
-                    wanted.insert(line_number, LineKind::Match);
-                }
-                for (line_number, kind) in wanted {
-                    matched_lines.push(MatchLine {
-                        file: file.clone(),
-                        line_number,
-                        line: clamp_line(lines[line_number - 1]),
-                        kind,
-                    });
+            matches
+        } else {
+            for (idx, line) in lines.iter().enumerate() {
+                if regex.is_match(line) {
+                    hit_lines.insert(idx + 1);
                 }
             }
+            hit_lines.len()
+        };
 
-            file_counts.push(FileMatch { file, count });
+        if count == 0 {
+            return;
         }
 
+        // Context shapes `content` output only: `count` stays a count of
+        // matches, and `files_with_matches` never reads these rows.
+        if parsed.output_mode == OutputMode::Content {
+            let mut wanted: BTreeMap<usize, LineKind> = BTreeMap::new();
+            for &line_number in &hit_lines {
+                let first = line_number.saturating_sub(parsed.before_context).max(1);
+                let last = line_number
+                    .saturating_add(parsed.after_context)
+                    .min(lines.len());
+                for neighbour in first..=last {
+                    wanted.entry(neighbour).or_insert(LineKind::Context);
+                }
+                wanted.insert(line_number, LineKind::Match);
+            }
+            for (line_number, kind) in wanted {
+                matched_lines.push(MatchLine {
+                    file: file.clone(),
+                    line_number,
+                    line: clamp_line(lines[line_number - 1]),
+                    kind,
+                });
+            }
+        }
+
+        file_counts.push(FileMatch { file, count });
+    }
+
+    fn render(&self, mut matched_lines: Vec<MatchLine>, mut file_counts: Vec<FileMatch>) -> Value {
+        let parsed = self.parsed;
+        let cwd = self.cwd;
+        let search_root = self.search_root;
         file_counts.sort_by(|left, right| left.file.cmp(&right.file));
         matched_lines.sort_by(|left, right| {
             left.file
@@ -267,7 +379,7 @@ impl Tool for GrepTool {
 
         let filenames: Vec<String> = file_counts
             .iter()
-            .map(|item| display_path(&item.file, &cwd, &search_root))
+            .map(|item| display_path(&item.file, cwd, search_root))
             .collect();
         let num_files = filenames.len();
         let total_matches: usize = file_counts.iter().map(|item| item.count).sum();
@@ -276,13 +388,13 @@ impl Tool for GrepTool {
             OutputMode::FilesWithMatches => {
                 let (items, applied_limit) =
                     apply_window(filenames.clone(), parsed.head_limit, parsed.offset);
-                Ok(json!({
+                json!({
                     "mode": "files_with_matches",
                     "numFiles": items.len(),
                     "filenames": items,
                     "appliedLimit": applied_limit,
                     "appliedOffset": (parsed.offset != 0).then_some(parsed.offset),
-                }))
+                })
             }
             OutputMode::Count => {
                 let rows: Vec<String> = file_counts
@@ -290,13 +402,13 @@ impl Tool for GrepTool {
                     .map(|item| {
                         format!(
                             "{}:{}",
-                            display_path(&item.file, &cwd, &search_root),
+                            display_path(&item.file, cwd, search_root),
                             item.count
                         )
                     })
                     .collect();
                 let (items, applied_limit) = apply_window(rows, parsed.head_limit, parsed.offset);
-                Ok(json!({
+                json!({
                     "mode": "count",
                     "numFiles": num_files,
                     "filenames": filenames,
@@ -304,17 +416,17 @@ impl Tool for GrepTool {
                     "numMatches": total_matches,
                     "appliedLimit": applied_limit,
                     "appliedOffset": (parsed.offset != 0).then_some(parsed.offset),
-                }))
+                })
             }
             OutputMode::Content => {
                 let rows: Vec<String> = matched_lines
                     .iter()
                     .map(|item| {
-                        format_content_line(item, &cwd, &search_root, parsed.show_line_numbers)
+                        format_content_line(item, cwd, search_root, parsed.show_line_numbers)
                     })
                     .collect();
                 let (items, applied_limit) = apply_window(rows, parsed.head_limit, parsed.offset);
-                Ok(json!({
+                json!({
                     "mode": "content",
                     "numFiles": num_files,
                     "filenames": filenames,
@@ -322,7 +434,7 @@ impl Tool for GrepTool {
                     "numLines": items.len(),
                     "appliedLimit": applied_limit,
                     "appliedOffset": (parsed.offset != 0).then_some(parsed.offset),
-                }))
+                })
             }
         }
     }
@@ -515,80 +627,6 @@ fn resolve_cwd(tool: ToolId, context: &ToolContext) -> ToolResult<PathBuf> {
     })
 }
 
-fn collect_files(
-    root: &Path,
-    glob: Option<&GlobMatcher>,
-    types: Option<&Types>,
-) -> ToolResult<Vec<PathBuf>> {
-    if root.is_file() {
-        return Ok(vec![root.to_path_buf()]);
-    }
-
-    // `ignore::WalkBuilder` is what ripgrep drives internally, so this gives
-    // us `.gitignore`/`.ignore`/global-excludes respect for free — the single
-    // biggest reason a naive `walkdir` over a monorepo falls over on
-    // `node_modules`/`target`/`dist`. `hidden(false)` keeps the explicit
-    // `--hidden` behaviour of runtime behavior (search dotfiles), while the
-    // `filter_entry` VCS guard is belt-and-braces for repos that keep `.svn`
-    // etc. unignored.
-    let mut files = Vec::new();
-    let mut builder = WalkBuilder::new(root);
-    if let Some(types) = types {
-        builder.types(types.clone());
-    }
-    let walker = builder
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .ignore(true)
-        .parents(true)
-        .follow_links(false)
-        .max_filesize(Some(MAX_FILE_BYTES))
-        .filter_entry(should_visit)
-        .build();
-
-    for entry in walker.filter_map(Result::ok) {
-        if entry.file_type().map(|ft| ft.is_file()) != Some(true) {
-            continue;
-        }
-
-        let candidate = entry.into_path();
-        let normalized = candidate
-            .strip_prefix(root)
-            .unwrap_or(&candidate)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        if let Some(matcher) = glob {
-            if !matcher.is_match(&normalized) {
-                continue;
-            }
-        }
-
-        // A search reads what it walks over, so a session credential inside the
-        // tree would come back as matched lines — the same content `Read`
-        // refuses. Left out of the walk rather than failing the search, since
-        // the caller asked about a directory, not about this file.
-        if crate::path_scope::is_session_credential_path(&candidate) {
-            continue;
-        }
-
-        files.push(candidate);
-    }
-    Ok(files)
-}
-
-fn should_visit(entry: &DirEntry) -> bool {
-    if entry.depth() == 0 {
-        return true;
-    }
-    let name = entry.file_name().to_string_lossy();
-    !VCS_DIRECTORIES_TO_EXCLUDE
-        .iter()
-        .any(|item| item == &name.as_ref())
-}
-
 fn display_path(path: &Path, cwd: &Path, root: &Path) -> String {
     path.strip_prefix(cwd)
         .or_else(|_| path.strip_prefix(root))
@@ -658,6 +696,7 @@ fn apply_window<T>(items: Vec<T>, limit: Option<usize>, offset: usize) -> (Vec<T
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
 
     struct TempDir {
         inner: tempfile::TempDir,
@@ -1153,5 +1192,119 @@ mod tests {
             json!(["ok.txt"]),
             "only the small file should be searched"
         );
+    }
+
+    async fn grep_in(dir: &Path) -> Value {
+        tool()
+            .call(
+                json!({ "pattern": "needle", "path": dir.to_string_lossy() }),
+                &ToolContext::new(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cargo_target_dir_is_skipped_outside_git_but_searchable_explicitly() {
+        // No `.git` anywhere: the `.rustc_info.json` marker alone has to keep
+        // the build output out of the walk.
+        let dir = TempDir::new();
+        fs::write(dir.path().join("lib.rs"), "needle\n").unwrap();
+        let target = dir.path().join("shared-target");
+        fs::create_dir_all(target.join("debug")).unwrap();
+        fs::write(target.join(".rustc_info.json"), "{}").unwrap();
+        fs::write(target.join("debug").join("out.rs"), "needle\n").unwrap();
+
+        let out = grep_in(dir.path()).await;
+        assert_eq!(out["filenames"], json!(["lib.rs"]));
+        assert!(out.get("searchIncomplete").is_none(), "{out}");
+        assert!(out.get("truncated").is_none(), "{out}");
+
+        let out = grep_in(&target).await;
+        assert_eq!(out["filenames"], json!(["debug/out.rs"]));
+    }
+
+    #[tokio::test]
+    async fn node_modules_below_the_root_is_skipped() {
+        let dir = TempDir::new();
+        let vendored = dir.path().join("node_modules").join("dep");
+        fs::create_dir_all(&vendored).unwrap();
+        fs::write(vendored.join("index.js"), "needle\n").unwrap();
+        fs::write(dir.path().join("app.js"), "needle\n").unwrap();
+
+        let out = grep_in(dir.path()).await;
+        assert_eq!(out["filenames"], json!(["app.js"]));
+    }
+
+    #[tokio::test]
+    async fn a_walk_over_the_entry_cap_says_the_search_is_incomplete() {
+        let dir = TempDir::new();
+        for idx in 0..20 {
+            fs::write(dir.path().join(format!("f{idx:02}.txt")), "needle\n").unwrap();
+        }
+        let limits = WalkLimits {
+            max_entries: 3,
+            ..WalkLimits::default()
+        };
+
+        let out = run_grep(
+            json!({ "pattern": "needle", "path": dir.path().to_string_lossy() }),
+            &ToolContext::new(),
+            limits,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out["mode"], json!("files_with_matches"));
+        assert_eq!(out["numFiles"], json!(2), "{out}");
+        assert_eq!(out["truncated"], json!(true));
+        let note = out["searchIncomplete"].as_str().unwrap();
+        assert!(note.contains("3 entries"), "{note}");
+        assert!(note.contains("Narrow `path`"), "{note}");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_call_stops_the_blocking_search() {
+        // 300 entries at 20ms each is a 6s search if nothing stops it.
+        let dir = TempDir::new();
+        for idx in 0..300 {
+            fs::write(dir.path().join(format!("f{idx}.txt")), "needle\n").unwrap();
+        }
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let limits = WalkLimits {
+            probe: Some(Arc::new(search_walk::WalkProbe {
+                on_entry: Box::new(|| std::thread::sleep(Duration::from_millis(20))),
+                on_finish: Box::new(move |summary| {
+                    let _ = finished_tx.send(*summary);
+                }),
+            })),
+            ..WalkLimits::default()
+        };
+
+        let context = ToolContext::new();
+        let call = run_grep(
+            json!({ "pattern": "needle", "path": dir.path().to_string_lossy() }),
+            &context,
+            limits,
+        );
+        // Timing out drops the call future, as the turn's cancel does.
+        let timed_out = tokio::time::timeout(Duration::from_millis(150), call).await;
+        assert!(timed_out.is_err(), "the search must still be running");
+
+        let summary = finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the blocking search must stop soon after the call is dropped");
+        assert_eq!(summary.stopped, Some(search_walk::WalkStop::Cancelled));
+        assert!(summary.visited < 300, "{summary:?}");
+    }
+
+    #[test]
+    fn schema_tells_the_model_to_scope_path_and_glob() {
+        let schema = tool().input_schema();
+        let path = schema["properties"]["path"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(path.contains("narrowest"), "{path}");
+        assert!(schema["properties"]["glob"]["description"].is_string());
     }
 }

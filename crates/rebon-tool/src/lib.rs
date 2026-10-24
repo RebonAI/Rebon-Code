@@ -225,6 +225,7 @@ pub mod plan_mode;
 pub mod powershell;
 pub mod queue;
 pub mod read;
+mod search_walk;
 pub mod shell_management;
 pub mod shell_preference;
 pub mod shell_process;
