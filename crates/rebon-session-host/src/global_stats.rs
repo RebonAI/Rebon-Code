@@ -30,12 +30,44 @@ pub struct GlobalStats {
     pub session_count: u64,
     pub daily_tokens: Vec<DailyTokenActivity>,
     pub model_usage: Vec<ModelUsageStats>,
+    /// One row per local day and model, oldest day first. A snapshot written
+    /// before this existed reads as empty until the next scan.
+    pub daily_model_usage: Vec<DailyModelUsage>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DailyTokenActivity {
     pub date: String,
     pub tokens: u64,
+}
+
+/// What one model did on one local day.
+///
+/// `tokens` is counted the way [`DailyTokenActivity::tokens`] is (billed input
+/// plus billed output), so a day's rows add up to its total. `input_tokens`
+/// includes the cached part, which `cache_read_tokens` breaks out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DailyModelUsage {
+    pub date: String,
+    pub model: Option<String>,
+    pub tokens: u64,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+}
+
+impl DailyModelUsage {
+    fn add(&mut self, other: &DailyModelUsage) {
+        self.tokens = self.tokens.saturating_add(other.tokens);
+        self.requests = self.requests.saturating_add(other.requests);
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +91,8 @@ struct SessionStats {
     /// unfolded; carrying it explicitly costs 8 bytes and saves a vector the
     /// length of the conversation.
     model_usage: Vec<(Option<String>, u64, u64)>,
+    /// One entry per distinct (day, model), folded the same way.
+    daily_models: Vec<DailyModelUsage>,
 }
 
 impl SessionStats {
@@ -88,6 +122,18 @@ impl SessionStats {
             .push((model.map(str::to_string), tokens, 1));
     }
 
+    fn record_day_model(&mut self, request: DailyModelUsage) {
+        if let Some(slot) = self
+            .daily_models
+            .iter_mut()
+            .find(|known| known.date == request.date && known.model == request.model)
+        {
+            slot.add(&request);
+            return;
+        }
+        self.daily_models.push(request);
+    }
+
     /// Fold in the owning job's own start/end, then drop a session that
     /// contributed nothing at all.
     fn with_job_timing(mut self, job_timing: Option<(u64, u64)>) -> Option<Self> {
@@ -103,6 +149,7 @@ impl GlobalStats {
     fn from_sessions(sessions: Vec<SessionStats>, now_ms: u64, offset_seconds: i32) -> Self {
         let mut daily: BTreeMap<String, u64> = BTreeMap::new();
         let mut usage_by_model: BTreeMap<Option<String>, (u64, u64)> = BTreeMap::new();
+        let mut by_day_model: BTreeMap<(String, Option<String>), DailyModelUsage> = BTreeMap::new();
         let mut total_tokens = 0u64;
         let mut longest_task_ms = 0u64;
 
@@ -119,6 +166,16 @@ impl GlobalStats {
                 let usage = usage_by_model.entry(model).or_default();
                 usage.0 = usage.0.saturating_add(tokens);
                 usage.1 = usage.1.saturating_add(requests);
+            }
+            for row in session.daily_models {
+                by_day_model
+                    .entry((row.date.clone(), row.model.clone()))
+                    .or_insert_with(|| DailyModelUsage {
+                        date: row.date.clone(),
+                        model: row.model.clone(),
+                        ..DailyModelUsage::default()
+                    })
+                    .add(&row);
             }
             if let (Some(first), Some(last)) = (session.first_ms, session.last_ms) {
                 longest_task_ms = longest_task_ms.max(last.saturating_sub(first));
@@ -174,6 +231,7 @@ impl GlobalStats {
             session_count,
             daily_tokens,
             model_usage,
+            daily_model_usage: by_day_model.into_values().collect(),
         }
     }
 }
@@ -439,6 +497,7 @@ fn session_stats_from_job(state: &BackgroundJobState) -> Option<SessionStats> {
         last_ms: Some(last),
         daily_tokens: Vec::new(),
         model_usage: Vec::new(),
+        daily_models: Vec::new(),
     })
 }
 
@@ -510,22 +569,45 @@ fn session_stats_from_transcript_uncached(
             .model
             .map(str::trim)
             .filter(|model| !model.is_empty());
-        let tokens = message
+        let (input, output, cache_read) = message
             .usage
             .map(|usage| {
-                u64::from(usage.billed_input_tokens())
-                    .saturating_add(u64::from(usage.billed_output_tokens()))
+                (
+                    u64::from(usage.billed_input_tokens()),
+                    u64::from(usage.billed_output_tokens()),
+                    u64::from(cache_read_tokens(&usage)),
+                )
             })
-            .unwrap_or(0);
+            .unwrap_or((0, 0, 0));
+        let tokens = input.saturating_add(output);
         stats.record_model(model, tokens);
         stats.tokens = stats.tokens.saturating_add(tokens);
-        if tokens > 0 {
-            if let Some(day) = entry_ms.map(|ms| day_key_from_ms(ms, offset_seconds)) {
-                stats.record_day(day, tokens);
+        if let Some(day) = entry_ms.map(|ms| day_key_from_ms(ms, offset_seconds)) {
+            if tokens > 0 {
+                stats.record_day(day.clone(), tokens);
             }
+            stats.record_day_model(DailyModelUsage {
+                date: day,
+                model: model.map(str::to_string),
+                tokens,
+                requests: 1,
+                input_tokens: input,
+                output_tokens: output,
+                cache_read_tokens: cache_read,
+            });
         }
     }
     Some(stats)
+}
+
+/// The prompt tokens one request read from cache: Anthropic's cache reads, or
+/// the cache hits of a vendor that reports hit/miss instead.
+fn cache_read_tokens(usage: &Usage) -> u32 {
+    if usage.prompt_cache_hit_tokens > 0 {
+        usage.prompt_cache_hit_tokens
+    } else {
+        usage.cache_read_input_tokens
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -533,6 +615,11 @@ fn session_stats_from_transcript_uncached(
 // ---------------------------------------------------------------------------
 
 const TRANSCRIPT_STATS_INDEX_FILE: &str = "global-stats-transcripts.json";
+
+/// Bumped when a record gains something a scan has to fill in, so a memo
+/// written before is recomputed rather than read back without it.
+/// 2: `daily_models`.
+const TRANSCRIPT_STATS_RECORD_VERSION: u32 = 2;
 
 /// Serialized index is capped: it is a *cache*, and a dropped entry only costs
 /// one rescan of that file.
@@ -578,6 +665,10 @@ struct TranscriptStatsRecord {
     daily: Vec<(String, u64)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     models: Vec<(Option<String>, u64, u64)>,
+    #[serde(default)]
+    version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    daily_models: Vec<DailyModelUsage>,
 }
 
 /// Remembers what each transcript contributed, keyed by its `(len, mtime)`.
@@ -619,6 +710,7 @@ impl TranscriptStatsIndex {
         if record.len != revision.len
             || record.mtime_ms != revision.mtime_ms
             || record.offset_seconds != offset_seconds
+            || record.version != TRANSCRIPT_STATS_RECORD_VERSION
         {
             return None;
         }
@@ -628,6 +720,7 @@ impl TranscriptStatsIndex {
             last_ms: record.last_ms,
             daily_tokens: record.daily.clone(),
             model_usage: record.models.clone(),
+            daily_models: record.daily_models.clone(),
         })
     }
 
@@ -649,6 +742,8 @@ impl TranscriptStatsIndex {
                 last_ms: stats.last_ms,
                 daily: stats.daily_tokens.clone(),
                 models: stats.model_usage.clone(),
+                version: TRANSCRIPT_STATS_RECORD_VERSION,
+                daily_models: stats.daily_models.clone(),
             },
         );
         self.dirty = true;
@@ -1125,6 +1220,7 @@ mod tests {
             last_ms: Some(3000),
             daily_tokens: vec![("1970-01-01".into(), 7)],
             model_usage: vec![(Some("test-model".into()), 7, 1)],
+            daily_models: Vec::new(),
         };
         let stats = GlobalStats::from_sessions(vec![session], 3000, UTC);
         assert_eq!(stats.total_tokens, 7);
@@ -1170,6 +1266,138 @@ mod tests {
         assert_eq!(stats.total_tokens, 7);
         assert!(stats.daily_tokens.is_empty());
         assert!(stats.model_usage.is_empty());
+        assert!(stats.daily_model_usage.is_empty());
+    }
+
+    fn full_usage_line(ts: &str, model: &str, usage: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": ts,
+            "message": {"model": model, "usage": usage}
+        })
+        .to_string()
+    }
+
+    fn day_model<'a>(stats: &'a GlobalStats, date: &str, model: &str) -> &'a DailyModelUsage {
+        stats
+            .daily_model_usage
+            .iter()
+            .find(|row| row.date == date && row.model.as_deref() == Some(model))
+            .unwrap_or_else(|| panic!("no row for {date} {model}"))
+    }
+
+    /// Each day's model rows add up to that day's total, across sessions,
+    /// with requests, input, output and cache reads kept apart.
+    #[test]
+    fn usage_is_kept_per_day_and_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("projects").join("repo");
+        fs::create_dir_all(&project).unwrap();
+        let mut file = fs::File::create(project.join("s1.jsonl")).unwrap();
+        let anthropic = serde_json::json!({
+            "input_tokens": 10, "output_tokens": 5,
+            "cache_read_input_tokens": 80, "cache_creation_input_tokens": 10
+        });
+        writeln!(
+            file,
+            "{}",
+            full_usage_line("2026-07-04T10:00:00Z", "opus", anthropic.clone())
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            full_usage_line("2026-07-04T11:00:00Z", "opus", anthropic)
+        )
+        .unwrap();
+        let deepseek = serde_json::json!({
+            "input_tokens": 100, "output_tokens": 20,
+            "prompt_cache_hit_tokens": 60, "prompt_cache_miss_tokens": 40
+        });
+        writeln!(
+            file,
+            "{}",
+            full_usage_line("2026-07-05T09:00:00Z", "deepseek", deepseek.clone())
+        )
+        .unwrap();
+        let mut other = fs::File::create(project.join("s2.jsonl")).unwrap();
+        writeln!(
+            other,
+            "{}",
+            full_usage_line("2026-07-04T12:00:00Z", "deepseek", deepseek)
+        )
+        .unwrap();
+        drop((file, other));
+        let now = parse_rfc3339_ms("2026-07-05T12:00:00Z").unwrap();
+
+        let stats = collect_global_stats_at_offset(dir.path(), now, UTC);
+
+        let opus = day_model(&stats, "2026-07-04", "opus");
+        assert_eq!(
+            (
+                opus.requests,
+                opus.input_tokens,
+                opus.output_tokens,
+                opus.cache_read_tokens
+            ),
+            (2, 200, 10, 160)
+        );
+        assert_eq!(opus.tokens, 210);
+        let deepseek = day_model(&stats, "2026-07-04", "deepseek");
+        assert_eq!((deepseek.requests, deepseek.cache_read_tokens), (1, 60));
+        assert_eq!(day_model(&stats, "2026-07-05", "deepseek").tokens, 120);
+        for day in &stats.daily_tokens {
+            let rows: u64 = stats
+                .daily_model_usage
+                .iter()
+                .filter(|row| row.date == day.date)
+                .map(|row| row.tokens)
+                .sum();
+            assert_eq!(rows, day.tokens, "{}", day.date);
+        }
+        let dates: Vec<&str> = stats
+            .daily_model_usage
+            .iter()
+            .map(|r| r.date.as_str())
+            .collect();
+        let mut sorted = dates.clone();
+        sorted.sort();
+        assert_eq!(dates, sorted, "oldest day first");
+    }
+
+    /// A memo written before the per-day model rows existed has none, and
+    /// reading it back would leave those days empty for as long as the
+    /// transcript went untouched.
+    #[test]
+    fn a_memo_from_before_the_model_rows_is_recomputed() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("projects").join("repo");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("s1.jsonl");
+        let mut file = fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            model_usage_line("2026-07-04T10:00:00Z", Some("opus"), 100, 50)
+        )
+        .unwrap();
+        drop(file);
+        let now = parse_rfc3339_ms("2026-07-05T12:00:00Z").unwrap();
+        collect_global_stats_at_offset(dir.path(), now, UTC);
+
+        // Rewrite the memo the way the previous release left it.
+        let index_path = TranscriptStatsIndex::path(dir.path());
+        let mut memo: serde_json::Value =
+            serde_json::from_slice(&fs::read(&index_path).unwrap()).unwrap();
+        for record in memo.as_object_mut().unwrap().values_mut() {
+            let record = record.as_object_mut().unwrap();
+            record.remove("version");
+            record.remove("daily_models");
+        }
+        fs::write(&index_path, serde_json::to_vec(&memo).unwrap()).unwrap();
+
+        let stats = collect_global_stats_at_offset(dir.path(), now, UTC);
+        assert_eq!(day_model(&stats, "2026-07-04", "opus").tokens, 150);
     }
 
     #[test]

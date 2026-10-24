@@ -105,7 +105,8 @@ pub use foreground_agent_endpoint::{
 };
 pub use global_stats::{
     collect_global_stats, load_cached_default_global_stats, refresh_default_global_stats,
-    refresh_default_global_stats_if_stale, DailyTokenActivity, GlobalStats, ModelUsageStats,
+    refresh_default_global_stats_if_stale, DailyModelUsage, DailyTokenActivity, GlobalStats,
+    ModelUsageStats,
 };
 pub use legacy_foreground::{
     ask_user_questions_from_permission, build_ask_user_question_updated_input,
