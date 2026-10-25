@@ -149,3 +149,84 @@ test('the configuration editor persists an entry\'s config as that entry and app
     await kit.stop();
   }
 });
+
+// ---- the bundle probe ---------------------------------------------------
+
+function writeBundle() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rebon-bundle-'));
+  const write = (relative, text) => {
+    const file = path.join(root, relative);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, text);
+  };
+  write('package.json', JSON.stringify({ name: 'demo-bundle', dsh: { bundle: { patch: './cordis.patch.yml' } } }));
+  // The patch is dsh's: YAML rows, parsed with the `yaml` package the bundle
+  // installs. A tiny stand-in answers the one call the probe makes.
+  write('node_modules/yaml/package.json', JSON.stringify({ name: 'yaml', main: 'index.js' }));
+  write('node_modules/yaml/index.js', `exports.parse = (text) => JSON.parse(text);\n`);
+  write('cordis.patch.yml', JSON.stringify([
+    { insert: [
+      { id: 'consumer', name: '@demo/consumer', config: { greeting: 'hi' } },
+      { id: 'stranded', name: '@demo/stranded' },
+      { id: 'provider', name: '@demo/provider' },
+      { id: 'library', name: '@demo/library' },
+      { id: 'scripted', name: '@demo/provider', config: { root: { __jsExpr: "dshHomePath('x')" } } },
+      { id: 'absent', name: '@demo/absent' },
+    ] },
+    { id: 'consumer', config: { greeting: 'hello' } },
+  ]));
+  write('node_modules/@demo/provider/package.json', JSON.stringify({ name: '@demo/provider', type: 'module', main: 'lib/index.js' }));
+  write('node_modules/@demo/provider/lib/index.js', `
+import { Service } from 'cordis';
+export default class Store extends Service { constructor(ctx) { super(ctx, 'store'); } }
+`);
+  write('node_modules/@demo/consumer/package.json', JSON.stringify({ name: '@demo/consumer', type: 'module', exports: { '.': { default: './index.js' } } }));
+  write('node_modules/@demo/consumer/index.js', `
+import { defineTool } from '@deepseek-ai/dsh-tools';
+export const name = 'consumer';
+export const inject = ['tools', 'store'];
+export function apply(ctx) {
+  ctx.tools.register(defineTool({
+    name: 'stored', description: 'x', parameters: {},
+    output: { schema: { type: 'object', additionalProperties: false, properties: {} }, render: () => [] },
+    execute: async () => ({}),
+  }));
+}
+`);
+  write('node_modules/@demo/stranded/package.json', JSON.stringify({ name: '@demo/stranded', type: 'module', main: 'index.js' }));
+  write('node_modules/@demo/stranded/index.js', `export const name = 'stranded';\nexport const inject = ['agents'];\nexport function apply() {}\n`);
+  write('node_modules/@demo/library/package.json', JSON.stringify({ name: '@demo/library', type: 'module', main: 'index.js' }));
+  write('node_modules/@demo/library/index.js', 'export const helper = 1;\n');
+  return fs.realpathSync(root);
+}
+
+function probeBundle(root) {
+  const runtime = path.resolve(here, '..', '..');
+  const args = ['--permission', `--allow-fs-read=${runtime}`, `--allow-fs-read=${root}`, probeScript, '--bundle', root];
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, args, { timeout: 30000 }, (error, stdout, stderr) => {
+      if (error && !stdout) return reject(new Error(`${error.message}\n${stderr}`));
+      resolve(JSON.parse(stdout.trim().split('\n').pop()));
+    });
+  });
+}
+
+test('a bundle\'s rows mount in one realm in the order their injections allow', async () => {
+  const answer = await probeBundle(writeBundle());
+  assert.equal(answer.ok, true, JSON.stringify(answer));
+  assert.deepEqual(answer.entries.map((entry) => entry.id), ['provider', 'consumer'], JSON.stringify(answer.skipped));
+  const [provider, consumer] = answer.entries;
+  assert.deepEqual(provider.provides, ['store']);
+  assert.equal(provider.entry, 'node_modules/@demo/provider/lib/index.js');
+  assert.equal(consumer.entry, 'node_modules/@demo/consumer/index.js');
+  assert.deepEqual(consumer.inject.required, ['tools', 'store']);
+  assert.deepEqual(consumer.tools.map((tool) => tool.name), ['stored']);
+  assert.deepEqual(consumer.config, { greeting: 'hello' }, 'a later patch row replaces the config');
+  const skipped = Object.fromEntries(answer.skipped.map((row) => [row.id, row.code]));
+  assert.deepEqual(skipped, {
+    scripted: '[CONFIG_EXPRESSION]',
+    absent: '[NOT_INSTALLED]',
+    stranded: '[MISSING_INJECT]',
+  });
+  assert.deepEqual(answer.skipped.find((row) => row.id === 'stranded').missing, ['agents']);
+});
