@@ -38,7 +38,6 @@ rebon-types.workspace = true
 # Code Mode runs its program in the same restricted Node runtime the plugin
 # host uses, through the shared code runner.
 rebon-code-runner.workspace = true
-rebon-node-runtime.workspace = true
 # The task registry the session scopes hand across a turn.
 rebon-plugin-tasks.workspace = true
 # Code Mode's model-facing instructions come from the prompt plugin's table.

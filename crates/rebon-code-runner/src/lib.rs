@@ -1,14 +1,15 @@
-//! PTC / Code Mode one-shot Node executor.
+//! PTC / Code Mode one-shot executor.
 //!
-//! This crate is deliberately V8-free. Code Mode never needed rebon's embedded
-//! JS runtime — it needs a *separate* process it is allowed to kill — so it
-//! lives beside [`rebon_boa_runner`] (which owns the containment unit) rather
-//! than inside the crate that hosts V8, and a build without the embedded
-//! runtime still has Code Mode.
+//! Code Mode needs a *separate* process it is allowed to kill, so it lives
+//! beside [`rebon_boa_runner`] (which owns the containment unit) rather than
+//! in the plugin plane's in-process runtime.
 //!
-//! Boa is deliberately not used here: the hardened Boa helper is synchronous and rejects genuine
-//! Promise results, while Code Mode's ABI is an async-function body. Each run therefore starts a
-//! fresh, restricted Node process that is independent of the long-lived plugin host. The child is
+//! Each run starts a fresh `rebon-verve` — Verve's `verve run`, shipped beside
+//! rebon — under its permission model (no files, workers, network or
+//! processes) with the program in a `vm` realm of its own, independent of the
+//! long-lived plugin host. The status-line Boa helper is not used: it is
+//! synchronous and rejects genuine Promise results, while Code Mode's ABI is an
+//! async-function body. The child is
 //! placed in an OS containment unit before its execute frame is admitted, and the supervisor owns
 //! hard timeout/cancellation, descendant termination, and direct-child reaping.
 //!
@@ -33,19 +34,10 @@ use rebon_boa_runner::{
 use serde::{Deserialize, Serialize};
 
 const PROTOCOL_VERSION: u16 = 1;
-const NODE_ENV: &str = "REBON_CODE_MODE_NODE";
-/// The spellings of the flag that turns Node's permission model on, newest
-/// first.
-///
-/// Node renamed this when the model went stable and dropped the old spelling,
-/// so no single string works across the runtimes Code Mode is handed: 24
-/// rejects `--experimental-permission` outright, and a runtime old enough to
-/// need it has never heard of `--permission`. Asking the runtime which one it
-/// accepts costs one short-lived process, cannot drift when Node renames the
-/// next flag, and — unlike a version table — is answered by the runtime that
-/// will actually execute the program.
-const PERMISSION_FLAGS: [&str; 2] = ["--permission", "--experimental-permission"];
-const NODE_HELPER: &str = include_str!("../js/code_mode_runner.js");
+/// The flag that turns the runner's permission model on: no files, workers,
+/// network or processes beyond what is granted, and Code Mode grants nothing.
+const PERMISSION_FLAG: &str = "--permission";
+const RUNNER_SCRIPT: &str = include_str!("../js/code_mode_runner.js");
 const MAX_CODE_BYTES: usize = 64 * 1024;
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// How large one tool result may be on its way *down* to the program.
@@ -91,7 +83,6 @@ const STACK_BYTES: u64 = 4 * 1024 * 1024;
 // supervisor kills that group on the deadline.
 const ACTIVE_PROCESS_LIMIT: u32 = 0;
 static ACTIVE_CODE_EXECUTIONS: AtomicUsize = AtomicUsize::new(0);
-const NODE_OLD_SPACE_MIB: u64 = 192;
 #[cfg(windows)]
 const MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
 // V8 reserves a multi-GiB pointer-compression cage on Unix. RLIMIT_AS must admit that reservation;
@@ -144,19 +135,7 @@ pub struct CodeProgramError {
     pub logs: Vec<String>,
 }
 
-/// An absolute Node executable selected independently of plugin runtime
-/// discovery, together with the proof that it can be hardened.
-///
-/// The sibling runtime a packaged install is expected to carry.
-fn sibling_runtime_name() -> &'static str {
-    if cfg!(windows) {
-        "rebon-code-node.exe"
-    } else {
-        "rebon-code-node"
-    }
-}
-
-/// Where [`CodeNodeRuntime::discover`] would look, without running anything.
+/// Where [`CodeRuntime::discover`] would look, without running anything.
 ///
 /// The same two deterministic rungs, stopping short of the permission-flag
 /// probe — which spawns a process, and so cannot sit on a path that decides
@@ -167,77 +146,60 @@ fn sibling_runtime_name() -> &'static str {
 /// Finding a path here does not promise the runtime can be hardened. It only
 /// rules out the case where there is nothing to harden.
 pub fn locate_executable() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(NODE_ENV) {
-        let path = PathBuf::from(path);
-        return path.is_file().then_some(path);
-    }
-    let current = std::env::current_exe().ok()?;
-    let candidate = current.parent()?.join(sibling_runtime_name());
-    candidate.is_file().then_some(candidate)
+    rebon_types::sibling_binary::verve_runner().ok()
 }
 
-/// Constructing one runs the guest's own flag set against the runtime and keeps
-/// the permission-flag spelling it accepted, so the check happens once per
-/// runtime rather than once per program — and so a runtime that cannot be
-/// hardened is refused where it is chosen, not where a model's program is
-/// already waiting to run.
+/// The runner Code Mode's one-shot processes run on (`rebon-verve`), with the
+/// proof that it can be hardened.
+///
+/// Constructing one runs the guest's own flag set against the runner, so the
+/// check happens once per runner rather than once per program — and so a
+/// runner that cannot be hardened is refused where it is chosen, not where a
+/// model's program is already waiting to run.
 #[derive(Debug, Clone)]
-pub struct CodeNodeRuntime {
+pub struct CodeRuntime {
     executable: PathBuf,
     working_directory: PathBuf,
-    permission_flag: &'static str,
 }
 
-impl CodeNodeRuntime {
+impl CodeRuntime {
     pub fn new(executable: impl Into<PathBuf>) -> Result<Self, CodeProgramError> {
         let executable = executable.into();
         if !executable.is_absolute() {
-            return Err(startup_error(
-                "Code Mode Node executable must be an absolute path",
-            ));
+            return Err(startup_error("Code Mode's runner must be an absolute path"));
         }
         if !executable.is_file() {
             return Err(startup_error(format!(
-                "Code Mode Node executable is missing: {}",
+                "Code Mode's runner is missing: {}",
                 executable.display()
             )));
         }
         let working_directory = executable
             .parent()
             .map(Path::to_path_buf)
-            .ok_or_else(|| startup_error("Code Mode Node executable has no parent directory"))?;
-        let permission_flag = probe_permission_flag(&executable, &working_directory)?;
+            .ok_or_else(|| startup_error("Code Mode's runner has no parent directory"))?;
+        probe_hardening(&executable, &working_directory)?;
         Ok(Self {
             executable,
             working_directory,
-            permission_flag,
         })
     }
 
-    /// Production discovery is intentionally deterministic: an absolute launcher-provided path,
-    /// then a specifically named sibling runtime. It never searches `PATH` or plugin installs.
+    /// Production discovery is intentionally deterministic: `REBON_VERVE` when
+    /// set, else the `rebon-verve` shipped beside rebon. It never searches
+    /// `PATH` or plugin installs.
     pub fn discover() -> Result<Self, CodeProgramError> {
-        match locate_executable() {
-            Some(path) => Self::new(path),
-            None => Err(startup_error(format!(
-                "Code Mode Node runtime is unavailable; the packaged launcher must set {NODE_ENV} to its absolute process.execPath (or bundle {} beside Rebon)",
-                sibling_runtime_name()
-            ))),
-        }
+        let path = rebon_types::sibling_binary::verve_runner()
+            .map_err(|why| startup_error(format!("Code Mode's runner is unavailable: {why}")))?;
+        Self::new(path)
     }
 
     pub fn executable(&self) -> &Path {
         &self.executable
     }
-
-    /// The permission-flag spelling this runtime accepted. Diagnostic only —
-    /// the spawn reads the field directly.
-    pub fn permission_flag(&self) -> &'static str {
-        self.permission_flag
-    }
 }
 
-/// A Node invocation with nothing inherited from rebon's own environment.
+/// A runner invocation with nothing inherited from rebon's own environment.
 ///
 /// `env_clear` is part of the sandbox: the guest must not see API keys, proxy
 /// settings, or anything else that reached rebon's process. Windows needs three
@@ -260,74 +222,60 @@ fn base_command(executable: &Path, working_directory: &Path) -> Command {
 /// Every one of these is load-bearing, so they are written once and used by both
 /// the probe and the spawn: a runtime is accepted only if it accepts exactly the
 /// set it will later be run with.
-fn harden(command: &mut Command, permission_flag: &str, stack_bytes: u64) {
+///
+/// There is no heap flag: Boa has no heap cap, so the containment unit's
+/// memory limit is what bounds a program's memory.
+fn harden(command: &mut Command, stack_bytes: u64) {
     command
         .arg("--no-warnings")
-        .arg(permission_flag)
+        .arg(PERMISSION_FLAG)
         .arg("--experimental-vm-modules")
         .arg("--no-addons")
         .arg("--disable-proto=throw")
-        .arg(format!("--max-old-space-size={NODE_OLD_SPACE_MIB}"))
         .arg(format!("--stack_size={}", v8_stack_kib(stack_bytes)));
 }
 
-/// What to tell V8 its stack is, given what the OS will actually allow.
+/// What to tell the runner its script stack is, given what the OS will allow.
 ///
-/// Deliberately below the `RLIMIT_STACK` the containment installs, because V8
-/// has to notice first. Told it owns the whole rlimit, it keeps recursing until
-/// the kernel faults, and a program that recursed too deep dies as SIGSEGV with
-/// nothing to report instead of raising `RangeError: Maximum call stack size
-/// exceeded` — which the program can catch and the run can explain. Seen on
-/// Linux, where the two numbers were equal; Windows never had an rlimit to
-/// collide with, so it always had the headroom this makes explicit.
-///
-/// Three quarters, so the margin scales with the limit rather than being a
-/// constant that a smaller stack would swallow.
+/// Deliberately below the stack limit the containment installs, so the
+/// runtime notices first: a program that recursed too deep then raises a
+/// `RangeError` it can catch and the run can explain, rather than dying with
+/// nothing to report. Three quarters, so the margin scales with the limit.
 fn v8_stack_kib(stack_bytes: u64) -> u64 {
     (stack_bytes / 1024) * 3 / 4
 }
 
-/// Which permission-flag spelling this runtime accepts, or a refusal.
+/// Whether the runner starts with the whole hardened set, or a refusal.
 ///
-/// Fail-closed by construction: the loop returns a flag only when the runtime
-/// started with the whole hardened set, and no rung drops the permission flag to
-/// make an unsupported runtime work. Code Mode executes code the model wrote;
-/// running it with the sandbox silently absent is worse than not running it.
-fn probe_permission_flag(
-    executable: &Path,
-    working_directory: &Path,
-) -> Result<&'static str, CodeProgramError> {
-    let mut rejected = Vec::new();
-    for flag in PERMISSION_FLAGS {
-        let mut command = base_command(executable, working_directory);
-        harden(&mut command, flag, STACK_BYTES);
-        // `0` is the smallest program that proves the runtime got as far as
-        // evaluating one. It reads, writes, and resolves nothing, so a failure
-        // here is about the flags rather than about what the program did.
-        command
-            .arg("-e")
-            .arg("0")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        match command.status() {
-            Ok(status) if status.success() => return Ok(flag),
-            Ok(status) => rejected.push(format!("{flag} ({status})")),
-            Err(error) => {
-                return Err(startup_error(format!(
-                    "cannot start the Code Mode Node runtime at {}: {error}",
-                    executable.display()
-                )))
-            }
-        }
+/// Fail-closed: nothing drops a flag to make a runner work. Code Mode executes
+/// code the model wrote; running it with the sandbox silently absent is worse
+/// than not running it.
+fn probe_hardening(executable: &Path, working_directory: &Path) -> Result<(), CodeProgramError> {
+    let mut command = base_command(executable, working_directory);
+    harden(&mut command, STACK_BYTES);
+    // `0` is the smallest program that proves the runner got as far as
+    // evaluating one. It reads, writes, and resolves nothing, so a failure
+    // here is about the flags rather than about what the program did.
+    command
+        .arg("-e")
+        .arg("0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match command.status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(startup_error(format!(
+            "the runner at {} refused Code Mode's hardening flags (--permission and the rest; \
+             {status}); Code Mode runs \
+             model-authored code and will not run it without the permission model, so this \
+             runner is refused rather than used unsandboxed",
+            executable.display()
+        ))),
+        Err(error) => Err(startup_error(format!(
+            "cannot start Code Mode's runner at {}: {error}",
+            executable.display()
+        ))),
     }
-    Err(startup_error(format!(
-        "the Node runtime at {} accepts none of Code Mode's hardening flags (tried {}); \
-         Code Mode runs model-authored code and will not run it without Node's permission \
-         model, so this runtime is refused rather than used unsandboxed",
-        executable.display(),
-        rejected.join(", ")
-    )))
 }
 
 fn startup_error(message: impl Into<String>) -> CodeProgramError {
@@ -510,7 +458,7 @@ pub async fn run_code_program(
     dispatcher: Arc<dyn CodeToolDispatcher>,
     budget: Duration,
 ) -> Result<CodeOutcome, CodeProgramError> {
-    let runtime = CodeNodeRuntime::discover()?;
+    let runtime = CodeRuntime::discover()?;
     run_code_program_with_runtime(code, dispatcher, budget, runtime).await
 }
 
@@ -518,7 +466,7 @@ pub async fn run_code_program_with_runtime(
     code: String,
     dispatcher: Arc<dyn CodeToolDispatcher>,
     budget: Duration,
-    runtime: CodeNodeRuntime,
+    runtime: CodeRuntime,
 ) -> Result<CodeOutcome, CodeProgramError> {
     if code.len() > MAX_CODE_BYTES {
         return Err(startup_error(format!(
@@ -950,7 +898,7 @@ impl Drop for StartedChild {
 /// is admitted, so the child is never asked to run anything while it is still
 /// unbounded.
 fn start_child(
-    runtime: &CodeNodeRuntime,
+    runtime: &CodeRuntime,
     code: &str,
     limits: &ExecutionLimits,
 ) -> Result<StartedChild, CodeProgramError> {
@@ -974,10 +922,10 @@ fn start_child(
     }
 
     let mut command = base_command(&runtime.executable, &runtime.working_directory);
-    harden(&mut command, runtime.permission_flag, limits.stack_bytes);
+    harden(&mut command, limits.stack_bytes);
     command
         .arg("-e")
-        .arg(NODE_HELPER)
+        .arg(RUNNER_SCRIPT)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -996,7 +944,7 @@ fn start_child(
         .ok_or_else(|| startup_error("Code Mode deadline is not representable"))?;
     let mut child = command
         .spawn()
-        .map_err(|error| startup_error(format!("start Code Mode Node runtime: {error}")))?;
+        .map_err(|error| startup_error(format!("start Code Mode's runner: {error}")))?;
     let child_pid = child.id();
     let mut containment = match ProcessContainment::establish(
         &mut child,
@@ -1061,7 +1009,7 @@ fn attach_execution(started: StartedChild) -> Result<ExecutionProcess, CodeProgr
     let io_stop = Arc::new(AtomicBool::new(false));
     let reader_stop = io_stop.clone();
     let reader = std::thread::Builder::new()
-        .name("code-node-reader".into())
+        .name("code-mode-reader".into())
         .spawn(move || read_child_frames(stdout, event_tx, reader_stop))
         .map_err(|error| {
             cleanup_failed_start(&mut child, &mut containment);
@@ -1069,7 +1017,7 @@ fn attach_execution(started: StartedChild) -> Result<ExecutionProcess, CodeProgr
         })?;
     let writer_stop = io_stop.clone();
     let writer = match std::thread::Builder::new()
-        .name("code-node-writer".into())
+        .name("code-mode-writer".into())
         .spawn(move || write_child_frames(stdin, response_rx, writer_stop))
     {
         Ok(writer) => writer,
@@ -1096,7 +1044,7 @@ fn attach_execution(started: StartedChild) -> Result<ExecutionProcess, CodeProgr
         active_execution: ActiveExecution::acquire(),
     };
     let supervisor = match std::thread::Builder::new()
-        .name("code-node-supervisor".into())
+        .name("code-mode-supervisor".into())
         .spawn(move || {
             let Ok(start) = start_rx.recv() else {
                 return;
@@ -1281,18 +1229,34 @@ fn read_child_frames(
 mod tests {
     use super::*;
 
-    /// The Node these tests run a real execution unit on.
-    fn test_runtime() -> CodeNodeRuntime {
-        let output = Command::new("node")
-            .args(["-p", "process.execPath"])
-            .output()
-            .expect("Node is required for Code Mode tests");
+    /// The runner these tests run a real execution unit on: `REBON_VERVE`, or
+    /// the `rebon-verve` built into this target directory
+    /// (`cargo build -p rebon-verve-host --bin rebon-verve`).
+    fn test_runner() -> PathBuf {
+        if let Some(path) = std::env::var_os("REBON_VERVE") {
+            return PathBuf::from(path);
+        }
+        let exe = std::env::current_exe().expect("the test knows its own path");
+        let name = if cfg!(windows) {
+            "rebon-verve.exe"
+        } else {
+            "rebon-verve"
+        };
+        let built = exe
+            .parent()
+            .and_then(Path::parent)
+            .expect("a test binary lives in target/<profile>/deps")
+            .join(name);
         assert!(
-            output.status.success(),
-            "node could not report its own path"
+            built.is_file(),
+            "Code Mode tests need the runner: build it with \
+             `cargo build -p rebon-verve-host --bin rebon-verve`, or set REBON_VERVE"
         );
-        let path = String::from_utf8(output.stdout).expect("a Node path is UTF-8");
-        CodeNodeRuntime::new(PathBuf::from(path.trim())).expect("a hardenable Node runtime")
+        built
+    }
+
+    fn test_runtime() -> CodeRuntime {
+        CodeRuntime::new(test_runner()).expect("a hardenable runner")
     }
 
     /// Walking away from a chatty program releases the thread that walks.
@@ -1320,7 +1284,7 @@ mod tests {
 
         let (finished_tx, finished_rx) = std_mpsc::channel();
         std::thread::Builder::new()
-            .name("code-node-drop-probe".into())
+            .name("code-mode-drop-probe".into())
             .spawn(move || {
                 drop(process);
                 let _ = finished_tx.send(());
@@ -1334,13 +1298,13 @@ mod tests {
 
     #[test]
     fn runtime_requires_an_absolute_existing_executable() {
-        assert!(CodeNodeRuntime::new("node").is_err());
+        assert!(CodeRuntime::new("node").is_err());
         let missing = if cfg!(windows) {
             PathBuf::from(r"C:\definitely-missing\node.exe")
         } else {
             PathBuf::from("/definitely-missing/node")
         };
-        assert!(CodeNodeRuntime::new(missing).is_err());
+        assert!(CodeRuntime::new(missing).is_err());
     }
 
     #[test]
@@ -1497,17 +1461,17 @@ mod tests {
     #[test]
     fn the_helper_has_no_frame_limit_of_its_own() {
         assert!(
-            !NODE_HELPER.contains("const MAX_FRAME_BYTES"),
+            !RUNNER_SCRIPT.contains("const MAX_FRAME_BYTES"),
             "the limit lives in Rust; a second copy is a second number that can drift"
         );
-        assert!(NODE_HELPER.contains("request.limits.maxFrameBytes"));
-        assert!(NODE_HELPER.contains("request.limits.maxIncomingBytes"));
+        assert!(RUNNER_SCRIPT.contains("request.limits.maxFrameBytes"));
+        assert!(RUNNER_SCRIPT.contains("request.limits.maxIncomingBytes"));
     }
 
     #[test]
     fn embedded_helper_is_not_the_plugin_host() {
-        assert!(NODE_HELPER.contains("One-shot Code Mode executor"));
-        assert!(!NODE_HELPER.contains("plugin-host/src"));
-        assert!(!NODE_HELPER.contains("@rebon/plugin-host"));
+        assert!(RUNNER_SCRIPT.contains("One-shot Code Mode executor"));
+        assert!(!RUNNER_SCRIPT.contains("plugin-host/src"));
+        assert!(!RUNNER_SCRIPT.contains("@rebon/plugin-host"));
     }
 }

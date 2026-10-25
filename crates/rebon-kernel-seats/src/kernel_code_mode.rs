@@ -23,8 +23,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
 use rebon_code_runner::{
-    run_code_program_with_runtime, CodeNodeRuntime, CodeOutcome, CodeProgramError,
-    CodeToolDispatcher,
+    run_code_program_with_runtime, CodeOutcome, CodeProgramError, CodeRuntime, CodeToolDispatcher,
 };
 use rebon_core::Engine;
 use rebon_tool::{Tool, ToolContext};
@@ -65,70 +64,22 @@ fn resolve_program_budget(input: &Value, fallback: Duration) -> Duration {
 /// Concurrent nested dispatch cap (dsh `maxParallelSubCalls` default).
 const DEFAULT_MAX_PARALLEL: usize = 10;
 
-/// The Node that Code Mode's one-shot processes run on.
+/// The runner Code Mode's one-shot processes run on: `rebon-verve`, shipped
+/// beside rebon (or `REBON_VERVE`). `PATH` is deliberately never searched —
+/// Code Mode executes code the model wrote, and the provenance of the
+/// executable is part of its threat model.
 ///
-/// Two rungs, and `PATH` is deliberately not one of them. The first is the
-/// launcher contract — an npm-distributed rebon was itself started by a Node, so
-/// it hands that one down. The second is rebon's own managed install, whose
-/// bytes had to match a digest compiled into this binary before they were
-/// unpacked.
-///
-/// The plugin plane's ladder ends in `PATH` and this one does not, for the
-/// reason recorded in `rebon-node-runtime`: plugins are trusted local code, so
-/// the user's own Node is exactly right for them, while Code Mode executes code
-/// the model wrote and the provenance of the executable is part of its threat
-/// model. What this adds is the managed rung — before it, a rebon that was not
-/// launched by npm had no Code Mode at all, even with a vetted runtime already
-/// installed under its own config home.
-///
-/// Resolved once per process. Both rungs run the runtime to check it can be
+/// Resolved once per process: finding it runs the runner to check it can be
 /// hardened, and that answer does not change while rebon is running.
-pub fn code_mode_runtime() -> Result<&'static CodeNodeRuntime, &'static CodeProgramError> {
-    static RUNTIME: std::sync::OnceLock<Result<CodeNodeRuntime, CodeProgramError>> =
+pub fn code_mode_runtime() -> Result<&'static CodeRuntime, &'static CodeProgramError> {
+    static RUNTIME: std::sync::OnceLock<Result<CodeRuntime, CodeProgramError>> =
         std::sync::OnceLock::new();
-    RUNTIME
-        .get_or_init(|| {
-            let launcher = match CodeNodeRuntime::discover() {
-                Ok(runtime) => return Ok(runtime),
-                Err(error) => error,
-            };
-            let managed = rebon_node_runtime::ManagedRuntimeStore::under_config_home(
-                &rebon_config::config_home_dir(),
-            );
-            // Newest first: a store may hold more than one install, and the
-            // newest vetted runtime is the one whose flag set is most likely to
-            // still be the supported spelling.
-            let mut installed = managed.installed();
-            installed.sort_by(|left, right| right.version.cmp(&left.version));
-            let mut refusals = Vec::new();
-            for runtime in installed {
-                match CodeNodeRuntime::new(runtime.executable) {
-                    Ok(runtime) => return Ok(runtime),
-                    Err(error) => refusals.push(error.message),
-                }
-            }
-            let mut message = launcher.message;
-            if refusals.is_empty() {
-                message.push_str(
-                    "; no managed Node runtime is installed either — `rebon node install` \
-                     provides one",
-                );
-            } else {
-                message.push_str("; the managed runtimes were refused too: ");
-                message.push_str(&refusals.join("; "));
-            }
-            Err(CodeProgramError {
-                message,
-                logs: Vec::new(),
-            })
-        })
-        .as_ref()
+    RUNTIME.get_or_init(CodeRuntime::discover).as_ref()
 }
 
-/// Whether a Node that could run a program is reachable at all.
+/// Whether a runner that could run a program is reachable at all.
 ///
-/// Cheap on purpose: two `stat`s for the launcher's runtime, a directory
-/// listing for the managed store, and the answer is cached. It is read from
+/// Cheap on purpose: a `stat` or two, and the answer is cached. It is read from
 /// tool exposure, which runs for every tool on every snapshot, so it cannot
 /// afford [`code_mode_runtime`]'s spawn — and cannot wait for it either,
 /// because that probe is what makes the *first* `run_code` call slow, not
@@ -141,16 +92,7 @@ pub fn code_mode_runtime() -> Result<&'static CodeNodeRuntime, &'static CodeProg
 /// answer it had to get both times.
 pub fn code_mode_runtime_reachable() -> bool {
     static REACHABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *REACHABLE.get_or_init(|| {
-        if rebon_code_runner::locate_executable().is_some() {
-            return true;
-        }
-        !rebon_node_runtime::ManagedRuntimeStore::under_config_home(
-            &rebon_config::config_home_dir(),
-        )
-        .installed()
-        .is_empty()
-    })
+    *REACHABLE.get_or_init(|| rebon_code_runner::locate_executable().is_some())
 }
 
 pub const PLUGIN_ID: &str = "code-mode";
@@ -208,7 +150,7 @@ pub struct RunCodeTool {
     events: rebon_kernel::Context,
     budget: Duration,
     max_parallel: usize,
-    node_runtime: Option<CodeNodeRuntime>,
+    node_runtime: Option<CodeRuntime>,
     // 启用状态只对当前实验插件实例有效；卸载再开放不会自动恢复开启。
     activation: Mutex<Option<Weak<()>>>,
 }
@@ -244,7 +186,7 @@ impl RunCodeTool {
                 Ok(if self.is_enabled() {
                     "Code Mode: on（仅当前会话；run_code 优先，权限与工具过滤仍生效）".into()
                 } else {
-                    "Code Mode: on（仅当前会话）；run_code 暂不可用：缺少受信任的 Node runtime。请执行 rebon node install 后重启并重新 /codemode on。".into()
+                    "Code Mode: on（仅当前会话）；run_code 暂不可用：找不到 rebon-verve（应随 rebon 一起安装）。请重新安装 rebon 后重启并重新 /codemode on。".into()
                 })
             }
             _ => Err("用法：/codemode [on|off]".into()),
@@ -286,12 +228,12 @@ impl RunCodeTool {
     }
 
     /// Test/embedding hook for an explicit, absolute Node runtime. Production uses the packaged
-    /// launcher contract resolved by [`CodeNodeRuntime::discover`].
+    /// launcher contract resolved by [`CodeRuntime::discover`].
     pub fn with_budget_and_runtime(
         engine: Arc<Engine>,
         events: rebon_kernel::Context,
         budget: Duration,
-        node_runtime: CodeNodeRuntime,
+        node_runtime: CodeRuntime,
     ) -> Arc<Self> {
         Arc::new(Self {
             engine,
