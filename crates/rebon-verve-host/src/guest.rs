@@ -75,8 +75,9 @@ impl HostGuest {
             &serde_json::Value::from(script.as_str()).to_string(),
             1,
         );
-        self.runtime.set_permissions(spec.network.clone());
-        self.runtime.set_worker_permissions(spec.network.clone());
+        self.runtime.set_permissions(spec.permissions.clone());
+        self.runtime
+            .set_worker_permissions(spec.permissions.clone());
         self.runtime.eval(&process_setup(spec, &entry))?;
         install_transport(self.runtime.context()).map_err(|error| error.to_string())?;
         let promise = self.runtime.load_esm(&entry, &source)?;

@@ -97,6 +97,49 @@ pub fn resolve(name: &str) -> Result<PathBuf, SiblingBinaryMissing> {
     resolve_from_executable(name, &executable)
 }
 
+/// The Verve runner: `verve run`, shipped beside `rebon` as `rebon-verve`.
+/// What rebon starts where it used to start Node — a contained plugin host,
+/// a Code Mode program, a package probe.
+pub const VERVE_RUNNER: &str = "rebon-verve";
+
+/// An explicit runner, as an absolute path: a test's build, or a deployment
+/// that keeps it elsewhere. A demand rather than a hint — set and wrong is the
+/// answer, not a reason to look beside the executable.
+pub const VERVE_RUNNER_ENV: &str = "REBON_VERVE";
+
+/// The runner to start: [`VERVE_RUNNER_ENV`] when set, else the one beside
+/// the running executable.
+pub fn verve_runner() -> Result<PathBuf, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| SiblingBinaryMissing::CurrentExecutable(error).to_string());
+    verve_runner_from(std::env::var_os(VERVE_RUNNER_ENV), executable)
+}
+
+/// [`verve_runner`]'s rule, given what it reads: the variable, and the
+/// running executable.
+fn verve_runner_from(
+    explicit: Option<std::ffi::OsString>,
+    executable: Result<PathBuf, String>,
+) -> Result<PathBuf, String> {
+    if let Some(path) = explicit {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(format!(
+                "{VERVE_RUNNER_ENV} must be an absolute path, not {}",
+                path.display()
+            ));
+        }
+        if !path.is_file() {
+            return Err(format!(
+                "{VERVE_RUNNER_ENV} names {}, which is not a file",
+                path.display()
+            ));
+        }
+        return Ok(path);
+    }
+    resolve_from_executable(VERVE_RUNNER, &executable?).map_err(|missing| missing.to_string())
+}
+
 /// Why a sibling binary could not be located.
 #[derive(Debug)]
 pub enum SiblingBinaryMissing {
@@ -150,6 +193,34 @@ impl std::error::Error for SiblingBinaryMissing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_runner_is_the_variable_when_set_and_the_sibling_otherwise() {
+        let dir = std::env::temp_dir().join(format!("rebon-runner-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let runner = dir.join(file_name(VERVE_RUNNER));
+        std::fs::write(&runner, b"").unwrap();
+        let executable = dir.join(file_name("rebon"));
+
+        // The variable wins, and is a demand: absolute, and a file.
+        assert_eq!(
+            verve_runner_from(Some(runner.clone().into()), Err("unused".into())),
+            Ok(runner.clone())
+        );
+        let relative = verve_runner_from(Some("rebon-verve".into()), Ok(executable.clone()));
+        assert!(relative.unwrap_err().contains("absolute"));
+        let missing = verve_runner_from(
+            Some(dir.join("nothing-here").into()),
+            Ok(executable.clone()),
+        );
+        assert!(missing.unwrap_err().contains("not a file"));
+
+        // Without it: beside the executable, and nowhere else.
+        assert_eq!(verve_runner_from(None, Ok(executable)), Ok(runner.clone()));
+        let elsewhere = verve_runner_from(None, Ok(native(&["elsewhere", "rebon"])));
+        assert!(elsewhere.unwrap_err().contains(VERVE_RUNNER));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn native(parts: &[&str]) -> PathBuf {
         parts.iter().collect()

@@ -41,7 +41,7 @@ fn started(script: PathBuf, environment: Option<Vec<(&str, &str)>>) -> VerveHost
         }),
         working_directory: script.parent().unwrap().to_path_buf(),
         name: "test-host".into(),
-        network: verve_permissions(),
+        permissions: verve_permissions(),
     })
     .expect("the isolate starts")
 }
@@ -190,7 +190,7 @@ export async function runHost() { throw new Error('must not run'); }
     assert_eq!(host.process.wait().await, HostExit::Code(2));
 }
 
-/// The test hosts touch no network.
+/// The test hosts touch no network; the stand-in host is read from disk.
 fn verve_permissions() -> verve::Permissions {
     verve::Permissions::default()
 }

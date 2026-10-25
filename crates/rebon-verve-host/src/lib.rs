@@ -63,24 +63,16 @@ pub struct VerveHostSpec {
     pub working_directory: PathBuf,
     /// The isolate thread's name, for whoever reads a thread list.
     pub name: String,
-    /// What the host and the workers it starts may reach on the network:
-    /// `fetch`, and Node's `net`, `http`, `tls` and `dgram`.
-    pub network: verve::Permissions,
+    /// What the host and the workers it starts may reach: files, workers, and
+    /// the network (`fetch`, and Node's `net`, `http`, `tls` and `dgram`).
+    pub permissions: verve::Permissions,
 }
 
 impl VerveHostSpec {
-    /// The network a trusted host has on Node: any host, any port, listening
-    /// and DNS. What an uncontained plugin plane runs with.
-    pub fn trusted_network() -> verve::Permissions {
-        verve::Permissions {
-            outbound: vec![verve::NetworkRule {
-                host: None,
-                port: None,
-            }],
-            listen: verve::ListenPermission::Any,
-            dns: true,
-            child_process: false,
-        }
+    /// What a trusted host has on Node: every file, workers, any host and
+    /// port, listening and DNS. What an uncontained plugin plane runs with.
+    pub fn trusted() -> verve::Permissions {
+        verve::Permissions::all()
     }
 }
 

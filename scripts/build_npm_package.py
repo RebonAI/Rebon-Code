@@ -48,6 +48,9 @@ SANDBOX_WIN_HELPER_NAME = "sandbox-win"
 # helper these are required — each one is the whole of a feature the product
 # advertises, so a package missing one is a broken package, not a smaller one.
 PLUGIN_CRATES_DIR = REPO_ROOT / "crates" / "plugins"
+# Crates outside crates/plugins/ whose binaries ship beside `rebon` the same
+# way: `rebon-verve`, which runs contained plugin hosts and Code Mode.
+SIBLING_CRATE_DIRS = [REPO_ROOT / "crates" / "rebon-verve-host"]
 NPM_ASSETS_ROOT = REPO_ROOT / "npm"
 WRAPPER_PACKAGE_NAME = "@rebon/cli"
 BARE_PACKAGE_NAME = "rebon"
@@ -265,7 +268,10 @@ def plugin_binaries() -> list[PluginBinary]:
     found: list[PluginBinary] = []
     for package in metadata["packages"]:
         manifest_dir = Path(package["manifest_path"]).resolve().parent
-        if PLUGIN_CRATES_DIR not in manifest_dir.parents:
+        if (
+            PLUGIN_CRATES_DIR not in manifest_dir.parents
+            and manifest_dir not in [d.resolve() for d in SIBLING_CRATE_DIRS]
+        ):
             continue
         for target in package["targets"]:
             if target["kind"] == ["bin"]:

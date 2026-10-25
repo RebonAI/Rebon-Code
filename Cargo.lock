@@ -404,7 +404,7 @@ dependencies = [
 [[package]]
 name = "boa_ast"
 version = "0.22.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#18e1def8dfa761a71a905da6456616b1ac63deab"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#0a20351e7a34d2f5adf03d2dbc8025ade4af0495"
 dependencies = [
  "bitflags 2.13.2",
  "boa_interner 0.22.0",
@@ -464,7 +464,7 @@ dependencies = [
 [[package]]
 name = "boa_engine"
 version = "0.22.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#18e1def8dfa761a71a905da6456616b1ac63deab"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#0a20351e7a34d2f5adf03d2dbc8025ade4af0495"
 dependencies = [
  "aligned-vec",
  "arrayvec",
@@ -527,7 +527,7 @@ dependencies = [
 [[package]]
 name = "boa_gc"
 version = "0.22.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#18e1def8dfa761a71a905da6456616b1ac63deab"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#0a20351e7a34d2f5adf03d2dbc8025ade4af0495"
 dependencies = [
  "arrayvec",
  "boa_macros 0.22.0",
@@ -555,7 +555,7 @@ dependencies = [
 [[package]]
 name = "boa_interner"
 version = "0.22.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#18e1def8dfa761a71a905da6456616b1ac63deab"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#0a20351e7a34d2f5adf03d2dbc8025ade4af0495"
 dependencies = [
  "boa_gc 0.22.0",
  "boa_macros 0.22.0",
@@ -582,7 +582,7 @@ dependencies = [
 [[package]]
 name = "boa_macros"
 version = "0.22.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#18e1def8dfa761a71a905da6456616b1ac63deab"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#0a20351e7a34d2f5adf03d2dbc8025ade4af0495"
 dependencies = [
  "cfg-if",
  "cow-utils",
@@ -614,7 +614,7 @@ dependencies = [
 [[package]]
 name = "boa_parser"
 version = "0.22.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#18e1def8dfa761a71a905da6456616b1ac63deab"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#0a20351e7a34d2f5adf03d2dbc8025ade4af0495"
 dependencies = [
  "bitflags 2.13.2",
  "boa_ast 0.22.0",
@@ -650,7 +650,7 @@ dependencies = [
 [[package]]
 name = "boa_string"
 version = "0.22.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#18e1def8dfa761a71a905da6456616b1ac63deab"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#0a20351e7a34d2f5adf03d2dbc8025ade4af0495"
 dependencies = [
  "fast-float2",
  "itoa",
@@ -4421,6 +4421,7 @@ dependencies = [
  "futures-util",
  "libc",
  "rebon-boa-runner",
+ "rebon-types",
  "serde",
  "serde_json",
  "tokio",
@@ -4646,7 +4647,6 @@ dependencies = [
  "rebon-core",
  "rebon-dialog",
  "rebon-kernel",
- "rebon-node-runtime",
  "rebon-plugin-model-prompt",
  "rebon-plugin-protocol",
  "rebon-plugin-supervisor",
@@ -5550,6 +5550,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "verve",
 ]
 
 [[package]]
@@ -6013,10 +6014,11 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.37"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "758025cb5fccfd3bc2fd74708fd4682be41d99e5dff73c377c0646c6012c73a4"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -6058,9 +6060,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.10"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df33b2b81ac578cabaf06b89b0631153a3f416b0a886e8a7a1707fb51abbd1ef"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -6487,7 +6489,7 @@ dependencies = [
 [[package]]
 name = "small_btree"
 version = "0.1.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#18e1def8dfa761a71a905da6456616b1ac63deab"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#0a20351e7a34d2f5adf03d2dbc8025ade4af0495"
 dependencies = [
  "arrayvec",
 ]
@@ -6734,13 +6736,23 @@ dependencies = [
 [[package]]
 name = "tag_ptr"
 version = "0.1.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#18e1def8dfa761a71a905da6456616b1ac63deab"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#0a20351e7a34d2f5adf03d2dbc8025ade4af0495"
 
 [[package]]
 name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+]
 
 [[package]]
 name = "tempfile"
@@ -7387,6 +7399,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
+name = "ureq"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cde93ff05758a36a851a398a772b0b79a82fbe3c186a46f2696baaeaf84c966b"
+dependencies = [
+ "base64 0.23.1",
+ "flate2",
+ "log",
+ "percent-encoding",
+ "rustls",
+ "rustls-pki-types",
+ "ureq-proto",
+ "utf8-zero",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "841583fc36089d7d59419568ae157f43a5a03a2e5a81ba87c77d1596ef46e922"
+dependencies = [
+ "base64 0.23.1",
+ "http",
+ "httparse",
+ "log",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7438,6 +7478,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8232dd3cdaed5356e0f716d285e4b40b932ac434100fe9b7e0e8e935b9e6246"
 
 [[package]]
+name = "utf8-zero"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
+
+[[package]]
 name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7470,9 +7516,10 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "verve"
 version = "0.1.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#18e1def8dfa761a71a905da6456616b1ac63deab"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#0a20351e7a34d2f5adf03d2dbc8025ade4af0495"
 dependencies = [
  "aes",
+ "base64 0.23.1",
  "boa_engine 0.22.0",
  "boa_gc 0.22.0",
  "brotli",
@@ -7507,8 +7554,10 @@ dependencies = [
  "sha1",
  "sha2 0.10.9",
  "socket2",
+ "tar",
  "tungstenite 0.28.0",
  "unicode-segmentation",
+ "ureq",
  "url",
  "wasmi",
  "web-time",

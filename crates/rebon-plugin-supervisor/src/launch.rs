@@ -95,9 +95,9 @@ pub(crate) fn launch(config: &HostConfig) -> io::Result<Launched> {
                 environment: config.environment.clone(),
                 working_directory: config.working_directory.clone(),
                 name: format!("plugin-host-{}", config.host_epoch),
-                // Uncontained, as the check above made sure: the network a
-                // trusted Node host has.
-                network: rebon_verve_host::VerveHostSpec::trusted_network(),
+                // Uncontained, as the check above made sure: what a trusted
+                // Node host has.
+                permissions: rebon_verve_host::VerveHostSpec::trusted(),
             })?;
             Ok(Launched {
                 stdin: Box::new(host.stdin),
