@@ -49,6 +49,7 @@ members = [
     "crates/rebon-plugin-package",
     "crates/rebon-plugin-protocol",
     "crates/rebon-plugin-supervisor",
+    "crates/rebon-verve-host",
     "crates/rebon-proto",
     "crates/rebon-render",
     "crates/rebon-session",
@@ -91,7 +92,8 @@ exclude = ["services/rc-server"]
 version = "1.17.0"
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.80"
+# Verve's Boa needs 1.91.
+rust-version = "1.91"
 publish = false
 
 [workspace.dependencies]
@@ -106,6 +108,11 @@ schemars = "1"
 regex = "1"
 boa_engine = "0.19.1"
 boa_gc = "0.19.1"
+# The JavaScript runtime the plugin plane runs on in place of Node: Boa with
+# Node's and the web's APIs. Its Boa is the one `[patch.crates-io]` below takes
+# from the same repository; `boa_engine` above is the separate, older Boa the
+# status-script runner still uses.
+verve = { git = "https://github.com/Quorafind/verve.git", branch = "main" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -231,6 +238,7 @@ rebon-rc-runner = { path = "crates/rebon-rc-runner" }
 rebon-plugin-package = { path = "crates/rebon-plugin-package" }
 rebon-node-runtime = { path = "crates/rebon-node-runtime" }
 rebon-plugin-supervisor = { path = "crates/rebon-plugin-supervisor" }
+rebon-verve-host = { path = "crates/rebon-verve-host" }
 rebon-boa-runner = { path = "crates/rebon-boa-runner" }
 rebon-code-runner = { path = "crates/rebon-code-runner" }
 rebon-i18n-gen = { path = "crates/rebon-i18n-gen" }
@@ -246,6 +254,33 @@ sandbox-win = { path = "crates/plugins/sandbox-win" }
 # ships equivalent APIs in a tagged release.
 [patch.crates-io]
 ratatui = { path = "vendor/ratatui-0.29.0-rebon" }
+# Verve's Boa 0.22, with the fixes it carries, kept in Verve's repository under
+# `boa/`. Patched here because a dependency's own patches do not reach the
+# build that uses it. Only 0.22 is replaced; the 0.19 above is untouched.
+boa_ast = { git = "https://github.com/Quorafind/verve.git", branch = "main" }
+boa_engine = { git = "https://github.com/Quorafind/verve.git", branch = "main" }
+boa_gc = { git = "https://github.com/Quorafind/verve.git", branch = "main" }
+boa_interner = { git = "https://github.com/Quorafind/verve.git", branch = "main" }
+boa_macros = { git = "https://github.com/Quorafind/verve.git", branch = "main" }
+boa_parser = { git = "https://github.com/Quorafind/verve.git", branch = "main" }
+boa_string = { git = "https://github.com/Quorafind/verve.git", branch = "main" }
+
+# Verve's interpreter unoptimised is several times slower, in tests as
+# anywhere: plugin hosts run on it.
+[profile.dev.package.boa_engine]
+opt-level = 3
+[profile.dev.package.boa_parser]
+opt-level = 3
+[profile.dev.package.boa_ast]
+opt-level = 3
+[profile.dev.package.boa_gc]
+opt-level = 3
+[profile.dev.package.boa_interner]
+opt-level = 3
+[profile.dev.package.boa_string]
+opt-level = 3
+[profile.dev.package.regress]
+opt-level = 3
 
 [profile.release]
 lto = "thin"
