@@ -93,6 +93,85 @@ test('the working directory cannot be changed from a plugin', async () => {
   }
 });
 
+// A shell executor's use of the seam: spawn, collect, wait for the outcome.
+const RUNNER = `
+import { defineTool } from '@deepseek-ai/dsh-tools';
+export const name = 'runner';
+export const inject = ['tools', 'subprocess'];
+export function apply(ctx) {
+  ctx.tools.register(defineTool({
+    name: 'run_it',
+    description: 'Runs a program.',
+    parameters: {},
+    output: {
+      schema: { type: 'object', additionalProperties: true, properties: {} },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    execute: async (_args, exec) => {
+      const handle = ctx.subprocess.spawn({
+        argv: ['pwsh', '-Command', 'Write-Output hi'],
+        cwd: 'C:/projects/demo',
+        stdio: { stdin: { data: 'in' }, stdout: { maxBytes: 4 }, stderr: { maxBytes: 100 } },
+        graceMs: 100,
+        signal: exec.signal,
+        env: { DSH_SESSION: 's1', DROPPED: undefined },
+      });
+      const outcome = await handle.done;
+      return {
+        outcome,
+        stdout: handle.collected.stdout.readFrom(0),
+        stderr: handle.collected.stderr.readFrom(0),
+        tail: handle.collected.stdout.readFrom(9),
+        exited: await handle.waitForExit(),
+      };
+    },
+  }));
+  let refusal;
+  try {
+    ctx.subprocess.spawn({ argv: ['x'], stdio: { stdin: 'ignore', stdout: 'pipe', stderr: { maxBytes: 1 } } });
+  } catch (error) { refusal = error.code; }
+  globalThis.__pipeRefusal = refusal;
+}
+`;
+
+test('a program is started by rebon through the process seat, as the dsh seam asks', async () => {
+  const calls = [];
+  const answers = [
+    { stdout: { text: 'hello', dropped: 0 }, stderr: { text: '', dropped: 0 }, exit: null },
+    { stdout: { text: ' world', dropped: 3 }, stderr: { text: 'warn', dropped: 0 }, exit: { exitCode: 0, signal: null } },
+  ];
+  const kit = await startHost({ seats: { process: (payload) => {
+    calls.push({ method: payload.method, params: payload.params });
+    if (payload.method === 'spawn') return { id: 7 };
+    return answers.shift();
+  } } });
+  try {
+    await loadCompose(kit, { entries: [{ id: 'runner' }] });
+    const loaded = await loadEntry(kit, { id: 'runner', ...cordisPackage(RUNNER), tools: ['run_it'], seats: ['process'], publishedTopics: ['compose:session/append'] });
+    assert.equal(loaded.status, 'success', JSON.stringify(loaded.payload));
+    assert.equal(globalThis.__pipeRefusal, '[UNSUPPORTED]', 'a raw pipe is refused by name');
+    await openScope(kit, 'runner');
+    const call = await kit.scoped('runner', 'tool/call', { tool: 'run_it', input: {} });
+    assert.equal(call.terminal.status, 'success', JSON.stringify(call.terminal.payload));
+    const value = JSON.parse(plainly(call.terminal.payload).content[0].text);
+    assert.deepEqual(value.outcome, { exitCode: 0, signal: null });
+    // Four bytes kept of a fourteen-byte stream (three of them dropped on
+    // rebon's side): a read from the start is lossy and gets the tail.
+    assert.deepEqual(value.stdout, { text: 'orld', nextOffset: 14, lossy: true });
+    assert.deepEqual(value.tail, { text: 'orld', nextOffset: 14, lossy: true });
+    assert.deepEqual(value.stderr, { text: 'warn', nextOffset: 4, lossy: false });
+    assert.equal(value.exited, true);
+    assert.deepEqual(plainly(calls[0]), {
+      method: 'spawn',
+      params: { argv: ['pwsh', '-Command', 'Write-Output hi'], cwd: 'C:/projects/demo', env: { DSH_SESSION: 's1', DROPPED: null }, stdin: 'in' },
+    });
+    assert.deepEqual(calls.slice(1).map((c) => c.method), ['wait', 'wait']);
+    assert.equal(plainly(calls[1]).params.id, 7);
+  } finally {
+    await kit.stop();
+  }
+});
+
 // A plugin with live-editable config, the shape `dsh-settings` forms read.
 const KNOB = `
 import z from '@deepseek-ai/schemastery';

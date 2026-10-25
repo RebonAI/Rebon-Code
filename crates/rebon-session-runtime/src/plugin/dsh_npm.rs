@@ -40,6 +40,18 @@ use serde_json::{json, Value};
 /// grant, the logger and the plugin's own settings namespace are harmless.
 pub(super) const SEATS: &[&str] = &["credentials", "logger", "settings"];
 
+/// The seats of a package that starts programs: [`SEATS`] and `process`,
+/// which the realm's `subprocess` seam reaches. Asked for when the package
+/// (or, for a bundle, any of its rows) injects `subprocess`, so the person
+/// sees at install that it starts programs.
+pub(super) fn seats_for(starts_programs: bool) -> Vec<&'static str> {
+    let mut seats = SEATS.to_vec();
+    if starts_programs {
+        seats.push("process");
+    }
+    seats
+}
+
 /// Hosts a package names that are not hosts it connects to.
 const NOT_ENDPOINTS: &[&str] = &[
     "github.com",
@@ -236,7 +248,7 @@ pub fn manifest_for(
         "services": names("services"),
         "llmProviders": names("llmProviders"),
         "eventTopics": names("eventTopics"),
-        "seats": SEATS,
+        "seats": seats_for(injects.contains(&"subprocess")),
         "invokableTools": invokable,
         "inject": required,
         "provides": names("provides"),

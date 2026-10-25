@@ -29,17 +29,19 @@ import RebonWebRuntime from './web-runtime.mjs';
 import RebonSystemPromptRuntime from './systemprompt-runtime.mjs';
 import RebonCommandsRuntime from './commands-runtime.mjs';
 import RebonWorkingDirectory from './working-directory-runtime.mjs';
+import RebonSubprocess from './subprocess-runtime.mjs';
 import { RebonConfigEditor, RebonLoader, RebonProfileContext } from './loader-runtime.mjs';
 import { mounting, track, untrack } from './entries.mjs';
 
 /** The built-in seats, in mount order: a dsh `inject` is satisfied at mount
  *  time, so a seat that arrives after the plugin needing it never arrives.
- *  The last four are the dsh boot services an upstream package injects —
- *  the composition answers them itself (see `loader-runtime.mjs` and
- *  `working-directory-runtime.mjs`). */
+ *  The last five are services an upstream package injects that dsh's boot
+ *  layer and session model provide — the composition answers them itself
+ *  (see `working-directory-runtime.mjs`, `subprocess-runtime.mjs` and
+ *  `loader-runtime.mjs`). */
 const BUILTIN_SEATS = [
   'llm', 'credentials', 'tools', 'web', 'systemPrompt', 'commands',
-  'workingDirectory', 'loader', 'profileContext', 'configEditor',
+  'workingDirectory', 'subprocess', 'loader', 'profileContext', 'configEditor',
 ];
 
 let state;
@@ -116,6 +118,7 @@ export async function createRealm({ web = null, entries = [], profile = null } =
   await ctx.plugin(RebonSystemPromptRuntime);
   await ctx.plugin(RebonCommandsRuntime);
   await ctx.plugin(RebonWorkingDirectory);
+  await ctx.plugin(RebonSubprocess);
   await ctx.plugin(RebonLoader);
   await ctx.plugin(RebonProfileContext, profile ?? {});
   await ctx.plugin(RebonConfigEditor, profile ?? {});

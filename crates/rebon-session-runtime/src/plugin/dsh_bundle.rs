@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 
 use super::dsh_npm::{
     fetches_any_url, package_sources, plugin_id_of, provided_modules, run_probe, scan_requests,
-    Adapted, SEATS,
+    seats_for, Adapted,
 };
 
 /// How many times peers are added and the tree installed again before giving
@@ -200,12 +200,22 @@ pub fn bundle_manifest(
     let id = plugin_id_of(package)?;
     let mut kernel_plugins = serde_json::Map::new();
     let mut configs = serde_json::Map::new();
-    for entry in probe
+    let entries = probe
         .get("entries")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+        .cloned()
+        .unwrap_or_default();
+    // A row that starts programs reaches the `process` seat through the
+    // realm's subprocess seam whichever row's call it happens in — the tool's
+    // or the executor's — so the grant is the bundle's, on every row.
+    let starts_programs = entries.iter().any(|entry| {
+        ["required", "optional"].iter().any(|key| {
+            entry["inject"][key]
+                .as_array()
+                .is_some_and(|names| names.iter().any(|name| name == "subprocess"))
+        })
+    });
+    for entry in &entries {
         let Some(row) = entry.get("id").and_then(Value::as_str) else {
             continue;
         };
@@ -241,7 +251,7 @@ pub fn bundle_manifest(
             "services": list("services"),
             "llmProviders": list("llmProviders"),
             "eventTopics": list("eventTopics"),
-            "seats": SEATS,
+            "seats": seats_for(starts_programs),
             // See `dsh_npm::manifest_for`: the web seat falls back to rebon's
             // own search and fetch.
             "invokableTools": if uses_web { json!(["WebSearch", "WebFetch"]) } else { json!([]) },
@@ -583,6 +593,33 @@ mod tests {
         );
     }
 
+    /// A bundle with a row that injects `subprocess` asks, on every row,
+    /// for the seat that starts programs.
+    #[test]
+    fn a_bundle_that_starts_programs_asks_for_the_process_seat() {
+        let row = |id: &str, required: &[&str]| {
+            json!({ "id": id, "name": format!("@deepseek-ai/dsh-{id}"), "entry": "x.js",
+                    "inject": { "required": required, "optional": [] }, "provides": [] })
+        };
+        let probe = json!({ "ok": true, "entries": [
+            row("pwsh-local", &["subprocess"]),
+            row("tool-pwsh", &["tools", "shell"]),
+        ] });
+        let manifest = bundle_manifest(
+            &json!({ "name": "shell", "version": "1.0.0" }),
+            &probe,
+            &ContainerRequest::default(),
+        )
+        .unwrap();
+        for id in ["pwsh-local", "tool-pwsh"] {
+            assert_eq!(
+                manifest["capabilities"]["kernelPlugins"][id]["seats"],
+                json!(["credentials", "logger", "settings", "process"]),
+                "{id}"
+            );
+        }
+    }
+
     #[test]
     fn the_manifest_has_one_kernel_plugin_per_mounted_row() {
         let package = json!({ "name": "dsh-files", "version": "1.0.0", "description": "files" });
@@ -627,6 +664,10 @@ mod tests {
             json!({ "tool-fs": { "readImage": false } })
         );
         assert_eq!(manifest["metadata"]["bundle"]["skipped"][0]["id"], "agent");
+        assert!(
+            !kernel["fs-local"]["seats"].to_string().contains("process"),
+            "nothing here starts a program"
+        );
         let parsed: rebon_harness::rebon_plugin_package::PluginManifest =
             serde_json::from_value(manifest).unwrap();
         assert_eq!(parsed.capabilities.kernel_plugins.len(), 2);

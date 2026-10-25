@@ -643,6 +643,12 @@ impl HostEpochs {
     fn next(&self) -> u64 {
         self.base | (self.next.fetch_add(1, Ordering::Relaxed) << Self::STEP_BITS)
     }
+
+    /// Which host an epoch belongs to: the range its supervisor's own
+    /// restarts stay inside.
+    fn range_of(epoch: u64) -> u64 {
+        epoch >> Self::STEP_BITS
+    }
 }
 
 struct ContainerTemplate {
@@ -699,12 +705,15 @@ impl PluginPlane {
         invoker: Arc<dyn ToolInvoker>,
     ) -> Result<Arc<Self>, SupervisorError> {
         let mods = Arc::new(std::sync::OnceLock::new());
+        let epochs = Arc::new(HostEpochs::new());
+        let main_epoch = epochs.next();
         let seats = Arc::new(KernelSeats {
             ctx: ctx.clone(),
             mods: Arc::clone(&mods),
+            processes: Arc::new(crate::process_seat::ProcessSeat::default()),
+            shared_host: HostEpochs::range_of(main_epoch),
         });
         let events = Arc::new(KernelEvents { ctx: ctx.clone() });
-        let epochs = Arc::new(HostEpochs::new());
         let template = ContainerTemplate {
             epochs: Arc::clone(&epochs),
             runner: config.runner.clone(),
@@ -721,7 +730,7 @@ impl PluginPlane {
             exposed_seats: config.exposed_seats.clone(),
         };
         let host = HostConfig::new(config.runner.clone(), config.host_script.clone())
-            .with_host_epoch(epochs.next())
+            .with_host_epoch(main_epoch)
             .with_loader(&config.loader)
             .with_working_directory(config.working_directory.clone())
             .with_tool_invoker(invoker, config.exposed_tools.iter().cloned())
@@ -2657,6 +2666,7 @@ pub fn default_exposed_seats() -> Vec<String> {
         "logger".to_owned(),
         "settings".to_owned(),
         rebon_types::MODS_SEAT.to_owned(),
+        crate::process_seat::PROCESS_SEAT.to_owned(),
     ]
 }
 
@@ -2672,6 +2682,10 @@ struct KernelSeats {
     /// run child processes and HTTP requests, which a synchronous JSON
     /// service on the reader's thread could not.
     mods: Arc<std::sync::OnceLock<Arc<crate::mods::ModsRegistry>>>,
+    /// The programs compositions start, answered here for the same reason.
+    processes: Arc<crate::process_seat::ProcessSeat>,
+    /// The shared host's epoch range: the `process` seat answers it alone.
+    shared_host: u64,
 }
 
 impl SeatDispatcher for KernelSeats {
@@ -2682,6 +2696,28 @@ impl SeatDispatcher for KernelSeats {
         Box<dyn std::future::Future<Output = Result<Payload, ToolRefusal>> + Send + '_>,
     > {
         let mut params = invocation.params.to_value().unwrap_or(Value::Null);
+        if invocation.seat == crate::process_seat::PROCESS_SEAT {
+            // A contained plugin is confined to its own files and no
+            // processes; a program started for it here would be outside the
+            // container. See `process_seat`.
+            if HostEpochs::range_of(invocation.identity.host_epoch) != self.shared_host {
+                return Box::pin(async move {
+                    Err(ToolRefusal::new(
+                        "[CONTAINED]",
+                        "a contained plugin cannot start programs; trust it (kernelPlugins.trusted) to let it",
+                    ))
+                });
+            }
+            let processes = Arc::clone(&self.processes);
+            let owner = invocation.identity.plugin_id.clone();
+            let method = invocation.method.clone();
+            return Box::pin(async move {
+                processes
+                    .call(&owner, &method, &params)
+                    .await
+                    .map(Payload::from)
+            });
+        }
         if invocation.seat == rebon_types::MODS_SEAT {
             return match self.mods.get() {
                 Some(mods) => {

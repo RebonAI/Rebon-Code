@@ -17,10 +17,9 @@
 //!   the endpoint the settings write configured;
 //! * `dsh-storage` + `dsh-storage-json`, `dsh-skill` +
 //!   `dsh-skill-filesystem` — reached by a fixture consumer in the same realm;
-//! * `dsh-tool-skill` — named as not running: it needs dsh's agent loop;
-//! * `dsh-pwsh-local` + `dsh-tool-pwsh` — named as not running: they need a
-//!   `subprocess` provider, and dsh's own (`dsh-subprocess-local`) is native
-//!   addons and `child_process`, which a plugin on Verve does not get.
+//! * `dsh-pwsh-local` + `dsh-tool-pwsh` — the `pwsh` tool runs a command
+//!   over the realm's subprocess seam, the program started by rebon;
+//! * `dsh-tool-skill` — named as not running: it needs dsh's agent loop.
 //!
 //! It fetches from registry.npmjs.org and needs the runner (`REBON_VERVE`,
 //! or `cargo build -p rebon-verve-host --bin rebon-verve`), so it is run by
@@ -220,6 +219,7 @@ async fn upstream_dsh_packages_load_unchanged_and_work_on_the_plane() {
         rows,
         [
             "fs-local",
+            "pwsh-local",
             "settings",
             "shell-env",
             "skill",
@@ -227,6 +227,7 @@ async fn upstream_dsh_packages_load_unchanged_and_work_on_the_plane() {
             "storage",
             "storage-json",
             "tool-fs",
+            "tool-pwsh",
             "web-fetch-http",
             "web-search-deepseek",
         ],
@@ -240,11 +241,7 @@ async fn upstream_dsh_packages_load_unchanged_and_work_on_the_plane() {
         .collect();
     assert_eq!(
         skipped,
-        BTreeMap::from([
-            ("pwsh-local", "[MISSING_INJECT]"),
-            ("tool-pwsh", "[MISSING_INJECT]"),
-            ("tool-skill", "[MISSING_INJECT]"),
-        ])
+        BTreeMap::from([("tool-skill", "[MISSING_INJECT]")])
     );
     let reason = |id: &str| {
         adapted
@@ -255,16 +252,11 @@ async fn upstream_dsh_packages_load_unchanged_and_work_on_the_plane() {
             .unwrap_or_default()
     };
     assert!(
-        reason("pwsh-local").contains("\"subprocess\""),
-        "{}",
-        reason("pwsh-local")
-    );
-    assert!(
         reason("tool-skill").contains("\"agents\""),
         "{}",
         reason("tool-skill")
     );
-    for tool in ["read", "write", "edit"] {
+    for tool in ["read", "write", "edit", "pwsh"] {
         assert!(
             adapted.tools.iter().any(|t| t == tool),
             "{tool}: {:?}",
@@ -279,6 +271,12 @@ async fn upstream_dsh_packages_load_unchanged_and_work_on_the_plane() {
     assert!(manifest.capabilities.kernel_plugins["tool-fs"]
         .inject
         .contains(&"fs".to_owned()));
+    assert!(
+        manifest.capabilities.kernel_plugins["tool-pwsh"]
+            .seats
+            .contains(&"process".to_owned()),
+        "a bundle that starts programs asks for the seat that does"
+    );
 
     // ---- compose: the rows in reverse of what they need, trusted ----
     let config_dir = scratch.path().join("config");
@@ -341,6 +339,10 @@ async fn upstream_dsh_packages_load_unchanged_and_work_on_the_plane() {
     let at = |id: &str| order.iter().position(|x| *x == id).unwrap();
     assert!(at("fs-local") < at("tool-fs"), "{order:?}");
     assert!(at("storage") < at("storage-json"), "{order:?}");
+    assert!(
+        at("pwsh-local") < at("tool-pwsh") && at("shell-env") < at("tool-pwsh"),
+        "{order:?}"
+    );
     assert!(at("skill") < at("skill-filesystem"), "{order:?}");
     assert!(
         at("storage-json") < at("dsh-seam-probe") && at("skill") < at("dsh-seam-probe"),
@@ -385,7 +387,12 @@ async fn upstream_dsh_packages_load_unchanged_and_work_on_the_plane() {
             // What a provider of the web seat may cause, as the real plane
             // exposes it: rebon's own search and fetch.
             exposed_tools: vec!["WebSearch".into(), "WebFetch".into()],
-            exposed_seats: vec!["credentials".into(), "logger".into(), "settings".into()],
+            exposed_seats: vec![
+                "credentials".into(),
+                "logger".into(),
+                "settings".into(),
+                "process".into(),
+            ],
             tool_catalog: json!([]),
             scope_id: None,
             working_directory: workspace.clone(),
@@ -445,6 +452,34 @@ async fn upstream_dsh_packages_load_unchanged_and_work_on_the_plane() {
             std::fs::read_to_string(workspace.join("new.txt")).unwrap(),
             "edited by dsh-tool-fs\n"
         );
+    }
+
+    // ---- the shell: dsh-tool-pwsh over dsh-pwsh-local, started by rebon ----
+    let has_pwsh = std::process::Command::new("pwsh")
+        .args(["-NoProfile", "-Command", "exit 0"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    let shell = call(
+        "pwsh",
+        json!({ "command": "Write-Output hi-from-pwsh; Get-Location", "description": "say hi" }),
+    )
+    .await;
+    if has_pwsh {
+        let shell = shell.expect("pwsh answers");
+        assert!(shell.to_string().contains("hi-from-pwsh"), "{shell}");
+        // In the session's directory: the realm's working directory.
+        assert!(
+            shell.to_string().to_lowercase().contains(
+                &workspace
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_lowercase()
+            ),
+            "{shell}"
+        );
+    } else {
+        eprintln!("pwsh is not installed here; the shell answered {shell:?}");
     }
 
     // ---- storage and skills, from a consumer in the same realm ----

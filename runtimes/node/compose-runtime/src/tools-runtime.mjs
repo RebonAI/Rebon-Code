@@ -238,6 +238,12 @@ export default class RebonToolsRuntime extends Service {
         id: callCtx.scopeId,
         session: {
           id: callCtx.scopeId,
+          // What a dsh tool reads off the session's header: its id (the
+          // shell exports it as `DSH_SESSION_ID`) and where it started.
+          header: Object.freeze({ id: callCtx.scopeId, cwd: callCtx.workspaceRoot }),
+          // A session's model request settings are rebon's own; a tool that
+          // asks finds none and takes its default.
+          requestHeader: () => undefined,
           append(type, data) {
             void publish(SESSION_APPEND_TOPIC, { type, data, tool: name, callId })
               .catch(() => {});
