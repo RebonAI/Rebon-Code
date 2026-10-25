@@ -113,6 +113,35 @@ impl HostGuest {
         }
     }
 
+    /// A host that can never move again ends, as a Node process does when its
+    /// event loop empties: its entry has not finished, yet nothing could wake
+    /// it — no read waiting on stdin, no timer, no worker, no socket. That is
+    /// a host whose loop is waiting on a plugin's promise nobody will settle,
+    /// typically during a shutdown; Node exits it with 13, for an unsettled
+    /// top-level await, and so does this rather than wait to be killed.
+    fn check_stalled(&mut self) {
+        let Some(entry) = &self.entry else { return };
+        if !matches!(entry.state(), PromiseState::Pending)
+            || self.transport.exited.get()
+            || self.transport.waiting.borrow().is_some()
+            || !self.transport.input.borrow().is_empty()
+            || self.runtime.next_due().is_some()
+        {
+            return;
+        }
+        self.entry = None;
+        self.transport.exited.set(true);
+        let line = serde_json::json!({
+            "level": "warn",
+            "code": "unsettled_top_level_await",
+            "message": "the host has nothing left that could wake it: \
+                        a promise it waits on will never settle",
+        });
+        let mut events = self.transport.events.borrow_mut();
+        events.push(HostEvent::Stderr(format!("{line}\n").into_bytes()));
+        events.push(HostEvent::Exit(13));
+    }
+
     /// A chunk of stdin, or its end: answers a waiting `read()` or keeps it.
     pub(crate) fn input(&mut self, chunk: Option<Vec<u8>>) {
         let waiting = self.transport.waiting.borrow_mut().take();
@@ -155,6 +184,7 @@ impl Guest for HostGuest {
         self.runtime.run_workers();
         self.runtime.run_microtasks();
         self.check_entry();
+        self.check_stalled();
     }
 
     fn next_due(&self) -> Option<Duration> {

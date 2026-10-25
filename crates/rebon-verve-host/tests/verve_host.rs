@@ -194,3 +194,40 @@ export async function runHost() { throw new Error('must not run'); }
 fn verve_permissions() -> verve::Permissions {
     verve::Permissions::default()
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_nothing_can_wake_exits_13_as_node_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = host(
+        dir.path(),
+        r#"
+  output.write('waiting\n');
+  await new Promise(() => {});
+"#,
+    );
+    let host = started(script, None);
+    let exit = tokio::time::timeout(Duration::from_secs(10), host.process.wait())
+        .await
+        .expect("a host that cannot move ends without being killed");
+    assert_eq!(exit, HostExit::Code(13));
+    assert_eq!(read_all(host.stdout).await, "waiting\n");
+    assert!(read_all(host.stderr)
+        .await
+        .contains("unsettled_top_level_await"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_waiting_on_a_timer_is_not_stalled() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = host(
+        dir.path(),
+        r#"
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  output.write('woke\n');
+  return 0;
+"#,
+    );
+    let host = started(script, None);
+    assert_eq!(read_all(host.stdout).await, "woke\n");
+    assert_eq!(host.process.wait().await, HostExit::Code(0));
+}
