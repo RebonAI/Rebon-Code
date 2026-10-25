@@ -73,8 +73,18 @@ A scoped call needs an open scope, and a plane has work that belongs to no user 
 
 `@deepseek-ai/dsh-agent` declares a Cordis accessor on the context prototype — process-global, so a second copy fails whatever realm it is placed in — and `@deepseek-ai/dsh-agent-loop` registers itself as *the* agent factory on whichever `agents` registry it can see. `isolate` does not rescue either: isolating `systemPrompt` works, isolating `sessions` alongside it breaks the inject ACL. So a realm is not enough to keep two agent loops apart; a process is, which is the same trade the embedded runtime's isolate made.
 
+## Upstream dsh packages, unchanged
+
+A current dsh package from npm (the `next` channel, 0.2.x) runs here as it is. Three things make that so:
+
+- **Two kinds of provided module.** `src/provided-modules.json` separates what rebon *owns* — the module behind a seat it implements (`cordis`, `dsh-tools`, `dsh-llm`, `dsh-web`, the environment shims), answered for every importer — from the vendored packages its own *payload* is built from (`dsh-session`, `dsh-agent`, `dsh-settings`, `zod`, …). Those answer the payload and this runtime; a package installed from npm resolves its own, current copy, and falls back to the vendored one only when it has none. Schemastery and cosmokit are DeepSeek Harness's forks (`@deepseek-ai/schemastery`, `@deepseek-ai/cosmokit`), which current packages need for `.volatile()` and `.role()`.
+- **The dsh boot services, answered by the realm.** Upstream packages inject services that dsh's boot layer and session model provide. Rebon is that layer, so the realm answers them from its own facts instead of mounting dsh's: `workingDirectory` (the session's workspace root, `working-directory-runtime.mjs`), and `loader`, `configEditor` and `profileContext` (`loader-runtime.mjs`) — which is what lets `@deepseek-ai/dsh-settings` run unchanged, its namespaces being entry configs, persisted through the `settings` seat's `entryConfig` and committed live into the plugin's volatile fields. `ctx.systemPrompt` resolves provider-function section text once an entry has loaded and places sections by dsh's named orders; `ctx.tools.get` answers what this composition registered.
+- **Bundles.** dsh packages reach each other through services in a realm they share, so rebon installs a dsh *bundle* (a package with `dsh.bundle.patch`, the format dsh's own profile bundles use) as one rebon package: one `node_modules`, one container, one realm. `probe.mjs --bundle` mounts its rows in the order their injections allow and reports which realm services each provided; the manifest's `inject`/`provides` keep that order when rebon loads them.
+
+The client half of the contract a dsh package has — the browser bundle its host half serves — is described in `docs/dsh-client.md` at the repository root. The realm's share of it is `src/remote.mjs`: `kind: 'remote'` on the `compose` service, answered in dsh's wire shape, and the Host events a client hears published on `compose:remote-event`.
+
 ## Scope
 
-Ported: `ctx.llm`, `ctx.credentials`, `ctx.tools`, `ctx.web`, `ctx.systemPrompt`, and the loop assembly. What is left on the deno_core side is deletion work, gated on the compatibility matrix.
+Ported: `ctx.llm`, `ctx.credentials`, `ctx.tools`, `ctx.web`, `ctx.systemPrompt`, and the loop assembly; answered for upstream packages: `ctx.workingDirectory`, `ctx.loader`, `ctx.configEditor`, `ctx.profileContext`. What is left on the deno_core side is deletion work, gated on the compatibility matrix.
 
 This package is not a sandbox. Composed plugins are trusted local code, per the plugin plane's trust model.
