@@ -1,0 +1,14 @@
+{
+  "name": "dsh-seam-probe",
+  "version": "0.0.0",
+  "description": "Test fixture: reaches the storage and skills seams upstream packages provide, from a tool rebon can call.",
+  "capabilities": {
+    "kernelPlugins": {
+      "dsh-seam-probe": {
+        "entry": "index.mjs",
+        "tools": ["seam_probe"],
+        "inject": ["tools", "storage", "skills"]
+      }
+    }
+  }
+}
