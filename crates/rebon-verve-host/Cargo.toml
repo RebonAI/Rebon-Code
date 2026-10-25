@@ -12,6 +12,7 @@ name = "rebon-verve"
 path = "src/bin/rebon-verve.rs"
 
 [dependencies]
+cordis-verve.workspace = true
 verve.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true }

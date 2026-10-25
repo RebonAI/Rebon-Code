@@ -80,6 +80,9 @@ impl HostGuest {
             .set_worker_permissions(spec.permissions.clone());
         self.runtime.eval(&process_setup(spec, &entry))?;
         install_transport(self.runtime.context()).map_err(|error| error.to_string())?;
+        // The native Cordis, as the `cordis` builtin; the composition's
+        // resolver prefers it to the vendored bundle.
+        cordis_verve::install(&mut self.runtime)?;
         let promise = self.runtime.load_esm(&entry, &source)?;
         self.entry = Some(promise);
         self.check_entry();

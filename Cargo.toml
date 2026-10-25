@@ -112,6 +112,8 @@ boa_gc = "0.19.1"
 # from the same repository; `boa_engine` above is the separate, older Boa the
 # status-script runner still uses.
 verve = { git = "https://github.com/Quorafind/verve.git", branch = "main" }
+# Cordis in Rust, served to the plugin host as the `cordis` module.
+cordis-verve = { git = "https://github.com/Quorafind/cordis-rs.git", branch = "main" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
