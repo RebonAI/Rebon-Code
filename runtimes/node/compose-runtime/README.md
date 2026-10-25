@@ -2,7 +2,7 @@
 
 The dsh/Cordis composition, running on the plugin plane. Where `runtimes/node/plugin-host` is the protocol and knows nothing about what runs on it, this package is what runs on it: one Cordis realm, the built-in seats a dsh plugin injects, and a loader that turns a Cordis plugin into a plugin the plane understands.
 
-The supported runtime is Node `>=24.19.0 <25`, the same range `rebon-node-runtime` pins and `runtimes/node/plugin-host` declares; a Rust test reads all three back so they cannot drift.
+Rebon runs it on Verve, its own JavaScript runtime, unchanged; no Node is installed or needed. Its `node --test` suites run on Node 24.19 in CI as a development tool.
 
 ## One load per entry
 

@@ -17,7 +17,7 @@ services/
   rc-server/                  standalone Remote Control service workspace
   relay-server/               standalone relay service workspace
 runtimes/node/
-  plugin-host/                our own JS plugin host, not Node.js itself
+  plugin-host/                our own JS plugin host, run on Verve (no Node)
   compose-runtime/            the plugin composition runtime
   mods-runtime/               the Claude Code mods loader (hooks modules, JSX/TS)
   plugins/                    JS plugin packages and the browser extension
@@ -204,7 +204,7 @@ the arrows as "declares in its `Cargo.toml`"; nothing below reaches back up.
 rebon-cli ─┬─▶ rebon-harness ──▶ crates/plugins/*   (assembly: builtin_plugin_defs(),
            │        │                                kernel boot, agent + session
            │        │                                assembly, feature plugins)
-           │        ├─▶ rebon-plugin-host   (Node plugin plane, compositions,
+           │        ├─▶ rebon-plugin-host   (plugin plane on Verve, compositions,
            │        │                        manifests, payload patches)
            │        ├─▶ rebon-provider      (provider catalog, runtime cache,
            │        │                        model-router seat, llm adapters)
@@ -612,9 +612,10 @@ the number is what a raise then negotiates with. Read the change instead.
   or the config directory holds a `TestConfigHome` guard.
 - Put `#[cfg]` on an assertion that only holds on one platform, and branch on
   `is_available()` before asserting that a tool exists.
-- A silently skipped test did not run (plugin-plane tests need
-  `REBON_TEST_NODE`). Run several packages' tests separately, with
-  `--no-fail-fast` to see the whole picture.
+- A silently skipped test did not run. Plugin-plane tests that start a
+  process need the runner built (`cargo build -p rebon-verve-host --bin
+  rebon-verve`) and fail, not skip, without it. Run several packages' tests
+  separately, with `--no-fail-fast` to see the whole picture.
 - An example program that is not in the build graph rots without telling you.
 
 ### Dependencies and runtime structure
