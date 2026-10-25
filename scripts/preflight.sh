@@ -306,7 +306,9 @@ if [ -n "$node_bin" ]; then
     for suite in plugin_plane_e2e plugin_plane_loop_e2e kernel_loop_backend_plane kernel_mainline_deepseek_js; do
         retry "rebon-harness $suite on Verve" env REBON_TEST_ENGINE=verve REBON_PLUGIN_RUNTIME=verve cargo test -q -p rebon-harness --test "$suite" --locked -- --test-threads=1
     done
-    retry "rebon-plugin-host plane_unload on Verve" env REBON_TEST_ENGINE=verve REBON_PLUGIN_RUNTIME=verve cargo test -q -p rebon-plugin-host --test plane_unload --locked -- --test-threads=1
+    for suite in plane_unload mods_plane; do
+        retry "rebon-plugin-host $suite on Verve" env REBON_TEST_ENGINE=verve REBON_PLUGIN_RUNTIME=verve cargo test -q -p rebon-plugin-host --test "$suite" --locked -- --test-threads=1
+    done
 fi
 
 # ------------------------------------------------------------- the other tree

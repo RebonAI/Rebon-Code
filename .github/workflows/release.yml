@@ -222,6 +222,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Mainline composition tests on Verve failed with exit code $LASTEXITCODE" }
           cargo test -p rebon-plugin-host --test plane_unload --locked -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Plane unload tests on Verve failed with exit code $LASTEXITCODE" }
+          cargo test -p rebon-plugin-host --test mods_plane --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Mods plane tests on Verve failed with exit code $LASTEXITCODE" }
           Remove-Item Env:REBON_TEST_ENGINE, Env:REBON_PLUGIN_RUNTIME
       - name: Check isolated Boa runner target portability
         run: |
