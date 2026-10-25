@@ -8,8 +8,9 @@
 //! client path, the tool arrives in the process `tool-registry`, and unloading
 //! an entry withdraws exactly what it registered.
 //!
-//! Skips without `REBON_TEST_NODE`, like every other test that drives a real
-//! child process; `REBON_REQUIRE_TEST_NODE=1` turns the skip into a failure.
+//! Contained hosts need the runner built (`cargo build -p rebon-verve-host
+//! --bin rebon-verve`) or named by `REBON_VERVE`; the plane's own host runs
+//! in this process.
 //!
 //! Run these serially (`--test-threads=1`). They share one process kernel and
 //! the process-wide registration slots a composition writes into, so running
@@ -40,35 +41,30 @@ use rebon_provider::kernel_llm_dispatch::unregister_llm_host;
 use rebon_provider::kernel_model_router::{KernelAwareProviderResolver, ModelRouterPlugin};
 use serde_json::Value;
 
-/// The engine the plane's host runs on here: Node by default, or Verve with
-/// `REBON_TEST_ENGINE=verve` — the same tests, and no Node needed except by a
-/// contained host, which runs on Node whatever the plane runs on.
-fn engine() -> rebon_plugin_supervisor::HostEngine {
-    match std::env::var("REBON_TEST_ENGINE").as_deref() {
-        Ok("verve") => rebon_plugin_supervisor::HostEngine::Verve,
-        _ => rebon_plugin_supervisor::HostEngine::Node,
+/// The runner a contained host starts: `REBON_VERVE`, or the `rebon-verve`
+/// this target directory built (`cargo build -p rebon-verve-host --bin
+/// rebon-verve`). The plane's own host runs in this process and needs none.
+fn runner() -> PathBuf {
+    if let Some(path) = std::env::var_os("REBON_VERVE") {
+        return PathBuf::from(path);
     }
-}
-
-fn node() -> Option<PathBuf> {
-    if engine() == rebon_plugin_supervisor::HostEngine::Verve
-        && std::env::var_os("REBON_TEST_NODE").is_none()
-    {
-        // No Node: the plane runs, and a container is refused by name.
-        return Some(PathBuf::new());
-    }
-    match std::env::var_os("REBON_TEST_NODE") {
-        Some(node) => Some(PathBuf::from(node)),
-        None => {
-            assert_ne!(
-                std::env::var_os("REBON_REQUIRE_TEST_NODE").as_deref(),
-                Some(std::ffi::OsStr::new("1")),
-                "REBON_REQUIRE_TEST_NODE=1 requires an absolute REBON_TEST_NODE"
-            );
-            eprintln!("skipping: set REBON_TEST_NODE to an absolute Node executable");
-            None
-        }
-    }
+    let exe = std::env::current_exe().expect("the test knows its own path");
+    let name = if cfg!(windows) {
+        "rebon-verve.exe"
+    } else {
+        "rebon-verve"
+    };
+    let built = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("a test binary lives in target/<profile>/deps")
+        .join(name);
+    assert!(
+        built.is_file(),
+        "contained hosts need the runner: build it with \
+         `cargo build -p rebon-verve-host --bin rebon-verve`, or set REBON_VERVE"
+    );
+    built
 }
 
 fn repo() -> PathBuf {
@@ -155,7 +151,7 @@ async fn boot_with_bound(
     exposed_tools: &[&str],
     unary_call_timeout: Option<std::time::Duration>,
 ) -> Option<Fixture> {
-    let node = node()?;
+    let runner = runner();
     let repo = repo();
     let config_dir = tempfile::tempdir().expect("config dir");
     let kernel = Kernel::new();
@@ -193,8 +189,7 @@ async fn boot_with_bound(
     });
     let plane = PluginPlane::start(
         PluginPlaneConfig {
-            node,
-            engine: engine(),
+            runner,
             // Plain paths throughout: a Windows verbatim prefix survives Rust
             // fine and confuses `pathToFileURL` on the other side, and every one
             // of these crosses to Node as a string.
@@ -288,6 +283,10 @@ async fn fake_deepseek() -> std::net::SocketAddr {
     addr
 }
 
+/// These tests share one process kernel and process-wide slots, so they take
+/// turns however the harness runs them.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// A reload restarts exactly what changed, against the real host.
 ///
 /// The classifier is unit-tested next to the rule; this checks the half that
@@ -296,6 +295,7 @@ async fn fake_deepseek() -> std::net::SocketAddr {
 /// and that the generation only moves when something did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reload_restarts_what_changed_and_leaves_the_rest_running() {
+    let _serial = SERIAL.lock().await;
     let _serial = serialised().await;
     let Some(fixture) = boot(
         vec![
@@ -393,6 +393,7 @@ async fn a_reload_restarts_what_changed_and_leaves_the_rest_running() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_model_route_a_composition_registered_resolves_through_the_ordinary_path() {
+    let _serial = SERIAL.lock().await;
     let _serial = serialised().await;
     let Some(fixture) = boot(
         vec![ComposeNode {
@@ -484,6 +485,7 @@ async fn a_model_route_a_composition_registered_resolves_through_the_ordinary_pa
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_composition_tool_lands_in_the_process_registry_and_leaves_on_unload() {
+    let _serial = SERIAL.lock().await;
     let _serial = serialised().await;
     let Some(fixture) = boot(
         vec![ComposeNode {
@@ -536,6 +538,7 @@ async fn a_composition_tool_lands_in_the_process_registry_and_leaves_on_unload()
 /// the composition config the package asks to be listed with.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_marketplaces_dsh_packages_load_and_register_their_tools() {
+    let _serial = SERIAL.lock().await;
     use rebon_plugin_host::plugin_manifests::{entry_for, read_package_manifest};
 
     let _serial = serialised().await;
@@ -601,6 +604,7 @@ async fn the_marketplaces_dsh_packages_load_and_register_their_tools() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_composition_tool_runs_through_the_plane_and_reaches_rebon_own_tools() {
+    let _serial = SERIAL.lock().await;
     let _serial = serialised().await;
     let Some(fixture) = boot(
         vec![ComposeNode {
@@ -682,6 +686,7 @@ impl ProviderRuntimeResolver for NoBuiltins {
 /// * a reader that walks away mid-turn makes the adapter's own signal fire.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_package_model_provider_streams_signals_and_cancels_on_the_plane() {
+    let _serial = SERIAL.lock().await;
     use rebon_api::model_provider_protocol::ProviderConnectionConfigV1;
     use rebon_api::ModelClient;
     use rebon_provider::model_provider_plugin::{
@@ -886,6 +891,7 @@ async fn a_package_model_provider_streams_signals_and_cancels_on_the_plane() {
 ///   the collision rather than shadowing `/help`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_plugin_contributes_commands_and_services_to_the_seats() {
+    let _serial = SERIAL.lock().await;
     use rebon_command_seat::{CommandArgs, CommandHandler, CommandSeatService, Surface};
 
     let _serial = serialised().await;
@@ -1050,6 +1056,7 @@ async fn a_plugin_contributes_commands_and_services_to_the_seats() {
 /// model catalogs and prompt sections, which this one has none of.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_native_composition_entry_loads_and_its_commands_reach_the_seat() {
+    let _serial = SERIAL.lock().await;
     use rebon_command_seat::CommandSeatService;
 
     let _serial = serialised().await;
@@ -1141,6 +1148,7 @@ async fn a_host_native_composition_entry_loads_and_its_commands_reach_the_seat()
 /// promise and the provider it promised.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_provider_a_plugin_declares_but_never_registers_is_refused_at_load() {
+    let _serial = SERIAL.lock().await;
     let _serial = serialised().await;
     let Some(fixture) = boot(Vec::new(), &[]).await else {
         return;
@@ -1203,6 +1211,7 @@ async fn a_provider_a_plugin_declares_but_never_registers_is_refused_at_load() {
 /// without waiting out the real twenty seconds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_command_whose_plugin_never_answers_comes_back_as_a_refusal() {
+    let _serial = SERIAL.lock().await;
     use rebon_command_seat::{CommandArgs, CommandHandler, CommandSeatService, Surface};
 
     let _serial = serialised().await;
@@ -1291,6 +1300,7 @@ async fn a_command_whose_plugin_never_answers_comes_back_as_a_refusal() {
 /// declared would fail here, which is the same refusal a user would meet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_example_package_registers_its_command() {
+    let _serial = SERIAL.lock().await;
     use rebon_command_seat::{CommandArgs, CommandHandler, CommandSeatService, Surface};
     use rebon_plugin_host::plugin_manifests::read_package_manifest;
 
@@ -1457,6 +1467,7 @@ fn probe_entry(id: &str, tool: &str, container: Option<ContainerSpec>) -> Compos
 /// new process, and its last entry leaving takes the container down.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_contained_plugin_is_confined_to_its_own_files_and_dies_with_its_last_entry() {
+    let _serial = SERIAL.lock().await;
     let _serial = serialised().await;
     let Some(fixture) = boot(Vec::new(), &[]).await else {
         return;
@@ -1591,6 +1602,7 @@ async fn a_contained_plugin_is_confined_to_its_own_files_and_dies_with_its_last_
 /// was granted answers, and a container granted nothing is refused by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_contained_plugin_reaches_only_the_hosts_it_was_granted() {
+    let _serial = SERIAL.lock().await;
     let _serial = serialised().await;
     let Some(fixture) = boot(Vec::new(), &[]).await else {
         return;
@@ -1712,6 +1724,7 @@ async fn a_contained_plugin_reaches_only_the_hosts_it_was_granted() {
 /// rather than sent to the model, answered by the plugin in its container.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dsh_plugin_s_commands_are_rebon_commands_that_answer_in_place() {
+    let _serial = SERIAL.lock().await;
     use rebon_command_seat::{CommandArgs, CommandHandler, CommandSeatService, Surface};
     let _serial = serialised().await;
     let Some(fixture) = boot(Vec::new(), &[]).await else {

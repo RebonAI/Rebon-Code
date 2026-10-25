@@ -225,12 +225,10 @@ pub struct ComposeNode {
 /// Everything the plane needs to start.
 #[derive(Clone, Debug)]
 pub struct PluginPlaneConfig {
-    /// Absolute Node executable, from `rebon_node_runtime::NodeRuntimeResolver`.
-    /// What a contained host runs on, whichever `engine` is; empty when there
-    /// is none, which only a Verve plane can have.
-    pub node: PathBuf,
-    /// What the plane's shared host runs on.
-    pub engine: HostEngine,
+    /// The runner a contained host starts (`rebon-verve`); empty when it was
+    /// not found, which refuses a container by name. The plane's own host is
+    /// an isolate in this process and needs none.
+    pub runner: PathBuf,
     /// Absolute path to the host's `cli.mjs`.
     pub host_script: PathBuf,
     /// Absolute path to the composition loader's `index.mjs`.
@@ -615,7 +613,7 @@ impl HostEpochs {
 struct ContainerTemplate {
     /// Shared with the plane's own host, so no two hosts share an epoch.
     epochs: Arc<HostEpochs>,
-    node: PathBuf,
+    runner: PathBuf,
     host_script: PathBuf,
     loader: PathBuf,
     compose_root: PathBuf,
@@ -674,7 +672,7 @@ impl PluginPlane {
         let epochs = Arc::new(HostEpochs::new());
         let template = ContainerTemplate {
             epochs: Arc::clone(&epochs),
-            node: config.node.clone(),
+            runner: config.runner.clone(),
             host_script: config.host_script.clone(),
             loader: config.loader.clone(),
             compose_root: config.compose_root.clone(),
@@ -687,8 +685,7 @@ impl PluginPlane {
             exposed_tools: config.exposed_tools.clone(),
             exposed_seats: config.exposed_seats.clone(),
         };
-        let host = HostConfig::new(config.node.clone(), config.host_script.clone())
-            .with_engine(config.engine)
+        let host = HostConfig::new(config.runner.clone(), config.host_script.clone())
             .with_host_epoch(epochs.next())
             .with_loader(&config.loader)
             .with_working_directory(config.working_directory.clone())
@@ -822,13 +819,13 @@ impl PluginPlane {
             HostCallError::Malformed(format!("[CONTAINER_REFUSED] {}: {why}", spec.id))
         };
         let template = &self.template;
-        // A container is held by Node's permission model and the OS sandbox
-        // around Node, so it runs on Node whatever the plane runs on. A Verve
-        // plane with no Node says that, rather than spawning nothing.
-        if template.node.as_os_str().is_empty() {
+        // A container is a process of its own, held by the runner's
+        // permission flags and the OS sandbox around it. Without the runner
+        // that is said, rather than spawning nothing.
+        if template.runner.as_os_str().is_empty() {
             return Err(refuse(
-                "a contained plugin runs on Node until Verve has a permission model, \
-                 and no Node runtime resolves (`rebon node install`)"
+                "a contained plugin runs in rebon-verve, which was not found beside rebon \
+                 (reinstall rebon, or set REBON_VERVE)"
                     .to_owned(),
             ));
         }
@@ -851,26 +848,27 @@ impl PluginPlane {
             .chain(crate::container::runtime_root(&host_script))
             .map(|path| real(&path))
             .collect();
-        // Node's half first: the OS layer wraps the command line it makes.
-        let node_half = crate::container::container_launch(
+        // The runner's half first: the OS layer wraps the command line it makes.
+        let runner_half = crate::container::container_launch(
             spec,
             &host_script,
             &extra_read,
             &|key| std::env::var_os(key),
             &[],
         );
-        let mut probe_config = HostConfig::new(template.node.clone(), host_script.clone())
+        let mut probe_config = HostConfig::new(template.runner.clone(), host_script.clone())
+            .with_engine(HostEngine::Process)
             .with_host_epoch(template.epochs.next())
             .with_loader(&loader);
-        probe_config.node_args = node_half.node_args.clone();
-        let argv = rebon_plugin_supervisor::node_argv(&probe_config);
+        probe_config.runner_args = runner_half.runner_args.clone();
+        let argv = rebon_plugin_supervisor::runner_argv(&probe_config);
         let confinement = match self.ctx.get::<rebon_tool::ContainerSandboxService>() {
             Some(sandbox) => sandbox
                 .confine(&rebon_tool::ConfineRequest {
                     container: spec.id.clone(),
-                    node: template.node.clone(),
+                    runner: template.runner.clone(),
                     argv,
-                    environment: node_half.environment.clone(),
+                    environment: runner_half.environment.clone(),
                     read,
                     write: real(&data),
                     network: spec.network.clone(),
@@ -896,7 +894,8 @@ impl PluginPlane {
             &|key| std::env::var_os(key),
             &confinement.environment,
         );
-        let mut host = HostConfig::new(template.node.clone(), host_script.clone())
+        let mut host = HostConfig::new(template.runner.clone(), host_script.clone())
+            .with_engine(HostEngine::Process)
             .with_host_epoch(template.epochs.next())
             .with_loader(&loader)
             .with_working_directory(launch.working_directory.clone())
@@ -909,7 +908,7 @@ impl PluginPlane {
                 template.exposed_seats.iter().cloned(),
             )
             .with_event_publisher(Arc::clone(&template.events) as Arc<dyn EventPublisher>);
-        host.node_args = launch.node_args;
+        host.runner_args = launch.runner_args;
         host.environment = Some(launch.environment);
         host.launcher = confinement
             .launcher

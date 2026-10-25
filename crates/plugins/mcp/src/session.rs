@@ -729,21 +729,27 @@ pub(super) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replacement_and_host_join_close_unpublished_stdio_child() {
-        // Gated the same way as every other test that drives a real Node
-        // child: the release workflow only exports REBON_TEST_NODE on the
-        // runner that has one, so elsewhere this skips rather than fails.
-        let Some(node) = std::env::var_os("REBON_TEST_NODE") else {
-            assert_ne!(
-                std::env::var_os("REBON_REQUIRE_TEST_NODE").as_deref(),
-                Some(std::ffi::OsStr::new("1")),
-                "REBON_REQUIRE_TEST_NODE=1 requires an absolute REBON_TEST_NODE"
-            );
-            eprintln!("skipping: set REBON_TEST_NODE to an absolute Node executable");
-            return;
-        };
-        let node = std::path::PathBuf::from(node);
-        assert!(node.is_absolute(), "REBON_TEST_NODE must be absolute");
-        let node = node.to_string_lossy().into_owned();
+        // A real stdio child that never answers: a script on the runner
+        // (`REBON_VERVE`, or the `rebon-verve` this target directory built).
+        let runner = std::env::var_os("REBON_VERVE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                let exe = std::env::current_exe().expect("the test knows its own path");
+                let name = if cfg!(windows) {
+                    "rebon-verve.exe"
+                } else {
+                    "rebon-verve"
+                };
+                exe.parent()
+                    .and_then(std::path::Path::parent)
+                    .expect("a test binary lives in target/<profile>/deps")
+                    .join(name)
+            });
+        assert!(
+            runner.is_file(),
+            "this test needs the runner: `cargo build -p rebon-verve-host --bin rebon-verve`"
+        );
+        let runner = runner.to_string_lossy().into_owned();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let script = format!(
             "const s = require('net').connect({}, '127.0.0.1', () => s.write('ready')); process.stdin.resume(); setInterval(() => {{}}, 1000);",
@@ -755,8 +761,8 @@ pub(super) mod tests {
             generation
                 .client_for_session(request(vec![McpServerConfig::Stdio {
                     name: "pending-child".into(),
-                    command: node,
-                    args: vec!["-e".into(), script],
+                    command: runner,
+                    args: vec!["--allow-all".into(), "-e".into(), script],
                     env: Default::default(),
                     cwd: None,
                 }]))

@@ -27,35 +27,30 @@ use rebon_plugin_protocol::Payload;
 use rebon_plugin_supervisor::{ToolInvocation, ToolInvoker, ToolRefusal};
 use serde_json::{json, Value};
 
-/// The engine the plane's host runs on here: Node by default, or Verve with
-/// `REBON_TEST_ENGINE=verve` — the same tests, and no Node needed except by a
-/// contained host, which runs on Node whatever the plane runs on.
-fn engine() -> rebon_plugin_supervisor::HostEngine {
-    match std::env::var("REBON_TEST_ENGINE").as_deref() {
-        Ok("verve") => rebon_plugin_supervisor::HostEngine::Verve,
-        _ => rebon_plugin_supervisor::HostEngine::Node,
+/// The runner a contained host starts: `REBON_VERVE`, or the `rebon-verve`
+/// this target directory built (`cargo build -p rebon-verve-host --bin
+/// rebon-verve`). The plane's own host runs in this process and needs none.
+fn runner() -> PathBuf {
+    if let Some(path) = std::env::var_os("REBON_VERVE") {
+        return PathBuf::from(path);
     }
-}
-
-fn node() -> Option<PathBuf> {
-    if engine() == rebon_plugin_supervisor::HostEngine::Verve
-        && std::env::var_os("REBON_TEST_NODE").is_none()
-    {
-        // No Node: the plane runs, and a container is refused by name.
-        return Some(PathBuf::new());
-    }
-    match std::env::var_os("REBON_TEST_NODE") {
-        Some(node) => Some(PathBuf::from(node)),
-        None => {
-            assert_ne!(
-                std::env::var_os("REBON_REQUIRE_TEST_NODE").as_deref(),
-                Some(std::ffi::OsStr::new("1")),
-                "REBON_REQUIRE_TEST_NODE=1 requires an absolute REBON_TEST_NODE"
-            );
-            eprintln!("skipping: set REBON_TEST_NODE to an absolute Node executable");
-            None
-        }
-    }
+    let exe = std::env::current_exe().expect("the test knows its own path");
+    let name = if cfg!(windows) {
+        "rebon-verve.exe"
+    } else {
+        "rebon-verve"
+    };
+    let built = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("a test binary lives in target/<profile>/deps")
+        .join(name);
+    assert!(
+        built.is_file(),
+        "contained hosts need the runner: build it with \
+         `cargo build -p rebon-verve-host --bin rebon-verve`, or set REBON_VERVE"
+    );
+    built
 }
 
 fn repo() -> PathBuf {
@@ -136,7 +131,7 @@ fn write_probe_mod(into: &Path) -> PathBuf {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_contained_mod_reads_its_own_writes_its_data_and_asks_for_the_rest() {
-    let Some(node) = node() else { return };
+    let runner = runner();
     let repo = repo();
     let tmp = tempfile::tempdir().expect("temp dir");
     let config_dir = tmp.path().join("config");
@@ -158,8 +153,7 @@ async fn a_contained_mod_reads_its_own_writes_its_data_and_asks_for_the_rest() {
     let tools = Arc::new(RecordingTools::default());
     let plane = PluginPlane::start(
         PluginPlaneConfig {
-            node,
-            engine: engine(),
+            runner,
             host_script: PathBuf::from(plain(&repo.join("runtimes/node/plugin-host/src/cli.mjs"))),
             loader: PathBuf::from(plain(
                 &repo.join("runtimes/node/compose-runtime/src/index.mjs"),

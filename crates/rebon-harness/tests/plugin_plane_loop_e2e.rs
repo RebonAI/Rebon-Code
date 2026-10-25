@@ -9,7 +9,9 @@
 //! module docs on `kernel_loop_plane` say why. The second test is the proof that
 //! this is a real separation and not a happy accident.
 //!
-//! Skips without `REBON_TEST_NODE`.
+//! Contained hosts need the runner built (`cargo build -p rebon-verve-host
+//! --bin rebon-verve`) or named by `REBON_VERVE`; the plane's own host runs
+//! in this process.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -23,19 +25,30 @@ use rebon_plugin_host::plugin_manifests::plain_path;
 use rebon_provider::kernel_model_router::ModelRouterPlugin;
 use serde_json::Value;
 
-fn node() -> Option<PathBuf> {
-    match std::env::var_os("REBON_TEST_NODE") {
-        Some(node) => Some(PathBuf::from(node)),
-        None => {
-            assert_ne!(
-                std::env::var_os("REBON_REQUIRE_TEST_NODE").as_deref(),
-                Some(std::ffi::OsStr::new("1")),
-                "REBON_REQUIRE_TEST_NODE=1 requires an absolute REBON_TEST_NODE"
-            );
-            eprintln!("skipping: set REBON_TEST_NODE to an absolute Node executable");
-            None
-        }
+/// The runner a contained host starts: `REBON_VERVE`, or the `rebon-verve`
+/// this target directory built (`cargo build -p rebon-verve-host --bin
+/// rebon-verve`). The plane's own host runs in this process and needs none.
+fn runner() -> PathBuf {
+    if let Some(path) = std::env::var_os("REBON_VERVE") {
+        return PathBuf::from(path);
     }
+    let exe = std::env::current_exe().expect("the test knows its own path");
+    let name = if cfg!(windows) {
+        "rebon-verve.exe"
+    } else {
+        "rebon-verve"
+    };
+    let built = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("a test binary lives in target/<profile>/deps")
+        .join(name);
+    assert!(
+        built.is_file(),
+        "contained hosts need the runner: build it with \
+         `cargo build -p rebon-verve-host --bin rebon-verve`, or set REBON_VERVE"
+    );
+    built
 }
 
 fn repo() -> PathBuf {
@@ -47,9 +60,9 @@ fn repo() -> PathBuf {
 
 /// Points `plane_paths` at this checkout, and hands it the Node the test runs
 /// with. Process-global, so these tests run one at a time.
-fn point_at_checkout(node: &std::path::Path) {
+fn point_at_checkout(runner: &std::path::Path) {
     let repo = repo();
-    std::env::set_var("REBON_PLUGIN_NODE", node);
+    std::env::set_var("REBON_VERVE", runner);
     std::env::set_var(
         "REBON_PLUGIN_HOST_JS",
         plain_path(&repo.join("runtimes/node/plugin-host/src/cli.mjs")),
@@ -110,7 +123,6 @@ fn config_dir(endpoint: std::net::SocketAddr) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("config dir");
     let config = serde_json::json!({
         "kernelPlugins": {
-            "runtime": "node",
             "credentialGrants": ["REBON_TEST_LOOP_PLANE_KEY"],
             "plugins": [{
                 "id": "llm-deepseek",
@@ -189,11 +201,16 @@ async fn turn_end(
     (kinds, Value::Null)
 }
 
+/// These tests share one process kernel and process-wide slots, so they take
+/// turns however the harness runs them.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_loop_runs_a_turn_on_a_host_of_its_own() {
-    let Some(node) = node() else { return };
+    let _serial = SERIAL.lock().await;
+    let runner = runner();
     let endpoint = fake_deepseek().await;
-    point_at_checkout(&node);
+    point_at_checkout(&runner);
     std::env::set_var("REBON_TEST_LOOP_PLANE_KEY", "sk-loop-plane");
     let dir = config_dir(endpoint);
     let kernel = kernel_with_seats(dir.path());
@@ -244,9 +261,10 @@ async fn a_loop_runs_a_turn_on_a_host_of_its_own() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_sessions_get_two_hosts_and_do_not_see_each_other() {
-    let Some(node) = node() else { return };
+    let _serial = SERIAL.lock().await;
+    let runner = runner();
     let endpoint = fake_deepseek().await;
-    point_at_checkout(&node);
+    point_at_checkout(&runner);
     std::env::set_var("REBON_TEST_LOOP_PLANE_KEY", "sk-loop-plane");
     let dir = config_dir(endpoint);
     let kernel = kernel_with_seats(dir.path());

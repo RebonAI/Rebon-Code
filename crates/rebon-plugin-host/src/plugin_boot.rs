@@ -100,8 +100,8 @@ pub async fn ensure_process_composition(
 /// rebon carries these beside its executable, and a build tree resolves them
 /// from where they were built.
 pub struct PlanePaths {
-    pub node: PathBuf,
-    pub engine: rebon_plugin_supervisor::HostEngine,
+    /// The runner a contained host starts; empty when it was not found.
+    pub runner: PathBuf,
     pub host_script: PathBuf,
     pub loader: PathBuf,
     pub compose_root: PathBuf,
@@ -122,31 +122,14 @@ pub struct PlaneScripts {
 /// train people to ignore the message that matters.
 #[derive(Clone, Debug)]
 pub enum CompositionRefusal {
-    /// Kernel plugins are configured and there is no Node runtime to run them.
-    ///
-    /// The one failure with a one-command fix, so it carries its own
-    /// instructions rather than making a caller invent them.
-    NoRuntime { entries: usize, reason: String },
-    /// The composition was reached but something else stopped it.
+    /// The composition was reached but something stopped it.
     Failed { reason: String },
 }
 
 impl CompositionRefusal {
-    /// What a person should see. Ends in what to do about it.
+    /// What a person should see.
     pub fn message(&self) -> String {
         match self {
-            Self::NoRuntime { entries, reason } => format!(
-                "{entries} kernel plugin{} configured, but there is no Node runtime to run \
-                 {}: {reason}.\n\n  rebon node install\n\ninstalls the pinned build \
-                 ({}) under ~/.rebon and needs no arguments. Rebon only accepts bytes \
-                 matching a SHA-256 compiled into this binary. Already have a Node? Point \
-                 {} at it instead. Offline? `rebon node install --from-path <archive> \
-                 --version <x.y.z> --sha256 <digest>`.",
-                if *entries == 1 { " is" } else { "s are" },
-                if *entries == 1 { "it" } else { "them" },
-                rebon_node_runtime::PINNED_NODE_VERSION,
-                rebon_node_runtime::NODE_EXECUTABLE_ENV,
-            ),
             Self::Failed { reason } => {
                 format!("the kernel plugin composition did not start: {reason}")
             }
@@ -161,30 +144,7 @@ fn repo_relative(relative: &str) -> Option<PathBuf> {
     candidate.exists().then(|| candidate)
 }
 
-/// Resolves everything the plane needs, or says which piece is missing.
-/// The Node rebon runs on, by the resolution ladder `rebon-node-runtime`
-/// defines: an explicit `REBON_PLUGIN_NODE`, then a managed install, then PATH.
-///
-/// One answer for everything that needs Node, so a plugin provider and the
-/// plugin host cannot end up on two different ones — and so "the user machine
-/// needs no Node of its own" keeps meaning something once the embedded runtime
-/// that used to make it true is gone.
-pub fn resolve_node() -> Result<PathBuf, String> {
-    let store = rebon_node_runtime::ManagedRuntimeStore::under_config_home(
-        &rebon_config::config_home_dir(),
-    );
-    let probe = rebon_node_runtime::ExecutingProbe;
-    rebon_node_runtime::NodeRuntimeResolver::from_env(&probe, &store)
-        .resolve()
-        .map(|resolved| resolved.executable.clone())
-        .map_err(|error| format!("no usable Node runtime: {error}"))
-}
-
-/// Everything the plane needs except the runtime.
-///
-/// Split from [`plane_paths`] so a boot can find out *whether there is anything
-/// to run* before it demands a Node. Rebon must not tell someone with no kernel
-/// plugins to go and install a runtime for them.
+/// The plane's own scripts: the host, the composition loader and its root.
 pub fn plane_scripts() -> Result<PlaneScripts, String> {
     let host_script = rebon_plugin_supervisor::locate_host_script()
         .ok()
@@ -211,139 +171,51 @@ pub fn plane_scripts() -> Result<PlaneScripts, String> {
     })
 }
 
-/// What a plane's hosts run on, and the Node a contained host still needs.
-#[derive(Clone, Debug)]
-pub struct PlaneRuntime {
-    pub engine: rebon_plugin_supervisor::HostEngine,
-    /// Node, when one resolves. On Node it is the engine and required; on
-    /// Verve only a contained host uses it, and an empty path means there is
-    /// none — a container is then refused by name rather than the plane.
-    pub node: PathBuf,
-}
-
-/// The runtime [`crate::loop_host::plugin_runtime`] chose, with what it needs.
-pub fn plane_runtime() -> Result<PlaneRuntime, String> {
-    match crate::loop_host::plugin_runtime() {
-        crate::loop_host::PluginRuntime::Node => Ok(PlaneRuntime {
-            engine: rebon_plugin_supervisor::HostEngine::Node,
-            node: resolve_node()?,
-        }),
-        crate::loop_host::PluginRuntime::Verve => Ok(PlaneRuntime {
-            engine: rebon_plugin_supervisor::HostEngine::Verve,
-            node: resolve_node().unwrap_or_default(),
-        }),
-    }
+/// The runner a contained host starts (`rebon-verve`), or an empty path when
+/// it was not found. Only a container needs it: the plane's own hosts run in
+/// this process, so its absence refuses a container by name and nothing else.
+pub fn plane_runner() -> PathBuf {
+    rebon_types::sibling_binary::verve_runner().unwrap_or_default()
 }
 
 pub fn plane_paths() -> Result<PlanePaths, String> {
-    let runtime = plane_runtime()?;
     let scripts = plane_scripts()?;
     Ok(PlanePaths {
-        node: runtime.node,
-        engine: runtime.engine,
+        runner: plane_runner(),
         host_script: scripts.host_script,
         loader: scripts.loader,
         compose_root: scripts.compose_root,
     })
 }
 
-/// Kernel plugins are configured and there is nothing to run them on.
-#[derive(Clone, Debug)]
-pub struct MissingRuntime {
-    /// How many entries the configuration asks for. Counted from the written
-    /// list, not from a resolved composition — see
-    /// [`missing_runtime_for_configured_plugins`].
-    pub entries: usize,
-    /// The resolver's own words for why nothing was found.
-    pub reason: String,
-}
-
-/// A cheap pre-flight: does this machine want kernel plugins it cannot run?
-///
-/// Reads the configured entry list rather than resolving the composition,
-/// because it runs before a session exists and its only job is to decide
-/// whether to offer an install. The boot's own [`CompositionRefusal`] stays
-/// authoritative about what actually happened.
-///
-/// `kernelPlugins` is opt-in and absent from a default install, so this asks
-/// nothing of the many and asks exactly once of the few who wrote the section.
-pub fn missing_runtime_for_configured_plugins() -> Option<MissingRuntime> {
-    let config_dir = rebon_config::config_home_dir();
-    let config: serde_json::Value = std::fs::read(config_dir.join("config.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_slice(&raw).ok())
-        .unwrap_or(serde_json::Value::Null);
-    let entries = config
-        .get("kernelPlugins")
-        .and_then(|section| section.get("plugins"))
-        .and_then(serde_json::Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0)
-        + crate::mods::compose::discovered_mod_dirs(&config_dir).len();
-    if entries == 0 {
-        return None;
-    }
-    let reason = plane_runtime().err()?;
-    Some(MissingRuntime { entries, reason })
-}
-
 /// The plugin runtime, as a surface shows it to a person.
-///
-/// [`missing_runtime_for_configured_plugins`] answers one yes/no question at
-/// startup, which is the right shape for a gate and the wrong shape for a panel:
-/// a settings page has to say what *is* the case as well as what is wrong, and
-/// has to say it whether or not anything is configured yet.
 #[derive(Clone, Debug)]
 pub struct PlaneRuntimeStatus {
     /// Kernel plugin entries the configuration asks for. Zero is a normal
     /// state, not a problem — `kernelPlugins` is opt-in.
     pub configured_plugins: usize,
-    /// The runtime a composition would run on, if one resolves.
-    pub runtime: Option<ResolvedRuntime>,
-    /// The resolver's own words for why nothing resolved.
+    /// What plugins run on: Verve, inside rebon. Always there.
+    pub runtime: &'static str,
+    /// The runner contained plugins and Code Mode start, when it was found.
+    pub runner: Option<PathBuf>,
+    /// Why it was not found: contained plugins and Code Mode cannot run.
     pub problem: Option<String>,
-    /// A Node that was found and turned down for its version.
-    ///
-    /// Separate from `problem` because it is a different situation with a
-    /// different fix, and because "no usable Node runtime" reads as "none
-    /// installed" to someone who has one — the search already looked at `PATH`
-    /// and this is what it found there.
-    pub out_of_range: Option<OutOfRangeRuntime>,
-    /// The versions a runtime may report, as a range someone can read.
-    pub supported: String,
-    /// Whether `rebon node install` could fix this here: rebon pins a build for
-    /// this platform and nothing forbids fetching it. False on a platform with
-    /// no pinned build, or where an operator disabled downloads — telling
-    /// someone to run a command that will refuse is worse than saying nothing.
-    pub installable: bool,
-}
-
-/// A Node that exists and answered, but not with a version this build accepts.
-#[derive(Clone, Debug)]
-pub struct OutOfRangeRuntime {
-    pub version: String,
-    pub executable: PathBuf,
-}
-
-/// One resolved Node, flattened so a UI needs no dependency on the resolver.
-#[derive(Clone, Debug)]
-pub struct ResolvedRuntime {
-    pub version: String,
-    pub executable: PathBuf,
-    /// Which rung of the ladder answered: an explicit demand, a managed
-    /// install, or `PATH`.
-    pub origin: String,
 }
 
 impl PlaneRuntimeStatus {
-    /// Whether something is configured that cannot run.
+    /// Something is configured that cannot all run: the runner contained
+    /// plugins start is missing. Nothing configured is never blocked —
+    /// `kernelPlugins` is opt-in, and a warning shown to everyone is read by
+    /// no one.
     pub fn is_blocked(&self) -> bool {
-        self.configured_plugins > 0 && self.runtime.is_none()
+        self.configured_plugins > 0 && self.runner.is_none()
     }
 }
 
-/// Reads the current state. Cheap enough for a panel to call on open: one
-/// config read plus, at most, one short-lived `node --version`.
+/// What [`PlaneRuntimeStatus::runtime`] says.
+pub const PLANE_RUNTIME: &str = "Verve, in rebon";
+
+/// Reads the current state: one config read and a `stat`.
 pub fn plane_runtime_status() -> PlaneRuntimeStatus {
     let config_dir = rebon_config::config_home_dir();
     let configured_plugins = std::fs::read(config_dir.join("config.json"))
@@ -358,59 +230,16 @@ pub fn plane_runtime_status() -> PlaneRuntimeStatus {
         })
         .unwrap_or(0)
         + crate::mods::compose::discovered_mod_dirs(&config_dir).len();
-
-    let store = rebon_node_runtime::ManagedRuntimeStore::under_config_home(
-        &rebon_config::config_home_dir(),
-    );
-    let probe = rebon_node_runtime::ExecutingProbe;
-    let mut out_of_range = None;
-    let (runtime, problem) =
-        match rebon_node_runtime::NodeRuntimeResolver::from_env(&probe, &store).resolve() {
-            Ok(resolved) => (
-                Some(ResolvedRuntime {
-                    version: resolved.version.to_string(),
-                    executable: resolved.executable.clone(),
-                    origin: resolved.origin.to_string(),
-                }),
-                None,
-            ),
-            Err(error) => {
-                // The newest one that was turned down for its version. A
-                // machine usually has one Node; when it has several, the newest
-                // is the one whose upgrade is shortest.
-                if let rebon_node_runtime::ResolveError::Unavailable { rejected, .. } = &error {
-                    out_of_range = rejected
-                        .iter()
-                        .filter_map(|candidate| match &candidate.reason {
-                            rebon_node_runtime::RejectionReason::Unsupported(version) => {
-                                Some((*version, candidate.executable.clone()))
-                            }
-                            rebon_node_runtime::RejectionReason::Unusable(_) => None,
-                        })
-                        .max_by_key(|(version, _)| *version)
-                        .map(|(version, executable)| OutOfRangeRuntime {
-                            version: version.to_string(),
-                            executable,
-                        });
-                }
-                (None, Some(error.to_string()))
-            }
-        };
-
+    let (runner, problem) = match rebon_types::sibling_binary::verve_runner() {
+        Ok(runner) => (Some(runner), None),
+        Err(problem) => (None, Some(problem)),
+    };
     PlaneRuntimeStatus {
         configured_plugins,
-        runtime,
+        runtime: PLANE_RUNTIME,
+        runner,
         problem,
-        out_of_range,
-        supported: rebon_node_runtime::SUPPORTED_NODE_VERSIONS.to_string(),
-        installable: rebon_node_runtime::pinned_archive_for_host().is_some()
-            && !rebon_node_runtime::DownloadPolicy::from_env().is_disabled(),
     }
-}
-
-/// The version `rebon node install` would put on this machine.
-pub fn pinned_node_version() -> String {
-    rebon_node_runtime::PINNED_NODE_VERSION.to_string()
 }
 
 /// Records a refusal and returns the `None` the boot owes its caller.
@@ -560,7 +389,7 @@ async fn ensure_plane(
     // changed. Without this the verdict was cleared and retried by *every*
     // caller: one unusable machine turned a single failed resolution into a
     // string of full boot attempts, each paying the startup cost again and
-    // each leaving another Node behind. `clear_composition_refusal` — which
+    // each leaving another host behind. `clear_composition_refusal` — which
     // `node-host` calls when it is (re)loaded — is what makes a retry mean
     // something again.
     if composition_refusal().is_some() {
@@ -568,7 +397,7 @@ async fn ensure_plane(
     }
     let _one_boot_at_a_time = boot_lock().lock().await;
     // Checked again under the lock: two hosts assembling their first session
-    // at once must not each start a Node process.
+    // at once must not each start a host.
     if let Some(plane) = running_plane().plane {
         return Some(plane);
     }
@@ -608,7 +437,7 @@ async fn ensure_plane(
 /// The plane this process is running, without starting one.
 ///
 /// The read-only half of [`ensure_process_plugin_plane`]: a caller that wants
-/// to *describe* what is running must not bring a Node host up by asking.
+/// to *describe* what is running must not bring a host up by asking.
 pub fn running_plugin_plane() -> Option<Arc<crate::plugin_plane::PluginPlane>> {
     running_plane().plane
 }
@@ -623,7 +452,7 @@ pub fn running_plane_runtime() -> Option<tokio::runtime::Handle> {
 /// How many times this process has actually tried to start a host.
 ///
 /// Not a statistic: it is the only externally visible difference between "the
-/// verdict stood" and "we started another Node and it failed the same way", and
+/// verdict stood" and "we started another host and it failed the same way", and
 /// the second of those is what this counter exists to keep from coming back.
 pub fn plane_boot_attempts() -> u64 {
     boot_attempts().load(std::sync::atomic::Ordering::Relaxed)
@@ -811,18 +640,8 @@ async fn boot_process_plugin_plane(
         return None;
     }
 
-    // Only now is a runtime owed. Asked for after the composition rather than
-    // before it, so the demand is only ever made of someone who needs it met.
-    let runtime = match plane_runtime() {
-        Ok(runtime) => runtime,
-        Err(reason) => {
-            ctx.dispose();
-            return refuse(CompositionRefusal::NoRuntime {
-                entries: composition.entries.len(),
-                reason,
-            });
-        }
-    };
+    // The runner only a container needs; the plane's own host is in process.
+    let runner = plane_runner();
 
     // The three registration faces, published exactly as the embedded path
     // publishes them — what a composition provides is the same fact either way.
@@ -916,8 +735,7 @@ async fn boot_process_plugin_plane(
 
     let plane = match crate::plugin_plane::PluginPlane::start(
         crate::plugin_plane::PluginPlaneConfig {
-            node: runtime.node,
-            engine: runtime.engine,
+            runner,
             host_script: scripts.host_script,
             loader: scripts.loader,
             compose_root: scripts.compose_root,
@@ -1009,76 +827,16 @@ async fn boot_process_plugin_plane(
 mod tests {
     use super::*;
 
-    /// The refusal has to be actionable, because it replaces a silence.
-    ///
-    /// Before this, kernel plugins configured on a machine with no runtime
-    /// produced nothing at all — not an error, not a log line, just a session
-    /// missing a feature. Whatever else changes here, the message must still
-    /// name the command that fixes it.
+    /// The runtime is always there; what can be missing is the runner, and
+    /// with it only contained plugins and Code Mode.
     #[test]
-    fn a_missing_runtime_is_told_how_to_stop_being_missing() {
-        let refusal = super::CompositionRefusal::NoRuntime {
-            entries: 3,
-            reason: "no usable Node runtime: none found".to_owned(),
-        };
-        let message = refusal.message();
-        assert!(message.contains("rebon node install"), "{message}");
-        assert!(
-            message.contains("3 kernel plugins are configured"),
-            "{message}"
-        );
-        assert!(message.contains("no usable Node runtime"), "{message}");
-        // The two ways out that are not a download.
-        assert!(
-            message.contains(rebon_node_runtime::NODE_EXECUTABLE_ENV),
-            "{message}"
-        );
-        assert!(message.contains("--from-path"), "{message}");
-
-        let one = super::CompositionRefusal::NoRuntime {
-            entries: 1,
-            reason: "nope".to_owned(),
-        };
-        assert!(
-            one.message().contains("1 kernel plugin is configured"),
-            "{}",
-            one.message()
-        );
-    }
-
-    /// Blocked means "something is configured that cannot run", and nothing
-    /// else. A machine with no runtime and no kernel plugins is in a normal
-    /// state, and a panel that warned about it would be warning everyone —
-    /// which is how a warning stops being read.
-    #[test]
-    fn only_a_configured_composition_with_no_runtime_counts_as_blocked() {
-        let ready = ResolvedRuntime {
-            version: "24.19.0".into(),
-            executable: PathBuf::from("/usr/bin/node"),
-            origin: "managed install".into(),
-        };
-        let case = |configured: usize, runtime: Option<ResolvedRuntime>| PlaneRuntimeStatus {
-            configured_plugins: configured,
-            runtime,
-            problem: None,
-            out_of_range: None,
-            supported: ">=24.19.0 <25.0.0".to_owned(),
-            installable: true,
-        };
-
-        assert!(
-            case(2, None).is_blocked(),
-            "configured, nothing to run them"
-        );
-        assert!(!case(0, None).is_blocked(), "nothing configured");
-        assert!(
-            !case(2, Some(ready.clone())).is_blocked(),
-            "configured and ready"
-        );
-        assert!(
-            !case(0, Some(ready)).is_blocked(),
-            "ready, nothing asked for"
-        );
+    fn the_status_names_verve_and_the_runner_or_why_it_is_missing() {
+        let status = plane_runtime_status();
+        assert_eq!(status.runtime, PLANE_RUNTIME);
+        assert_eq!(status.runner.is_some(), status.problem.is_none());
+        if let Some(problem) = status.problem {
+            assert!(problem.contains("rebon-verve"), "{problem}");
+        }
     }
 
     #[test]
