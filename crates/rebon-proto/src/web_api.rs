@@ -390,7 +390,7 @@ pub struct HistorySnapshot {
 pub struct PluginStatus {
     /// Which loop host this build carries, in one line.
     pub host: String,
-    /// The Node runtime a composition would run on.
+    /// The runtime a composition would run on.
     pub runtime: PluginRuntimeStatus,
     /// The plane that is actually up, if one is.
     pub plane: PluginPlaneStatus,

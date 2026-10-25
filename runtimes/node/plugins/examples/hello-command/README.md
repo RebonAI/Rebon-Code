@@ -36,8 +36,8 @@ project's):
 says what the entry may register. `plugins` is the list that actually loads
 things — a name mapped but not listed stays on disk.
 
-Loading also needs a Node runtime in the supported range; `rebon node install`
-provides one. With both in place, `/hello` appears in the command list and in
+Nothing else needs installing: the plugin runs on Verve inside rebon. With that
+in place, `/hello` appears in the command list and in
 the `/` selector, and `/kernel` shows the entry running.
 
 Installing the package (`rebon plugin install ./runtimes/node/plugins/examples/hello-command`)

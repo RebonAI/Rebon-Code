@@ -675,14 +675,6 @@ export interface ModsParams {
   call: JsonValue;
 }
 
-/** A Node that answered, but not with a version this build accepts. */
-export interface OutOfRangeRuntime {
-  /** Where it lives. */
-  executable: string;
-  /** The version it reported. */
-  version: string;
-}
-
 /** One option offered to the client when the agent asks for permission. */
 export interface PermissionOption {
   kind: PermissionOptionKind;
@@ -744,7 +736,10 @@ export interface PluginPlaneStatus {
   running: boolean;
 }
 
-/** The Node runtime under a plugin plane. */
+/**
+ * The runtime under a plugin plane: Verve, inside rebon, and the runner a
+ * contained plugin or a Code Mode program starts.
+ */
 export interface PluginRuntimeStatus {
   /**
    * How many entries `kernelPlugins` asks for. Zero is a normal state,
@@ -753,21 +748,18 @@ export interface PluginRuntimeStatus {
    * A count, not a boolean: nothing on the page ever read it as a flag.
    */
   configuredPlugins: number;
-  /** Whether `rebon node install` could fix this here. */
-  installable: boolean;
   /**
-   * A Node that was found and turned down for its version.
-   *
-   * Separate from `problem` because it is a different situation with a
-   * different fix.
+   * Why the runner was not found: contained plugins and Code Mode cannot
+   * run until it is.
    */
-  outOfRange?: OutOfRangeRuntime;
-  /** The resolver's own words for why nothing resolved. */
   problem?: string;
-  /** The runtime that resolved, or `null` if none did. */
-  resolved?: ResolvedRuntime;
-  /** The versions a runtime may report, as a range someone can read. */
-  supported: string;
+  /**
+   * The runner (`rebon-verve`), as a path string, or `null` when it was
+   * not found beside rebon.
+   */
+  runner?: string;
+  /** What plugins run on. Always there: it is part of rebon. */
+  runtime: string;
 }
 
 /**
@@ -785,7 +777,7 @@ export interface PluginStatus {
   loops: KernelLoopOption[];
   /** The plane that is actually up, if one is. */
   plane: PluginPlaneStatus;
-  /** The Node runtime a composition would run on. */
+  /** The runtime a composition would run on. */
   runtime: PluginRuntimeStatus;
   /**
    * Entries that could not be turned into a load request, and why.
@@ -922,22 +914,6 @@ export interface RequestPermissionResult {
 export interface RequestPermissionWireResult {
   outcome: RequestPermissionResult;
   updatedInput?: JsonValue;
-}
-
-/** One resolved Node. */
-export interface ResolvedRuntime {
-  /**
-   * Where it lives, as a string: the server has a path and the wire has
-   * no path type.
-   */
-  executable: string;
-  /**
-   * Which rung of the ladder answered: an explicit demand, a managed
-   * install, or `PATH`.
-   */
-  origin: string;
-  /** The version it reported. */
-  version: string;
 }
 
 export interface ResourceBody {

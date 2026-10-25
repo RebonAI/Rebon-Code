@@ -112,9 +112,9 @@ pub fn register_core_options(seat: &Arc<ConfigSeat>, ctx: &Context) -> Result<()
                 .describe(
                     "Offer `run_code`, which lets the model write one program that chains \
                      tool calls instead of calling them one by one. Permissions still apply \
-                     to every call it makes. Needs a trusted Node runtime (`rebon node \
-                     install`). The default applies to new sessions; `/codemode on|off` \
-                     changes the current one.",
+                     to every call it makes. Programs run on rebon's own runtime; nothing \
+                     needs installing. The default applies to new sessions; \
+                     `/codemode on|off` changes the current one.",
                 )
                 .in_category(EXPERIMENTAL),
             Arc::new(CodeModeSwitch),
