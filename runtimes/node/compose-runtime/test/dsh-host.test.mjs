@@ -150,6 +150,55 @@ test('the configuration editor persists an entry\'s config as that entry and app
   }
 });
 
+test('the client contract answers from the realm in dsh\'s wire shape', async () => {
+  const kit = await startHost();
+  try {
+    await loadCompose(kit, { entries: [{ id: 'brand' }] });
+    const client = cordisPackage('export const name = "brand";\nexport function apply() {}\n', {
+      name: '@deepseek-ai/dsh-client-ui-brand-official',
+      exports: { '.': './entry.mjs', './client': './lib/client.js' },
+      dsh: { client: { platform: 'web', inject: ['@deepseek-ai/dsh-client-ui-slots'] } },
+    });
+    fs.mkdirSync(path.join(client.root, 'lib'));
+    fs.writeFileSync(path.join(client.root, 'lib', 'client.js'), 'window.__ModuleLoader__.load({ id: "brand", factory: () => ({}) });\n');
+    assert.equal((await loadEntry(kit, { id: 'brand', ...client })).status, 'success');
+    await openScope(kit, 'rebon:compose');
+
+    const inventory = await remote(kit, 'pluginInventory/list');
+    assert.deepEqual(plainly(inventory.terminal.payload), {
+      ok: true,
+      value: {
+        managementAvailable: false,
+        entries: [{ entryId: 'brand', moduleName: '@deepseek-ai/dsh-client-ui-brand-official', enabled: true, fiberPhase: 'active' }],
+      },
+    });
+
+    const modules = plainly((await remote(kit, 'rebon/clientModules')).terminal.payload);
+    assert.equal(modules.ok, true);
+    assert.equal(modules.value.entries.length, 1);
+    const [row] = modules.value.entries;
+    assert.equal(row.entryId, 'brand');
+    assert.equal(row.id, '@deepseek-ai/dsh-client-ui-brand-official');
+    assert.equal(path.resolve(row.file), path.resolve(client.root, 'lib', 'client.js'));
+    assert.deepEqual(row.inject, ['@deepseek-ai/dsh-client-ui-slots']);
+    assert.match(row.rev, /^\d+-\d+$/);
+
+    // No settings service in this composition: unavailable, by name.
+    const settings = plainly((await remote(kit, 'settings/describe')).terminal.payload);
+    assert.equal(settings.ok, false);
+    assert.equal(settings.error.code, 'gateway/method-unavailable');
+
+    const unknown = plainly((await remote(kit, 'session/list')).terminal.payload);
+    assert.deepEqual(unknown.error.code, 'gateway/method-unavailable');
+
+    // Credentials are the plane's to describe, not a realm's.
+    const credentials = plainly((await remote(kit, 'credentials/describe', { refs: ['EXA_API_KEY'] })).terminal.payload);
+    assert.equal(credentials.error.code, 'gateway/method-unavailable');
+  } finally {
+    await kit.stop();
+  }
+});
+
 // ---- the bundle probe ---------------------------------------------------
 
 function writeBundle() {

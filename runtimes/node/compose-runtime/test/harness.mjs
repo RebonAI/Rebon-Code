@@ -137,6 +137,7 @@ export async function loadCompose(kit, { entries = [], web = null, modules = {},
     root: COMPOSE_ROOT.replace(/\\/g, '/'),
     entry: 'src/plugin.mjs',
     services: ['compose'],
+    publishedTopics: ['compose:remote-event'],
     config: { payloadDir: PAYLOAD, entries, web, modules, profile },
   });
 }

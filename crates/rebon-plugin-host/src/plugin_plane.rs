@@ -69,6 +69,8 @@ use serde_json::Value;
 use rebon_kernel_seats::kernel_compose_tools::{ComposeToolDispatch, ComposeToolRegistry};
 use rebon_provider::kernel_llm_dispatch::{register_llm_host, unregister_llm_host, LlmRoute};
 
+mod remote;
+
 /// The reserved plugin id of the composition control plugin.
 pub const COMPOSE_PLUGIN_ID: &str = "rebon:compose";
 
@@ -282,6 +284,11 @@ impl PluginPlaneConfig {
     }
 }
 
+/// The topic the composition publishes the Host events a DeepSeek Harness
+/// client hears on (`settings/document-updated`, …); see
+/// `compose-runtime/src/plugin.mjs`.
+pub const REMOTE_EVENT_TOPIC: &str = "compose:remote-event";
+
 /// What a realm's `profileContext` says: its home, rebon's counterpart of
 /// `DSH_HOME`. The shared host's is `<config home>/dsh`; a container's is its
 /// own data directory, the one place it may write.
@@ -300,7 +307,7 @@ fn control_request(compose_root: &Path, config: Value) -> PluginLoadRequest {
         services: vec!["compose".to_owned()],
         config: Payload::from(config),
         event_topics: Vec::new(),
-        published_topics: Vec::new(),
+        published_topics: vec![REMOTE_EVENT_TOPIC.to_owned()],
         llm_providers: Vec::new(),
         tools: Vec::new(),
         commands: Vec::new(),

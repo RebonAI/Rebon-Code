@@ -25,7 +25,8 @@ export async function activate(api, config = {}) {
   });
 
   const { withCall } = await import('./bridge.mjs');
-  const { builtinSeats, createRealm, mounted, reportFor } = await import('./realm.mjs');
+  const { builtinSeats, createRealm, mounted, realm, reportFor } = await import('./realm.mjs');
+  const { remote, REMOTE_EVENTS } = await import('./remote.mjs');
   await createRealm({
     web: config.web ?? null,
     entries: config.entries ?? [],
@@ -44,6 +45,9 @@ export async function activate(api, config = {}) {
     if (kind === 'list') {
       return { plugins: mounted(), builtin: builtinSeats() };
     }
+    if (kind === 'remote') {
+      return remote(String(request?.endpoint ?? ''), request?.args ?? {});
+    }
     if (kind === 'report') {
       const pluginId = String(request?.pluginId ?? '');
       const report = reportFor(pluginId);
@@ -58,6 +62,27 @@ export async function activate(api, config = {}) {
     error.code = '[UNKNOWN_CONTROL]';
     throw error;
   }));
+
+  // The Host events a dsh client hears, put on rebon's event plane. They are
+  // the composition's own facts — a settings form changing under a page —
+  // and nothing is asking when they happen, so they go out through the
+  // session the control plugin is attached to rather than an inbound call.
+  const sessions = new Set();
+  api.scope((scope) => {
+    sessions.add(scope);
+    return () => sessions.delete(scope);
+  });
+  for (const event of REMOTE_EVENTS) {
+    realm().ctx.on(event, (...args) => {
+      for (const scope of sessions) {
+        void scope.publish(REMOTE_EVENT_TOPIC, { event, args: JSON.parse(JSON.stringify(args)) }).catch(() => {});
+        break;
+      }
+    });
+  }
 }
+
+/** The topic forwarded Host events are published on. */
+export const REMOTE_EVENT_TOPIC = 'compose:remote-event';
 
 export default activate;
