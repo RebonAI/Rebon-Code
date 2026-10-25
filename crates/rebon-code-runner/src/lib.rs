@@ -225,9 +225,14 @@ fn base_command(executable: &Path, working_directory: &Path) -> Command {
 ///
 /// There is no heap flag: Boa has no heap cap, so the containment unit's
 /// memory limit is what bounds a program's memory.
+///
+/// `--jitless`: a model-written program is untrusted, and Verve's JIT has no
+/// constant blinding yet, so its numbers could become chosen machine-code
+/// immediates. Code Mode stays interpreted.
 fn harden(command: &mut Command, stack_bytes: u64) {
     command
         .arg("--no-warnings")
+        .arg("--jitless")
         .arg(PERMISSION_FLAG)
         .arg("--experimental-vm-modules")
         .arg("--no-addons")

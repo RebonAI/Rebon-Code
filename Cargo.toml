@@ -111,7 +111,9 @@ boa_gc = "0.19.1"
 # Node's and the web's APIs. Its Boa is the one `[patch.crates-io]` below takes
 # from the same repository; `boa_engine` above is the separate, older Boa the
 # status-script runner still uses.
-verve = { git = "https://github.com/Quorafind/verve.git", branch = "main" }
+# `jit`: hot functions run as native code (Cranelift). Code Mode turns it off
+# per process with `--jitless`.
+verve = { git = "https://github.com/Quorafind/verve.git", branch = "main", features = ["jit"] }
 # Cordis in Rust, served to the plugin host as the `cordis` module.
 cordis-verve = { git = "https://github.com/Quorafind/cordis-rs.git", branch = "main" }
 
@@ -280,6 +282,13 @@ opt-level = 3
 [profile.dev.package."boa_string@0.22.0"]
 opt-level = 3
 [profile.dev.package."regress@0.12.0"]
+opt-level = 3
+# The JIT's compiler, for the same reason: unoptimised it compiles slowly.
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+[profile.dev.package.regalloc2]
 opt-level = 3
 
 [profile.release]
