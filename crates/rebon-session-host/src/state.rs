@@ -499,17 +499,6 @@ pub struct ProcessOwnership {
     #[doc(hidden)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process_path: Option<String>,
-    /// The Node runtime the plugin plane must use, captured from
-    /// [`rebon_node_runtime::NODE_EXECUTABLE_ENV`] when the job was created.
-    ///
-    /// A worker is a separate process, and the one that created the job may be
-    /// a desktop app whose `PATH` the worker does not share — the same reason
-    /// `process_path` exists. Recording the resolved runtime keeps a session
-    /// running on the runtime the app vetted instead of whatever the worker
-    /// would find on its own. Absent when nobody had resolved one, in which
-    /// case the worker walks the resolution ladder itself.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node_runtime_path: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1074,9 +1063,6 @@ impl BackgroundJobState {
                 ipc_token: None,
                 turn_generation: 0,
                 process_path: std::env::var("PATH").ok(),
-                node_runtime_path: std::env::var(rebon_node_runtime::NODE_EXECUTABLE_ENV)
-                    .ok()
-                    .filter(|path| !path.is_empty()),
                 created_at_ms: now,
                 updated_at_ms: now,
                 started_at_ms: None,

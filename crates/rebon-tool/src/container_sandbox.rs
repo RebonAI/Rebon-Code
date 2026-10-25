@@ -22,9 +22,10 @@ pub const CONTAINER_SANDBOX_SERVICE: &str = "container-sandbox";
 pub struct ConfineRequest {
     /// The container's name, for notes and the proxy's log tag.
     pub container: String,
-    /// Node itself, which the host must be allowed to execute.
-    pub node: PathBuf,
-    /// The host's whole command line, Node first: what the OS layer wraps.
+    /// The runner (`rebon-verve`), which the host must be allowed to execute.
+    pub runner: PathBuf,
+    /// The host's whole command line, the runner first: what the OS layer
+    /// wraps.
     pub argv: Vec<OsString>,
     /// The environment the host runs with, before the proxy's variables.
     /// An OS layer that does not pass its own environment through (Windows

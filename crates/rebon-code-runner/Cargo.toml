@@ -5,10 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "One-shot contained Node process for PTC / Code Mode: model-authored programs run behind an OS containment unit and Node's permission model, never in rebon's own process"
+description = "One-shot contained process for PTC / Code Mode: model-authored programs run on rebon-verve behind an OS containment unit and its permission model, never in rebon's own process"
 
 [dependencies]
 rebon-boa-runner.workspace = true
+rebon-types.workspace = true
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true

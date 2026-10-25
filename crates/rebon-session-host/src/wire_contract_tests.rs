@@ -173,7 +173,6 @@ fn fully_populated_job() -> BackgroundJobState {
             ipc_token: Some("f0e1d2c3b4a596877869504132231405".to_string()),
             turn_generation: 9,
             process_path: Some("/usr/local/bin/rebon".to_string()),
-            node_runtime_path: Some("/runtime/node".to_string()),
             created_at_ms: 1_700_000_000_000,
             updated_at_ms: 1_700_000_000_500,
             started_at_ms: Some(1_700_000_000_050),
@@ -319,7 +318,6 @@ fn minimal_job() -> BackgroundJobState {
             ipc_token: None,
             turn_generation: 0,
             process_path: None,
-            node_runtime_path: None,
             created_at_ms: 1_700_000_000_000,
             updated_at_ms: 1_700_000_000_000,
             started_at_ms: None,
@@ -389,7 +387,7 @@ fn a_minimal_job_state_skips_every_defaulted_field() {
 /// No field added, renamed or dropped by a refactor.
 ///
 /// Separate from the value golden because this is the assertion a reviewer can
-/// read at a glance: 49 names, spelled the way they are spelled on disk.
+/// read at a glance: 48 names, spelled the way they are spelled on disk.
 #[test]
 fn the_flat_job_json_carries_exactly_these_keys() {
     let value = serde_json::to_value(fully_populated_job()).expect("serializable");
@@ -419,7 +417,6 @@ fn the_flat_job_json_carries_exactly_these_keys() {
             "jobId",
             "lingerMs",
             "name",
-            "nodeRuntimePath",
             "ownerDetachedGroup",
             "parentJobId",
             "pendingPermission",
@@ -454,7 +451,7 @@ fn the_flat_job_json_carries_exactly_these_keys() {
             "worktreePath",
         ]
     );
-    assert_eq!(keys.len(), 49);
+    assert_eq!(keys.len(), 48);
 }
 
 /// A record an older build left on disk, read and written back unchanged.

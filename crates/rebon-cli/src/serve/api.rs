@@ -19,10 +19,9 @@ use rebon_api::{ContentBlock, Role};
 use rebon_plugin_skill::SkillSource;
 use rebon_proto::web_api::{
     ActionResult, AgentEntry, AgentOption, AgentsResponse, CommandsResponse, HistorySnapshot,
-    KernelLoopOption, McpServerEntry, McpStatus, ModelOption, ModelsResponse, OutOfRangeRuntime,
-    PluginEntry, PluginPlaneStatus, PluginRuntimeStatus, PluginStatus, ResolvedRuntime,
-    RewindCheckpoint, RewindResponse, ServerInfo, SkillEntry, SkillsResponse, TaskEntry,
-    TasksResponse, UsageResponse,
+    KernelLoopOption, McpServerEntry, McpStatus, ModelOption, ModelsResponse, PluginEntry,
+    PluginPlaneStatus, PluginRuntimeStatus, PluginStatus, RewindCheckpoint, RewindResponse,
+    ServerInfo, SkillEntry, SkillsResponse, TaskEntry, TasksResponse, UsageResponse,
 };
 use rebon_slash_commands::{for_surface, Surface};
 use rebon_tool::{AgentRegistrySettingSource as Setting, AgentRegistrySource as Source};
@@ -826,21 +825,12 @@ pub async fn plugin_status(
         host: rebon_plugin_host::loop_host::describe_loop_host().to_string(),
         runtime: PluginRuntimeStatus {
             configured_plugins: runtime.configured_plugins,
-            supported: runtime.supported,
-            resolved: runtime.runtime.as_ref().map(|resolved| ResolvedRuntime {
-                version: resolved.version.clone(),
-                executable: resolved.executable.to_string_lossy().into_owned(),
-                origin: resolved.origin.clone(),
-            }),
-            problem: runtime.problem,
-            out_of_range: runtime
-                .out_of_range
+            runtime: runtime.runtime.to_owned(),
+            runner: runtime
+                .runner
                 .as_ref()
-                .map(|out_of_range| OutOfRangeRuntime {
-                    version: out_of_range.version.clone(),
-                    executable: out_of_range.executable.to_string_lossy().into_owned(),
-                }),
-            installable: runtime.installable,
+                .map(|runner| runner.to_string_lossy().into_owned()),
+            problem: runtime.problem,
         },
         plane: PluginPlaneStatus {
             running: plane.is_some(),

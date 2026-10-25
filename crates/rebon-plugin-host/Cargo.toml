@@ -21,7 +21,6 @@ rebon-provider.workspace = true
 rebon-plugin-supervisor.workspace = true
 rebon-plugin-protocol.workspace = true
 # Where a Node runtime is found and which version is pinned.
-rebon-node-runtime.workspace = true
 # The `node-host` plugin's own half: the switches, the wanted set, the service
 # a host resolves before starting a plane. The plugin cannot name this crate
 # back — that is the seam `kernel_node_host` implements.
@@ -63,3 +62,4 @@ tracing.workspace = true
 # model request across; the three crates it needs for that are ordinary
 # dependencies now that the boot decision lives here too.
 tempfile = "3"
+url.workspace = true

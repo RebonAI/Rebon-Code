@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use rebon_code_runner::CodeNodeRuntime;
+use rebon_code_runner::CodeRuntime;
 use rebon_core::Engine;
 use rebon_kernel::Kernel;
 use rebon_kernel_seats::kernel_code_mode::RunCodeTool;
@@ -115,17 +115,32 @@ fn engine_with_concurrency_probe() -> (Arc<Engine>, Arc<AtomicUsize>) {
     (Arc::new(engine), peak)
 }
 
-fn code_node_runtime() -> CodeNodeRuntime {
-    let output = std::process::Command::new("node")
-        .args(["-p", "process.execPath"])
-        .output()
-        .expect("Node is required for Code Mode tests");
-    assert!(output.status.success(), "Node runtime probe failed");
-    let path = String::from_utf8(output.stdout)
-        .expect("Node path is UTF-8")
-        .trim()
-        .to_string();
-    CodeNodeRuntime::new(std::path::PathBuf::from(path)).expect("absolute Node runtime")
+/// The runner: `REBON_VERVE`, or the `rebon-verve` built into this target
+/// directory (`cargo build -p rebon-verve-host --bin rebon-verve`).
+fn test_runner() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("REBON_VERVE") {
+        return std::path::PathBuf::from(path);
+    }
+    let exe = std::env::current_exe().expect("the test knows its own path");
+    let name = if cfg!(windows) {
+        "rebon-verve.exe"
+    } else {
+        "rebon-verve"
+    };
+    let built = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("a test binary lives in target/<profile>/deps")
+        .join(name);
+    assert!(
+        built.is_file(),
+        "Code Mode tests need the runner: build it with          `cargo build -p rebon-verve-host --bin rebon-verve`, or set REBON_VERVE"
+    );
+    built
+}
+
+fn code_runtime() -> CodeRuntime {
+    CodeRuntime::new(test_runner()).expect("a hardenable runner")
 }
 
 fn install_code_runtime(
@@ -142,7 +157,7 @@ fn install_code_runtime(
         engine.clone(),
         events.clone(),
         budget,
-        code_node_runtime(),
+        code_runtime(),
     );
     tool.command(&["on".into()]).unwrap();
     tools.set_run_code(tool);
@@ -152,43 +167,17 @@ fn slash(path: &std::path::Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// Production resolution reaches a runtime without being launched by npm.
-///
-/// The launcher rung only exists when an npm-distributed rebon was started by a
-/// Node, so before the managed rung a desktop install had no Code Mode at all —
-/// even with a vetted runtime already unpacked under its own config home. The
-/// assertion is deliberately one-sided: a machine with neither rung is a valid
-/// state and must produce a refusal that says how to fix it, not a panic.
+/// Production resolution finds the runner the way a packaged rebon does, and a
+/// machine without one is refused with a reason rather than a panic.
 #[test]
-fn code_mode_resolves_a_runtime_from_the_launcher_or_a_managed_install() {
+fn code_mode_resolves_its_runner_or_says_why_not() {
     match rebon_kernel_seats::kernel_code_mode::code_mode_runtime() {
-        Ok(runtime) => {
-            assert!(runtime.executable().is_absolute());
-            assert!(
-                ["--permission", "--experimental-permission"].contains(&runtime.permission_flag()),
-                "unexpected permission flag {}",
-                runtime.permission_flag()
-            );
-        }
-        Err(error) => {
-            // A machine with neither rung must be told what would fix it...
-            assert!(
-                error.message.contains("rebon node install") || error.message.contains("refused"),
-                "{}",
-                error.message
-            );
-            // ...and must actually be such a machine. An installed, vetted
-            // runtime that resolution fails to find is the gap this rung exists
-            // to close, so it is a failure here rather than a tolerated branch.
-            let managed = rebon_node_runtime::ManagedRuntimeStore::under_config_home(
-                &rebon_config::config_home_dir(),
-            );
-            assert!(
-                managed.installed().is_empty(),
-                "a managed runtime is installed but Code Mode did not reach it: {}",
-                error.message
-            );
-        }
+        Ok(runtime) => assert!(runtime.executable().is_absolute()),
+        Err(error) => assert!(
+            error.message.contains("rebon-verve") || error.message.contains("REBON_VERVE"),
+            "{}",
+            error.message
+        ),
     }
 }
 
@@ -210,7 +199,7 @@ async fn code_mode_live_session_seat_gate_and_filter_matrix() {
             engine.clone(),
             scope.clone(),
             Duration::from_secs(10),
-            code_node_runtime(),
+            code_runtime(),
         );
         let tools = SessionPluginTools::new(engine.clone());
         tools.set_run_code(tool.clone());
@@ -470,7 +459,7 @@ return messages;
         engine.clone(),
         session_ctx.clone(),
         Duration::from_secs(1),
-        code_node_runtime(),
+        code_runtime(),
     );
     run_code.command(&["on".into()]).unwrap();
     let err = run_code

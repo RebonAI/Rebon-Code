@@ -15,21 +15,6 @@ use rebon_plugin_supervisor::{
     SeatDispatcher, SeatInvocation, StreamEvent, ToolInvocation, ToolInvoker, ToolRefusal,
 };
 
-fn node() -> Option<PathBuf> {
-    match env::var_os("REBON_TEST_NODE") {
-        Some(node) => Some(PathBuf::from(node)),
-        None => {
-            assert_ne!(
-                env::var_os("REBON_REQUIRE_TEST_NODE").as_deref(),
-                Some(std::ffi::OsStr::new("1")),
-                "REBON_REQUIRE_TEST_NODE=1 requires an absolute REBON_TEST_NODE"
-            );
-            eprintln!("skipping: set REBON_TEST_NODE to an absolute Node executable");
-            None
-        }
-    }
-}
-
 fn real_host() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtimes/node/plugin-host/src/cli.mjs")
 }
@@ -90,14 +75,14 @@ fn listener_request(root: String) -> PluginLoadRequest {
     }
 }
 
-async fn started(node: &std::path::Path) -> PluginHostSupervisor {
-    PluginHostSupervisor::start(base_config(node))
+async fn started(runner: &std::path::Path) -> PluginHostSupervisor {
+    PluginHostSupervisor::start(base_config(runner))
         .await
         .expect("host starts")
 }
 
-fn base_config(node: &std::path::Path) -> HostConfig {
-    HostConfig::new(node, real_host())
+fn base_config(runner: &std::path::Path) -> HostConfig {
+    HostConfig::new(runner, real_host())
         .with_startup_timeout(Duration::from_secs(20))
         .with_working_directory(env::temp_dir())
 }
@@ -134,10 +119,10 @@ impl ToolInvoker for RecordingTools {
 
 #[tokio::test]
 async fn a_plugin_loads_answers_a_service_call_and_drains() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path(), ECHO_PLUGIN);
-    let supervisor = started(&node).await;
+    let supervisor = started(&runner).await;
 
     let report = supervisor
         .load_plugin(&load_request(root))
@@ -191,13 +176,13 @@ async fn a_plugin_loads_answers_a_service_call_and_drains() {
 /// a rejected report after its module already ran.
 #[tokio::test]
 async fn a_plugin_cannot_register_a_service_its_manifest_did_not_declare() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(
         dir.path(),
         "export function activate(plugin) { plugin.service('smuggled', async () => null); }\n",
     );
-    let supervisor = started(&node).await;
+    let supervisor = started(&runner).await;
 
     let error = supervisor
         .load_plugin(&load_request(root))
@@ -221,10 +206,10 @@ async fn a_plugin_cannot_register_a_service_its_manifest_did_not_declare() {
 
 #[tokio::test]
 async fn a_service_the_plugin_never_registered_is_refused_before_the_host_is_asked() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path(), ECHO_PLUGIN);
-    let supervisor = started(&node).await;
+    let supervisor = started(&runner).await;
     supervisor.load_plugin(&load_request(root)).await.unwrap();
     supervisor
         .open_scope("plugin.demo", "session-1", "C:/workspace")
@@ -247,13 +232,13 @@ async fn a_service_the_plugin_never_registered_is_refused_before_the_host_is_ask
 /// not a host failure — the host is still perfectly usable.
 #[tokio::test]
 async fn a_plugin_that_throws_on_activation_does_not_take_the_host_down() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(
         dir.path(),
         "export function activate() { throw new Error('deliberate'); }\n",
     );
-    let supervisor = started(&node).await;
+    let supervisor = started(&runner).await;
 
     let error = supervisor
         .load_plugin(&load_request(root))
@@ -281,11 +266,11 @@ async fn a_plugin_that_throws_on_activation_does_not_take_the_host_down() {
 /// though the payload's own text looked harmless.
 #[tokio::test]
 async fn an_entry_outside_the_package_root_is_refused() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path(), ECHO_PLUGIN);
     std::fs::create_dir_all(dir.path().join("nested")).unwrap();
-    let supervisor = started(&node).await;
+    let supervisor = started(&runner).await;
 
     let mut request = load_request(format!("{root}/nested"));
     // Textually relative and clean, but it lands in the parent directory.
@@ -304,10 +289,10 @@ async fn an_entry_outside_the_package_root_is_refused() {
 /// and the answer travels back on the same stream the request came in on.
 #[tokio::test]
 async fn a_plugin_subscribes_through_the_host_and_receives_an_event() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path(), LISTENER_PLUGIN);
-    let supervisor = started(&node).await;
+    let supervisor = started(&runner).await;
     supervisor
         .load_plugin(&listener_request(root))
         .await
@@ -351,10 +336,10 @@ async fn a_plugin_subscribes_through_the_host_and_receives_an_event() {
 /// asked.
 #[tokio::test]
 async fn closing_a_scope_revokes_the_subscriptions_it_created() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path(), LISTENER_PLUGIN);
-    let supervisor = started(&node).await;
+    let supervisor = started(&runner).await;
     supervisor
         .load_plugin(&listener_request(root))
         .await
@@ -405,10 +390,10 @@ async fn closing_a_scope_revokes_the_subscriptions_it_created() {
 /// does not require asking the host.
 #[tokio::test]
 async fn an_event_for_a_subscription_that_was_never_made_is_refused_locally() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path(), ECHO_PLUGIN);
-    let supervisor = started(&node).await;
+    let supervisor = started(&runner).await;
     supervisor.load_plugin(&load_request(root)).await.unwrap();
     supervisor
         .open_scope("plugin.demo", "session-1", "C:/workspace")
@@ -464,12 +449,13 @@ fn tool_request(root: String, tools: Vec<String>) -> PluginLoadRequest {
 }
 
 async fn with_tools(
-    node: &std::path::Path,
+    runner: &std::path::Path,
     tools: Arc<RecordingTools>,
     exposed: &[&str],
 ) -> PluginHostSupervisor {
     PluginHostSupervisor::start(
-        base_config(node).with_tool_invoker(tools, exposed.iter().map(|tool| (*tool).to_string())),
+        base_config(runner)
+            .with_tool_invoker(tools, exposed.iter().map(|tool| (*tool).to_string())),
     )
     .await
     .expect("host starts")
@@ -480,11 +466,11 @@ async fn with_tools(
 /// injected, and the answer comes back into the plugin.
 #[tokio::test]
 async fn a_plugin_invokes_a_rebon_tool_and_gets_its_answer() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path(), TOOL_PLUGIN);
     let tools = Arc::new(RecordingTools::default());
-    let supervisor = with_tools(&node, Arc::clone(&tools), &["read_file"]).await;
+    let supervisor = with_tools(&runner, Arc::clone(&tools), &["read_file"]).await;
 
     supervisor
         .load_plugin(&tool_request(root, vec!["read_file".into()]))
@@ -526,14 +512,14 @@ async fn a_plugin_invokes_a_rebon_tool_and_gets_its_answer() {
 /// — reaches the plugin with its own code rather than as "the call failed".
 #[tokio::test]
 async fn a_denied_tool_reaches_the_plugin_with_its_reason() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path(), TOOL_PLUGIN);
     let tools = Arc::new(RecordingTools {
         deny: true,
         ..RecordingTools::default()
     });
-    let supervisor = with_tools(&node, tools, &["read_file"]).await;
+    let supervisor = with_tools(&runner, tools, &["read_file"]).await;
     supervisor
         .load_plugin(&tool_request(root, vec!["read_file".into()]))
         .await
@@ -568,11 +554,11 @@ async fn a_denied_tool_reaches_the_plugin_with_its_reason() {
 /// plugin that can never work, so it is refused at load rather than at first use.
 #[tokio::test]
 async fn a_manifest_declaring_an_unexposed_tool_is_refused_at_load() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path(), TOOL_PLUGIN);
     let tools = Arc::new(RecordingTools::default());
-    let supervisor = with_tools(&node, Arc::clone(&tools), &["read_file"]).await;
+    let supervisor = with_tools(&runner, Arc::clone(&tools), &["read_file"]).await;
 
     let error = supervisor
         .load_plugin(&tool_request(root.clone(), vec!["run_shell".into()]))
@@ -597,10 +583,10 @@ async fn a_manifest_declaring_an_unexposed_tool_is_refused_at_load() {
 /// told so rather than left waiting.
 #[tokio::test]
 async fn a_plane_with_no_invoker_exposes_no_tools() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path(), TOOL_PLUGIN);
-    let supervisor = started(&node).await;
+    let supervisor = started(&runner).await;
 
     let error = supervisor
         .load_plugin(&tool_request(root, vec!["read_file".into()]))
@@ -654,11 +640,11 @@ fn streaming_request(root: String) -> PluginLoadRequest {
 }
 
 async fn streaming_supervisor(
-    node: &std::path::Path,
+    runner: &std::path::Path,
     dir: &tempfile::TempDir,
 ) -> PluginHostSupervisor {
     let root = plugin_package(dir.path(), STREAMING_PLUGIN);
-    let supervisor = started(node).await;
+    let supervisor = started(runner).await;
     supervisor
         .load_plugin(&streaming_request(root))
         .await
@@ -674,9 +660,9 @@ async fn streaming_supervisor(
 /// exactly one end follows them, and the plugin's return value is that end.
 #[tokio::test]
 async fn a_service_streams_its_answer_in_pieces_before_ending() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
-    let supervisor = streaming_supervisor(&node, &dir).await;
+    let supervisor = streaming_supervisor(&runner, &dir).await;
 
     let stream = supervisor
         .call_service_streaming(
@@ -717,9 +703,9 @@ async fn a_service_streams_its_answer_in_pieces_before_ending() {
 /// not the host's behaviour.
 #[tokio::test]
 async fn a_streamed_answer_on_a_non_streaming_call_fails_loudly() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
-    let supervisor = streaming_supervisor(&node, &dir).await;
+    let supervisor = streaming_supervisor(&runner, &dir).await;
 
     let error = supervisor
         .call_service(
@@ -745,9 +731,9 @@ async fn a_streamed_answer_on_a_non_streaming_call_fails_loudly() {
 /// read the end and stopped listening.
 #[tokio::test]
 async fn emitting_after_the_call_ended_is_refused() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
-    let supervisor = streaming_supervisor(&node, &dir).await;
+    let supervisor = streaming_supervisor(&runner, &dir).await;
 
     let (_, end) = supervisor
         .call_service_streaming("plugin.demo", "session-1", "leak", Payload::null())
@@ -775,9 +761,9 @@ async fn emitting_after_the_call_ended_is_refused() {
 /// drop, so the unload that follows can finish.
 #[tokio::test]
 async fn dropping_a_stream_early_still_closes_the_call() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
-    let supervisor = streaming_supervisor(&node, &dir).await;
+    let supervisor = streaming_supervisor(&runner, &dir).await;
 
     {
         let _stream = supervisor
@@ -859,9 +845,9 @@ fn llm_request(root: String) -> PluginLoadRequest {
     }
 }
 
-async fn llm_supervisor(node: &std::path::Path, dir: &tempfile::TempDir) -> PluginHostSupervisor {
+async fn llm_supervisor(runner: &std::path::Path, dir: &tempfile::TempDir) -> PluginHostSupervisor {
     let root = plugin_package(dir.path(), LLM_PLUGIN);
-    let supervisor = started(node).await;
+    let supervisor = started(runner).await;
     let report = supervisor
         .load_plugin(&llm_request(root))
         .await
@@ -883,9 +869,9 @@ async fn llm_supervisor(node: &std::path::Path, dir: &tempfile::TempDir) -> Plug
 /// ends with the adapter's own finish chunk.
 #[tokio::test]
 async fn an_llm_adapter_streams_a_turn_through_the_host() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
-    let supervisor = llm_supervisor(&node, &dir).await;
+    let supervisor = llm_supervisor(&runner, &dir).await;
 
     let stream = supervisor
         .stream_llm(
@@ -921,9 +907,9 @@ async fn an_llm_adapter_streams_a_turn_through_the_host() {
 /// a provider this plugin never registered is refused before the host is asked.
 #[tokio::test]
 async fn a_turn_for_an_unregistered_provider_is_refused_locally() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
-    let supervisor = llm_supervisor(&node, &dir).await;
+    let supervisor = llm_supervisor(&runner, &dir).await;
 
     let error = supervisor
         .stream_llm("plugin.demo", "session-1", "openai", Payload::null())
@@ -941,9 +927,9 @@ async fn a_turn_for_an_unregistered_provider_is_refused_locally() {
 /// commands, so the terminal has to say which of the two happened.
 #[tokio::test]
 async fn cancelling_a_turn_ends_it_as_cancelled_not_as_an_error() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
-    let supervisor = llm_supervisor(&node, &dir).await;
+    let supervisor = llm_supervisor(&runner, &dir).await;
 
     let mut stream = supervisor
         .stream_llm(
@@ -982,9 +968,9 @@ async fn cancelling_a_turn_ends_it_as_cancelled_not_as_an_error() {
 /// override.
 #[tokio::test]
 async fn an_adapter_that_honours_cancellation_by_returning_ends_successfully() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
-    let supervisor = llm_supervisor(&node, &dir).await;
+    let supervisor = llm_supervisor(&runner, &dir).await;
 
     let mut stream = supervisor
         .stream_llm("plugin.demo", "session-1", "honour", Payload::null())
@@ -1050,13 +1036,13 @@ fn provider_request(root: String) -> PluginLoadRequest {
 }
 
 async fn tool_provider(
-    node: &std::path::Path,
+    runner: &std::path::Path,
     dir: &tempfile::TempDir,
     tools: Arc<RecordingTools>,
 ) -> PluginHostSupervisor {
     let root = plugin_package(dir.path(), TOOL_PROVIDER_PLUGIN);
     let supervisor = PluginHostSupervisor::start(
-        base_config(node).with_tool_invoker(tools, [String::from("read_file")]),
+        base_config(runner).with_tool_invoker(tools, [String::from("read_file")]),
     )
     .await
     .expect("host starts");
@@ -1075,9 +1061,9 @@ async fn tool_provider(
 /// something a model could be offered, and calling it runs the plugin's code.
 #[tokio::test]
 async fn a_plugin_tool_is_described_and_then_called() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
-    let supervisor = tool_provider(&node, &dir, Arc::new(RecordingTools::default())).await;
+    let supervisor = tool_provider(&runner, &dir, Arc::new(RecordingTools::default())).await;
 
     // A tool cannot be offered to a model without saying what it does, so the
     // description and schema travel with the registration.
@@ -1113,10 +1099,10 @@ async fn a_plugin_tool_is_described_and_then_called() {
 /// providing it.
 #[tokio::test]
 async fn providing_a_tool_and_invoking_one_do_not_stand_in_for_each_other() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let tools = Arc::new(RecordingTools::default());
-    let supervisor = tool_provider(&node, &dir, Arc::clone(&tools)).await;
+    let supervisor = tool_provider(&runner, &dir, Arc::clone(&tools)).await;
 
     // rebon calling a tool the plugin only declared as invokable: not provided.
     let error = supervisor
@@ -1152,9 +1138,9 @@ async fn providing_a_tool_and_invoking_one_do_not_stand_in_for_each_other() {
 /// host stays usable and the call stops being counted, so an unload can finish.
 #[tokio::test]
 async fn a_failing_tool_ends_its_own_call_and_nothing_else() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
-    let supervisor = tool_provider(&node, &dir, Arc::new(RecordingTools::default())).await;
+    let supervisor = tool_provider(&runner, &dir, Arc::new(RecordingTools::default())).await;
 
     let error = supervisor
         .call_tool("plugin.demo", "session-1", "boom", Payload::null())
@@ -1173,13 +1159,13 @@ async fn a_failing_tool_ends_its_own_call_and_nothing_else() {
 /// refused at registration, so the failure names the plugin's own line.
 #[tokio::test]
 async fn a_tool_the_manifest_did_not_declare_cannot_be_registered() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(
         dir.path(),
         "export function activate(plugin) { plugin.tool({ name: 'smuggled', description: 'd', inputSchema: {} }, async () => null); }\n",
     );
-    let supervisor = started(&node).await;
+    let supervisor = started(&runner).await;
 
     let mut request = provider_request(root);
     request.tools = vec!["grep".into()];
@@ -1198,13 +1184,13 @@ async fn a_tool_the_manifest_did_not_declare_cannot_be_registered() {
 /// is refused where it is written rather than reaching the model as noise.
 #[tokio::test]
 async fn a_tool_with_no_description_is_refused_at_registration() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(
         dir.path(),
         "export function activate(plugin) { plugin.tool({ name: 'grep', description: '', inputSchema: {} }, async () => null); }\n",
     );
-    let supervisor = started(&node).await;
+    let supervisor = started(&runner).await;
 
     let mut request = provider_request(root);
     request.tools = vec!["grep".into()];
@@ -1280,14 +1266,14 @@ fn seat_request(root: String, seats: Vec<String>) -> PluginLoadRequest {
 }
 
 async fn seat_supervisor(
-    node: &std::path::Path,
+    runner: &std::path::Path,
     dir: &tempfile::TempDir,
     seats: Arc<RecordingSeats>,
     exposed: &[&str],
 ) -> PluginHostSupervisor {
     let root = plugin_package(dir.path(), SEAT_PLUGIN);
     let supervisor = PluginHostSupervisor::start(
-        base_config(node)
+        base_config(runner)
             .with_seat_dispatcher(seats, exposed.iter().map(|seat| (*seat).to_string())),
     )
     .await
@@ -1307,10 +1293,10 @@ async fn seat_supervisor(
 /// the identity that arrives at the embedder is the one the host injected.
 #[tokio::test]
 async fn a_plugin_calls_a_kernel_seat_and_gets_its_answer() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let seats = Arc::new(RecordingSeats::default());
-    let supervisor = seat_supervisor(&node, &dir, Arc::clone(&seats), &["credentials"]).await;
+    let supervisor = seat_supervisor(&runner, &dir, Arc::clone(&seats), &["credentials"]).await;
 
     let answer = supervisor
         .call_service(
@@ -1344,10 +1330,10 @@ async fn a_plugin_calls_a_kernel_seat_and_gets_its_answer() {
 /// the plugin's own line rather than arriving from across a process boundary.
 #[tokio::test]
 async fn a_seat_the_manifest_did_not_declare_is_refused_before_anything_is_sent() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let seats = Arc::new(RecordingSeats::default());
-    let supervisor = seat_supervisor(&node, &dir, Arc::clone(&seats), &["credentials"]).await;
+    let supervisor = seat_supervisor(&runner, &dir, Arc::clone(&seats), &["credentials"]).await;
 
     let answer = supervisor
         .call_service(
@@ -1370,10 +1356,10 @@ async fn a_seat_the_manifest_did_not_declare_is_refused_before_anything_is_sent(
 /// that cannot work, so it is refused at load rather than at first use.
 #[tokio::test]
 async fn a_manifest_declaring_an_unexposed_seat_is_refused_at_load() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path(), SEAT_PLUGIN);
-    let supervisor = PluginHostSupervisor::start(base_config(&node).with_seat_dispatcher(
+    let supervisor = PluginHostSupervisor::start(base_config(&runner).with_seat_dispatcher(
         Arc::new(RecordingSeats::default()),
         [String::from("logger")],
     ))
@@ -1395,13 +1381,13 @@ async fn a_manifest_declaring_an_unexposed_seat_is_refused_at_load() {
 /// that is not granted says so in the kernel's vocabulary.
 #[tokio::test]
 async fn a_refused_seat_reaches_the_plugin_with_its_reason() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let seats = Arc::new(RecordingSeats {
         deny: true,
         ..RecordingSeats::default()
     });
-    let supervisor = seat_supervisor(&node, &dir, seats, &["credentials"]).await;
+    let supervisor = seat_supervisor(&runner, &dir, seats, &["credentials"]).await;
 
     let answer = supervisor
         .call_service(
@@ -1425,10 +1411,10 @@ async fn a_refused_seat_reaches_the_plugin_with_its_reason() {
 /// asks is told so rather than left waiting.
 #[tokio::test]
 async fn a_plane_with_no_dispatcher_exposes_no_seats() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path(), SEAT_PLUGIN);
-    let supervisor = started(&node).await;
+    let supervisor = started(&runner).await;
 
     let error = supervisor
         .load_plugin(&seat_request(root, vec!["credentials".into()]))
@@ -1532,13 +1518,13 @@ fn emit_request(root: String, published_topics: Vec<String>) -> PluginLoadReques
 }
 
 async fn emit_supervisor(
-    node: &std::path::Path,
+    runner: &std::path::Path,
     dir: &tempfile::TempDir,
     events: Arc<RecordingEvents>,
     topics: Vec<String>,
 ) -> PluginHostSupervisor {
     let root = plugin_package(dir.path(), EMIT_PLUGIN);
-    let supervisor = PluginHostSupervisor::start(base_config(node).with_event_publisher(events))
+    let supervisor = PluginHostSupervisor::start(base_config(runner).with_event_publisher(events))
         .await
         .expect("host starts");
     supervisor
@@ -1556,11 +1542,11 @@ async fn emit_supervisor(
 /// reaches the embedder is the one the host injected, not one the plugin chose.
 #[tokio::test]
 async fn a_plugin_publishes_an_event_and_rebon_learns_who_sent_it() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let events = Arc::new(RecordingEvents::default());
     let supervisor = emit_supervisor(
-        &node,
+        &runner,
         &dir,
         Arc::clone(&events),
         vec!["compose:session/append".into()],
@@ -1607,14 +1593,14 @@ async fn a_plugin_publishes_an_event_and_rebon_learns_who_sent_it() {
 /// been closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn events_reach_the_embedder_in_the_order_they_were_sent() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let events = Arc::new(RecordingEvents::default());
     let root = plugin_package(dir.path(), BURST_PLUGIN);
     let mut request = emit_request(root, vec!["compose:session/append".into()]);
     request.services = vec!["burst".into()];
     let supervisor = PluginHostSupervisor::start(
-        base_config(&node).with_event_publisher(Arc::clone(&events) as Arc<dyn EventPublisher>),
+        base_config(&runner).with_event_publisher(Arc::clone(&events) as Arc<dyn EventPublisher>),
     )
     .await
     .expect("host starts");
@@ -1653,11 +1639,11 @@ async fn events_reach_the_embedder_in_the_order_they_were_sent() {
 /// on the plugin's own side — nothing reaches the embedder to be judged.
 #[tokio::test]
 async fn publishing_an_undeclared_topic_never_reaches_the_embedder() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let events = Arc::new(RecordingEvents::default());
     let supervisor =
-        emit_supervisor(&node, &dir, Arc::clone(&events), vec!["allowed".into()]).await;
+        emit_supervisor(&runner, &dir, Arc::clone(&events), vec!["allowed".into()]).await;
 
     let answer = supervisor
         .call_service(
@@ -1681,13 +1667,13 @@ async fn publishing_an_undeclared_topic_never_reaches_the_embedder() {
 /// author nowhere; the code and message say what actually happened.
 #[tokio::test]
 async fn the_embedders_refusal_reaches_the_plugin_verbatim() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let events = Arc::new(RecordingEvents {
         deny: true,
         ..RecordingEvents::default()
     });
-    let supervisor = emit_supervisor(&node, &dir, events, vec!["session".into()]).await;
+    let supervisor = emit_supervisor(&runner, &dir, events, vec!["session".into()]).await;
 
     let answer = supervisor
         .call_service(
@@ -1712,10 +1698,10 @@ async fn the_embedders_refusal_reaches_the_plugin_verbatim() {
 /// than loading a plugin whose events would vanish.
 #[tokio::test]
 async fn declaring_a_published_topic_without_a_publisher_fails_the_load() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path(), EMIT_PLUGIN);
-    let supervisor = PluginHostSupervisor::start(base_config(&node))
+    let supervisor = PluginHostSupervisor::start(base_config(&runner))
         .await
         .expect("host starts");
 
@@ -1773,10 +1759,10 @@ fn stalling_request(root: String) -> PluginLoadRequest {
 /// `call/cancel` on the way out, and the plugin can see it arrive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_bounded_call_that_expires_cancels_what_it_gave_up_on() {
-    let Some(node) = node() else { return };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path(), STALLING_PLUGIN);
-    let supervisor = started(&node).await;
+    let supervisor = started(&runner).await;
     supervisor
         .load_plugin(&stalling_request(root))
         .await

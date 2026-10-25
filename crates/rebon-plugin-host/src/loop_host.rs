@@ -69,81 +69,10 @@ pub trait LoopHost: Send + Sync {
 }
 
 /// Boots loop hosts for a backend. One spawner per backend registration;
-/// the choice of implementation is the choice of where V8 lives.
+/// the choice of implementation is the choice of where the loop runs.
 #[async_trait]
 pub trait LoopHostSpawner: Send + Sync {
     async fn spawn(&self, spec: LoopAgentSpec) -> Result<Arc<dyn LoopHost>, String>;
-}
-
-/// Which runtime carries the plugin plane.
-///
-/// One, now that the move from an embedded V8 to an external Node is done: the
-/// Node host below is what every build runs, and there is no second runtime to
-/// opt into.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PluginRuntime {
-    /// The plugin plane: an external Node host, one plugin per entry.
-    ///
-    /// The only one. `embedded` and its compiled-in isolate are gone; the
-    /// variant survives so `kernelPlugins.runtime` in an existing config is
-    /// still a value this can parse rather than a hard error.
-    Node,
-}
-
-impl PluginRuntime {
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "node" | "plane" => Some(Self::Node),
-            _ => None,
-        }
-    }
-
-    pub fn describe(self) -> &'static str {
-        match self {
-            Self::Node => "node (the plugin plane hosts one plugin per composition entry)",
-        }
-    }
-}
-
-/// Resolves the plugin runtime: environment first, then config, then the
-/// default.
-///
-/// A ladder, not a search — `REBON_PLUGIN_RUNTIME` is an explicit demand, and
-/// an unrecognised value is a mistake worth naming rather than a reason to fall
-/// back to something the operator did not ask for.
-pub fn plugin_runtime() -> PluginRuntime {
-    if let Ok(raw) = std::env::var("REBON_PLUGIN_RUNTIME") {
-        match PluginRuntime::parse(&raw) {
-            Some(runtime) => return runtime,
-            None => tracing::warn!(
-                value = %raw,
-                "REBON_PLUGIN_RUNTIME is not `node`; ignoring it"
-            ),
-        }
-    }
-    plugin_runtime_from_config(&rebon_config::config_home_dir())
-}
-
-/// `kernelPlugins.runtime`, read without touching the process environment.
-///
-/// The default is `node` because the embedded runtime is on its way out and a
-/// default nobody exercises is a default nobody maintains. A machine with no
-/// Node does not silently fall back to V8 — it is told what to install, once,
-/// and only if it configured kernel plugins at all. See
-/// [`crate::plugin_boot::CompositionRefusal`].
-pub fn plugin_runtime_from_config(config_dir: &std::path::Path) -> PluginRuntime {
-    let Ok(raw) = std::fs::read(config_dir.join("config.json")) else {
-        return PluginRuntime::Node;
-    };
-    let Ok(config) = serde_json::from_slice::<Value>(&raw) else {
-        return PluginRuntime::Node;
-    };
-    config
-        .get("kernelPlugins")
-        .and_then(|section| section.get("runtime"))
-        .and_then(Value::as_str)
-        .and_then(PluginRuntime::parse)
-        .unwrap_or(PluginRuntime::Node)
 }
 
 /// One line for status surfaces.
@@ -153,7 +82,7 @@ pub fn plugin_runtime_from_config(config_dir: &std::path::Path) -> PluginRuntime
 /// both are gone: a loop is a set of plugins on the plane, which is the only
 /// runtime left. What the surfaces print is now a fact rather than a selection.
 pub fn describe_loop_host() -> &'static str {
-    "on the plugin plane (kernel loops run as plugins on the Node host)"
+    "on the plugin plane (kernel loops run as plugins on Verve, in rebon)"
 }
 
 /// One entry in the loop vendor roster.
@@ -208,52 +137,6 @@ pub fn loop_backend_id(vendor: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The default is the plane, including for a machine with no config at all
-    /// and for one whose config is unreadable.
-    ///
-    /// A default nobody exercises is a default nobody maintains, and the
-    /// embedded runtime is on its way out. What a machine with no Node gets is
-    /// not a silent fall back to V8 — it is told, once, and only if it
-    /// configured kernel plugins at all.
-    #[test]
-    fn the_plugin_plane_is_what_an_unconfigured_machine_runs() {
-        let directory = tempfile::tempdir().expect("a temp dir");
-        assert_eq!(
-            plugin_runtime_from_config(directory.path()),
-            PluginRuntime::Node,
-            "no config.json"
-        );
-
-        std::fs::write(directory.path().join("config.json"), b"{ not json").unwrap();
-        assert_eq!(
-            plugin_runtime_from_config(directory.path()),
-            PluginRuntime::Node,
-            "unreadable config.json"
-        );
-
-        std::fs::write(directory.path().join("config.json"), b"{}").unwrap();
-        assert_eq!(
-            plugin_runtime_from_config(directory.path()),
-            PluginRuntime::Node,
-            "no kernelPlugins section"
-        );
-
-        // A config written when there was a second runtime still parses; there
-        // is simply nothing else left for it to name.
-        for raw in [
-            r#"{"kernelPlugins":{"runtime":"node"}}"#,
-            r#"{"kernelPlugins":{"runtime":"embedded"}}"#,
-            r#"{"kernelPlugins":{"runtime":"nonsense"}}"#,
-        ] {
-            std::fs::write(directory.path().join("config.json"), raw).unwrap();
-            assert_eq!(
-                plugin_runtime_from_config(directory.path()),
-                PluginRuntime::Node,
-                "{raw}"
-            );
-        }
-    }
 
     #[test]
     fn roster_has_dsh_bundled_and_seats_for_future_vendors() {

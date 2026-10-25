@@ -8,8 +8,9 @@ Terms:
 - **Seat**: an interface point in the kernel that plugins register a
   contribution on (tools, commands, prompt sections, attachment producers);
   consumers obtain it through the kernel's `require`.
-- **Plugin plane**: the in-process host that loads external Node plugins
-  (`PluginPlane`), started by `ensure_process_composition()` and stopped by
+- **Plugin plane**: the host that loads JavaScript plugins (`PluginPlane`) on
+  Verve — an isolate in this process, and a `rebon-verve` process for a
+  contained plugin — started by `ensure_process_composition()` and stopped by
   `shutdown_process_plugin_plane()`.
 
 ## What belongs in this directory
@@ -48,7 +49,7 @@ crate as `crates/rebon-<name>/`, a Rust feature plugin as
     `model-router` seat, the llm adapters plugins contribute
     (`kernel_llm_dispatch` / `plane_model_provider`), and the OAuth token
     refresher. It changes because a provider changed.
-  - `rebon-plugin-host`: the Node plugin plane itself (`plugin_plane`), the
+  - `rebon-plugin-host`: the plugin plane itself (`plugin_plane`), the
     compositions, the manifests, the payload patches, and **when a plane
     should be started at all** (`plugin_boot`, `kernel_node_host`), the three
     pieces of the vendor loop (`loop_host` / `kernel_loop_backend` /
@@ -666,8 +667,9 @@ crate as `crates/rebon-<name>/`, a Rust feature plugin as
 
 ## Verification
 
-- The plugin-plane tests need `REBON_TEST_NODE` (Node ≥ 24.19); when running the
-  cli's full test suite, run it once more with that environment variable set.
+- The plugin-plane tests that start a process (contained hosts, Code Mode)
+  need the runner: `cargo build -p rebon-verve-host --bin rebon-verve` first,
+  or `REBON_VERVE` naming one.
   Integration binaries live where the thing they test lives:
   `kernel_code_mode_js` and `plane_fork_publishes_tool_registry` in
   `rebon-kernel-seats`, `kernel_seats_plane` in `rebon-plugin-host`, and the

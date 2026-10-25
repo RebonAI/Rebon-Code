@@ -18,7 +18,6 @@ use background::RuntimeFieldsExt;
 mod file_scanner;
 mod goal;
 mod kernel_cmd;
-mod node_cmd;
 mod oauth_drive;
 // The session runtime is a crate of its own, so these aliases keep every
 // `crate::session::…`, `crate::plugin::…`, `crate::ui_config::…` call site
@@ -421,11 +420,6 @@ enum Command {
         #[command(subcommand)]
         command: KernelCommand,
     },
-    /// Inspect or install the Node runtime the plugin plane runs on.
-    Node {
-        #[command(subcommand)]
-        command: NodeCommand,
-    },
     /// Deprecated shell for `rebon-lsp-mcp`. Removed in 0.26.
     #[command(name = "lsp-mcp", hide = true)]
     LspMcp {
@@ -658,45 +652,6 @@ enum MarketplaceCommand {
 enum KernelCommand {
     /// Show loop vendors and where they run.
     Status,
-}
-
-#[derive(Debug, Subcommand, PartialEq, Eq)]
-enum NodeCommand {
-    /// Show which Node runtime the plugin plane would use, what is installed
-    /// under the config home, and whether downloading is allowed.
-    Status,
-    /// Install a Node runtime under the config home.
-    ///
-    /// With no flags this downloads the build whose SHA-256 is compiled into
-    /// this binary. `--from-path` installs from a local archive instead, which
-    /// is also the offline and air-gapped path.
-    Install {
-        /// Install from a local `.tar.gz` / `.zip` instead of downloading.
-        #[arg(long, value_name = "ARCHIVE")]
-        from_path: Option<std::path::PathBuf>,
-        /// SHA-256 of a local archive Rebon does not pin. Requires
-        /// `--version` and `--from-path`.
-        #[arg(long, value_name = "HEX")]
-        sha256: Option<String>,
-        /// Node version a local archive contains. Requires `--sha256`.
-        #[arg(long, value_name = "X.Y.Z")]
-        version: Option<String>,
-        /// Mirror serving nodejs.org's `dist` layout. The pinned digest still
-        /// decides whether the bytes are accepted.
-        #[arg(long, value_name = "URL")]
-        dist_base: Option<String>,
-        /// Reinstall even when this version is already installed.
-        #[arg(long)]
-        force: bool,
-    },
-    /// Remove a managed Node runtime.
-    Uninstall {
-        #[arg(long, value_name = "X.Y.Z")]
-        version: Option<String>,
-        /// Remove every managed runtime.
-        #[arg(long)]
-        all: bool,
-    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -1207,7 +1162,6 @@ async fn run_headless_command(command: Command) -> anyhow::Result<()> {
             sibling_command::forward_to_sibling("computer-use", COMPUTER_USE_SIBLING, args)
         }
         Command::Kernel { command } => kernel_cmd::run(command).await,
-        Command::Node { command } => node_cmd::run(command).await,
         Command::LspMcp { args } => {
             sibling_command::forward_to_sibling("lsp-mcp", LSP_MCP_SIBLING, args)
         }

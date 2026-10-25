@@ -83,19 +83,37 @@ async fn spawn_fake_deepseek_endpoint() -> (std::net::SocketAddr, Arc<Mutex<Opti
 
 /// The Node the plane runs on, and the checkout it loads from.
 ///
-/// The composition this test boots is a real Node process now, so the test
-/// needs the same three paths every other plane test needs. It used to boot an
-/// isolate compiled into the binary and needed none of them.
-fn point_at_checkout() -> bool {
-    let Some(node) = std::env::var_os("REBON_TEST_NODE") else {
-        assert_ne!(
-            std::env::var_os("REBON_REQUIRE_TEST_NODE").as_deref(),
-            Some(std::ffi::OsStr::new("1")),
-            "REBON_REQUIRE_TEST_NODE=1 requires an absolute REBON_TEST_NODE"
-        );
-        eprintln!("skipping: set REBON_TEST_NODE to an absolute Node executable");
-        return false;
+/// The composition this test boots runs the plane's scripts from the
+/// checkout, so the test points the plane at them, and at the runner a
+/// contained host would start.
+/// The runner a contained host starts: `REBON_VERVE`, or the `rebon-verve`
+/// this target directory built (`cargo build -p rebon-verve-host --bin
+/// rebon-verve`).
+fn runner() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("REBON_VERVE") {
+        return std::path::PathBuf::from(path);
+    }
+    let exe = std::env::current_exe().expect("the test knows its own path");
+    let name = if cfg!(windows) {
+        "rebon-verve.exe"
+    } else {
+        "rebon-verve"
     };
+    let built = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("a test binary lives in target/<profile>/deps")
+        .join(name);
+    assert!(
+        built.is_file(),
+        "contained hosts need the runner: build it with \
+         `cargo build -p rebon-verve-host --bin rebon-verve`, or set REBON_VERVE"
+    );
+    built
+}
+
+fn point_at_checkout() -> bool {
+    let runner = runner();
     let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
@@ -104,7 +122,7 @@ fn point_at_checkout() -> bool {
         let text = path.to_string_lossy().replace('\\', "/");
         text.strip_prefix("//?/").unwrap_or(&text).to_owned()
     };
-    std::env::set_var("REBON_PLUGIN_NODE", node);
+    std::env::set_var("REBON_VERVE", runner);
     std::env::set_var(
         "REBON_PLUGIN_HOST_JS",
         plain(repo.join("runtimes/node/plugin-host/src/cli.mjs")),

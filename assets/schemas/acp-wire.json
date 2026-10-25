@@ -1569,24 +1569,6 @@
       ],
       "type": "object"
     },
-    "OutOfRangeRuntime": {
-      "description": "A Node that answered, but not with a version this build accepts.",
-      "properties": {
-        "executable": {
-          "description": "Where it lives.",
-          "type": "string"
-        },
-        "version": {
-          "description": "The version it reported.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "version",
-        "executable"
-      ],
-      "type": "object"
-    },
     "PermissionOption": {
       "description": "One option offered to the client when the agent asks for permission.",
       "properties": {
@@ -1757,7 +1739,7 @@
       "type": "object"
     },
     "PluginRuntimeStatus": {
-      "description": "The Node runtime under a plugin plane.",
+      "description": "The runtime under a plugin plane: Verve, inside rebon, and the runner a\ncontained plugin or a Code Mode program starts.",
       "properties": {
         "configuredPlugins": {
           "description": "How many entries `kernelPlugins` asks for. Zero is a normal state,\nnot a problem — the section is opt-in.\n\nA count, not a boolean: nothing on the page ever read it as a flag.",
@@ -1765,48 +1747,28 @@
           "minimum": 0,
           "type": "integer"
         },
-        "installable": {
-          "description": "Whether `rebon node install` could fix this here.",
-          "type": "boolean"
-        },
-        "outOfRange": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/OutOfRangeRuntime"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "A Node that was found and turned down for its version.\n\nSeparate from `problem` because it is a different situation with a\ndifferent fix."
-        },
         "problem": {
-          "description": "The resolver's own words for why nothing resolved.",
+          "description": "Why the runner was not found: contained plugins and Code Mode cannot\nrun until it is.",
           "type": [
             "string",
             "null"
           ]
         },
-        "resolved": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ResolvedRuntime"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The runtime that resolved, or `null` if none did."
+        "runner": {
+          "description": "The runner (`rebon-verve`), as a path string, or `null` when it was\nnot found beside rebon.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
-        "supported": {
-          "description": "The versions a runtime may report, as a range someone can read.",
+        "runtime": {
+          "description": "What plugins run on. Always there: it is part of rebon.",
           "type": "string"
         }
       },
       "required": [
         "configuredPlugins",
-        "supported",
-        "installable"
+        "runtime"
       ],
       "type": "object"
     },
@@ -1837,7 +1799,7 @@
         },
         "runtime": {
           "$ref": "#/$defs/PluginRuntimeStatus",
-          "description": "The Node runtime a composition would run on."
+          "description": "The runtime a composition would run on."
         },
         "skipped": {
           "description": "Entries that could not be turned into a load request, and why.\n\nA plugin that starts and is then refused at every registration is a\nworse failure than one that never starts, so each line carries its\nreason rather than only a name.",
@@ -2069,29 +2031,6 @@
       },
       "required": [
         "outcome"
-      ],
-      "type": "object"
-    },
-    "ResolvedRuntime": {
-      "description": "One resolved Node.",
-      "properties": {
-        "executable": {
-          "description": "Where it lives, as a string: the server has a path and the wire has\nno path type.",
-          "type": "string"
-        },
-        "origin": {
-          "description": "Which rung of the ladder answered: an explicit demand, a managed\ninstall, or `PATH`.",
-          "type": "string"
-        },
-        "version": {
-          "description": "The version it reported.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "version",
-        "executable",
-        "origin"
       ],
       "type": "object"
     },

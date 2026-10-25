@@ -175,7 +175,7 @@ impl PlaneLoopHost {
         );
         let plane = PluginPlane::start(
             PluginPlaneConfig {
-                node: paths.node.clone(),
+                runner: paths.runner.clone(),
                 host_script: paths.host_script.clone(),
                 loader: paths.loader.clone(),
                 compose_root: paths.compose_root.clone(),

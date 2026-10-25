@@ -52,7 +52,7 @@ it is reported to Rebon.
 | `WebSearch` tool (fallback) | `api.search.brave.com`, `html.duckduckgo.com`, or `www.bing.com` | the search query. Used only when the active provider has no server-side search |
 | MCP tools | the MCP servers you configured | whatever that server's protocol carries |
 | Hooks | wherever your hook points | whatever your hook sends |
-| `rebon node install` | `https://nodejs.org/dist` | nothing; archives are SHA-256 pinned, and a mirror base can be passed |
+| Installing a plugin published to npm | `registry.npmjs.org`, or the registry its marketplace names | the names of the packages it needs; every tarball is checked against the integrity the registry published |
 | `rebon remote` | `registry.npmjs.org` for the server tarball, then your host over ssh | the session runs on the far machine you named |
 | Image generation | the provider's image endpoint | your prompt |
 

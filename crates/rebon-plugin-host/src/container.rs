@@ -53,10 +53,10 @@ pub struct ContainerSpec {
     pub env: Vec<String>,
 }
 
-/// The Node half of a container's launch.
+/// The runner's half of a container's launch.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ContainerLaunch {
-    pub node_args: Vec<OsString>,
+    pub runner_args: Vec<OsString>,
     pub environment: Vec<(OsString, OsString)>,
     pub working_directory: PathBuf,
     /// Every directory the host reads, in the order granted.
@@ -115,7 +115,28 @@ fn unverbatim(path: &Path) -> PathBuf {
     }
 }
 
-/// Builds the Node half of a container's launch.
+/// The runner's network grant for `network`, the hosts a container may reach.
+///
+/// The runner refuses the network unless granted, so this is a second fence
+/// beside the domain proxy wherever it can say the same thing: exact hosts
+/// become `--allow-net=a,b`. `*`, or a pattern the runner's exact-host rules
+/// cannot express, grants it the network and leaves the line to the proxy, as
+/// Node — which never fenced the network itself — always did. Nothing granted
+/// is no flag at all: refused twice.
+fn allow_net(network: &[String]) -> Option<OsString> {
+    if network.is_empty() {
+        return None;
+    }
+    if network
+        .iter()
+        .any(|host| host == "*" || host.contains('*') || host.starts_with('.'))
+    {
+        return Some("--allow-net".into());
+    }
+    Some(format!("--allow-net={}", network.join(",")).into())
+}
+
+/// Builds the runner's half of a container's launch.
 ///
 /// `parent_env` reads rebon's own environment; nothing from it reaches the
 /// host unless it is in the baseline, the runtime's own list or the spec's
@@ -146,11 +167,14 @@ pub fn container_launch(
     }
     grant(data.clone());
 
-    let mut node_args: Vec<OsString> = vec!["--permission".into()];
+    let mut runner_args: Vec<OsString> = vec!["--permission".into()];
     for path in &read {
-        node_args.push(flag("--allow-fs-read=", path));
+        runner_args.push(flag("--allow-fs-read=", path));
     }
-    node_args.push(flag("--allow-fs-write=", &data));
+    runner_args.push(flag("--allow-fs-write=", &data));
+    if let Some(net) = allow_net(&spec.network) {
+        runner_args.push(net);
+    }
 
     let mut environment: Vec<(OsString, OsString)> = Vec::new();
     let mut set = |key: &str, value: OsString| {
@@ -187,9 +211,9 @@ pub fn container_launch(
     for (key, value) in confinement_env {
         set(&key.to_string_lossy(), value.clone());
     }
-    // Node's own `fetch` ignores the proxy variables unless told — and a
-    // container granted nothing has a proxy too, one that refuses everything,
-    // so the flag follows the proxy rather than the grant.
+    // The runner's `fetch` ignores the proxy variables unless told, as
+    // Node's does — and a container granted nothing has a proxy too, one that
+    // refuses everything, so the flag follows the proxy rather than the grant.
     let proxied = confinement_env.iter().any(|(key, _)| {
         key.eq_ignore_ascii_case("https_proxy") || key.eq_ignore_ascii_case("http_proxy")
     });
@@ -198,7 +222,7 @@ pub fn container_launch(
     }
 
     ContainerLaunch {
-        node_args,
+        runner_args,
         environment,
         working_directory: data,
         read,
@@ -343,7 +367,7 @@ mod tests {
     fn the_host_reads_the_runtime_the_package_and_its_data_and_writes_only_its_data() {
         let launch = launch(&spec(), &[]);
         let args: Vec<String> = launch
-            .node_args
+            .runner_args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
@@ -376,6 +400,33 @@ mod tests {
     }
 
     #[test]
+    fn the_network_grant_is_the_runners_too_where_it_can_say_it() {
+        let net = |hosts: &[&str]| {
+            let spec = ContainerSpec {
+                network: hosts.iter().map(|h| h.to_string()).collect(),
+                ..spec()
+            };
+            launch(&spec, &[])
+                .runner_args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .filter(|a| a.starts_with("--allow-net"))
+                .collect::<Vec<_>>()
+        };
+        assert!(net(&[]).is_empty(), "nothing granted, nothing allowed");
+        assert_eq!(
+            net(&["api.exa.ai", "example.com"]),
+            ["--allow-net=api.exa.ai,example.com"]
+        );
+        assert_eq!(net(&["*"]), ["--allow-net"]);
+        assert_eq!(
+            net(&["*.example.com"]),
+            ["--allow-net"],
+            "the proxy holds patterns"
+        );
+    }
+
+    #[test]
     fn a_package_reached_through_a_link_is_granted_where_it_really_is() {
         let dir = tempfile::tempdir().unwrap();
         let package = dir.path().join("pkg");
@@ -403,7 +454,7 @@ mod tests {
                 .any(|part| part == std::path::Component::ParentDir)
         }));
         assert!(launch
-            .node_args
+            .runner_args
             .contains(&flag("--allow-fs-write=", &real_data)));
         assert_eq!(launch.working_directory, real_data);
         // Not there yet: kept as given.

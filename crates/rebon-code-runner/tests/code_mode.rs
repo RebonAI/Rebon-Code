@@ -1,11 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
 use rebon_code_runner::{
-    active_code_executions, run_code_program, run_code_program_with_runtime, CodeNodeRuntime,
+    active_code_executions, run_code_program, run_code_program_with_runtime, CodeRuntime,
     CodeToolDispatcher,
 };
 use serde_json::{json, Value};
@@ -54,14 +54,34 @@ impl CodeToolDispatcher for ProbeDispatcher {
     }
 }
 
-fn runtime() -> CodeNodeRuntime {
-    let output = std::process::Command::new("node")
-        .args(["-p", "process.execPath"])
-        .output()
-        .expect("Node is required for Code Mode tests");
-    assert!(output.status.success());
-    let path = String::from_utf8(output.stdout).unwrap().trim().to_string();
-    CodeNodeRuntime::new(PathBuf::from(path)).unwrap()
+/// The runner these tests run a real execution unit on: `REBON_VERVE`, or
+/// the `rebon-verve` built into this target directory
+/// (`cargo build -p rebon-verve-host --bin rebon-verve`).
+fn test_runner() -> PathBuf {
+    if let Some(path) = std::env::var_os("REBON_VERVE") {
+        return PathBuf::from(path);
+    }
+    let exe = std::env::current_exe().expect("the test knows its own path");
+    let name = if cfg!(windows) {
+        "rebon-verve.exe"
+    } else {
+        "rebon-verve"
+    };
+    let built = exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("a test binary lives in target/<profile>/deps")
+        .join(name);
+    assert!(
+        built.is_file(),
+        "Code Mode tests need the runner: build it with \
+         `cargo build -p rebon-verve-host --bin rebon-verve`, or set REBON_VERVE"
+    );
+    built
+}
+
+fn runtime() -> CodeRuntime {
+    CodeRuntime::new(test_runner()).unwrap()
 }
 
 fn helper_failure(request: &[u8]) -> Value {
@@ -159,8 +179,8 @@ return { sum: values[0] + values[1] };
 async fn launcher_runtime_contract_drives_production_discovery() {
     let _guard = test_lock().lock().await;
     let node = runtime();
-    let previous = std::env::var_os("REBON_CODE_MODE_NODE");
-    std::env::set_var("REBON_CODE_MODE_NODE", node.executable());
+    let previous = std::env::var_os("REBON_VERVE");
+    std::env::set_var("REBON_VERVE", node.executable());
     let outcome = run_code_program(
         "return 42;".into(),
         Arc::new(ProbeDispatcher::default()),
@@ -168,8 +188,8 @@ async fn launcher_runtime_contract_drives_production_discovery() {
     )
     .await;
     match previous {
-        Some(value) => std::env::set_var("REBON_CODE_MODE_NODE", value),
-        None => std::env::remove_var("REBON_CODE_MODE_NODE"),
+        Some(value) => std::env::set_var("REBON_VERVE", value),
+        None => std::env::remove_var("REBON_VERVE"),
     }
     assert_eq!(outcome.unwrap().result, Some(json!(42)));
 }
@@ -463,22 +483,12 @@ async fn timeouts_never_resolving_promises_and_cancellation_reap_without_leaks()
     }
 }
 
-/// The hardened flag set is checked against the runtime that will run the
-/// program, not against a version table.
-///
-/// Node renamed the permission flag when the model went stable, and a hard-coded
-/// spelling meant every Code Mode process died at `bad option` on Node 24 — the
-/// version rebon pins and installs — while the suite stayed green because it
-/// takes whichever Node is on `PATH`.
+/// The hardened flag set is checked against the runner that will run the
+/// program, and is in force there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_runtime_is_probed_for_the_flag_set_it_will_be_run_with() {
     let _guard = test_lock().lock().await;
     let node = runtime();
-    assert!(
-        ["--permission", "--experimental-permission"].contains(&node.permission_flag()),
-        "unexpected permission flag {}",
-        node.permission_flag()
-    );
 
     // The flag set the probe accepted is the set a program actually runs under,
     // which is what a probe-only test misses: that one never failed on the
@@ -498,7 +508,7 @@ async fn the_runtime_is_probed_for_the_flag_set_it_will_be_run_with() {
     // containment asserted elsewhere — so the permission model is checked from
     // outside, on the same runtime with the same flag, where `require` exists.
     let denied = std::process::Command::new(node.executable())
-        .args([node.permission_flag(), "-e"])
+        .args(["--permission", "-e"])
         .arg(
             "try { require('node:fs').readFileSync(process.argv[0]); console.log('READ'); } \
              catch (error) { console.log(error.code ?? 'THREW'); }",
@@ -508,8 +518,7 @@ async fn the_runtime_is_probed_for_the_flag_set_it_will_be_run_with() {
     assert_eq!(
         String::from_utf8_lossy(&denied.stdout).trim(),
         "ERR_ACCESS_DENIED",
-        "the permission model is not in force under {}",
-        node.permission_flag()
+        "the permission model is not in force under --permission"
     );
 }
 
@@ -524,7 +533,7 @@ async fn the_runtime_is_probed_for_the_flag_set_it_will_be_run_with() {
 async fn a_runtime_that_rejects_the_hardening_flags_is_refused_not_used_unsandboxed() {
     let _guard = test_lock().lock().await;
     let not_node = std::env::current_exe().expect("the test binary exists");
-    let error = CodeNodeRuntime::new(not_node).expect_err("an unhardenable runtime is refused");
+    let error = CodeRuntime::new(not_node).expect_err("an unhardenable runtime is refused");
     assert!(
         error
             .message
@@ -533,8 +542,7 @@ async fn a_runtime_that_rejects_the_hardening_flags_is_refused_not_used_unsandbo
         error.message
     );
     assert!(
-        error.message.contains("--permission")
-            && error.message.contains("--experimental-permission"),
+        error.message.contains("--permission"),
         "the refusal names what it tried: {}",
         error.message
     );

@@ -15,10 +15,31 @@ use std::{
 };
 
 use rebon_plugin_protocol::{Payload, PluginLoadRequest};
-use rebon_plugin_supervisor::{HostConfig, PluginHostSupervisor};
+use rebon_plugin_supervisor::{HostConfig, HostEngine, PluginHostSupervisor};
 
-fn node() -> Option<PathBuf> {
-    env::var_os("REBON_TEST_NODE").map(PathBuf::from)
+/// The runner a process host starts: `REBON_VERVE`, or the `rebon-verve` this
+/// target directory built (`cargo build -p rebon-verve-host --bin rebon-verve`).
+fn runner() -> PathBuf {
+    if let Some(path) = env::var_os("REBON_VERVE") {
+        return PathBuf::from(path);
+    }
+    let exe = env::current_exe().expect("the test knows its own path");
+    let name = if cfg!(windows) {
+        "rebon-verve.exe"
+    } else {
+        "rebon-verve"
+    };
+    let built = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("a test binary lives in target/<profile>/deps")
+        .join(name);
+    assert!(
+        built.is_file(),
+        "process hosts need the runner: build it with \
+         `cargo build -p rebon-verve-host --bin rebon-verve`, or set REBON_VERVE"
+    );
+    built
 }
 
 fn real_host() -> PathBuf {
@@ -64,11 +85,13 @@ fn load_request(root: String) -> PluginLoadRequest {
 
 /// A host with the plugin loaded and a scope open, plus the package root so a
 /// test can load it again.
-async fn loaded(node: &std::path::Path) -> (Arc<PluginHostSupervisor>, String, tempfile::TempDir) {
+async fn loaded(
+    runner: &std::path::Path,
+) -> (Arc<PluginHostSupervisor>, String, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let root = package(dir.path());
     let supervisor = PluginHostSupervisor::start(
-        HostConfig::new(node, real_host())
+        HostConfig::new(runner, real_host())
             .with_startup_timeout(Duration::from_secs(20))
             .with_working_directory(env::temp_dir()),
     )
@@ -107,11 +130,8 @@ async fn slow_call_in_flight(
 /// Nothing running: the wait is over before it starts.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_quiet_unload_needs_no_wait() {
-    let Some(node) = node() else {
-        eprintln!("skipping: set REBON_TEST_NODE");
-        return;
-    };
-    let (supervisor, _, _dir) = loaded(&node).await;
+    let runner = PathBuf::new();
+    let (supervisor, _, _dir) = loaded(&runner).await;
     supervisor.unload_plugin(ID).await.unwrap();
 
     let started = Instant::now();
@@ -127,11 +147,8 @@ async fn a_quiet_unload_needs_no_wait() {
 /// and the call still gets the answer of the run it was made to.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_wait_ends_when_the_last_call_does() {
-    let Some(node) = node() else {
-        eprintln!("skipping: set REBON_TEST_NODE");
-        return;
-    };
-    let (supervisor, root, _dir) = loaded(&node).await;
+    let runner = PathBuf::new();
+    let (supervisor, root, _dir) = loaded(&runner).await;
     let call = slow_call_in_flight(&supervisor).await;
 
     let report = supervisor.unload_plugin(ID).await.unwrap();
@@ -160,11 +177,8 @@ async fn the_wait_ends_when_the_last_call_does() {
 /// running, the plugin stays draining, and a later wait still sees it finish.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_deadline_reports_what_is_still_running() {
-    let Some(node) = node() else {
-        eprintln!("skipping: set REBON_TEST_NODE");
-        return;
-    };
-    let (supervisor, root, _dir) = loaded(&node).await;
+    let runner = PathBuf::new();
+    let (supervisor, root, _dir) = loaded(&runner).await;
     let call = slow_call_in_flight(&supervisor).await;
     supervisor.unload_plugin(ID).await.unwrap();
 
@@ -189,11 +203,8 @@ async fn a_deadline_reports_what_is_still_running() {
 /// A dead host runs nothing, so a drain waiting on it is over.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_host_dying_ends_the_wait() {
-    let Some(node) = node() else {
-        eprintln!("skipping: set REBON_TEST_NODE");
-        return;
-    };
-    let (supervisor, _, _dir) = loaded(&node).await;
+    let runner = PathBuf::new();
+    let (supervisor, _, _dir) = loaded(&runner).await;
     let _call = slow_call_in_flight(&supervisor).await;
     supervisor.unload_plugin(ID).await.unwrap();
 
@@ -217,11 +228,8 @@ async fn the_host_dying_ends_the_wait() {
 /// counts. The wait sees the caller walking away, not only the host finishing.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unread_stream_holds_the_drain_until_dropped() {
-    let Some(node) = node() else {
-        eprintln!("skipping: set REBON_TEST_NODE");
-        return;
-    };
-    let (supervisor, _, _dir) = loaded(&node).await;
+    let runner = PathBuf::new();
+    let (supervisor, _, _dir) = loaded(&runner).await;
     let stream = supervisor
         .call_service_streaming(
             ID,
@@ -254,11 +262,8 @@ async fn an_unread_stream_holds_the_drain_until_dropped() {
 /// unloaded. Neither is a drain, so neither may block.
 #[tokio::test(flavor = "multi_thread")]
 async fn there_is_no_drain_to_wait_for() {
-    let Some(node) = node() else {
-        eprintln!("skipping: set REBON_TEST_NODE");
-        return;
-    };
-    let (supervisor, _, _dir) = loaded(&node).await;
+    let runner = PathBuf::new();
+    let (supervisor, _, _dir) = loaded(&runner).await;
 
     assert_eq!(
         supervisor
@@ -307,15 +312,17 @@ await import(pathToFileURL(REAL).href);
 }
 
 async fn deaf(
-    node: &std::path::Path,
+    runner: &std::path::Path,
     dir: &std::path::Path,
     methods: &[&str],
     shutdown_timeout: Duration,
 ) -> Arc<PluginHostSupervisor> {
-    let mut config = HostConfig::new(node, deaf_host(dir, methods))
+    let mut config = HostConfig::new(runner, deaf_host(dir, methods))
+        .with_engine(HostEngine::Process)
         .with_startup_timeout(Duration::from_secs(20))
         .with_working_directory(env::temp_dir());
     config.shutdown_timeout = shutdown_timeout;
+    config.runner_args = vec!["--allow-all".into()];
     let supervisor = PluginHostSupervisor::start(config)
         .await
         .expect("the host starts");
@@ -336,13 +343,10 @@ async fn deaf(
 /// error is reported after — not instead of — the reaping.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unanswered_shutdown_is_bounded_and_still_reaps() {
-    let Some(node) = node() else {
-        eprintln!("skipping: set REBON_TEST_NODE");
-        return;
-    };
+    let runner = runner();
     let dir = tempfile::tempdir().unwrap();
     let supervisor = deaf(
-        &node,
+        &runner,
         dir.path(),
         &["platform/shutdown"],
         Duration::from_millis(500),
@@ -366,11 +370,8 @@ async fn an_unanswered_shutdown_is_bounded_and_still_reaps() {
 /// was running is answered with that.
 #[tokio::test(flavor = "multi_thread")]
 async fn terminate_ends_the_host_and_answers_what_it_owed() {
-    let Some(node) = node() else {
-        eprintln!("skipping: set REBON_TEST_NODE");
-        return;
-    };
-    let (supervisor, _, _dir) = loaded(&node).await;
+    let runner = PathBuf::new();
+    let (supervisor, _, _dir) = loaded(&runner).await;
     let call = slow_call_in_flight(&supervisor).await;
 
     let started = Instant::now();
@@ -396,13 +397,10 @@ async fn terminate_ends_the_host_and_answers_what_it_owed() {
 /// plugin while the caller decides what to do about its host.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unanswered_unload_is_bounded_and_this_side_still_drains() {
-    let Some(node) = node() else {
-        eprintln!("skipping: set REBON_TEST_NODE");
-        return;
-    };
+    let runner = runner();
     let dir = tempfile::tempdir().unwrap();
     let supervisor = deaf(
-        &node,
+        &runner,
         dir.path(),
         &["plugin/unload"],
         Duration::from_secs(2),

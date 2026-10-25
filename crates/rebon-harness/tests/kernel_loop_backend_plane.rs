@@ -10,7 +10,9 @@
 //! proved. The backend is runtime-agnostic — it holds a spawner — so moving it
 //! to the plane is the whole change.
 //!
-//! Skips without `REBON_TEST_NODE`.
+//! Contained hosts need the runner built (`cargo build -p rebon-verve-host
+//! --bin rebon-verve`) or named by `REBON_VERVE`; the plane's own host runs
+//! in this process.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -30,29 +32,40 @@ use rebon_types::{
     ContentBlock, SessionUpdate, SessionUpdateParams, StopReason, TextContent, ToolCallStatus,
 };
 
-fn node() -> Option<PathBuf> {
-    match std::env::var_os("REBON_TEST_NODE") {
-        Some(node) => Some(PathBuf::from(node)),
-        None => {
-            assert_ne!(
-                std::env::var_os("REBON_REQUIRE_TEST_NODE").as_deref(),
-                Some(std::ffi::OsStr::new("1")),
-                "REBON_REQUIRE_TEST_NODE=1 requires an absolute REBON_TEST_NODE"
-            );
-            eprintln!("skipping: set REBON_TEST_NODE to an absolute Node executable");
-            None
-        }
+/// The runner a contained host starts: `REBON_VERVE`, or the `rebon-verve`
+/// this target directory built (`cargo build -p rebon-verve-host --bin
+/// rebon-verve`). The plane's own host runs in this process and needs none.
+fn runner() -> PathBuf {
+    if let Some(path) = std::env::var_os("REBON_VERVE") {
+        return PathBuf::from(path);
     }
+    let exe = std::env::current_exe().expect("the test knows its own path");
+    let name = if cfg!(windows) {
+        "rebon-verve.exe"
+    } else {
+        "rebon-verve"
+    };
+    let built = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("a test binary lives in target/<profile>/deps")
+        .join(name);
+    assert!(
+        built.is_file(),
+        "contained hosts need the runner: build it with \
+         `cargo build -p rebon-verve-host --bin rebon-verve`, or set REBON_VERVE"
+    );
+    built
 }
 
 /// Points the plane at this checkout, and hands it the Node the test runs with.
 /// Process-global, so this test runs alone.
-fn point_at_checkout(node: &std::path::Path) {
+fn point_at_checkout(runner: &std::path::Path) {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .expect("the repository root resolves");
-    std::env::set_var("REBON_PLUGIN_NODE", node);
+    std::env::set_var("REBON_VERVE", runner);
     std::env::set_var(
         "REBON_PLUGIN_HOST_JS",
         plain_path(&repo.join("runtimes/node/plugin-host/src/cli.mjs")),
@@ -187,8 +200,8 @@ impl TurnJournal for RecordingJournal {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_backend_runs_a_switched_session_turn_end_to_end() {
-    let Some(node) = node() else { return };
-    point_at_checkout(&node);
+    let runner = runner();
+    point_at_checkout(&runner);
 
     let workspace = tempfile::tempdir().expect("workspace dir");
     let probe_file = workspace.path().join("loop-probe.txt");

@@ -2,7 +2,7 @@
 //!
 //! What this pins is a cost, not a message. `ensure_plane` used to clear the
 //! standing refusal at the top of every attempt, so each caller that wanted a
-//! plane on an unusable machine started another Node: one selected-but-broken
+//! plane on an unusable machine started another host: one selected-but-broken
 //! provider turned into a string of full boot attempts, each paying the
 //! startup cost again and each leaving a host behind. On a real machine that
 //! reads as rebon hanging for minutes at startup.
@@ -12,13 +12,13 @@
 
 use std::time::{Duration, Instant};
 
-/// A Node that cannot be a Node, so the boot fails for a reason that needs no
-/// network, no fixture and no waiting.
+/// A host script that cannot be a host, so the boot fails for a reason that
+/// needs no network, no fixture and no waiting.
 fn point_at_a_dead_end() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp dir");
-    let fake = dir.path().join("not-node.exe");
-    std::fs::write(&fake, b"this is not an executable").expect("fake node written");
-    std::env::set_var("REBON_PLUGIN_NODE", &fake);
+    let fake = dir.path().join("cli.mjs");
+    std::fs::write(&fake, b"this is not a host {").expect("fake host written");
+    std::env::set_var("REBON_PLUGIN_HOST_JS", &fake);
     std::env::set_var("REBON_CONFIG_DIR", dir.path());
     dir
 }
@@ -34,7 +34,7 @@ async fn a_failed_plane_boot_is_not_retried_by_the_next_caller() {
         )
         .await
         .is_none(),
-        "a plane cannot start on a Node that is not one"
+        "a plane cannot start on a host that is not one"
     );
     let after_first = rebon_plugin_host::plugin_boot::plane_boot_attempts();
     assert_eq!(
@@ -74,6 +74,6 @@ async fn a_failed_plane_boot_is_not_retried_by_the_next_caller() {
         started.elapsed()
     );
 
-    std::env::remove_var("REBON_PLUGIN_NODE");
+    std::env::remove_var("REBON_PLUGIN_HOST_JS");
     std::env::remove_var("REBON_CONFIG_DIR");
 }

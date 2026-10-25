@@ -59,58 +59,6 @@ pub fn run_trust_dialog(cwd: &str) -> anyhow::Result<TrustDialogAction> {
     })
 }
 
-/// What to do about kernel plugins with no runtime to run them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeRuntimeAction {
-    /// Install the pinned build now, then continue into the session.
-    Install,
-    /// Start without kernel plugins. The configuration still asks for them, so
-    /// this is not remembered — nothing has been settled, only postponed.
-    Continue,
-}
-
-/// Offer the one command that fixes a missing plugin runtime, at the moment it
-/// is missing.
-///
-/// Rebon does not fetch a runtime on its own — that decision is the user's, and
-/// this is where they get to make it without first having to find out that
-/// `rebon node install` exists. `kernelPlugins` is opt-in, so this can only ever
-/// appear to someone who wrote the section and therefore already wants it.
-pub fn run_node_runtime_dialog(
-    entries: usize,
-    reason: &str,
-    version: &str,
-) -> anyhow::Result<NodeRuntimeAction> {
-    let options = vec![
-        format!("Install Node {version} now"),
-        "Start without kernel plugins".to_string(),
-    ];
-    let plural = if entries == 1 { "" } else { "s" };
-    let body = vec![
-        format!("> {entries} kernel plugin{plural} configured, and no Node runtime to run them"),
-        String::new(),
-        format!("Reason: {reason}"),
-        String::new(),
-        format!(
-            "Rebon can install Node {version} under ~/.rebon. It accepts only bytes \
-             matching a checksum built into this binary."
-        ),
-        "Already have a Node you want used? Set REBON_PLUGIN_NODE to it and restart.".to_string(),
-    ];
-    let selected = run_select_dialog(
-        "Kernel plugin runtime",
-        DialogColor::Warning,
-        &body,
-        &options,
-        Some("Enter to choose · Esc to start without".to_string()),
-        1, // cancel_index = start without
-    )?;
-    Ok(match selected {
-        0 => NodeRuntimeAction::Install,
-        _ => NodeRuntimeAction::Continue,
-    })
-}
-
 pub fn run_invalid_config_dialog(
     failure: &ConfigParseFailure,
 ) -> anyhow::Result<InvalidConfigAction> {

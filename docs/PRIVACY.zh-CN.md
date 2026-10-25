@@ -45,7 +45,7 @@ npm 那边能知道的：你的 IP，以及有人请求了 `@rebon/cli` 的公�
 | `WebSearch` 工具（回退路径） | `api.search.brave.com`、`html.duckduckgo.com` 或 `www.bing.com` | 搜索词。仅在当前 provider 没有服务端搜索能力时启用 |
 | MCP 工具 | 你自己配置的 MCP server | 取决于该 server 的协议 |
 | Hooks | 你的 hook 指向的地方 | 你的 hook 自己发的内容 |
-| `rebon node install` | `https://nodejs.org/dist` | 什么都不带；归档有 SHA-256 校验，也可以传入镜像地址 |
+| 安装发布在 npm 上的插件 | `registry.npmjs.org`，或者插件市场指定的 registry | 需要的包名；每个 tarball 都按 registry 公布的 integrity 校验 |
 | `rebon remote` | 先从 `registry.npmjs.org` 取服务端 tarball，然后 ssh 到你指定的机器 | 会话跑在你指名的那台远端机器上 |
 | 图像生成 | provider 的图像接口 | 你的提示词 |
 

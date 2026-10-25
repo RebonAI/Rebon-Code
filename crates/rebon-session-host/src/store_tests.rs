@@ -45,6 +45,20 @@ fn store() -> (tempfile::TempDir, BackgroundStore) {
 
 /// Both spellings of every kind, and `None` for anything else — the caller
 /// decides what an unknown kind means, so the table must not guess one.
+/// A state file written by a release that recorded the worker's Node runtime
+/// still reads: the field is gone, and serde passes over it.
+#[test]
+fn a_job_that_recorded_a_node_runtime_still_deserializes() {
+    let state = BackgroundJobState::new("prompt".into(), ".".into(), runtime(), None);
+    let mut encoded = serde_json::to_value(state).unwrap();
+    encoded
+        .as_object_mut()
+        .unwrap()
+        .insert("nodeRuntimePath".into(), "/opt/node/bin/node".into());
+    let decoded: BackgroundJobState = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded.prompt(), "prompt");
+}
+
 #[test]
 fn permission_option_kinds_read_both_spellings_and_nothing_else() {
     use rebon_proto::PermissionOptionKind as Kind;
@@ -213,50 +227,6 @@ fn legacy_jobs_without_a_process_path_still_deserialize() {
     let decoded: BackgroundJobState = serde_json::from_value(encoded).unwrap();
 
     assert_eq!(decoded.process.process_path, None);
-}
-
-/// The creating process is the one that knows which Node runtime was
-/// vetted; the worker that runs the session is a different process.
-#[test]
-fn new_jobs_capture_the_resolved_node_runtime() {
-    let state = BackgroundJobState::new("prompt".into(), ".".into(), runtime(), None);
-
-    assert_eq!(
-        state.process.node_runtime_path,
-        std::env::var(rebon_node_runtime::NODE_EXECUTABLE_ENV)
-            .ok()
-            .filter(|path| !path.is_empty())
-    );
-}
-
-#[test]
-fn legacy_jobs_without_a_node_runtime_still_deserialize() {
-    let state = BackgroundJobState::new("prompt".into(), ".".into(), runtime(), None);
-    let mut encoded = serde_json::to_value(state).unwrap();
-    encoded.as_object_mut().unwrap().remove("nodeRuntimePath");
-
-    let decoded: BackgroundJobState = serde_json::from_value(encoded).unwrap();
-
-    assert_eq!(decoded.process.node_runtime_path, None);
-}
-
-/// The field is round-tripped under the camelCase name the rest of the
-/// state file uses, and is omitted entirely when there is nothing to say.
-#[test]
-fn a_recorded_node_runtime_round_trips_and_an_absent_one_is_not_written() {
-    let mut state = BackgroundJobState::new("prompt".into(), ".".into(), runtime(), None);
-    state.process.node_runtime_path = Some("/opt/node/bin/node".into());
-    let encoded = serde_json::to_value(&state).unwrap();
-    assert_eq!(encoded["nodeRuntimePath"], "/opt/node/bin/node");
-    let decoded: BackgroundJobState = serde_json::from_value(encoded).unwrap();
-    assert_eq!(
-        decoded.process.node_runtime_path.as_deref(),
-        Some("/opt/node/bin/node")
-    );
-
-    state.process.node_runtime_path = None;
-    let encoded = serde_json::to_value(&state).unwrap();
-    assert!(encoded.get("nodeRuntimePath").is_none());
 }
 
 #[test]

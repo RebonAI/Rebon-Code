@@ -926,8 +926,9 @@ fn git_clone(
     Ok(())
 }
 
-/// `npm pack` of the package into `scratch`, unpacked: install scripts never
-/// run.
+/// The npm package's published tarball, fetched into `scratch` and unpacked,
+/// as `npm pack` and an unpack did — by Verve's installer, so no npm, and no
+/// install script ever runs.
 fn npm_pack(
     package: &str,
     version: Option<&str>,
@@ -938,23 +939,22 @@ fn npm_pack(
         Some(version) if !package.starts_with("https://") => format!("{package}@{version}"),
         _ => package.to_owned(),
     };
-    let packs = scratch.join("pack");
-    std::fs::create_dir_all(&packs)?;
-    let mut pack = Command::new(if cfg!(windows) { "npm.cmd" } else { "npm" });
-    pack.args(["pack", "--silent", "--ignore-scripts", "--pack-destination"])
-        .arg(&packs)
-        .arg(&spec);
+    let mut options = verve::npm::InstallOptions::default();
     if let Some(registry) = registry {
-        pack.arg("--registry").arg(registry);
+        // A registry is a folder of packages: npm reads one without its
+        // trailing slash the same as with it.
+        let registry = if registry.ends_with('/') {
+            registry.to_owned()
+        } else {
+            format!("{registry}/")
+        };
+        options.registry = verve::npm::Url::parse(&registry)
+            .with_context(|| format!("{registry} is not a registry URL"))?;
     }
-    run(&mut pack, &format!("npm pack {spec}"))?;
-    let tarball = std::fs::read_dir(&packs)?
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "tgz"))
-        .ok_or_else(|| anyhow!("npm pack {spec} left no tarball"))?;
+    let packed = verve::npm::pack(&spec, &options, &scratch.join("pack"))
+        .map_err(|error| anyhow!("fetching {spec} from npm: {error}"))?;
     unpack_archive_folder(
-        &tarball,
+        &packed.tarball,
         &scratch.join("unpacked"),
         PackageLimits::default(),
     )

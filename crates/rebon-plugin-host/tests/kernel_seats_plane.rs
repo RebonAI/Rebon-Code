@@ -13,7 +13,7 @@
 //! JSON plane the old fixtures called through `callService`. So the port is the
 //! same requests from a different process.
 //!
-//! Skips without `REBON_TEST_NODE`. Run serially: these share one kernel and the
+//! Run serially: these share one kernel and the
 //! process-wide registration slots.
 
 use std::future::Future;
@@ -32,21 +32,6 @@ use rebon_plugin_supervisor::{
 };
 use rebon_provider::kernel_model_router::ModelRouterPlugin;
 use serde_json::Value;
-
-fn node() -> Option<PathBuf> {
-    match std::env::var_os("REBON_TEST_NODE") {
-        Some(node) => Some(PathBuf::from(node)),
-        None => {
-            assert_ne!(
-                std::env::var_os("REBON_REQUIRE_TEST_NODE").as_deref(),
-                Some(std::ffi::OsStr::new("1")),
-                "REBON_REQUIRE_TEST_NODE=1 requires an absolute REBON_TEST_NODE"
-            );
-            eprintln!("skipping: set REBON_TEST_NODE to an absolute Node executable");
-            None
-        }
-    }
-}
 
 fn host_script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtimes/node/plugin-host/src/cli.mjs")
@@ -99,7 +84,7 @@ async fn probe(
     .expect("manifest written");
 
     let supervisor = PluginHostSupervisor::start(
-        HostConfig::new(node().expect("checked by the caller"), host_script())
+        HostConfig::new(PathBuf::new(), host_script())
             .with_startup_timeout(Duration::from_secs(20))
             .with_working_directory(std::env::temp_dir())
             .with_seat_dispatcher(
@@ -175,11 +160,16 @@ const CONFIG: &str = r#"{
     ]
 }"#;
 
+/// These tests share one process kernel and process-wide slots, so they take
+/// turns however the harness runs them.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Settings hands out connection facts without secrets; credentials stays shut
 /// until the host authorizer opens it, and only for what it opened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn settings_strips_secrets_and_credentials_stay_fail_closed() {
-    let Some(_node) = node() else { return };
+    let _serial = SERIAL.lock().await;
+
     let config = tempfile::tempdir().expect("tempdir");
     std::fs::write(config.path().join("config.json"), CONFIG).expect("config written");
 
@@ -250,7 +240,8 @@ export function activate(plugin) {
 /// serve is refused where it is asked for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_registered_route_reaches_the_router_without_displacing_a_builtin() {
-    let Some(_node) = node() else { return };
+    let _serial = SERIAL.lock().await;
+
     let kernel = Kernel::new();
     kernel
         .load(vec![Box::new(ModelRouterPlugin)])
@@ -332,7 +323,8 @@ export function activate(plugin) {
 /// plugin makes comes back as a derived message beside the ones already there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_session_seat_appends_to_and_derives_from_the_real_transcript() {
-    let Some(_node) = node() else { return };
+    let _serial = SERIAL.lock().await;
+
     let kernel = Kernel::new();
     let session_ctx = kernel.context().fork_scoped("session/seat-plane");
     let projects = tempfile::tempdir().expect("tempdir");

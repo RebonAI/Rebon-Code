@@ -7,13 +7,15 @@
 //!
 //! 1. the package is slimmed to what runs — its own dependencies, plus the
 //!    peers rebon does not answer itself (`provided-modules.json` lists the
-//!    ones it does) — and npm installs that, with no scripts, no dev tree and
-//!    no peer chains (those are DSH's own engine, which rebon replaces);
-//! 2. the package is *probed*: mounted once against rebon's seats in a Node
-//!    under the permission model (its own files readable, nothing writable,
-//!    no processes) with a sink that records every registration. A package
-//!    needing a service rebon does not offer, or an API rebon's seams do not
-//!    have, fails here, with that named — before anything is installed;
+//!    ones it does) — and Verve's installer (`verve::npm`) installs that,
+//!    with no scripts, no dev tree and no peer chains (those are DSH's own
+//!    engine, which rebon replaces);
+//! 2. the package is *probed*: mounted once against rebon's seats in a
+//!    `rebon-verve` process under the permission model (its own files
+//!    readable, nothing writable, no processes) with a sink that records
+//!    every registration. A package needing a service rebon does not offer,
+//!    or an API rebon's seams do not have, fails here, with that named —
+//!    before anything is installed;
 //! 3. what it registered becomes the ceiling in `rebon-plugin.json`, and the
 //!    hosts and variables its code names become its container request, both
 //!    shown to the person at install.
@@ -25,7 +27,9 @@
 //! and there is no container to grant.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Context};
@@ -356,14 +360,6 @@ fn package_sources(root: &Path) -> Vec<String> {
     out
 }
 
-fn npm_beside(node: &Path) -> PathBuf {
-    let name = if cfg!(windows) { "npm.cmd" } else { "npm" };
-    node.parent()
-        .map(|dir| dir.join(name))
-        .filter(|path| path.is_file())
-        .unwrap_or_else(|| PathBuf::from(name))
-}
-
 /// Makes the npm package in `dir` a rebon package, in place.
 ///
 /// `config` is the composition config a package cannot start without, when
@@ -372,15 +368,15 @@ fn npm_beside(node: &Path) -> PathBuf {
 pub fn adapt(dir: &Path, config: Option<&Value>) -> anyhow::Result<Adapted> {
     let scripts =
         rebon_plugin_host::plugin_boot::plane_scripts().map_err(|error| anyhow!(error))?;
-    let node = rebon_plugin_host::plugin_boot::resolve_node().map_err(|error| anyhow!(error))?;
-    adapt_with(dir, config, &node, &scripts.compose_root)
+    let runner = rebon_types::sibling_binary::verve_runner().map_err(|error| anyhow!(error))?;
+    adapt_with(dir, config, &runner, &scripts.compose_root)
 }
 
-/// [`adapt`] with the Node and runtime named.
+/// [`adapt`] with the runner (`rebon-verve`) and runtime named.
 pub fn adapt_with(
     dir: &Path,
     config: Option<&Value>,
-    node: &Path,
+    runner: &Path,
     compose_root: &Path,
 ) -> anyhow::Result<Adapted> {
     let package_path = dir.join("package.json");
@@ -412,35 +408,18 @@ pub fn adapt_with(
         .and_then(Value::as_object)
         .is_some_and(|deps| !deps.is_empty());
     if has_dependencies {
-        let output = Command::new(npm_beside(node))
-            .current_dir(dir)
-            .args([
-                "install",
-                "--omit=dev",
-                "--legacy-peer-deps",
-                "--ignore-scripts",
-                "--no-audit",
-                "--no-fund",
-                "--no-package-lock",
-                "--loglevel=error",
-            ])
-            .output()
-            .context("running npm (is it installed beside Node?)")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let missing = stderr
-                .lines()
-                .find(|line| line.contains("404") && line.contains("@deepseek-ai"))
-                .map(|line| format!(" ({})", line.trim()))
-                .unwrap_or_default();
-            bail!(
-                "{id}: npm could not install what it needs{missing}: {}",
-                stderr.lines().rev().take(4).collect::<Vec<_>>().join(" | ")
-            );
-        }
+        // What `npm install --omit=dev --legacy-peer-deps --ignore-scripts
+        // --no-package-lock` did, without npm: dev dependencies left out,
+        // peers never fetched, no script ever run, no lockfile kept.
+        let options = verve::npm::InstallOptions {
+            write_lockfile: false,
+            ..Default::default()
+        };
+        verve::npm::install(dir, &options)
+            .map_err(|error| anyhow!("{id}: could not install what it needs: {error}"))?;
     }
 
-    // By where they really are: Node opens the entry by its real path and
+    // By where they really are: the runner opens the entry by its real path and
     // checks that against the grants (see `container::real_path`).
     let real = rebon_plugin_host::container::real_path;
     let (compose_root, package_root) = (real(compose_root), real(dir));
@@ -448,7 +427,7 @@ pub fn adapt_with(
         .parent()
         .ok_or_else(|| anyhow!("{} has no parent", compose_root.display()))?;
     let entry = entry_of(&package);
-    let mut probe = Command::new(node);
+    let mut probe = Command::new(runner);
     probe
         .arg("--permission")
         .arg(format!("--allow-fs-read={}", runtime_root.display()))
@@ -518,6 +497,54 @@ pub fn adapt_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real DSH package from npm made into a rebon package on Verve alone:
+    /// fetched with `verve::npm::pack`, its dependencies installed by
+    /// `verve::npm::install`, and probed in `rebon-verve`. Needs the network
+    /// and the runner (`REBON_VERVE`, or `cargo build -p rebon-verve-host
+    /// --bin rebon-verve`), so it is run by hand.
+    #[test]
+    #[ignore = "fetches from registry.npmjs.org"]
+    fn a_published_dsh_package_adapts_with_no_node() {
+        let runner = std::env::var_os("REBON_VERVE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let exe = std::env::current_exe().unwrap();
+                let name = if cfg!(windows) {
+                    "rebon-verve.exe"
+                } else {
+                    "rebon-verve"
+                };
+                exe.parent().unwrap().parent().unwrap().join(name)
+            });
+        assert!(runner.is_file(), "no runner at {}", runner.display());
+        let compose_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtimes/node/compose-runtime");
+        let scratch = tempfile::tempdir().unwrap();
+        let options = verve::npm::InstallOptions::default();
+        let packed =
+            verve::npm::pack("@deepseek-ai/dsh-tool-todo", &options, scratch.path()).unwrap();
+        let dir = crate::plugin::package::unpack_archive_folder(
+            &packed.tarball,
+            &scratch.path().join("unpacked"),
+            crate::plugin::package::PackageLimits::default(),
+        )
+        .unwrap();
+        // What the built-in marketplace supplies for it: the setting is
+        // required and has no default.
+        let config = serde_json::json!({ "allowParallelInProgress": false });
+        let adapted = adapt_with(&dir, Some(&config), &runner, &compose_root).unwrap();
+        assert_eq!(
+            adapted.plugin_id,
+            plugin_id_of(
+                &serde_json::from_slice(&std::fs::read(dir.join("package.json")).unwrap()).unwrap()
+            )
+            .unwrap()
+        );
+        assert!(!adapted.tools.is_empty(), "the probe saw its tools");
+        assert!(dir.join("rebon-plugin.json").is_file());
+        assert!(dir.join("node_modules").is_dir());
+    }
 
     fn provided() -> BTreeSet<String> {
         [

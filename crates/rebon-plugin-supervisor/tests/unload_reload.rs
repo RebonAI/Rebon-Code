@@ -15,10 +15,6 @@ use std::{env, path::PathBuf, time::Duration};
 use rebon_plugin_protocol::{Payload, PluginLoadRequest};
 use rebon_plugin_supervisor::{HostConfig, PluginHostSupervisor};
 
-fn node() -> Option<PathBuf> {
-    env::var_os("REBON_TEST_NODE").map(PathBuf::from)
-}
-
 fn real_host() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtimes/node/plugin-host/src/cli.mjs")
 }
@@ -58,9 +54,9 @@ fn load_request(root: String) -> PluginLoadRequest {
     }
 }
 
-async fn started(node: &std::path::Path) -> PluginHostSupervisor {
+async fn started(runner: &std::path::Path) -> PluginHostSupervisor {
     PluginHostSupervisor::start(
-        HostConfig::new(node, real_host())
+        HostConfig::new(runner, real_host())
             .with_startup_timeout(Duration::from_secs(20))
             .with_working_directory(env::temp_dir()),
     )
@@ -72,13 +68,10 @@ async fn started(node: &std::path::Path) -> PluginHostSupervisor {
 /// loads again.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reload_after_a_quiet_unload_succeeds() {
-    let Some(node) = node() else {
-        eprintln!("skipping: set REBON_TEST_NODE");
-        return;
-    };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path());
-    let supervisor = started(&node).await;
+    let supervisor = started(&runner).await;
 
     supervisor
         .load_plugin(&load_request(root.clone()))
@@ -110,13 +103,10 @@ async fn a_reload_after_a_quiet_unload_succeeds() {
 /// walking away closes the gap.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unload_while_a_finished_stream_is_unread() {
-    let Some(node) = node() else {
-        eprintln!("skipping: set REBON_TEST_NODE");
-        return;
-    };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path());
-    let supervisor = started(&node).await;
+    let supervisor = started(&runner).await;
 
     supervisor
         .load_plugin(&load_request(root.clone()))
@@ -182,13 +172,10 @@ async fn an_unload_while_a_finished_stream_is_unread() {
 /// its id could never be used again.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_abandoned_one_shot_call_stops_being_counted() {
-    let Some(node) = node() else {
-        eprintln!("skipping: set REBON_TEST_NODE");
-        return;
-    };
+    let runner = PathBuf::new();
     let dir = tempfile::tempdir().unwrap();
     let root = plugin_package(dir.path());
-    let supervisor = started(&node).await;
+    let supervisor = started(&runner).await;
 
     supervisor
         .load_plugin(&load_request(root.clone()))

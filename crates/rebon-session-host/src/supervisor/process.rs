@@ -8,17 +8,12 @@ use crate::*;
 
 /// Hands the worker the environment the job was created with.
 ///
-/// Both entries exist for the same reason: a session runs in its own process,
-/// and the process that created the job may be a desktop app whose environment
-/// the worker does not otherwise share. `PATH` is what tools are found on; the
-/// Node runtime is what the plugin plane runs on, and letting the worker
-/// re-resolve it could land on a different runtime than the one the app vetted.
+/// A session runs in its own process, and the process that created the job
+/// may be a desktop app whose environment the worker does not otherwise share:
+/// `PATH` is what tools are found on.
 pub fn apply_worker_process_environment(command: &mut Command, state: &BackgroundJobState) {
     if let Some(path) = state.process.process_path.as_deref() {
         command.env("PATH", path);
-    }
-    if let Some(node) = state.process.node_runtime_path.as_deref() {
-        command.env(rebon_node_runtime::NODE_EXECUTABLE_ENV, node);
     }
 }
 

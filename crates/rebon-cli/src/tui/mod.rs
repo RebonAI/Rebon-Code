@@ -135,7 +135,6 @@ pub async fn run_with_startup_resume(
     let mut ui_config =
         gates::run_settings_and_mcp_gates(&mut overrides, &config_dir, &cwd, startup_started)?;
     gates::run_trust_gate(&cwd, startup_started)?;
-    gates::run_kernel_plugin_runtime_gate(startup_started).await?;
 
     let startup_provider =
         gates::run_credentials_gate(&mut overrides, &mut ui_config, &config_dir, startup_started)

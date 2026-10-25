@@ -9,7 +9,9 @@
 //! the load is sent, and a run's terminal state is announced only once it is
 //! true.
 //!
-//! Skips without `REBON_TEST_NODE`, like every test that drives a real child.
+//! Contained hosts need the runner built (`cargo build -p rebon-verve-host
+//! --bin rebon-verve`) or named by `REBON_VERVE`; the plane's own host runs
+//! in this process.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -32,19 +34,30 @@ use rebon_plugin_supervisor::{
 };
 use serde_json::{json, Value};
 
-fn node() -> Option<PathBuf> {
-    match std::env::var_os("REBON_TEST_NODE") {
-        Some(node) => Some(PathBuf::from(node)),
-        None => {
-            assert_ne!(
-                std::env::var_os("REBON_REQUIRE_TEST_NODE").as_deref(),
-                Some(std::ffi::OsStr::new("1")),
-                "REBON_REQUIRE_TEST_NODE=1 requires an absolute REBON_TEST_NODE"
-            );
-            eprintln!("skipping: set REBON_TEST_NODE to an absolute Node executable");
-            None
-        }
+/// The runner a contained host starts: `REBON_VERVE`, or the `rebon-verve`
+/// this target directory built (`cargo build -p rebon-verve-host --bin
+/// rebon-verve`). The plane's own host runs in this process and needs none.
+fn runner() -> PathBuf {
+    if let Some(path) = std::env::var_os("REBON_VERVE") {
+        return PathBuf::from(path);
     }
+    let exe = std::env::current_exe().expect("the test knows its own path");
+    let name = if cfg!(windows) {
+        "rebon-verve.exe"
+    } else {
+        "rebon-verve"
+    };
+    let built = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("a test binary lives in target/<profile>/deps")
+        .join(name);
+    assert!(
+        built.is_file(),
+        "contained hosts need the runner: build it with \
+         `cargo build -p rebon-verve-host --bin rebon-verve`, or set REBON_VERVE"
+    );
+    built
 }
 
 fn repo() -> PathBuf {
@@ -128,9 +141,10 @@ fn contained(root: &str, data: &Path) -> ComposeEntry {
     contained_named(ID, root, data)
 }
 
-/// A host script that is the real host with some of what rebon sends it
-/// dropped on the floor, so a test can have a host that never answers one
-/// method and behaves normally otherwise.
+/// The real host with some of what rebon sends it dropped on the floor, so a
+/// test can have a host that never answers one method: a module standing where
+/// `cli.mjs` stands, whose `runHost` hands the real one an input with those
+/// frames taken out.
 fn deaf_host(into: &Path, methods: &[&str]) -> PathBuf {
     let real = repo().join("runtimes/node/plugin-host/src/cli.mjs");
     let script = into.join("deaf-host.mjs");
@@ -138,23 +152,32 @@ fn deaf_host(into: &Path, methods: &[&str]) -> PathBuf {
         &script,
         format!(
             r#"
-import {{ PassThrough }} from 'node:stream';
-import {{ createInterface }} from 'node:readline';
-import {{ pathToFileURL }} from 'node:url';
+import * as real from {real};
+export const {{ diagnostic, installRejectionDiagnostic, resolveLoader }} = real;
 const DROP = {drop};
-const REAL = {real};
-const filtered = new PassThrough();
-createInterface({{ input: process.stdin, crlfDelay: Infinity }})
-  .on('line', (line) => {{
-    if (!DROP.some((method) => line.includes(JSON.stringify(method)))) filtered.write(line + '\n');
-  }})
-  .on('close', () => filtered.end());
-Object.defineProperty(process, 'stdin', {{ value: filtered, configurable: true }});
-process.argv[1] = REAL;
-await import(pathToFileURL(REAL).href);
+async function* deaf(input) {{
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let pending = '';
+  for await (const chunk of input) {{
+    pending += decoder.decode(chunk, {{ stream: true }});
+    let end;
+    let kept = '';
+    while ((end = pending.indexOf('\n')) >= 0) {{
+      const line = pending.slice(0, end + 1);
+      pending = pending.slice(end + 1);
+      if (!DROP.some((method) => line.includes(JSON.stringify(method)))) kept += line;
+    }}
+    if (kept) yield encoder.encode(kept);
+  }}
+}}
+export function runHost(options) {{
+  return real.runHost({{ ...options, input: deaf(options.input) }});
+}}
 "#,
             drop = serde_json::to_string(methods).unwrap(),
-            real = serde_json::to_string(&plain(&real)).unwrap(),
+            real = serde_json::to_string(&url::Url::from_file_path(&real).unwrap().to_string())
+                .unwrap(),
         ),
     )
     .unwrap();
@@ -181,7 +204,7 @@ async fn with_plane_on<F, Fut>(
     F: FnOnce(Rig) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let Some(node) = node() else { return };
+    let runner = runner();
     let repo = repo();
     let tmp = tempfile::tempdir().expect("temp dir");
     let host_script = match host {
@@ -199,7 +222,7 @@ async fn with_plane_on<F, Fut>(
 
     let plane = PluginPlane::start(
         PluginPlaneConfig {
-            node,
+            runner,
             host_script: PathBuf::from(plain(&host_script)),
             loader: PathBuf::from(plain(
                 &repo.join("runtimes/node/compose-runtime/src/index.mjs"),
@@ -301,9 +324,14 @@ fn generation(plane: &PluginPlane) -> u64 {
     generation_of(plane, ID)
 }
 
+/// These tests share one process kernel and process-wide slots, so they take
+/// turns however the harness runs them.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Nothing running: unloaded at once, and the next load is a new run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_quiet_unload_is_clean_and_the_next_load_is_a_new_run() {
+    let _serial = SERIAL.lock().await;
     with_plane(
         Duration::from_secs(5),
         |Rig { plane, tmp, .. }| async move {
@@ -336,6 +364,7 @@ async fn a_quiet_unload_is_clean_and_the_next_load_is_a_new_run() {
 /// gives runs with none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_run_carries_its_entry_source() {
+    let _serial = SERIAL.lock().await;
     with_plane(
         Duration::from_secs(5),
         |Rig { plane, ctx, tmp }| async move {
@@ -370,6 +399,7 @@ async fn a_run_carries_its_entry_source() {
 /// the run it was made to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unload_waits_for_the_call_in_flight() {
+    let _serial = SERIAL.lock().await;
     with_plane(
         Duration::from_secs(10),
         |Rig { plane, tmp, .. }| async move {
@@ -395,6 +425,7 @@ async fn an_unload_waits_for_the_call_in_flight() {
 /// plugin is withdrawn, marked stuck, and its id is refused with a reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_shared_host_plugin_that_will_not_drain_is_stuck() {
+    let _serial = SERIAL.lock().await;
     with_plane(
         Duration::from_millis(300),
         |Rig { plane, tmp, .. }| async move {
@@ -433,6 +464,7 @@ async fn a_shared_host_plugin_that_will_not_drain_is_stuck() {
 /// leaves its registrations behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unanswered_unload_on_the_shared_host_is_stuck_and_withdrawn() {
+    let _serial = SERIAL.lock().await;
     with_plane_on(
         Duration::from_millis(500),
         Some(&["plugin/unload"]),
@@ -462,6 +494,7 @@ async fn an_unanswered_unload_on_the_shared_host_is_stuck_and_withdrawn() {
 /// A host that died runs nothing, so unloading a plugin on it is clean.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unload_on_a_dead_host_is_clean() {
+    let _serial = SERIAL.lock().await;
     with_plane(
         Duration::from_secs(5),
         |Rig { plane, tmp, .. }| async move {
@@ -481,6 +514,7 @@ async fn an_unload_on_a_dead_host_is_clean() {
 /// container, and its id is free for the next run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_contained_plugin_that_will_not_drain_is_forced_out() {
+    let _serial = SERIAL.lock().await;
     with_plane(
         Duration::from_millis(300),
         |Rig { plane, tmp, .. }| async move {
@@ -533,6 +567,7 @@ async fn a_contained_plugin_that_will_not_drain_is_forced_out() {
 /// it, and each of them is recorded as forced, naming why.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forcing_a_shared_container_takes_its_other_plugins_with_it() {
+    let _serial = SERIAL.lock().await;
     with_plane(
         Duration::from_millis(300),
         |Rig { plane, tmp, .. }| async move {
@@ -575,6 +610,7 @@ async fn forcing_a_shared_container_takes_its_other_plugins_with_it() {
 /// composition still wants, in a new container.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reload_restarts_what_it_took_down_and_still_wants() {
+    let _serial = SERIAL.lock().await;
     with_plane(
         Duration::from_millis(300),
         |Rig { plane, tmp, .. }| async move {
@@ -615,6 +651,7 @@ async fn a_reload_restarts_what_it_took_down_and_still_wants() {
 /// fails with the reason rather than as "already loaded".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reload_reports_what_did_not_drain() {
+    let _serial = SERIAL.lock().await;
     with_plane(
         Duration::from_millis(300),
         |Rig { plane, tmp, .. }| async move {
@@ -642,6 +679,7 @@ async fn a_reload_reports_what_did_not_drain() {
 /// attempt is the next generation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_load_is_recorded_as_an_attempt() {
+    let _serial = SERIAL.lock().await;
     with_plane(
         Duration::from_secs(5),
         |Rig { plane, tmp, .. }| async move {
@@ -681,6 +719,7 @@ struct Seen {
 /// a time, and announces its ending only after its registrations are gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_change_is_announced_and_an_ending_only_once_true() {
+    let _serial = SERIAL.lock().await;
     with_plane(
         Duration::from_secs(5),
         |Rig { plane, ctx, tmp }| async move {
@@ -752,6 +791,7 @@ async fn every_change_is_announced_and_an_ending_only_once_true() {
 /// the same loop must not rewrite that ending as a clean drain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sibling_forced_earlier_in_the_same_reload_stays_forced() {
+    let _serial = SERIAL.lock().await;
     with_plane(
         Duration::from_millis(300),
         |Rig { plane, ctx, tmp }| async move {
@@ -798,6 +838,7 @@ async fn a_sibling_forced_earlier_in_the_same_reload_stays_forced() {
 /// than left reading as ready.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dead_container_fails_its_other_plugins() {
+    let _serial = SERIAL.lock().await;
     with_plane(
         Duration::from_secs(5),
         |Rig { plane, tmp, .. }| async move {
@@ -831,6 +872,7 @@ async fn a_dead_container_fails_its_other_plugins() {
 /// behind a table that still says they are loaded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reload_restarts_plugins_whose_host_died() {
+    let _serial = SERIAL.lock().await;
     with_plane(
         Duration::from_secs(5),
         |Rig { plane, tmp, .. }| async move {
@@ -861,6 +903,7 @@ async fn a_reload_restarts_plugins_whose_host_died() {
 /// default every host used to share.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_host_has_its_own_epoch() {
+    let _serial = SERIAL.lock().await;
     with_plane(
         Duration::from_secs(5),
         |Rig { plane, tmp, .. }| async move {
@@ -918,6 +961,7 @@ impl LifecycleSink for RecordingSink {
 /// happened is kept, announced, and the refusal is reported.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn facts_are_committed_first_and_a_refusal_is_handled_by_kind() {
+    let _serial = SERIAL.lock().await;
     let sink = Arc::new(RecordingSink {
         plane: std::sync::OnceLock::new(),
         refuse: Mutex::new(Some("loading")),

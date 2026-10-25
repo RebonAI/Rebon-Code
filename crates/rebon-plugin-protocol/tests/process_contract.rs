@@ -34,25 +34,37 @@ fn scope(id: &str, generation: u64, method: &str, payload: serde_json::Value) ->
         },
     )
 }
-#[test]
-fn rust_codec_drives_node_lifecycle_process() {
-    let Some(node) = env::var_os("REBON_TEST_NODE") else {
-        assert_ne!(
-            env::var_os("REBON_REQUIRE_TEST_NODE").as_deref(),
-            Some(std::ffi::OsStr::new("1")),
-            "REBON_REQUIRE_TEST_NODE=1 requires absolute REBON_TEST_NODE"
-        );
-        eprintln!(
-            "skipping Node process contract: set REBON_TEST_NODE to an absolute executable path"
-        );
-        return;
+/// The runner the host runs on: `REBON_VERVE`, or the `rebon-verve` this
+/// target directory built (`cargo build -p rebon-verve-host --bin rebon-verve`).
+fn runner() -> PathBuf {
+    if let Some(path) = env::var_os("REBON_VERVE") {
+        return PathBuf::from(path);
+    }
+    let exe = env::current_exe().expect("the test knows its own path");
+    let name = if cfg!(windows) {
+        "rebon-verve.exe"
+    } else {
+        "rebon-verve"
     };
-    eprintln!("REBON_NODE_PROCESS_CONTRACT_EXECUTED");
-    let node = PathBuf::from(node);
-    assert!(node.is_absolute(), "REBON_TEST_NODE must be absolute");
+    let built = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("a test binary lives in target/<profile>/deps")
+        .join(name);
+    assert!(
+        built.is_file(),
+        "the process contract needs the runner: build it with          `cargo build -p rebon-verve-host --bin rebon-verve`, or set REBON_VERVE"
+    );
+    built
+}
+
+#[test]
+fn rust_codec_drives_the_host_process() {
+    let runner = runner();
     let cli = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../runtimes/node/plugin-host/src/cli.mjs");
-    let mut child = Command::new(node)
+    let mut child = Command::new(runner)
+        .arg("--allow-all")
         .arg(cli)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

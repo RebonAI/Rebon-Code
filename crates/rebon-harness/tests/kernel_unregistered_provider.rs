@@ -26,9 +26,35 @@ use rebon_provider::model_provider_plugin::{
     ModelProviderCapabilityManifest, PluginModelProviderContribution,
 };
 
-/// The Node the plane runs on, and the checkout it loads from.
+/// The runner a contained host starts: `REBON_VERVE`, or the `rebon-verve`
+/// this target directory built (`cargo build -p rebon-verve-host --bin
+/// rebon-verve`).
+fn runner() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("REBON_VERVE") {
+        return std::path::PathBuf::from(path);
+    }
+    let exe = std::env::current_exe().expect("the test knows its own path");
+    let name = if cfg!(windows) {
+        "rebon-verve.exe"
+    } else {
+        "rebon-verve"
+    };
+    let built = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("a test binary lives in target/<profile>/deps")
+        .join(name);
+    assert!(
+        built.is_file(),
+        "contained hosts need the runner: build it with \
+         `cargo build -p rebon-verve-host --bin rebon-verve`, or set REBON_VERVE"
+    );
+    built
+}
+
+/// The runner a package's container starts, and the checkout it loads from.
 fn point_at_checkout() -> Option<std::path::PathBuf> {
-    let node = std::env::var_os("REBON_TEST_NODE")?;
+    let runner = runner();
     let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
@@ -37,7 +63,7 @@ fn point_at_checkout() -> Option<std::path::PathBuf> {
         let text = path.to_string_lossy().replace('\\', "/");
         text.strip_prefix("//?/").unwrap_or(&text).to_owned()
     };
-    std::env::set_var("REBON_PLUGIN_NODE", node);
+    std::env::set_var("REBON_VERVE", runner);
     std::env::set_var(
         "REBON_PLUGIN_HOST_JS",
         plain(repo.join("runtimes/node/plugin-host/src/cli.mjs")),
@@ -52,7 +78,6 @@ fn point_at_checkout() -> Option<std::path::PathBuf> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_selected_provider_the_package_never_registers_fails_the_resolution() {
     let Some(repo) = point_at_checkout() else {
-        eprintln!("skipping: set REBON_TEST_NODE to an absolute Node executable");
         return;
     };
 
