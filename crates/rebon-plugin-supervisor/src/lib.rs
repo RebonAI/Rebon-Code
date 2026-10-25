@@ -64,6 +64,7 @@
 //! decision. A method this build does not implement is refused by name, not
 //! ignored.
 
+mod launch;
 pub mod state;
 
 use std::{
@@ -92,11 +93,14 @@ use rebon_plugin_protocol::{
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    process::{Child, ChildStdin, Command},
+    process::Command,
     sync::{mpsc, oneshot, Mutex, Notify},
 };
 
 pub use state::{HostFailure, Inbound, StateError, SupervisorState, HOST_FAILED_CODE};
+pub use launch::HostEngine;
+
+use launch::{launch, HostInput, HostOutput, HostProcess, Launched};
 
 /// Absolute path to the host's entry module, for deployments that place it
 /// somewhere other than beside the executable.
@@ -326,6 +330,10 @@ pub struct HostConfig {
     /// What the host runs under, when something confines it: an OS sandbox
     /// whose argv ends where Node's begins.
     pub launcher: Option<HostLauncher>,
+    /// What runs the host's JavaScript. Node unless the caller chose Verve;
+    /// `node`, `node_args` and `launcher` mean nothing to Verve, which refuses
+    /// a config that confines its host with them.
+    pub engine: HostEngine,
     pub working_directory: PathBuf,
     pub host_epoch: u64,
     pub stderr_tail_bytes: usize,
@@ -382,6 +390,7 @@ impl HostConfig {
             node_args: Vec::new(),
             environment: None,
             launcher: None,
+            engine: HostEngine::Node,
             // A constructor default the caller overrides per host; a vanished
             // cwd is not this crate's error to raise.
             working_directory: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -395,6 +404,12 @@ impl HostConfig {
             exposed_seats: BTreeSet::new(),
             event_publisher: None,
         }
+    }
+
+    /// Runs the host on `engine`.
+    pub fn with_engine(mut self, engine: HostEngine) -> Self {
+        self.engine = engine;
+        self
     }
 
     /// Installs the seam a plugin's published events land on.
@@ -854,7 +869,7 @@ struct Inner {
     events: mpsc::UnboundedSender<QueuedEvent>,
     state: Mutex<SupervisorState>,
     waiters: StdMutex<Waiters>,
-    stdin: Mutex<Option<ChildStdin>>,
+    stdin: Mutex<Option<HostInput>>,
     stderr: Arc<StdMutex<StderrTail>>,
     tool_invoker: Option<Arc<dyn ToolInvoker>>,
     exposed_tools: BTreeSet<String>,
@@ -977,7 +992,7 @@ impl Inner {
 pub struct PluginHostSupervisor {
     inner: Arc<Inner>,
     config: HostConfig,
-    child: Mutex<Option<Child>>,
+    child: Mutex<Option<HostProcess>>,
 }
 
 impl std::fmt::Debug for PluginHostSupervisor {
@@ -1006,13 +1021,12 @@ impl PluginHostSupervisor {
     }
 
     async fn spawn(config: HostConfig) -> Result<Self, SupervisorError> {
-        let mut child = host_command(&config)
-            .spawn()
-            .map_err(SupervisorError::Spawn)?;
-
-        let stdin = child.stdin.take().expect("stdin was piped");
-        let stdout = child.stdout.take().expect("stdout was piped");
-        let stderr = child.stderr.take().expect("stderr was piped");
+        let Launched {
+            stdin,
+            stdout,
+            stderr,
+            process: child,
+        } = launch(&config).map_err(SupervisorError::Spawn)?;
 
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(Inner {
@@ -1835,8 +1849,8 @@ impl PluginHostSupervisor {
         *self.inner.stdin.lock().await = None;
         let mut guard = self.child.lock().await;
         if let Some(child) = guard.as_mut() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            child.start_kill();
+            child.wait().await;
         }
         *guard = None;
     }
@@ -1854,8 +1868,8 @@ impl PluginHostSupervisor {
         match tokio::time::timeout(self.config.shutdown_timeout, child.wait()).await {
             Ok(_) => {}
             Err(_) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                child.start_kill();
+                child.wait().await;
             }
         }
         *guard = None;
@@ -1882,12 +1896,12 @@ impl PluginHostSupervisor {
             .bytes
             .clear();
 
-        let mut child = host_command(&self.config)
-            .spawn()
-            .map_err(SupervisorError::Spawn)?;
-        let stdin = child.stdin.take().expect("stdin was piped");
-        let stdout = child.stdout.take().expect("stdout was piped");
-        let stderr = child.stderr.take().expect("stderr was piped");
+        let Launched {
+            stdin,
+            stdout,
+            stderr,
+            process: child,
+        } = launch(&self.config).map_err(SupervisorError::Spawn)?;
         *self.inner.stdin.lock().await = Some(stdin);
         *self.child.lock().await = Some(child);
         tokio::spawn(drain_stderr(stderr, Arc::clone(&self.inner.stderr)));
@@ -1898,7 +1912,7 @@ impl PluginHostSupervisor {
     }
 }
 
-async fn drain_stderr(mut stderr: tokio::process::ChildStderr, tail: Arc<StdMutex<StderrTail>>) {
+async fn drain_stderr(mut stderr: HostOutput, tail: Arc<StdMutex<StderrTail>>) {
     let mut buffer = [0u8; 4096];
     loop {
         match stderr.read(&mut buffer).await {
@@ -1917,7 +1931,7 @@ async fn drain_stderr(mut stderr: tokio::process::ChildStderr, tail: Arc<StdMute
 /// `epoch` is the host generation this reader belongs to. It is carried all
 /// the way to the failure because that failure may be recorded long after the
 /// process died; see `Inner::fail_at_epoch`.
-async fn read_frames(mut stdout: tokio::process::ChildStdout, inner: Arc<Inner>, epoch: u64) {
+async fn read_frames(mut stdout: HostOutput, inner: Arc<Inner>, epoch: u64) {
     let mut codec = NdjsonCodec::default();
     let mut buffer = [0u8; 8192];
     let reason = loop {

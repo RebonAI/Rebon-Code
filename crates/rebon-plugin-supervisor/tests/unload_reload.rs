@@ -13,9 +13,22 @@
 use std::{env, path::PathBuf, time::Duration};
 
 use rebon_plugin_protocol::{Payload, PluginLoadRequest};
-use rebon_plugin_supervisor::{HostConfig, PluginHostSupervisor};
+use rebon_plugin_supervisor::{HostConfig, HostEngine, PluginHostSupervisor};
+
+/// The engine the real host runs on here: Node by default, or Verve with
+/// `REBON_TEST_ENGINE=verve` — the same tests, and no Node needed.
+fn engine() -> HostEngine {
+    match env::var("REBON_TEST_ENGINE").as_deref() {
+        Ok("verve") => HostEngine::Verve,
+        _ => HostEngine::Node,
+    }
+}
 
 fn node() -> Option<PathBuf> {
+    if engine() == HostEngine::Verve {
+        // Never run: Verve is not a program.
+        return Some(PathBuf::from("verve"));
+    }
     env::var_os("REBON_TEST_NODE").map(PathBuf::from)
 }
 
@@ -61,6 +74,7 @@ fn load_request(root: String) -> PluginLoadRequest {
 async fn started(node: &std::path::Path) -> PluginHostSupervisor {
     PluginHostSupervisor::start(
         HostConfig::new(node, real_host())
+            .with_engine(engine())
             .with_startup_timeout(Duration::from_secs(20))
             .with_working_directory(env::temp_dir()),
     )

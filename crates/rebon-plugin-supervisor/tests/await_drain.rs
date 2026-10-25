@@ -15,9 +15,22 @@ use std::{
 };
 
 use rebon_plugin_protocol::{Payload, PluginLoadRequest};
-use rebon_plugin_supervisor::{HostConfig, PluginHostSupervisor};
+use rebon_plugin_supervisor::{HostConfig, HostEngine, PluginHostSupervisor};
+
+/// The engine the real host runs on here: Node by default, or Verve with
+/// `REBON_TEST_ENGINE=verve` — the same tests, and no Node needed.
+fn engine() -> HostEngine {
+    match env::var("REBON_TEST_ENGINE").as_deref() {
+        Ok("verve") => HostEngine::Verve,
+        _ => HostEngine::Node,
+    }
+}
 
 fn node() -> Option<PathBuf> {
+    if engine() == HostEngine::Verve {
+        // Never run: Verve is not a program.
+        return Some(PathBuf::from("verve"));
+    }
     env::var_os("REBON_TEST_NODE").map(PathBuf::from)
 }
 
@@ -69,6 +82,7 @@ async fn loaded(node: &std::path::Path) -> (Arc<PluginHostSupervisor>, String, t
     let root = package(dir.path());
     let supervisor = PluginHostSupervisor::start(
         HostConfig::new(node, real_host())
+            .with_engine(engine())
             .with_startup_timeout(Duration::from_secs(20))
             .with_working_directory(env::temp_dir()),
     )
@@ -274,6 +288,16 @@ async fn there_is_no_drain_to_wait_for() {
     supervisor.shutdown().await.unwrap();
 }
 
+/// Node itself, for the deaf host: it rewires Node's own stdin, so it has no
+/// Verve form, and these tests are about the supervisor's deadlines rather
+/// than the engine.
+fn node_process() -> Option<PathBuf> {
+    match engine() {
+        HostEngine::Node => node(),
+        HostEngine::Verve => None,
+    }
+}
+
 /// The real host with some of what rebon sends it dropped on the floor, so a
 /// test can have a host that never answers one method.
 fn deaf_host(into: &std::path::Path, methods: &[&str]) -> PathBuf {
@@ -336,7 +360,7 @@ async fn deaf(
 /// error is reported after — not instead of — the reaping.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unanswered_shutdown_is_bounded_and_still_reaps() {
-    let Some(node) = node() else {
+    let Some(node) = node_process() else {
         eprintln!("skipping: set REBON_TEST_NODE");
         return;
     };
@@ -396,7 +420,7 @@ async fn terminate_ends_the_host_and_answers_what_it_owed() {
 /// plugin while the caller decides what to do about its host.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unanswered_unload_is_bounded_and_this_side_still_drains() {
-    let Some(node) = node() else {
+    let Some(node) = node_process() else {
         eprintln!("skipping: set REBON_TEST_NODE");
         return;
     };

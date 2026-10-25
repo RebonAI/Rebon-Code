@@ -11,11 +11,24 @@ use std::{env, future::Future, path::PathBuf, pin::Pin, sync::Arc, time::Duratio
 
 use rebon_plugin_protocol::{Payload, PluginLoadRequest};
 use rebon_plugin_supervisor::{
-    EventPublisher, HostCallError, HostConfig, PluginHostSupervisor, PublishedEvent,
+    EventPublisher, HostCallError, HostConfig, HostEngine, PluginHostSupervisor, PublishedEvent,
     SeatDispatcher, SeatInvocation, StreamEvent, ToolInvocation, ToolInvoker, ToolRefusal,
 };
 
+/// The engine the real host runs on here: Node by default, or Verve with
+/// `REBON_TEST_ENGINE=verve` — the same tests, and no Node needed.
+fn engine() -> HostEngine {
+    match env::var("REBON_TEST_ENGINE").as_deref() {
+        Ok("verve") => HostEngine::Verve,
+        _ => HostEngine::Node,
+    }
+}
+
 fn node() -> Option<PathBuf> {
+    if engine() == HostEngine::Verve {
+        // Never run: Verve is not a program.
+        return Some(PathBuf::from("verve"));
+    }
     match env::var_os("REBON_TEST_NODE") {
         Some(node) => Some(PathBuf::from(node)),
         None => {
@@ -98,6 +111,7 @@ async fn started(node: &std::path::Path) -> PluginHostSupervisor {
 
 fn base_config(node: &std::path::Path) -> HostConfig {
     HostConfig::new(node, real_host())
+        .with_engine(engine())
         .with_startup_timeout(Duration::from_secs(20))
         .with_working_directory(env::temp_dir())
 }
