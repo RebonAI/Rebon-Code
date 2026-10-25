@@ -131,13 +131,13 @@ export async function startHost({ env = {}, tools = {}, seats = {} } = {}) {
 }
 
 /// Loads the composition control plugin, which creates the realm.
-export async function loadCompose(kit, { entries = [], web = null, modules = {} } = {}) {
+export async function loadCompose(kit, { entries = [], web = null, modules = {}, profile = null } = {}) {
   return kit.control('plugin/load', {
     pluginId: 'rebon:compose',
     root: COMPOSE_ROOT.replace(/\\/g, '/'),
     entry: 'src/plugin.mjs',
     services: ['compose'],
-    config: { payloadDir: PAYLOAD, entries, web, modules },
+    config: { payloadDir: PAYLOAD, entries, web, modules, profile },
   });
 }
 

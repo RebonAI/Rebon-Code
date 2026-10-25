@@ -2103,6 +2103,46 @@ pub fn set_kernel_plugin_listed_in(
     Ok(changed)
 }
 
+/// Replaces the `config` of the `kernelPlugins.plugins` row named `id`.
+///
+/// The row has to exist in the base list: an entry a patch layer inserted
+/// keeps its config in that layer, and writing it here would be overridden
+/// by the very patch that made it. A row written as a bare id becomes an
+/// object so it can carry the config. Returns whether the file changed.
+pub fn set_kernel_plugin_entry_config_in(
+    config_dir: &Path,
+    id: &str,
+    entry_config: &serde_json::Value,
+) -> anyhow::Result<bool> {
+    let mut config = read_config_roundtrip(config_dir)?;
+    let Some(plugins) = config
+        .extra
+        .get_mut("kernelPlugins")
+        .and_then(|section| section.get_mut("plugins"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        anyhow::bail!("config.json lists no kernelPlugins.plugins to hold {id:?}'s config");
+    };
+    let Some(row) = plugins.iter_mut().find(|entry| {
+        entry.get("id").and_then(serde_json::Value::as_str) == Some(id)
+            || entry.as_str() == Some(id)
+    }) else {
+        anyhow::bail!(
+            "{id:?} is not a row of config.json's kernelPlugins.plugins (an entry a patch \
+             layer inserted keeps its config in that layer)"
+        );
+    };
+    if row.is_string() {
+        *row = serde_json::json!({ "id": id });
+    }
+    if row.get("config") == Some(entry_config) {
+        return Ok(false);
+    }
+    row["config"] = entry_config.clone();
+    write_config_roundtrip(config_dir, &config)?;
+    Ok(true)
+}
+
 pub fn load_update_preferences() -> anyhow::Result<UpdatePreferences> {
     load_update_preferences_in(&config_home_dir())
 }
@@ -7804,6 +7844,39 @@ mod tests {
             written["kernelPlugins"]["plugins"],
             serde_json::json!([{ "id": "todo", "config": { "allowParallelInProgress": false } }])
         );
+    }
+
+    #[test]
+    fn an_entry_config_replaces_only_its_own_row() {
+        let tmp = TempDir::new().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"theme":"dark","kernelPlugins":{"plugins":[{"id":"keep","config":{"x":1}},"plain",{"id":"web","name":"pkg","config":{"a":1,"b":2}}]}}"#,
+        );
+        let read = || -> serde_json::Value {
+            serde_json::from_slice(&fs::read(config_json_path(tmp.path())).unwrap()).unwrap()
+        };
+        let next = serde_json::json!({ "a": 3 });
+        assert!(set_kernel_plugin_entry_config_in(tmp.path(), "web", &next).unwrap());
+        assert!(
+            !set_kernel_plugin_entry_config_in(tmp.path(), "web", &next).unwrap(),
+            "the same config again is no change"
+        );
+        assert!(set_kernel_plugin_entry_config_in(tmp.path(), "plain", &next).unwrap());
+        let config = read();
+        assert_eq!(config["theme"], "dark");
+        assert_eq!(
+            config["kernelPlugins"]["plugins"],
+            serde_json::json!([
+                { "id": "keep", "config": { "x": 1 } },
+                { "id": "plain", "config": { "a": 3 } },
+                { "id": "web", "name": "pkg", "config": { "a": 3 } },
+            ])
+        );
+        let error = set_kernel_plugin_entry_config_in(tmp.path(), "absent", &next).unwrap_err();
+        assert!(error.to_string().contains("absent"), "{error}");
+        let empty = TempDir::new().unwrap();
+        assert!(set_kernel_plugin_entry_config_in(empty.path(), "web", &next).is_err());
     }
 
     #[test]

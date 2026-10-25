@@ -277,7 +277,35 @@ impl PluginPlaneConfig {
             "entries": self.structure,
             "web": self.web,
             "modules": self.modules,
+            "profile": profile(&rebon_config::config_home_dir().join("dsh")),
         })
+    }
+}
+
+/// What a realm's `profileContext` says: its home, rebon's counterpart of
+/// `DSH_HOME`. The shared host's is `<config home>/dsh`; a container's is its
+/// own data directory, the one place it may write.
+fn profile(home: &Path) -> Value {
+    serde_json::json!({ "home": home.to_string_lossy(), "name": "rebon" })
+}
+
+/// The composition control plugin's load request: the package that creates
+/// the realm, configured with its shape. One for the shared host and one per
+/// container, so both are built here.
+fn control_request(compose_root: &Path, config: Value) -> PluginLoadRequest {
+    PluginLoadRequest {
+        plugin_id: COMPOSE_PLUGIN_ID.to_owned(),
+        root: compose_root.to_string_lossy().into_owned(),
+        entry: "src/plugin.mjs".to_owned(),
+        services: vec!["compose".to_owned()],
+        config: Payload::from(config),
+        event_topics: Vec::new(),
+        published_topics: Vec::new(),
+        llm_providers: Vec::new(),
+        tools: Vec::new(),
+        commands: Vec::new(),
+        invokable_tools: Vec::new(),
+        seats: Vec::new(),
     }
 }
 
@@ -697,20 +725,7 @@ impl PluginPlane {
         // The control plugin creates the realm every entry mounts into, so it
         // is loaded before any of them — and a failure here is the whole
         // composition failing rather than one entry.
-        let control = PluginLoadRequest {
-            plugin_id: COMPOSE_PLUGIN_ID.to_owned(),
-            root: config.compose_root.to_string_lossy().into_owned(),
-            entry: "src/plugin.mjs".to_owned(),
-            services: vec!["compose".to_owned()],
-            config: Payload::from(config.control_config()),
-            event_topics: Vec::new(),
-            published_topics: Vec::new(),
-            llm_providers: Vec::new(),
-            tools: Vec::new(),
-            commands: Vec::new(),
-            invokable_tools: Vec::new(),
-            seats: Vec::new(),
-        };
+        let control = control_request(&config.compose_root, config.control_config());
         supervisor.load_plugin(&control).await?;
         let workspace_root = config.working_directory.to_string_lossy().into_owned();
         let scope = config
@@ -919,25 +934,16 @@ impl PluginPlane {
                 .await
                 .map_err(|error| refuse(format!("starting its host: {error}")))?,
         );
-        let control = PluginLoadRequest {
-            plugin_id: COMPOSE_PLUGIN_ID.to_owned(),
-            root: compose_root.to_string_lossy().into_owned(),
-            entry: "src/plugin.mjs".to_owned(),
-            services: vec!["compose".to_owned()],
-            config: Payload::from(serde_json::json!({
+        let control = control_request(
+            &compose_root,
+            serde_json::json!({
                 "payloadDir": payload_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
                 "entries": [],
                 "web": template.web,
                 "modules": template.modules,
-            })),
-            event_topics: Vec::new(),
-            published_topics: Vec::new(),
-            llm_providers: Vec::new(),
-            tools: Vec::new(),
-            commands: Vec::new(),
-            invokable_tools: Vec::new(),
-            seats: Vec::new(),
-        };
+                "profile": profile(&real(&data)),
+            }),
+        );
         let realm = async {
             supervisor.load_plugin(&control).await?;
             supervisor

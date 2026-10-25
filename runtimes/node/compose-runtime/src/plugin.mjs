@@ -26,7 +26,11 @@ export async function activate(api, config = {}) {
 
   const { withCall } = await import('./bridge.mjs');
   const { builtinSeats, createRealm, mounted, reportFor } = await import('./realm.mjs');
-  await createRealm({ web: config.web ?? null, entries: config.entries ?? [] });
+  await createRealm({
+    web: config.web ?? null,
+    entries: config.entries ?? [],
+    profile: config.profile ?? null,
+  });
 
   // Registered before any entry is loaded, so an entry claiming the same
   // service name hits the registrar's refusal rather than replacing this.

@@ -299,6 +299,32 @@ impl SettingsService {
         Ok(serde_json::json!({ "namespace": namespace, "written": patch.len() }))
     }
 
+    /// Replaces the caller's own composition entry config — its row in
+    /// `kernelPlugins.plugins`.
+    ///
+    /// The composition's configuration editor persists a settings edit
+    /// through this (`@deepseek-ai/dsh-settings` over rebon's
+    /// `configEditor`). The row is the caller's and no other: the plane
+    /// writes the caller id, so an entry can change what it was configured
+    /// with and nothing else in the file. The entry applies the config
+    /// itself; this only makes it what the next start reads.
+    fn write_entry_config(
+        &self,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, KernelError> {
+        let caller = Self::caller(params)?;
+        let config = params
+            .get("config")
+            .filter(|config| config.is_object())
+            .ok_or_else(|| {
+                KernelError::Other("settings entryConfig requires a `config` object".into())
+            })?;
+        let changed =
+            rebon_config::set_kernel_plugin_entry_config_in(&self.config_dir, &caller, config)
+                .map_err(|error| KernelError::Other(format!("{error}")))?;
+        Ok(serde_json::json!({ "entry": caller, "changed": changed }))
+    }
+
     fn get(&self, params: &serde_json::Value) -> Result<serde_json::Value, KernelError> {
         let section = params
             .get("section")
@@ -346,6 +372,7 @@ impl JsonService for SettingsService {
             "undeclare" => self.undeclare(&params),
             "read" => self.read(&params),
             "write" => self.write(&params),
+            "entryConfig" => self.write_entry_config(&params),
             other => Err(KernelError::Other(format!(
                 "settings has no method `{other}`"
             ))),
@@ -677,6 +704,70 @@ mod tests {
             )
             .expect_err("section outside the whitelist must be refused");
         assert!(err.to_string().contains("not readable"), "{err}");
+    }
+
+    /// A composition entry writes its own row's config and no other, and
+    /// only with a caller the plane named.
+    #[test]
+    fn an_entry_writes_its_own_composition_config_and_nobody_elses() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"kernelPlugins":{"plugins":[{"id":"web","config":{"maxUses":1}},{"id":"other","config":{"x":1}}]}}"#,
+        );
+        let kernel = kernel_with_seats(tmp.path());
+        let ctx = kernel.context();
+        let answer = ctx
+            .call_json(
+                SETTINGS_SERVICE,
+                "entryConfig",
+                serde_json::json!({ CALLER_PLUGIN_ID: "web", "config": { "maxUses": 5 } }),
+            )
+            .expect("the caller writes its own row");
+        assert_eq!(
+            answer,
+            serde_json::json!({ "entry": "web", "changed": true })
+        );
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(tmp.path().join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            written["kernelPlugins"]["plugins"],
+            serde_json::json!([
+                { "id": "web", "config": { "maxUses": 5 } },
+                { "id": "other", "config": { "x": 1 } },
+            ])
+        );
+        let anonymous = ctx
+            .call_json(
+                SETTINGS_SERVICE,
+                "entryConfig",
+                serde_json::json!({ "config": { "x": 2 } }),
+            )
+            .expect_err("no caller, no row");
+        assert!(
+            anonymous.to_string().contains(CALLER_PLUGIN_ID),
+            "{anonymous}"
+        );
+        let not_a_row = ctx
+            .call_json(
+                SETTINGS_SERVICE,
+                "entryConfig",
+                serde_json::json!({ CALLER_PLUGIN_ID: "stranger", "config": {} }),
+            )
+            .expect_err("a caller with no row has nothing to write");
+        assert!(not_a_row.to_string().contains("stranger"), "{not_a_row}");
+        let not_an_object = ctx
+            .call_json(
+                SETTINGS_SERVICE,
+                "entryConfig",
+                serde_json::json!({ CALLER_PLUGIN_ID: "web", "config": 3 }),
+            )
+            .expect_err("a config is an object");
+        assert!(
+            not_an_object.to_string().contains("config"),
+            "{not_an_object}"
+        );
     }
 
     #[test]
