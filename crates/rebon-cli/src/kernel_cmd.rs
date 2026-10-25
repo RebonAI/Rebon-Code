@@ -1,9 +1,8 @@
 //! `rebon kernel …` — the kernel loop vendors and where they run.
 //!
 //! Kernel loops run on the plugin plane: each loop's composition entries are
-//! plugins on a Node host of the session's own. There is nothing to install
-//! here — the runtime that hosts them is Node, and `rebon node` is where that
-//! lives.
+//! plugins on a host of the session's own, on Verve inside rebon. There is
+//! nothing to install.
 //!
 //! This module used to install a sidecar process carrying
 //! an embedded V8 so a V8-free rebon could still run loops. The plane serves a
@@ -40,9 +39,5 @@ fn status() -> anyhow::Result<()> {
         };
         println!("  {} — {}  [{}]", vendor.id, vendor.label, state);
     }
-
-    // The runtime a loop needs is the plugin plane's, so the answer to "can
-    // this machine run one" is the answer `rebon node status` gives.
-    println!("\nRuntime: `rebon node status` says which Node the plane would use.");
     Ok(())
 }

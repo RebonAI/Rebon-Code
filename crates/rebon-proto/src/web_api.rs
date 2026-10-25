@@ -406,7 +406,8 @@ pub struct PluginStatus {
     pub loops: Vec<KernelLoopOption>,
 }
 
-/// The Node runtime under a plugin plane.
+/// The runtime under a plugin plane: Verve, inside rebon, and the runner a
+/// contained plugin or a Code Mode program starts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PluginRuntimeStatus {
@@ -416,44 +417,14 @@ pub struct PluginRuntimeStatus {
     /// A count, not a boolean: nothing on the page ever read it as a flag.
     #[serde(rename = "configuredPlugins")]
     pub configured_plugins: usize,
-    /// The versions a runtime may report, as a range someone can read.
-    pub supported: String,
-    /// The runtime that resolved, or `null` if none did.
-    pub resolved: Option<ResolvedRuntime>,
-    /// The resolver's own words for why nothing resolved.
+    /// What plugins run on. Always there: it is part of rebon.
+    pub runtime: String,
+    /// The runner (`rebon-verve`), as a path string, or `null` when it was
+    /// not found beside rebon.
+    pub runner: Option<String>,
+    /// Why the runner was not found: contained plugins and Code Mode cannot
+    /// run until it is.
     pub problem: Option<String>,
-    /// A Node that was found and turned down for its version.
-    ///
-    /// Separate from `problem` because it is a different situation with a
-    /// different fix.
-    #[serde(rename = "outOfRange")]
-    pub out_of_range: Option<OutOfRangeRuntime>,
-    /// Whether `rebon node install` could fix this here.
-    pub installable: bool,
-}
-
-/// One resolved Node.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct ResolvedRuntime {
-    /// The version it reported.
-    pub version: String,
-    /// Where it lives, as a string: the server has a path and the wire has
-    /// no path type.
-    pub executable: String,
-    /// Which rung of the ladder answered: an explicit demand, a managed
-    /// install, or `PATH`.
-    pub origin: String,
-}
-
-/// A Node that answered, but not with a version this build accepts.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct OutOfRangeRuntime {
-    /// The version it reported.
-    pub version: String,
-    /// Where it lives.
-    pub executable: String,
 }
 
 /// The running plane, or the reasons there is none.
@@ -883,18 +854,12 @@ mod tests {
     #[test]
     fn the_plugin_plane_reports_every_key_the_page_was_reading() {
         let status = PluginStatus {
-            host: "node".into(),
+            host: "plane".into(),
             runtime: PluginRuntimeStatus {
                 configured_plugins: 2,
-                supported: ">=22".into(),
-                resolved: Some(ResolvedRuntime {
-                    version: "24.19.0".into(),
-                    executable: "/home/a/.rebon/runtime/node/24.19.0/bin/node".into(),
-                    origin: "managed".into(),
-                }),
+                runtime: "Verve, in rebon".into(),
+                runner: Some("/opt/rebon/rebon-verve".into()),
                 problem: None,
-                out_of_range: None,
-                installable: true,
             },
             plane: PluginPlaneStatus {
                 running: true,
@@ -927,18 +892,12 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&status).unwrap(),
             json!({
-                "host": "node",
+                "host": "plane",
                 "runtime": {
                     "configuredPlugins": 2,
-                    "supported": ">=22",
-                    "resolved": {
-                        "version": "24.19.0",
-                        "executable": "/home/a/.rebon/runtime/node/24.19.0/bin/node",
-                        "origin": "managed",
-                    },
+                    "runtime": "Verve, in rebon",
+                    "runner": "/opt/rebon/rebon-verve",
                     "problem": null,
-                    "outOfRange": null,
-                    "installable": true,
                 },
                 "plane": {
                     "running": true,
@@ -976,17 +935,12 @@ mod tests {
         // The state a fresh install reports, and the one the panel has to be
         // able to draw: nothing resolved, nothing running, nothing composed.
         let status = PluginStatus {
-            host: "node".into(),
+            host: "plane".into(),
             runtime: PluginRuntimeStatus {
                 configured_plugins: 0,
-                supported: ">=22".into(),
-                resolved: None,
-                problem: Some("no usable Node runtime".into()),
-                out_of_range: Some(OutOfRangeRuntime {
-                    version: "18.20.4".into(),
-                    executable: "/usr/bin/node".into(),
-                }),
-                installable: false,
+                runtime: "Verve, in rebon".into(),
+                runner: None,
+                problem: Some("`rebon-verve` was not found beside the running executable".into()),
             },
             plane: PluginPlaneStatus {
                 running: false,
@@ -1002,17 +956,12 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&status).unwrap(),
             json!({
-                "host": "node",
+                "host": "plane",
                 "runtime": {
                     "configuredPlugins": 0,
-                    "supported": ">=22",
-                    "resolved": null,
-                    "problem": "no usable Node runtime",
-                    "outOfRange": {
-                        "version": "18.20.4",
-                        "executable": "/usr/bin/node",
-                    },
-                    "installable": false,
+                    "runtime": "Verve, in rebon",
+                    "runner": null,
+                    "problem": "`rebon-verve` was not found beside the running executable",
                 },
                 "plane": {
                     "running": false,

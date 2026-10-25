@@ -198,38 +198,6 @@ pub(crate) fn run_trust_gate(
     Ok(())
 }
 
-/// Kernel plugin runtime gate. Rebon does not fetch a Node runtime by itself, so a
-/// machine that configured kernel plugins and has nothing to run them on gets asked
-/// here rather than discovering later that the composition quietly did not exist.
-/// `kernelPlugins` is opt-in, so this asks nothing of anyone who did not configure it.
-pub(crate) async fn run_kernel_plugin_runtime_gate(
-    startup_started: std::time::Instant,
-) -> anyhow::Result<()> {
-    if let Some(missing) = rebon_plugin_host::plugin_boot::missing_runtime_for_configured_plugins()
-    {
-        let version = rebon_node_runtime::PINNED_NODE_VERSION.to_string();
-        match startup_dialog::run_node_runtime_dialog(missing.entries, &missing.reason, &version)? {
-            startup_dialog::NodeRuntimeAction::Install => {
-                if let Err(error) = crate::node_cmd::install_pinned_runtime().await {
-                    // Not fatal: a session without kernel plugins is still a
-                    // session, and the person is standing right here to read why.
-                    eprintln!("Could not install Node {version}: {error:#}");
-                    eprintln!("Starting without kernel plugins. `rebon node install` retries.");
-                }
-            }
-            startup_dialog::NodeRuntimeAction::Continue => {
-                tracing::info!("starting without kernel plugins at the user's choice");
-            }
-        }
-    }
-
-    tracing::info!(
-        elapsed_ms = startup_started.elapsed().as_millis() as u64,
-        "rebon startup: kernel plugin runtime gate completed"
-    );
-    Ok(())
-}
-
 /// Credentials gate. `build_tui_session` bails with
 /// `no model credentials found` when neither a rebon-config active
 /// provider nor an `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env var
