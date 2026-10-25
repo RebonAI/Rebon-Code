@@ -34,8 +34,8 @@ cd "$root"
 quick=0
 [ "${1:-}" = "--quick" ] && quick=1
 
-# The Node the plugin host is built and tested against. CI provisions exactly
-# this; the runtime's own resolution refuses anything outside >=24.19.0 <25.
+# The Node CI runs the plane's JavaScript unit tests on (`node --test`). A
+# development tool only: the product runs that JavaScript on Verve.
 PINNED_NODE=24.19.0
 
 started=$(date +%s)
@@ -143,80 +143,13 @@ if [ "$quick" = 1 ]; then
     exit 0
 fi
 
-# ------------------------------------------------------------- resolving node
+# ------------------------------------------------------------- the runner
 
-# Resolved before any suite runs, not just before the plugin-plane ones. CI
-# can leave this to the `verify` job because `test` is a separate job with its
-# own steps; here everything shares one process, and suites outside the plugin
-# plane want it too — `rebon-plugin-mcp` has a test that `expect`s it and
-# panics with `NotPresent` rather than skipping.
-#
-# The plugin-plane tests skip themselves without an absolute REBON_TEST_NODE,
-# and a skipped test reads as a pass, so REBON_REQUIRE_TEST_NODE turns any
-# later skip back into a failure.
-node_bin=${REBON_TEST_NODE:-}
-if [ -z "$node_bin" ] && command -v node >/dev/null 2>&1; then
-    node_bin=$(command -v node)
-fi
-
-# Three suites open a session through the runtime's own resolution ladder,
-# whose version gate is fail-closed: on anything but the pinned Node they
-# refuse rather than run weakly. Rather than asking whoever pushes to switch
-# their global runtime for the length of a hook, look where a pinned Node is
-# normally installed and use it just for this run. Only when PATH does not
-# already have it, and never over an explicit REBON_TEST_NODE.
-if [ -z "${REBON_TEST_NODE:-}" ]; then
-    have_pinned=0
-    if [ -n "$node_bin" ] && [ "$("$node_bin" -p "process.versions.node" 2>/dev/null)" = "$PINNED_NODE" ]; then
-        have_pinned=1
-    fi
-    if [ "$have_pinned" = 0 ]; then
-        # `git config`-style Windows paths arrive with backslashes.
-        nvm_home=$(printf '%s' "${NVM_HOME:-}" | tr '\\' '/')
-        for candidate in \
-            "$nvm_home/v$PINNED_NODE/node.exe" \
-            "$nvm_home/v$PINNED_NODE/bin/node" \
-            "$HOME/.nvm/versions/node/v$PINNED_NODE/bin/node" \
-            "$HOME/.cache/rebon-ci/node-v$PINNED_NODE-darwin-arm64/bin/node"
-        do
-            case "$candidate" in /v"$PINNED_NODE"/*) continue ;; esac
-            if [ -x "$candidate" ]; then
-                echo "preflight -- PATH has no Node $PINNED_NODE; using $candidate for this run"
-                node_bin=$candidate
-                break
-            fi
-        done
-    fi
-fi
-
-if [ -z "$node_bin" ]; then
-    skip "every test that needs a real Node (none on PATH, no REBON_TEST_NODE)"
-else
-    # Absolute: the tests assert it, and a bare `node` from PATH is relative
-    # on some shells.
-    case "$node_bin" in
-        /*|[A-Za-z]:[/\\]*) : ;;
-        *) node_bin=$(cd "$(dirname "$node_bin")" && pwd)/$(basename "$node_bin") ;;
-    esac
-    # Windows: `command -v node` hands back an extensionless path, and
-    # `kernel_loop_backend_plane` passes this value straight to
-    # REBON_PLUGIN_NODE, whose resolution is fail-closed and checks the path
-    # exactly as given. Rust sees no such file and refuses the session with
-    # "no usable Node runtime" on a machine with a working Node.
-    #
-    # Testing `[ -e "$node_bin" ]` first cannot catch this: msys resolves the
-    # extensionless name to node.exe and reports it as existing, so the shell
-    # and Rust disagree about the same string. Prefer the .exe whenever one is
-    # there — on macOS and Linux there never is, so nothing changes.
-    if [ -e "$node_bin.exe" ]; then
-        node_bin="$node_bin.exe"
-    fi
-    REBON_TEST_NODE=$node_bin
-    REBON_REQUIRE_TEST_NODE=1
-    export REBON_TEST_NODE REBON_REQUIRE_TEST_NODE
-    node_version=$("$node_bin" -p "process.versions.node")
-    echo "preflight -- node $node_version at $node_bin"
-fi
+# Built before any suite runs, not just before the plugin-plane ones: contained
+# hosts, Code Mode, the process tests and `rebon-plugin-mcp`'s stdio child all
+# start rebon-verve, and they find it in this target directory.
+say "cargo build -p rebon-verve-host --bin rebon-verve --locked"
+cargo build -q -p rebon-verve-host --bin rebon-verve --locked
 
 # ------------------------------------------------------------------ the tests
 
@@ -252,64 +185,35 @@ retry "the plugin-first crates" cargo test -q --locked -p rebon-core -p rebon-ha
 say "computer-use, serially"
 retry "rebon-plugin-computer-use" cargo test -q -p rebon-plugin-computer-use --locked -- --test-threads=1
 
-# -------------------------------------------------------------- the Node gate
+# -------------------------------------------------------------- the plane gate
 
-if [ -n "$node_bin" ]; then
-    say "plugin protocol on Node $node_version"
-    if [ "$node_version" = "$PINNED_NODE" ]; then
-        # CI pins this version and runs the host's own suites against it.
-        # They assert behaviour of the runtime rebon ships, so a different
-        # Node makes them a test of the wrong thing rather than a weaker one.
-        # `dot` for the same reason `cargo test` runs with `-q`: the default
-        # TAP reporter narrates every passing assertion. Failures still print
-        # in full underneath the dots.
-        "$node_bin" --test --test-reporter=dot runtimes/node/plugin-host/test/*.test.mjs
-        "$node_bin" --test --test-reporter=dot runtimes/node/compose-runtime/test/*.test.mjs
-    else
-        skip "node --test suites (CI pins Node $PINNED_NODE, this run has $node_version)"
-    fi
-
-    # These start a host directly and run on whatever Node is here — a real
-    # child process is all they need.
-    #
-    # Serial where marked: those share one process kernel and process-wide
-    # registration slots, so running them at once is several tests writing one
-    # seat table.
-    retry "rebon-plugin-protocol" cargo test -q -p rebon-plugin-protocol --locked
-    retry "rebon-node-runtime" cargo test -q -p rebon-node-runtime --locked
-    retry "rebon-plugin-supervisor" cargo test -q -p rebon-plugin-supervisor --locked
-    retry "rebon-harness plugin_plane_e2e" cargo test -q -p rebon-harness --test plugin_plane_e2e --locked -- --test-threads=1
-    retry "rebon-code-runner" cargo test -q -p rebon-code-runner --locked -- --test-threads=1
-    retry "rebon-kernel-seats kernel_code_mode_js" cargo test -q -p rebon-kernel-seats --test kernel_code_mode_js --locked
-    retry "rebon-plugin-host kernel_seats_plane" cargo test -q -p rebon-plugin-host --test kernel_seats_plane --locked -- --test-threads=1
-
-    # And these three open a session through the runtime's own resolution
-    # ladder, which enforces the pinned range (>=24.19.0 <25.0.0) and is
-    # fail-closed: on an older Node they do not run weakly, they refuse with
-    # "no usable Node runtime".
-    #
-    # The split is measured rather than guessed: on 22.21.1 everything above
-    # passes and exactly these three refuse.
-    if [ "$node_version" = "$PINNED_NODE" ]; then
-        retry "rebon-harness plugin_plane_loop_e2e" cargo test -q -p rebon-harness --test plugin_plane_loop_e2e --locked -- --test-threads=1
-        retry "rebon-harness kernel_loop_backend_plane" cargo test -q -p rebon-harness --test kernel_loop_backend_plane --locked -- --test-threads=1
-        retry "rebon-harness kernel_mainline_deepseek_js" cargo test -q -p rebon-harness --test kernel_mainline_deepseek_js --locked -- --test-threads=1
-    else
-        skip "3 harness suites that open a session (the runtime's version gate needs Node $PINNED_NODE; this run has $node_version)"
-    fi
-
-    # The same plane on Verve: the host's JavaScript in an isolate inside
-    # rebon, no Node under it. Contained plugins still run on Node, so this
-    # stays in the Node gate until they move too.
-    say "the plugin plane on Verve"
-    retry "rebon-plugin-supervisor on Verve" env REBON_TEST_ENGINE=verve REBON_PLUGIN_RUNTIME=verve cargo test -q -p rebon-plugin-supervisor --locked
-    for suite in plugin_plane_e2e plugin_plane_loop_e2e kernel_loop_backend_plane kernel_mainline_deepseek_js; do
-        retry "rebon-harness $suite on Verve" env REBON_TEST_ENGINE=verve REBON_PLUGIN_RUNTIME=verve cargo test -q -p rebon-harness --test "$suite" --locked -- --test-threads=1
-    done
-    for suite in plane_unload mods_plane; do
-        retry "rebon-plugin-host $suite on Verve" env REBON_TEST_ENGINE=verve REBON_PLUGIN_RUNTIME=verve cargo test -q -p rebon-plugin-host --test "$suite" --locked -- --test-threads=1
-    done
+# The plane's JavaScript keeps its own `node --test` suites. They assert what
+# the JavaScript does, which CI checks on the Node it pins; a different Node
+# would make them a test of the wrong thing, so they run only on that one.
+node_bin=$(command -v node 2>/dev/null || true)
+if [ -n "$node_bin" ] && [ "$("$node_bin" -p "process.versions.node" 2>/dev/null)" = "$PINNED_NODE" ]; then
+    say "the plane's JavaScript unit tests"
+    # `dot` for the same reason `cargo test` runs with `-q`: the default TAP
+    # reporter narrates every passing assertion.
+    "$node_bin" --test --test-reporter=dot runtimes/node/plugin-host/test/*.test.mjs
+    "$node_bin" --test --test-reporter=dot runtimes/node/compose-runtime/test/*.test.mjs
+else
+    skip "node --test suites (CI runs them on Node $PINNED_NODE)"
 fi
+
+# The plane itself, on Verve. Serial where marked: those share one process
+# kernel and process-wide registration slots.
+say "the plugin plane on Verve"
+retry "rebon-plugin-protocol" cargo test -q -p rebon-plugin-protocol --locked
+retry "rebon-plugin-supervisor" cargo test -q -p rebon-plugin-supervisor --locked
+for suite in plugin_plane_e2e plugin_plane_loop_e2e kernel_loop_backend_plane kernel_mainline_deepseek_js plane_boot_failure_stands; do
+    retry "rebon-harness $suite" cargo test -q -p rebon-harness --test "$suite" --locked -- --test-threads=1
+done
+retry "rebon-code-runner" cargo test -q -p rebon-code-runner --locked -- --test-threads=1
+retry "rebon-kernel-seats kernel_code_mode_js" cargo test -q -p rebon-kernel-seats --test kernel_code_mode_js --locked
+for suite in kernel_seats_plane plane_unload mods_plane mods_container; do
+    retry "rebon-plugin-host $suite" cargo test -q -p rebon-plugin-host --test "$suite" --locked -- --test-threads=1
+done
 
 # ------------------------------------------------------------- the other tree
 

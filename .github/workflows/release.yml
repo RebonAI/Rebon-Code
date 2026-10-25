@@ -70,11 +70,9 @@ jobs:
             ~/.cargo/git/db/
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-registry-
-      - name: Provision the pinned Node
-        # The gate below asserts against Node 24.19.0 exactly — the version
-        # rebon-node-runtime pins. Asking the runner's preinstalled Node made
-        # the gate fail on whatever the image last upgraded to, so the
-        # workflow provisions the pinned one.
+      - name: Provision Node for the JavaScript unit tests
+        # A development tool only: the plane's JavaScript keeps `node --test`
+        # suites. The product runs that JavaScript on Verve.
         uses: actions/setup-node@v7
         with:
           node-version: 24.19.0
@@ -87,9 +85,9 @@ jobs:
       - name: Cargo check
         run: cargo check -p rebon-cli --locked
       - name: No JS engine in the build graph
-        # V8 is gone and Boa is a separate one-shot process. Nothing rebon links
-        # embeds a JS engine, and the way that changes is one dependency line —
-        # so it is checked rather than remembered.
+        # V8 is gone. The one engine rebon links is Verve's Boa, and the way
+        # another comes back is one dependency line — so it is checked rather
+        # than remembered.
         run: |
           set -eu
           cargo check -p rebon-harness -p rebon-kernel-seats -p rebon-provider -p rebon-plugin-host --locked
@@ -136,95 +134,56 @@ jobs:
           t.start()
           t.join()
           EOF
-      - name: Verify plugin protocol on Node 24.19
+      - name: Verify the plugin plane on Verve
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # The JavaScript the plane runs keeps its own unit tests, written for
+          # `node --test`; Node is a development tool here and nothing more —
+          # the product runs that same JavaScript on Verve.
           $node = (@(Get-Command node -CommandType Application -ErrorAction Stop))[0].Source
-          $version = & $node -p "process.versions.node"
-          if ($version -ne '24.19.0') { throw "plugin protocol requires Node 24.19.0, found $version at $node" }
-          $tests = Get-ChildItem runtimes/node/plugin-host/test/*.test.mjs | ForEach-Object { $_.FullName }
-          & $node --test @tests
-          if ($LASTEXITCODE -ne 0) { throw "Node plugin host tests failed with exit code $LASTEXITCODE" }
-          # The composition runtime runs the vendored dsh payload on this same
-          # Node. Its tests are what say whether a package in that payload still
-          # loads outside deno_core, so they belong to the same gate.
-          $composeTests = Get-ChildItem runtimes/node/compose-runtime/test/*.test.mjs | ForEach-Object { $_.FullName }
-          & $node --test @composeTests
-          if ($LASTEXITCODE -ne 0) { throw "Node compose runtime tests failed with exit code $LASTEXITCODE" }
-          # The Claude Code mods runtime: the JSX/TypeScript transform, the
-          # hook chain and a real .tsx mod loaded through the loader seam.
-          $modsTests = Get-ChildItem runtimes/node/mods-runtime/test/*.test.mjs | ForEach-Object { $_.FullName }
-          & $node --test @modsTests
-          if ($LASTEXITCODE -ne 0) { throw "Node mods runtime tests failed with exit code $LASTEXITCODE" }
-          $env:REBON_TEST_NODE = $node
-          $env:REBON_REQUIRE_TEST_NODE = '1'
+          foreach ($suite in 'plugin-host', 'compose-runtime', 'mods-runtime') {
+            $tests = Get-ChildItem "runtimes/node/$suite/test/*.test.mjs" | ForEach-Object { $_.FullName }
+            & $node --test @tests
+            if ($LASTEXITCODE -ne 0) { throw "$suite unit tests failed with exit code $LASTEXITCODE" }
+          }
+          # The runner contained hosts, Code Mode and the process tests start,
+          # built once and named for every suite below.
+          cargo build -p rebon-verve-host --bin rebon-verve --locked
+          if ($LASTEXITCODE -ne 0) { throw "building rebon-verve failed with exit code $LASTEXITCODE" }
+          $env:REBON_VERVE = (Resolve-Path target/debug/rebon-verve.exe).Path
           cargo test -p rebon-plugin-protocol --locked
-          if ($LASTEXITCODE -ne 0) { throw "Rust plugin protocol tests failed with exit code $LASTEXITCODE" }
-          # The runtime crate's drift test reads the gate above back, so it has
-          # to run here: a range change that misses this file must fail CI.
-          cargo test -p rebon-node-runtime --locked
-          if ($LASTEXITCODE -ne 0) { throw "Node runtime tests failed with exit code $LASTEXITCODE" }
-          # The supervisor's integration tests drive real child processes; they
-          # skip without REBON_TEST_NODE, which is set above.
+          if ($LASTEXITCODE -ne 0) { throw "Plugin protocol tests failed with exit code $LASTEXITCODE" }
+          cargo test -p rebon-verve-host --locked
+          if ($LASTEXITCODE -ne 0) { throw "Verve host tests failed with exit code $LASTEXITCODE" }
           cargo test -p rebon-plugin-supervisor --locked
           if ($LASTEXITCODE -ne 0) { throw "Plugin supervisor tests failed with exit code $LASTEXITCODE" }
           # The embedder half: a real host, the real composition runtime, and
-          # rebon's own kernel seats on this side. It is the only test that
-          # proves the two halves agree about a whole composition.
-          # Serial: these share one process kernel and process-wide registration
-          # slots, so running them at once is three tests writing one seat table.
+          # rebon's own kernel seats on this side. Serial: these share one
+          # process kernel and process-wide registration slots.
           cargo test -p rebon-harness --test plugin_plane_e2e --locked -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Plugin plane end-to-end tests failed with exit code $LASTEXITCODE" }
-          # And a whole agent loop on a host of its own, driven the way a session
-          # drives one. It sets process-wide environment, so it runs alone.
+          # A whole agent loop on a host of its own. Sets process-wide
+          # environment, so it runs alone.
           cargo test -p rebon-harness --test plugin_plane_loop_e2e --locked -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Plugin plane loop tests failed with exit code $LASTEXITCODE" }
-          # Code Mode belongs to this gate for the reason it was broken: its
-          # suite takes whichever Node is on PATH, so on a machine with an older
-          # one it stayed green while every Code Mode process on the version
-          # rebon actually pins died at `bad option`. Running it here is what
-          # makes the pinned runtime the one the assertions are made against.
+          cargo test -p rebon-harness --test kernel_loop_backend_plane --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Kernel loop backend tests failed with exit code $LASTEXITCODE" }
+          cargo test -p rebon-harness --test kernel_mainline_deepseek_js --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Mainline composition tests failed with exit code $LASTEXITCODE" }
+          cargo test -p rebon-harness --test plane_boot_failure_stands --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Plane boot failure tests failed with exit code $LASTEXITCODE" }
+          # Code Mode: model-authored programs in a contained rebon-verve.
           cargo test -p rebon-code-runner --locked -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Code Mode executor tests failed with exit code $LASTEXITCODE" }
           cargo test -p rebon-kernel-seats --test kernel_code_mode_js --locked
           if ($LASTEXITCODE -ne 0) { throw "Code Mode acceptance tests failed with exit code $LASTEXITCODE" }
-          # The backend seam a session sees, on the plane. Sets process-wide
-          # environment, so it runs alone.
-          cargo test -p rebon-harness --test kernel_loop_backend_plane --locked -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw "Kernel loop backend tests failed with exit code $LASTEXITCODE" }
-          # Rebon's own seats, reached the way a plugin reaches them. Serial:
-          # one kernel and process-wide registration slots.
-          cargo test -p rebon-plugin-host --test kernel_seats_plane --locked -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw "Kernel seat tests failed with exit code $LASTEXITCODE" }
-          # A Claude Code mod on the real plane: loaded through the compose
-          # loader, seated, drawn, and heard by the policy subscriber.
-          cargo test -p rebon-plugin-host --test mods_plane --locked -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw "Mods plane tests failed with exit code $LASTEXITCODE" }
-          # And the whole chain from one config.json, which is the shape a user
-          # actually arrives in.
-          cargo test -p rebon-harness --test kernel_mainline_deepseek_js --locked -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw "Mainline composition tests failed with exit code $LASTEXITCODE" }
-          # The same plane on Verve: the host's JavaScript in an isolate inside
-          # rebon, no Node under it. Contained plugins still run on Node, which
-          # is why this stays inside the Node gate for now.
-          $env:REBON_TEST_ENGINE = 'verve'
-          $env:REBON_PLUGIN_RUNTIME = 'verve'
-          cargo test -p rebon-plugin-supervisor --locked
-          if ($LASTEXITCODE -ne 0) { throw "Plugin supervisor tests on Verve failed with exit code $LASTEXITCODE" }
-          cargo test -p rebon-harness --test plugin_plane_e2e --locked -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw "Plugin plane end-to-end tests on Verve failed with exit code $LASTEXITCODE" }
-          cargo test -p rebon-harness --test plugin_plane_loop_e2e --locked -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw "Plugin plane loop tests on Verve failed with exit code $LASTEXITCODE" }
-          cargo test -p rebon-harness --test kernel_loop_backend_plane --locked -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw "Kernel loop backend tests on Verve failed with exit code $LASTEXITCODE" }
-          cargo test -p rebon-harness --test kernel_mainline_deepseek_js --locked -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw "Mainline composition tests on Verve failed with exit code $LASTEXITCODE" }
-          cargo test -p rebon-plugin-host --test plane_unload --locked -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw "Plane unload tests on Verve failed with exit code $LASTEXITCODE" }
-          cargo test -p rebon-plugin-host --test mods_plane --locked -- --test-threads=1
-          if ($LASTEXITCODE -ne 0) { throw "Mods plane tests on Verve failed with exit code $LASTEXITCODE" }
-          Remove-Item Env:REBON_TEST_ENGINE, Env:REBON_PLUGIN_RUNTIME
+          # Rebon's own seats, reached the way a plugin reaches them; unload
+          # deadlines; Claude Code mods on the real plane.
+          foreach ($suite in 'kernel_seats_plane', 'plane_unload', 'mods_plane', 'mods_container') {
+            cargo test -p rebon-plugin-host --test $suite --locked -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "$suite tests failed with exit code $LASTEXITCODE" }
+          }
       - name: Check isolated Boa runner target portability
         run: |
           set -eu
@@ -260,6 +219,10 @@ jobs:
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-registry-
       - run: cargo test -p rebon-cli --locked
+      - name: Build the runner the plane's tests start
+        # Contained hosts, Code Mode and the process tests run on rebon-verve;
+        # the tests find it in this target directory.
+        run: cargo build -p rebon-verve-host --bin rebon-verve --locked
       - name: Test the crates the plugin-first refactor touches
         # rebon-core's unit tests (and the ACP end-to-end tests that moved
         # to rebon-harness) cannot run on the main development machine: its
