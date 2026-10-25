@@ -151,7 +151,8 @@ jobs:
           # built once and named for every suite below.
           cargo build -p rebon-verve-host --bin rebon-verve --locked
           if ($LASTEXITCODE -ne 0) { throw "building rebon-verve failed with exit code $LASTEXITCODE" }
-          $env:REBON_VERVE = (Resolve-Path target/debug/rebon-verve.exe).Path
+          $runner = if ($IsWindows) { "target/debug/rebon-verve.exe" } else { "target/debug/rebon-verve" }
+          $env:REBON_VERVE = (Resolve-Path $runner).Path
           cargo test -p rebon-plugin-protocol --locked
           if ($LASTEXITCODE -ne 0) { throw "Plugin protocol tests failed with exit code $LASTEXITCODE" }
           cargo test -p rebon-verve-host --locked
