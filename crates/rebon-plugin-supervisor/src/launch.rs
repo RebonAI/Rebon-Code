@@ -1,4 +1,5 @@
-//! Starting a host: a Node process, or a Verve isolate in this process.
+//! Starting a host: a Verve isolate in this process, or a `rebon-verve`
+//! process of its own for a host something confines.
 //!
 //! Everything the supervisor does with a host goes through three byte streams
 //! and a handle that ends it, so this is the one place that knows which kind it
@@ -11,17 +12,17 @@ use tokio::process::Child;
 
 use crate::{host_command, HostConfig};
 
-/// What runs a plugin host's JavaScript.
+/// Where a plugin host's JavaScript runs. Verve either way; what differs is
+/// whether the host shares this process.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HostEngine {
-    /// `node cli.mjs`, a child process: the host as it has always run, and the
-    /// only engine with a permission model for a contained host.
+    /// An isolate inside this process: the trusted plane's shared host and a
+    /// session's loop host.
     #[default]
-    Node,
-    /// The same `cli.mjs` on Verve, an isolate inside this process: no Node to
-    /// install. Not for a contained host yet — Verve has no permission model
-    /// to confine one with.
-    Verve,
+    Isolate,
+    /// `rebon-verve cli.mjs`, a process of its own, under Verve's permission
+    /// flags and whatever OS sandbox wraps it: a contained host.
+    Process,
 }
 
 pub(crate) type HostInput = Box<dyn AsyncWrite + Send + Unpin>;
@@ -37,28 +38,30 @@ pub(crate) struct Launched {
 
 /// The host as something that can be ended and waited for.
 pub(crate) enum HostProcess {
-    Node(Child),
-    Verve(rebon_verve_host::VerveProcess),
+    /// A runner process of its own (boxed: a `Child` is far larger than
+    /// the isolate's handle).
+    Process(Box<Child>),
+    Isolate(rebon_verve_host::VerveProcess),
 }
 
 impl HostProcess {
     /// Ends the host without asking it.
     pub(crate) fn start_kill(&mut self) {
         match self {
-            Self::Node(child) => {
+            Self::Process(child) => {
                 let _ = child.start_kill();
             }
-            Self::Verve(process) => process.start_kill(),
+            Self::Isolate(process) => process.start_kill(),
         }
     }
 
     /// Waits for the host to leave.
     pub(crate) async fn wait(&mut self) {
         match self {
-            Self::Node(child) => {
+            Self::Process(child) => {
                 let _ = child.wait().await;
             }
-            Self::Verve(process) => {
+            Self::Isolate(process) => {
                 process.wait().await;
             }
         }
@@ -68,7 +71,7 @@ impl HostProcess {
 /// Starts the host `config` describes.
 pub(crate) fn launch(config: &HostConfig) -> io::Result<Launched> {
     match config.engine {
-        HostEngine::Node => {
+        HostEngine::Process => {
             let mut child = host_command(config).spawn()?;
             let stdin = child.stdin.take().expect("stdin was piped");
             let stdout = child.stdout.take().expect("stdout was piped");
@@ -77,16 +80,16 @@ pub(crate) fn launch(config: &HostConfig) -> io::Result<Launched> {
                 stdin: Box::new(stdin),
                 stdout: Box::new(stdout),
                 stderr: Box::new(stderr),
-                process: HostProcess::Node(child),
+                process: HostProcess::Process(Box::new(child)),
             })
         }
-        HostEngine::Verve => {
-            // Refused rather than run unconfined: a launcher and Node's
-            // permission flags are how a contained host is held, and Verve
-            // would silently drop both.
-            if config.launcher.is_some() || !config.node_args.is_empty() {
+        HostEngine::Isolate => {
+            // Refused rather than run unconfined: a launcher and the runner's
+            // permission flags are how a contained host is held, and an
+            // isolate in this process would silently drop both.
+            if config.launcher.is_some() || !config.runner_args.is_empty() {
                 return Err(io::Error::other(
-                    "a contained plugin host cannot run on Verve yet: it has no permission model",
+                    "a contained plugin host runs as a process of its own, not in this one",
                 ));
             }
             let host = rebon_verve_host::spawn(rebon_verve_host::VerveHostSpec {
@@ -95,15 +98,15 @@ pub(crate) fn launch(config: &HostConfig) -> io::Result<Launched> {
                 environment: config.environment.clone(),
                 working_directory: config.working_directory.clone(),
                 name: format!("plugin-host-{}", config.host_epoch),
-                // Uncontained, as the check above made sure: what a trusted
-                // Node host has.
+                // Uncontained, as the check above made sure: everything, as a
+                // trusted host has.
                 permissions: rebon_verve_host::VerveHostSpec::trusted(),
             })?;
             Ok(Launched {
                 stdin: Box::new(host.stdin),
                 stdout: Box::new(host.stdout),
                 stderr: Box::new(host.stderr),
-                process: HostProcess::Verve(host.process),
+                process: HostProcess::Isolate(host.process),
             })
         }
     }

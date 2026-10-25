@@ -1,8 +1,9 @@
-//! Runs the Node plugin host and stays responsible for it.
+//! Runs the plugin host and stays responsible for it.
 //!
-//! The protocol crate says what a frame means; [`rebon_node_runtime`] says which
-//! Node may run; this crate is what actually starts a process, speaks NDJSON to
-//! it over stdio, and decides what happens when it stops answering.
+//! The protocol crate says what a frame means; this crate is what actually
+//! starts a host — a Verve isolate in this process, or a `rebon-verve` process
+//! for a contained one — speaks NDJSON to it over its three streams, and
+//! decides what happens when it stops answering.
 //!
 //! # What supervision means here
 //!
@@ -97,8 +98,8 @@ use tokio::{
     sync::{mpsc, oneshot, Mutex, Notify},
 };
 
-pub use state::{HostFailure, Inbound, StateError, SupervisorState, HOST_FAILED_CODE};
 pub use launch::HostEngine;
+pub use state::{HostFailure, Inbound, StateError, SupervisorState, HOST_FAILED_CODE};
 
 use launch::{launch, HostInput, HostOutput, HostProcess, Launched};
 
@@ -237,8 +238,8 @@ pub trait EventPublisher: Send + Sync {
 }
 
 /// An OS sandbox a host runs under: the complete command line it runs instead
-/// of Node's (the Node command is inside it), with the environment changes
-/// it asks for applied over the host's own.
+/// of the runner's (the runner's command is inside it), with the environment
+/// changes it asks for applied over the host's own.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HostLauncher {
     pub program: PathBuf,
@@ -247,30 +248,30 @@ pub struct HostLauncher {
     pub env_unset: Vec<OsString>,
 }
 
-/// Node's own command line for a host: Node's flags, the host script and its
-/// arguments. What a launcher wraps.
-pub fn node_argv(config: &HostConfig) -> Vec<OsString> {
-    let mut argv: Vec<OsString> = vec![config.node.clone().into_os_string()];
-    argv.extend(config.node_args.iter().cloned());
+/// The runner's own command line for a host: its flags, the host script and
+/// the script's arguments. What a launcher wraps.
+pub fn runner_argv(config: &HostConfig) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = vec![config.runner.clone().into_os_string()];
+    argv.extend(config.runner_args.iter().cloned());
     argv.push(config.host_script.clone().into_os_string());
     argv.extend(config.host_args.iter().map(OsString::from));
     argv
 }
 
 /// The argv a host starts with: the launcher's whole command line when there
-/// is one, else Node's.
+/// is one, else the runner's.
 pub fn host_argv(config: &HostConfig) -> (OsString, Vec<OsString>) {
-    let mut node: Vec<OsString> =
-        Vec::with_capacity(config.node_args.len() + config.host_args.len() + 2);
-    node.extend(config.node_args.iter().cloned());
-    node.push(config.host_script.clone().into_os_string());
-    node.extend(config.host_args.iter().map(OsString::from));
+    let mut own: Vec<OsString> =
+        Vec::with_capacity(config.runner_args.len() + config.host_args.len() + 2);
+    own.extend(config.runner_args.iter().cloned());
+    own.push(config.host_script.clone().into_os_string());
+    own.extend(config.host_args.iter().map(OsString::from));
     match &config.launcher {
         Some(launcher) => (
             launcher.program.clone().into_os_string(),
             launcher.args.clone(),
         ),
-        None => (config.node.clone().into_os_string(), node),
+        None => (config.runner.clone().into_os_string(), own),
     }
 }
 
@@ -307,9 +308,10 @@ fn host_command(config: &HostConfig) -> Command {
 
 #[derive(Clone)]
 pub struct HostConfig {
-    /// Absolute Node executable, normally from
-    /// `rebon_node_runtime::NodeRuntimeResolver`.
-    pub node: PathBuf,
+    /// The absolute runner a process host is started with: `rebon-verve`,
+    /// from `rebon_types::sibling_binary::verve_runner`. Unused by an
+    /// isolate.
+    pub runner: PathBuf,
     /// Absolute path to the host's `cli.mjs`.
     pub host_script: PathBuf,
     /// Extra arguments handed to the host script.
@@ -319,20 +321,22 @@ pub struct HostConfig {
     /// host refuses to start rather than falling back if it cannot build the
     /// loader it was pointed at, so this is a demand rather than a hint.
     pub host_args: Vec<String>,
-    /// Arguments for Node itself, ahead of the host script: the permission
-    /// flags a contained host runs under (`--permission`, `--allow-fs-read`).
-    pub node_args: Vec<OsString>,
+    /// Arguments for the runner itself, ahead of the host script: the
+    /// permission flags a contained host runs under (`--permission`,
+    /// `--allow-fs-read`, `--allow-net`).
+    pub runner_args: Vec<OsString>,
     /// The whole environment the host starts with. `None` inherits this
     /// process's, which is what the trusted process plane does; a contained
     /// host gets exactly the variables it was granted and nothing else, so a
     /// key in the parent's environment is not a plugin's to read.
     pub environment: Option<Vec<(OsString, OsString)>>,
     /// What the host runs under, when something confines it: an OS sandbox
-    /// whose argv ends where Node's begins.
+    /// whose argv ends where the runner's begins.
     pub launcher: Option<HostLauncher>,
-    /// What runs the host's JavaScript. Node unless the caller chose Verve;
-    /// `node`, `node_args` and `launcher` mean nothing to Verve, which refuses
-    /// a config that confines its host with them.
+    /// Where the host runs: an isolate in this process (the default), or a
+    /// runner process of its own. `runner`, `runner_args` and `launcher` mean
+    /// nothing to an isolate, which refuses a config that confines its host
+    /// with them.
     pub engine: HostEngine,
     pub working_directory: PathBuf,
     pub host_epoch: u64,
@@ -358,10 +362,10 @@ pub struct HostConfig {
 impl std::fmt::Debug for HostConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostConfig")
-            .field("node", &self.node)
+            .field("runner", &self.runner)
             .field("host_script", &self.host_script)
             .field("host_args", &self.host_args)
-            .field("node_args", &self.node_args)
+            .field("runner_args", &self.runner_args)
             .field(
                 "environment",
                 &self.environment.as_ref().map(|vars| vars.len()),
@@ -382,15 +386,15 @@ impl std::fmt::Debug for HostConfig {
 }
 
 impl HostConfig {
-    pub fn new(node: impl Into<PathBuf>, host_script: impl Into<PathBuf>) -> Self {
+    pub fn new(runner: impl Into<PathBuf>, host_script: impl Into<PathBuf>) -> Self {
         Self {
-            node: node.into(),
+            runner: runner.into(),
             host_script: host_script.into(),
             host_args: Vec::new(),
-            node_args: Vec::new(),
+            runner_args: Vec::new(),
             environment: None,
             launcher: None,
-            engine: HostEngine::Node,
+            engine: HostEngine::Isolate,
             // A constructor default the caller overrides per host; a vanished
             // cwd is not this crate's error to raise.
             working_directory: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -1001,7 +1005,7 @@ impl std::fmt::Debug for PluginHostSupervisor {
     /// used to diagnose.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PluginHostSupervisor")
-            .field("node", &self.config.node)
+            .field("runner", &self.config.runner)
             .field("host_script", &self.config.host_script)
             .field("host_epoch", &self.config.host_epoch)
             .finish_non_exhaustive()
@@ -2325,18 +2329,18 @@ mod tests {
     }
 
     #[test]
-    fn an_unconfined_host_is_node_then_its_script_then_the_host_arguments() {
-        let config = HostConfig::new("/n/node", "/h/cli.mjs").with_loader("/c/index.mjs");
+    fn an_unconfined_host_is_the_runner_then_its_script_then_the_host_arguments() {
+        let config = HostConfig::new("/n/rebon-verve", "/h/cli.mjs").with_loader("/c/index.mjs");
         let (program, args) = host_argv(&config);
-        assert_eq!(program, OsString::from("/n/node"));
+        assert_eq!(program, OsString::from("/n/rebon-verve"));
         assert_eq!(args, os(&["/h/cli.mjs", "--loader", "/c/index.mjs"]));
         assert!(config.environment.is_none(), "the trusted plane inherits");
     }
 
     #[test]
-    fn node_flags_go_before_the_script_so_node_reads_them_not_the_host() {
-        let mut config = HostConfig::new("/n/node", "/h/cli.mjs");
-        config.node_args = os(&["--permission", "--allow-fs-read=/p"]);
+    fn runner_flags_go_before_the_script_so_the_runner_reads_them_not_the_host() {
+        let mut config = HostConfig::new("/n/rebon-verve", "/h/cli.mjs");
+        config.runner_args = os(&["--permission", "--allow-fs-read=/p"]);
         let (_, args) = host_argv(&config);
         assert_eq!(
             args,
@@ -2345,15 +2349,16 @@ mod tests {
     }
 
     #[test]
-    fn a_launcher_runs_its_whole_command_line_which_carries_nodes() {
-        let mut config = HostConfig::new("/n/node", "/h/cli.mjs").with_loader("/c/index.mjs");
-        config.node_args = os(&["--permission"]);
+    fn a_launcher_runs_its_whole_command_line_which_carries_the_runners() {
+        let mut config =
+            HostConfig::new("/n/rebon-verve", "/h/cli.mjs").with_loader("/c/index.mjs");
+        config.runner_args = os(&["--permission"]);
         let mut wrapped = os(&["exec", "--"]);
-        wrapped.extend(node_argv(&config));
+        wrapped.extend(runner_argv(&config));
         assert_eq!(
-            node_argv(&config),
+            runner_argv(&config),
             os(&[
-                "/n/node",
+                "/n/rebon-verve",
                 "--permission",
                 "/h/cli.mjs",
                 "--loader",
@@ -2372,7 +2377,7 @@ mod tests {
             os(&[
                 "exec",
                 "--",
-                "/n/node",
+                "/n/rebon-verve",
                 "--permission",
                 "/h/cli.mjs",
                 "--loader",
@@ -2383,7 +2388,7 @@ mod tests {
 
     #[test]
     fn a_granted_environment_replaces_the_inherited_one() {
-        let mut config = HostConfig::new("/n/node", "/h/cli.mjs");
+        let mut config = HostConfig::new("/n/rebon-verve", "/h/cli.mjs");
         config.environment = Some(vec![(OsString::from("ONLY"), OsString::from("this"))]);
         config.launcher = Some(HostLauncher {
             program: PathBuf::from("/s/sandbox"),

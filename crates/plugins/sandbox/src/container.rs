@@ -200,7 +200,7 @@ fn wrap_host(
                     .to_owned(),
             );
         }
-        let mut read: Vec<PathBuf> = request.node.parent().map(plain).into_iter().collect();
+        let mut read: Vec<PathBuf> = request.runner.parent().map(plain).into_iter().collect();
         for root in &request.read {
             let root = plain(root);
             if !read.contains(&root) {
@@ -340,8 +340,8 @@ mod tests {
         let confinement = ContainerSandbox
             .confine(&ConfineRequest {
                 container: "mod-x".into(),
-                node: "/n/node".into(),
-                argv: vec!["/n/node".into()],
+                runner: "/n/rebon-verve".into(),
+                argv: vec!["/n/rebon-verve".into()],
                 environment: Vec::new(),
                 read: Vec::new(),
                 write: "/d".into(),
@@ -393,7 +393,7 @@ mod tests {
         let confinement = ContainerSandbox
             .confine(&ConfineRequest {
                 container: "pkg-x".into(),
-                node: "/n/node".into(),
+                runner: "/n/rebon-verve".into(),
                 argv: Vec::new(),
                 environment: Vec::new(),
                 read: Vec::new(),
@@ -433,7 +433,7 @@ mod tests {
     fn host_request() -> ConfineRequest {
         ConfineRequest {
             container: "pkg-exa".into(),
-            node: PathBuf::from(r"C:\node\node.exe"),
+            runner: PathBuf::from(r"C:\node\node.exe"),
             argv: vec![
                 r"C:\node\node.exe".into(),
                 "--permission".into(),
@@ -485,7 +485,10 @@ mod tests {
         };
         assert!(args.contains(&"--pipe-stdin".to_owned()), "{args:?}");
         assert!(args.contains(&"--block-network".to_owned()), "{args:?}");
-        assert!(has("--allow-read", r"C:\node"), "Node itself: {args:?}");
+        assert!(
+            has("--allow-read", r"C:\node"),
+            "the runner itself: {args:?}"
+        );
         assert!(has("--allow-read", r"C:\pkgs\exa"), "the package: {args:?}");
         assert!(
             has("--allow-write", r"C:\data\pkg-exa"),
@@ -513,7 +516,7 @@ mod tests {
                 "--permission",
                 r"C:\rt\plugin-host\src\cli.mjs"
             ],
-            "Node's own command line ends it"
+            "the runner's own command line ends it"
         );
     }
 
@@ -535,7 +538,7 @@ mod tests {
     fn confining_outside_a_runtime_is_refused_not_unrestricted() {
         let refused = ContainerSandbox.confine(&ConfineRequest {
             container: "mod-x".into(),
-            node: "/n/node".into(),
+            runner: "/n/rebon-verve".into(),
             argv: Vec::new(),
             environment: Vec::new(),
             read: Vec::new(),

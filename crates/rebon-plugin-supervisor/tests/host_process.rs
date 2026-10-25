@@ -1,9 +1,8 @@
-//! The supervisor against real child processes.
+//! The supervisor against real child processes: `rebon-verve` hosts.
 //!
-//! Gated on `REBON_TEST_NODE` the same way the protocol crate's cross-language
-//! contract is, so a machine without the supported runtime skips rather than
-//! fails — and `REBON_REQUIRE_TEST_NODE=1` turns the skip back into a failure
-//! where the runtime is supposed to exist.
+//! They need the runner built (`cargo build -p rebon-verve-host --bin
+//! rebon-verve`) or named by `REBON_VERVE`; without it they fail and say so,
+//! rather than skip.
 //!
 //! Most cases drive purpose-built scripts rather than the real host, because
 //! what is being tested is how the supervisor behaves when a host misbehaves,
@@ -11,26 +10,33 @@
 
 use std::{env, path::PathBuf, time::Duration};
 
-use rebon_plugin_supervisor::{HostCallError, HostConfig, PluginHostSupervisor, SupervisorError};
+use rebon_plugin_supervisor::{
+    HostCallError, HostConfig, HostEngine, PluginHostSupervisor, SupervisorError,
+};
 
-/// The Node to drive tests with, or `None` when this machine has none.
-fn node() -> Option<PathBuf> {
-    match env::var_os("REBON_TEST_NODE") {
-        Some(node) => {
-            let node = PathBuf::from(node);
-            assert!(node.is_absolute(), "REBON_TEST_NODE must be absolute");
-            Some(node)
-        }
-        None => {
-            assert_ne!(
-                env::var_os("REBON_REQUIRE_TEST_NODE").as_deref(),
-                Some(std::ffi::OsStr::new("1")),
-                "REBON_REQUIRE_TEST_NODE=1 requires an absolute REBON_TEST_NODE"
-            );
-            eprintln!("skipping: set REBON_TEST_NODE to an absolute Node executable");
-            None
-        }
+/// The runner a process host starts: `REBON_VERVE`, or the `rebon-verve` this
+/// target directory built (`cargo build -p rebon-verve-host --bin rebon-verve`).
+fn runner() -> PathBuf {
+    if let Some(path) = env::var_os("REBON_VERVE") {
+        return PathBuf::from(path);
     }
+    let exe = env::current_exe().expect("the test knows its own path");
+    let name = if cfg!(windows) {
+        "rebon-verve.exe"
+    } else {
+        "rebon-verve"
+    };
+    let built = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("a test binary lives in target/<profile>/deps")
+        .join(name);
+    assert!(
+        built.is_file(),
+        "process hosts need the runner: build it with \
+         `cargo build -p rebon-verve-host --bin rebon-verve`, or set REBON_VERVE"
+    );
+    built
 }
 
 fn real_host() -> PathBuf {
@@ -44,16 +50,21 @@ fn fake_host(dir: &std::path::Path, body: &str) -> PathBuf {
     script
 }
 
-fn config(node: &std::path::Path, script: PathBuf) -> HostConfig {
-    HostConfig::new(node, script)
+/// A process host with nothing confining it: what these cases test is the
+/// supervisor, not the permission model.
+fn config(runner: &std::path::Path, script: PathBuf) -> HostConfig {
+    let mut config = HostConfig::new(runner, script)
+        .with_engine(HostEngine::Process)
         .with_startup_timeout(Duration::from_secs(20))
-        .with_working_directory(env::temp_dir())
+        .with_working_directory(env::temp_dir());
+    config.runner_args = vec!["--allow-all".into()];
+    config
 }
 
 #[tokio::test]
 async fn the_supervisor_drives_the_real_host_through_its_lifecycle() {
-    let Some(node) = node() else { return };
-    let supervisor = PluginHostSupervisor::start(config(&node, real_host()))
+    let runner = runner();
+    let supervisor = PluginHostSupervisor::start(config(&runner, real_host()))
         .await
         .expect("host starts and initializes");
     assert!(supervisor.is_alive().await);
@@ -86,8 +97,8 @@ async fn the_supervisor_drives_the_real_host_through_its_lifecycle() {
 /// breaking: the call fails and everything else keeps working.
 #[tokio::test]
 async fn an_unsupported_method_is_a_rejection_not_a_host_failure() {
-    let Some(node) = node() else { return };
-    let supervisor = PluginHostSupervisor::start(config(&node, real_host()))
+    let runner = runner();
+    let supervisor = PluginHostSupervisor::start(config(&runner, real_host()))
         .await
         .unwrap();
 
@@ -121,14 +132,14 @@ async fn an_unsupported_method_is_a_rejection_not_a_host_failure() {
 /// The rule the state machine encodes, proven against a process that really dies.
 #[tokio::test]
 async fn a_host_that_exits_immediately_fails_the_handshake_with_its_stderr() {
-    let Some(node) = node() else { return };
+    let runner = runner();
     let dir = tempfile::tempdir().unwrap();
     let script = fake_host(
         dir.path(),
         "process.stderr.write('boom: the host could not start\\n');\nprocess.exit(9);\n",
     );
 
-    let error = PluginHostSupervisor::start(config(&node, script))
+    let error = PluginHostSupervisor::start(config(&runner, script))
         .await
         .expect_err("a host that exits cannot initialize");
     let rendered = error.to_string();
@@ -142,14 +153,14 @@ async fn a_host_that_exits_immediately_fails_the_handshake_with_its_stderr() {
 /// and a decoder that has lost framing can answer the wrong call.
 #[tokio::test]
 async fn junk_on_stdout_is_fatal_rather_than_skipped() {
-    let Some(node) = node() else { return };
+    let runner = runner();
     let dir = tempfile::tempdir().unwrap();
     let script = fake_host(
         dir.path(),
         "process.stdout.write('not a frame\\n');\nsetTimeout(() => {}, 60_000);\n",
     );
 
-    let error = PluginHostSupervisor::start(config(&node, script))
+    let error = PluginHostSupervisor::start(config(&runner, script))
         .await
         .expect_err("a host that pollutes stdout is unusable");
     let rendered = error.to_string();
@@ -163,15 +174,13 @@ async fn junk_on_stdout_is_fatal_rather_than_skipped() {
 /// so the handshake is the one call with a clock on it.
 #[tokio::test]
 async fn a_silent_host_fails_the_handshake_instead_of_hanging() {
-    let Some(node) = node() else { return };
+    let runner = runner();
     let dir = tempfile::tempdir().unwrap();
     let script = fake_host(dir.path(), "setTimeout(() => {}, 60_000);\n");
 
     let started = std::time::Instant::now();
     let error = PluginHostSupervisor::start(
-        HostConfig::new(&node, script)
-            .with_startup_timeout(Duration::from_millis(750))
-            .with_working_directory(env::temp_dir()),
+        config(&runner, script).with_startup_timeout(Duration::from_millis(750)),
     )
     .await
     .expect_err("a silent host cannot initialize");
@@ -186,10 +195,10 @@ async fn a_silent_host_fails_the_handshake_instead_of_hanging() {
 /// rather than as the host having answered.
 #[tokio::test]
 async fn a_failed_start_reports_a_host_failure_not_a_rejection() {
-    let Some(node) = node() else { return };
+    let runner = runner();
     let dir = tempfile::tempdir().unwrap();
     let script = fake_host(dir.path(), "process.stdout.write('not a frame\\n');\n");
-    match PluginHostSupervisor::start(config(&node, script)).await {
+    match PluginHostSupervisor::start(config(&runner, script)).await {
         Err(SupervisorError::Call(HostCallError::HostFailed(failure))) => {
             assert!(failure.reason.contains("not a protocol frame"), "{failure}");
         }
@@ -201,8 +210,8 @@ async fn a_failed_start_reports_a_host_failure_not_a_rejection() {
 /// A restart is a new process on a new epoch, and the old one is really gone.
 #[tokio::test]
 async fn restarting_makes_a_new_epoch_on_a_fresh_process() {
-    let Some(node) = node() else { return };
-    let supervisor = PluginHostSupervisor::start(config(&node, real_host()))
+    let runner = runner();
+    let supervisor = PluginHostSupervisor::start(config(&runner, real_host()))
         .await
         .unwrap();
     supervisor
@@ -260,10 +269,10 @@ process.stdin.on('data', (chunk) => {{
     )
 }
 
-async fn diagnostics_after_probe(node: &std::path::Path, method: &str, payload: &str) -> String {
+async fn diagnostics_after_probe(runner: &std::path::Path, method: &str, payload: &str) -> String {
     let dir = tempfile::tempdir().unwrap();
     let script = fake_host(dir.path(), &upstream_probe(method, payload));
-    let supervisor = PluginHostSupervisor::start(config(node, script))
+    let supervisor = PluginHostSupervisor::start(config(runner, script))
         .await
         .expect("the probe host initializes");
 
@@ -283,12 +292,12 @@ async fn diagnostics_after_probe(node: &std::path::Path, method: &str, payload: 
 /// hang it with no diagnosis, so the refusal names the method instead.
 #[tokio::test]
 async fn an_upstream_request_this_supervisor_cannot_serve_is_still_answered() {
-    let Some(node) = node() else { return };
+    let runner = runner();
     // Every method in the protocol's table is now implemented, so the probe
     // deliberately asks for a name outside it: what is under test is the rule
     // that an unhandled request is still *answered*, not any one method's
     // absence.
-    let diagnostics = diagnostics_after_probe(&node, "rebon/nonexistent", "null").await;
+    let diagnostics = diagnostics_after_probe(&runner, "rebon/nonexistent", "null").await;
     assert!(
         diagnostics.contains("[UNSUPPORTED_METHOD]"),
         "the refusal must be a real answer: {diagnostics}"
@@ -304,9 +313,9 @@ async fn an_upstream_request_this_supervisor_cannot_serve_is_still_answered() {
 /// different places.
 #[tokio::test]
 async fn an_upstream_request_with_a_bad_payload_is_refused_by_shape() {
-    let Some(node) = node() else { return };
+    let runner = runner();
     let diagnostics =
-        diagnostics_after_probe(&node, "event/subscribe", r#"{"subscription": "only"}"#).await;
+        diagnostics_after_probe(&runner, "event/subscribe", r#"{"subscription": "only"}"#).await;
     assert!(
         diagnostics.contains("[MALFORMED_PAYLOAD]"),
         "expected a shape refusal: {diagnostics}"
