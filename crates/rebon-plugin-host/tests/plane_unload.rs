@@ -32,7 +32,23 @@ use rebon_plugin_supervisor::{
 };
 use serde_json::{json, Value};
 
+/// The engine the plane's host runs on here: Node by default, or Verve with
+/// `REBON_TEST_ENGINE=verve` — the same tests, and no Node needed except by a
+/// contained host, which runs on Node whatever the plane runs on.
+fn engine() -> rebon_plugin_supervisor::HostEngine {
+    match std::env::var("REBON_TEST_ENGINE").as_deref() {
+        Ok("verve") => rebon_plugin_supervisor::HostEngine::Verve,
+        _ => rebon_plugin_supervisor::HostEngine::Node,
+    }
+}
+
 fn node() -> Option<PathBuf> {
+    if engine() == rebon_plugin_supervisor::HostEngine::Verve
+        && std::env::var_os("REBON_TEST_NODE").is_none()
+    {
+        // No Node: the plane runs, and a container is refused by name.
+        return Some(PathBuf::new());
+    }
     match std::env::var_os("REBON_TEST_NODE") {
         Some(node) => Some(PathBuf::from(node)),
         None => {
@@ -182,6 +198,12 @@ async fn with_plane_on<F, Fut>(
     Fut: Future<Output = ()>,
 {
     let Some(node) = node() else { return };
+    // The deaf host rewires Node's own stdin, so it runs on Node whatever the
+    // plane is tested on; it is the supervisor's deadlines it is for.
+    if host.is_some() && node.as_os_str().is_empty() {
+        eprintln!("skipping: a deaf host needs REBON_TEST_NODE");
+        return;
+    }
     let repo = repo();
     let tmp = tempfile::tempdir().expect("temp dir");
     let host_script = match host {
@@ -200,6 +222,11 @@ async fn with_plane_on<F, Fut>(
     let plane = PluginPlane::start(
         PluginPlaneConfig {
             node,
+            engine: if host.is_some() {
+                rebon_plugin_supervisor::HostEngine::Node
+            } else {
+                engine()
+            },
             host_script: PathBuf::from(plain(&host_script)),
             loader: PathBuf::from(plain(
                 &repo.join("runtimes/node/compose-runtime/src/index.mjs"),

@@ -60,8 +60,8 @@ use rebon_plugin_protocol::{
     PluginCommandSurface, PluginLoadRequest, PluginReadyReport, RegistryError,
 };
 use rebon_plugin_supervisor::{
-    whole_seconds, EventPublisher, HostCallError, HostConfig, PluginHostSupervisor, PublishedEvent,
-    SeatDispatcher, SeatInvocation, SupervisorError, ToolInvoker, ToolRefusal,
+    whole_seconds, EventPublisher, HostCallError, HostConfig, HostEngine, PluginHostSupervisor,
+    PublishedEvent, SeatDispatcher, SeatInvocation, SupervisorError, ToolInvoker, ToolRefusal,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -226,7 +226,11 @@ pub struct ComposeNode {
 #[derive(Clone, Debug)]
 pub struct PluginPlaneConfig {
     /// Absolute Node executable, from `rebon_node_runtime::NodeRuntimeResolver`.
+    /// What a contained host runs on, whichever `engine` is; empty when there
+    /// is none, which only a Verve plane can have.
     pub node: PathBuf,
+    /// What the plane's shared host runs on.
+    pub engine: HostEngine,
     /// Absolute path to the host's `cli.mjs`.
     pub host_script: PathBuf,
     /// Absolute path to the composition loader's `index.mjs`.
@@ -684,6 +688,7 @@ impl PluginPlane {
             exposed_seats: config.exposed_seats.clone(),
         };
         let host = HostConfig::new(config.node.clone(), config.host_script.clone())
+            .with_engine(config.engine)
             .with_host_epoch(epochs.next())
             .with_loader(&config.loader)
             .with_working_directory(config.working_directory.clone())
@@ -816,10 +821,20 @@ impl PluginPlane {
         let refuse = |why: String| {
             HostCallError::Malformed(format!("[CONTAINER_REFUSED] {}: {why}", spec.id))
         };
+        let template = &self.template;
+        // A container is held by Node's permission model and the OS sandbox
+        // around Node, so it runs on Node whatever the plane runs on. A Verve
+        // plane with no Node says that, rather than spawning nothing.
+        if template.node.as_os_str().is_empty() {
+            return Err(refuse(
+                "a contained plugin runs on Node until Verve has a permission model, \
+                 and no Node runtime resolves (`rebon node install`)"
+                    .to_owned(),
+            ));
+        }
         let data = PathBuf::from(&spec.data_dir);
         std::fs::create_dir_all(data.join("tmp"))
             .map_err(|error| refuse(format!("creating {}: {error}", data.display())))?;
-        let template = &self.template;
         // Every script the host is handed by where it really is, as its
         // grants name it (see `container::real_path`).
         let real = crate::container::real_path;

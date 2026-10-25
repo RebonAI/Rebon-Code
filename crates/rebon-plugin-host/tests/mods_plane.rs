@@ -45,7 +45,23 @@ use rebon_plugin_supervisor::{ToolInvocation, ToolInvoker, ToolRefusal};
 use rebon_types::ModUiSurface;
 use serde_json::{json, Value};
 
+/// The engine the plane's host runs on here: Node by default, or Verve with
+/// `REBON_TEST_ENGINE=verve` — the same tests, and no Node needed except by a
+/// contained host, which runs on Node whatever the plane runs on.
+fn engine() -> rebon_plugin_supervisor::HostEngine {
+    match std::env::var("REBON_TEST_ENGINE").as_deref() {
+        Ok("verve") => rebon_plugin_supervisor::HostEngine::Verve,
+        _ => rebon_plugin_supervisor::HostEngine::Node,
+    }
+}
+
 fn node() -> Option<PathBuf> {
+    if engine() == rebon_plugin_supervisor::HostEngine::Verve
+        && std::env::var_os("REBON_TEST_NODE").is_none()
+    {
+        // No Node: the plane runs, and a container is refused by name.
+        return Some(PathBuf::new());
+    }
     match std::env::var_os("REBON_TEST_NODE") {
         Some(node) => Some(PathBuf::from(node)),
         None => {
@@ -152,6 +168,7 @@ async fn a_mod_loads_seats_its_command_draws_and_answers_hooks() {
     let plane = PluginPlane::start(
         PluginPlaneConfig {
             node,
+            engine: engine(),
             host_script: PathBuf::from(plain(&repo.join("runtimes/node/plugin-host/src/cli.mjs"))),
             loader: PathBuf::from(plain(
                 &repo.join("runtimes/node/compose-runtime/src/index.mjs"),

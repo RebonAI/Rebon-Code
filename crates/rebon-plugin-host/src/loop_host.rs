@@ -77,23 +77,26 @@ pub trait LoopHostSpawner: Send + Sync {
 
 /// Which runtime carries the plugin plane.
 ///
-/// One, now that the move from an embedded V8 to an external Node is done: the
-/// Node host below is what every build runs, and there is no second runtime to
-/// opt into.
+/// What the plugin plane's hosts run on. The plane, its protocol and its
+/// plugins are the same on both; only the engine under the host differs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginRuntime {
-    /// The plugin plane: an external Node host, one plugin per entry.
+    /// An external Node host, one plugin per entry. The default, and what a
+    /// contained host runs on whichever is chosen.
     ///
-    /// The only one. `embedded` and its compiled-in isolate are gone; the
-    /// variant survives so `kernelPlugins.runtime` in an existing config is
-    /// still a value this can parse rather than a hard error.
+    /// `embedded` and its compiled-in isolate are gone; the word still parses
+    /// as this, so `kernelPlugins.runtime` in an old config is not an error.
     Node,
+    /// The same host on Verve, an isolate inside this process: no Node to
+    /// install. On its way to being the only one.
+    Verve,
 }
 
 impl PluginRuntime {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "node" | "plane" => Some(Self::Node),
+            "verve" => Some(Self::Verve),
             _ => None,
         }
     }
@@ -101,6 +104,17 @@ impl PluginRuntime {
     pub fn describe(self) -> &'static str {
         match self {
             Self::Node => "node (the plugin plane hosts one plugin per composition entry)",
+            Self::Verve => {
+                "verve (the plugin plane hosts one plugin per composition entry, in process)"
+            }
+        }
+    }
+
+    /// The engine a plane's shared and loop hosts run on.
+    pub fn host_engine(self) -> rebon_plugin_supervisor::HostEngine {
+        match self {
+            Self::Node => rebon_plugin_supervisor::HostEngine::Node,
+            Self::Verve => rebon_plugin_supervisor::HostEngine::Verve,
         }
     }
 }
@@ -117,7 +131,7 @@ pub fn plugin_runtime() -> PluginRuntime {
             Some(runtime) => return runtime,
             None => tracing::warn!(
                 value = %raw,
-                "REBON_PLUGIN_RUNTIME is not `node`; ignoring it"
+                "REBON_PLUGIN_RUNTIME is not `node` or `verve`; ignoring it"
             ),
         }
     }
@@ -241,6 +255,17 @@ mod tests {
 
         // A config written when there was a second runtime still parses; there
         // is simply nothing else left for it to name.
+        std::fs::write(
+            directory.path().join("config.json"),
+            br#"{"kernelPlugins":{"runtime":"Verve"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            plugin_runtime_from_config(directory.path()),
+            PluginRuntime::Verve,
+            "verve is chosen by name"
+        );
+
         for raw in [
             r#"{"kernelPlugins":{"runtime":"node"}}"#,
             r#"{"kernelPlugins":{"runtime":"embedded"}}"#,

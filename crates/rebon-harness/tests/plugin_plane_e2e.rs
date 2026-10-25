@@ -40,7 +40,23 @@ use rebon_provider::kernel_llm_dispatch::unregister_llm_host;
 use rebon_provider::kernel_model_router::{KernelAwareProviderResolver, ModelRouterPlugin};
 use serde_json::Value;
 
+/// The engine the plane's host runs on here: Node by default, or Verve with
+/// `REBON_TEST_ENGINE=verve` — the same tests, and no Node needed except by a
+/// contained host, which runs on Node whatever the plane runs on.
+fn engine() -> rebon_plugin_supervisor::HostEngine {
+    match std::env::var("REBON_TEST_ENGINE").as_deref() {
+        Ok("verve") => rebon_plugin_supervisor::HostEngine::Verve,
+        _ => rebon_plugin_supervisor::HostEngine::Node,
+    }
+}
+
 fn node() -> Option<PathBuf> {
+    if engine() == rebon_plugin_supervisor::HostEngine::Verve
+        && std::env::var_os("REBON_TEST_NODE").is_none()
+    {
+        // No Node: the plane runs, and a container is refused by name.
+        return Some(PathBuf::new());
+    }
     match std::env::var_os("REBON_TEST_NODE") {
         Some(node) => Some(PathBuf::from(node)),
         None => {
@@ -178,6 +194,7 @@ async fn boot_with_bound(
     let plane = PluginPlane::start(
         PluginPlaneConfig {
             node,
+            engine: engine(),
             // Plain paths throughout: a Windows verbatim prefix survives Rust
             // fine and confuses `pathToFileURL` on the other side, and every one
             // of these crosses to Node as a string.

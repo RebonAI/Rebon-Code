@@ -101,6 +101,7 @@ pub async fn ensure_process_composition(
 /// from where they were built.
 pub struct PlanePaths {
     pub node: PathBuf,
+    pub engine: rebon_plugin_supervisor::HostEngine,
     pub host_script: PathBuf,
     pub loader: PathBuf,
     pub compose_root: PathBuf,
@@ -210,11 +211,36 @@ pub fn plane_scripts() -> Result<PlaneScripts, String> {
     })
 }
 
+/// What a plane's hosts run on, and the Node a contained host still needs.
+#[derive(Clone, Debug)]
+pub struct PlaneRuntime {
+    pub engine: rebon_plugin_supervisor::HostEngine,
+    /// Node, when one resolves. On Node it is the engine and required; on
+    /// Verve only a contained host uses it, and an empty path means there is
+    /// none — a container is then refused by name rather than the plane.
+    pub node: PathBuf,
+}
+
+/// The runtime [`crate::loop_host::plugin_runtime`] chose, with what it needs.
+pub fn plane_runtime() -> Result<PlaneRuntime, String> {
+    match crate::loop_host::plugin_runtime() {
+        crate::loop_host::PluginRuntime::Node => Ok(PlaneRuntime {
+            engine: rebon_plugin_supervisor::HostEngine::Node,
+            node: resolve_node()?,
+        }),
+        crate::loop_host::PluginRuntime::Verve => Ok(PlaneRuntime {
+            engine: rebon_plugin_supervisor::HostEngine::Verve,
+            node: resolve_node().unwrap_or_default(),
+        }),
+    }
+}
+
 pub fn plane_paths() -> Result<PlanePaths, String> {
-    let node = resolve_node()?;
+    let runtime = plane_runtime()?;
     let scripts = plane_scripts()?;
     Ok(PlanePaths {
-        node,
+        node: runtime.node,
+        engine: runtime.engine,
         host_script: scripts.host_script,
         loader: scripts.loader,
         compose_root: scripts.compose_root,
@@ -257,7 +283,7 @@ pub fn missing_runtime_for_configured_plugins() -> Option<MissingRuntime> {
     if entries == 0 {
         return None;
     }
-    let reason = resolve_node().err()?;
+    let reason = plane_runtime().err()?;
     Some(MissingRuntime { entries, reason })
 }
 
@@ -787,8 +813,8 @@ async fn boot_process_plugin_plane(
 
     // Only now is a runtime owed. Asked for after the composition rather than
     // before it, so the demand is only ever made of someone who needs it met.
-    let node = match resolve_node() {
-        Ok(node) => node,
+    let runtime = match plane_runtime() {
+        Ok(runtime) => runtime,
         Err(reason) => {
             ctx.dispose();
             return refuse(CompositionRefusal::NoRuntime {
@@ -890,7 +916,8 @@ async fn boot_process_plugin_plane(
 
     let plane = match crate::plugin_plane::PluginPlane::start(
         crate::plugin_plane::PluginPlaneConfig {
-            node,
+            node: runtime.node,
+            engine: runtime.engine,
             host_script: scripts.host_script,
             loader: scripts.loader,
             compose_root: scripts.compose_root,
