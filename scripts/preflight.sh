@@ -237,7 +237,7 @@ retry "the plugin-first crates" cargo test -q --locked -p rebon-core -p rebon-ha
     -p rebon-plugin-mcp -p rebon-plugin-tasks -p rebon-plugin-plan-mode \
     -p rebon-plugin-updater -p rebon-plugin-agents -p rebon-plugin-remote \
     -p rebon-plugin-lsp-mcp -p rebon-plugin-browser -p rebon-plugin-onboarding \
-    -p sandbox-win -p rebon-plugin-sandbox -p rebon-plugin-workflow
+    -p sandbox-win -p rebon-plugin-sandbox -p rebon-plugin-workflow -p rebon-verve-host
 
 # Serial, and out of the batch above: computer-use's endpoint tests fail about
 # one run in four when that crate's own suite runs in parallel, and pass every
@@ -297,6 +297,16 @@ if [ -n "$node_bin" ]; then
     else
         skip "3 harness suites that open a session (the runtime's version gate needs Node $PINNED_NODE; this run has $node_version)"
     fi
+
+    # The same plane on Verve: the host's JavaScript in an isolate inside
+    # rebon, no Node under it. Contained plugins still run on Node, so this
+    # stays in the Node gate until they move too.
+    say "the plugin plane on Verve"
+    retry "rebon-plugin-supervisor on Verve" env REBON_TEST_ENGINE=verve REBON_PLUGIN_RUNTIME=verve cargo test -q -p rebon-plugin-supervisor --locked
+    for suite in plugin_plane_e2e plugin_plane_loop_e2e kernel_loop_backend_plane kernel_mainline_deepseek_js; do
+        retry "rebon-harness $suite on Verve" env REBON_TEST_ENGINE=verve REBON_PLUGIN_RUNTIME=verve cargo test -q -p rebon-harness --test "$suite" --locked -- --test-threads=1
+    done
+    retry "rebon-plugin-host plane_unload on Verve" env REBON_TEST_ENGINE=verve REBON_PLUGIN_RUNTIME=verve cargo test -q -p rebon-plugin-host --test plane_unload --locked -- --test-threads=1
 fi
 
 # ------------------------------------------------------------- the other tree

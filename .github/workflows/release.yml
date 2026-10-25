@@ -205,6 +205,24 @@ jobs:
           # actually arrives in.
           cargo test -p rebon-harness --test kernel_mainline_deepseek_js --locked -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw "Mainline composition tests failed with exit code $LASTEXITCODE" }
+          # The same plane on Verve: the host's JavaScript in an isolate inside
+          # rebon, no Node under it. Contained plugins still run on Node, which
+          # is why this stays inside the Node gate for now.
+          $env:REBON_TEST_ENGINE = 'verve'
+          $env:REBON_PLUGIN_RUNTIME = 'verve'
+          cargo test -p rebon-plugin-supervisor --locked
+          if ($LASTEXITCODE -ne 0) { throw "Plugin supervisor tests on Verve failed with exit code $LASTEXITCODE" }
+          cargo test -p rebon-harness --test plugin_plane_e2e --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Plugin plane end-to-end tests on Verve failed with exit code $LASTEXITCODE" }
+          cargo test -p rebon-harness --test plugin_plane_loop_e2e --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Plugin plane loop tests on Verve failed with exit code $LASTEXITCODE" }
+          cargo test -p rebon-harness --test kernel_loop_backend_plane --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Kernel loop backend tests on Verve failed with exit code $LASTEXITCODE" }
+          cargo test -p rebon-harness --test kernel_mainline_deepseek_js --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Mainline composition tests on Verve failed with exit code $LASTEXITCODE" }
+          cargo test -p rebon-plugin-host --test plane_unload --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Plane unload tests on Verve failed with exit code $LASTEXITCODE" }
+          Remove-Item Env:REBON_TEST_ENGINE, Env:REBON_PLUGIN_RUNTIME
       - name: Check isolated Boa runner target portability
         run: |
           set -eu
@@ -272,6 +290,7 @@ jobs:
           -p rebon-plugin-lsp-mcp -p rebon-plugin-browser
           -p rebon-plugin-onboarding -p sandbox-win
           -p rebon-plugin-sandbox -p rebon-plugin-workflow
+          -p rebon-verve-host
 
   boa-runtime:
     needs: verify
