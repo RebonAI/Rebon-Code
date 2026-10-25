@@ -20,7 +20,7 @@
 //     rewrite breaks — `body.pipeThrough(new EventSourceParserStream())` throws
 //     `ERR_INVALID_ARG_TYPE` — so the upstream shape comes back. See
 //     `eventsource-stream.mjs`.
-import { registerHooks } from 'node:module';
+import { isBuiltin, registerHooks } from 'node:module';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { payloadDir } from './payload.mjs';
@@ -67,6 +67,12 @@ export function installModuleResolution({ dir = payloadDir(), extraModules = {} 
   const state = { map };
   registerHooks({
     resolve(specifier, context, next) {
+      // The native Cordis, where the host defines it (cordis-rs on Verve's
+      // in-process host). Elsewhere `cordis` is not a builtin and the
+      // vendored bundle answers, as before.
+      if ((specifier === 'cordis' || specifier === '@deepseek-ai/cordis') && isBuiltin('cordis')) {
+        return { url: 'node:cordis', shortCircuit: true };
+      }
       const mapped = state.map.get(specifier);
       if (mapped !== undefined) return { url: mapped, format: 'module', shortCircuit: true };
       return next(specifier, context);

@@ -100,6 +100,45 @@ async fn input_comes_in_output_goes_out_and_the_loops_code_is_the_exit() {
     assert_eq!(host.process.wait().await, HostExit::Code(7));
 }
 
+/// The native Cordis is a builtin in both places a composition can run: the
+/// isolate host and the `rebon-verve` runner a contained plugin starts. The
+/// composition's resolver picks it over the vendored bundle by asking
+/// `isBuiltin('cordis')`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_native_cordis_is_a_builtin_in_the_host_and_the_runner() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = host(
+        dir.path(),
+        r#"
+  const { isBuiltin } = await import('node:module');
+  const { Context } = await import('cordis');
+  const ctx = new Context();
+  output.write(JSON.stringify([isBuiltin('cordis'), typeof ctx.plugin]) + '\n');
+  return 0;
+"#,
+    );
+    let host = started(script, None);
+    let stdout = read_all(host.stdout).await;
+    let stderr = read_all(host.stderr).await;
+    assert_eq!(stdout, "[true,\"function\"]\n", "{stderr}");
+    assert!(host.process.wait().await.success());
+
+    let runner = std::process::Command::new(env!("CARGO_BIN_EXE_rebon-verve"))
+        .args([
+            "-e",
+            "const { Context } = require('cordis'); \
+             console.log(JSON.stringify([require('node:module').isBuiltin('cordis'), \
+             typeof new Context().plugin]))",
+        ])
+        .output()
+        .unwrap();
+    assert!(runner.status.success(), "{runner:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&runner.stdout).trim(),
+        "[true,\"function\"]"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_console_is_diagnostics_never_protocol() {
     let dir = tempfile::tempdir().unwrap();

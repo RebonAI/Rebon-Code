@@ -115,7 +115,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -126,7 +126,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -404,7 +404,7 @@ dependencies = [
 [[package]]
 name = "boa_ast"
 version = "0.22.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#6d00ee2f6eb6d7ba443decbfa7d48e7882b053fd"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#7cedfe68f0e970c8c119ac00bf3278b00c3a8d43"
 dependencies = [
  "bitflags 2.13.2",
  "boa_interner 0.22.0",
@@ -464,7 +464,7 @@ dependencies = [
 [[package]]
 name = "boa_engine"
 version = "0.22.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#6d00ee2f6eb6d7ba443decbfa7d48e7882b053fd"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#7cedfe68f0e970c8c119ac00bf3278b00c3a8d43"
 dependencies = [
  "aligned-vec",
  "arrayvec",
@@ -527,7 +527,7 @@ dependencies = [
 [[package]]
 name = "boa_gc"
 version = "0.22.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#6d00ee2f6eb6d7ba443decbfa7d48e7882b053fd"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#7cedfe68f0e970c8c119ac00bf3278b00c3a8d43"
 dependencies = [
  "arrayvec",
  "boa_macros 0.22.0",
@@ -555,7 +555,7 @@ dependencies = [
 [[package]]
 name = "boa_interner"
 version = "0.22.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#6d00ee2f6eb6d7ba443decbfa7d48e7882b053fd"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#7cedfe68f0e970c8c119ac00bf3278b00c3a8d43"
 dependencies = [
  "boa_gc 0.22.0",
  "boa_macros 0.22.0",
@@ -582,7 +582,7 @@ dependencies = [
 [[package]]
 name = "boa_macros"
 version = "0.22.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#6d00ee2f6eb6d7ba443decbfa7d48e7882b053fd"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#7cedfe68f0e970c8c119ac00bf3278b00c3a8d43"
 dependencies = [
  "cfg-if",
  "cow-utils",
@@ -614,7 +614,7 @@ dependencies = [
 [[package]]
 name = "boa_parser"
 version = "0.22.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#6d00ee2f6eb6d7ba443decbfa7d48e7882b053fd"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#7cedfe68f0e970c8c119ac00bf3278b00c3a8d43"
 dependencies = [
  "bitflags 2.13.2",
  "boa_ast 0.22.0",
@@ -650,7 +650,7 @@ dependencies = [
 [[package]]
 name = "boa_string"
 version = "0.22.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#6d00ee2f6eb6d7ba443decbfa7d48e7882b053fd"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#7cedfe68f0e970c8c119ac00bf3278b00c3a8d43"
 dependencies = [
  "fast-float2",
  "itoa",
@@ -985,6 +985,25 @@ name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
+name = "cordis"
+version = "0.1.0"
+source = "git+https://github.com/Quorafind/cordis-rs.git?branch=main#13f510cb51a5b2e9e6e3d2032617c50f966c9173"
+dependencies = [
+ "indexmap",
+]
+
+[[package]]
+name = "cordis-verve"
+version = "0.1.0"
+source = "git+https://github.com/Quorafind/cordis-rs.git?branch=main#13f510cb51a5b2e9e6e3d2032617c50f966c9173"
+dependencies = [
+ "boa_engine 0.22.0",
+ "boa_gc 0.22.0",
+ "cordis",
+ "verve",
+]
 
 [[package]]
 name = "core-foundation"
@@ -1454,7 +1473,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3064,7 +3083,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5691,6 +5710,7 @@ dependencies = [
 name = "rebon-verve-host"
 version = "1.17.0"
 dependencies = [
+ "cordis-verve",
  "serde_json",
  "tempfile",
  "tokio",
@@ -5994,7 +6014,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6474,7 +6494,7 @@ dependencies = [
 [[package]]
 name = "small_btree"
 version = "0.1.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#6d00ee2f6eb6d7ba443decbfa7d48e7882b053fd"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#7cedfe68f0e970c8c119ac00bf3278b00c3a8d43"
 dependencies = [
  "arrayvec",
 ]
@@ -6501,7 +6521,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6721,7 +6741,7 @@ dependencies = [
 [[package]]
 name = "tag_ptr"
 version = "0.1.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#6d00ee2f6eb6d7ba443decbfa7d48e7882b053fd"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#7cedfe68f0e970c8c119ac00bf3278b00c3a8d43"
 
 [[package]]
 name = "tap"
@@ -6749,7 +6769,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7501,7 +7521,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "verve"
 version = "0.1.0"
-source = "git+https://github.com/Quorafind/verve.git?branch=main#6d00ee2f6eb6d7ba443decbfa7d48e7882b053fd"
+source = "git+https://github.com/Quorafind/verve.git?branch=main#7cedfe68f0e970c8c119ac00bf3278b00c3a8d43"
 dependencies = [
  "aes",
  "base64 0.23.1",

@@ -37,6 +37,10 @@ Every call that reaches rebon says which plugin caused it, and the host injects 
 
 Cordis lets a plugin wait for a service that has not arrived yet. Inside one composition that is a feature; here a load is a call rebon is waiting on, so a plugin waiting forever is a call that never answers. A composition entry's required `inject` must be satisfiable where it is mounted, rebon orders entries so it is, and a missing one is `[MISSING_INJECT]` naming the service.
 
+## Cordis is native on Verve
+
+On Verve, `cordis` is not the vendored bundle: rebon defines it as a builtin backed by [cordis-rs](https://github.com/Quorafind/cordis-rs), a Rust port of Cordis 4.0.0-rc.8 (the version the bundle is), in the isolate host and in the `rebon-verve` runner a contained plugin starts. `src/resolve.mjs` sends `cordis` there whenever `isBuiltin('cordis')` is true. The bundle stays in the payload: it is the payload sentinel, what `node --test` loads, and the reference cordis-rs's differential tests compare against.
+
 ## The one payload package that is not the published one
 
 `js/vendor/eventsource-parser/stream.js` was rewritten for deno_core: the published `EventSourceParserStream` extends the WHATWG `TransformStream`, which bare deno_core does not have, so the vendored build is a "Mini streams" transform instead. On real Node that rewrite breaks — the dsh DeepSeek adapter does `body.pipeThrough(new EventSourceParserStream())` and gets `ERR_INVALID_ARG_TYPE` — so `src/eventsource-stream.mjs` restores the upstream shape over the same vendored `createParser`. Framing semantics stay byte-identical on both runtimes; only the plumbing differs.
