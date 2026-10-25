@@ -30,7 +30,6 @@ rebon-tool.workspace = true
 rebon-session.workspace = true
 # Windows verbatim-prefix stripping for canonicalized worktree roots.
 rebon-tools-core.workspace = true
-rebon-node-runtime.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
 

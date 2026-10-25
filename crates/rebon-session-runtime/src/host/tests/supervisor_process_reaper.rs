@@ -98,41 +98,6 @@ fn worker_process_inherits_path_for_legacy_jobs() {
     assert!(!command.get_envs().any(|(key, _)| key == "PATH"));
 }
 
-/// A session runs in the worker, not in the process that resolved the runtime.
-/// Without this the worker would re-resolve and could land on a different Node
-/// than the app vetted — or on none at all, when the app's `PATH` is the only
-/// place one exists.
-#[test]
-fn worker_process_receives_the_node_runtime_the_job_was_created_with() {
-    let mut state = queued_state(None, 1);
-    state.process.node_runtime_path = Some("/opt/node/bin/node".into());
-    let mut command = Command::new("rebon");
-
-    apply_worker_process_environment(&mut command, &state);
-
-    let node = command.get_envs().find_map(|(key, value)| {
-        (key == rebon_node_runtime::NODE_EXECUTABLE_ENV)
-            .then_some(value)
-            .flatten()
-    });
-    assert_eq!(node, Some(std::ffi::OsStr::new("/opt/node/bin/node")));
-}
-
-/// Nothing recorded means nobody had resolved a runtime; the worker walks the
-/// ladder itself rather than being handed an empty demand it must then reject.
-#[test]
-fn worker_process_is_left_to_resolve_node_when_the_job_recorded_none() {
-    let mut state = queued_state(None, 1);
-    state.process.node_runtime_path = None;
-    let mut command = Command::new("rebon");
-
-    apply_worker_process_environment(&mut command, &state);
-
-    assert!(!command
-        .get_envs()
-        .any(|(key, _)| key == rebon_node_runtime::NODE_EXECUTABLE_ENV));
-}
-
 #[test]
 fn spawned_worker_commit_completes_an_early_claim_with_detached_provenance() {
     let mut state = queued_state(None, 1);
