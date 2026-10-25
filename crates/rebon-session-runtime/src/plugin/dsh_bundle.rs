@@ -414,6 +414,97 @@ pub fn adapt_bundle_with(
 mod tests {
     use super::*;
 
+    /// dsh's own base profile, `@deepseek-ai/dsh-base`, as rebon installs a
+    /// bundle: which of its rows run on rebon, and why the rest do not.
+    ///
+    /// It is dsh's engine as much as a plugin set — the agent loop, sessions,
+    /// the API gateway, telemetry — and rebon *is* the engine, so most of it
+    /// is not meant to run here. What this holds is that the rows that are
+    /// plugins on an engine do, and that every other row is refused by name.
+    /// (Its `settings` row is one: its `disabled` is a Loader expression,
+    /// `!ctx.get('profileContext')`, which rebon does not evaluate.)
+    /// Needs the network and the runner (see `dsh_npm`'s registry test), so
+    /// it is run by hand.
+    #[test]
+    #[ignore = "fetches from registry.npmjs.org"]
+    fn the_dsh_base_profile_runs_the_rows_that_are_plugins() {
+        let runner = std::env::var_os("REBON_VERVE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                let exe = std::env::current_exe().unwrap();
+                let name = if cfg!(windows) {
+                    "rebon-verve.exe"
+                } else {
+                    "rebon-verve"
+                };
+                exe.parent().unwrap().parent().unwrap().join(name)
+            });
+        let compose_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../runtimes/node/compose-runtime");
+        let scratch = tempfile::tempdir().unwrap();
+        let packed = verve::npm::pack(
+            "@deepseek-ai/dsh-base@0.2.1-rc.3",
+            &verve::npm::InstallOptions::default(),
+            scratch.path(),
+        )
+        .unwrap();
+        let dir = crate::plugin::package::unpack_archive_folder(
+            &packed.tarball,
+            &scratch.path().join("unpacked"),
+            crate::plugin::package::PackageLimits::default(),
+        )
+        .unwrap();
+        let package: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("package.json")).unwrap()).unwrap();
+        assert!(is_bundle(&package));
+        let adapted = adapt_bundle_with(&dir, &package, None, &runner, &compose_root)
+            .unwrap_or_else(|error| panic!("dsh-base adapts: {error:#}"));
+        let mut skipped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for row in &adapted.skipped {
+            skipped
+                .entry(row.code.clone())
+                .or_default()
+                .push(format!("{}: {}", row.id, row.reason));
+        }
+        eprintln!("runs: {:?}", adapted.rows);
+        for (code, rows) in &skipped {
+            eprintln!("{code} ({}):", rows.len());
+            for row in rows {
+                eprintln!("  {row}");
+            }
+        }
+        for row in [
+            "skill",
+            "skill-filesystem",
+            "storage",
+            "web-search-deepseek",
+            "web-fetch-http",
+            "tool-web",
+        ] {
+            assert!(
+                adapted.rows.iter().any(|ran| ran == row),
+                "{row} runs: {:?}",
+                adapted.rows
+            );
+        }
+        let refused: Vec<&str> = adapted.skipped.iter().map(|row| row.id.as_str()).collect();
+        for row in ["agent", "agent-loop"] {
+            assert!(refused.contains(&row), "{row} is dsh's engine: {refused:?}");
+        }
+        // dsh's own services for the seats rebon implements are rebon's.
+        for row in ["llm", "tools", "web", "system-prompt", "commands"] {
+            assert!(
+                adapted
+                    .skipped
+                    .iter()
+                    .any(|skip| skip.id == row && skip.code == "[REBON_PROVIDES]"),
+                "{row}: {:?}",
+                adapted.skipped
+            );
+        }
+        assert!(adapted.skipped.iter().all(|row| !row.reason.is_empty()));
+    }
+
     #[test]
     fn a_bundle_is_a_package_naming_a_dsh_bundle() {
         assert!(is_bundle(

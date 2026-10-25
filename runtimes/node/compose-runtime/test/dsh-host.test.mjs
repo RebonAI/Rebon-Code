@@ -221,6 +221,9 @@ function writeBundle() {
       { id: 'library', name: '@demo/library' },
       { id: 'scripted', name: '@demo/provider', config: { root: { __jsExpr: "dshHomePath('x')" } } },
       { id: 'absent', name: '@demo/absent' },
+      { id: 'tools-again', name: '@demo/tools-service' },
+      { id: 'off', name: '@demo/provider', disabled: true },
+      { id: 'sometimes', name: '@demo/provider', disabled: { __jsExpr: "process.platform === 'win32'" } },
     ] },
     { id: 'consumer', config: { greeting: 'hello' } },
   ]));
@@ -244,6 +247,12 @@ export function apply(ctx) {
 `);
   write('node_modules/@demo/stranded/package.json', JSON.stringify({ name: '@demo/stranded', type: 'module', main: 'index.js' }));
   write('node_modules/@demo/stranded/index.js', `export const name = 'stranded';\nexport const inject = ['agents'];\nexport function apply() {}\n`);
+  // dsh's own `tools` service, which rebon's seat already is.
+  write('node_modules/@demo/tools-service/package.json', JSON.stringify({ name: '@demo/tools-service', type: 'module', main: 'index.js' }));
+  write('node_modules/@demo/tools-service/index.js', `
+import { Service } from 'cordis';
+export default class Tools extends Service { constructor(ctx) { super(ctx, 'tools'); } }
+`);
   write('node_modules/@demo/library/package.json', JSON.stringify({ name: '@demo/library', type: 'module', main: 'index.js' }));
   write('node_modules/@demo/library/index.js', 'export const helper = 1;\n');
   return fs.realpathSync(root);
@@ -275,6 +284,9 @@ test('a bundle\'s rows mount in one realm in the order their injections allow', 
   assert.deepEqual(skipped, {
     scripted: '[CONFIG_EXPRESSION]',
     absent: '[NOT_INSTALLED]',
+    off: '[DISABLED]',
+    sometimes: '[CONFIG_EXPRESSION]',
+    'tools-again': '[REBON_PROVIDES]',
     stranded: '[MISSING_INJECT]',
   });
   assert.deepEqual(answer.skipped.find((row) => row.id === 'stranded').missing, ['agents']);

@@ -118,7 +118,7 @@ function patchRows(root, manifest) {
   for (const op of Array.isArray(doc) ? doc : []) {
     if (Array.isArray(op?.insert)) {
       for (const row of op.insert) {
-        if (row && typeof row.name === 'string') rows.push({ id: row.id ?? row.name, name: row.name, config: row.config });
+        if (row && typeof row.name === 'string') rows.push({ id: row.id ?? row.name, name: row.name, config: row.config, disabled: row.disabled });
       }
     } else if (op && typeof op.id === 'string' && Object.hasOwn(op, 'config')) {
       const row = rows.find((candidate) => candidate.id === op.id);
@@ -153,6 +153,14 @@ async function probeBundle(root, overrides = {}) {
       manifest = readJson(path.join(dir, 'package.json'));
     } catch {
       skipped.push({ id: row.id, name: row.name, code: '[NOT_INSTALLED]', error: `${row.name} is not installed in the bundle` });
+      continue;
+    }
+    if (row.disabled === true) {
+      skipped.push({ id: row.id, name: row.name, code: '[DISABLED]', error: `${row.id} is disabled in the bundle` });
+      continue;
+    }
+    if (holdsExpression(row.disabled)) {
+      skipped.push({ id: row.id, name: row.name, code: '[CONFIG_EXPRESSION]', error: `whether ${row.id} runs is a dsh Loader expression, which rebon does not evaluate` });
       continue;
     }
     const config = Object.hasOwn(overrides, row.id) ? overrides[row.id] : row.config;
@@ -202,7 +210,14 @@ async function probeBundle(root, overrides = {}) {
         progress = true;
       } catch (cause) {
         failed.add(member);
-        skipped.push({ id: member.id, name: member.name, code: cause?.code ?? '[ACTIVATE_FAILED]', error: String(cause?.message ?? cause) });
+        // A row that *is* one of rebon's seats — dsh's own `llm`, `tools`,
+        // `web`, … services — is answered by rebon, not missing.
+        const taken = /service "([^"]+)" has been registered/.exec(String(cause?.message ?? ''))?.[1];
+        if (taken !== undefined && builtinSeats().includes(taken)) {
+          skipped.push({ id: member.id, name: member.name, code: '[REBON_PROVIDES]', error: `rebon provides ${JSON.stringify(taken)} itself` });
+        } else {
+          skipped.push({ id: member.id, name: member.name, code: cause?.code ?? '[ACTIVATE_FAILED]', error: String(cause?.message ?? cause) });
+        }
       }
     }
   }
