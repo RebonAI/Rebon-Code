@@ -265,19 +265,19 @@ boa_string = { git = "https://github.com/Quorafind/verve.git", branch = "main" }
 
 # Verve's interpreter unoptimised is several times slower, in tests as
 # anywhere: plugin hosts run on it.
-[profile.dev.package.boa_engine]
+[profile.dev.package."boa_engine@0.22.0"]
 opt-level = 3
-[profile.dev.package.boa_parser]
+[profile.dev.package."boa_parser@0.22.0"]
 opt-level = 3
-[profile.dev.package.boa_ast]
+[profile.dev.package."boa_ast@0.22.0"]
 opt-level = 3
-[profile.dev.package.boa_gc]
+[profile.dev.package."boa_gc@0.22.0"]
 opt-level = 3
-[profile.dev.package.boa_interner]
+[profile.dev.package."boa_interner@0.22.0"]
 opt-level = 3
-[profile.dev.package.boa_string]
+[profile.dev.package."boa_string@0.22.0"]
 opt-level = 3
-[profile.dev.package.regress]
+[profile.dev.package."regress@0.12.0"]
 opt-level = 3
 
 [profile.release]
