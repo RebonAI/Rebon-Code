@@ -71,7 +71,6 @@ test-support = ["rebon-tool/test-support"]
 rebon-tool = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 # One reaper test names the node sidecar to prove it is not reaped.
-rebon-node-runtime.workspace = true
 # Tests only: one `/context` test drives the terminal's reducer to check that
 # what the command reports matches what a screen would show. Nothing in the
 # library half names this crate.

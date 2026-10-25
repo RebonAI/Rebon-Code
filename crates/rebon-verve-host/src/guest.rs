@@ -237,8 +237,11 @@ fn process_setup(spec: &VerveHostSpec, entry: &Path) -> String {
                 )
             })
             .collect();
+        // Emptied and refilled rather than replaced: on Windows `process.env`
+        // finds a name whatever its case, and a plain object would not.
         setup.push_str(&format!(
-            "process.env = {};\n",
+            "for (const name of Object.keys(process.env)) delete process.env[name];\n\
+             Object.assign(process.env, {});\n",
             serde_json::Value::from(env)
         ));
     }

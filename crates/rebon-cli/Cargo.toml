@@ -44,7 +44,6 @@ rebon-harness.workspace = true
 rebon-kernel-seats.workspace = true
 rebon-provider.workspace = true
 rebon-plugin-host.workspace = true
-rebon-node-runtime.workspace = true
 rebon-permissions.workspace = true
 rebon-plugin-remote.workspace = true
 rebon-tool.workspace = true

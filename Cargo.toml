@@ -43,7 +43,6 @@ members = [
     "crates/rebon-kernel",
     "crates/rebon-math",
     "crates/rebon-message-tui",
-    "crates/rebon-node-runtime",
     "crates/rebon-permissions",
     "crates/rebon-picker",
     "crates/rebon-plugin-package",
@@ -236,7 +235,6 @@ rebon-provider = { path = "crates/rebon-provider" }
 rebon-plugin-host = { path = "crates/rebon-plugin-host" }
 rebon-rc-runner = { path = "crates/rebon-rc-runner" }
 rebon-plugin-package = { path = "crates/rebon-plugin-package" }
-rebon-node-runtime = { path = "crates/rebon-node-runtime" }
 rebon-plugin-supervisor = { path = "crates/rebon-plugin-supervisor" }
 rebon-verve-host = { path = "crates/rebon-verve-host" }
 rebon-boa-runner = { path = "crates/rebon-boa-runner" }
