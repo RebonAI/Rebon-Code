@@ -47,6 +47,8 @@ rebon-slash-commands.workspace = true
 rebon-tool.workspace = true
 rebon-tools-core.workspace = true
 rebon-types.workspace = true
+# Installing an npm package's dependencies without npm.
+verve.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true
