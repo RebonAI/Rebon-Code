@@ -1,35 +1,37 @@
 {
-  "note": "The bare specifiers the composition answers itself, and from where. `payload` entries are relative to the payload directory, `runtime` entries to this package's src/. Read by src/resolve.mjs and by rebon's installer, which installs from npm only the peers of a package that are not here.",
-  "payload": {
+  "note": "The bare specifiers the composition answers itself, and from where. `owned` entries are rebon's for every importer: the module is the other half of a seat rebon implements (cordis, dsh-tools' scheduler symbol, dsh-llm's adapter base, the environment that shows only what was granted), so a second copy would be a second, wrong answer. `payload` entries are the vendored packages rebon's own payload is built from: they answer importers inside the payload and this runtime, while a package installed from npm resolves its own copy and only falls back to these when it has none. Both are relative to the payload directory; `runtime` entries are relative to this package's src/. Read by src/resolve.mjs and by rebon's installer, which installs from npm every peer of a package that is not `owned` or `runtime`.",
+  "owned": {
     "cordis": "vendor/cordis/index.js",
     "cosmokit": "vendor/cosmokit/index.mjs",
     "schemastery": "vendor/schemastery/index.mjs",
     "@deepseek-ai/cordis": "vendor/cordis/index.js",
     "@deepseek-ai/cosmokit": "vendor/cosmokit/index.mjs",
     "@deepseek-ai/schemastery": "vendor/schemastery/index.mjs",
+    "@deepseek-ai/dsh-llm": "compose/shims/dsh-llm.js",
+    "@deepseek-ai/dsh-credentials": "compose/shims/dsh-credentials.js",
+    "@deepseek-ai/dsh-launch-environment": "compose/shims/dsh-launch-environment.js",
+    "@deepseek-ai/dsh-anonymous-user-id": "compose/shims/dsh-anonymous-user-id.js",
+    "@deepseek-ai/dsh-user-id": "compose/shims/dsh-anonymous-user-id.js",
+    "@deepseek-ai/dsh-environment": "compose/shims/dsh-environment.js",
+    "@deepseek-ai/dsh-tools": "compose/shims/dsh-tools.js",
+    "@deepseek-ai/dsh-web": "compose/shims/dsh-web.js"
+  },
+  "payload": {
     "@deepseek-ai/cordis-plugin-timer": "vendor/dsh/timer.js",
     "@deepseek-ai/cordis-plugin-logger-console": "vendor/dsh/logger-console.js",
     "@deepseek-ai/dsh-llm-deepseek": "vendor/dsh/llm-deepseek.js",
     "@deepseek-ai/dsh-timeout": "vendor/dsh/timeout.js",
-    "@deepseek-ai/dsh-llm": "compose/shims/dsh-llm.js",
-    "@deepseek-ai/dsh-credentials": "compose/shims/dsh-credentials.js",
     "@deepseek-ai/dsh-settings": "compose/shims/dsh-settings.js",
-    "@deepseek-ai/dsh-launch-environment": "compose/shims/dsh-launch-environment.js",
-    "@deepseek-ai/dsh-anonymous-user-id": "compose/shims/dsh-anonymous-user-id.js",
     "eventsource-parser": "vendor/eventsource-parser/index.js",
-    "@deepseek-ai/dsh-tools": "compose/shims/dsh-tools.js",
     "@deepseek-ai/dsh-tool-todo": "vendor/dsh/tool-todo.js",
     "zod": "compose/shims/zod-lite.js",
-    "@deepseek-ai/dsh-web": "compose/shims/dsh-web.js",
     "@deepseek-ai/dsh-web-search-exa": "vendor/dsh/web-search-exa.js",
     "@deepseek-ai/dsh-tool-web": "vendor/dsh/tool-web.js",
     "@deepseek-ai/dsh-scope": "vendor/dsh/scope.js",
     "@deepseek-ai/dsh-session": "vendor/dsh/session.js",
     "@deepseek-ai/dsh-agent": "vendor/dsh/agent.js",
     "@deepseek-ai/dsh-system-prompt": "vendor/dsh/system-prompt.js",
-    "@deepseek-ai/dsh-agent-loop": "vendor/dsh/agent-loop.js",
-    "@deepseek-ai/dsh-environment": "compose/shims/dsh-environment.js",
-    "@deepseek-ai/dsh-user-id": "compose/shims/dsh-anonymous-user-id.js"
+    "@deepseek-ai/dsh-agent-loop": "vendor/dsh/agent-loop.js"
   },
   "runtime": {
     "rebon": "./bridge.mjs",

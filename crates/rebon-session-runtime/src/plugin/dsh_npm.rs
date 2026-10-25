@@ -72,12 +72,15 @@ pub fn is_cordis_npm_package(dir: &Path) -> bool {
         })
 }
 
-/// The bare specifiers the composition answers itself.
+/// The bare specifiers the composition answers itself for every importer —
+/// the modules rebon owns. A peer that is only one of its vendored payload
+/// packages is installed from npm: dsh's current packages need their own
+/// versions of those.
 pub fn provided_modules(compose_root: &Path) -> anyhow::Result<BTreeSet<String>> {
     let path = compose_root.join("src").join("provided-modules.json");
     let raw = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let doc: Value = serde_json::from_slice(&raw)?;
-    Ok(["payload", "runtime"]
+    Ok(["owned", "runtime"]
         .iter()
         .filter_map(|section| doc.get(section).and_then(Value::as_object))
         .flat_map(|map| map.keys().cloned())
