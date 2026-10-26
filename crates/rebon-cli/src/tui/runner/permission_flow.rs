@@ -2314,6 +2314,94 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn synchronous_question_modal_answers_cancels_and_releases_on_runner_drop() {
+        use rebon_tool::PermissionBroker;
+
+        // Exercise the real broker and modal together. The await must leave
+        // the runner free to process input or tear down its pending dialog.
+        for action in [
+            Some(PermissionModalAction::Confirm),
+            Some(PermissionModalAction::Cancel),
+            None,
+        ] {
+            let mut app = AppState::new();
+            let mut session = make_test_tui_session();
+            let broker = session.engine_half.runtime.permission_broker.clone();
+            let tool = crate::tui::runner::test_support::builtin_test_engine()
+                .tool_catalog()
+                .into_iter()
+                .find(|tool| tool.id().as_str() == "AskUserQuestion")
+                .expect("the escalation plugin provides AskUserQuestion");
+            let context = rebon_tool::ToolContext::new().with_tool_use_id("toolu_sync");
+            let input = json!({ "questions": [{
+                "question": "Which database?", "header": "DB",
+                "options": [
+                    { "label": "Postgres", "description": "Relational" },
+                    { "label": "SQLite", "description": "Embedded" }
+                ]
+            }] });
+            let decision = tool.check_permissions(&input, &context).await.unwrap();
+            let future = broker.resolve(tool.as_ref(), input, &context, decision);
+            tokio::pin!(future);
+            assert!(futures_util::poll!(&mut future).is_pending());
+            let mut pending = None;
+            assert_eq!(
+                drain_pending_permissions(&mut app, &mut session, &mut pending),
+                1
+            );
+            sync_permission_view(&mut app, &pending);
+            assert!(app.pending_permission_view.is_some());
+            assert!(futures_util::poll!(&mut future).is_pending());
+
+            // A running question remains an active turn: session replacement
+            // is refused rather than moving its still-live waiter elsewhere.
+            app.is_loading = true;
+            let cwd = session.cwd.clone();
+            assert!(session
+                .swap_runtime("other-session", &cwd, app.is_loading)
+                .is_err());
+
+            if let Some(action) = action {
+                apply_permission_modal_action_for_session(
+                    &mut app,
+                    &session,
+                    &mut pending,
+                    action,
+                    &rebon_core::policy::PolicyStore::new(),
+                    &cwd,
+                );
+                assert!(app.pending_permission_view.is_none());
+            } else {
+                // LoopState owns PendingPermission; its drop closes the oneshot.
+                drop(pending.take());
+            }
+            assert!(pending.is_none());
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), future)
+                .await
+                .expect("the modal releases the synchronous call");
+            match action {
+                Some(PermissionModalAction::Confirm) => {
+                    let output = result.unwrap();
+                    assert_eq!(output["answers"]["Which database?"], "Postgres");
+                    assert!(output.get("status").is_none());
+                }
+                Some(_) => assert!(matches!(
+                    result,
+                    Err(rebon_tools_core::ToolError::PermissionDenied { .. })
+                )),
+                None => assert!(matches!(
+                    result,
+                    Err(rebon_tools_core::ToolError::Execution { .. })
+                )),
+            }
+            assert!(
+                app.queued_submit_payloads.is_empty(),
+                "no asynchronous answer injection"
+            );
+        }
+    }
+
     #[test]
     fn every_answered_question_is_recorded_as_a_plain_interview_turn() {
         let mut app = AppState::new();

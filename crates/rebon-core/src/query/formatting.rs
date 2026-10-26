@@ -352,7 +352,8 @@ pub(super) fn format_bytes(bytes: u64) -> String {
     }
 }
 pub(super) fn format_ask_user_question_result_for_model(value: &Value) -> String {
-    // A deferred question has no answers yet; its result says so instead.
+    // Historical transcripts may contain a deferred placeholder. Preserve
+    // its text rather than misrepresenting it as the user's answers.
     if let Some(pending) = crate::deferred_question::pending_model_text(value) {
         return pending.to_string();
     }

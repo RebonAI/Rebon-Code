@@ -645,8 +645,8 @@ pub fn serialize_auto_mode_transcript_as(
                 ContentBlock::ToolResult(tool_result) => {
                     let tool_name = tool_names.get(&tool_result.tool_use_id).map(String::as_str);
                     let content = tool_result.content.to_plain_text();
-                    // A deferred question's placeholder is not the user's
-                    // answer; that arrives later as a user message.
+                    // Historical deferred placeholders are not answers or
+                    // authorization from the user.
                     if tool_name == Some("AskUserQuestion")
                         && !tool_result.is_error
                         && !crate::deferred_question::is_pending_model_text(&content)
@@ -1138,12 +1138,13 @@ mod tests {
         assert!(transcript.contains("\"outcome\":\"ok\""));
     }
 
-    /// A deferred question's placeholder result must not read as the user's
+    /// A historical deferred question's placeholder must not read as the user's
     /// answer: the classifier would otherwise see "User answered" with text
     /// the user never wrote.
     #[test]
     fn a_pending_question_result_is_not_serialized_as_the_users_answer() {
-        let pending = crate::deferred_question::pending_result("ask-2");
+        let pending =
+            serde_json::from_str(crate::deferred_question::LEGACY_PENDING_RESULT).unwrap();
         let pending_text = crate::deferred_question::pending_model_text(&pending)
             .unwrap()
             .to_owned();

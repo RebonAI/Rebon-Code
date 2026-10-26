@@ -27,7 +27,6 @@ use crate::auto_mode_classifier::{
     AutoModeClassifier, AutoModeClassifierError, AutoModeClassifierFailureKind,
     AutoModeClassifierOutcome, AutoModeClassifierRequest,
 };
-use crate::deferred_question::{self, DeferredQuestionSink};
 use crate::permission_seat::{DecisionScope, PermissionRules, RejectionNote};
 
 /// How long one auto-mode classification may take: both stages, and the
@@ -267,12 +266,6 @@ pub struct ChannelPermissionBroker {
     /// Runtime resolver used only by the long-lived broker. `for_session`
     /// acquires once and stores the resulting fixed snapshot above.
     kernel_ctx_resolver: Arc<std::sync::Mutex<Option<KernelContextLeaseResolver>>>,
-    /// Where deferred `AskUserQuestion` answers go. Only a surface that can
-    /// take a user message at any time installs one (the local TUI); without
-    /// it every question holds its turn as before. Shared by every per-turn
-    /// view, so a sink installed mid-session reaches the next turn.
-    /// See [`Self::question_deferral`].
-    deferred_question_sink: Arc<std::sync::Mutex<Option<Arc<dyn DeferredQuestionSink>>>>,
 }
 
 pub type SharedChannelPermissionBroker = Arc<ChannelPermissionBroker>;
@@ -310,7 +303,6 @@ impl ChannelPermissionBroker {
                 auto_mode_classifier: Arc::new(std::sync::Mutex::new(None)),
                 kernel_ctx: Arc::new(std::sync::Mutex::new(None)),
                 kernel_ctx_resolver: Arc::new(std::sync::Mutex::new(None)),
-                deferred_question_sink: Arc::new(std::sync::Mutex::new(None)),
             },
             receiver,
         )
@@ -403,7 +395,6 @@ impl ChannelPermissionBroker {
             auto_mode_classifier: self.auto_mode_classifier.clone(),
             kernel_ctx: Arc::new(std::sync::Mutex::new(kernel_ctx)),
             kernel_ctx_resolver: Arc::new(std::sync::Mutex::new(None)),
-            deferred_question_sink: self.deferred_question_sink.clone(),
         }
     }
 
@@ -465,65 +456,6 @@ impl ChannelPermissionBroker {
 
     fn current_classifier(&self) -> Option<Arc<dyn AutoModeClassifier>> {
         self.auto_mode_classifier.lock().expect("poisoned").clone()
-    }
-
-    /// Install (or with `None`, remove) the sink deferred questions answer
-    /// into. See [`crate::deferred_question`].
-    pub fn set_deferred_question_sink(&self, sink: Option<Arc<dyn DeferredQuestionSink>>) {
-        *self.deferred_question_sink.lock().expect("poisoned") = sink;
-    }
-
-    pub fn has_deferred_question_sink(&self) -> bool {
-        self.deferred_question_sink
-            .lock()
-            .expect("poisoned")
-            .is_some()
-    }
-
-    /// Whether this ask may return before the user answers, and if so what
-    /// the answer needs to be delivered later.
-    ///
-    /// Only a plain `AskUserQuestion` from the main thread qualifies. A
-    /// grill or ultraplan question gates what happens next — its
-    /// `metadata.intent` or the run it belongs to reads the answer
-    /// synchronously — and a sub-agent's or teammate's question has no user
-    /// message to come back as. The tool is re-resolved as an owned handle
-    /// because the call that finally records the answer outlives this
-    /// borrow; with no resolver on the context the question simply waits.
-    fn question_deferral(
-        &self,
-        tool: &dyn Tool,
-        input: &Value,
-        context: &ToolContext,
-    ) -> Option<QuestionDeferral> {
-        if tool.id().as_str() != deferred_question::ASK_USER_QUESTION_TOOL
-            || !deferred_question::deferred_questions_enabled()
-            || context.agent_id().is_some()
-            || context.ultraplan_context().is_some()
-            || input
-                .get("metadata")
-                .and_then(|metadata| metadata.get("intent"))
-                .is_some()
-        {
-            return None;
-        }
-        let sink = self
-            .deferred_question_sink
-            .lock()
-            .expect("poisoned")
-            .clone()?;
-        let tool_use_id = context.tool_use_id()?.to_owned();
-        let tool = context
-            .tool_resolver()?
-            .resolve(tool.id().as_str(), context.tool_filter())
-            .ok()
-            .flatten()?;
-        Some(QuestionDeferral {
-            sink,
-            tool,
-            session_id: self.session_id.lock().expect("poisoned").clone(),
-            tool_use_id,
-        })
     }
 
     /// Hand `query` to whoever shows it.
@@ -1390,11 +1322,6 @@ impl PermissionBroker for ChannelPermissionBroker {
                 let answer = if let Some(answer) = kernel_answer {
                     answer
                 } else {
-                    let deferral = self.question_deferral(
-                        tool,
-                        decision.updated_input.as_ref().unwrap_or(&input),
-                        context,
-                    );
                     let (response_tx, response_rx) = oneshot::channel();
                     let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
@@ -1416,19 +1343,8 @@ impl PermissionBroker for ChannelPermissionBroker {
 
                     self.send_query(tool, query)?;
 
-                    // The dialog is up either way; a deferred question just
-                    // stops waiting for it here.
-                    if let Some(deferral) = deferral {
-                        let pending = deferred_question::pending_result(&deferral.tool_use_id);
-                        deferral.await_answer(
-                            response_rx,
-                            decision.updated_input.unwrap_or(input),
-                            permission_authorized_context.unwrap_or_else(|| context.clone()),
-                            rules,
-                        );
-                        return Ok(pending);
-                    }
-
+                    // Suspend this tool call, not the UI: the runner owns
+                    // the sender and can answer, cancel, or drop it on exit.
                     response_rx.await.map_err(|_| ToolError::Execution {
                         tool: tool.id(),
                         source: anyhow::anyhow!("permission response dropped"),
@@ -1483,8 +1399,7 @@ impl PermissionBroker for ChannelPermissionBroker {
     }
 }
 
-/// Run a call the user approved, the way both a waiting and a deferred ask
-/// finish.
+/// Run a call the user approved, preserving the selected input and notes.
 async fn call_approved(
     tool: &dyn Tool,
     option_id: &str,
@@ -1507,80 +1422,6 @@ async fn call_approved(
     let mut output = tool.call(effective_input, &call_context).await?;
     append_permission_extra_text(&mut output, extra_text);
     Ok(output)
-}
-
-/// What a deferred question needs once its answer arrives, after the call
-/// that asked has returned. See [`ChannelPermissionBroker::question_deferral`].
-struct QuestionDeferral {
-    sink: Arc<dyn DeferredQuestionSink>,
-    tool: Arc<dyn Tool>,
-    session_id: String,
-    tool_use_id: String,
-}
-
-impl QuestionDeferral {
-    /// Wait for the dialog in the background and deliver what the user did.
-    ///
-    /// An answer goes through the tool exactly as a waiting ask's would, so
-    /// the model reads the same content either way. A dialog closed without
-    /// an answer (the surface dropped it, say on exit) delivers nothing:
-    /// nobody is there to have said anything.
-    fn await_answer(
-        self,
-        response_rx: oneshot::Receiver<PermissionAnswer>,
-        input: Value,
-        call_context: ToolContext,
-        rules: PermissionRules,
-    ) {
-        tokio::spawn(async move {
-            let Ok(answer) = response_rx.await else {
-                tracing::info!(
-                    session_id = %self.session_id,
-                    tool_use_id = %self.tool_use_id,
-                    "deferred question closed without an answer; nothing to deliver"
-                );
-                return;
-            };
-            let delivery = match answer {
-                PermissionAnswer::Selected {
-                    option_id,
-                    extra_text,
-                    ..
-                } if is_reject_option(&option_id) => deferred_question::dismissed(
-                    &self.session_id,
-                    &self.tool_use_id,
-                    extra_text.as_deref(),
-                ),
-                PermissionAnswer::Selected {
-                    option_id,
-                    updated_input,
-                    extra_text,
-                } => match call_approved(
-                    self.tool.as_ref(),
-                    &option_id,
-                    updated_input.unwrap_or(input),
-                    call_context,
-                    &rules,
-                    &extra_text,
-                )
-                .await
-                {
-                    Ok(output) => {
-                        deferred_question::answered(&self.session_id, &self.tool_use_id, &output)
-                    }
-                    Err(error) => deferred_question::unreadable(
-                        &self.session_id,
-                        &self.tool_use_id,
-                        &error.to_string(),
-                    ),
-                },
-                PermissionAnswer::Cancelled => {
-                    deferred_question::dismissed(&self.session_id, &self.tool_use_id, None)
-                }
-            };
-            self.sink.deliver(delivery);
-        });
-    }
 }
 
 pub fn user_prompt_permission_broker_from(
@@ -5558,19 +5399,9 @@ mod tests {
         let _ = handle.await.unwrap();
     }
 
-    /// Deferred `AskUserQuestion`: the broker's half. The sink stands in for
-    /// the surface; what the surface does with a delivery is its own test.
-    mod deferred_questions {
+    /// Questions suspend the tool call while the UI owns the reply channel.
+    mod synchronous_questions {
         use super::*;
-        use crate::deferred_question::{DeferredQuestionAnswer, DEFERRED_QUESTIONS_ENV};
-
-        struct ChannelSink(mpsc::UnboundedSender<DeferredQuestionAnswer>);
-
-        impl DeferredQuestionSink for ChannelSink {
-            fn deliver(&self, answer: DeferredQuestionAnswer) {
-                self.0.send(answer).expect("test holds the receiver");
-            }
-        }
 
         struct OneTool(Arc<dyn Tool>);
 
@@ -5618,15 +5449,11 @@ mod tests {
                 .with_tool_resolver(Arc::new(OneTool(Arc::new(AskUserQuestionTool))))
         }
 
-        fn broker_with_sink() -> (
+        fn question_broker() -> (
             ChannelPermissionBroker,
             mpsc::UnboundedReceiver<OutboundPermissionQuery>,
-            mpsc::UnboundedReceiver<DeferredQuestionAnswer>,
         ) {
-            let (broker, rx) = ChannelPermissionBroker::new("sess-deferred");
-            let (tx, deliveries) = mpsc::unbounded_channel();
-            broker.set_deferred_question_sink(Some(Arc::new(ChannelSink(tx))));
-            (broker, rx, deliveries)
+            ChannelPermissionBroker::new("sess-question")
         }
 
         async fn ask(
@@ -5651,186 +5478,147 @@ mod tests {
             }
         }
 
-        async fn next_delivery(
-            deliveries: &mut mpsc::UnboundedReceiver<DeferredQuestionAnswer>,
-        ) -> DeferredQuestionAnswer {
-            tokio::time::timeout(std::time::Duration::from_secs(5), deliveries.recv())
-                .await
-                .expect("the answer is delivered")
-                .expect("sink stays open")
-        }
-
-        /// A question that waits resolves to the answers only after the
-        /// dialog is answered, and nothing reaches the sink.
+        /// Polling proves suspension without a timing or scheduling race.
         async fn assert_waits_for_the_dialog(
             broker: ChannelPermissionBroker,
             mut rx: mpsc::UnboundedReceiver<OutboundPermissionQuery>,
-            mut deliveries: Option<mpsc::UnboundedReceiver<DeferredQuestionAnswer>>,
             input: Value,
             context: ToolContext,
         ) {
-            let handle = tokio::spawn(async move { ask(&broker, input, &context).await });
-            let query = rx.recv().await.expect("the dialog is shown");
-            assert!(!handle.is_finished(), "a waiting ask holds the call");
+            let future = ask(&broker, input, &context);
+            tokio::pin!(future);
+            assert!(futures_util::poll!(&mut future).is_pending());
+            let query = rx.try_recv().expect("the dialog is shown");
             let mut answered = query.tool_input.clone().expect("question input");
             answered["answers"] = json!({ QUESTION: "Postgres" });
             answer_with(query, selected(answered));
-            let output = handle.await.unwrap().expect("answered question runs");
+            let output = future.await.expect("answered question runs");
             assert_eq!(output["answers"][QUESTION], "Postgres");
-            if let Some(deliveries) = deliveries.as_mut() {
-                assert!(deliveries.try_recv().is_err(), "nothing was deferred");
+        }
+
+        #[tokio::test]
+        async fn main_session_question_waits_and_returns_the_answer() {
+            let _env = crate::test_env_lock();
+            let (broker, mut rx) = question_broker();
+            let context = question_context();
+            let future = ask(&broker, question_input(), &context);
+            tokio::pin!(future);
+
+            // Poll the actual call rather than relying on a spawned task's
+            // scheduling: showing the dialog must not complete the call.
+            assert!(futures_util::poll!(&mut future).is_pending());
+            let query = rx.try_recv().expect("the dialog is shown");
+            assert_eq!(query.tool_call_id, "toolu_q");
+            let mut input = answered_input();
+            input["annotations"] =
+                json!({ QUESTION: { "preview": "schema", "notes": "keep it small" } });
+            answer_with(
+                query,
+                selected(input).with_extra_text(Some("go fast".into())),
+            );
+            let output = future.await.expect("answered question runs");
+            assert_eq!(output["permissionExtraText"], "go fast");
+            assert_eq!(output["answers"][QUESTION], "Postgres");
+            assert_eq!(output["annotations"][QUESTION]["notes"], "keep it small");
+            assert_eq!(output["annotations"][QUESTION]["preview"], "schema");
+            assert!(output.get("status").is_none());
+        }
+
+        #[tokio::test]
+        async fn a_cancel_or_rejection_finishes_the_waiting_call() {
+            for answer in [
+                PermissionAnswer::Cancelled,
+                PermissionAnswer::Selected {
+                    option_id: "reject_once".into(),
+                    updated_input: None,
+                    extra_text: Some("explain first".into()),
+                },
+            ] {
+                let (broker, mut rx) = question_broker();
+                let context = question_context();
+                let future = ask(&broker, question_input(), &context);
+                tokio::pin!(future);
+                assert!(futures_util::poll!(&mut future).is_pending());
+                answer_with(rx.try_recv().unwrap(), answer);
+                let result = tokio::time::timeout(Duration::from_secs(1), future)
+                    .await
+                    .expect("cancellation releases the waiter");
+                assert!(matches!(result, Err(ToolError::PermissionDenied { .. })));
             }
         }
 
         #[tokio::test]
-        async fn an_eligible_question_returns_pending_and_the_answer_reaches_the_sink() {
-            let _env = crate::test_env_lock();
-            let (broker, mut rx, mut deliveries) = broker_with_sink();
-
-            let output = ask(&broker, question_input(), &question_context())
-                .await
-                .expect("a deferred question does not fail");
-            assert_eq!(output["status"], "pending");
-            assert_eq!(output["toolUseId"], "toolu_q");
-            let pending = crate::deferred_question::pending_model_text(&output).unwrap();
-            assert!(pending.contains("<question-answer tool_use_id=\"toolu_q\">"));
-
-            // The dialog went out exactly as a waiting ask's would.
-            let query = rx.try_recv().expect("the dialog is shown");
-            assert_eq!(query.tool_name, "AskUserQuestion");
-            assert_eq!(query.tool_call_id, "toolu_q");
-            assert_eq!(query.session_id, "sess-deferred");
-
-            answer_with(
-                query,
-                PermissionAnswer::Selected {
-                    option_id: "allow_once".into(),
-                    updated_input: Some(answered_input()),
-                    extra_text: Some("go fast".into()),
-                },
-            );
-            let delivery = next_delivery(&mut deliveries).await;
-            assert_eq!(delivery.session_id, "sess-deferred");
-            assert_eq!(delivery.tool_use_id, "toolu_q");
-            assert!(delivery.start_turn_if_idle);
-            assert_eq!(
-                delivery.display_text,
-                "Answered questions:\n- Which database?\n  Answer: Postgres"
-            );
-            assert_eq!(
-                delivery.model_text,
-                "<question-answer tool_use_id=\"toolu_q\">\n\
-                 Answered questions:\n- Which database?\n  Answer: Postgres\n\
-                 User note: go fast\n\
-                 </question-answer>"
-            );
-        }
-
-        /// The per-turn view the executor builds shares the sink the surface
-        /// installed on the long-lived broker.
-        #[tokio::test]
-        async fn a_per_turn_view_defers_through_the_installed_sink() {
-            let _env = crate::test_env_lock();
-            let (broker, mut rx, mut deliveries) = broker_with_sink();
-            let turn = broker.for_session("sess-turn");
-            assert!(turn.has_deferred_question_sink());
-
-            let output = ask(&turn, question_input(), &question_context())
-                .await
-                .unwrap();
-            assert_eq!(output["status"], "pending");
-            answer_with(rx.try_recv().unwrap(), selected(answered_input()));
-            assert_eq!(next_delivery(&mut deliveries).await.session_id, "sess-turn");
+        async fn dropping_the_dialog_or_receiver_releases_the_waiter() {
+            for take_dialog in [false, true] {
+                let (broker, mut rx) = question_broker();
+                let context = question_context();
+                let future = ask(&broker, question_input(), &context);
+                tokio::pin!(future);
+                assert!(futures_util::poll!(&mut future).is_pending());
+                if take_dialog {
+                    drop(rx.try_recv().unwrap());
+                }
+                // A runner can close before or after showing the dialog.
+                drop(rx);
+                let result = tokio::time::timeout(Duration::from_secs(1), future)
+                    .await
+                    .expect("channel closure releases the waiter");
+                assert!(matches!(result, Err(ToolError::Execution { .. })));
+            }
         }
 
         #[tokio::test]
-        async fn an_answer_after_the_asking_turn_is_gone_still_arrives() {
-            let _env = crate::test_env_lock();
-            let (broker, mut rx, mut deliveries) = broker_with_sink();
-            ask(&broker, question_input(), &question_context())
-                .await
-                .unwrap();
+        async fn a_closed_request_channel_fails_without_waiting() {
+            let (broker, rx) = question_broker();
+            drop(rx);
+            let result = ask(&broker, question_input(), &question_context()).await;
+            assert!(matches!(result, Err(ToolError::Execution { .. })));
+        }
+
+        #[tokio::test]
+        async fn dropping_the_call_leaves_no_background_answer_waiter() {
+            let (broker, mut rx) = question_broker();
+            let context = question_context();
+            let mut future = Box::pin(ask(&broker, question_input(), &context));
+            assert!(futures_util::poll!(&mut future).is_pending());
             let query = rx.try_recv().unwrap();
-            // Nothing of the turn survives but the dialog.
-            drop(broker);
+            drop(future);
+            assert!(query.response_tx.is_closed());
+            assert!(query.response_tx.send(selected(answered_input())).is_err());
+        }
+
+        #[tokio::test]
+        async fn a_per_turn_question_waits_on_the_ordered_event_channel() {
+            let (broker, _rx) = question_broker();
+            let (tx, mut events) = mpsc::unbounded_channel();
+            let turn = broker.for_session("sess-turn");
+            turn.set_query_event_tx(Some(tx));
+            let context = question_context();
+            let future = ask(&turn, question_input(), &context);
+            tokio::pin!(future);
+            assert!(futures_util::poll!(&mut future).is_pending());
+            let crate::query::QueryEvent::PermissionQuery(query) = events.try_recv().unwrap()
+            else {
+                panic!("expected a permission query");
+            };
+            assert_eq!(query.session_id, "sess-turn");
             answer_with(query, selected(answered_input()));
-            assert_eq!(next_delivery(&mut deliveries).await.tool_use_id, "toolu_q");
-        }
-
-        #[tokio::test]
-        async fn a_rejection_or_cancel_delivers_a_dismissal() {
-            let _env = crate::test_env_lock();
-            let (broker, mut rx, mut deliveries) = broker_with_sink();
-
-            ask(&broker, question_input(), &question_context())
-                .await
-                .unwrap();
-            answer_with(rx.try_recv().unwrap(), PermissionAnswer::Cancelled);
-            let dismissal = next_delivery(&mut deliveries).await;
-            assert!(!dismissal.start_turn_if_idle);
-            assert!(dismissal.model_text.contains("status=\"dismissed\""));
-
-            ask(&broker, question_input(), &question_context())
-                .await
-                .unwrap();
-            answer_with(
-                rx.try_recv().unwrap(),
-                PermissionAnswer::Selected {
-                    option_id: "reject_once".into(),
-                    updated_input: None,
-                    extra_text: Some("neither, explain first".into()),
-                },
-            );
-            let rejection = next_delivery(&mut deliveries).await;
-            assert!(rejection.model_text.contains("status=\"dismissed\""));
-            assert!(rejection
-                .model_text
-                .contains("User note: neither, explain first"));
-            assert!(
-                rejection.start_turn_if_idle,
-                "a note the user wrote is something they said"
-            );
-        }
-
-        #[tokio::test]
-        async fn a_dialog_dropped_unanswered_delivers_nothing() {
-            let _env = crate::test_env_lock();
-            let (broker, mut rx, mut deliveries) = broker_with_sink();
-            ask(&broker, question_input(), &question_context())
-                .await
-                .unwrap();
-            drop(rx.try_recv().unwrap());
-            drop(broker);
-            // The task ends and takes the only other sender with it.
-            let closed = tokio::time::timeout(std::time::Duration::from_secs(5), deliveries.recv())
-                .await
-                .expect("the waiting task finishes");
-            assert!(closed.is_none(), "nothing delivered: {closed:?}");
-        }
-
-        #[tokio::test]
-        async fn without_a_sink_the_question_waits() {
-            let _env = crate::test_env_lock();
-            let (broker, rx) = ChannelPermissionBroker::new("sess-no-sink");
-            assert!(!broker.has_deferred_question_sink());
-            assert_waits_for_the_dialog(broker, rx, None, question_input(), question_context())
-                .await;
+            assert_eq!(future.await.unwrap()["answers"][QUESTION], "Postgres");
         }
 
         #[tokio::test]
         async fn a_grill_intent_question_waits() {
             let _env = crate::test_env_lock();
-            let (broker, rx, deliveries) = broker_with_sink();
+            let (broker, rx) = question_broker();
             let mut input = question_input();
             input["metadata"] = json!({ "intent": "confirm_understanding" });
-            assert_waits_for_the_dialog(broker, rx, Some(deliveries), input, question_context())
-                .await;
+            assert_waits_for_the_dialog(broker, rx, input, question_context()).await;
         }
 
         #[tokio::test]
         async fn an_ultraplan_question_waits() {
             let _env = crate::test_env_lock();
-            let (broker, rx, deliveries) = broker_with_sink();
+            let (broker, rx) = question_broker();
             let ultraplan = rebon_types::UltraplanContext::planning_turn(
                 "run",
                 "plan",
@@ -5838,54 +5626,30 @@ mod tests {
             );
             let context = question_context()
                 .with_execution_policy(rebon_types::ExecutionPolicy::ultraplan(ultraplan));
-            assert_waits_for_the_dialog(broker, rx, Some(deliveries), question_input(), context)
-                .await;
+            assert_waits_for_the_dialog(broker, rx, question_input(), context).await;
         }
 
         #[tokio::test]
         async fn a_sub_agent_question_waits() {
             let _env = crate::test_env_lock();
-            let (broker, rx, deliveries) = broker_with_sink();
+            let (broker, rx) = question_broker();
             let context = question_context().with_agent_id("worker-1");
-            assert_waits_for_the_dialog(broker, rx, Some(deliveries), question_input(), context)
-                .await;
+            assert_waits_for_the_dialog(broker, rx, question_input(), context).await;
         }
 
         #[tokio::test]
         async fn a_context_without_a_tool_resolver_waits() {
             let _env = crate::test_env_lock();
-            let (broker, rx, deliveries) = broker_with_sink();
+            let (broker, rx) = question_broker();
             let context = ToolContext::new().with_tool_use_id("toolu_q");
-            assert_waits_for_the_dialog(broker, rx, Some(deliveries), question_input(), context)
-                .await;
+            assert_waits_for_the_dialog(broker, rx, question_input(), context).await;
         }
 
+        /// Ordinary permission requests still use the same waiting channel.
         #[tokio::test]
-        async fn switching_the_feature_off_makes_questions_wait() {
+        async fn other_tools_still_wait_for_approval() {
             let _env = crate::test_env_lock();
-            let previous = std::env::var_os(DEFERRED_QUESTIONS_ENV);
-            std::env::set_var(DEFERRED_QUESTIONS_ENV, "0");
-            let (broker, rx, deliveries) = broker_with_sink();
-            assert_waits_for_the_dialog(
-                broker,
-                rx,
-                Some(deliveries),
-                question_input(),
-                question_context(),
-            )
-            .await;
-            match previous {
-                Some(value) => std::env::set_var(DEFERRED_QUESTIONS_ENV, value),
-                None => std::env::remove_var(DEFERRED_QUESTIONS_ENV),
-            }
-        }
-
-        /// Only `AskUserQuestion` defers; any other ask holds its call even
-        /// with a sink installed.
-        #[tokio::test]
-        async fn other_tools_still_wait_with_a_sink_installed() {
-            let _env = crate::test_env_lock();
-            let (broker, mut rx, mut deliveries) = broker_with_sink();
+            let (broker, mut rx) = question_broker();
             let context = ToolContext::new()
                 .with_tool_use_id("t-echo")
                 .with_tool_resolver(Arc::new(OneTool(Arc::new(EchoTool))));
@@ -5910,7 +5674,6 @@ mod tests {
                 },
             );
             assert_eq!(handle.await.unwrap().unwrap(), json!({ "x": 1 }));
-            assert!(deliveries.try_recv().is_err());
         }
     }
 }

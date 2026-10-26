@@ -97,6 +97,70 @@ async fn run_query_cancellation_interrupts_an_in_flight_tool() {
 }
 
 #[tokio::test]
+async fn run_query_cancellation_releases_a_waiting_question() {
+    let (broker, _dialogs) = crate::permission::ChannelPermissionBroker::new("sess-question");
+    let mut engine = Engine::new().with_permission_broker(Arc::new(broker));
+    engine.register_tool(Arc::new(rebon_plugin_escalation::AskUserQuestionTool));
+    let engine = Arc::new(engine);
+    let client = MockModelClient::new();
+    let input = json!({ "questions": [{
+        "question": "Which database?", "header": "DB",
+        "options": [
+            { "label": "Postgres", "description": "Relational" },
+            { "label": "SQLite", "description": "Embedded" }
+        ]
+    }] });
+    client.push_turn(tool_turn(
+        "msg_question",
+        "AskUserQuestion",
+        "toolu_question",
+        &input.to_string(),
+    ));
+    let params = QueryParams::new("mock", vec![ApiMessage::user_text("ask me")])
+        .with_tools(tools_from_engine(&engine));
+    let cancel = CancelToken::new();
+    let mut events = run_query(
+        engine,
+        SessionHandle::new(Arc::new(client)),
+        params,
+        ToolContext::new(),
+        cancel.clone(),
+    );
+    let query = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            match events.recv().await {
+                Some(QueryEvent::PermissionQuery(query)) => break query,
+                Some(QueryEvent::ToolDispatchResult {
+                    outcome: Err(error),
+                    ..
+                }) => {
+                    panic!("question failed before reaching the UI: {error}");
+                }
+                Some(_) => {}
+                None => panic!("query ended before asking the question"),
+            }
+        }
+    })
+    .await
+    .expect("question reaches the UI");
+    assert!(
+        !query.response_tx.is_closed(),
+        "the call is waiting for an answer"
+    );
+    cancel.cancel();
+    let events = tokio::time::timeout(std::time::Duration::from_secs(1), drain(&mut events))
+        .await
+        .expect("turn cancellation must not wait for the user's answer");
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, QueryEvent::Cancelled)));
+    assert!(
+        query.response_tx.is_closed(),
+        "no answer task survives the cancelled turn"
+    );
+}
+
+#[tokio::test]
 async fn run_query_cancellation_interrupts_retry_middleware_backoff() {
     let engine = Arc::new(Engine::new());
     let mock = Arc::new(MockModelClient::new());
