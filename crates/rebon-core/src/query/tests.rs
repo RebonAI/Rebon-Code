@@ -1,6 +1,7 @@
 use super::executor::{stable_session_prompt_cache_key, sync_ultraplan_run_handle_from_disk};
 use super::prompt::history_has_anchored_minimal_anchor;
 use super::*;
+use crate::tests::SubAgentsEnabledGuard;
 use async_trait::async_trait;
 use rebon_api::{
     auto_compact_truncate, ContentBlockDelta, ContentBlockStart, MessageDeltaFields,
@@ -108,24 +109,6 @@ impl Drop for EnvVarGuard {
             Some(value) => std::env::set_var(self.name, value),
             None => std::env::remove_var(self.name),
         }
-    }
-}
-
-struct SubAgentsEnabledGuard {
-    prior: bool,
-}
-
-impl SubAgentsEnabledGuard {
-    fn set(enabled: bool) -> Self {
-        let prior = rebon_tool::sub_agents_enabled();
-        rebon_tool::set_sub_agents_enabled(enabled);
-        Self { prior }
-    }
-}
-
-impl Drop for SubAgentsEnabledGuard {
-    fn drop(&mut self) {
-        rebon_tool::set_sub_agents_enabled(self.prior);
     }
 }
 
