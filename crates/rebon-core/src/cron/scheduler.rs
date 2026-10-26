@@ -712,6 +712,83 @@ mod tests {
         assert!(table.contains_key(&one_shot_id));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_file_watcher_avoids_per_path_descriptors() {
+        assert_eq!(
+            <notify::RecommendedWatcher as notify::Watcher>::kind(),
+            notify::WatcherKind::Fsevent
+        );
+    }
+
+    #[tokio::test]
+    async fn file_watcher_reloads_after_creation_atomic_replacement_and_deletion() {
+        let dir = tmp_project();
+        let (reload_tx, mut reload_rx) = mpsc::channel(1);
+        let watcher = spawn_file_watcher(&dir.path().to_path_buf(), reload_tx).unwrap();
+        let path = cron_file_path(dir.path());
+        assert!(!path.exists());
+
+        for prompt in ["created", "replaced"] {
+            let task = CronTask {
+                id: "aaaabbbb".into(),
+                cron: "0 * * * *".into(),
+                prompt: prompt.into(),
+                created_at: 1_000,
+                last_fired_at: None,
+                recurring: true,
+                permanent: false,
+            };
+            write_cron_tasks(dir.path(), &[task]).unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), reload_rx.recv())
+                    .await
+                    .expect("任务文件写入后应通知重载"),
+                Some(())
+            );
+            assert_eq!(read_cron_tasks(dir.path())[0].prompt, prompt);
+        }
+
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), reload_rx.recv())
+                .await
+                .expect("任务文件删除后应通知重载"),
+            Some(())
+        );
+        assert!(read_cron_tasks(dir.path()).is_empty());
+        drop(watcher);
+    }
+
+    #[tokio::test]
+    async fn file_watcher_ignores_worktrees_and_scheduler_lock() {
+        let dir = tmp_project();
+        let rebon_dir = cron_dir(dir.path());
+        let worktree = rebon_dir.join("worktrees").join("agent-probe");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let (reload_tx, mut reload_rx) = mpsc::channel(1);
+        let watcher = spawn_file_watcher(&dir.path().to_path_buf(), reload_tx).unwrap();
+
+        std::fs::write(rebon_dir.join(".scheduler.lock"), b"probe").unwrap();
+        std::fs::create_dir(rebon_dir.join("another-worktree")).unwrap();
+        std::fs::write(worktree.join("scheduled_tasks.json"), b"{}").unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(FILE_STABILITY_MS * 3),
+            reload_rx.recv()
+        )
+        .await
+        .is_err());
+        drop(watcher);
+    }
+
+    #[test]
+    fn file_watcher_refuses_a_non_directory_cron_path() {
+        let dir = tmp_project();
+        std::fs::write(cron_dir(dir.path()), b"not a directory").unwrap();
+        let (reload_tx, _reload_rx) = mpsc::channel(1);
+        assert!(spawn_file_watcher(&dir.path().to_path_buf(), reload_tx).is_none());
+    }
+
     #[test]
     fn handle_stop_terminates_loop() {
         let dir = tmp_project();

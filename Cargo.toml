@@ -162,7 +162,8 @@ image = { version = "=0.25.10", default-features = false, features = ["png"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # Filesystem change notification
-notify = { version = "6", default-features = false, features = ["macos_kqueue"] }
+# macOS 的 kqueue 后端会将非递归监听扩展到 worktree，打开大量 FD 并导致 spawn 报 EBADF。
+notify = { version = "6", default-features = false, features = ["macos_fsevent"] }
 
 # Advisory cross-process file locks
 fs2 = "0.4"
