@@ -243,6 +243,49 @@ impl BashTool {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Bash 进程执行失败 (stage={stage}, program={program:?}, pid={pid:?}): {source}")]
+struct BashProcessError {
+    stage: &'static str,
+    program: String,
+    pid: Option<u32>,
+    #[source]
+    source: std::io::Error,
+}
+
+fn bash_process_error(
+    stage: &'static str,
+    source: std::io::Error,
+    prepared: &PreparedCommand,
+    context: &ToolContext,
+    pid: Option<u32>,
+) -> ToolError {
+    tracing::error!(
+        stage,
+        program = %prepared.program,
+        pid,
+        cwd = ?prepared.cwd,
+        sandbox_backend = prepared.backend,
+        confined = prepared.confined,
+        session_id = context.session_id(),
+        tool_use_id = context.tool_use_id(),
+        os_error = source.raw_os_error(),
+        error_kind = ?source.kind(),
+        error = %source,
+        "Bash 进程执行失败"
+    );
+    ToolError::Execution {
+        tool: ToolId::new(BASH_TOOL_NAME),
+        source: BashProcessError {
+            stage,
+            program: prepared.program.clone(),
+            pid,
+            source,
+        }
+        .into(),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BashInput {
     command: String,
@@ -400,10 +443,10 @@ impl Tool for BashTool {
             return Ok(result);
         }
 
-        let mut child = cmd.spawn().map_err(|err| ToolError::Execution {
-            tool: self.id(),
-            source: err.into(),
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| bash_process_error("spawn", err, &prepared, context, None))?;
+        let child_pid = child.id();
 
         let stdout = child.stdout.take().ok_or_else(|| ToolError::Execution {
             tool: self.id(),
@@ -448,10 +491,9 @@ impl Tool for BashTool {
                         }
                         Ok(None) => stdout_open = false,
                         Err(err) => {
-                            return Err(ToolError::Execution {
-                                tool: self.id(),
-                                source: err.into(),
-                            });
+                            return Err(bash_process_error(
+                                "read_stdout", err, &prepared, context, child_pid,
+                            ));
                         }
                     }
                 }
@@ -463,20 +505,19 @@ impl Tool for BashTool {
                         }
                         Ok(None) => stderr_open = false,
                         Err(err) => {
-                            return Err(ToolError::Execution {
-                                tool: self.id(),
-                                source: err.into(),
-                            });
+                            return Err(bash_process_error(
+                                "read_stderr", err, &prepared, context, child_pid,
+                            ));
                         }
                     }
                 }
             }
         }
 
-        let status = child.wait().await.map_err(|err| ToolError::Execution {
-            tool: self.id(),
-            source: err.into(),
-        })?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|err| bash_process_error("wait", err, &prepared, context, child_pid))?;
 
         // Cap each stream so a single large dump doesn't flood the
         // transcript (and every later model request) with output the
@@ -1397,9 +1438,102 @@ mod tests {
         };
 
         let tail = completed["outputTail"].as_str().unwrap();
-        assert!(tail.contains("first") && tail.contains("second"), "{tail:?}");
+        assert!(
+            tail.contains("first") && tail.contains("second"),
+            "{tail:?}"
+        );
         let file = std::fs::read_to_string(&output_path).unwrap();
-        assert!(file.contains("first") && file.contains("second"), "{file:?}");
+        assert!(
+            file.contains("first") && file.contains("second"),
+            "{file:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_errors_preserve_stage_and_ebadf_in_presentation_and_source() {
+        let prepared = PreparedCommand::passthrough(
+            &BinShell::new("/bin/sh", ["-lc"]),
+            "private-command",
+            Some("/diagnostic-cwd"),
+        );
+        let context = ToolContext::for_tool_use("bash-io-diagnostic")
+            .with_session_id("bash-diagnostic-session");
+        for (stage, pid) in [
+            ("spawn", None),
+            ("read_stdout", Some(42)),
+            ("read_stderr", Some(42)),
+            ("wait", Some(42)),
+        ] {
+            let source = std::io::Error::from_raw_os_error(libc::EBADF);
+            let original_message = source.to_string();
+            let err = bash_process_error(stage, source, &prepared, &context, pid);
+            let presentation = err.presentation();
+            assert!(
+                presentation
+                    .model_message
+                    .contains(&format!("stage={stage}")),
+                "{presentation}"
+            );
+            assert!(presentation.model_message.contains("/bin/sh"));
+            assert!(presentation.model_message.contains(&format!("pid={pid:?}")));
+            assert!(presentation.model_message.contains(&original_message));
+            assert!(!presentation.model_message.contains("private-command"));
+            assert_eq!(presentation.display_message, presentation.model_message);
+            let ToolError::Execution { source, .. } = err else {
+                panic!("expected an execution error");
+            };
+            let io_error = source
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+                .expect("保留原始 I/O 错误");
+            assert_eq!(io_error.raw_os_error(), Some(libc::EBADF));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn call_captures_both_streams_and_nonzero_exit() {
+        let _env = crate::test_env::hold_env();
+        let out = tool()
+            .call(
+                json!({ "command": "printf 'out\\n'; printf 'err\\n' >&2; exit 7" }),
+                &ToolContext::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["stdout"], "out");
+        assert_eq!(out["stderr"], "err");
+        assert_eq!(out["exitCode"], 7);
+        assert_eq!(out["interrupted"], false);
+        assert_eq!(out["timedOut"], false);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn call_reports_spawn_stage_and_preserves_io_error() {
+        let _env = crate::test_env::hold_env();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("missing-cwd");
+        let context = ToolContext::for_tool_use("bash-spawn-diagnostic")
+            .with_session_id("bash-diagnostic-session")
+            .with_cwd(cwd.to_string_lossy());
+        let err = tool()
+            .call(json!({ "command": echo_command() }), &context)
+            .await
+            .unwrap_err();
+
+        let message = err.presentation().model_message;
+        assert!(message.contains("stage=spawn"), "{message}");
+        assert!(message.contains(&bash_bin_shell().program), "{message}");
+        let ToolError::Execution { source, .. } = err else {
+            panic!("expected an execution error");
+        };
+        let io_error = source
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .expect("保留原始 I/O 错误");
+        assert!(io_error.raw_os_error().is_some());
+        assert!(message.contains(&io_error.to_string()), "{message}");
     }
 
     #[tokio::test]
