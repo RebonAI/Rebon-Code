@@ -159,6 +159,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Verve host tests failed with exit code $LASTEXITCODE" }
           cargo test -p rebon-plugin-supervisor --locked
           if ($LASTEXITCODE -ne 0) { throw "Plugin supervisor tests failed with exit code $LASTEXITCODE" }
+          cargo test -p rebon-plugin-host --lib --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Plugin host unit tests failed' }
           # The embedder half: a real host, the real composition runtime, and
           # rebon's own kernel seats on this side. Serial: these share one
           # process kernel and process-wide registration slots.
@@ -198,6 +200,72 @@ jobs:
           done
       - name: Test isolated Boa runner containment on macOS
         run: cargo test -p rebon-boa-runner --all-features --locked -- --test-threads=1
+
+  # 真实 DSH 验收依赖尚未合并的 Quorafind/verve#6，不能冒充生产 main 图的结果。
+  dsh-integration:
+    name: DSH integration (macOS)
+    runs-on: macos-14
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout RebonCode
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Checkout the exact Verve DSH compatibility revision
+        uses: actions/checkout@v7
+        with:
+          repository: Quorafind/verve
+          ref: a9fc5f6e15bec3d11fe7f3db5c034ae5ac3c41aa
+          path: .ci/verve-dsh
+          persist-credentials: false
+      - name: Cache the cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+      - name: Configure the job-local DSH dependency graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          verve="$GITHUB_WORKSPACE/.ci/verve-dsh"
+          config="$RUNNER_TEMP/dsh-cargo-config.toml"
+          # Verve 与 Boa 必须来自同一副本，避免重复类型和同源 git patch。
+          cat > "$config" <<EOF
+          [patch.crates-io]
+          boa_ast = { path = "$verve/boa/core/ast" }
+          boa_engine = { path = "$verve/boa/core/engine" }
+          boa_gc = { path = "$verve/boa/core/gc" }
+          boa_interner = { path = "$verve/boa/core/interner" }
+          boa_macros = { path = "$verve/boa/core/macros" }
+          boa_parser = { path = "$verve/boa/core/parser" }
+          boa_string = { path = "$verve/boa/core/string" }
+
+          [patch."https://github.com/Quorafind/verve.git"]
+          verve = { path = "$verve" }
+          EOF
+          echo "DSH_CARGO_CONFIG=$config" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/dsh-target" >> "$GITHUB_ENV"
+      # 临时 path patch 会改变此 job 的 lockfile；正常 verify/publish 仍检查生产锁定图。
+      - name: Build the DSH runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo --config "$DSH_CARGO_CONFIG" build -p rebon-verve-host --bin rebon-verve
+          echo "REBON_VERVE=$CARGO_TARGET_DIR/debug/rebon-verve" >> "$GITHUB_ENV"
+      - name: Test plugin host library
+        run: cargo --config "$DSH_CARGO_CONFIG" test -p rebon-plugin-host --lib
+      - name: Test real upstream DSH npm packages
+        run: cargo --config "$DSH_CARGO_CONFIG" test -p rebon-session-runtime --test dsh_upstream -- --ignored --test-threads=1
+      - name: Test the upstream DSH base profile
+        run: cargo --config "$DSH_CARGO_CONFIG" test -p rebon-session-runtime --lib the_dsh_base_profile_runs_the_rows_that_are_plugins -- --ignored --test-threads=1
+      - name: Test contained plugin boundaries
+        run: cargo --config "$DSH_CARGO_CONFIG" test -p rebon-harness --test plugin_plane_e2e a_contained_plugin_is_confined -- --test-threads=1
 
   test:
     needs: verify

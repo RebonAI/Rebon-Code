@@ -241,9 +241,25 @@ halves.
 **Events.** The composition's control plugin forwards the realm's
 `settings/document-updated`, `credentials/*-updated`, `llm/adapters-updated`
 and `commands/change` onto Rebon's event plane, on the topic
-`compose:remote-event` (`plugin_plane::REMOTE_EVENT_TOPIC`), as
-`{event, args}`. The client carrier turns each one into a `$events`
-`{type:'emit'}` frame.
+`compose:remote-event` (`plugin_plane::REMOTE_EVENT_TOPIC`)，内核订阅仍可读取
+`{event, args}`。client carrier 现在可直接调用
+`PluginPlane::open_remote("$events", {})`，取得 `RemoteEventStream`，无需自行拼装帧：
+
+- 首项固定为 `{type:'ready', clientId, host:{home}}`；`home` 与共享 realm 的
+  `profileContext.home` 一致，每次连接的 `clientId` 不同。
+- 后续 `recv().await` 返回 `{type:'emit', event, args}`。事件与 unary 调用共用现有
+  plugin-plane NDJSON 协议，不启动 HTTP/WebSocket 服务。
+- 仅已认证的 composition control plugin 能向该流发布；普通插件获准发布同名
+  topic 也不能冒充 Host。每个 plane 独立广播，不会因 scope 同名而串流。
+- 丢弃流或调用 `close()` 即取消订阅；plane `shutdown()` 会结束流，关闭后不能
+  新建订阅。慢客户端超过 256 项缓存时得到一次 `gateway/internal` 错误后结束，
+  必须重连并重读 settings 等快照，不能静默漏掉 invalidation。
+- 未提供的 stream（包括权限 waterfall）明确返回 `gateway/method-unavailable`。
+
+`__DSH_TRANSPORT__.rpc.call('/api', endpoint, {args})` 的 Host 端映射是
+`call_remote(endpoint, args)`；`rpc.open('/api', '$events', {args:{}})` 映射到
+`open_remote`。流中 `Ok(frame)` 是直接交给上游的 item，`Err(envelope)` 使用
+与 unary 相同的 `{ok:false,error}` 结构；carrier 应以该 `error` 结束流。
 
 **Settings are entry configs.** This is dsh's model, kept as it is. A
 settings namespace is a composition entry's id. Its form is the entry's
@@ -272,13 +288,32 @@ second loader.
 
 - `compose-runtime/test/dsh-host.test.mjs` drives the realm half with small
   local packages.
-- `crates/rebon-session-runtime/tests/dsh_upstream.rs` installs real
-  upstream packages from npm, boots a plane, and calls `settings/describe`,
-  `settings/mutate` (persisted and applied live: a search then goes to the
-  endpoint the write set), `pluginManager/listPlugins`,
-  `pluginInventory/list` and `credentials/describe`. It also watches the
-  write's `settings/document-updated` arrive on `compose:remote-event`.
-- `plugin_plane/remote.rs` has unit tests for the plane-owned namespaces.
+- `crates/rebon-session-runtime/tests/dsh_upstream.rs` 安装真实、未改写的 npm
+  包并启动 Verve + native Cordis plane。它调用 `settings/describe`、
+  `settings/mutate`（持久化且实时改变后续 search endpoint）、
+  `pluginManager/listPlugins`、`pluginInventory/list`、`credentials/describe`，
+  并通过 `open_remote("$events", {})` 检查 ready、settings 更新和关闭，而不只观察
+  内核 topic。
+- `plugin_plane/remote.rs` 的单元测试覆盖 plane 自有 namespace，以及多 client
+  广播、跨 plane 隔离、来源认证、取消、参数拒绝、慢消费者丢失和关闭。
+
+**真实 npm 验收的依赖边界。** DSH 集成依赖（depends on）
+[Quorafind/verve#6](https://github.com/Quorafind/verve/pull/6) 的模块解析、
+原生扩展拒绝与 resource timing 修复；该 PR 尚未 merge。生产 workspace 的
+Verve 与 7 个 Boa patch 仍使用原有 git `main`，正式 `Cargo.lock` 保持原有来源，
+不包含这次 test-only 替换，也不提交机器专属路径。
+
+现有 `release.yml` 的独立、必跑 macOS job `dsh-integration` checkout 当前
+RebonCode 与 Verve 精确 commit `a9fc5f6e15bec3d11fe7f3db5c034ae5ac3c41aa`。
+它仅在 runner 临时 Cargo config 中将 Verve 与 7 个 Boa 指向同一副本，使用独立
+构建目录，构建 `rebon-verve` 后依次执行 Host lib、真实 npm `dsh_upstream`
+ignored、DSH base profile ignored 与 contained-plugin 边界测试。临时 patch 图允许
+更新该 job 的临时 lockfile，不使用 `--locked` 硬卡正式 lock；正常 `verify` 保留
+Host lib 测试，但不执行这两条依赖 #6 的 npm 集成调用。发布权限与触发保持不变。
+
+上述 job 不执行 React/DOM 客户端验收，验证结果仅适用于它 checkout 的精确
+依赖图；Host 单元测试通过不等于生产 git `main` 已具备 #6 的修复，也不能
+代替真实 npm 或桌面 app plane 验收。
 
 ## 6. Which process runs what
 
@@ -365,11 +400,10 @@ The boot is the one in §1, without `uiRenderer.mount`:
 - **The graph and the bundles.** `PluginPlane::call_remote("rebon/clientModules", {})`
   lists them. Bundles are files on this machine (`entries[].file`), and
   `rev` changes when a bundle does.
-- **The carrier.** `call_remote(endpoint, args)` answers every unary
-  remote, and the topic `compose:remote-event` carries the events. The DOM
-  side wraps these in `__DSH_TRANSPORT__`. `$events` starts with
-  `{type:'ready', clientId, host:{home}}`, then one `emit` frame per
-  forwarded event.
+- **The carrier.** `call_remote(endpoint, args)` 提供 unary Host seam；
+  `open_remote("$events", {})` 提供 ready／emit 流，生命周期与错误语义见 §5。
+  DOM 侧只需将二者接到 `__DSH_TRANSPORT__`，不再自行订阅内核 topic 或构造 ready。
+  当前不提供的 namespace／stream 都会按 wire contract 明确拒绝。
 - **DOM capabilities the framework uses:**
   - `document.head`;
   - `<style>` elements with `data-*` attributes;

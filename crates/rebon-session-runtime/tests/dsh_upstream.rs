@@ -38,7 +38,7 @@ use rebon_kernel_seats::kernel_config_seats::ConfigSeatsPlugin;
 use rebon_kernel_seats::kernel_prompt_sections::{ComposePromptSections, SYSTEM_PROMPT_SERVICE};
 use rebon_plugin_host::plugin_composition::{compose_section, CompositionRoots};
 use rebon_plugin_host::plugin_manifests::PayloadManifests;
-use rebon_plugin_host::plugin_plane::{PluginPlane, PluginPlaneConfig, REMOTE_EVENT_TOPIC};
+use rebon_plugin_host::plugin_plane::{PluginPlane, PluginPlaneConfig};
 use rebon_plugin_supervisor::{ToolInvocation, ToolInvoker, ToolRefusal};
 use rebon_session_runtime::plugin::dsh_npm::adapt_with;
 use serde_json::{json, Value};
@@ -369,11 +369,6 @@ async fn upstream_dsh_packages_load_unchanged_and_work_on_the_plane() {
     set_process_compose_tools(registry.clone());
     ctx.provide_json(SYSTEM_PROMPT_SERVICE, ComposePromptSections::new())
         .unwrap();
-    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
-    let heard = Arc::clone(&events);
-    kernel.context().on_json(REMOTE_EVENT_TOPIC, move |event| {
-        heard.lock().unwrap().push(event.clone());
-    });
     let plane = PluginPlane::start(
         PluginPlaneConfig {
             runner,
@@ -406,6 +401,20 @@ async fn upstream_dsh_packages_load_unchanged_and_work_on_the_plane() {
     )
     .await
     .expect("the plugin plane starts");
+    // 用实际 client carrier seam 订阅，而不是只观察内核 topic。
+    let mut events = plane
+        .open_remote("$events", json!({}))
+        .unwrap_or_else(|error| panic!("{error}"));
+    let ready = events.recv().await.unwrap().unwrap();
+    assert_eq!(ready["type"], "ready");
+    assert!(ready["clientId"].as_str().is_some_and(|id| !id.is_empty()));
+    assert!(ready["host"]["home"]
+        .as_str()
+        .is_some_and(|home| !home.is_empty()));
+    assert_eq!(
+        plane.call_remote("pluginInventory/list", Value::Null).await["error"]["code"],
+        "gateway/bad-request"
+    );
     for entry in &composition.entries {
         plane
             .load_entry(entry)
@@ -605,15 +614,30 @@ async fn upstream_dsh_packages_load_unchanged_and_work_on_the_plane() {
         remote_value(&described)["DEEPSEEK_API_KEY"]["writable"],
         false
     );
-    assert!(
-        events
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|event| event["event"]["event"] == "settings/document-updated"),
-        "the settings write was announced to clients: {:?}",
-        events.lock().unwrap()
-    );
+    // 真实 npm settings 写入必须沿既有 NDJSON event/emit 到达 `$events`。
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = events
+                .recv()
+                .await
+                .expect("事件流未关闭")
+                .expect("事件未丢失");
+            assert_eq!(frame["type"], "emit");
+            if frame["event"] == "settings/document-updated" {
+                assert!(frame["args"].is_array(), "{frame}");
+                break;
+            }
+        }
+    })
+    .await
+    .expect("settings 更新事件到达 client");
 
     plane.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(frame) = events.recv().await {
+            frame.expect("关闭前事件未丢失");
+        }
+    })
+    .await
+    .expect("plane 关闭后事件流结束");
 }

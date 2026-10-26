@@ -172,6 +172,52 @@ test('a program is started by rebon through the process seat, as the dsh seam as
   }
 });
 
+test('subprocess collection does not join bytes across a gap or retain an unbounded zero-sized tail', async () => {
+  for (const maxBytes of [64, 0]) {
+    const answers = [
+      { stdout: { text: 'hello', dropped: 0 }, exit: null },
+      { stdout: { text: ' world', dropped: 3 }, exit: { exitCode: 0, signal: null } },
+    ];
+    const kit = await startHost({ seats: { process: (payload) => payload.method === 'spawn' ? { id: 7 } : answers.shift() } });
+    try {
+      await loadCompose(kit, { entries: [{ id: 'runner' }] });
+      const body = RUNNER.replace('stdout: { maxBytes: 4 }', `stdout: { maxBytes: ${maxBytes} }`);
+      const loaded = await loadEntry(kit, { id: 'runner', ...cordisPackage(body), tools: ['run_it'], seats: ['process'] });
+      assert.equal(loaded.status, 'success', JSON.stringify(loaded.payload));
+      await openScope(kit, 'runner');
+      const call = await kit.scoped('runner', 'tool/call', { tool: 'run_it', input: {} });
+      assert.equal(call.terminal.status, 'success', JSON.stringify(call.terminal.payload));
+      const value = JSON.parse(plainly(call.terminal.payload).content[0].text);
+      // 中间丢失三字节，不能把旧前缀接到新尾部并宣称完整。
+      assert.deepEqual(value.stdout, { text: maxBytes === 0 ? '' : ' world', nextOffset: 14, lossy: true });
+    } finally {
+      await kit.stop();
+    }
+  }
+});
+
+test('subprocess waitForExit observes an already aborted wait without losing the live outcome', async () => {
+  const answers = [{ exit: { exitCode: 0, signal: null } }];
+  const kit = await startHost({ seats: { process: (payload) => payload.method === 'spawn' ? { id: 7 } : answers.shift() } });
+  try {
+    await loadCompose(kit, { entries: [{ id: 'runner' }] });
+    const body = RUNNER.replace('const outcome = await handle.done;', `
+      const controller = new AbortController();
+      controller.abort();
+      const wait = handle.waitForExit(controller.signal);
+      const outcome = await handle.done;
+      if (await wait !== false) throw new Error('aborted wait did not return false');
+    `);
+    const loaded = await loadEntry(kit, { id: 'runner', ...cordisPackage(body), tools: ['run_it'], seats: ['process'] });
+    assert.equal(loaded.status, 'success', JSON.stringify(loaded.payload));
+    await openScope(kit, 'runner');
+    const call = await kit.scoped('runner', 'tool/call', { tool: 'run_it', input: {} });
+    assert.equal(call.terminal.status, 'success', JSON.stringify(call.terminal.payload));
+  } finally {
+    await kit.stop();
+  }
+});
+
 // A plugin with live-editable config, the shape `dsh-settings` forms read.
 const KNOB = `
 import z from '@deepseek-ai/schemastery';
@@ -262,6 +308,10 @@ test('the client contract answers from the realm in dsh\'s wire shape', async ()
     assert.deepEqual(row.inject, ['@deepseek-ai/dsh-client-ui-slots']);
     assert.match(row.rev, /^\d+-\d+$/);
 
+    // 无效的 wire 参数不应被当作空命名参数接受。
+    const invalid = plainly((await remote(kit, 'pluginInventory/list', [])).terminal.payload);
+    assert.equal(invalid.error.code, 'gateway/bad-request');
+
     // No settings service in this composition: unavailable, by name.
     const settings = plainly((await remote(kit, 'settings/describe')).terminal.payload);
     assert.equal(settings.ok, false);
@@ -273,6 +323,31 @@ test('the client contract answers from the realm in dsh\'s wire shape', async ()
     // Credentials are the plane's to describe, not a realm's.
     const credentials = plainly((await remote(kit, 'credentials/describe', { refs: ['EXA_API_KEY'] })).terminal.payload);
     assert.equal(credentials.error.code, 'gateway/method-unavailable');
+  } finally {
+    await kit.stop();
+  }
+});
+
+test('realm remote events use the control scope and stop publishing after it closes', { timeout: 5000 }, async () => {
+  let received;
+  const heard = new Promise((resolve) => { received = resolve; });
+  const kit = await startHost({ onEvent: received });
+  try {
+    await loadCompose(kit);
+    await openScope(kit, 'rebon:compose');
+    const { realm } = await import('../src/realm.mjs');
+    realm().ctx.emit('commands/change', { revision: 1 });
+    // 等待实际 wire 发布，不靠 sleep 或微任务次数猜测异步桥何时完成。
+    await heard;
+    assert.deepEqual(plainly(kit.seen.events), [{
+      topic: 'compose:remote-event',
+      pluginId: 'rebon:compose',
+      event: { event: 'commands/change', args: [{ revision: 1 }] },
+    }]);
+    const closed = await kit.scoped('rebon:compose', 'scope/close', null, 2);
+    assert.equal(closed.terminal.status, 'success', JSON.stringify(closed.terminal.payload));
+    realm().ctx.emit('commands/change', { revision: 2 });
+    assert.equal(kit.seen.events.length, 1, '关闭的 scope 不再发布 Host 事件');
   } finally {
     await kit.stop();
   }

@@ -17,9 +17,8 @@
 //!   composition tool (`pwsh`, `bash`), and a composition tool that is not
 //!   read-only asks before it runs (`kernel_compose_tools`).
 //!
-//! A program outlives nothing of rebon's: each child is started with
-//! `kill_on_drop`, owned by the task waiting for it, and that task ends with
-//! the plane's runtime.
+//! plane 关闭时显式终止并等待它启动的直接子进程，而不是等待共享 Tokio runtime
+//! 销毁。`kill_on_drop` 仅作为宿主异常退出时的最后一道保护。
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -67,13 +66,21 @@ struct Running {
     changed: Arc<Notify>,
     /// Asks the task that owns the child to end it.
     kill: Option<tokio::sync::oneshot::Sender<()>>,
+    /// plane 关闭时等待直接子进程被回收，不把 JoinHandle 丢弃成后台孤儿。
+    exited: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct ProcessTable {
+    closed: bool,
+    running: BTreeMap<u64, Running>,
 }
 
 /// The programs this plane started, by id.
 #[derive(Default)]
 pub struct ProcessSeat {
     next: AtomicU64,
-    running: Mutex<BTreeMap<u64, Running>>,
+    table: Mutex<ProcessTable>,
 }
 
 impl ProcessSeat {
@@ -96,6 +103,11 @@ impl ProcessSeat {
     }
 
     fn spawn(&self, owner: &str, params: &Value) -> Result<Value, ToolRefusal> {
+        // 与 shutdown 共用锁，避免关闭取走进程表之后又启动一个未被回收的进程。
+        let mut table = self.table.lock().expect("process table poisoned");
+        if table.closed {
+            return Err(refused("[CLOSED]", "the process seat has shut down"));
+        }
         let argv: Option<Vec<&str>> = params
             .get("argv")
             .and_then(Value::as_array)
@@ -202,7 +214,7 @@ impl ProcessSeat {
             |output| &mut output.stderr,
         );
         let (kill, killed) = tokio::sync::oneshot::channel::<()>();
-        {
+        let exited = {
             let output = Arc::clone(&output);
             let changed = Arc::clone(&changed);
             // The child's one owner: it waits for the exit, and ends the
@@ -217,16 +229,17 @@ impl ProcessSeat {
                 };
                 output.lock().expect("process output poisoned").exit = Some(exit_of(status));
                 changed.notify_waiters();
-            });
-        }
+            })
+        };
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-        self.running.lock().expect("process table poisoned").insert(
+        table.running.insert(
             id,
             Running {
                 owner: owner.to_owned(),
                 output,
                 changed,
                 kill: Some(kill),
+                exited,
             },
         );
         Ok(json!({ "id": id }))
@@ -244,8 +257,9 @@ impl ProcessSeat {
                 "a process call names the process by its id",
             )
         })?;
-        let running = self.running.lock().expect("process table poisoned");
-        let process = running
+        let table = self.table.lock().expect("process table poisoned");
+        let process = table
+            .running
             .get(&id)
             .filter(|process| process.owner == owner)
             .ok_or_else(|| {
@@ -291,9 +305,10 @@ impl ProcessSeat {
                     });
                     drop(output);
                     if finished {
-                        self.running
+                        self.table
                             .lock()
                             .expect("process table poisoned")
+                            .running
                             .remove(&id);
                     }
                     return Ok(answer);
@@ -306,14 +321,37 @@ impl ProcessSeat {
     async fn kill(&self, owner: &str, params: &Value) -> Result<Value, ToolRefusal> {
         let (id, _, _) = self.find(owner, params)?;
         let kill = self
-            .running
+            .table
             .lock()
             .expect("process table poisoned")
+            .running
             .get_mut(&id)
             .and_then(|process| process.kill.take());
         // Asked once: a second kill, or one after the exit, finds nothing to ask.
         let asked = kill.is_some_and(|kill| kill.send(()).is_ok());
         Ok(json!({ "killed": asked }))
+    }
+
+    /// 先禁止新启动并同时通知所有子进程，再逐个等待回收。
+    pub async fn shutdown(&self) {
+        let running = {
+            let mut table = self.table.lock().expect("process table poisoned");
+            table.closed = true;
+            std::mem::take(&mut table.running)
+        };
+        let mut exits = Vec::new();
+        for (_, mut process) in running {
+            if let Some(kill) = process.kill.take() {
+                // 已退出的子进程会关闭接收端，无须再次终止。
+                let _ = kill.send(());
+            }
+            exits.push(process.exited);
+        }
+        for exit in exits {
+            if let Err(error) = exit.await {
+                tracing::warn!(%error, "回收 composition 子进程的任务异常结束");
+            }
+        }
     }
 }
 
@@ -445,6 +483,33 @@ mod tests {
         let (out, _, exit) = drain(&seat, "shell", id).await;
         assert!(out.contains("piped in"), "{out:?}");
         assert_eq!(exit["exitCode"], 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutting_down_reaps_running_children_and_refuses_new_spawns() {
+        let seat = ProcessSeat::default();
+        let argv = if cfg!(windows) {
+            json!(["ping", "-n", "30", "127.0.0.1"])
+        } else {
+            json!(["sleep", "30"])
+        };
+        let started = seat
+            .call("shell", "spawn", &json!({ "argv": argv }))
+            .await
+            .unwrap();
+        let id = started["id"].as_u64().unwrap();
+        let (_, output, _) = seat.find("shell", &json!({ "id": id })).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), seat.shutdown())
+            .await
+            .expect("直接子进程被回收");
+        assert!(output.lock().unwrap().exit.is_some());
+        assert!(seat.table.lock().unwrap().running.is_empty());
+        let refused = seat
+            .call("shell", "spawn", &json!({ "argv": echo("late") }))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, "[CLOSED]");
+        seat.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

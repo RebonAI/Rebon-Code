@@ -213,6 +213,9 @@ const ENDPOINTS = {
 /// Answers one remote call in dsh's wire shape. Never throws: a refusal is a
 /// result the client reads, as dsh's gateway answers.
 export async function remote(endpoint, args = {}) {
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) {
+    return { ok: false, error: { code: 'gateway/bad-request', message: 'remote calls expect named arguments', details: {} } };
+  }
   const handler = Object.hasOwn(ENDPOINTS, endpoint) ? ENDPOINTS[endpoint] : undefined;
   if (handler === undefined) {
     return {

@@ -35,14 +35,18 @@ const WAIT_SLICE_MS = 10_000;
 /// One collect-mode stream: the retained tail, by whole-stream byte offset.
 class Collected {
   constructor(maxBytes) {
-    this.maxBytes = Number.isFinite(maxBytes) && maxBytes > 0 ? maxBytes : Infinity;
+    this.maxBytes = Math.max(0, Math.floor(maxBytes));
     this.bytes = Buffer.alloc(0);
     /** Whole-stream offset of `bytes[0]`. */
     this.start = 0;
   }
 
   push(text, dropped = 0) {
-    this.start += dropped;
+    if (dropped > 0) {
+      // 丢失发生在旧尾部之后；只保留新连续区间，否则 readFrom 会返回不存在的拼接。
+      this.start += this.bytes.length + dropped;
+      this.bytes = Buffer.alloc(0);
+    }
     if (text.length === 0) return;
     this.bytes = Buffer.concat([this.bytes, Buffer.from(text, 'utf8')]);
     if (this.bytes.length > this.maxBytes) {
@@ -103,6 +107,7 @@ export default class RebonSubprocess extends Service {
       if (id === undefined || exited) return;
       void seat('process', 'kill', { id }, { via }).catch(() => {});
     };
+    const onAbort = () => terminate();
     const done = (async () => {
       const started = await seat('process', 'spawn', {
         argv: [...argv],
@@ -122,6 +127,7 @@ export default class RebonSubprocess extends Service {
       }
     })().finally(() => {
       exited = true;
+      spec.signal?.removeEventListener?.('abort', onAbort);
       for (const resolve of exitWaiters) resolve(true);
       exitWaiters.clear();
     });
@@ -130,7 +136,7 @@ export default class RebonSubprocess extends Service {
       kill();
     };
     if (spec.signal?.aborted) terminate();
-    spec.signal?.addEventListener?.('abort', terminate, { once: true });
+    spec.signal?.addEventListener?.('abort', onAbort, { once: true });
     return {
       stdin: undefined,
       stdout: undefined,
@@ -141,12 +147,16 @@ export default class RebonSubprocess extends Service {
       terminate,
       waitForExit(signal) {
         if (exited) return Promise.resolve(true);
+        if (signal?.aborted) return Promise.resolve(false);
         return new Promise((resolve) => {
-          exitWaiters.add(resolve);
-          signal?.addEventListener?.('abort', () => {
-            exitWaiters.delete(resolve);
-            resolve(false);
-          }, { once: true });
+          const finish = (value) => {
+            exitWaiters.delete(finish);
+            signal?.removeEventListener?.('abort', abort);
+            resolve(value);
+          };
+          const abort = () => finish(false);
+          exitWaiters.add(finish);
+          signal?.addEventListener?.('abort', abort, { once: true });
         });
       },
     };

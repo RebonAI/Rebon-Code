@@ -70,6 +70,7 @@ use rebon_kernel_seats::kernel_compose_tools::{ComposeToolDispatch, ComposeToolR
 use rebon_provider::kernel_llm_dispatch::{register_llm_host, unregister_llm_host, LlmRoute};
 
 mod remote;
+pub use remote::RemoteEventStream;
 
 /// The reserved plugin id of the composition control plugin.
 pub const COMPOSE_PLUGIN_ID: &str = "rebon:compose";
@@ -707,13 +708,21 @@ impl PluginPlane {
         let mods = Arc::new(std::sync::OnceLock::new());
         let epochs = Arc::new(HostEpochs::new());
         let main_epoch = epochs.next();
+        let control_config = config.control_config();
         let seats = Arc::new(KernelSeats {
             ctx: ctx.clone(),
             mods: Arc::clone(&mods),
             processes: Arc::new(crate::process_seat::ProcessSeat::default()),
             shared_host: HostEpochs::range_of(main_epoch),
         });
-        let events = Arc::new(KernelEvents { ctx: ctx.clone() });
+        let events = Arc::new(KernelEvents::new(
+            ctx.clone(),
+            main_epoch,
+            control_config["profile"]["home"]
+                .as_str()
+                .expect("control_config 已构造 profile.home")
+                .to_owned(),
+        ));
         let template = ContainerTemplate {
             epochs: Arc::clone(&epochs),
             runner: config.runner.clone(),
@@ -741,7 +750,7 @@ impl PluginPlane {
         // The control plugin creates the realm every entry mounts into, so it
         // is loaded before any of them — and a failure here is the whole
         // composition failing rather than one entry.
-        let control = control_request(&config.compose_root, config.control_config());
+        let control = control_request(&config.compose_root, control_config);
         supervisor.load_plugin(&control).await?;
         let workspace_root = config.working_directory.to_string_lossy().into_owned();
         let scope = config
@@ -1956,6 +1965,8 @@ impl PluginPlane {
     /// Winds the host down and withdraws every registration the composition
     /// made, whichever way it ends.
     pub async fn shutdown(&self) {
+        self.template.events.remote_events.close();
+        self.template.seats.processes.shutdown().await;
         let _ = self.hosts.main().shutdown().await;
         let containers: Vec<ContainerHost> = std::mem::take(&mut *self.containers.lock().await)
             .into_values()
@@ -2754,10 +2765,32 @@ impl SeatDispatcher for KernelSeats {
 
 /// Published events, put on the kernel's event plane.
 ///
-/// The topic is namespaced by the publishing plugin so a composition entry
-/// cannot announce something a kernel component would mistake for its own.
+/// Attribution is stamped outside the plugin's payload, after the supervisor
+/// authenticated it. The stable plane epoch also covers its contained hosts
+/// and supervisor restarts; a scope name alone does not identify a plane.
 struct KernelEvents {
     ctx: Context,
+    plane_epoch: u64,
+    remote_events: remote::RemoteEvents,
+}
+
+impl KernelEvents {
+    fn new(ctx: Context, main_epoch: u64, home: String) -> Self {
+        // 只需在同一进程的 kernel 中唯一；不能把 HostEpochs 的随机基址当隔离保证。
+        // 保持 JSON 安全整数，耗尽时拒绝复用。容器与 supervisor 重启复用本 publisher。
+        static NEXT_PLANE_EPOCH: AtomicU64 = AtomicU64::new(1);
+        let plane_epoch = NEXT_PLANE_EPOCH
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| {
+                (epoch < (1 << 52)).then_some(epoch + 1)
+            })
+            .expect("plugin plane epochs exhausted");
+        let remote_events = remote::RemoteEvents::new(&ctx, plane_epoch, main_epoch, home);
+        Self {
+            ctx,
+            plane_epoch,
+            remote_events,
+        }
+    }
 }
 
 impl EventPublisher for KernelEvents {
@@ -2767,10 +2800,14 @@ impl EventPublisher for KernelEvents {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Payload, ToolRefusal>> + Send + '_>,
     > {
+        let body = event.event.to_value().unwrap_or(Value::Null);
+        // kernel 是唯一事件分发机制；client transport 也只能经它的 scoped listener 收到。
         let payload = serde_json::json!({
+            "planeEpoch": self.plane_epoch,
+            "hostEpoch": event.identity.host_epoch,
             "pluginId": event.identity.plugin_id,
             "scopeId": event.identity.scope_id,
-            "event": event.event.to_value().unwrap_or(Value::Null),
+            "event": body,
         });
         self.ctx.emit_json(&event.topic, &payload);
         Box::pin(async move { Ok(Payload::from(serde_json::json!({ "published": true }))) })
