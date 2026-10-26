@@ -868,7 +868,7 @@ mod tests {
         if let Err(err) = stop_background_job_in_store(&store, &mut state) {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("stopping a resident terminal worker failed: {err}");
+            panic!("stopping a resident terminal worker failed: {err:#}");
         }
 
         let _ = child.wait();
@@ -1110,7 +1110,7 @@ mod tests {
             Ok(released) => released,
             Err(err) => {
                 let _ = child.kill();
-                panic!("local takeover failed: {err}");
+                panic!("local takeover failed: {err:#}");
             }
         };
 

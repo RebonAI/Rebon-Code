@@ -23,14 +23,27 @@ pub fn recorded_process_is_running(
     pid: u32,
     expected_identity: Option<&str>,
 ) -> anyhow::Result<bool> {
-    match process_is_running(pid) {
+    recorded_process_is_running_with(pid, expected_identity, process_is_running, process_identity)
+}
+
+fn recorded_process_is_running_with(
+    pid: u32,
+    expected_identity: Option<&str>,
+    mut is_running: impl FnMut(u32) -> Option<bool>,
+    identity: impl FnOnce(u32) -> Option<String>,
+) -> anyhow::Result<bool> {
+    match is_running(pid) {
         Some(false) => return Ok(false),
         Some(true) => {}
         None => anyhow::bail!("could not determine whether process {pid} is running"),
     }
     let expected_identity = expected_identity
         .ok_or_else(|| anyhow::anyhow!("process {pid} has no recorded identity"))?;
-    let Some(actual_identity) = process_identity(pid) else {
+    let Some(actual_identity) = identity(pid) else {
+        // 进程可能在存活检查后退出；只有确认退出才能接受身份缺失。
+        if is_running(pid) == Some(false) {
+            return Ok(false);
+        }
         anyhow::bail!("could not verify the identity of process {pid}");
     };
     Ok(actual_identity == expected_identity)
@@ -835,6 +848,84 @@ pub fn process_executable_path(_pid: u32) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_process_exit_between_liveness_and_identity_reads_is_not_an_error() {
+        let mut liveness = [Some(true), Some(false)].into_iter();
+        let running = recorded_process_is_running_with(
+            42,
+            Some("owner"),
+            |_| liveness.next().expect("expected liveness read"),
+            |_| None,
+        )
+        .unwrap();
+
+        assert!(!running);
+        assert!(liveness.next().is_none());
+    }
+
+    #[test]
+    fn recorded_process_missing_identity_fails_closed_unless_exit_is_confirmed() {
+        for after_identity in [Some(true), None] {
+            let mut liveness = [Some(true), after_identity].into_iter();
+            let error = recorded_process_is_running_with(
+                42,
+                Some("owner"),
+                |_| liveness.next().expect("expected liveness read"),
+                |_| None,
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("could not verify the identity"));
+            assert!(liveness.next().is_none());
+        }
+    }
+
+    #[test]
+    fn recorded_process_identity_comparison_keeps_live_owners_distinct() {
+        for (actual_identity, expected_running) in [("owner", true), ("other-owner", false)] {
+            let running = recorded_process_is_running_with(
+                42,
+                Some("owner"),
+                |_| Some(true),
+                |_| Some(actual_identity.to_string()),
+            )
+            .unwrap();
+            assert_eq!(running, expected_running);
+        }
+    }
+
+    #[test]
+    fn recorded_process_missing_owner_identity_fails_closed() {
+        let error = recorded_process_is_running_with(
+            42,
+            None,
+            |_| Some(true),
+            |_| panic!("a process without recorded identity must not be compared"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("has no recorded identity"));
+    }
+
+    #[test]
+    fn recorded_process_dead_or_unknown_liveness_does_not_read_identity() {
+        for liveness in [Some(false), None] {
+            let result = recorded_process_is_running_with(
+                42,
+                Some("owner"),
+                |_| liveness,
+                |_| panic!("identity requires confirmed liveness"),
+            );
+            match liveness {
+                Some(false) => assert!(!result.unwrap()),
+                None => assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("could not determine whether process")),
+                Some(true) => unreachable!(),
+            }
+        }
+    }
 
     #[test]
     fn process_liveness_reports_current_process_alive() {
