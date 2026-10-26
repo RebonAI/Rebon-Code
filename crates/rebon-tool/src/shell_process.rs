@@ -50,6 +50,16 @@ const MAX_COMPLETED_SHELLS_PER_OWNER: usize = 64;
 /// `pipe2`, std marks a new pipe close-on-exec in a second step.
 const READER_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
+#[derive(Debug, thiserror::Error)]
+#[error("shell 进程执行失败 (stage={stage}, program={program:?}, pid={pid:?}): {source}")]
+pub(crate) struct ShellProcessError {
+    pub(crate) stage: &'static str,
+    pub(crate) program: String,
+    pub(crate) pid: Option<u32>,
+    #[source]
+    pub(crate) source: io::Error,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ShellOutputEncoding {
     Utf8,
@@ -269,9 +279,21 @@ impl ShellProcessRegistry {
         self.ensure_capacity(&owner, tool_name)?;
         configure_process_group(&mut command);
 
-        let mut child = command
-            .spawn()
-            .map_err(|err| execution_error(tool_name, err))?;
+        let mut child = command.spawn().map_err(|source| {
+            execution_error(
+                tool_name,
+                ShellProcessError {
+                    stage: "spawn",
+                    program: command
+                        .as_std()
+                        .get_program()
+                        .to_string_lossy()
+                        .into_owned(),
+                    pid: None,
+                    source,
+                },
+            )
+        })?;
         let process_tree = match ProcessTreeControl::for_child(&child) {
             Ok(process_tree) => Arc::new(process_tree),
             Err(err) => {
@@ -983,7 +1005,8 @@ impl ShellEntry {
     fn launch_value(&self) -> Value {
         let mut value = self.summary_value();
         if self.output_path.is_some() {
-            let notified = self.task_runtime_controller.is_some() && self.owner.session_id.is_some();
+            let notified =
+                self.task_runtime_controller.is_some() && self.owner.session_id.is_some();
             let note = if notified {
                 "Running in the background. Its output streams to outputPath: read it with \
                  Read or search it with Grep. A task notification announces its exit, so keep \
@@ -1026,7 +1049,9 @@ impl ShellEntry {
             "completed": completed,
             "outputBytes": state.output_bytes,
         });
-        let object = value.as_object_mut().expect("result_value builds an object");
+        let object = value
+            .as_object_mut()
+            .expect("result_value builds an object");
         if let Some(exit_code) = state.exit_code {
             object.insert("exitCode".into(), json!(exit_code));
         }
@@ -1714,6 +1739,60 @@ mod tests {
     use super::*;
     use std::process::Stdio;
 
+    #[tokio::test]
+    async fn background_read_and_wait_errors_preserve_the_stage_and_os_error() {
+        struct FailingStream;
+
+        impl AsyncRead for FailingStream {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<io::Result<()>> {
+                std::task::Poll::Ready(Err(io::Error::from_raw_os_error(9)))
+            }
+        }
+
+        for stage in ["stdout", "stderr", "wait"] {
+            let entry = Arc::new(ShellEntry::new(
+                "sh_error".into(),
+                ShellOwner {
+                    session_id: Some("shell-error-stage".into()),
+                    agent_id: None,
+                },
+                "Bash",
+                "true".into(),
+                None,
+                Arc::new(ProcessTreeControl::finished_without_a_tree()),
+                None,
+                PromptCancel::new(),
+                ShellTaskRegistration::BackgroundShell,
+                None,
+            ));
+            if stage == "wait" {
+                entry.finish(Err(io::Error::from_raw_os_error(9)));
+            } else {
+                read_stream(
+                    FailingStream,
+                    entry.clone(),
+                    stage,
+                    ShellOutputEncoding::Utf8,
+                )
+                .await;
+                entry.finish(Err(io::Error::other("later wait error")));
+            }
+            let (result, completed) = entry.result_value(false);
+            assert!(completed);
+            assert_eq!(result["status"], "failed");
+            let error = result["error"]
+                .as_str()
+                .expect("the shell reports its error");
+            assert!(error.contains(stage), "{error}");
+            assert!(error.contains(&io::Error::from_raw_os_error(9).to_string()));
+            assert!(!error.contains("later wait error"));
+        }
+    }
+
     /// [`ShellLineReader`] is only ever read inside a `tokio::select!`, so the
     /// property worth pinning is what a *cancelled* read does. These drive the
     /// cancellation directly — `timeout(ZERO, ..)` polls the read once and then
@@ -1868,12 +1947,17 @@ mod tests {
         assert!(tail.ends_with(&format!("line {}\n", TAIL_RESPONSE_LINES + 19)));
 
         // Too many bytes: cut, and start on a whole line.
-        let wide: String = (0..40).map(|i| format!("{i:04}{}\n", "x".repeat(1000))).collect();
+        let wide: String = (0..40)
+            .map(|i| format!("{i:04}{}\n", "x".repeat(1000)))
+            .collect();
         let (tail, cut) = response_tail(&wide);
         assert!(cut);
         assert!(tail.len() <= TAIL_RESPONSE_BYTES);
         assert!(tail.ends_with("x\n"));
-        assert!(tail.as_bytes()[0].is_ascii_digit(), "starts mid-line: {tail:?}");
+        assert!(
+            tail.as_bytes()[0].is_ascii_digit(),
+            "starts mid-line: {tail:?}"
+        );
 
         // One enormous line is still shown rather than dropped, cut on a
         // character boundary.
@@ -2138,7 +2222,10 @@ mod tests {
                 .wait(&context("session-a"), "ShellOutput", shell_id, false, 0)
                 .await
                 .unwrap();
-            let path = status["outputPath"].as_str().expect("outputPath").to_owned();
+            let path = status["outputPath"]
+                .as_str()
+                .expect("outputPath")
+                .to_owned();
             let output = std::fs::read_to_string(&path).unwrap_or_default();
             if let Some(rest) = output.split("CHILD_PID=").nth(1) {
                 if let Some(raw_pid) = rest
@@ -2348,13 +2435,20 @@ mod tests {
             .await
             .unwrap();
         let shell_id = launched["shellId"].as_str().unwrap();
-        let path = PathBuf::from(launched["outputPath"].as_str().expect("launch names the file"));
+        let path = PathBuf::from(
+            launched["outputPath"]
+                .as_str()
+                .expect("launch names the file"),
+        );
         assert_eq!(
             path.file_name().unwrap().to_str().unwrap(),
             format!("{shell_id}.output")
         );
         let note = launched["note"].as_str().unwrap();
-        assert!(note.contains("Read") && note.contains("ShellOutput"), "{note}");
+        assert!(
+            note.contains("Read") && note.contains("ShellOutput"),
+            "{note}"
+        );
         // The cursor fields are gone from the launch result.
         for absent in ["oldestCursor", "endCursor", "outputTruncated"] {
             assert!(launched.get(absent).is_none(), "{absent} in {launched}");
@@ -2365,10 +2459,16 @@ mod tests {
         assert_eq!(completed["exitCode"], 0);
         assert_eq!(completed["outputPath"], launched["outputPath"]);
         let tail = completed["outputTail"].as_str().unwrap();
-        assert!(tail.contains("first") && tail.contains("second"), "{tail:?}");
+        assert!(
+            tail.contains("first") && tail.contains("second"),
+            "{tail:?}"
+        );
 
         let file = std::fs::read_to_string(&path).unwrap();
-        assert!(file.contains("first") && file.contains("second"), "{file:?}");
+        assert!(
+            file.contains("first") && file.contains("second"),
+            "{file:?}"
+        );
         assert_eq!(completed["outputBytes"], file.len() as u64);
     }
 

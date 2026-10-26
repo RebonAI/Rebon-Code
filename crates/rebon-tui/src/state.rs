@@ -9,8 +9,7 @@
 //!
 //! The cancel reducer does it in this order:
 //!
-//! 1. Materialize any full live shell history the overlay was still
-//!    holding, and mark in-flight workflows as interrupted.
+//! 1. 物化 overlay 保存的完整 shell 输出，并将仍在进行中的工具调用标记为中断。
 //! 2. Group the overlay's blocks into chunks — a visible text segment
 //!    starts a chunk, and the tool calls that follow it join that same
 //!    chunk, while whitespace-only text and thinking are dropped — and
@@ -651,24 +650,39 @@ fn workflow_interrupted_content() -> ToolCallContent {
     })
 }
 
-fn mark_interrupted_workflows(blocks: &mut [StreamingContentBlock]) {
+enum TurnCommitKind {
+    Cancel,
+    Finalize,
+}
+
+fn mark_interrupted_tools(blocks: &mut [StreamingContentBlock], kind: TurnCommitKind) {
     for block in blocks {
         let StreamingContentBlock::ToolUse(tool) = block else {
             continue;
         };
-        if !crate::streaming::is_workflow_tool_use(&tool.tool_name, tool.raw_input.as_ref())
-            || !matches!(
-                tool.status,
-                ToolCallStatus::Pending | ToolCallStatus::InProgress
-            )
+        let workflow =
+            crate::streaming::is_workflow_tool_use(&tool.tool_name, tool.raw_input.as_ref());
+        if !matches!(
+            tool.status,
+            ToolCallStatus::Pending | ToolCallStatus::InProgress
+        ) || (!workflow && matches!(kind, TurnCommitKind::Finalize))
         {
             continue;
         }
         tool.status = ToolCallStatus::Failed;
-        match &mut tool.content {
-            Some(content) => content.push(workflow_interrupted_content()),
-            None => tool.content = Some(vec![workflow_interrupted_content()]),
-        }
+        let interrupted_content = if workflow {
+            workflow_interrupted_content()
+        } else {
+            ToolCallContent::Content(RegularContent {
+                content: ContentBlock::Text(TextContent {
+                    text: "已被用户取消".into(),
+                    annotations: None,
+                }),
+            })
+        };
+        tool.content
+            .get_or_insert_with(Vec::new)
+            .push(interrupted_content);
     }
 }
 
@@ -676,9 +690,10 @@ fn commit_streaming_content_and_clear(
     state: &mut AppState,
     commit_uuid: String,
     commit_timestamp: String,
+    kind: TurnCommitKind,
 ) {
     state.overlay.materialize_full_live_shell_content();
-    mark_interrupted_workflows(&mut state.overlay.blocks);
+    mark_interrupted_tools(&mut state.overlay.blocks, kind);
     let first_chunk_is_continuation = first_block_is_committable_continuation(&state.overlay);
     let chunks = group_blocks_into_chunks(&state.overlay.blocks);
     push_assistant_chunks(
@@ -927,11 +942,21 @@ pub fn reducer(state: &mut AppState, action: Action) {
         Action::Cancel {
             commit_uuid,
             commit_timestamp,
-        } => commit_streaming_content_and_clear(state, commit_uuid, commit_timestamp),
+        } => commit_streaming_content_and_clear(
+            state,
+            commit_uuid,
+            commit_timestamp,
+            TurnCommitKind::Cancel,
+        ),
         Action::FinalizeTurn {
             commit_uuid,
             commit_timestamp,
-        } => commit_streaming_content_and_clear(state, commit_uuid, commit_timestamp),
+        } => commit_streaming_content_and_clear(
+            state,
+            commit_uuid,
+            commit_timestamp,
+            TurnCommitKind::Finalize,
+        ),
         Action::TruncateTranscript { len } => {
             state.transcript.truncate(len);
         }
@@ -1865,7 +1890,7 @@ mod tests {
             .tool_call_content
             .as_ref()
             .expect("cancelled shell content");
-        assert_eq!(content.len(), 1_000);
+        assert_eq!(content.len(), 1_001);
         assert!(matches!(
             &content[0],
             ToolCallContent::Content(RegularContent {
@@ -1878,6 +1903,160 @@ mod tests {
                 content: ContentBlock::Text(text),
             }) if text.text == "line-0999"
         ));
+        assert!(matches!(
+            &content[1_000],
+            ToolCallContent::Content(RegularContent {
+                content: ContentBlock::Text(text),
+            }) if text.text == "已被用户取消"
+        ));
+        assert_eq!(tool.status, Some(ToolCallStatus::Failed));
+        assert!(state.overlay.is_empty());
+    }
+
+    #[test]
+    fn cancel_closes_shell_calls_without_changing_finished_results() {
+        use crate::render::{render_transcript, RenderTheme, ToolOutputVerbosity};
+        use ratatui::{buffer::Buffer, layout::Rect};
+
+        for tool_name in ["PowerShell", "Bash"] {
+            for status in [
+                ToolCallStatus::Pending,
+                ToolCallStatus::InProgress,
+                ToolCallStatus::Completed,
+                ToolCallStatus::Failed,
+            ] {
+                for has_output in [false, true] {
+                    let mut state = AppState::new();
+                    reducer(
+                        &mut state,
+                        Action::StartToolUse {
+                            call_id: "shell-cancelled".into(),
+                            tool_name: tool_name.into(),
+                            kind: ToolKind::Execute,
+                            initial_status: status,
+                            initial_title: Some(tool_name.into()),
+                            raw_input: None,
+                            content: has_output.then(|| {
+                                vec![ToolCallContent::Content(RegularContent {
+                                    content: ContentBlock::Text(TextContent {
+                                        text: "partial output".into(),
+                                        annotations: None,
+                                    }),
+                                })]
+                            }),
+                            locations: None,
+                            raw_output: None,
+                        },
+                    );
+                    reducer(
+                        &mut state,
+                        Action::Cancel {
+                            commit_uuid: "a-cancelled-shell".into(),
+                            commit_timestamp: "t".into(),
+                        },
+                    );
+                    let Message::Assistant(message) = &state.transcript.rows()[0] else {
+                        panic!("expected assistant message");
+                    };
+                    let AssistantContentBlock::ToolUse(tool) = &message.message.content[0] else {
+                        panic!("expected shell tool use");
+                    };
+                    let interrupted =
+                        matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
+                    assert_eq!(
+                        tool.status,
+                        Some(if interrupted {
+                            ToolCallStatus::Failed
+                        } else {
+                            status
+                        }),
+                        "{tool_name}: {status:?}",
+                    );
+                    let content = tool.tool_call_content.as_deref().unwrap_or_default();
+                    assert_eq!(
+                        content.len(),
+                        usize::from(has_output) + usize::from(interrupted)
+                    );
+                    if has_output {
+                        assert!(matches!(
+                            &content[0],
+                            ToolCallContent::Content(RegularContent {
+                                content: ContentBlock::Text(text),
+                            }) if text.text == "partial output"
+                        ));
+                    }
+                    if interrupted {
+                        assert!(matches!(
+                            content.last().unwrap(),
+                            ToolCallContent::Content(RegularContent {
+                                content: ContentBlock::Text(text),
+                            }) if text.text == "已被用户取消"
+                        ));
+                    }
+                    assert!(state.overlay.is_empty());
+
+                    reducer(
+                        &mut state,
+                        Action::AppendStreamingText("continued reply".into()),
+                    );
+                    reducer(
+                        &mut state,
+                        Action::FinalizeTurn {
+                            commit_uuid: "a-continued".into(),
+                            commit_timestamp: "t2".into(),
+                        },
+                    );
+                    assert_eq!(state.transcript.len(), 2);
+                    for verbosity in [ToolOutputVerbosity::Compact, ToolOutputVerbosity::Normal] {
+                        let area = Rect::new(0, 0, 80, 12);
+                        let mut buffer = Buffer::empty(area);
+                        render_transcript(
+                            &state,
+                            area,
+                            &mut buffer,
+                            &RenderTheme::plain(),
+                            0,
+                            verbosity,
+                            0,
+                            None,
+                        );
+                        let rendered = buffer
+                            .content
+                            .iter()
+                            .map(|cell| cell.symbol())
+                            .collect::<String>();
+                        assert!(rendered.contains(tool_name), "{rendered:?}");
+                        assert!(rendered.contains("continued reply"), "{rendered:?}");
+                        assert_eq!(
+                            rendered.replace(' ', "").contains("已被用户取消"),
+                            interrupted,
+                            "{rendered:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn finalize_turn_preserves_inflight_non_workflow_tools() {
+        let mut state = AppState::new();
+        reducer(&mut state, start_tool_use("read-active"));
+        reducer(
+            &mut state,
+            Action::FinalizeTurn {
+                commit_uuid: "a-finalized".into(),
+                commit_timestamp: "t".into(),
+            },
+        );
+        let Message::Assistant(message) = &state.transcript.rows()[0] else {
+            panic!("expected assistant message");
+        };
+        let AssistantContentBlock::ToolUse(tool) = &message.message.content[0] else {
+            panic!("expected tool use");
+        };
+        assert_eq!(tool.status, Some(ToolCallStatus::Pending));
+        assert!(tool.tool_call_content.is_none());
         assert!(state.overlay.is_empty());
     }
 

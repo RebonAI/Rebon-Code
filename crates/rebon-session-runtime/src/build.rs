@@ -2062,14 +2062,6 @@ pub async fn build_session_with_runtime_controller(
     // and cloned into `start_scheduler` below once the cwd is known.
     let cron_poller = CronPoller::new();
     let session_cron_store = SessionCronStore::new();
-    let mid_turn_queue = crate::mid_turn_queue::MidTurnQueuedSubmitPoller::new("");
-    let mut user_attachment_poller: Arc<dyn AttachmentPoller> = mid_turn_queue.clone();
-    if let Some(additional_attachment_poller) = additional_attachment_poller.clone() {
-        user_attachment_poller = Arc::new(CompositePoller::new(
-            user_attachment_poller,
-            additional_attachment_poller,
-        ));
-    }
     // A mirror's executor gets an empty seam: it never runs a turn here,
     // and the servers behind a real one belong to the owner.
     let mcp_client: Arc<dyn McpClient> = match mcp.as_ref() {
@@ -2149,6 +2141,14 @@ pub async fn build_session_with_runtime_controller(
         elapsed_ms = startup_started.elapsed().as_millis() as u64,
         "rebon startup: startup skills loaded"
     );
+    let mid_turn_queue = crate::mid_turn_queue::MidTurnQueuedSubmitPoller::new(&record.session_id);
+    let mut user_attachment_poller: Arc<dyn AttachmentPoller> = mid_turn_queue.clone();
+    if let Some(additional_attachment_poller) = additional_attachment_poller.clone() {
+        user_attachment_poller = Arc::new(CompositePoller::new(
+            user_attachment_poller,
+            additional_attachment_poller,
+        ));
+    }
     let kernel = bind_session_kernel(SessionKernelRequest {
         runtime_resolved,
         engine: &wiring.engine,
@@ -2262,6 +2262,90 @@ pub fn system_prompt_config_for_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initial_shell_feedback_uses_the_created_or_resumed_session() {
+        use crate::commands::EnvRestore;
+        use crate::submit_payload::SubmitPayload;
+        use rebon_session::session_storage::{load_transcript_from_file, transcript_file_path};
+
+        let config = rebon_tool::tasks::test_support::TestConfigHome::new("initial-shell-feedback");
+        let _env = EnvRestore::new(&[
+            "HOME",
+            "USERPROFILE",
+            "ANTHROPIC_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "DEEPSEEK_MODEL",
+            "OPENAI_API_KEY",
+            "REBON_MODEL",
+            "REBON_MCP_SERVERS_JSON",
+            "REBON_MCP_SERVERS",
+        ]);
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "DEEPSEEK_MODEL",
+            "REBON_MODEL",
+            "REBON_MCP_SERVERS_JSON",
+            "REBON_MCP_SERVERS",
+        ] {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("HOME", config.path());
+        std::env::set_var("USERPROFILE", config.path());
+        std::env::set_var("OPENAI_API_KEY", "sk-test");
+        let cwd = config.path().join("workspace");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let result: anyhow::Result<()> = async {
+            let mut resume = None;
+            for startup in 0..2 {
+                let built = build_tui_session(RuntimeOverride {
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    model: Some("gpt-test".into()),
+                    resume: resume.clone(),
+                    strict_mcp_config: true,
+                    ..RuntimeOverride::default()
+                })
+                .await?;
+                let session = built.session;
+                if let Some(expected) = &resume {
+                    anyhow::ensure!(&session.session_id == expected);
+                }
+                let queue = &session.engine_half.runtime.mid_turn_queue;
+                for (index, output) in ["ok", "Command failed: unavailable"].iter().enumerate() {
+                    let mut feedback = SubmitPayload {
+                        text: format!("!true\n{output}"),
+                        model_text: Some(format!("Local shell output: {output}")),
+                        user_message_uuid: Some(format!("shell-{startup}-{index}")),
+                        image_pastes: Vec::new(),
+                        directory_attachments: Vec::new(),
+                        execution_policy: None,
+                        skill_invocations: Vec::new(),
+                    };
+                    queue.enqueue_submit(&mut feedback);
+                    anyhow::ensure!(queue.persist_idle_submit(
+                        &session.projects_root,
+                        &session.cwd,
+                        &session.server_state,
+                        &feedback,
+                    )?);
+                }
+                let transcript = load_transcript_from_file(&transcript_file_path(
+                    &session.projects_root,
+                    &session.cwd,
+                    &session.session_id,
+                ))?
+                .expect("shell feedback creates a transcript");
+                anyhow::ensure!(transcript.messages.len() == (startup + 1) * 2);
+                resume = Some(session.session_id.clone());
+            }
+            Ok(())
+        }
+        .await;
+        rebon_harness::shutdown_process_plugin_plane().await;
+        result.unwrap();
+    }
 
     fn transcript_on_disk(projects_root: &Path, cwd: &str, session_id: &str) {
         let path = rebon_session::ensure_session_file_path(projects_root, cwd, session_id).unwrap();
