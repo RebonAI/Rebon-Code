@@ -2318,8 +2318,7 @@ mod tests {
     async fn synchronous_question_modal_answers_cancels_and_releases_on_runner_drop() {
         use rebon_tool::PermissionBroker;
 
-        // Exercise the real broker and modal together. The await must leave
-        // the runner free to process input or tear down its pending dialog.
+        // 同步等待不能阻塞 runner 处理输入或销毁仍在等待的对话框。
         for action in [
             Some(PermissionModalAction::Confirm),
             Some(PermissionModalAction::Cancel),
@@ -2354,8 +2353,7 @@ mod tests {
             assert!(app.pending_permission_view.is_some());
             assert!(futures_util::poll!(&mut future).is_pending());
 
-            // A running question remains an active turn: session replacement
-            // is refused rather than moving its still-live waiter elsewhere.
+            // 提问期间仍有活动轮次，必须拒绝切换会话，避免遗留等待者。
             app.is_loading = true;
             let cwd = session.cwd.clone();
             assert!(session
@@ -2373,7 +2371,7 @@ mod tests {
                 );
                 assert!(app.pending_permission_view.is_none());
             } else {
-                // LoopState owns PendingPermission; its drop closes the oneshot.
+                // LoopState 持有 PendingPermission，退出时 drop 会关闭 oneshot。
                 drop(pending.take());
             }
             assert!(pending.is_none());

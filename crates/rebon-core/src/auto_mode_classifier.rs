@@ -645,8 +645,7 @@ pub fn serialize_auto_mode_transcript_as(
                 ContentBlock::ToolResult(tool_result) => {
                     let tool_name = tool_names.get(&tool_result.tool_use_id).map(String::as_str);
                     let content = tool_result.content.to_plain_text();
-                    // Historical deferred placeholders are not answers or
-                    // authorization from the user.
+                    // 历史异步占位记录不代表用户已经回答或授权。
                     if tool_name == Some("AskUserQuestion")
                         && !tool_result.is_error
                         && !crate::deferred_question::is_pending_model_text(&content)
@@ -1138,9 +1137,7 @@ mod tests {
         assert!(transcript.contains("\"outcome\":\"ok\""));
     }
 
-    /// A historical deferred question's placeholder must not read as the user's
-    /// answer: the classifier would otherwise see "User answered" with text
-    /// the user never wrote.
+    /// 历史占位记录不能序列化成用户答案，否则分类器会把模型生成的内容误认为用户授权。
     #[test]
     fn a_pending_question_result_is_not_serialized_as_the_users_answer() {
         let pending =

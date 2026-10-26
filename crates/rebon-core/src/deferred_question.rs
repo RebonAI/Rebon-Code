@@ -1,12 +1,11 @@
-//! Read-only compatibility for transcripts written when `AskUserQuestion`
-//! could return a pending placeholder. New calls always await the user's
-//! answer or cancellation; nothing here creates or delivers deferred answers.
+//! 仅兼容读取 `AskUserQuestion` 曾经返回的 pending 占位记录。
+//! 新调用始终等待回答或取消，此处不能重新生成或投递异步答案。
 
 use serde_json::Value;
 
 const PENDING_LEAD: &str = "Your question is on the user's screen; the answer has not arrived yet.";
 
-/// Preserve the model-facing text when reading a historical pending result.
+/// 保留历史 pending 结果面向模型的原文，避免伪造用户答案。
 pub(crate) fn pending_model_text(value: &Value) -> Option<&str> {
     if value.get("status").and_then(Value::as_str) != Some("pending") {
         return None;
@@ -14,12 +13,12 @@ pub(crate) fn pending_model_text(value: &Value) -> Option<&str> {
     value.get("message").and_then(Value::as_str)
 }
 
-/// A historical placeholder is not an answer or an authorization from the user.
+/// 历史占位记录不代表用户已经回答或授权。
 pub(crate) fn is_pending_model_text(text: &str) -> bool {
     text.starts_with(PENDING_LEAD)
 }
 
-/// Frozen old output, not a producer for new calls.
+/// 固定的历史输出样本，不能用于生成新调用的结果。
 #[cfg(test)]
 pub(crate) const LEGACY_PENDING_RESULT: &str = r#"{
     "status": "pending",

@@ -1343,8 +1343,8 @@ impl PermissionBroker for ChannelPermissionBroker {
 
                     self.send_query(tool, query)?;
 
-                    // Suspend this tool call, not the UI: the runner owns
-                    // the sender and can answer, cancel, or drop it on exit.
+                    // 这里只挂起工具 future；UI 持有 sender，可回答、取消，
+                    // 退出时 drop 会释放等待，不能阻塞 UI。
                     response_rx.await.map_err(|_| ToolError::Execution {
                         tool: tool.id(),
                         source: anyhow::anyhow!("permission response dropped"),
@@ -5399,7 +5399,7 @@ mod tests {
         let _ = handle.await.unwrap();
     }
 
-    /// Questions suspend the tool call while the UI owns the reply channel.
+    /// UI 持有回复通道时，工具必须保持等待。
     mod synchronous_questions {
         use super::*;
 
@@ -5645,7 +5645,7 @@ mod tests {
             assert_waits_for_the_dialog(broker, rx, question_input(), context).await;
         }
 
-        /// Ordinary permission requests still use the same waiting channel.
+        /// 普通权限请求仍共用等待通道，不能因提问同步化而改变审批语义。
         #[tokio::test]
         async fn other_tools_still_wait_for_approval() {
             let _env = crate::test_env_lock();

@@ -12,8 +12,7 @@
 //! the collected answers so downstream dispatch can hand a
 //! well-formed result block back to the model.
 //!
-//! The call waits for the user to answer or cancel; answers and annotations
-//! are returned in this tool's result, never in a later user message.
+//! 调用会等待用户回答或取消；答案和注释必须在当前工具结果中返回，不能拆成后续用户消息。
 //!
 //! ## Input fields
 //!
@@ -781,7 +780,7 @@ mod tests {
         assert!(model_description.contains("never use it for notifications or closing remarks"));
     }
 
-    /// Both prompt surfaces promise the same synchronous result contract.
+    /// 两种描述都必须承诺同步返回，避免模型预期与实际交互不一致。
     #[test]
     fn prompt_contract_waits_for_an_answer_or_cancellation() {
         let tool = tool();

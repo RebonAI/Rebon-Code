@@ -352,8 +352,7 @@ pub(super) fn format_bytes(bytes: u64) -> String {
     }
 }
 pub(super) fn format_ask_user_question_result_for_model(value: &Value) -> String {
-    // Historical transcripts may contain a deferred placeholder. Preserve
-    // its text rather than misrepresenting it as the user's answers.
+    // 历史 transcript 可能保留异步占位记录，必须保留原文，不能伪装成用户答案。
     if let Some(pending) = crate::deferred_question::pending_model_text(value) {
         return pending.to_string();
     }

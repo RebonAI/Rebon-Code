@@ -242,7 +242,7 @@ fn ask_user_question_tool_result_uses_specialized_sentence() {
     assert!(!content.contains("{\"answers\""));
 }
 
-/// A historical placeholder is still read as pending, not as empty answers.
+/// 历史占位记录仍应读作 pending，而不是空答案。
 #[test]
 fn a_pending_ask_user_question_result_is_the_pending_note() {
     let value = serde_json::from_str(crate::deferred_question::LEGACY_PENDING_RESULT).unwrap();
