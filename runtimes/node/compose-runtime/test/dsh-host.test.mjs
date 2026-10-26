@@ -63,10 +63,11 @@ test('a tool package reaches the session directory and words its section after i
     await loadCompose(kit, { entries: [{ id: 'reader' }] });
     const loaded = await loadEntry(kit, { id: 'reader', ...cordisPackage(READER), tools: ['where'], publishedTopics: ['compose:session/append'] });
     assert.equal(loaded.status, 'success', JSON.stringify(loaded.payload));
-    await openScope(kit, 'reader', 'C:/projects/demo');
+    const cwd = path.join(os.tmpdir(), 'rebon-session-demo').replace(/\\/g, '/');
+    await openScope(kit, 'reader', cwd);
     const call = await kit.scoped('reader', 'tool/call', { tool: 'where', input: {} });
     assert.equal(call.terminal.status, 'success', JSON.stringify(call.terminal.payload));
-    assert.equal(plainly(call.terminal.payload).content[0].text, 'C:/projects/demo');
+    assert.equal(plainly(call.terminal.payload).content[0].text, cwd);
 
     await openScope(kit, 'rebon:compose');
     const report = await kit.scoped('rebon:compose', 'service/call', { service: 'compose', request: { kind: 'report', pluginId: 'reader' } });

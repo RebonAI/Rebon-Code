@@ -208,17 +208,22 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
+    defaults:
+      run:
+        working-directory: reboncode
     steps:
+      # 同级 checkout 防止 Boa 的 workspace 继承落到 RebonCode 根目录。
       - name: Checkout RebonCode
         uses: actions/checkout@v7
         with:
+          path: reboncode
           persist-credentials: false
       - name: Checkout the exact Verve DSH compatibility revision
         uses: actions/checkout@v7
         with:
           repository: Quorafind/verve
           ref: a9fc5f6e15bec3d11fe7f3db5c034ae5ac3c41aa
-          path: .ci/verve-dsh
+          path: verve-dsh
           persist-credentials: false
       - name: Cache the cargo registry
         uses: actions/cache@v6
@@ -233,7 +238,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          verve="$GITHUB_WORKSPACE/.ci/verve-dsh"
+          verve="$GITHUB_WORKSPACE/verve-dsh"
           config="$RUNNER_TEMP/dsh-cargo-config.toml"
           # Verve 与 Boa 必须来自同一副本，避免重复类型和同源 git patch。
           cat > "$config" <<EOF
