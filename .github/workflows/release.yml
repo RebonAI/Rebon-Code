@@ -222,7 +222,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: Quorafind/verve
-          ref: a9fc5f6e15bec3d11fe7f3db5c034ae5ac3c41aa
+          ref: 9f3673eea10baf6d90443e8100a0d85e0e2f051b
           path: verve-dsh
           persist-credentials: false
       - name: Cache the cargo registry
