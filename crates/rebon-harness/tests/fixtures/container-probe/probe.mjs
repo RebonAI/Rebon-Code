@@ -5,6 +5,7 @@
 import fs from 'node:fs';
 import childProcess from 'node:child_process';
 import { defineTool } from '@deepseek-ai/dsh-tools';
+import { seat } from 'rebon';
 
 export const name = 'container-probe';
 export const inject = ['tools'];
@@ -22,7 +23,7 @@ export function apply(ctx, config) {
     name: config?.tool ?? 'probe',
     description: 'Reports what this plugin host permits.',
     parameters: {
-      action: { type: 'string', required: true, description: 'pid | read | write | spawn | env | fetch' },
+      action: { type: 'string', required: true, description: 'pid | read | write | spawn | process | env | fetch' },
       path: { type: 'string', description: 'A file path, or a variable name for env.' },
     },
     output: {
@@ -36,6 +37,12 @@ export function apply(ctx, config) {
         case 'read': answer = attempt(() => fs.readFileSync(args.path, 'utf8').length); break;
         case 'write': answer = attempt(() => fs.writeFileSync(args.path, 'probe')); break;
         case 'spawn': answer = attempt(() => String(childProcess.execSync('node --version'))); break;
+        // A program started for it by rebon, through the `process` seat.
+        case 'process':
+          answer = await seat('process', 'spawn', { argv: process.platform === 'win32' ? ['cmd', '/c', 'echo', 'x'] : ['sh', '-c', 'echo x'] })
+            .then((started) => ({ ok: true, value: started.id }))
+            .catch((error) => ({ ok: false, code: String(error.code ?? ''), message: String(error.message ?? error) }));
+          break;
         case 'env': answer = { ok: true, value: process.env[args.path] ?? null }; break;
         case 'fetch':
           answer = await fetch(args.path)

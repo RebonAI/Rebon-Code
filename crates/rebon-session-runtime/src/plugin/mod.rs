@@ -11,6 +11,7 @@
 //! crate owns the type, not what it is called.
 
 pub mod builtin;
+pub mod dsh_bundle;
 pub mod dsh_npm;
 pub mod installer;
 pub mod marketplace;

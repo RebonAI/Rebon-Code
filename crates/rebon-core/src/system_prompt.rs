@@ -824,9 +824,7 @@ pub fn prime_injected_prompt_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    static SUB_AGENT_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    use crate::tests::SubAgentsEnabledGuard;
 
     fn sample_config() -> SystemPromptConfig {
         SystemPromptConfig {
@@ -1149,10 +1147,6 @@ mod tests {
 
     #[test]
     fn session_guidance_matches_for_eager_and_deferred_capabilities() {
-        let _lock = SUB_AGENT_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
         let _guard = SubAgentsEnabledGuard::set(true);
         let tools = [
             "Agent",
@@ -1809,30 +1803,8 @@ mod tests {
         assert!(!prompt.contains("A user's `/<skill-name>` command"));
     }
 
-    struct SubAgentsEnabledGuard {
-        prior: bool,
-    }
-
-    impl SubAgentsEnabledGuard {
-        fn set(enabled: bool) -> Self {
-            let prior = rebon_tool::sub_agents_enabled();
-            rebon_tool::set_sub_agents_enabled(enabled);
-            Self { prior }
-        }
-    }
-
-    impl Drop for SubAgentsEnabledGuard {
-        fn drop(&mut self) {
-            rebon_tool::set_sub_agents_enabled(self.prior);
-        }
-    }
-
     #[test]
     fn session_guidance_includes_agent_bullets_when_agent_tool_registered() {
-        let _lock = SUB_AGENT_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
         let _guard = SubAgentsEnabledGuard::set(true);
         let config = config_with_tools(&["Agent"]);
         let prompt = build_system_prompt(&config, &sample_context());
@@ -1867,10 +1839,6 @@ mod tests {
 
     #[test]
     fn session_guidance_agent_bullet_suggests_glob_grep_when_both_available() {
-        let _lock = SUB_AGENT_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
         let _guard = SubAgentsEnabledGuard::set(true);
         // sample_config already has Glob + Grep.
         let config = config_with_tools(&["Agent"]);
@@ -1885,10 +1853,6 @@ mod tests {
 
     #[test]
     fn session_guidance_agent_bullet_falls_back_to_bash_when_search_tools_missing() {
-        let _lock = SUB_AGENT_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
         let _guard = SubAgentsEnabledGuard::set(true);
         // Neither Glob nor Grep is registered, so the guidance bullet
         // names the Bash search fallback.
@@ -1900,10 +1864,6 @@ mod tests {
 
     #[test]
     fn session_guidance_runtime_toggle_suppresses_agent_bullets_only() {
-        let _lock = SUB_AGENT_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
         let _guard = SubAgentsEnabledGuard::set(true);
         let config = config_with_tools(&["Agent"]);
 
@@ -1931,10 +1891,6 @@ mod tests {
 
     #[test]
     fn session_guidance_reserves_named_teammates_for_reusable_context() {
-        let _lock = SUB_AGENT_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
         let _guard = SubAgentsEnabledGuard::set(true);
         let config = config_with_tools(&["Agent"]);
 
@@ -1958,10 +1914,6 @@ mod tests {
 
     #[test]
     fn session_guidance_background_agent_bullet_tracks_auto_continue_capability() {
-        let _lock = SUB_AGENT_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
         let _guard = SubAgentsEnabledGuard::set(true);
         let config = config_with_tools(&["Agent"]);
 
@@ -2009,10 +1961,6 @@ mod tests {
 
     #[test]
     fn session_guidance_appears_before_tone_and_style() {
-        let _lock = SUB_AGENT_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
         let _guard = SubAgentsEnabledGuard::set(true);
         let config = config_with_tools(&["Agent"]);
         let prompt = build_system_prompt(&config, &sample_context());
@@ -2025,10 +1973,6 @@ mod tests {
 
     #[test]
     fn session_guidance_bullet_ordering_is_stable() {
-        let _lock = SUB_AGENT_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
         let _guard = SubAgentsEnabledGuard::set(true);
         // Expected order: AskUserQuestion → !<command> → Agent bullets → Skill.
         let config = config_with_tools(&["Agent", "AskUserQuestion", "Skill"]);

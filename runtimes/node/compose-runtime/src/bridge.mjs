@@ -72,6 +72,25 @@ export function seat(name, method, params = null, options = {}) {
   return require(`seat ${JSON.stringify(name)}`, via).seat(name, method, params, call);
 }
 
+/// Calls a kernel seat as the plugin `via` belongs to, whatever call is in
+/// flight.
+///
+/// `seat()` speaks for the call being answered, which is right for code
+/// serving that call. This is for the composition acting *on behalf of one
+/// entry* while answering someone else — the configuration editor
+/// persisting an entry's own config while a settings form asked for it.
+/// The seat then sees that entry as the caller, so the entry's own ceiling,
+/// not the composition's, decides what the call may do.
+export function seatFor(via, name, method, params = null) {
+  const session = sessionOf(via);
+  if (session === undefined) {
+    throw new Error(
+      `[NO_CALL_CONTEXT] seat ${JSON.stringify(name)} cannot be reached for this entry: it is not attached to a session`,
+    );
+  }
+  return session.seat(name, method, params);
+}
+
 /// Invokes one rebon core tool on the session this call belongs to.
 ///
 /// Three gates stand in front of it and only the first is here: the plugin's

@@ -49,4 +49,5 @@ pub mod plugin_boot;
 pub mod plugin_composition;
 pub mod plugin_manifests;
 pub mod plugin_plane;
+pub mod process_seat;
 pub mod provider_registry;

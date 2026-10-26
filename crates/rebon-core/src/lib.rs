@@ -1670,7 +1670,10 @@ mod tests {
             .unwrap_or_default()
             .contains("ready")
         {
-            assert!(std::time::Instant::now() < deadline, "no `ready` in {output_path}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no `ready` in {output_path}"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
@@ -1821,15 +1824,20 @@ mod tests {
         }
     }
 
-    struct SubAgentsEnabledGuard {
+    pub(crate) struct SubAgentsEnabledGuard {
         prior: bool,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl SubAgentsEnabledGuard {
-        fn set(enabled: bool) -> Self {
+        pub(crate) fn set(enabled: bool) -> Self {
+            let lock = SUB_AGENT_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("sub-agent 测试锁中毒");
             let prior = rebon_tool::sub_agents_enabled();
             rebon_tool::set_sub_agents_enabled(enabled);
-            Self { prior }
+            Self { prior, _lock: lock }
         }
     }
 
@@ -1840,11 +1848,16 @@ mod tests {
     }
 
     #[test]
-    fn agent_tool_description_omits_worktree_agent_by_default() {
-        let _lock = SUB_AGENT_TEST_LOCK
+    fn sub_agent_test_guard_holds_the_shared_switch_lock() {
+        let _guard = SubAgentsEnabledGuard::set(true);
+        assert!(SUB_AGENT_TEST_LOCK
             .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
+            .try_lock()
+            .is_err());
+    }
+
+    #[test]
+    fn agent_tool_description_omits_worktree_agent_by_default() {
         let _guard = SubAgentsEnabledGuard::set(true);
         // The tool is `rebon-plugin-agents`' now; what is under test here is
         // the engine's projection of it, so register it directly.
@@ -1871,10 +1884,6 @@ mod tests {
 
     #[test]
     fn agent_tool_description_includes_worktree_when_enabled() {
-        let _lock = SUB_AGENT_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
         let _guard = SubAgentsEnabledGuard::set(true);
         let mut engine = Engine::with_builtin_tools();
         engine.register_tool(Arc::new(

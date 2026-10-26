@@ -28,10 +28,21 @@ import RebonToolsRuntime from './tools-runtime.mjs';
 import RebonWebRuntime from './web-runtime.mjs';
 import RebonSystemPromptRuntime from './systemprompt-runtime.mjs';
 import RebonCommandsRuntime from './commands-runtime.mjs';
+import RebonWorkingDirectory from './working-directory-runtime.mjs';
+import RebonSubprocess from './subprocess-runtime.mjs';
+import { RebonConfigEditor, RebonLoader, RebonProfileContext } from './loader-runtime.mjs';
+import { mounting, track, untrack } from './entries.mjs';
 
 /** The built-in seats, in mount order: a dsh `inject` is satisfied at mount
- *  time, so a seat that arrives after the plugin needing it never arrives. */
-const BUILTIN_SEATS = ['llm', 'credentials', 'tools', 'web', 'systemPrompt', 'commands'];
+ *  time, so a seat that arrives after the plugin needing it never arrives.
+ *  The last five are services an upstream package injects that dsh's boot
+ *  layer and session model provide — the composition answers them itself
+ *  (see `working-directory-runtime.mjs`, `subprocess-runtime.mjs` and
+ *  `loader-runtime.mjs`). */
+const BUILTIN_SEATS = [
+  'llm', 'credentials', 'tools', 'web', 'systemPrompt', 'commands',
+  'workingDirectory', 'subprocess', 'loader', 'profileContext', 'configEditor',
+];
 
 let state;
 
@@ -90,7 +101,7 @@ function place(nodes, parent, placements, groups, realms) {
 }
 
 /// Creates the realm. Called once, by the composition control plugin.
-export async function createRealm({ web = null, entries = [] } = {}) {
+export async function createRealm({ web = null, entries = [], profile = null } = {}) {
   if (state !== undefined) {
     throw new ComposeError('[REALM_EXISTS]', 'the composition realm is already created');
   }
@@ -106,6 +117,11 @@ export async function createRealm({ web = null, entries = [] } = {}) {
   await ctx.plugin(RebonWebRuntime, { web });
   await ctx.plugin(RebonSystemPromptRuntime);
   await ctx.plugin(RebonCommandsRuntime);
+  await ctx.plugin(RebonWorkingDirectory);
+  await ctx.plugin(RebonSubprocess);
+  await ctx.plugin(RebonLoader);
+  await ctx.plugin(RebonProfileContext, profile ?? {});
+  await ctx.plugin(RebonConfigEditor, profile ?? {});
 
   state = { ctx, placements, groups, realms, fibers: new Map(), sinks: new Map() };
   return state;
@@ -150,7 +166,11 @@ function requiredInjects(plugin) {
 /// The sink rides on the entry's own derived context, which is what lets a seat
 /// attribute a registration synchronously — the moment a plugin registers, the
 /// context it registered through says which plugin it was.
-export async function mountEntry(request, plugin, { probe = false } = {}) {
+export async function mountEntry(request, plugin, options = {}) {
+  return mounting(() => mount(request, plugin, options));
+}
+
+async function mount(request, plugin, { probe = false } = {}) {
   const live = realm();
   const { pluginId } = request;
   if (live.groups.has(pluginId)) {
@@ -199,6 +219,7 @@ export async function mountEntry(request, plugin, { probe = false } = {}) {
   sink.seal();
   live.fibers.set(pluginId, fiber);
   live.sinks.set(pluginId, sink);
+  track(pluginId, request, fiber);
   return sink;
 }
 
@@ -209,6 +230,7 @@ export async function disposeEntry(pluginId) {
   const fiber = state.fibers.get(pluginId);
   state.fibers.delete(pluginId);
   state.sinks.delete(pluginId);
+  untrack(pluginId);
   if (fiber === undefined) return;
   await fiber.dispose();
 }

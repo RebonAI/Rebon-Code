@@ -534,6 +534,9 @@ pub fn kernel_manifest_for(mod_: &ClaudeMod) -> KernelPluginManifest {
         },
         seats: MOD_SEATS.iter().map(|s| (*s).to_owned()).collect(),
         settings: setting_keys(&mod_.manifest),
+        // A mod reaches nothing in a realm: it runs on its own loader.
+        inject: Vec::new(),
+        provides: Vec::new(),
     }
 }
 

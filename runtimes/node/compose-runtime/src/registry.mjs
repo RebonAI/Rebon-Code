@@ -176,11 +176,20 @@ export class RegistrationSink {
   /// What the `compose` service reports for this plugin.
   report() {
     return {
-      sections: this.sections.map((section) => ({ ...section })),
+      sections: this.sections
+        .map((section) => ({ ...section, text: resolvedText(section.text) }))
+        .filter((section) => section.text.length > 0),
       providers: [...this.catalogs].map(([provider, catalog]) => ({ provider, ...catalog })),
       webProviders: this.webProviders.map((entry) => ({ ...entry })),
     };
   }
+}
+
+/// A section's text as rebon receives it: a provider is asked once, with the
+/// empty AssembleContext a whole-composition prompt is assembled with.
+function resolvedText(text) {
+  const value = typeof text === 'function' ? text({}) : text;
+  return typeof value === 'string' ? value : '';
 }
 
 /// The session this plugin is attached to, if it is attached to one.

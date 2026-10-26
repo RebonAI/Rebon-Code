@@ -109,22 +109,22 @@ cordis (https://github.com/cordiverse/cordis)
   LICENSE at tag v4.0.0-rc.8:
   https://github.com/cordiverse/cordis/blob/v4.0.0-rc.8/LICENSE
 
-cosmokit (https://github.com/cordiverse/cosmokit)
+cosmokit (https://github.com/cordiverse/cosmokit), as DeepSeek Harness forks it
   Copyright (c) 2021-present Shigma. Licensed under the MIT License.
-  Vendored build: cosmokit@1.8.1 lib/index.mjs, byte-identical (apart from
-  line endings) to https://registry.npmjs.org/cosmokit/-/cosmokit-1.8.1.tgz
-  (LICENSE alongside, under runtimes/node/compose-runtime/payload/vendor/cosmokit/).
+  Vendored build: @deepseek-ai/cosmokit@1.8.6 lib/index.js, byte-identical
+  to https://registry.npmjs.org/@deepseek-ai/cosmokit/-/cosmokit-1.8.6.tgz
+  (vendor/cosmokit in https://github.com/deepseek-ai/deepseek-harness), with
+  the tarball's LICENSE alongside, under
+  runtimes/node/compose-runtime/payload/vendor/cosmokit/.
 
-schemastery (https://github.com/shigma/schemastery)
+schemastery (https://github.com/shigma/schemastery), as DeepSeek Harness forks it
   Copyright (c) 2021-present Shigma. Licensed under the MIT License.
-  Vendored build: schemastery@3.18.0 lib/index.mjs, byte-identical (apart
-  from line endings) to
-  https://registry.npmjs.org/schemastery/-/schemastery-3.18.0.tgz.
-  The npm tarball ships no license file and the repository has no release
-  tags; the LICENSE alongside
-  (runtimes/node/compose-runtime/payload/vendor/schemastery/LICENSE) is the
-  repository's LICENSE, unchanged since it was added:
-  https://github.com/shigma/schemastery/blob/1b1f506d450c04c663440457b1b0e576d056717c/LICENSE
+  Vendored build: @deepseek-ai/schemastery@3.18.5 lib/index.mjs,
+  byte-identical to
+  https://registry.npmjs.org/@deepseek-ai/schemastery/-/schemastery-3.18.5.tgz
+  (vendor/schemastery in https://github.com/deepseek-ai/deepseek-harness),
+  with the tarball's LICENSE alongside, under
+  runtimes/node/compose-runtime/payload/vendor/schemastery/.
 
 deepseek-harness vendored plugins (https://github.com/deepseek-ai/deepseek-harness)
   Vendored builds under runtimes/node/compose-runtime/payload/vendor/dsh/, each with

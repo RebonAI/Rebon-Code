@@ -1,0 +1,25 @@
+{
+  "name": "dsh-upstream-sample",
+  "version": "0.2.1-rc.3",
+  "description": "Upstream DeepSeek Harness packages, unchanged from npm, as one bundle: the filesystem tools over the local filesystem, settings forms, storage, skills, the PowerShell tool, and web search and fetch.",
+  "type": "module",
+  "license": "MIT",
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "peerDependencies": { "@deepseek-ai/cordis": "~4.0.5" },
+  "dependencies": {
+    "@deepseek-ai/dsh-tool-fs": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-fs-local": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-settings": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-storage": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-storage-json": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-skill": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-skill-filesystem": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-tool-skill": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-shell-env": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-pwsh-local": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-tool-pwsh": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-web-fetch-http": "0.2.1-rc.3",
+    "@deepseek-ai/dsh-web-search-deepseek": "0.2.1-rc.3",
+    "yaml": "^2.8.1"
+  }
+}

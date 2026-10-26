@@ -107,6 +107,19 @@ pub struct KernelPluginManifest {
     /// roughly what shape they hold, is the part a person reviews before
     /// installing.
     pub settings: Vec<KernelPluginSettingKey>,
+    /// Realm services it cannot mount without — its required Cordis
+    /// `inject` — that another composition entry provides.
+    ///
+    /// Not a capability: services inside one realm are how DeepSeek Harness
+    /// packages reach each other, and nothing here reaches rebon. What it
+    /// decides is order. A composition loads an entry after the entries
+    /// that [`Self::provides`] what it injects, so a seam implementation
+    /// (`dsh-fs-local`) is mounted before its consumer (`dsh-tool-fs`)
+    /// whatever order the rows were written in.
+    pub inject: Vec<String>,
+    /// Realm services mounting it makes available, as the install probe saw
+    /// them. The other half of [`Self::inject`].
+    pub provides: Vec<String>,
 }
 
 /// One declared settings key, as a manifest writes it.

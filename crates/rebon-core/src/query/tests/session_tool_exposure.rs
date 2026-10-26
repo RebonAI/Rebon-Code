@@ -65,6 +65,7 @@ fn queue_session_projection_exposes_queue_tools_without_ceo_escalation_tools() {
 
 #[test]
 fn coordinator_session_projection_keeps_agent_and_deferred_gateway_visible() {
+    let _guard = SubAgentsEnabledGuard::set(true);
     let engine = crate::engine_with_every_builtin_tool();
     let filter = crate::coordinator_mode::coordinator_session_filter();
     let projection = runtime_tool_projection(
@@ -182,6 +183,7 @@ fn eager_tool_name_snapshots_list_exactly_the_eager_snapshots() {
 
 #[test]
 fn stable_builtin_exposure_policy_projects_expected_eager_and_deferred_sets() {
+    let _guard = SubAgentsEnabledGuard::set(true);
     let engine = crate::engine_with_every_builtin_tool();
     let registered: std::collections::HashSet<_> = engine.tool_names().into_iter().collect();
     let eager: std::collections::HashSet<_> = engine

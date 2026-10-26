@@ -209,7 +209,12 @@ async fn boot_with_bound(
             // list used to be two here, so a package declaring `settings` (the
             // example one does now) was refused at load by the fixture and by
             // nothing else.
-            exposed_seats: vec!["credentials".into(), "logger".into(), "settings".into()],
+            exposed_seats: vec![
+                "credentials".into(),
+                "logger".into(),
+                "settings".into(),
+                "process".into(),
+            ],
             tool_catalog: serde_json::json!([]),
             scope_id: None,
             working_directory: repo.clone(),
@@ -1455,6 +1460,7 @@ fn probe_entry(id: &str, tool: &str, container: Option<ContainerSpec>) -> Compos
         entry: "probe.mjs".into(),
         config: serde_json::json!({ "tool": tool }),
         tools: vec![tool.into()],
+        seats: vec!["process".into()],
         container,
         ..ComposeEntry::default()
     }
@@ -1538,6 +1544,13 @@ async fn a_contained_plugin_is_confined_to_its_own_files_and_dies_with_its_last_
         probe(&fixture.plane, "probe_boxed", "spawn", "").await["code"],
         "ERR_ACCESS_DENIED"
     );
+    // Nor one rebon would start for it: the `process` seat answers the
+    // shared host alone.
+    let contained = probe(&fixture.plane, "probe_boxed", "process", "").await;
+    assert_eq!(contained["ok"], false, "{contained}");
+    assert!(contained.to_string().contains("[CONTAINED]"), "{contained}");
+    let shared = probe(&fixture.plane, "probe_shared", "process", "").await;
+    assert_eq!(shared["ok"], true, "{shared}");
     assert_eq!(
         probe(&fixture.plane, "probe_boxed", "env", "PATH").await["value"],
         Value::Null

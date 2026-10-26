@@ -246,6 +246,7 @@ pub fn compose_section(
             .collect(),
         ..PlaneComposition::default()
     };
+    let mut realm = BTreeMap::new();
     out.structure = walk(
         &resolved.entries,
         roots,
@@ -255,8 +256,95 @@ pub fn compose_section(
         installed,
         config_dir,
         &mut out,
+        &mut realm,
     );
+    out.entries = realm_order(std::mem::take(&mut out.entries), &realm);
     out
+}
+
+/// What an entry's manifest says about the realm it mounts into: the
+/// services it injects and the ones it provides.
+#[derive(Clone, Debug, Default)]
+struct RealmFacts {
+    inject: Vec<String>,
+    provides: Vec<String>,
+}
+
+impl RealmFacts {
+    fn of(manifest: &rebon_types::KernelPluginManifest) -> Self {
+        Self {
+            inject: manifest.inject.clone(),
+            provides: manifest.provides.clone(),
+        }
+    }
+}
+
+/// Load order, with every entry after the entries providing what it
+/// injects.
+///
+/// The realm refuses an entry whose required service is not there yet rather
+/// than waiting for it, so the order rows are written in is not good enough:
+/// a bundle's rows are listed by name, and a seam implementation sorts after
+/// the consumer that needs it as often as not. Stable otherwise — entries
+/// with nothing to wait for keep the order they were written in — and an
+/// entry whose provider never loads keeps its place, to be refused by name
+/// when it mounts. A cycle is the same: written order, and the realm says
+/// what was missing.
+fn realm_order(
+    entries: Vec<ComposeEntry>,
+    realm: &BTreeMap<String, RealmFacts>,
+) -> Vec<ComposeEntry> {
+    let provider_of = |service: &str| -> Option<&str> {
+        entries
+            .iter()
+            .find(|entry| {
+                realm
+                    .get(&entry.id)
+                    .is_some_and(|facts| facts.provides.iter().any(|provided| provided == service))
+            })
+            .map(|entry| entry.id.as_str())
+    };
+    let waits_for: BTreeMap<&str, Vec<&str>> = entries
+        .iter()
+        .map(|entry| {
+            let needs = realm
+                .get(&entry.id)
+                .map(|facts| {
+                    facts
+                        .inject
+                        .iter()
+                        .filter_map(|service| provider_of(service))
+                        .filter(|provider| *provider != entry.id)
+                        .collect()
+                })
+                .unwrap_or_default();
+            (entry.id.as_str(), needs)
+        })
+        .collect();
+    // Each step takes the first entry, in written order, whose providers are
+    // all placed: every entry moves only as far as its providers make it.
+    let mut placed: Vec<String> = Vec::with_capacity(entries.len());
+    while let Some(next) = entries.iter().find(|entry| {
+        !placed.contains(&entry.id)
+            && waits_for[entry.id.as_str()]
+                .iter()
+                .all(|provider| placed.iter().any(|done| done == provider))
+    }) {
+        placed.push(next.id.clone());
+    }
+    for entry in &entries {
+        if !placed.contains(&entry.id) {
+            placed.push(entry.id.clone());
+        }
+    }
+    let mut by_id: BTreeMap<String, ComposeEntry> = entries
+        .into_iter()
+        .map(|entry| (entry.id.clone(), entry))
+        .collect();
+    placed
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -269,6 +357,7 @@ fn walk(
     installed: &[KernelPluginDeclaration],
     config_dir: &Path,
     out: &mut PlaneComposition,
+    realm: &mut BTreeMap<String, RealmFacts>,
 ) -> Vec<ComposeNode> {
     let mut nodes = Vec::new();
     for entry in entries {
@@ -286,7 +375,7 @@ fn walk(
             // A group is a container, not a module: it becomes structure and
             // nothing is loaded for it.
             let children = walk(
-                group, roots, all_tools, manifests, modules, installed, config_dir, out,
+                group, roots, all_tools, manifests, modules, installed, config_dir, out, realm,
             );
             nodes.push(ComposeNode {
                 id: id.to_owned(),
@@ -304,7 +393,8 @@ fn walk(
         match load_request(
             id, &name, config, roots, all_tools, manifests, modules, installed, config_dir,
         ) {
-            Ok(request) => {
+            Ok((request, facts)) => {
+                realm.insert(request.id.clone(), facts);
                 out.entries.push(request);
                 nodes.push(ComposeNode {
                     id: id.to_owned(),
@@ -332,7 +422,7 @@ fn load_request(
     modules: &BTreeMap<String, PathBuf>,
     installed: &[KernelPluginDeclaration],
     config_dir: &Path,
-) -> Result<ComposeEntry, String> {
+) -> Result<(ComposeEntry, RealmFacts), String> {
     if let Some(manifest) = manifests.get(name) {
         let entry = manifest
             .entry
@@ -345,7 +435,10 @@ fn load_request(
         } else {
             roots.payload.clone()
         };
-        return Ok(entry_for(manifest, id, root, entry, config, all_tools));
+        return Ok((
+            entry_for(manifest, id, root, entry, config, all_tools),
+            RealmFacts::of(manifest),
+        ));
     }
     let Some(module) = modules.get(name) else {
         // Nothing pointed at a file, so the name has to have been declared by
@@ -355,6 +448,7 @@ fn load_request(
             // Installed means someone else's: it runs in its container.
             return installed_entry(declared, id, config, all_tools)
                 .map(|entry| crate::container::Containment::load(config_dir).package(entry))
+                .map(|entry| (entry, RealmFacts::of(&declared.manifest)))
                 .ok_or_else(|| format!("the installed declaration for {name} names no module"));
         }
         return Err(format!(
@@ -365,7 +459,8 @@ fn load_request(
     // A Claude Code mod folder, named by its folder, its manifest or its
     // hooks module: the ceiling is read off the hooks module itself.
     if let Some(mod_root) = crate::mods::compose::mod_root_of(module) {
-        return crate::mods::compose::mod_entry(id, &mod_root, config_dir, &config, all_tools);
+        return crate::mods::compose::mod_entry(id, &mod_root, config_dir, &config, all_tools)
+            .map(|entry| (entry, RealmFacts::default()));
     }
     let root = module
         .parent()
@@ -387,7 +482,11 @@ fn load_request(
         package = %root.display(),
         "composition entry loaded against its package's own declaration"
     );
-    Ok(entry_for(&manifest, id, root, file, config, all_tools))
+    let facts = RealmFacts::of(&manifest);
+    Ok((
+        entry_for(&manifest, id, root, file, config, all_tools),
+        facts,
+    ))
 }
 
 /// The load request for a kernel plugin an installed package declares,
@@ -495,6 +594,57 @@ mod tests {
         assert_eq!(entry.config, serde_json::json!({ "a": 1 }));
         // The package's recorded source travels with the load request.
         assert_eq!(entry.source.as_deref(), Some("source-of-demo-plane"));
+    }
+
+    /// A consumer written before the entry providing what it injects still
+    /// loads after it; entries that wait for nothing keep their order, and
+    /// one whose provider is not in the composition keeps its place.
+    #[test]
+    fn an_entry_loads_after_the_entries_providing_what_it_injects() {
+        let realm = |name: &str, inject: &[&str], provides: &[&str]| {
+            let mut declared = installed(name, &format!("/packages/{name}"), "index.js");
+            declared.manifest.inject = inject.iter().map(|s| (*s).to_owned()).collect();
+            declared.manifest.provides = provides.iter().map(|s| (*s).to_owned()).collect();
+            declared
+        };
+        let section = serde_json::json!({
+            "plugins": [
+                { "id": "tool-fs", "name": "tool-fs" },
+                { "id": "plain", "name": "plain" },
+                { "id": "tool-skill", "name": "tool-skill" },
+                { "id": "fs-local", "name": "fs-local" },
+                { "id": "skills", "name": "skills" },
+                { "id": "orphan", "name": "orphan" },
+            ]
+        });
+        let declared = [
+            realm("tool-fs", &["tools", "fs"], &[]),
+            realm("plain", &[], &[]),
+            realm("tool-skill", &["skills", "fs"], &[]),
+            realm("fs-local", &[], &["fs"]),
+            realm("skills", &["fs"], &["skills"]),
+            realm("orphan", &["agents"], &[]),
+        ];
+        let out = compose_section(
+            &section,
+            &roots(),
+            &[],
+            &manifests(),
+            &declared,
+            Path::new("/nowhere"),
+        );
+        let order: Vec<&str> = out.entries.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(
+            order,
+            [
+                "plain",
+                "fs-local",
+                "tool-fs",
+                "skills",
+                "tool-skill",
+                "orphan"
+            ]
+        );
     }
 
     /// Pointing `modules` at a directory is a statement about *which* copy to

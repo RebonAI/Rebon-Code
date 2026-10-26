@@ -70,7 +70,7 @@ export function localEntry(dir, specifier) {
  * answers, and `deny` a set of seats that refuse — the three shapes a test
  * needs to stand in for a kernel.
  */
-export async function startHost({ env = {}, tools = {}, seats = {} } = {}) {
+export async function startHost({ env = {}, tools = {}, seats = {}, onEvent } = {}) {
   const sent = [];
   const seen = { seats: [], invokes: [], events: [] };
   const writer = {
@@ -94,7 +94,9 @@ export async function startHost({ env = {}, tools = {}, seats = {} } = {}) {
           ? { status: 'error', payload: { code: '[UNAVAILABLE_TOOL]', message: `no ${payload.tool}` } }
           : { status: 'success', payload: answerer(payload.input) };
       } else if (method === 'event/emit') {
-        seen.events.push({ topic: payload.topic, event: payload.event, pluginId: envelope.plugin_id });
+        const event = { topic: payload.topic, event: payload.event, pluginId: envelope.plugin_id };
+        seen.events.push(event);
+        onEvent?.(event);
       }
       queueMicrotask(() => host.accept(terminal(identityOf(envelope), answer.status, answer.payload)));
     },
@@ -131,13 +133,14 @@ export async function startHost({ env = {}, tools = {}, seats = {} } = {}) {
 }
 
 /// Loads the composition control plugin, which creates the realm.
-export async function loadCompose(kit, { entries = [], web = null, modules = {} } = {}) {
+export async function loadCompose(kit, { entries = [], web = null, modules = {}, profile = null } = {}) {
   return kit.control('plugin/load', {
     pluginId: 'rebon:compose',
     root: COMPOSE_ROOT.replace(/\\/g, '/'),
     entry: 'src/plugin.mjs',
     services: ['compose'],
-    config: { payloadDir: PAYLOAD, entries, web, modules },
+    publishedTopics: ['compose:remote-event'],
+    config: { payloadDir: PAYLOAD, entries, web, modules, profile },
   });
 }
 

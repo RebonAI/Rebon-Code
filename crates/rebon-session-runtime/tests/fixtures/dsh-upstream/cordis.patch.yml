@@ -1,0 +1,35 @@
+# The rows of the sample bundle, in dsh's own patch format. Written
+# consumers-first on purpose: rebon mounts each row after the rows providing
+# what it injects, whatever order they are written in.
+- insert:
+    - id: tool-fs
+      name: '@deepseek-ai/dsh-tool-fs'
+      config:
+        readImage: false
+    - id: fs-local
+      name: '@deepseek-ai/dsh-fs-local'
+    - id: settings
+      name: '@deepseek-ai/dsh-settings'
+    - id: storage-json
+      name: '@deepseek-ai/dsh-storage-json'
+    - id: storage
+      name: '@deepseek-ai/dsh-storage'
+    - id: skill-filesystem
+      name: '@deepseek-ai/dsh-skill-filesystem'
+    - id: skill
+      name: '@deepseek-ai/dsh-skill'
+    # Its catalog is injected on dsh's own agent loop (`agent/pre-step`),
+    # which rebon's engine does not run: it needs `agents`, and is named
+    # as not running here.
+    - id: tool-skill
+      name: '@deepseek-ai/dsh-tool-skill'
+    - id: tool-pwsh
+      name: '@deepseek-ai/dsh-tool-pwsh'
+    - id: pwsh-local
+      name: '@deepseek-ai/dsh-pwsh-local'
+    - id: shell-env
+      name: '@deepseek-ai/dsh-shell-env'
+    - id: web-fetch-http
+      name: '@deepseek-ai/dsh-web-fetch-http'
+    - id: web-search-deepseek
+      name: '@deepseek-ai/dsh-web-search-deepseek'

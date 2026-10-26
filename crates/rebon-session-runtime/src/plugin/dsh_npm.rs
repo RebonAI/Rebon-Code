@@ -38,7 +38,19 @@ use serde_json::{json, Value};
 
 /// The seats every DSH package may call: credentials are gated by their own
 /// grant, the logger and the plugin's own settings namespace are harmless.
-const SEATS: &[&str] = &["credentials", "logger", "settings"];
+pub(super) const SEATS: &[&str] = &["credentials", "logger", "settings"];
+
+/// The seats of a package that starts programs: [`SEATS`] and `process`,
+/// which the realm's `subprocess` seam reaches. Asked for when the package
+/// (or, for a bundle, any of its rows) injects `subprocess`, so the person
+/// sees at install that it starts programs.
+pub(super) fn seats_for(starts_programs: bool) -> Vec<&'static str> {
+    let mut seats = SEATS.to_vec();
+    if starts_programs {
+        seats.push("process");
+    }
+    seats
+}
 
 /// Hosts a package names that are not hosts it connects to.
 const NOT_ENDPOINTS: &[&str] = &[
@@ -72,12 +84,15 @@ pub fn is_cordis_npm_package(dir: &Path) -> bool {
         })
 }
 
-/// The bare specifiers the composition answers itself.
+/// The bare specifiers the composition answers itself for every importer —
+/// the modules rebon owns. A peer that is only one of its vendored payload
+/// packages is installed from npm: dsh's current packages need their own
+/// versions of those.
 pub fn provided_modules(compose_root: &Path) -> anyhow::Result<BTreeSet<String>> {
     let path = compose_root.join("src").join("provided-modules.json");
     let raw = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let doc: Value = serde_json::from_slice(&raw)?;
-    Ok(["payload", "runtime"]
+    Ok(["owned", "runtime"]
         .iter()
         .filter_map(|section| doc.get(section).and_then(Value::as_object))
         .flat_map(|map| map.keys().cloned())
@@ -211,6 +226,14 @@ pub fn manifest_for(
         .flatten()
         .filter_map(Value::as_str)
         .collect();
+    // The realm services it cannot mount without, which rebon keeps it
+    // loaded after (`plugin_composition::realm_order`).
+    let required: Vec<&str> = probe
+        .get("inject")
+        .and_then(|i| i.get("required"))
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
     // The web seat answers a search or fetch through rebon's own tools when
     // no provider is configured, so a plugin using it may invoke those two.
     let invokable: Vec<&str> = if injects.contains(&"web") {
@@ -225,8 +248,10 @@ pub fn manifest_for(
         "services": names("services"),
         "llmProviders": names("llmProviders"),
         "eventTopics": names("eventTopics"),
-        "seats": SEATS,
+        "seats": seats_for(injects.contains(&"subprocess")),
         "invokableTools": invokable,
+        "inject": required,
+        "provides": names("provides"),
     });
     if probe
         .get("report")
@@ -280,6 +305,11 @@ pub struct Adapted {
     pub tools: Vec<String>,
     /// The skill roots a skill package declares (relative to the package).
     pub skills: Vec<String>,
+    /// A bundle's rows that run, by id — its kernel plugins. Empty for a
+    /// single package, whose one kernel plugin is [`Self::plugin_id`].
+    pub rows: Vec<String>,
+    /// A bundle's rows that do not run on rebon, and why.
+    pub skipped: Vec<super::dsh_bundle::SkippedRow>,
 }
 
 /// The folders holding the `SKILL.md` skills a package ships, as the roots
@@ -333,7 +363,7 @@ pub fn skills_manifest(package: &Value, roots: &[String]) -> anyhow::Result<Valu
 
 /// The JavaScript a package ships, for [`scan_requests`]: its own files, not
 /// its dependencies'.
-fn package_sources(root: &Path) -> Vec<String> {
+pub(super) fn package_sources(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -358,6 +388,40 @@ fn package_sources(root: &Path) -> Vec<String> {
         }
     }
     out
+}
+
+/// Runs `probe.mjs` with `args` on the runner, under the permission model:
+/// the runtime and the package readable, nothing else. One line of JSON
+/// comes back whatever happens; anything else is the probe itself failing.
+pub(super) fn run_probe(
+    id: &str,
+    runner: &Path,
+    compose_root: &Path,
+    package_root: &Path,
+    args: &[std::ffi::OsString],
+) -> anyhow::Result<Value> {
+    let runtime_root = compose_root
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent", compose_root.display()))?;
+    let mut probe = Command::new(runner);
+    probe
+        .arg("--permission")
+        .arg(format!("--allow-fs-read={}", runtime_root.display()))
+        .arg(format!("--allow-fs-read={}", package_root.display()))
+        .arg(compose_root.join("src").join("probe.mjs"))
+        .args(args);
+    let output = probe.output().context("running the probe")?;
+    let line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .to_owned();
+    serde_json::from_str(&line).map_err(|_| {
+        anyhow!(
+            "{id}: the probe said nothing readable: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    })
 }
 
 /// Makes the npm package in `dir` a rebon package, in place.
@@ -385,6 +449,9 @@ pub fn adapt_with(
             .with_context(|| format!("reading {}", package_path.display()))?,
     )
     .with_context(|| format!("{} is not JSON", package_path.display()))?;
+    if super::dsh_bundle::is_bundle(&package) {
+        return super::dsh_bundle::adapt_bundle_with(dir, &package, config, runner, compose_root);
+    }
     let id = plugin_id_of(&package)?;
     let skills = skill_roots(dir);
     if !skills.is_empty() {
@@ -397,6 +464,8 @@ pub fn adapt_with(
             request: ContainerRequest::default(),
             tools: Vec::new(),
             skills,
+            rows: Vec::new(),
+            skipped: Vec::new(),
         });
     }
     let provided = provided_modules(compose_root)?;
@@ -423,33 +492,14 @@ pub fn adapt_with(
     // checks that against the grants (see `container::real_path`).
     let real = rebon_plugin_host::container::real_path;
     let (compose_root, package_root) = (real(compose_root), real(dir));
-    let runtime_root = compose_root
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent", compose_root.display()))?;
-    let entry = entry_of(&package);
-    let mut probe = Command::new(runner);
-    probe
-        .arg("--permission")
-        .arg(format!("--allow-fs-read={}", runtime_root.display()))
-        .arg(format!("--allow-fs-read={}", package_root.display()))
-        .arg(compose_root.join("src").join("probe.mjs"))
-        .arg(&package_root)
-        .arg(&entry);
+    let mut args = vec![
+        package_root.clone().into_os_string(),
+        entry_of(&package).into(),
+    ];
     if let Some(config) = config {
-        probe.arg(config.to_string());
+        args.push(config.to_string().into());
     }
-    let output = probe.output().context("running the probe")?;
-    let line = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .last()
-        .unwrap_or_default()
-        .to_owned();
-    let answer: Value = serde_json::from_str(&line).map_err(|_| {
-        anyhow!(
-            "{id}: the probe said nothing readable: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-    })?;
+    let answer = run_probe(&id, runner, &compose_root, &package_root, &args)?;
     if answer.get("ok").and_then(Value::as_bool) != Some(true) {
         let missing: Vec<&str> = answer
             .get("missing")
@@ -491,6 +541,8 @@ pub fn adapt_with(
         request,
         tools,
         skills: Vec::new(),
+        rows: Vec::new(),
+        skipped: Vec::new(),
     })
 }
 

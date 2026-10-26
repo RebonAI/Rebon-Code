@@ -149,6 +149,17 @@ export default class RebonToolsRuntime extends Service {
   }
 
   /**
+   * dsh `ToolRuntime.get`: the definition registered under `name` in this
+   * composition, or undefined. The scope is accepted and not consulted:
+   * rebon offers a composition's tools to every session alike, so the
+   * global answer is the scoped one. A prompt section that mentions a tool
+   * only while it exists asks this.
+   */
+  get(name, _scope) {
+    return this.defs.get(name);
+  }
+
+  /**
    * Register one dsh-shaped tool definition. Mirrors dsh
    * `ToolRuntime.register` validation; returns the exact disposer.
    */
@@ -222,7 +233,17 @@ export default class RebonToolsRuntime extends Service {
       // On the plane that is a published event: the tool is telling rebon
       // something happened, and rebon decides who hears it.
       agent: {
+        // The session's scope is the agent's identity here: rebon's engine
+        // runs the turn, and the scope is what rebon calls its session.
+        id: callCtx.scopeId,
         session: {
+          id: callCtx.scopeId,
+          // What a dsh tool reads off the session's header: its id (the
+          // shell exports it as `DSH_SESSION_ID`) and where it started.
+          header: Object.freeze({ id: callCtx.scopeId, cwd: callCtx.workspaceRoot }),
+          // A session's model request settings are rebon's own; a tool that
+          // asks finds none and takes its default.
+          requestHeader: () => undefined,
           append(type, data) {
             void publish(SESSION_APPEND_TOPIC, { type, data, tool: name, callId })
               .catch(() => {});

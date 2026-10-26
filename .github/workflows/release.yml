@@ -159,6 +159,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Verve host tests failed with exit code $LASTEXITCODE" }
           cargo test -p rebon-plugin-supervisor --locked
           if ($LASTEXITCODE -ne 0) { throw "Plugin supervisor tests failed with exit code $LASTEXITCODE" }
+          cargo test -p rebon-plugin-host --lib --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Plugin host unit tests failed' }
           # The embedder half: a real host, the real composition runtime, and
           # rebon's own kernel seats on this side. Serial: these share one
           # process kernel and process-wide registration slots.
@@ -198,6 +200,41 @@ jobs:
           done
       - name: Test isolated Boa runner containment on macOS
         run: cargo test -p rebon-boa-runner --all-features --locked -- --test-threads=1
+
+  dsh-integration:
+    name: DSH integration (macOS)
+    runs-on: macos-14
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout RebonCode
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Cache the cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-registry-
+      - name: Build the DSH runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p rebon-verve-host --bin rebon-verve --locked
+          echo "REBON_VERVE=$GITHUB_WORKSPACE/target/debug/rebon-verve" >> "$GITHUB_ENV"
+      - name: Test plugin host library
+        run: cargo test -p rebon-plugin-host --lib --locked
+      - name: Test real upstream DSH npm packages
+        run: cargo test -p rebon-session-runtime --test dsh_upstream --locked -- --ignored --test-threads=1
+      - name: Test the upstream DSH base profile
+        run: cargo test -p rebon-session-runtime --lib the_dsh_base_profile_runs_the_rows_that_are_plugins --locked -- --ignored --test-threads=1
+      - name: Test contained plugin boundaries
+        run: cargo test -p rebon-harness --test plugin_plane_e2e a_contained_plugin_is_confined --locked -- --test-threads=1
 
   test:
     needs: verify

@@ -26,10 +26,22 @@ import { pathToFileURL } from 'node:url';
 import { payloadDir } from './payload.mjs';
 import provided from './provided-modules.json' with { type: 'json' };
 
-/// Payload-relative module map, keyed by bare specifier.
-///
-/// Mirrors `build_import_map` entry for entry, minus the `node:` shims.
+/// Payload-relative module map, keyed by bare specifier: what rebon owns and
+/// what its vendored payload is built from, together.
 export function payloadModules(dir) {
+  return new Map([...ownedModules(dir), ...vendoredModules(dir)]);
+}
+
+/// The specifiers rebon answers for every importer.
+export function ownedModules(dir) {
+  const at = (relative) => pathToFileURL(path.join(dir, relative)).href;
+  return new Map(Object.entries(provided.owned).map(([name, relative]) => [name, at(relative)]));
+}
+
+/// The vendored packages rebon's own payload imports. A package installed
+/// from npm brings its own copy of these and gets it; only one that has none
+/// falls back to the vendored build.
+export function vendoredModules(dir) {
   const at = (relative) => pathToFileURL(path.join(dir, relative)).href;
   return new Map(Object.entries(provided.payload).map(([name, relative]) => [name, at(relative)]));
 }
@@ -51,20 +63,25 @@ let installed;
 /// Returns the resolved map so callers can report what a specifier became
 /// without repeating the lookup rules.
 export function installModuleResolution({ dir = payloadDir(), extraModules = {} } = {}) {
-  const map = new Map([...payloadModules(dir), ...localModules()]);
+  const map = new Map([...ownedModules(dir), ...localModules()]);
   for (const [name, file] of Object.entries(extraModules)) {
     map.set(name, pathToFileURL(path.resolve(file)).href);
   }
+  const vendored = vendoredModules(dir);
   if (installed) {
     // Hooks are process-wide and cannot be unregistered per call; re-running
     // with a different map would leave two resolvers disagreeing about the
     // same specifier, which is a debugging trap rather than a feature.
     for (const [name, url] of map) installed.map.set(name, url);
-    return installed.map;
+    return new Map([...installed.vendored, ...installed.map]);
   }
 
   const payloadPrefix = pathToFileURL(dir.endsWith(path.sep) ? dir : dir + path.sep).href;
-  const state = { map };
+  const runtimePrefix = new URL('./', import.meta.url).href;
+  // Rebon's own code — the payload and this runtime — always gets the
+  // vendored build it was written against.
+  const ours = (parent) => parent === undefined || parent.startsWith(payloadPrefix) || parent.startsWith(runtimePrefix);
+  const state = { map, vendored };
   registerHooks({
     resolve(specifier, context, next) {
       // The native Cordis, where the host defines it (cordis-rs on Verve's
@@ -75,7 +92,16 @@ export function installModuleResolution({ dir = payloadDir(), extraModules = {} 
       }
       const mapped = state.map.get(specifier);
       if (mapped !== undefined) return { url: mapped, format: 'module', shortCircuit: true };
-      return next(specifier, context);
+      const fallback = state.vendored.get(specifier);
+      if (fallback === undefined) return next(specifier, context);
+      if (ours(context?.parentURL)) return { url: fallback, format: 'module', shortCircuit: true };
+      // A package from npm: its own copy if it installed one — dsh's current
+      // packages need their own versions of these — else the vendored one.
+      try {
+        return next(specifier, context);
+      } catch {
+        return { url: fallback, format: 'module', shortCircuit: true };
+      }
     },
     // The payload's ESM is `.js` under no `package.json`, so Node's own rules
     // read it as CommonJS and every `import` in it is a syntax error. The
@@ -87,5 +113,5 @@ export function installModuleResolution({ dir = payloadDir(), extraModules = {} 
     },
   });
   installed = state;
-  return state.map;
+  return new Map([...vendored, ...map]);
 }

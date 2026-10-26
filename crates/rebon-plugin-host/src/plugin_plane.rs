@@ -69,6 +69,9 @@ use serde_json::Value;
 use rebon_kernel_seats::kernel_compose_tools::{ComposeToolDispatch, ComposeToolRegistry};
 use rebon_provider::kernel_llm_dispatch::{register_llm_host, unregister_llm_host, LlmRoute};
 
+mod remote;
+pub use remote::RemoteEventStream;
+
 /// The reserved plugin id of the composition control plugin.
 pub const COMPOSE_PLUGIN_ID: &str = "rebon:compose";
 
@@ -277,7 +280,40 @@ impl PluginPlaneConfig {
             "entries": self.structure,
             "web": self.web,
             "modules": self.modules,
+            "profile": profile(&rebon_config::config_home_dir().join("dsh")),
         })
+    }
+}
+
+/// The topic the composition publishes the Host events a DeepSeek Harness
+/// client hears on (`settings/document-updated`, …); see
+/// `compose-runtime/src/plugin.mjs`.
+pub const REMOTE_EVENT_TOPIC: &str = "compose:remote-event";
+
+/// What a realm's `profileContext` says: its home, rebon's counterpart of
+/// `DSH_HOME`. The shared host's is `<config home>/dsh`; a container's is its
+/// own data directory, the one place it may write.
+fn profile(home: &Path) -> Value {
+    serde_json::json!({ "home": home.to_string_lossy(), "name": "rebon" })
+}
+
+/// The composition control plugin's load request: the package that creates
+/// the realm, configured with its shape. One for the shared host and one per
+/// container, so both are built here.
+fn control_request(compose_root: &Path, config: Value) -> PluginLoadRequest {
+    PluginLoadRequest {
+        plugin_id: COMPOSE_PLUGIN_ID.to_owned(),
+        root: compose_root.to_string_lossy().into_owned(),
+        entry: "src/plugin.mjs".to_owned(),
+        services: vec!["compose".to_owned()],
+        config: Payload::from(config),
+        event_topics: Vec::new(),
+        published_topics: vec![REMOTE_EVENT_TOPIC.to_owned()],
+        llm_providers: Vec::new(),
+        tools: Vec::new(),
+        commands: Vec::new(),
+        invokable_tools: Vec::new(),
+        seats: Vec::new(),
     }
 }
 
@@ -608,6 +644,12 @@ impl HostEpochs {
     fn next(&self) -> u64 {
         self.base | (self.next.fetch_add(1, Ordering::Relaxed) << Self::STEP_BITS)
     }
+
+    /// Which host an epoch belongs to: the range its supervisor's own
+    /// restarts stay inside.
+    fn range_of(epoch: u64) -> u64 {
+        epoch >> Self::STEP_BITS
+    }
 }
 
 struct ContainerTemplate {
@@ -664,12 +706,23 @@ impl PluginPlane {
         invoker: Arc<dyn ToolInvoker>,
     ) -> Result<Arc<Self>, SupervisorError> {
         let mods = Arc::new(std::sync::OnceLock::new());
+        let epochs = Arc::new(HostEpochs::new());
+        let main_epoch = epochs.next();
+        let control_config = config.control_config();
         let seats = Arc::new(KernelSeats {
             ctx: ctx.clone(),
             mods: Arc::clone(&mods),
+            processes: Arc::new(crate::process_seat::ProcessSeat::default()),
+            shared_host: HostEpochs::range_of(main_epoch),
         });
-        let events = Arc::new(KernelEvents { ctx: ctx.clone() });
-        let epochs = Arc::new(HostEpochs::new());
+        let events = Arc::new(KernelEvents::new(
+            ctx.clone(),
+            main_epoch,
+            control_config["profile"]["home"]
+                .as_str()
+                .expect("control_config 已构造 profile.home")
+                .to_owned(),
+        ));
         let template = ContainerTemplate {
             epochs: Arc::clone(&epochs),
             runner: config.runner.clone(),
@@ -686,7 +739,7 @@ impl PluginPlane {
             exposed_seats: config.exposed_seats.clone(),
         };
         let host = HostConfig::new(config.runner.clone(), config.host_script.clone())
-            .with_host_epoch(epochs.next())
+            .with_host_epoch(main_epoch)
             .with_loader(&config.loader)
             .with_working_directory(config.working_directory.clone())
             .with_tool_invoker(invoker, config.exposed_tools.iter().cloned())
@@ -697,20 +750,7 @@ impl PluginPlane {
         // The control plugin creates the realm every entry mounts into, so it
         // is loaded before any of them — and a failure here is the whole
         // composition failing rather than one entry.
-        let control = PluginLoadRequest {
-            plugin_id: COMPOSE_PLUGIN_ID.to_owned(),
-            root: config.compose_root.to_string_lossy().into_owned(),
-            entry: "src/plugin.mjs".to_owned(),
-            services: vec!["compose".to_owned()],
-            config: Payload::from(config.control_config()),
-            event_topics: Vec::new(),
-            published_topics: Vec::new(),
-            llm_providers: Vec::new(),
-            tools: Vec::new(),
-            commands: Vec::new(),
-            invokable_tools: Vec::new(),
-            seats: Vec::new(),
-        };
+        let control = control_request(&config.compose_root, control_config);
         supervisor.load_plugin(&control).await?;
         let workspace_root = config.working_directory.to_string_lossy().into_owned();
         let scope = config
@@ -919,25 +959,16 @@ impl PluginPlane {
                 .await
                 .map_err(|error| refuse(format!("starting its host: {error}")))?,
         );
-        let control = PluginLoadRequest {
-            plugin_id: COMPOSE_PLUGIN_ID.to_owned(),
-            root: compose_root.to_string_lossy().into_owned(),
-            entry: "src/plugin.mjs".to_owned(),
-            services: vec!["compose".to_owned()],
-            config: Payload::from(serde_json::json!({
+        let control = control_request(
+            &compose_root,
+            serde_json::json!({
                 "payloadDir": payload_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
                 "entries": [],
                 "web": template.web,
                 "modules": template.modules,
-            })),
-            event_topics: Vec::new(),
-            published_topics: Vec::new(),
-            llm_providers: Vec::new(),
-            tools: Vec::new(),
-            commands: Vec::new(),
-            invokable_tools: Vec::new(),
-            seats: Vec::new(),
-        };
+                "profile": profile(&real(&data)),
+            }),
+        );
         let realm = async {
             supervisor.load_plugin(&control).await?;
             supervisor
@@ -1934,6 +1965,8 @@ impl PluginPlane {
     /// Winds the host down and withdraws every registration the composition
     /// made, whichever way it ends.
     pub async fn shutdown(&self) {
+        self.template.events.remote_events.close();
+        self.template.seats.processes.shutdown().await;
         let _ = self.hosts.main().shutdown().await;
         let containers: Vec<ContainerHost> = std::mem::take(&mut *self.containers.lock().await)
             .into_values()
@@ -2644,6 +2677,7 @@ pub fn default_exposed_seats() -> Vec<String> {
         "logger".to_owned(),
         "settings".to_owned(),
         rebon_types::MODS_SEAT.to_owned(),
+        crate::process_seat::PROCESS_SEAT.to_owned(),
     ]
 }
 
@@ -2659,6 +2693,10 @@ struct KernelSeats {
     /// run child processes and HTTP requests, which a synchronous JSON
     /// service on the reader's thread could not.
     mods: Arc<std::sync::OnceLock<Arc<crate::mods::ModsRegistry>>>,
+    /// The programs compositions start, answered here for the same reason.
+    processes: Arc<crate::process_seat::ProcessSeat>,
+    /// The shared host's epoch range: the `process` seat answers it alone.
+    shared_host: u64,
 }
 
 impl SeatDispatcher for KernelSeats {
@@ -2669,6 +2707,28 @@ impl SeatDispatcher for KernelSeats {
         Box<dyn std::future::Future<Output = Result<Payload, ToolRefusal>> + Send + '_>,
     > {
         let mut params = invocation.params.to_value().unwrap_or(Value::Null);
+        if invocation.seat == crate::process_seat::PROCESS_SEAT {
+            // A contained plugin is confined to its own files and no
+            // processes; a program started for it here would be outside the
+            // container. See `process_seat`.
+            if HostEpochs::range_of(invocation.identity.host_epoch) != self.shared_host {
+                return Box::pin(async move {
+                    Err(ToolRefusal::new(
+                        "[CONTAINED]",
+                        "a contained plugin cannot start programs; trust it (kernelPlugins.trusted) to let it",
+                    ))
+                });
+            }
+            let processes = Arc::clone(&self.processes);
+            let owner = invocation.identity.plugin_id.clone();
+            let method = invocation.method.clone();
+            return Box::pin(async move {
+                processes
+                    .call(&owner, &method, &params)
+                    .await
+                    .map(Payload::from)
+            });
+        }
         if invocation.seat == rebon_types::MODS_SEAT {
             return match self.mods.get() {
                 Some(mods) => {
@@ -2705,10 +2765,32 @@ impl SeatDispatcher for KernelSeats {
 
 /// Published events, put on the kernel's event plane.
 ///
-/// The topic is namespaced by the publishing plugin so a composition entry
-/// cannot announce something a kernel component would mistake for its own.
+/// Attribution is stamped outside the plugin's payload, after the supervisor
+/// authenticated it. The stable plane epoch also covers its contained hosts
+/// and supervisor restarts; a scope name alone does not identify a plane.
 struct KernelEvents {
     ctx: Context,
+    plane_epoch: u64,
+    remote_events: remote::RemoteEvents,
+}
+
+impl KernelEvents {
+    fn new(ctx: Context, main_epoch: u64, home: String) -> Self {
+        // 只需在同一进程的 kernel 中唯一；不能把 HostEpochs 的随机基址当隔离保证。
+        // 保持 JSON 安全整数，耗尽时拒绝复用。容器与 supervisor 重启复用本 publisher。
+        static NEXT_PLANE_EPOCH: AtomicU64 = AtomicU64::new(1);
+        let plane_epoch = NEXT_PLANE_EPOCH
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |epoch| {
+                (epoch < (1 << 52)).then_some(epoch + 1)
+            })
+            .expect("plugin plane epochs exhausted");
+        let remote_events = remote::RemoteEvents::new(&ctx, plane_epoch, main_epoch, home);
+        Self {
+            ctx,
+            plane_epoch,
+            remote_events,
+        }
+    }
 }
 
 impl EventPublisher for KernelEvents {
@@ -2718,10 +2800,14 @@ impl EventPublisher for KernelEvents {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Payload, ToolRefusal>> + Send + '_>,
     > {
+        let body = event.event.to_value().unwrap_or(Value::Null);
+        // kernel 是唯一事件分发机制；client transport 也只能经它的 scoped listener 收到。
         let payload = serde_json::json!({
+            "planeEpoch": self.plane_epoch,
+            "hostEpoch": event.identity.host_epoch,
             "pluginId": event.identity.plugin_id,
             "scopeId": event.identity.scope_id,
-            "event": event.event.to_value().unwrap_or(Value::Null),
+            "event": body,
         });
         self.ctx.emit_json(&event.topic, &payload);
         Box::pin(async move { Ok(Payload::from(serde_json::json!({ "published": true }))) })
