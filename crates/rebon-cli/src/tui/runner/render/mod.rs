@@ -216,6 +216,8 @@ mod tests {
             started_at: std::time::Instant::now(),
             messages_before: 142,
             respond_to_command_id: None,
+            automatic: false,
+            invalidated: false,
         });
         app
     }

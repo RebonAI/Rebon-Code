@@ -127,6 +127,8 @@ mod tests {
             started_at: Instant::now() - elapsed,
             messages_before: 128,
             respond_to_command_id: None,
+            automatic: false,
+            invalidated: false,
         }
     }
 

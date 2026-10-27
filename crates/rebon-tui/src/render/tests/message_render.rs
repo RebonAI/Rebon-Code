@@ -36,6 +36,30 @@ fn hidden_info_system_message_consumes_zero_transcript_rows() {
 }
 
 #[test]
+fn compact_report_is_visible_in_compact_verbosity() {
+    let mut message = system_info(
+        "s-compact",
+        "Compacted successfully\n⎿ Recently accessed: notes.md",
+    );
+    let Message::System(system) = &mut message else {
+        unreachable!();
+    };
+    system.subtype = "compact".into();
+    let mut buf = new_buf(60, 8);
+    let used = render_message(
+        &message,
+        Rect::new(0, 0, 60, 8),
+        &mut buf,
+        &RenderTheme::plain(),
+        ToolOutputVerbosity::Compact,
+    );
+    let text = all_text(&buf);
+    assert!(used > 0, "{text}");
+    assert!(text.contains("Compacted successfully"), "{text}");
+    assert!(text.contains("Recently accessed: notes.md"), "{text}");
+}
+
+#[test]
 fn user_prompt_renders_with_prompt_gutter() {
     let mut buf = new_buf(40, 4);
     let used = render_message(

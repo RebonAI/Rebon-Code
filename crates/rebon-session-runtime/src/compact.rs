@@ -122,7 +122,7 @@ pub fn render_compact_report(report: &ManualCompactReport) -> String {
         ));
     }
     for file in &report.files {
-        lines.push(format!("{REPORT_BULLET} {file}"));
+        lines.push(format!("{REPORT_BULLET} Recently accessed: {file}"));
     }
     if !report.used_model {
         lines.push(format!(
@@ -200,8 +200,14 @@ mod tests {
             lines[3],
             "⎿ Last response and prompt · 4 messages · 10,310 tokens"
         );
-        assert_eq!(lines[4], "⎿ crates/rebon-core/src/query/compact.rs");
-        assert_eq!(lines[5], "⎿ crates/rebon-cli/src/tui/runner/commands.rs");
+        assert_eq!(
+            lines[4],
+            "⎿ Recently accessed: crates/rebon-core/src/query/compact.rs"
+        );
+        assert_eq!(
+            lines[5],
+            "⎿ Recently accessed: crates/rebon-cli/src/tui/runner/commands.rs"
+        );
         assert!(text.contains("Freed 85,801 tokens · 142 → 7 messages"));
     }
 

@@ -4,8 +4,8 @@ pub(super) use rebon_types::wall_clock_ms;
 
 use crate::session::commands::fmt_tokens;
 
-const NEW_SESSION_HINT_TOKENS_THRESHOLD: u32 = 8_000;
-const NEW_SESSION_HINT_IDLE_DELAY: Duration = Duration::from_secs(60 * 60);
+pub(super) const NEW_SESSION_HINT_TOKENS_THRESHOLD: u32 = 8_000;
+pub(super) const NEW_SESSION_HINT_IDLE_DELAY: Duration = Duration::from_secs(60 * 60);
 const STALE_SESSION_WARNING_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,7 +156,7 @@ pub(super) fn footer_new_session_hint(
 
 fn format_new_session_hint(tokens: u32) -> Option<String> {
     (tokens >= NEW_SESSION_HINT_TOKENS_THRESHOLD)
-        .then(|| format!("/new to save ~{} tokens", fmt_tokens(tokens)))
+        .then(|| format!("Use /clear to save ~{} tokens", fmt_tokens(tokens)))
 }
 
 pub(crate) fn stale_resume_warning(
@@ -573,7 +573,7 @@ mod tests {
                 false,
                 NEW_SESSION_HINT_IDLE_DELAY,
             ),
-            Some("/new to save ~8.0k tokens".into())
+            Some("Use /clear to save ~8.0k tokens".into())
         );
     }
 
@@ -621,7 +621,7 @@ mod tests {
                 false,
                 NEW_SESSION_HINT_IDLE_DELAY,
             ),
-            Some("/new to save ~8.0k tokens".into())
+            Some("Use /clear to save ~8.0k tokens".into())
         );
         assert_eq!(
             footer_new_session_hint(

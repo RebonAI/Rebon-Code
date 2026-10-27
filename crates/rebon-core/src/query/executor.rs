@@ -150,6 +150,46 @@ impl ResumeReplayHandle {
         entries: &[TranscriptEntry],
         manual_instructions: Option<&str>,
     ) -> Result<(PreparedResumeSummary, ManualCompactReport), String> {
+        self.compact_messages(
+            entries,
+            &transcript_to_api_messages(entries),
+            manual_instructions,
+        )
+        .await
+    }
+
+    pub async fn compact_session_now(
+        &self,
+        projects_root: &std::path::Path,
+        cwd: &str,
+        session_id: &str,
+        entries: &[TranscriptEntry],
+        manual_instructions: Option<&str>,
+    ) -> Result<(PreparedResumeSummary, ManualCompactReport), String> {
+        let messages = match self.replay_windows.project_resume_summary_for_model(
+            projects_root,
+            cwd,
+            session_id,
+            entries,
+            None,
+        ) {
+            Ok(Some(messages)) => messages,
+            Ok(None) => transcript_to_api_messages(entries),
+            Err(_) => {
+                self.replay_windows.clear_resume_summary(session_id);
+                transcript_to_api_messages(entries)
+            }
+        };
+        self.compact_messages(entries, &messages, manual_instructions)
+            .await
+    }
+
+    async fn compact_messages(
+        &self,
+        entries: &[TranscriptEntry],
+        messages: &[ApiMessage],
+        manual_instructions: Option<&str>,
+    ) -> Result<(PreparedResumeSummary, ManualCompactReport), String> {
         if entries.is_empty() {
             return Err("This session has nothing to compact yet.".to_string());
         }
@@ -168,7 +208,7 @@ impl ResumeReplayHandle {
         );
         summarise_into_baseline(
             entries,
-            &transcript_to_api_messages(entries),
+            messages,
             [primary, fallback],
             instructions.as_deref(),
             &self.compact_summary_options,
@@ -5036,6 +5076,27 @@ mod compact_now_tests {
             ApiMessage::user_text(format!("{COMPACT_SUMMARY_MARKER}\nwhat happened\n")),
             ApiMessage::user_text("ask 7"),
         ]
+    }
+
+    #[tokio::test]
+    async fn compact_session_now_uses_existing_compacted_context() {
+        let handle = handle(Some(Arc::new(StubCompactProvider {
+            messages: compacted(),
+        })));
+        let entries = conversation();
+        let baseline = ReplayWindowStore::prepare_resume_summary(&entries[..10], compacted())
+            .expect("baseline");
+        handle.install_summary("session".into(), baseline);
+        let (prepared, report) = handle
+            .compact_session_now(std::path::Path::new(""), "", "session", &entries, None)
+            .await
+            .expect("compaction");
+        assert_eq!(report.messages_before, 9);
+        assert!(prepared.matches_transcript(&entries));
+        assert!(!prepared.matches_transcript(&entries[..15]));
+        let mut changed = entries.clone();
+        changed[0].raw["message"]["content"][0]["text"] = Value::String("changed".into());
+        assert!(!prepared.matches_transcript(&changed));
     }
 
     #[tokio::test]
