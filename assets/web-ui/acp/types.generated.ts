@@ -1173,6 +1173,7 @@ export type SessionUpdate =
     toolCallId: string;
   }
   | {
+    manual?: boolean;
     messages_before: number;
     sessionUpdate: "compacting_started";
   }

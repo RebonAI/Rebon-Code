@@ -19,21 +19,113 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 
 const FILE_READ_TOOL_NAME: &str = "Read";
-const DESCRIPTION: &str = "Reads a file from the local filesystem. You can access any file directly by using this tool.\n\
-Assume this tool is able to read all files on the machine. If the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.\n\
-\n\
-Usage:\n\
-- The file_path parameter must be an absolute path, not a relative path\n\
-- By default, it reads up to 200 lines starting from the beginning of the file\n\
-- When you already know which part of the file you need, only read that part. This can be important for larger files.\n\
-- Results are returned using cat -n format, with line numbers starting at 1\n\
-- `limit` controls line count, not output size. Total output is capped at 16 KiB and individual lines are clipped at ~4 KiB; minified, obfuscated, or generated files may be truncated even when `limit` is small. When the response indicates truncation, retry with a smaller `limit` or a narrower `offset` range, or use Grep/Bash to extract specific symbols from files with very long lines.\n\
-- This tool allows Rebon to read images (eg PNG, JPG, etc). When reading an image file the contents are presented visually as Rebon is a multimodal LLM.\n\
-- This tool can read PDF files (.pdf). For large PDFs (more than 10 pages), you MUST provide the pages parameter to read specific page ranges (e.g., pages: \"1-5\"). Reading a large PDF without the pages parameter will fail. Maximum 20 pages per request.\n\
-- This tool can read Jupyter notebooks (.ipynb files) and returns all cells with their outputs, combining code, text, and visualizations.\n\
-- This tool can only read files, not directories. To read a directory, use an ls command via the Bash tool.\n\
-- You will regularly be asked to read screenshots. If the user provides a path to a screenshot, ALWAYS use this tool to view the file at the path. This tool will work with all temporary file paths.\n\
-- If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents.";
+const MAX_READ_TARGETS: usize = 16;
+pub const READ_BATCH_TEXT_BUDGET: usize = 100_000;
+pub const READ_BATCH_NOTICE_BUDGET: usize = 8192;
+const READ_BATCH_BINARY_BUDGET: usize = 28 * 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReadBatchDelivery {
+    Full,
+    Partial,
+    Omitted,
+}
+
+pub fn read_batch_delivery(results: &[Value], include_binary: bool) -> Vec<ReadBatchDelivery> {
+    // Conservative size estimates keep this decision identical for the cache
+    // and model projection without requiring the raw file content in the cache
+    // to pass through the model-facing representation.
+    let mut text = 0usize;
+    let mut binary = 0usize;
+    let mut stopped = false;
+    let mut delivery = Vec::with_capacity(results.len());
+    for result in results {
+        if stopped {
+            delivery.push(ReadBatchDelivery::Omitted);
+            continue;
+        }
+        let path = result
+            .get("filePath")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                result
+                    .get("file")
+                    .and_then(|f| f.get("filePath"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("<unknown>");
+        let file = result.get("file").and_then(Value::as_object);
+        let kind = result.get("type").and_then(Value::as_str);
+        let mut item_text = "File: ".len().saturating_add(path.len());
+        let mut item_binary = 0usize;
+        match (kind, file) {
+            (Some("image"), Some(file)) if file.get("base64").and_then(Value::as_str).is_some() => {
+                item_binary = file["base64"].as_str().unwrap().len();
+            }
+            (Some("pdf"), Some(file)) if file.get("base64").and_then(Value::as_str).is_some() => {
+                item_text = item_text
+                    .saturating_add(
+                        file.get("filePath")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<unknown>")
+                            .len(),
+                    )
+                    .saturating_add(128);
+                if include_binary {
+                    item_binary = file["base64"].as_str().unwrap().len();
+                }
+            }
+            (Some("parts"), Some(file)) => {
+                item_text = item_text
+                    .saturating_add(
+                        file.get("filePath")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<unknown>")
+                            .len(),
+                    )
+                    .saturating_add(128);
+                if include_binary {
+                    if let Some(pages) = file.get("pages").and_then(Value::as_array) {
+                        for page in pages {
+                            item_binary = item_binary.saturating_add(
+                                page.get("base64")
+                                    .and_then(Value::as_str)
+                                    .map_or(0, str::len),
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {
+                let size = result.to_string().len();
+                item_text = item_text.saturating_add(size.min(READ_BATCH_TEXT_BUDGET));
+                if size > READ_BATCH_TEXT_BUDGET {
+                    item_text = item_text.saturating_add(128);
+                }
+            }
+        }
+        if text.saturating_add(item_text) > READ_BATCH_TEXT_BUDGET - READ_BATCH_NOTICE_BUDGET
+            || binary.saturating_add(item_binary) > READ_BATCH_BINARY_BUDGET
+        {
+            let partial = delivery.is_empty() && item_binary == 0;
+            delivery.push(if partial {
+                ReadBatchDelivery::Partial
+            } else {
+                ReadBatchDelivery::Omitted
+            });
+            stopped = true;
+        } else {
+            text += item_text;
+            binary += item_binary;
+            delivery.push(ReadBatchDelivery::Full);
+        }
+    }
+    delivery
+}
+const DESCRIPTION: &str = "Reads files from the local filesystem. Put all files and ranges needed for this step into one call. Provide a non-empty `targets` array of at most 16 items; each target requires an absolute `path` and may specify inclusive 1-indexed `start` and `end`, a `symbol`, or PDF `pages`. If a symbol and range are both given, both are read.\n\
+Text files of at most 600 lines are selected in full; larger files use windows of at least 300 lines, expanded to symbol boundaries where available for Rust, Python, JavaScript and TypeScript. Adjacent or overlapping windows in one call are merged. Each rendered text result has a 16 KiB output budget and lines over 4 KiB are clipped, so selection may be truncated. Text files over 16 MiB require search instead.\n\
+Example: targets=[{path:\"/work/view.rs\"},{path:\"/work/draw.rs\",symbol:\"draw_node\"},{path:\"/work/style.rs\",start:1,end:200}].\n\
+Images are returned as visual payloads. PDFs over 10 pages require `pages`; at most 20 pages per target. Files only, not directories.";
 /// Default lines to read when the model does not provide an explicit
 /// `limit`. Kept low (200) so that a single Read does not dump tens
 /// of thousands of tokens into the context window. The model should
@@ -46,6 +138,7 @@ const MAX_LINES_TO_READ: usize = 2000;
 /// `limit` is provided) are rejected with a guiding error message.
 const MAX_FILE_SIZE_BYTES: u64 = 256 * 1024; // 256 KB
 const MAX_IMAGE_FILE_SIZE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_BATCH_TEXT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_IMAGE_DECODE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_GIF_DECODED_BYTES: u64 = 256 * 1024 * 1024;
@@ -97,6 +190,7 @@ struct ReadInput {
     offset: usize,
     limit: Option<usize>,
     pages: Option<String>,
+    symbol: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,26 +225,22 @@ impl Tool for ReadTool {
         json!({
             "type": "object",
             "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "The absolute path to the file to read"
-                },
-                "offset": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "description": "The line number to start reading from for text files. Provide with `limit` to read a specific line range, or alone when the file is too large to read at once. Omit for image files. 0 is treated as 1."
-                },
-                "limit": {
-                    "type": "integer",
-                    "exclusiveMinimum": 0,
-                    "description": "ONLY include with offset to read a specific slice. OMIT to read the whole file (harness truncates oversized files automatically)."
-                },
-                "pages": {
-                    "type": "string",
-                    "description": "Page range for PDF files (e.g., \"1-5\", \"3\", \"10-20\"). Only applicable to PDF files. Maximum 20 pages per request."
+                "targets": {
+                    "type": "array", "minItems": 1, "maxItems": MAX_READ_TARGETS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "start": {"type": "integer", "minimum": 1},
+                            "end": {"type": "integer", "minimum": 1},
+                            "symbol": {"type": "string", "minLength": 1},
+                            "pages": {"type": "string"}
+                        },
+                        "required": ["path"], "additionalProperties": false
+                    }
                 }
             },
-            "required": ["file_path"],
+            "required": ["targets"],
             "additionalProperties": false
         })
     }
@@ -168,25 +258,237 @@ impl Tool for ReadTool {
         input: &Value,
         context: &ToolContext,
     ) -> ToolResult<ValidationOutcome> {
-        validation_outcome_from(prepare_input(self.id(), input, context))
+        validation_outcome_from(prepare_requests(self.id(), input, context).map(|_| ()))
     }
 
     async fn call(&self, input: Value, context: &ToolContext) -> ToolResult<Value> {
-        let parsed = prepare_input(self.id(), &input, context)?;
+        let mut requests = prepare_requests(self.id(), &input, context)?;
+        let mut results = Vec::new();
+        let mut observations = Vec::new();
+        // Do not publish a snapshot until its result is guaranteed to fit
+        // the same budget used by the model-facing projection.
+        let staged_cache = rebon_tools_core::file_state::FileStateCache::new();
+        let staged_context = context.clone().with_file_state_cache(staged_cache.clone());
+        while !requests.is_empty() {
+            let first = requests.remove(0);
+            let path = first.file_path.clone();
+            if is_pdf_path(&path) || image_media_type_for_path(&path).is_some() {
+                let result = if first.symbol.is_some() {
+                    Err(ToolError::InvalidInput {
+                        tool: self.id(),
+                        reason: "Cannot resolve a symbol in a non-text file".into(),
+                        error_code: Some(INVALID_INPUT_CODE),
+                    })
+                } else {
+                    self.read_one(first, context).await
+                };
+                results.push(result.unwrap_or_else(|e| json!({"type":"error", "filePath":normalize_path(&path), "error":e.to_string()})));
+                continue;
+            }
+            let mut group = vec![first];
+            let mut i = 0;
+            while i < requests.len() {
+                if requests[i].file_path == path {
+                    group.push(requests.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            let _guard = crate::lock_file_for_read(&path).await;
+            let content = fs::File::open(&path).and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take(MAX_BATCH_TEXT_BYTES + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() as u64 > MAX_BATCH_TEXT_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Text file exceeds the 16 MiB Read limit; use search to inspect it",
+                    ));
+                }
+                String::from_utf8(bytes)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            });
+            let content = match content {
+                Ok(content) => content,
+                Err(e) => {
+                    for _ in group {
+                        results.push(json!({"type":"error", "filePath":normalize_path(&path), "error":e.to_string()}));
+                    }
+                    continue;
+                }
+            };
+            let symbols = crate::read_outline::outline(&path, &content);
+            let total = content.lines().count();
+            let mut resolved = Vec::new();
+            for mut request in group {
+                if let Some(name) = request.symbol.take() {
+                    let matches: Vec<_> = symbols
+                        .as_ref()
+                        .map(|s| s.iter().filter(|s| s.name == name).collect())
+                        .unwrap_or_default();
+                    let error = if symbols.is_none() {
+                        Some(format!("Cannot parse file to resolve symbol `{name}`"))
+                    } else if matches.is_empty() {
+                        Some(format!("Symbol `{name}` not found"))
+                    } else if matches.len() > 1 {
+                        Some(format!("Symbol `{name}` is ambiguous"))
+                    } else {
+                        None
+                    };
+                    if let Some(error) = error {
+                        results.push(json!({"type":"error", "filePath":normalize_path(&path), "error":error}));
+                        continue;
+                    }
+                    request.offset = matches[0].start;
+                    request.limit = Some(matches[0].end - matches[0].start + 1);
+                }
+                let requested_start = request.offset;
+                let requested_end = requested_start
+                    .saturating_add(request.limit.unwrap_or(1))
+                    .saturating_sub(1)
+                    .min(total);
+                if total <= 600 {
+                    request.offset = 1;
+                    request.limit = Some(total.max(1));
+                } else {
+                    let requested_length = request.limit.unwrap_or(300);
+                    let length = requested_length.max(300);
+                    let mut start = request
+                        .offset
+                        .saturating_sub((length - requested_length) / 2)
+                        .max(1);
+                    let mut end = start.saturating_add(length).saturating_sub(1).min(total);
+                    if request.offset <= total
+                        && end.saturating_sub(start).saturating_add(1) < length
+                    {
+                        start = end.saturating_sub(length - 1).max(1);
+                    }
+                    if let Some(symbols) = &symbols {
+                        for boundary in [true, false] {
+                            let point = if boundary { start } else { end };
+                            if let Some(s) = symbols
+                                .iter()
+                                .filter(|s| {
+                                    if boundary {
+                                        s.start < point && point <= s.end
+                                    } else {
+                                        s.start <= point && point < s.end
+                                    }
+                                })
+                                .min_by_key(|s| s.end - s.start)
+                            {
+                                if boundary {
+                                    start = s.start;
+                                } else {
+                                    end = s.end;
+                                }
+                            }
+                        }
+                    }
+                    request.offset = start;
+                    request.limit = Some(end.saturating_sub(start).saturating_add(1));
+                }
+                if let Some(previous) = context
+                    .file_state_cache()
+                    .and_then(|cache| cache.get(&path))
+                {
+                    if previous.content == content && !previous.is_partial_view {
+                        if let (Some(offset), Some(limit)) = (previous.offset, previous.limit) {
+                            let old_start = offset as usize;
+                            let old_end =
+                                old_start.saturating_add(limit as usize).saturating_sub(1);
+                            let new_start = request.offset;
+                            let new_end = new_start
+                                .saturating_add(request.limit.unwrap_or(0))
+                                .saturating_sub(1);
+                            if old_start <= new_end.saturating_add(1)
+                                && new_start <= old_end.saturating_add(1)
+                            {
+                                let start = old_start.min(new_start);
+                                let end = old_end.max(new_end);
+                                let lines = end.saturating_sub(start).saturating_add(1);
+                                let bytes: usize = content
+                                    .lines()
+                                    .skip(start - 1)
+                                    .take(lines)
+                                    .map(|line| line.len().saturating_add(8))
+                                    .sum();
+                                if lines <= MAX_LINES_TO_READ && bytes <= READ_MAX_OUTPUT_BYTES {
+                                    request.offset = start;
+                                    request.limit = Some(lines);
+                                }
+                            }
+                        }
+                    }
+                }
+                let selected: Vec<_> = content
+                    .lines()
+                    .skip(request.offset.saturating_sub(1))
+                    .take(request.limit.unwrap_or(300))
+                    .collect();
+                let rendered = render_with_byte_budget(&selected, request.offset);
+                let emitted_end = request
+                    .offset
+                    .saturating_add(rendered.emitted_lines)
+                    .saturating_sub(1);
+                if emitted_end < requested_end && request.offset < requested_start {
+                    let end = request
+                        .offset
+                        .saturating_add(request.limit.unwrap_or(0))
+                        .saturating_sub(1);
+                    request.offset = requested_start;
+                    request.limit = Some(end.saturating_sub(requested_start).saturating_add(1));
+                }
+                resolved.push(request);
+            }
+            for request in merge_batch_requests(resolved, &content) {
+                let result = self
+                    .read_locked(request, &staged_context, Some(&content), Some(&symbols))
+                    .await;
+                if result.is_ok() {
+                    if let Some(state) = staged_cache.get(&path) {
+                        observations.push((results.len(), path.clone(), state));
+                    }
+                }
+                results.push(result.unwrap_or_else(|e| json!({"type":"error", "filePath":normalize_path(&path), "error":e.to_string()})));
+            }
+        }
+        if let Some(cache) = context.file_state_cache() {
+            let delivery = read_batch_delivery(&results, true);
+            for (index, path, state) in observations {
+                if delivery[index] == ReadBatchDelivery::Full {
+                    cache.set(&path, state);
+                }
+            }
+        }
+        Ok(json!({"type": "batch", "results": results}))
+    }
+}
 
+impl ReadTool {
+    async fn read_one(&self, parsed: ReadInput, context: &ToolContext) -> ToolResult<Value> {
         if context.coordinator_mode() {
             enforce_coordinator_report_read_allowed(&parsed.file_path, context)?;
         }
 
         let _file_guard = crate::lock_file_for_read(&parsed.file_path).await;
+        self.read_locked(parsed, context, None, None).await
+    }
 
+    async fn read_locked(
+        &self,
+        parsed: ReadInput,
+        context: &ToolContext,
+        cached: Option<&str>,
+        batch_outline: Option<&Option<Vec<crate::read_outline::Symbol>>>,
+    ) -> ToolResult<Value> {
         // Pre-read size gate: when no explicit limit is specified,
         // reject files larger than MAX_FILE_SIZE_BYTES. When a limit
         // IS specified the user is already reading a slice, so we
         // skip this gate and allow the requested slice to be read.
         let is_image = image_media_type_for_path(&parsed.file_path).is_some();
         let is_pdf = is_pdf_path(&parsed.file_path);
-        if !is_pdf && (is_image || parsed.limit.is_none()) {
+        if !is_pdf && cached.is_none() && (is_image || parsed.limit.is_none()) {
             let metadata = fs::metadata(&parsed.file_path).map_err(|err| ToolError::Execution {
                 tool: self.id(),
                 source: err.into(),
@@ -207,7 +509,7 @@ impl Tool for ReadTool {
                 } else {
                     format!(
                         "File content ({}) exceeds maximum allowed size ({}). \
-                         Use offset and limit parameters to read specific portions \
+                         Use target `start` and `end` to read specific portions \
                          of the file, or search for specific content instead of \
                          reading the whole file.",
                         format_file_size(file_size),
@@ -226,10 +528,14 @@ impl Tool for ReadTool {
             return read_pdf_file(&parsed.file_path, parsed.pages.as_deref()).await;
         }
 
-        let bytes = fs::read(&parsed.file_path).map_err(|err| ToolError::Execution {
-            tool: self.id(),
-            source: err.into(),
-        })?;
+        let bytes = if let Some(text) = cached {
+            text.as_bytes().to_vec()
+        } else {
+            fs::read(&parsed.file_path).map_err(|err| ToolError::Execution {
+                tool: self.id(),
+                source: err.into(),
+            })?
+        };
 
         if let Some(media_type) = image_media_type_for_path(&parsed.file_path) {
             validate_image_bytes(&parsed.file_path, media_type, &bytes)?;
@@ -266,7 +572,13 @@ impl Tool for ReadTool {
         // DEFAULT_READ_LINES so a single Read doesn't flood the
         // context window.
         let effective_limit = match parsed.limit {
-            Some(l) => l.min(MAX_LINES_TO_READ),
+            Some(l) => {
+                if batch_outline.is_some() {
+                    l
+                } else {
+                    l.min(MAX_LINES_TO_READ)
+                }
+            }
             None => DEFAULT_READ_LINES,
         };
         let available = total_lines.saturating_sub(zero_based_start);
@@ -306,6 +618,34 @@ impl Tool for ReadTool {
                 "totalLines": total_lines,
             }
         });
+        if let Some(batch_symbols) = batch_outline {
+            if let Some(symbols) = batch_symbols {
+                let last = start_line.saturating_add(emitted_lines).saturating_sub(1);
+                let mut outline = String::new();
+                let mut truncated = false;
+                for symbol in symbols
+                    .iter()
+                    .filter(|s| emitted_lines == 0 || s.start < start_line || s.end > last)
+                {
+                    let line = format!(
+                        "{} {} ({}-{})\n",
+                        symbol.kind, symbol.name, symbol.start, symbol.end
+                    );
+                    if outline.len() + line.len() > 4096 {
+                        truncated = true;
+                        break;
+                    }
+                    outline.push_str(&line);
+                }
+                if truncated {
+                    outline.push_str("[outline truncated]\n");
+                }
+                result["outline"] = json!(outline);
+            } else {
+                result["outline"] =
+                    json!("Outline unavailable: unsupported language or parse error");
+            }
+        }
         if let Some(note) = truncation_note {
             result["truncation"] = json!(note);
         }
@@ -323,8 +663,7 @@ impl Tool for ReadTool {
         // `limit` / auto-truncation; it is set only when the injected
         // content differs from the bytes on disk.
         if let Some(cache) = context.file_state_cache() {
-            let had_explicit_range = parsed.offset != 1
-                || parsed.limit.is_some()
+            let had_explicit_range = start_line != 1
                 || was_line_truncated
                 || was_byte_truncated
                 || emitted_lines < total_lines;
@@ -353,6 +692,145 @@ impl Tool for ReadTool {
     }
 }
 
+fn prepare_requests(
+    tool: ToolId,
+    input: &Value,
+    context: &ToolContext,
+) -> ToolResult<Vec<ReadInput>> {
+    let invalid = |reason: &str| ToolError::InvalidInput {
+        tool: ToolId::new(FILE_READ_TOOL_NAME),
+        reason: reason.into(),
+        error_code: Some(INVALID_INPUT_CODE),
+    };
+    let object = input
+        .as_object()
+        .ok_or_else(|| invalid("Read input must be an object"))?;
+    if object.keys().any(|key| key != "targets") {
+        return Err(invalid("Only `targets` is allowed in Read input"));
+    }
+    let targets = object
+        .get("targets")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| invalid("`targets` must be a non-empty array"))?;
+    if targets.len() > MAX_READ_TARGETS {
+        return Err(invalid("`targets` may contain at most 16 items"));
+    }
+    let mut requests = Vec::with_capacity(targets.len());
+    for target in targets {
+        let obj = target
+            .as_object()
+            .ok_or_else(|| invalid("Each target must be an object"))?;
+        if obj
+            .keys()
+            .any(|key| !matches!(key.as_str(), "path" | "start" | "end" | "pages" | "symbol"))
+        {
+            return Err(invalid("Unknown target field"));
+        }
+        let symbol = match obj.get("symbol").filter(|value| !value.is_null()) {
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| invalid("Target `symbol` must be a non-empty string"))?
+                    .to_owned(),
+            ),
+            None => None,
+        };
+        let start = match obj.get("start").filter(|value| !value.is_null()) {
+            Some(value) => value
+                .as_u64()
+                .filter(|n| *n > 0)
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| invalid("Target `start` must be a positive integer"))?,
+            None => 1,
+        };
+        let end = match obj.get("end").filter(|value| !value.is_null()) {
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .filter(|n| *n > 0)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| invalid("Target `end` must be a positive integer"))?,
+            ),
+            None => None,
+        };
+        if end.is_some_and(|end| end < start) {
+            return Err(invalid("Target `end` must not precede `start`"));
+        }
+        let mut single = json!({"file_path": obj.get("path"), "offset": start});
+        if let Some(end) = end {
+            single["limit"] = json!(end.saturating_sub(start).saturating_add(1));
+        }
+        if let Some(pages) = obj.get("pages").filter(|value| !value.is_null()) {
+            single["pages"] = pages.clone();
+        }
+        let mut parsed = prepare_input(tool.clone(), &single, context)?;
+        if context.coordinator_mode() {
+            enforce_coordinator_report_read_allowed(&parsed.file_path, context)?;
+        }
+        if symbol.is_some() && (obj.get("start").is_some_and(|v| !v.is_null()) || end.is_some()) {
+            requests.push(parsed.clone());
+        }
+        parsed.symbol = symbol;
+        requests.push(parsed);
+    }
+    Ok(requests)
+}
+
+// Batch ranges are expanded before coalescing, so adjacent expanded windows
+// are read once. Never merge past the existing per-read hard line cap.
+fn merge_batch_requests(requests: Vec<ReadInput>, content: &str) -> Vec<ReadInput> {
+    let mut merged: Vec<ReadInput> = Vec::new();
+    for request in requests {
+        if is_pdf_path(&request.file_path)
+            || image_media_type_for_path(&request.file_path).is_some()
+        {
+            merged.push(request);
+            continue;
+        }
+        let mut current = request;
+        let mut i = 0;
+        while i < merged.len() {
+            let other = &merged[i];
+            let start = current.offset.min(other.offset);
+            let end = current
+                .offset
+                .saturating_add(current.limit.unwrap_or(300))
+                .saturating_sub(1);
+            let other_end = other
+                .offset
+                .saturating_add(other.limit.unwrap_or(300))
+                .saturating_sub(1);
+            let union_end = end.max(other_end);
+            if other.file_path == current.file_path
+                && other.pages == current.pages
+                && current.offset <= other_end.saturating_add(1)
+                && other.offset <= end.saturating_add(1)
+                && union_end.saturating_sub(start) < MAX_LINES_TO_READ
+                && !render_with_byte_budget(
+                    &content
+                        .lines()
+                        .skip(start.saturating_sub(1))
+                        .take(union_end - start + 1)
+                        .collect::<Vec<_>>(),
+                    start,
+                )
+                .budget_hit
+            {
+                current.offset = start;
+                current.limit = Some(union_end - start + 1);
+                merged.remove(i);
+                i = 0;
+            } else {
+                i += 1;
+            }
+        }
+        merged.push(current);
+    }
+    merged
+}
+
 /// Parse and vet one `Read` request, once.
 ///
 /// The tool's two entry points ask the same three questions in the same
@@ -361,12 +839,7 @@ impl Tool for ReadTool {
 /// reports the answer as a verdict, `call` takes the parsed request and runs.
 fn prepare_input(tool: ToolId, input: &Value, context: &ToolContext) -> ToolResult<ReadInput> {
     let parsed = parse_input(input)?;
-    crate::path_scope::enforce_read_path_policy(
-        tool.clone(),
-        context,
-        &parsed.file_path,
-        "file_path",
-    )?;
+    crate::path_scope::enforce_read_path_policy(tool.clone(), context, &parsed.file_path, "path")?;
     require_valid_input(
         tool,
         validate_parsed_input(&parsed)?,
@@ -390,7 +863,7 @@ fn parse_input(input: &Value) -> ToolResult<ReadInput> {
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ToolError::InvalidInput {
             tool: tool.clone(),
-            reason: "Read input requires a non-empty `file_path` string".into(),
+            reason: "Read target requires a non-empty `path` string".into(),
             error_code: Some(INVALID_INPUT_CODE),
         })?;
 
@@ -448,6 +921,7 @@ fn parse_input(input: &Value) -> ToolResult<ReadInput> {
         file_path: PathBuf::from(file_path),
         offset: offset.max(1),
         limit,
+        symbol: None,
         pages,
     })
 }
@@ -456,7 +930,7 @@ fn validate_parsed_input(input: &ReadInput) -> ToolResult<ValidationOutcome> {
     if !input.file_path.is_absolute() {
         return Ok(ValidationOutcome::invalid(
             format!(
-                "Read requires an absolute `file_path`, got: {}",
+                "Read requires an absolute `path`, got: {}",
                 input.file_path.display()
             ),
             INVALID_INPUT_CODE,
@@ -742,12 +1216,11 @@ fn build_truncation_note(ctx: TruncationContext<'_>) -> Option<String> {
             ));
         }
         parts.push(format!(
-            "Hint: retry with a smaller range, e.g. Read offset={next_line} limit=10. \
-             If a single line is enormous, target it directly (Read offset=<line> limit=1) \
-             or use Grep/Bash to extract specific symbols instead of reading the file."
+            "Hint: retry with target `start` at {next_line}; windows may be expanded. \
+             Use Grep/Bash to extract content from very long lines."
         ));
     } else if ctx.was_line_truncated {
-        parts.push("Use offset and limit to read more.".into());
+        parts.push("Use target `start` and `end` to read more.".into());
     }
 
     if !ctx.clipped_lines.is_empty() {
@@ -1112,6 +1585,13 @@ mod tests {
     use rebon_tools_core::file_state::FileStateCache;
     use serde_json::json;
 
+    #[test]
+    fn description_encourages_batching_files_and_ranges() {
+        assert!(ReadTool
+            .description()
+            .contains("Put all files and ranges needed for this step into one call"));
+    }
+
     struct TempDir {
         inner: tempfile::TempDir,
     }
@@ -1136,6 +1616,344 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_target_count_is_bounded_in_schema_and_execution() {
+        let dir = TempDir::new();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, "hello\n").unwrap();
+        let context = ToolContext::new();
+        let target = json!({"path": path});
+        let accepted = json!({"targets": vec![target.clone(); 16]});
+        let rejected = json!({"targets": vec![target; 17]});
+        assert_eq!(
+            tool().input_schema()["properties"]["targets"]["maxItems"],
+            16
+        );
+        assert!(tool()
+            .validate_input(&accepted, &context)
+            .await
+            .unwrap()
+            .is_valid());
+        assert!(!tool()
+            .validate_input(&rejected, &context)
+            .await
+            .unwrap()
+            .is_valid());
+        assert!(tool().call(rejected, &context).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_legacy_and_unknown_input_fields() {
+        let dir = TempDir::new();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, "hello\n").unwrap();
+        let context = ToolContext::new();
+        for input in [
+            json!({"file_path": path}),
+            json!({"targets": [{"path": path}], "offset": 1}),
+            json!({"targets": [{"path": path, "limit": 1}]}),
+            json!({"targets": []}),
+        ] {
+            assert!(!tool()
+                .validate_input(&input, &context)
+                .await
+                .unwrap()
+                .is_valid());
+            assert!(tool().call(input, &context).await.is_err());
+        }
+        let schema = tool().input_schema();
+        assert_eq!(schema["required"], json!(["targets"]));
+        assert!(schema["properties"].get("file_path").is_none());
+        assert!(schema["properties"]["targets"]["items"]["properties"]
+            .get("symbol")
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn batch_accepts_null_optional_fields_and_symbol_with_range() {
+        let dir = TempDir::new();
+        let path = dir.path().join("source.rs");
+        fs::write(
+            &path,
+            format!(
+                "{}fn target() {{}}\n{}",
+                "// before\n".repeat(400),
+                "// after\n".repeat(400)
+            ),
+        )
+        .unwrap();
+        let context = ToolContext::new();
+        let output = tool()
+            .call(
+                json!({"targets":[
+                    {"path":path, "symbol":null, "start":null, "end":null, "pages":null},
+                    {"path":path, "symbol":"target", "start":null, "end":null},
+                    {"path":path, "symbol":"target", "start":350, "end":450}
+                ]}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(
+            output["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r.get("error").is_none()),
+            "{output}"
+        );
+        let invalid = tool()
+            .call(
+                json!({"targets":[{"path":path,"symbol":"target","start":0}]}),
+                &context,
+            )
+            .await;
+        assert!(invalid.is_err());
+
+        fs::write(
+            &path,
+            format!(
+                "{}fn target() {{}}\n{}",
+                "// before\n".repeat(800),
+                "// after\n".repeat(800)
+            ),
+        )
+        .unwrap();
+        let output = tool()
+            .call(
+                json!({"targets":[{"path":path,"symbol":"target","start":1,"end":1}]}),
+                &ToolContext::new(),
+            )
+            .await
+            .unwrap();
+        let results = output["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2, "{output}");
+        assert!(results.iter().any(|r| r["file"]["startLine"] == 1));
+        assert!(results.iter().any(|r| r["file"]["content"]
+            .as_str()
+            .is_some_and(|s| s.contains("fn target()"))));
+    }
+
+    #[tokio::test]
+    async fn batch_symbols_boundaries_and_errors() {
+        let dir = TempDir::new();
+        let path = dir.path().join("symbols.rs");
+        let source = format!(
+            "{}impl Thing {{\n    fn wanted() {{\n{}    }}\n}}\n{}fn hidden() {{}}\n",
+            "// padding\n".repeat(300),
+            "        // body\n".repeat(400),
+            "// padding\n".repeat(200)
+        );
+        fs::write(&path, source).unwrap();
+        let result = tool()
+            .call(
+                json!({"targets":[{"path":path,"start":500,"end":501}]}),
+                &ToolContext::new(),
+            )
+            .await
+            .unwrap();
+        let item = &result["results"][0];
+        assert_eq!(item["file"]["startLine"], 302);
+        assert!(item["outline"].as_str().unwrap().contains("hidden"));
+        let result = tool().call(json!({"targets":[{"path":path,"symbol":"wanted"},{"path":path,"symbol":"missing"}]}), &ToolContext::new()).await.unwrap();
+        assert!(result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["error"].as_str().unwrap_or("").contains("not found")));
+        let result = tool()
+            .call(
+                json!({"targets":[{"path":path,"symbol":"wanted","start":1}]}),
+                &ToolContext::new(),
+            )
+            .await
+            .unwrap();
+        assert!(result["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v.get("error").is_none()));
+        fs::write(&path, "fn duplicate() {}\nfn duplicate() {}\n").unwrap();
+        let result = tool()
+            .call(
+                json!({"targets":[{"path":path,"symbol":"duplicate"}]}),
+                &ToolContext::new(),
+            )
+            .await
+            .unwrap();
+        assert!(result["results"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("ambiguous"));
+        fs::write(&path, "fn broken( {").unwrap();
+        let result = tool()
+            .call(
+                json!({"targets":[{"path":path,"symbol":"broken"}]}),
+                &ToolContext::new(),
+            )
+            .await
+            .unwrap();
+        assert!(result["results"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("Cannot parse"));
+    }
+
+    #[tokio::test]
+    async fn explicit_targets_remain_reachable_with_output_budget() {
+        let dir = TempDir::new();
+        let small = dir.path().join("small.rs");
+        let large = dir.path().join("large.txt");
+        fs::write(
+            &small,
+            format!(
+                "{}fn tail_target() {{}}\n",
+                format!("{}\n", "//0123456789".repeat(8)).repeat(499)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &large,
+            format!(
+                "{}TARGET_LINE\n{}",
+                format!("{}\n", "x".repeat(100)).repeat(899),
+                format!("{}\n", "x".repeat(100)).repeat(100)
+            ),
+        )
+        .unwrap();
+        for target in [
+            json!({"path":small,"start":500,"end":500}),
+            json!({"path":small,"symbol":"tail_target"}),
+            json!({"path":large,"start":900,"end":900}),
+        ] {
+            let out = tool()
+                .call(json!({"targets":[target]}), &ToolContext::new())
+                .await
+                .unwrap();
+            let content = out["results"][0]["file"]["content"].as_str().unwrap();
+            assert!(
+                content.contains("tail_target") || content.contains("TARGET_LINE"),
+                "{out}"
+            );
+        }
+        let context = ToolContext::new().with_file_state_cache(FileStateCache::new());
+        let out = tool().call(json!({"targets":[{"path":small,"start":1,"end":1}, {"path":small,"start":500,"end":500}]}), &context).await.unwrap();
+        let results = out["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|r| r["file"]["content"]
+            .as_str()
+            .is_some_and(|s| s.contains("tail_target"))));
+        let retry = tool()
+            .call(
+                json!({"targets":[{"path":small,"start":500,"end":500}]}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(retry["results"][0]["file"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("tail_target"));
+    }
+
+    #[tokio::test]
+    async fn batch_expands_and_merges_text_ranges() {
+        let dir = TempDir::new();
+        let small = dir.path().join("small.txt");
+        let large = dir.path().join("large.txt");
+        fs::write(&small, "small\n".repeat(10)).unwrap();
+        fs::write(&large, "line\n".repeat(1000)).unwrap();
+        let result = tool()
+            .call(
+                json!({"targets": [
+                    {"path": small, "start": 5, "end": 6},
+                    {"path": large, "start": 1, "end": 3},
+                    {"path": large, "start": 450, "end": 451}
+                ]}),
+                &ToolContext::new(),
+            )
+            .await
+            .unwrap();
+        let results = result["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["file"]["startLine"], 1);
+        assert_eq!(results[0]["file"]["numLines"], 10);
+        assert_eq!(results[1]["file"]["numLines"], 600);
+    }
+
+    #[tokio::test]
+    async fn adjacent_reads_merge_only_when_file_is_unchanged() {
+        let dir = TempDir::new();
+        let path = dir.path().join("large.txt");
+        fs::write(&path, "line\n".repeat(1000)).unwrap();
+        let context = ToolContext::new().with_file_state_cache(FileStateCache::new());
+        let first = tool()
+            .call(
+                json!({"targets":[{"path":path,"start":1,"end":1}]}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first["results"][0]["file"]["numLines"], 300);
+        let second = tool()
+            .call(
+                json!({"targets":[{"path":path,"start":450,"end":450}]}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second["results"][0]["file"]["startLine"], 1);
+        assert_eq!(second["results"][0]["file"]["numLines"], 600);
+        fs::write(&path, "changed\n".repeat(1000)).unwrap();
+        let changed = tool()
+            .call(
+                json!({"targets":[{"path":path,"start":601,"end":601}]}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed["results"][0]["file"]["startLine"], 452);
+    }
+
+    #[tokio::test]
+    async fn narrow_window_expands_around_requested_lines() {
+        let dir = TempDir::new();
+        let path = dir.path().join("large.txt");
+        fs::write(&path, "line\n".repeat(1000)).unwrap();
+        let result = tool()
+            .call(
+                json!({"targets": [{"path": path, "start": 500, "end": 500}]}),
+                &ToolContext::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["results"][0]["file"]["startLine"], 351);
+        assert_eq!(result["results"][0]["file"]["numLines"], 300);
+    }
+
+    #[tokio::test]
+    async fn batch_validates_every_target_before_reading() {
+        let dir = TempDir::new();
+        let file = dir.path().join("ok.txt");
+        fs::write(&file, "hello").unwrap();
+        let input = json!({"targets": [{"path": file}, {"path": "relative.txt"}]});
+        assert!(tool().call(input, &ToolContext::new()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn batch_preserves_image_payload() {
+        let dir = TempDir::new();
+        let path = dir.path().join("pixel.png");
+        let png = BASE64.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=").unwrap();
+        fs::write(&path, &png).unwrap();
+        let result = tool()
+            .call(json!({"targets": [{"path": path}]}), &ToolContext::new())
+            .await
+            .unwrap();
+        assert_eq!(result["results"][0]["type"], "image");
+        assert_eq!(result["results"][0]["file"]["base64"], BASE64.encode(png));
+    }
+
+    #[tokio::test]
     async fn sub_agent_read_rejects_paths_outside_scope() {
         let dir = TempDir::new();
         let outside = TempDir::new();
@@ -1144,7 +1962,7 @@ mod tests {
 
         let result = tool()
             .call(
-                json!({ "file_path": file.to_string_lossy() }),
+                json!({ "targets": [{"path": file.to_string_lossy()}] }),
                 &ToolContext::new()
                     .with_agent_id("agent-test")
                     .with_cwd(dir.path().to_string_lossy()),
@@ -1164,7 +1982,7 @@ mod tests {
 
         let result = tool()
             .call(
-                json!({ "file_path": file.to_string_lossy() }),
+                json!({ "targets": [{"path": file.to_string_lossy()}] }),
                 &ToolContext::new()
                     .with_agent_id("agent-test")
                     .with_cwd(dir.path().to_string_lossy())
@@ -1176,7 +1994,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result["type"], "text");
+        assert_eq!(result["results"][0]["type"], "text");
     }
 
     #[tokio::test]
@@ -1190,12 +2008,13 @@ mod tests {
 
         let result = tool()
             .call(
-                json!({ "file_path": path.to_string_lossy() }),
+                json!({ "targets": [{ "path": path.to_string_lossy() }] }),
                 &ToolContext::new(),
             )
             .await
             .unwrap();
 
+        let result = &result["results"][0];
         assert_eq!(result["type"], "image");
         assert_eq!(result["file"]["type"], "image/png");
         assert_eq!(result["file"]["base64"], BASE64.encode(png));
@@ -1209,22 +2028,25 @@ mod tests {
 
         let error = tool()
             .call(
-                json!({ "file_path": path.to_string_lossy() }),
+                json!({ "targets": [{ "path": path.to_string_lossy() }] }),
                 &ToolContext::new(),
             )
             .await
-            .unwrap_err();
+            .unwrap()["results"][0]
+            .clone();
 
-        match error {
+        assert_eq!(error["type"], "error");
+        let reason = error["error"].as_str().unwrap();
+        assert!(reason.contains("contents are not valid image/png data"));
+        assert!(reason.contains("incomplete or mislabeled"));
+        let direct_error = validate_image_bytes(&path, "image/png", b"not an image").unwrap_err();
+        assert!(matches!(
+            direct_error,
             ToolError::InvalidInput {
-                reason, error_code, ..
-            } => {
-                assert_eq!(error_code, Some(INVALID_INPUT_CODE));
-                assert!(reason.contains("contents are not valid image/png data"));
-                assert!(reason.contains("incomplete or mislabeled"));
+                error_code: Some(INVALID_INPUT_CODE),
+                ..
             }
-            other => panic!("expected invalid input, got {other:?}"),
-        }
+        ));
     }
 
     #[tokio::test]
@@ -1238,12 +2060,13 @@ mod tests {
 
         let error = tool()
             .call(
-                json!({ "file_path": path.to_string_lossy() }),
+                json!({ "targets": [{ "path": path.to_string_lossy() }] }),
                 &ToolContext::new(),
             )
             .await
-            .unwrap_err()
-            .to_string();
+            .unwrap();
+        assert_eq!(error["results"][0]["type"], "error");
+        let error = error["results"][0]["error"].as_str().unwrap();
 
         assert!(error.contains("contents are not valid image/jpeg data"));
         assert!(error.contains("correct its extension"));
@@ -1317,12 +2140,13 @@ mod tests {
 
         let result = tool()
             .call(
-                json!({ "file_path": path.to_string_lossy() }),
+                json!({ "targets": [{ "path": path.to_string_lossy() }] }),
                 &ToolContext::new(),
             )
             .await
             .unwrap();
 
+        let result = &result["results"][0];
         assert_eq!(result["type"], "image");
         assert_eq!(result["file"]["type"], "image/webp");
     }
@@ -1336,22 +2160,37 @@ mod tests {
 
         let error = tool()
             .call(
-                json!({ "file_path": path.to_string_lossy(), "limit": 1 }),
+                json!({ "targets": [{ "path": path.to_string_lossy(), "start": 1, "end": 1 }] }),
+                &ToolContext::new(),
+            )
+            .await
+            .unwrap()["results"][0]
+            .clone();
+
+        assert_eq!(error["type"], "error");
+        let reason = error["error"].as_str().unwrap();
+        assert!(reason.contains("maximum safe size"));
+        assert!(reason.contains("Resize or recompress"));
+        let direct_error = tool()
+            .read_one(
+                ReadInput {
+                    file_path: path,
+                    offset: 1,
+                    limit: Some(1),
+                    pages: None,
+                    symbol: None,
+                },
                 &ToolContext::new(),
             )
             .await
             .unwrap_err();
-
-        match error {
+        assert!(matches!(
+            direct_error,
             ToolError::InvalidInput {
-                reason, error_code, ..
-            } => {
-                assert_eq!(error_code, Some(FILE_TOO_LARGE_CODE));
-                assert!(reason.contains("maximum safe size"));
-                assert!(reason.contains("Resize or recompress"));
+                error_code: Some(FILE_TOO_LARGE_CODE),
+                ..
             }
-            other => panic!("expected invalid input, got {other:?}"),
-        }
+        ));
     }
 
     #[tokio::test]
@@ -1380,7 +2219,7 @@ mod tests {
 
         let result = tool()
             .validate_input(
-                &json!({ "file_path": file.to_string_lossy(), "pages": "1-5" }),
+                &json!({ "targets": [{"path": file.to_string_lossy(), "pages": "1-5"}] }),
                 &ToolContext::new(),
             )
             .await
@@ -1400,7 +2239,7 @@ mod tests {
 
         let result = tool()
             .validate_input(
-                &json!({ "file_path": file.to_string_lossy(), "pages": "10-" }),
+                &json!({ "targets": [{"path": file.to_string_lossy(), "pages": "10-"}] }),
                 &ToolContext::new(),
             )
             .await
@@ -1420,7 +2259,7 @@ mod tests {
 
         let result = tool()
             .validate_input(
-                &json!({ "file_path": file.to_string_lossy(), "pages": "5-1" }),
+                &json!({ "targets": [{"path": file.to_string_lossy(), "pages": "5-1"}] }),
                 &ToolContext::new(),
             )
             .await
@@ -1438,7 +2277,7 @@ mod tests {
 
         let result = tool()
             .validate_input(
-                &json!({ "file_path": file.to_string_lossy(), "pages": "1-21" }),
+                &json!({ "targets": [{"path": file.to_string_lossy(), "pages": "1-21"}] }),
                 &ToolContext::new(),
             )
             .await
@@ -1457,12 +2296,13 @@ mod tests {
 
         let out = tool()
             .call(
-                json!({ "file_path": file.to_string_lossy() }),
+                json!({ "targets": [{ "path": file.to_string_lossy() }] }),
                 &ToolContext::new(),
             )
             .await
             .unwrap();
 
+        let out = &out["results"][0];
         assert_eq!(out["type"], "pdf");
         assert_eq!(out["file"]["base64"], BASE64.encode(pdf));
         assert_eq!(out["file"]["originalSize"], json!(pdf.len()));
@@ -1474,20 +2314,19 @@ mod tests {
         let file = dir.path().join("fake.pdf");
         fs::write(&file, b"not a pdf").unwrap();
 
-        let err = tool()
+        let out = tool()
             .call(
-                json!({ "file_path": file.to_string_lossy() }),
+                json!({ "targets": [{ "path": file.to_string_lossy() }] }),
                 &ToolContext::new(),
             )
             .await
-            .unwrap_err();
-
-        match err {
-            ToolError::InvalidInput { reason, .. } => {
-                assert!(reason.contains("missing %PDF- header"), "{reason}");
-            }
-            other => panic!("expected invalid input, got {other:?}"),
-        }
+            .unwrap();
+        let result = &out["results"][0];
+        assert_eq!(result["type"], "error");
+        assert!(result["error"]
+            .as_str()
+            .unwrap()
+            .contains("missing %PDF- header"));
     }
 
     #[tokio::test]
@@ -1502,25 +2341,25 @@ mod tests {
         let file = dir.path().join("doc.pdf");
         fs::write(&file, b"%PDF-1.4\n").unwrap();
 
-        let err = tool()
+        let out = tool()
             .call(
-                json!({ "file_path": file.to_string_lossy(), "pages": "1" }),
+                json!({ "targets": [{ "path": file.to_string_lossy(), "pages": "1" }] }),
                 &ToolContext::new(),
             )
             .await
-            .unwrap_err();
+            .unwrap();
 
         match old_path {
             Some(path) => std::env::set_var("PATH", path),
             None => std::env::remove_var("PATH"),
         }
 
-        match err {
-            ToolError::InvalidInput { reason, .. } => {
-                assert!(reason.contains("pdftoppm is not installed"), "{reason}");
-            }
-            other => panic!("expected invalid input, got {other:?}"),
-        }
+        let result = &out["results"][0];
+        assert_eq!(result["type"], "error");
+        assert!(result["error"]
+            .as_str()
+            .unwrap()
+            .contains("pdftoppm is not installed"));
     }
 
     #[tokio::test]
@@ -1535,25 +2374,25 @@ mod tests {
         let file = dir.path().join("fake.pdf");
         fs::write(&file, b"not a pdf").unwrap();
 
-        let err = tool()
+        let out = tool()
             .call(
-                json!({ "file_path": file.to_string_lossy(), "pages": "1" }),
+                json!({ "targets": [{ "path": file.to_string_lossy(), "pages": "1" }] }),
                 &ToolContext::new(),
             )
             .await
-            .unwrap_err();
+            .unwrap();
 
         match old_path {
             Some(path) => std::env::set_var("PATH", path),
             None => std::env::remove_var("PATH"),
         }
 
-        match err {
-            ToolError::InvalidInput { reason, .. } => {
-                assert!(reason.contains("missing %PDF- header"), "{reason}");
-            }
-            other => panic!("expected invalid input, got {other:?}"),
-        }
+        let result = &out["results"][0];
+        assert_eq!(result["type"], "error");
+        assert!(result["error"]
+            .as_str()
+            .unwrap()
+            .contains("missing %PDF- header"));
     }
 
     #[tokio::test]
@@ -1575,24 +2414,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offset_zero_is_treated_as_first_line() {
+    async fn zero_start_is_rejected() {
         let dir = TempDir::new();
         let file = dir.path().join("zero.txt");
         fs::write(&file, "alpha\nbeta").unwrap();
 
-        let out = tool()
+        let err = tool()
             .call(
-                json!({ "file_path": file.to_string_lossy(), "offset": 0 }),
+                json!({ "targets": [{ "path": file.to_string_lossy(), "start": 0 }] }),
                 &ToolContext::new(),
             )
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(out["file"]["startLine"], json!(1));
+        assert!(matches!(
+            err,
+            ToolError::InvalidInput {
+                error_code: Some(INVALID_INPUT_CODE),
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
-    async fn image_read_ignores_offset_zero() {
+    async fn image_read_accepts_explicit_range() {
         let dir = TempDir::new();
         let path = dir.path().join("pixel.jpg");
         let mut jpeg = std::io::Cursor::new(Vec::new());
@@ -1603,19 +2448,20 @@ mod tests {
 
         let result = tool()
             .call(
-                json!({ "file_path": path.to_string_lossy(), "offset": 0 }),
+                json!({ "targets": [{ "path": path.to_string_lossy(), "start": 1 }] }),
                 &ToolContext::new(),
             )
             .await
             .unwrap();
 
+        let result = &result["results"][0];
         assert_eq!(result["type"], "image");
         assert_eq!(result["file"]["type"], "image/jpeg");
     }
 
     #[tokio::test]
     async fn validate_input_rejects_relative_path() {
-        let input = json!({ "file_path": "src/lib.rs" });
+        let input = json!({ "targets": [{"path": "src/lib.rs"}] });
         let result = tool()
             .validate_input(&input, &ToolContext::new())
             .await
@@ -1627,7 +2473,7 @@ mod tests {
     #[tokio::test]
     async fn validate_input_rejects_directory() {
         let dir = TempDir::new();
-        let input = json!({ "file_path": dir.path().to_string_lossy() });
+        let input = json!({ "targets": [{"path": dir.path().to_string_lossy()}] });
         let result = tool()
             .validate_input(&input, &ToolContext::new())
             .await
@@ -1647,20 +2493,22 @@ mod tests {
         let out = tool()
             .call(
                 json!({
-                    "file_path": file.to_string_lossy(),
-                    "offset": 2,
-                    "limit": 2
+                    "targets": [{ "path": file.to_string_lossy(), "start": 2, "end": 3 }]
                 }),
                 &ToolContext::new(),
             )
             .await
             .unwrap();
 
+        let out = &out["results"][0];
         assert_eq!(out["type"], json!("text"));
-        assert_eq!(out["file"]["numLines"], json!(2));
-        assert_eq!(out["file"]["startLine"], json!(2));
+        assert_eq!(out["file"]["numLines"], json!(3));
+        assert_eq!(out["file"]["startLine"], json!(1));
         assert_eq!(out["file"]["totalLines"], json!(3));
-        assert_eq!(out["file"]["content"], json!("     2\tbeta\n     3\tgamma"));
+        assert_eq!(
+            out["file"]["content"],
+            json!("     1\talpha\n     2\tbeta\n     3\tgamma")
+        );
     }
 
     #[tokio::test]
@@ -1669,50 +2517,47 @@ mod tests {
         let file = dir.path().join("blob.bin");
         fs::write(&file, [0_u8, 159, 146, 150]).unwrap();
 
-        let err = tool()
+        let out = tool()
             .call(
-                json!({ "file_path": file.to_string_lossy() }),
+                json!({ "targets": [{ "path": file.to_string_lossy() }] }),
                 &ToolContext::new(),
             )
             .await
-            .unwrap_err();
-
-        match err {
-            ToolError::InvalidInput { error_code, .. } => {
-                assert_eq!(error_code, Some(UNSUPPORTED_MEDIA_CODE));
-            }
-            other => panic!("expected invalid input, got {other:?}"),
-        }
+            .unwrap();
+        let result = &out["results"][0];
+        assert_eq!(result["type"], "error");
+        assert!(result["error"]
+            .as_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("utf-8"));
     }
 
     #[tokio::test]
-    async fn call_rejects_large_file_without_limit() {
+    async fn call_truncates_large_file_without_range() {
         let dir = TempDir::new();
         let file = dir.path().join("big.txt");
-        // Write a file just over 256 KB.
         let big_content = "x".repeat((MAX_FILE_SIZE_BYTES as usize) + 1);
         fs::write(&file, &big_content).unwrap();
 
-        let err = tool()
+        let out = tool()
             .call(
-                json!({ "file_path": file.to_string_lossy() }),
+                json!({ "targets": [{ "path": file.to_string_lossy() }] }),
                 &ToolContext::new(),
             )
             .await
-            .unwrap_err();
-
-        match &err {
-            ToolError::InvalidInput {
-                reason, error_code, ..
-            } => {
-                assert_eq!(*error_code, Some(FILE_TOO_LARGE_CODE));
-                assert!(
-                    reason.contains("offset and limit"),
-                    "error should guide AI to use offset/limit: {reason}"
-                );
-            }
-            other => panic!("expected InvalidInput, got {other:?}"),
-        }
+            .unwrap();
+        let result = &out["results"][0];
+        assert_eq!(result["type"], "text");
+        assert_eq!(result["file"]["numLines"], 1);
+        assert_eq!(result["file"]["totalLines"], 1);
+        let content = result["file"]["content"].as_str().unwrap();
+        assert!(content.len() <= READ_MAX_OUTPUT_BYTES);
+        assert!(content.contains("[line clipped:"));
+        assert!(result["truncation"]
+            .as_str()
+            .unwrap()
+            .contains("Long lines clipped"));
     }
 
     #[tokio::test]
@@ -1722,21 +2567,26 @@ mod tests {
         let lines: Vec<String> = (1..=5000).map(|i| format!("line {i}")).collect();
         fs::write(&file, lines.join("\n")).unwrap();
 
-        // Even though the file is large, specifying limit bypasses the size gate.
+        // A narrow range expands to the minimum 300-line window.
         let out = tool()
             .call(
                 json!({
-                    "file_path": file.to_string_lossy(),
-                    "offset": 1,
-                    "limit": 10
+                    "targets": [{ "path": file.to_string_lossy(), "start": 1, "end": 10 }]
                 }),
                 &ToolContext::new(),
             )
             .await
             .unwrap();
 
-        assert_eq!(out["file"]["numLines"], json!(10));
+        let out = &out["results"][0];
+        assert_eq!(out["type"], "text");
+        assert_eq!(out["file"]["numLines"], json!(300));
         assert_eq!(out["file"]["startLine"], json!(1));
+        assert_eq!(out["file"]["totalLines"], json!(5000));
+        assert!(out["file"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("line 300"));
     }
 
     #[tokio::test]
@@ -1753,14 +2603,14 @@ mod tests {
         let out = tool()
             .call(
                 json!({
-                    "file_path": file.to_string_lossy(),
-                    "limit": 80,
+                    "targets": [{ "path": file.to_string_lossy(), "start": 1, "end": 80 }],
                 }),
                 &ToolContext::new(),
             )
             .await
             .unwrap();
 
+        let out = &out["results"][0];
         let content = out["file"]["content"].as_str().unwrap();
         assert!(
             content.len() <= READ_MAX_OUTPUT_BYTES,
@@ -1799,14 +2649,14 @@ mod tests {
         let out = tool()
             .call(
                 json!({
-                    "file_path": file.to_string_lossy(),
-                    "limit": 3,
+                    "targets": [{ "path": file.to_string_lossy(), "start": 1, "end": 3 }],
                 }),
                 &ToolContext::new(),
             )
             .await
             .unwrap();
 
+        let out = &out["results"][0];
         let content = out["file"]["content"].as_str().unwrap();
         assert!(
             content.len() <= READ_MAX_OUTPUT_BYTES,
@@ -1867,13 +2717,15 @@ mod tests {
         let tool = tool();
         let ctx = ToolContext::new();
         let calls = [
-            json!({ "file_path": file.to_string_lossy(), "offset": 1,    "limit": 80 }),
-            json!({ "file_path": file.to_string_lossy(), "offset": 500,  "limit": 80 }),
-            json!({ "file_path": file.to_string_lossy(), "offset": 1000, "limit": 80 }),
+            json!({ "targets": [{ "path": file.to_string_lossy(), "start": 1, "end": 80 }] }),
+            json!({ "targets": [{ "path": file.to_string_lossy(), "start": 500, "end": 579 }] }),
+            json!({ "targets": [{ "path": file.to_string_lossy(), "start": 1000, "end": 1079 }] }),
         ];
         let mut total_bytes = 0usize;
         for input in calls {
             let out = tool.call(input, &ctx).await.unwrap();
+            let out = &out["results"][0];
+            assert_eq!(out["type"], "text");
             let content = out["file"]["content"].as_str().unwrap();
             assert!(
                 content.len() <= READ_MAX_OUTPUT_BYTES,
@@ -1903,14 +2755,13 @@ mod tests {
         let out = tool()
             .call(
                 json!({
-                    "file_path": file.to_string_lossy(),
-                    "offset": 1,
-                    "limit": 600,
+                    "targets": [{ "path": file.to_string_lossy(), "start": 1, "end": 600 }],
                 }),
                 &ToolContext::new(),
             )
             .await
             .unwrap();
+        let out = &out["results"][0];
 
         assert_eq!(out["type"], "text");
         let note = out["truncation"].as_str().unwrap();
@@ -1921,23 +2772,30 @@ mod tests {
     async fn call_auto_truncates_large_file_without_limit() {
         let dir = TempDir::new();
         let file = dir.path().join("many_lines.txt");
-        let lines: Vec<String> = (1..=500).map(|i| format!("line {i}")).collect();
+        let lines: Vec<String> = (1..=700).map(|i| format!("line {i}")).collect();
         fs::write(&file, lines.join("\n")).unwrap();
 
-        // No limit provided → auto-truncates to DEFAULT_READ_LINES.
+        // No range provided selects the first 300 lines of a large file.
         let out = tool()
             .call(
-                json!({ "file_path": file.to_string_lossy() }),
+                json!({ "targets": [{ "path": file.to_string_lossy() }] }),
                 &ToolContext::new(),
             )
             .await
             .unwrap();
+        let out = &out["results"][0];
 
-        assert_eq!(out["file"]["numLines"], json!(DEFAULT_READ_LINES));
-        assert_eq!(out["file"]["totalLines"], json!(500));
-        assert!(out["truncation"].is_string(), "should have truncation note");
-        let note = out["truncation"].as_str().unwrap();
-        assert!(note.contains("500 total lines"), "note: {note}");
+        assert_eq!(out["file"]["numLines"], json!(300));
+        assert_eq!(out["file"]["totalLines"], json!(700));
+        assert_eq!(out["file"]["startLine"], 1);
+        assert!(out["file"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("line 300"));
+        assert!(!out["file"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("line 301"));
     }
 
     #[tokio::test]
@@ -1949,7 +2807,10 @@ mod tests {
         let ctx = ToolContext::new().with_file_state_cache(cache.clone());
 
         tool()
-            .call(json!({ "file_path": file.to_string_lossy() }), &ctx)
+            .call(
+                json!({ "targets": [{ "path": file.to_string_lossy() }] }),
+                &ctx,
+            )
             .await
             .unwrap();
 
@@ -1966,16 +2827,18 @@ mod tests {
     async fn read_records_offset_and_limit_without_partial_view_flag() {
         let dir = TempDir::new();
         let file = dir.path().join("slice.txt");
-        fs::write(&file, "a\nb\nc\nd\ne").unwrap();
+        let content = (1..=700)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&file, &content).unwrap();
         let cache = FileStateCache::new();
         let ctx = ToolContext::new().with_file_state_cache(cache.clone());
 
         tool()
             .call(
                 json!({
-                    "file_path": file.to_string_lossy(),
-                    "offset": 2,
-                    "limit": 2
+                    "targets": [{ "path": file.to_string_lossy(), "start": 2, "end": 3 }]
                 }),
                 &ctx,
             )
@@ -1983,29 +2846,32 @@ mod tests {
             .unwrap();
 
         let state = cache.get(&file).expect("file should be registered");
-        // Offset/limit are recorded unchanged so the Read dedup path
+        // The expanded offset/limit are recorded so the Read dedup path
         // can tell a Read-populated entry
         // apart from a post-Edit refresh. They do NOT imply a partial
         // view — the model saw exactly these lines from disk.
         assert!(!state.is_partial_view);
-        assert_eq!(state.offset, Some(2));
-        assert_eq!(state.limit, Some(2));
+        assert_eq!(state.offset, Some(1));
+        assert_eq!(state.limit, Some(300));
         // Raw disk content is still stored so Edit's content
         // comparison works without a follow-up full Read.
-        assert_eq!(state.content, "a\nb\nc\nd\ne");
+        assert_eq!(state.content, content);
     }
 
     #[tokio::test]
     async fn read_does_not_flag_partial_view_on_auto_truncation() {
         let dir = TempDir::new();
         let file = dir.path().join("many.txt");
-        let lines: Vec<String> = (1..=500).map(|i| format!("line {i}")).collect();
+        let lines: Vec<String> = (1..=700).map(|i| format!("line {i}")).collect();
         fs::write(&file, lines.join("\n")).unwrap();
         let cache = FileStateCache::new();
         let ctx = ToolContext::new().with_file_state_cache(cache.clone());
 
         tool()
-            .call(json!({ "file_path": file.to_string_lossy() }), &ctx)
+            .call(
+                json!({ "targets": [{ "path": file.to_string_lossy() }] }),
+                &ctx,
+            )
             .await
             .unwrap();
 
@@ -2020,7 +2886,7 @@ mod tests {
             Some(1),
             "auto-truncated reads still record the line range for dedup"
         );
-        assert!(state.limit.is_some());
+        assert_eq!(state.limit, Some(300));
     }
 
     #[tokio::test]
@@ -2033,11 +2899,14 @@ mod tests {
             .with_coordinator_report_paths(vec![report.clone()]);
 
         let out = tool()
-            .call(json!({ "file_path": report.to_string_lossy() }), &ctx)
+            .call(
+                json!({ "targets": [{"path": report.to_string_lossy()}] }),
+                &ctx,
+            )
             .await
             .unwrap();
 
-        assert_eq!(out["file"]["totalLines"], json!(3));
+        assert_eq!(out["results"][0]["file"]["totalLines"], json!(3));
     }
 
     #[tokio::test]
@@ -2052,7 +2921,10 @@ mod tests {
             .with_coordinator_report_paths(vec![report]);
 
         let err = tool()
-            .call(json!({ "file_path": source.to_string_lossy() }), &ctx)
+            .call(
+                json!({ "targets": [{"path": source.to_string_lossy()}] }),
+                &ctx,
+            )
             .await
             .unwrap_err();
 
@@ -2078,13 +2950,13 @@ mod tests {
 
         let out = tool()
             .call(
-                json!({ "file_path": source.to_string_lossy() }),
+                json!({ "targets": [{"path": source.to_string_lossy()}] }),
                 &ToolContext::new(),
             )
             .await
             .unwrap();
 
-        assert_eq!(out["file"]["numLines"], json!(1));
+        assert_eq!(out["results"][0]["file"]["numLines"], json!(1));
     }
 
     #[tokio::test]
@@ -2100,11 +2972,33 @@ mod tests {
             .with_coordinator_report_paths(vec![report]);
 
         let out = tool()
-            .call(json!({ "file_path": bypass.to_string_lossy() }), &ctx)
+            .call(
+                json!({ "targets": [{"path": bypass.to_string_lossy()}] }),
+                &ctx,
+            )
             .await
             .unwrap();
 
-        assert_eq!(out["file"]["totalLines"], json!(3));
+        assert_eq!(out["results"][0]["file"]["totalLines"], json!(3));
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_text_over_memory_limit() {
+        let dir = TempDir::new();
+        let file = dir.path().join("oversized.txt");
+        fs::write(&file, vec![b'x'; 16 * 1024 * 1024 + 1]).unwrap();
+        let out = tool()
+            .call(
+                json!({"targets": [{"path": file.to_string_lossy(), "start": 1, "end": 2}]}),
+                &ToolContext::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["results"][0]["type"], "error");
+        assert!(out["results"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("16 MiB"));
     }
 
     #[tokio::test]
@@ -2116,11 +3010,12 @@ mod tests {
 
         let out = tool()
             .call(
-                json!({ "file_path": file.to_string_lossy() }),
+                json!({ "targets": [{ "path": file.to_string_lossy() }] }),
                 &ToolContext::new(),
             )
             .await
             .unwrap();
+        let out = &out["results"][0];
 
         assert_eq!(out["file"]["numLines"], json!(50));
         assert_eq!(out["file"]["totalLines"], json!(50));

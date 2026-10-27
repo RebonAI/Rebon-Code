@@ -315,7 +315,13 @@ fn build_body(
                 input.add_margin,
             ))
         }
-        MessageRow::User(user) if user.content.len() == 1 => {
+        MessageRow::User(user)
+            if matches!(
+                user.content.as_slice(),
+                [rebon_render::UserContentBlock::Text { .. }]
+                    | [rebon_render::UserContentBlock::ToolResult { .. }]
+            ) =>
+        {
             let block = user.content[0].clone();
             let projection = project_user_block(&UserBlockProjectInput {
                 message: user.clone(),
@@ -678,6 +684,48 @@ mod tests {
         // With add_margin, gutter label and content are pushed down by 1 row.
         assert!((1..4).any(|y| line(&buf, y).starts_with("●")));
         assert!((1..4).any(|y| line(&buf, y).contains("hello world")));
+    }
+
+    #[test]
+    fn single_image_user_message_renders_with_or_without_paste_id() {
+        for (paste_ids, expected) in [
+            (vec![Some("7".into())], "[Image #7]"),
+            (vec![], "[Image #1]"),
+        ] {
+            let input = RenderMessageInput {
+                message: MessageRow::User(UserMessage {
+                    uuid: "u-image".into(),
+                    is_compact_summary: false,
+                    content: vec![UserContentBlock::Image { source_hint: None }],
+                    image_paste_ids: paste_ids,
+                    plan_content: None,
+                    timestamp: None,
+                }),
+                container_width: Some(40),
+                add_margin: false,
+                verbose: false,
+                style_condensed: false,
+                is_transcript_mode: false,
+                is_active_collapsed_group: false,
+                is_user_continuation: false,
+                last_thinking_block_id: None,
+                latest_bash_output_uuid: None,
+                terminal_columns: 40,
+                fullscreen_env_enabled: false,
+                compact_thinking_preview: false,
+                show_thinking_expand_hint: false,
+                frame_time_ms: 0,
+                in_progress_tool_use_ids: Vec::new(),
+                errored_tool_use_ids: Vec::new(),
+                show_tool_expand_hint: false,
+            };
+            let widget =
+                RenderedMessageWidget::new(&input, &MessageRenderTheme::plain(), 40, None, None);
+            let height = widget.height(40);
+            let mut buf = buffer(40, height);
+            widget.render(Rect::new(0, 0, 40, height), &mut buf);
+            assert!((0..height).any(|y| line(&buf, y).contains(expected)));
+        }
     }
 
     #[test]

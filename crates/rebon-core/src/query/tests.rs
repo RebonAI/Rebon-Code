@@ -827,6 +827,7 @@ fn query_event_kind(event: &QueryEvent) -> &'static str {
         QueryEvent::ToolDispatchProgress { .. } => "tool-progress",
         QueryEvent::ToolDispatchResult { .. } => "tool-result",
         QueryEvent::IterationLimitReached { .. } => "iteration-limit",
+        QueryEvent::TurnHookHistoryInjected { .. } => "hook-injection",
         QueryEvent::AttachmentInjected { .. } => "attachment",
         QueryEvent::ContextReset { .. } => "context-reset",
         QueryEvent::CompactingStarted { .. } => "compact-start",

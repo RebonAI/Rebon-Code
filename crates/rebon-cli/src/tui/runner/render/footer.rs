@@ -206,20 +206,18 @@ pub(in crate::tui::runner) fn render_footer(
         ));
     }
     if let Some(pct) = status.context_left_pct {
-        if pct < 20 {
-            let color = if pct > 10 {
-                parse_theme_color(ds_footer.warning)
-            } else {
-                parse_theme_color(ds_footer.error)
-            };
-            if !right_spans.is_empty() {
-                right_spans.push(Span::raw("  "));
-            }
-            right_spans.push(Span::styled(
-                format!("{pct}% until auto-compact"),
-                Style::default().fg(color),
-            ));
+        let color = if pct > 10 {
+            parse_theme_color(ds_footer.warning)
+        } else {
+            parse_theme_color(ds_footer.error)
+        };
+        if !right_spans.is_empty() {
+            right_spans.push(Span::raw("  "));
         }
+        right_spans.push(Span::styled(
+            format!("{pct:>2}% until auto-compact"),
+            Style::default().fg(color),
+        ));
     }
 
     let left_line = Line::from(left_spans);

@@ -383,7 +383,7 @@ mod tests {
         let read = host
             .invoke_inner(
                 "Read",
-                serde_json::json!({ "file_path": file.to_string_lossy() }),
+                serde_json::json!({ "targets": [{ "path": file.to_string_lossy() }] }),
             )
             .await
             .expect("Read succeeds without any grant");

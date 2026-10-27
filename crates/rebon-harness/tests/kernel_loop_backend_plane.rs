@@ -207,7 +207,8 @@ async fn the_backend_runs_a_switched_session_turn_end_to_end() {
     let probe_file = workspace.path().join("loop-probe.txt");
     std::fs::write(&probe_file, "后端轮暗号BACKEND-9257\n").expect("probe file written");
 
-    let read_args = serde_json::json!({ "file_path": probe_file.to_string_lossy() }).to_string();
+    let read_args =
+        serde_json::json!({ "targets": [{ "path": probe_file.to_string_lossy() }] }).to_string();
     let step_one = sse_body(&[
         serde_json::json!({"choices":[{"index":0,"delta":{"reasoning_content":"查文件"}}]}),
         serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[
@@ -370,7 +371,7 @@ async fn the_backend_runs_a_switched_session_turn_end_to_end() {
     assert!(
         tool_call
             .3
-            .is_some_and(|input| input.contains_key("file_path")),
+            .is_some_and(|input| input.contains_key("targets")),
         "raw input must carry the parsed arguments"
     );
     let tool_update = updates
@@ -386,7 +387,12 @@ async fn the_backend_runs_a_switched_session_turn_end_to_end() {
         })
         .expect("tool result streamed");
     assert_eq!(tool_update.0, "call-backend-1");
-    assert_eq!(tool_update.1, Some(ToolCallStatus::Completed));
+    assert_eq!(
+        tool_update.1,
+        Some(ToolCallStatus::Completed),
+        "tool result: {:?}",
+        tool_update.2
+    );
     assert!(
         format!("{:?}", tool_update.2).contains("BACKEND-9257"),
         "tool result must carry the file payload: {:?}",

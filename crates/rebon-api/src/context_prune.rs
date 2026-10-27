@@ -1233,6 +1233,8 @@ struct ReadSignature {
     path: String,
     offset: Option<i64>,
     limit: Option<i64>,
+    // Batch selectors are distinct from legacy offset/limit windows.
+    selectors: Option<String>,
 }
 
 /// Collect the tool_use ids of the latest `Read` invocation for each
@@ -1262,17 +1264,37 @@ fn protected_file_read_ids(messages: &[Message]) -> std::collections::HashSet<St
             if tu.name != "Read" {
                 continue;
             }
-            let Some(path) = tu.input.get("file_path").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let sig = ReadSignature {
-                path: path.to_string(),
-                offset: tu.input.get("offset").and_then(|v| v.as_i64()),
-                limit: tu.input.get("limit").and_then(|v| v.as_i64()),
-            };
-            // Later occurrences overwrite earlier ones, so `latest`
-            // ends up keyed on the newest id per signature.
-            latest.insert(sig, tu.id.clone());
+            if let Some(targets) = tu.input.get("targets").and_then(|v| v.as_array()) {
+                for target in targets {
+                    let Some(path) = target.get("path").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let selectors = serde_json::json!([
+                        target.get("start"),
+                        target.get("end"),
+                        target.get("symbol"),
+                        target.get("pages")
+                    ])
+                    .to_string();
+                    latest.insert(
+                        ReadSignature {
+                            path: path.to_string(),
+                            offset: None,
+                            limit: None,
+                            selectors: Some(selectors),
+                        },
+                        tu.id.clone(),
+                    );
+                }
+            } else if let Some(path) = tu.input.get("file_path").and_then(|v| v.as_str()) {
+                let sig = ReadSignature {
+                    path: path.to_string(),
+                    offset: tu.input.get("offset").and_then(|v| v.as_i64()),
+                    limit: tu.input.get("limit").and_then(|v| v.as_i64()),
+                    selectors: None,
+                };
+                latest.insert(sig, tu.id.clone());
+            }
         }
     }
 
@@ -2491,6 +2513,37 @@ mod tests {
         } else {
             panic!("expected tool result");
         }
+    }
+
+    #[test]
+    fn batch_read_protects_latest_per_target_and_selector() {
+        let messages = vec![
+            assistant_msg(vec![make_tool_use(
+                "batch",
+                "Read",
+                serde_json::json!({"targets": [{"path":"a", "start":1}, {"path":"b", "symbol":"f"}]}),
+            )]),
+            assistant_msg(vec![make_tool_use(
+                "new_a",
+                "Read",
+                serde_json::json!({"targets": [{"path":"a", "start":1}]}),
+            )]),
+            assistant_msg(vec![make_tool_use(
+                "other",
+                "Read",
+                serde_json::json!({"targets": [{"path":"b", "pages":"1-2"}]}),
+            )]),
+            assistant_msg(vec![make_tool_use(
+                "legacy",
+                "Read",
+                serde_json::json!({"file_path":"a", "offset":1}),
+            )]),
+        ];
+        let ids = protected_file_read_ids(&messages);
+        for id in ["batch", "new_a", "other", "legacy"] {
+            assert!(ids.contains(id));
+        }
+        assert_eq!(ids.len(), 4);
     }
 
     #[test]

@@ -8,6 +8,69 @@ pub(super) const NEW_SESSION_HINT_TOKENS_THRESHOLD: u32 = 8_000;
 pub(super) const NEW_SESSION_HINT_IDLE_DELAY: Duration = Duration::from_secs(60 * 60);
 const STALE_SESSION_WARNING_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
+#[derive(Default)]
+pub(super) struct CompactWarningTracker {
+    session_id: String,
+    threshold: u32,
+    last_estimate: Option<u32>,
+    visible: bool,
+}
+
+impl CompactWarningTracker {
+    pub(super) fn update(
+        &mut self,
+        session_id: &str,
+        budget: &rebon_api::ContextBudget,
+        is_loading: bool,
+    ) -> Option<u32> {
+        if self.session_id != session_id {
+            *self = Self {
+                session_id: session_id.to_owned(),
+                ..Self::default()
+            };
+        }
+        let threshold = budget.auto_compact_threshold();
+        if self.threshold != threshold {
+            self.threshold = threshold;
+            self.last_estimate = None;
+            self.visible = false;
+        }
+        if threshold == 0 || !budget.should_auto_compact_for_tokens(threshold) {
+            self.last_estimate = None;
+            self.visible = false;
+            return None;
+        }
+        let usage = budget.usage_snapshot();
+        let tokens = match usage.source {
+            rebon_api::ContextUsageSource::Unknown => {
+                self.last_estimate = None;
+                self.visible = false;
+                return None;
+            }
+            rebon_api::ContextUsageSource::Estimated => {
+                self.last_estimate = Some(usage.tokens);
+                usage.tokens
+            }
+            rebon_api::ContextUsageSource::Server if is_loading => {
+                // The server count describes the previous request, not the pending tool results.
+                usage.tokens.max(self.last_estimate.unwrap_or(0))
+            }
+            rebon_api::ContextUsageSource::Server => {
+                self.last_estimate = None;
+                usage.tokens
+            }
+        };
+        if tokens == 0 {
+            self.visible = false;
+            return None;
+        }
+        let pct = ((u64::from(threshold.saturating_sub(tokens)) * 100 + u64::from(threshold) / 2)
+            / u64::from(threshold)) as u32;
+        self.visible = if self.visible { pct < 22 } else { pct < 20 };
+        self.visible.then_some(pct)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AgentActivityInfo {
     pub(super) elapsed_ms: u64,
@@ -33,8 +96,8 @@ pub(in crate::tui) struct StatusBarInfo<'a> {
     /// Current OpenAI OAuth fast-mode display marker. Empty when fast
     /// mode is off or unavailable for the current provider.
     pub(super) fast_mode_display: String,
-    /// Percentage of context left until auto-compact triggers.
-    /// `None` when no usage has been reported yet (budget unknown).
+    /// Estimated percentage of context left until auto-compact triggers.
+    /// `None` when the warning is not applicable or the budget is unknown.
     pub(super) context_left_pct: Option<u32>,
     /// Optional right-aligned timer for live coordinator agent tasks.
     pub(super) agent_activity: Option<AgentActivityInfo>,
@@ -182,6 +245,44 @@ pub(crate) fn stale_resume_warning(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_warning_tracks_projected_usage_and_real_threshold() {
+        let budget = rebon_api::ContextBudget::with_output_reserve(200_000, 20_000);
+        budget.set_auto_compact_token_limit(Some(100_000));
+        let mut tracker = CompactWarningTracker::default();
+        budget.report_estimated_usage(83_000);
+        assert_eq!(tracker.update("a", &budget, true), Some(17));
+        budget.report_usage(90_000);
+        assert_eq!(tracker.update("a", &budget, true), Some(10));
+        budget.report_estimated_usage(83_000);
+        budget.report_usage(70_000);
+        assert_eq!(tracker.update("a", &budget, true), Some(17));
+        budget.report_estimated_usage(85_000);
+        assert_eq!(tracker.update("a", &budget, true), Some(15));
+        budget.report_estimated_usage(79_000);
+        assert_eq!(tracker.update("a", &budget, true), Some(21));
+        budget.report_estimated_usage(77_000);
+        assert_eq!(tracker.update("a", &budget, true), None);
+        budget.report_usage(83_000);
+        assert_eq!(tracker.update("a", &budget, false), Some(17));
+        budget.set_auto_compact_enabled(false);
+        assert_eq!(tracker.update("a", &budget, false), None);
+        budget.set_auto_compact_enabled(true);
+        budget.clear_usage();
+        assert_eq!(tracker.update("a", &budget, false), None);
+        budget.report_usage(60_000);
+        assert_eq!(tracker.update("b", &budget, true), None);
+        budget.report_estimated_usage(90_000);
+        assert_eq!(tracker.update("b", &budget, true), Some(10));
+        budget.set_auto_compact_token_limit(Some(120_000));
+        budget.report_usage(70_000);
+        assert_eq!(tracker.update("b", &budget, true), None);
+        budget.report_estimated_usage(110_000);
+        assert_eq!(tracker.update("b", &budget, true), Some(8));
+        budget.report_estimated_usage(10_000);
+        assert_eq!(tracker.update("b", &budget, true), None);
+    }
 
     use crate::tui::app::AppState;
 

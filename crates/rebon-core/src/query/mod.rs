@@ -543,6 +543,12 @@ pub enum QueryEvent {
         /// Iteration count when the limit was hit.
         iterations: usize,
     },
+    /// A user-role hook writeback committed to in-memory history. This does
+    /// not imply that a provider request was sent or accepted.
+    TurnHookHistoryInjected {
+        iteration: usize,
+        message: ApiMessage,
+    },
     /// The attachment poller injected a message between iterations.
     /// Emitted once per message the poller returned, right before
     /// the next model request is built. Consumers (TUI, ACP update
@@ -575,6 +581,7 @@ pub enum QueryEvent {
     CompactingStarted {
         /// Number of messages before compaction.
         messages_before: usize,
+        manual: bool,
     },
     /// Active compaction finished. The TUI should inject a system
     /// message and resume the normal spinner verb.

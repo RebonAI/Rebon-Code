@@ -55,6 +55,7 @@ mod profile_command;
 mod profile_proposal;
 mod prompt_history;
 mod prompt_lifecycle;
+mod prompt_suggestion;
 mod quick_open;
 mod remote_background_attachment;
 mod remote_session_option;

@@ -1243,11 +1243,36 @@ pub fn describe_worker_after_tool_activity(name: &str) -> String {
     format!("processing {name} result")
 }
 
+#[cfg(test)]
+#[test]
+fn batch_read_activity_mentions_paths() {
+    let input = serde_json::json!({"targets": [{"path": "/a"}, {"path": "/b"}]});
+    assert_eq!(
+        describe_worker_tool_activity("Read", &input),
+        "reading /a, /b"
+    );
+}
+
 pub fn describe_worker_tool_activity(name: &str, input: &Value) -> String {
     match name {
-        "Read" | "FileReadTool" => input_first_str(input, &["file_path", "path"])
-            .map(|path| format!("reading {}", compact_activity_text(path, 96)))
-            .unwrap_or_else(|| format!("running {name}")),
+        "Read" | "FileReadTool" => {
+            let paths = input
+                .get("targets")
+                .and_then(Value::as_array)
+                .map(|targets| {
+                    targets
+                        .iter()
+                        .filter_map(|target| target.get("path").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                });
+            paths
+                .as_deref()
+                .filter(|paths| !paths.is_empty())
+                .or_else(|| input_first_str(input, &["file_path", "path"]))
+                .map(|path| format!("reading {}", compact_activity_text(path, 96)))
+                .unwrap_or_else(|| format!("running {name}"))
+        }
         "Grep" | "GrepTool" => {
             let pattern = input_first_str(input, &["pattern", "query"])
                 .map(|value| compact_activity_text(value, 64));
@@ -3380,10 +3405,16 @@ fn build_local_shell_notification_xml(snap: &TaskSnapshot) -> String {
     }
     let output_path = result_text("outputPath");
     if let Some(path) = output_path {
-        message.push_str(&format!("\n<output-file>{}</output-file>", xml_escape(path)));
+        message.push_str(&format!(
+            "\n<output-file>{}</output-file>",
+            xml_escape(path)
+        ));
     }
     if let Some(tail) = result_text("outputTail") {
-        message.push_str(&format!("\n<output-tail>{}</output-tail>", xml_escape(tail)));
+        message.push_str(&format!(
+            "\n<output-tail>{}</output-tail>",
+            xml_escape(tail)
+        ));
         let tail_truncated = result
             .and_then(|value| value.get("tailTruncated"))
             .and_then(Value::as_bool)

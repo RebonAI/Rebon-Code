@@ -36,6 +36,8 @@ pub enum KeyAction {
     CursorLeft,
     /// Move the cursor right by one grapheme.
     CursorRight,
+    /// Accept the current prompt suggestion without submitting.
+    AcceptPromptSuggestion,
     /// Move the cursor to column 0 of the current logical line.
     CursorHome,
     /// Move the cursor to the end of the current logical line.
@@ -231,6 +233,21 @@ pub fn translate_key(key: &KeyEvent, app: &AppState) -> KeyAction {
         || (matches!(key.code, KeyCode::Tab) && key.modifiers.contains(KeyModifiers::SHIFT))
     {
         return KeyAction::CyclePermissionMode;
+    }
+
+    if key.modifiers == KeyModifiers::NONE
+        && matches!(key.code, KeyCode::Tab | KeyCode::Right)
+        && app.input.is_empty()
+        && app.prompt_suggestion_text.is_some()
+        && !app.is_loading
+        && !app.has_modal_overlay()
+        && app.footer_selection.is_none()
+        && app.slash_picker.is_none()
+        && app.at_mention_picker.is_none()
+        && app.foregrounded_task_id.is_none()
+        && app.mode == "prompt"
+    {
+        return KeyAction::AcceptPromptSuggestion;
     }
 
     match key.code {
@@ -995,6 +1012,33 @@ mod tests {
             }
             other => panic!("expected TextEdit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn prompt_suggestion_keys_respect_modifiers_and_focus() {
+        let mut app = app_with_input("", 0);
+        app.prompt_suggestion_text = Some("next".into());
+        for code in [KeyCode::Tab, KeyCode::Right] {
+            assert!(matches!(
+                translate_key(&key(code, KeyModifiers::NONE), &app),
+                KeyAction::AcceptPromptSuggestion
+            ));
+            assert!(!matches!(
+                translate_key(&key(code, KeyModifiers::CONTROL), &app),
+                KeyAction::AcceptPromptSuggestion
+            ));
+        }
+        app.input = "typed".into();
+        assert!(!matches!(
+            translate_key(&key(KeyCode::Right, KeyModifiers::NONE), &app),
+            KeyAction::AcceptPromptSuggestion
+        ));
+        app.input.clear();
+        app.help_open = true;
+        assert!(matches!(
+            translate_key(&key(KeyCode::Tab, KeyModifiers::NONE), &app),
+            KeyAction::HelpNextTab
+        ));
     }
 
     #[test]

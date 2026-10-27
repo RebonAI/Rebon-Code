@@ -207,6 +207,7 @@ pub(crate) fn sync_compact_run(app: &mut AppState, session: &mut TuiEngineSessio
     match result {
         Ok((_, report)) if automatic && !report.used_model => {
             session.model.prune_level.budget.record_compact_failure();
+            crate::tui::update::seal_overlay_before_transcript_message(app);
             inject_system_message(app, "warning", "Idle auto-compaction could not summarize the conversation; the existing context was kept.");
             app.follow_transcript_tail = true;
         }
@@ -225,6 +226,7 @@ pub(crate) fn sync_compact_run(app: &mut AppState, session: &mut TuiEngineSessio
                     }
                     Err(error) => {
                         session.model.prune_level.budget.record_compact_failure();
+                        crate::tui::update::seal_overlay_before_transcript_message(app);
                         inject_system_message(
                             app,
                             "warning",
@@ -257,6 +259,7 @@ pub(crate) fn sync_compact_run(app: &mut AppState, session: &mut TuiEngineSessio
             } else {
                 text
             };
+            crate::tui::update::seal_overlay_before_transcript_message(app);
             inject_system_message(app, "compact", &text);
             app.follow_transcript_tail = true;
             answer_deferred_command(session, &worker_session_id, respond_to.as_deref(), Ok(text));
@@ -266,6 +269,7 @@ pub(crate) fn sync_compact_run(app: &mut AppState, session: &mut TuiEngineSessio
                 session.model.prune_level.budget.record_compact_failure();
             }
             let text = format!("Compaction failed: {message}");
+            crate::tui::update::seal_overlay_before_transcript_message(app);
             inject_system_message(app, "warning", &text);
             app.follow_transcript_tail = true;
             answer_deferred_command(
@@ -330,6 +334,7 @@ mod tests {
             true,
             idle
         ));
+        assert_eq!(crate::tui::compact_widget::desired_height(&app, 10), 1);
         for _ in 0..200 {
             sync_compact_run(&mut app, &mut session);
             if !session.engine_half.compact_runtime.is_running() {
@@ -338,6 +343,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(!session.engine_half.compact_runtime.is_running());
+        assert_eq!(crate::tui::compact_widget::desired_height(&app, 10), 0);
         assert_eq!(budget.consecutive_compact_failures(), 1);
         assert!(!maybe_start_idle_compact(
             &mut app,
@@ -371,7 +377,9 @@ mod tests {
             true,
             idle
         ));
+        assert_eq!(crate::tui::compact_widget::desired_height(&app, 10), 1);
         invalidate_idle_compact(&mut app);
+        assert_eq!(crate::tui::compact_widget::desired_height(&app, 10), 0);
         for _ in 0..200 {
             sync_compact_run(&mut app, &mut session);
             if !session.engine_half.compact_runtime.is_running() {
@@ -424,6 +432,10 @@ mod tests {
     #[tokio::test]
     async fn a_failed_run_clears_the_widget_and_reports_it_in_the_transcript() {
         let mut app = AppState::new();
+        rebon_tui::reducer(
+            &mut app.rebon_tui,
+            rebon_tui::Action::AppendStreamingText("earlier reply".into()),
+        );
         let mut session = super::super::test_support::make_test_tui_session();
         let handle = tokio::runtime::Handle::current();
         let _ = start_manual_compact(&mut app, &mut session, &handle, None, None);
@@ -441,6 +453,15 @@ mod tests {
             "the run never settled"
         );
         assert!(app.compact_run.is_none(), "the progress widget must clear");
+        let rows = app.rebon_tui.transcript.rows();
+        assert!(
+            matches!(&rows[0], rebon_tui::Message::Assistant(_)),
+            "{rows:?}"
+        );
+        assert!(
+            matches!(&rows[1], rebon_tui::Message::System(_)),
+            "{rows:?}"
+        );
         let rendered = app
             .rebon_tui
             .transcript

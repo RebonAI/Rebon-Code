@@ -2194,7 +2194,11 @@ pub enum SessionUpdate {
     },
 
     /// Context compaction has started.
-    CompactingStarted { messages_before: usize },
+    CompactingStarted {
+        messages_before: usize,
+        #[serde(default)]
+        manual: bool,
+    },
 
     /// Context compaction finished.
     CompactingDone {
@@ -2253,4 +2257,30 @@ pub enum SessionUpdate {
 pub struct SessionUpdateParams {
     pub session_id: SessionId,
     pub update: SessionUpdate,
+}
+
+#[cfg(test)]
+mod compaction_update_tests {
+    use super::SessionUpdate;
+    use serde_json::json;
+
+    #[test]
+    fn compaction_trigger_round_trips_and_defaults_for_older_peers() {
+        for manual in [false, true] {
+            let update = SessionUpdate::CompactingStarted {
+                messages_before: 42,
+                manual,
+            };
+            let value = serde_json::to_value(update).unwrap();
+            assert_eq!(value["manual"], manual);
+            assert!(
+                matches!(serde_json::from_value::<SessionUpdate>(value).unwrap(), SessionUpdate::CompactingStarted { manual: actual, .. } if actual == manual)
+            );
+        }
+        let old = json!({"sessionUpdate": "compacting_started", "messages_before": 42});
+        assert!(matches!(
+            serde_json::from_value::<SessionUpdate>(old).unwrap(),
+            SessionUpdate::CompactingStarted { manual: false, .. }
+        ));
+    }
 }

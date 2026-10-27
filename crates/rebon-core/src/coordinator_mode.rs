@@ -346,7 +346,7 @@ User:
 You:
   Reading the report to see the actual findings.
 
-  Read({ file_path: "/tasks/agent-a1b.report.md" })
+  Read({ targets: [{ path: "/tasks/agent-a1b.report.md" }] })
 
   *(reads report, sees: "Files inspected: src/auth/session.ts, src/auth/tokens.ts. Issue: src/auth/session.ts:42 dereferences session.user.id without a null check. session.user is undefined when Session.expired === true but the cached token hasn't been evicted yet (see src/auth/tokens.ts). Recommended fix: null-check session.user before accessing .id; return 401 'Session expired' on null.")*
 
@@ -574,7 +574,7 @@ User:
 You:
   Reading the report.
 
-  Read({ file_path: "/tasks/agent-a1b.report.md" })
+  Read({ targets: [{ path: "/tasks/agent-a1b.report.md" }] })
 
   *(reads structured report, sees concrete files / lines / root cause)*
 
@@ -597,7 +597,7 @@ User:
 You:
   Reading the report.
 
-  Read({ file_path: "/tasks/agent-d4e.report.md" })
+  Read({ targets: [{ path: "/tasks/agent-d4e.report.md" }] })
 
   *(reads report, sees the fix landed but one existing assertion still expects the old error text)*
 
@@ -1361,6 +1361,17 @@ pub fn match_session_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinator_read_examples_use_batch_schema() {
+        for simple in [false, true] {
+            for worktree in [false, true] {
+                let prompt = coordinator_system_prompt_with_options(simple, worktree);
+                assert!(!prompt.contains("Read({ file_path:"));
+                assert_eq!(prompt.matches("Read({ targets: [{ path:").count(), 3);
+            }
+        }
+    }
 
     // Env access needs serialisation because std::env::set_var is
     // process-global. Shares `crate::test_env_lock` with every other

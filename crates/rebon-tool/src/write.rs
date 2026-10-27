@@ -379,10 +379,10 @@ fn check_read_before_write_with_state(
     match observed_state {
         None => Ok(ValidationOutcome::invalid(
             format!(
-                "File has not been read yet. Use the Read tool with file_path={} first \
+                "File has not been read yet. Use the Read tool with {} first \
                  before overwriting it. Write is destructive and requires the model to \
                  have seen the current contents.",
-                path.display()
+                json!({"targets": [{"path": path}]}),
             ),
             MUST_READ_BEFORE_WRITE_CODE,
         )),
@@ -522,6 +522,10 @@ mod tests {
                 assert!(
                     reason.contains("Read tool"),
                     "reason should tell the model to Read: {reason}"
+                );
+                assert!(
+                    reason.contains(&json!({"targets":[{"path":file}]}).to_string()),
+                    "{reason}"
                 );
             }
             other => panic!("expected InvalidInput, got {other:?}"),

@@ -169,6 +169,9 @@ pub(super) fn maybe_update_loading_state(
         .as_ref()
         .unwrap_or(&session.engine_half.runtime);
     finalize_turn(app, &turn_runtime.session_id);
+    app.prompt_suggestion_turn = app.prompt_suggestion_turn.wrapping_add(1);
+    app.prompt_suggestion_session = Some(turn_runtime.session_id.clone());
+    app.prompt_suggestion_text = None;
     if let Some(elapsed) = completed_elapsed {
         super::transcript_messages::inject_worked_message(app, elapsed);
     }

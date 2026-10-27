@@ -1074,7 +1074,10 @@ mod tests {
 
     #[test]
     fn compaction_events_preserve_their_phase() {
-        let started = project_json(&QueryEvent::CompactingStarted { messages_before: 3 });
+        let started = project_json(&QueryEvent::CompactingStarted {
+            messages_before: 3,
+            manual: false,
+        });
         let finished = project_json(&QueryEvent::CompactingFinished {
             messages_after: 1,
             used_model: true,

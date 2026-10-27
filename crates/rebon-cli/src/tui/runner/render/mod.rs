@@ -223,6 +223,18 @@ mod tests {
     }
 
     #[test]
+    fn idle_auto_compaction_shows_status_without_a_progress_bar() {
+        let mut app = compacting_app();
+        app.compact_run.as_mut().unwrap().automatic = true;
+        let rows = render_screen_rows(app, 120, 20);
+        let status = rows
+            .iter()
+            .find(|row| row.contains("Auto Compacting"))
+            .unwrap_or_else(|| panic!("idle auto-compaction must be visible: {rows:?}"));
+        assert!(!status.contains('▕') && !status.contains('%'), "{status}");
+    }
+
+    #[test]
     fn a_running_compaction_paints_its_bar_above_the_prompt() {
         let rows = render_screen_rows(compacting_app(), 120, 20);
 

@@ -225,6 +225,7 @@ pub mod plan_mode;
 pub mod powershell;
 pub mod queue;
 pub mod read;
+mod read_outline;
 mod search_walk;
 pub mod shell_management;
 pub mod shell_preference;
@@ -3266,7 +3267,7 @@ mod tests {
         let mut reader = tokio::spawn(async move {
             ReadTool
                 .call(
-                    serde_json::json!({ "file_path": reader_path }),
+                    serde_json::json!({ "targets": [{ "path": reader_path }] }),
                     &ToolContext::new().with_file_state_cache(FileStateCache::new()),
                 )
                 .await
@@ -3283,7 +3284,7 @@ mod tests {
         release_tx.send(()).unwrap();
         writer.await.unwrap().expect("writer");
         let read = reader.await.unwrap().expect("reader");
-        assert!(read["file"]["content"]
+        assert!(read["results"][0]["file"]["content"]
             .as_str()
             .expect("text content")
             .contains("after"));

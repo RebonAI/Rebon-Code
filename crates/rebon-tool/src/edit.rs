@@ -504,10 +504,10 @@ pub fn check_read_before_edit_with_state(
     match observed_state {
         None => Ok(ValidationOutcome::invalid(
             format!(
-                "File has not been read yet. Use the Read tool with file_path={} first, \
+                "File has not been read yet. Use the Read tool with {} first, \
                  then retry the Edit. Read establishes the baseline content that Edit \
                  matches `old_string` against.",
-                path.display()
+                json!({"targets": [{"path": path}]}),
             ),
             MUST_READ_BEFORE_EDIT_CODE,
         )),
@@ -979,6 +979,10 @@ mod tests {
                 assert!(
                     reason.contains("Read tool"),
                     "reason should tell the model to Read: {reason}"
+                );
+                assert!(
+                    reason.contains(&json!({"targets":[{"path":file}]}).to_string()),
+                    "{reason}"
                 );
             }
             other => panic!("expected InvalidInput, got {other:?}"),

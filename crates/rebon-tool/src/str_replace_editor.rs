@@ -227,11 +227,11 @@ fn translate(input: &Value, for_validation: bool) -> ToolResult<Translated> {
                     input: Value::Null,
                 });
             }
-            let mut read = json!({ "file_path": display });
+            let mut read = json!({ "targets": [{ "path": display }] });
             if let Some((start, end)) = view_range_of(input)? {
-                read["offset"] = json!(start);
+                read["targets"][0]["start"] = json!(start);
                 if end != -1 {
-                    read["limit"] = json!(end - start + 1);
+                    read["targets"][0]["end"] = json!(end);
                 }
             }
             Ok(Translated {
@@ -362,7 +362,10 @@ fn retarget_guidance(outcome: ValidationOutcome, translated: &Translated) -> Val
     };
     let rewritten = message
         .replace(
-            &format!("Use the Read tool with file_path={path} first"),
+            &format!(
+                "Use the Read tool with {} first",
+                json!({"targets": [{"path": path}]})
+            ),
             &format!(
                 "Run `{STR_REPLACE_EDITOR_TOOL_NAME}` with command=view and path={path} first"
             ),
@@ -508,6 +511,18 @@ impl Tool for StrReplaceEditorTool {
         let translated = translate(&input, false)?;
         match translated.target {
             Target::ListDirectory(ref root) => list_directory(root),
+            Target::Read => {
+                let result = ReadTool.call(translated.input, context).await?;
+                let item = result["results"]
+                    .as_array()
+                    .and_then(|items| items.first())
+                    .cloned()
+                    .ok_or_else(|| invalid("Read returned no result"))?;
+                if item["type"] == "error" {
+                    return Err(invalid(item["error"].as_str().unwrap_or("Read failed")));
+                }
+                Ok(item)
+            }
             _ => {
                 let tool = translated
                     .tool()
@@ -570,8 +585,8 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(translated.target, Target::Read));
-        assert_eq!(translated.input["offset"], 2);
-        assert_eq!(translated.input["limit"], 2);
+        assert_eq!(translated.input["targets"][0]["start"], 2);
+        assert_eq!(translated.input["targets"][0]["end"], 3);
     }
 
     #[test]
@@ -584,8 +599,8 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(translated.input["offset"], 2);
-        assert!(translated.input.get("limit").is_none());
+        assert_eq!(translated.input["targets"][0]["start"], 2);
+        assert!(translated.input["targets"][0].get("end").is_none());
     }
 
     #[test]
@@ -764,6 +779,27 @@ mod tests {
             !message.contains("Use the Read tool"),
             "stale advice leaked: {message}"
         );
+    }
+
+    #[test]
+    fn read_before_write_advice_is_translated_with_escaped_path() {
+        let path = "/a/quoted\"file.txt";
+        let translated = Translated {
+            target: Target::Write,
+            input: json!({"file_path": path}),
+        };
+        let message = format!(
+            "File has not been read yet. Use the Read tool with {} first before overwriting it.",
+            json!({"targets": [{"path": path}]})
+        );
+        let outcome = retarget_guidance(ValidationOutcome::invalid(message, 6), &translated);
+        let message = outcome.message.unwrap();
+        assert!(
+            message.contains("str_replace_editor` with command=view"),
+            "{message}"
+        );
+        assert!(!message.contains("Use the Read tool"), "{message}");
+        assert!(message.contains(path), "{message}");
     }
 
     #[test]

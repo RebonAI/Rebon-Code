@@ -291,6 +291,7 @@ async fn compact_history(
 ) -> (u32, u32, bool) {
     let _ = tx.send(QueryEvent::CompactingStarted {
         messages_before: manager.len(),
+        manual: trigger == CompactTrigger::Manual,
     });
     let before_tokens = next_request_input_estimate(manager, params);
     let result =
@@ -1521,7 +1522,14 @@ fn commit_turn_hook_writeback(
 ) {
     context.extend_coordinator_report_paths(applied.coordinator_report_paths);
     for message in applied.history {
+        let user_message = (message.role == rebon_api::Role::User).then(|| message.clone());
         manager.push_message(message);
+        if let Some(message) = user_message {
+            let _ = tx.send(QueryEvent::TurnHookHistoryInjected {
+                iteration: announce_iteration,
+                message,
+            });
+        }
     }
     for attachment in applied.injected_attachments {
         let _ = tx.send(QueryEvent::AttachmentInjected {

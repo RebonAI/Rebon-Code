@@ -1468,8 +1468,45 @@ pub(super) fn render_streaming_tool_use_with_content(
     // Render the header row (always shown) via its own gutter call so
     // the body block below can own a `⎿` glyph without fighting the
     // single-paragraph wrap used by the legacy all-in-one path.
+    let header_lines = if name == "Bash" {
+        let wrapped = hard_wrap_text_lines(
+            std::slice::from_ref(&header_text),
+            area.width.saturating_sub(GUTTER).max(1),
+        );
+        let wrapped = if wrapped.len() > 3 && verbosity != ToolOutputVerbosity::Verbose {
+            vec![
+                wrapped[0].clone(),
+                "…".to_string(),
+                wrapped
+                    .last()
+                    .expect("wrapped header has more than three lines")
+                    .clone(),
+            ]
+        } else {
+            wrapped
+        };
+        header_text = wrapped.join("\n");
+        wrapped
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| {
+                if index == 0 {
+                    if let Some(summary) = text.strip_prefix(display_name) {
+                        return Line::from(vec![
+                            Span::styled(display_name.to_string(), tool_name_style(theme)),
+                            Span::styled(summary.to_string(), theme.assistant_prefix),
+                        ]);
+                    }
+                }
+                Line::from(Span::styled(text, theme.assistant_prefix))
+            })
+            .collect()
+    } else {
+        vec![header_line]
+    };
+
     let mut consumed = render_gutter_lines(
-        vec![header_line.clone()],
+        header_lines.clone(),
         &header_text,
         gutter_glyph,
         gutter_style,
@@ -1478,7 +1515,7 @@ pub(super) fn render_streaming_tool_use_with_content(
     );
     if theme.supports_hyperlinks {
         apply_line_hyperlinks(
-            &[header_line],
+            &header_lines,
             Rect {
                 x: area.x.saturating_add(GUTTER),
                 y: area.y,

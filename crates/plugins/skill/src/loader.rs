@@ -693,6 +693,19 @@ pub fn extract_file_paths(tool_uses: &[(&str, &serde_json::Value)]) -> Vec<Strin
         };
         // The file tools name their target in a field they each declare;
         // Glob and Grep take a directory to search under `path`.
+        if rebon_tools_core::builtin_tool_facts_for_name(name)
+            .is_some_and(|facts| facts.name == "Read")
+        {
+            if let Some(targets) = obj.get("targets").and_then(|v| v.as_array()) {
+                paths.extend(targets.iter().filter_map(|target| {
+                    target
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                }));
+                continue;
+            }
+        }
         if let Some(field) = rebon_tools_core::file_target_field_for_name(name) {
             if let Some(p) = obj.get(field).and_then(|v| v.as_str()) {
                 paths.push(p.to_string());
@@ -1340,6 +1353,16 @@ mod tests {
     }
 
     // -- file path extraction --
+
+    #[test]
+    fn extract_batch_read_paths() {
+        let input =
+            serde_json::json!({"targets": [{"path": "/project/a.rs"}, {"path": "/project/b.rs"}]});
+        assert_eq!(
+            extract_file_paths(&[("Read", &input)]),
+            vec!["/project/a.rs", "/project/b.rs"]
+        );
+    }
 
     #[test]
     fn extract_file_paths_from_tool_uses() {

@@ -690,17 +690,18 @@ fn render_teammate_renderables(
 fn render_generic_system_display(
     display: &SystemGenericTextDisplay,
     theme: &MessagesRenderTheme,
-) -> Line<'static> {
-    render_system_line(
-        display.marker,
-        display.content.clone(),
-        match display.color.as_deref() {
-            Some("warning") => theme.warning,
-            Some("error") => theme.error,
-            _ if display.dim_color => theme.dim,
-            _ => theme.text,
-        },
-    )
+) -> Vec<Line<'static>> {
+    let style = match display.color.as_deref() {
+        Some("warning") => theme.warning,
+        Some("error") => theme.error,
+        _ if display.dim_color => theme.dim,
+        _ => theme.text,
+    };
+    display
+        .content
+        .split('\n')
+        .map(|line| render_system_line(display.marker, line.to_string(), style))
+        .collect()
 }
 
 fn render_system_line(

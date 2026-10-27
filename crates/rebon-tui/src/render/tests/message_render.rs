@@ -55,8 +55,39 @@ fn compact_report_is_visible_in_compact_verbosity() {
     );
     let text = all_text(&buf);
     assert!(used > 0, "{text}");
-    assert!(text.contains("Compacted successfully"), "{text}");
+    assert!(text.contains("● Compacted successfully"), "{text}");
     assert!(text.contains("Recently accessed: notes.md"), "{text}");
+    let first = (0..8)
+        .find(|&y| row_text(&buf, y).contains("● Compacted successfully"))
+        .unwrap();
+    assert!(
+        row_text(&buf, first + 1).contains("Recently accessed: notes.md"),
+        "{text}"
+    );
+}
+
+#[test]
+fn automatic_compact_report_preserves_separate_rows() {
+    let mut message = system_info("auto-compact", "Automatically compacted after extended idle time.\nCompacted successfully\n⎿ Recently accessed: notes.md\n\nFreed 123 tokens");
+    let Message::System(system) = &mut message else {
+        unreachable!()
+    };
+    system.subtype = "compact".into();
+    let mut buf = new_buf(80, 8);
+    render_message(
+        &message,
+        Rect::new(0, 0, 80, 8),
+        &mut buf,
+        &RenderTheme::plain(),
+        ToolOutputVerbosity::Compact,
+    );
+    let first = (0..8)
+        .find(|&y| row_text(&buf, y).contains("● Automatically compacted"))
+        .expect("automatic report header");
+    assert!(row_text(&buf, first + 1).contains("Compacted successfully"));
+    assert!(row_text(&buf, first + 2).contains("Recently accessed: notes.md"));
+    assert!(row_text(&buf, first + 3).is_empty());
+    assert!(row_text(&buf, first + 4).contains("Freed 123 tokens"));
 }
 
 #[test]

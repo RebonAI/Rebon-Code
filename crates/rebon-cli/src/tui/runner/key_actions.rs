@@ -277,6 +277,22 @@ fn handle_app_only_key_action(app: &mut AppState, action: KeyAction, ui_mode: Ui
             pop_undo(app);
             false
         }
+        KeyAction::AcceptPromptSuggestion => {
+            if app.input.is_empty() {
+                if let Some(text) = app.prompt_suggestion_text.as_ref() {
+                    app.input = text.clone();
+                    for paste in app
+                        .pasted_contents
+                        .iter()
+                        .filter(|paste| paste.kind == "image")
+                    {
+                        app.input.push_str(&format!(" [Image #{}]", paste.id));
+                    }
+                    app.cursor_offset = app.input.len();
+                }
+            }
+            false
+        }
         KeyAction::CursorRight => {
             let chips = extract_all_ref_positions(&app.input);
             app.cursor_offset =
@@ -540,6 +556,55 @@ mod tests {
     use super::super::test_support::{insert_local_agent_task, make_test_tui_session};
     use super::super::ActivePrompt;
     use super::handle_key_action;
+
+    #[test]
+    fn prompt_suggestion_accepts_without_submit_or_overwrite() {
+        let mut app = AppState::new();
+        app.prompt_suggestion_text = Some("下一步".into());
+        assert!(!super::handle_app_only_key_action(
+            &mut app,
+            KeyAction::AcceptPromptSuggestion,
+            UiMode::Inline,
+        ));
+        assert_eq!(app.input, "下一步");
+        assert_eq!(app.cursor_offset, app.input.len());
+        app.input.push('!');
+        super::handle_app_only_key_action(
+            &mut app,
+            KeyAction::AcceptPromptSuggestion,
+            UiMode::Inline,
+        );
+        assert_eq!(app.input, "下一步!");
+    }
+
+    #[test]
+    fn right_accepts_suggestion_with_pending_images_and_keeps_them_on_submit() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = AppState::new();
+        app.prompt_suggestion_text = Some("下一步".into());
+        for id in [1, 2] {
+            app.pasted_contents.push(rebon_types::PromptPasteContent {
+                id,
+                kind: "image".into(),
+                content: "image data".into(),
+                media_type: Some("image/png".into()),
+                filename: None,
+                source_path: None,
+            });
+        }
+        let action = crate::tui::event::translate_key(
+            &KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &app,
+        );
+        assert!(matches!(action, KeyAction::AcceptPromptSuggestion));
+        super::handle_app_only_key_action(&mut app, action, UiMode::Inline);
+        assert_eq!(app.input, "下一步 [Image #1] [Image #2]");
+        assert_eq!(app.cursor_offset, app.input.len());
+        let text = app.input.clone();
+        let payload = crate::tui::dispatch::take_submit_payload(&mut app, &text).unwrap();
+        assert_eq!(payload.image_pastes.len(), 2);
+    }
 
     fn make_immediate_handle() -> (Runtime, Handle) {
         let runtime = Builder::new_current_thread()
@@ -1239,7 +1304,10 @@ mod tests {
             &mut theme,
         );
 
-        assert!(session.model.service_tier.is_fast(), "the toggle still took");
+        assert!(
+            session.model.service_tier.is_fast(),
+            "the toggle still took"
+        );
         assert!(
             app.rebon_tui.transcript.is_empty(),
             "the empty screen stays empty rather than gaining a row"

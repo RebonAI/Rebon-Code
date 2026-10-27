@@ -156,7 +156,7 @@ async fn engine_query_executor_runs_full_turn_with_mock_model() {
     let projects_root_dir = temp_projects_root("full_turn");
     let projects_root = projects_root_dir.path();
     let executor = EngineQueryExecutor::new(engine, client, projects_root, "mock-model")
-        .with_max_iterations(5);
+        .with_max_iterations(11);
 
     let publisher = Arc::new(MemorySessionUpdatePublisher::new());
     let request = PromptRequest {
@@ -186,6 +186,7 @@ async fn engine_query_executor_runs_full_turn_with_mock_model() {
         skill_invocations: Vec::new(),
     };
 
+    let retry_request = request.clone();
     let outcome = executor.execute(request).await.unwrap();
     assert_eq!(outcome.stop_reason, AcpStopReason::EndTurn);
 
@@ -213,6 +214,60 @@ async fn engine_query_executor_runs_full_turn_with_mock_model() {
     // The file should contain at least one "user" and one "assistant" entry.
     assert!(raw.contains("\"type\":\"user\""));
     assert!(raw.contains("\"type\":\"assistant\""));
+    let rows: Vec<serde_json::Value> = raw
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let index = rows
+        .iter()
+        .position(|row| row["type"] == "turn_hook_injection")
+        .expect("injection diagnostic");
+    assert_eq!(rows[index]["stage"], "history_committed");
+    assert_eq!(rows[index]["message"]["content"][0]["text"], "[SYSTEM: You are approaching the iteration limit. You have 10 iterations remaining out of 11. Please wrap up your current work and provide a final response.]");
+    assert_eq!(rows[index]["parentUuid"], rows[index - 1]["uuid"]);
+    assert_ne!(rows[index + 1]["parentUuid"], rows[index]["uuid"]);
+    let loaded = rebon_session::load_transcript_from_file(&transcript_path)
+        .unwrap()
+        .unwrap();
+    let replay = serde_json::to_string(&transcript_to_api_messages(&loaded.messages)).unwrap();
+    assert!(!replay.contains("approaching the iteration limit"));
+    assert!(replay.contains("toolu_1"));
+    assert!(!loaded
+        .messages
+        .iter()
+        .any(|entry| entry.entry_type == "turn_hook_injection"));
+    let crash_path = projects_root.join("crash.jsonl");
+    std::fs::write(
+        &crash_path,
+        rows[..=index]
+            .iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let crashed = rebon_session::load_transcript_from_file(&crash_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        crashed.messages.last().unwrap().uuid,
+        rows[index - 1]["uuid"].as_str().unwrap()
+    );
+    let bad_root = projects_root.join("not-a-directory");
+    std::fs::write(&bad_root, "file").unwrap();
+    let client = MockModelClient::new();
+    client.push_turn(tool_turn("bad_tool", "Read", "bad_id", "{}"));
+    client.push_turn(text_turn("bad_done", "done"));
+    let executor = EngineQueryExecutor::new(
+        build_engine_with(tool as Arc<dyn Tool>),
+        Arc::new(client),
+        &bad_root,
+        "mock-model",
+    )
+    .with_max_iterations(11);
+    assert_eq!(
+        executor.execute(retry_request).await.unwrap().stop_reason,
+        AcpStopReason::EndTurn
+    );
 }
 
 #[tokio::test]
@@ -571,7 +626,7 @@ async fn same_response_same_file_writes_do_not_both_succeed() {
         Arc::new(rebon_tool::WriteTool),
     ]);
     let client = MockModelClient::new();
-    let read_input = serde_json::to_string(&json!({ "file_path": file })).unwrap();
+    let read_input = serde_json::to_string(&json!({ "targets": [{"path": file}] })).unwrap();
     let first_write = serde_json::to_string(&json!({
         "file_path": file,
         "content": "first"

@@ -2317,6 +2317,15 @@ fn parent_worker_tool_activity_lines(name: &str, input: &Value) -> Vec<String> {
     if !rebon_tools_core::tool_kind_for_name(name).touches_a_file() {
         return Vec::new();
     }
+    if matches!(name, "Read" | "FileReadTool") {
+        if let Some(targets) = input.get("targets").and_then(Value::as_array) {
+            return targets
+                .iter()
+                .filter_map(|target| input_first_str_for_parent_activity(target, &["path"]))
+                .map(str::to_string)
+                .collect();
+        }
+    }
     input_first_str_for_parent_activity(input, &["file_path", "notebook_path", "path"])
         .map(|path| vec![path.to_string()])
         .unwrap_or_default()
@@ -2829,6 +2838,19 @@ fn tasks_output_dir() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batched_read_activity_reports_each_file() {
+        assert_eq!(
+            parent_worker_tool_activity_lines(
+                "Read",
+                &serde_json::json!({
+                    "targets": [{"path": "a.rs"}, {"path": "b.rs"}]
+                })
+            ),
+            vec!["a.rs", "b.rs"]
+        );
+    }
     use async_trait::async_trait;
     use futures_util::StreamExt;
     use rebon_api::{

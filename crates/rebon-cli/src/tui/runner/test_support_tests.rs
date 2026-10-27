@@ -127,6 +127,12 @@ pub(crate) fn builtin_test_engine() -> Arc<rebon_core::Engine> {
 }
 
 pub(crate) fn make_test_tui_session() -> TuiEngineSession {
+    make_test_tui_session_with_projects_root(std::env::temp_dir())
+}
+
+pub(super) fn make_test_tui_session_with_projects_root(
+    projects_root: std::path::PathBuf,
+) -> TuiEngineSession {
     let handler = rebon_acp::DefaultHandler::default();
     let server_state = handler.state().clone();
     let session = server_state.create_session(".".into(), Vec::new());
@@ -180,7 +186,6 @@ pub(crate) fn make_test_tui_session() -> TuiEngineSession {
         ".",
         session_id.clone(),
     ));
-    let projects_root = std::env::temp_dir();
     let cwd = ".".to_string();
     let executor: Arc<dyn rebon_agent_core::PromptExecutor> =
         Arc::new(rebon_agent_core::StubPromptExecutor);

@@ -750,6 +750,18 @@ fn collect_tool_use_file_paths(value: &Value, out: &mut Vec<String>) {
         Value::Object(map) => {
             if map.get("type").and_then(Value::as_str) == Some("tool_use") {
                 if let Some(input) = map.get("input").and_then(Value::as_object) {
+                    if map.get("name").and_then(Value::as_str) == Some("Read") {
+                        if let Some(targets) = input.get("targets").and_then(Value::as_array) {
+                            out.extend(targets.iter().filter_map(|target| {
+                                target
+                                    .get("path")
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|path| !path.is_empty())
+                                    .map(str::to_string)
+                            }));
+                        }
+                    }
                     for key in ["file_path", "path", "notebook_path", "filePath"] {
                         if let Some(path) = input.get(key).and_then(Value::as_str) {
                             let path = path.trim();
@@ -1201,6 +1213,20 @@ mod manual_compact_tests {
             recent_transcript_files(&entries),
             vec!["src/kept.rs".to_string(), "nb.ipynb".to_string()]
         );
+    }
+
+    #[test]
+    fn batched_read_paths_are_included_in_recent_files() {
+        let mut paths = Vec::new();
+        collect_tool_use_file_paths(
+            &serde_json::json!({
+                "type": "tool_use",
+                "name": "Read",
+                "input": {"targets": [{"path": "a.rs"}, {"path": "b.rs"}]}
+            }),
+            &mut paths,
+        );
+        assert_eq!(paths, vec!["a.rs", "b.rs"]);
     }
 
     #[test]
