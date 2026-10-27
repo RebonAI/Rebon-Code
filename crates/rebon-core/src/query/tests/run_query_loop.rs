@@ -1043,7 +1043,7 @@ async fn run_query_keeps_model_error_detail_separate_from_display_message() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn run_query_reports_repeated_transient_start_failure_after_partial_turn() {
     let tool = Arc::new(RecordingTool::new("Read", json!({"contents": "hi"})));
     let tool_ref: Arc<dyn Tool> = tool.clone();
@@ -1058,7 +1058,7 @@ async fn run_query_reports_repeated_transient_start_failure_after_partial_turn()
     ));
     mock.push_error(ModelError::transient("network down"));
     mock.push_error(ModelError::transient("network down"));
-    let client: Arc<dyn ModelClient> = Arc::new(mock);
+    let client: Arc<dyn ModelClient> = Arc::new(mock.clone());
 
     let params = QueryParams::new("mock", vec![ApiMessage::user_text("read a.rs")])
         .with_tools(tools_from_engine(&engine))
@@ -1072,6 +1072,8 @@ async fn run_query_reports_repeated_transient_start_failure_after_partial_turn()
     );
     let events = drain(&mut rx).await;
 
+    assert_eq!(tool.call_count(), 1);
+    assert_eq!(mock.call_count(), 3);
     let last = events.last().expect("terminal event");
     match last {
         QueryEvent::Error(message) => {
