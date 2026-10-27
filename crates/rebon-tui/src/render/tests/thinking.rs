@@ -71,6 +71,73 @@ fn streaming_thinking_incremental_frames_match_full_repaint() {
 }
 
 #[test]
+fn compact_thinking_only_turn_keeps_a_preview_before_duration() {
+    let mut state = AppState::new();
+    reducer(&mut state, Action::Commit(user("u", "Continue")));
+    reducer(
+        &mut state,
+        Action::Commit(assistant_thinking("a", "Checking the result\nMore detail")),
+    );
+    let mut duration = system_info("duration", "Worked 5s");
+    if let Message::System(system) = &mut duration {
+        system.subtype = "turn_duration".into();
+    }
+    reducer(&mut state, Action::Commit(duration));
+    let mut buffer = new_buf(80, 12);
+    render_transcript(
+        &state,
+        Rect::new(0, 0, 80, 12),
+        &mut buffer,
+        &RenderTheme::plain(),
+        0,
+        ToolOutputVerbosity::Compact,
+        0,
+        None,
+    );
+    let output = all_text(&buffer);
+    assert!(output.contains("Checking the result"), "{output:?}");
+    assert!(output.contains("Worked 5s"), "{output:?}");
+}
+
+#[test]
+fn compact_thinking_only_turns_keep_distinct_previews() {
+    let mut state = AppState::new();
+    for (index, thinking) in ["Checking first result", "Checking second result"]
+        .into_iter()
+        .enumerate()
+    {
+        reducer(
+            &mut state,
+            Action::Commit(user(&format!("u{index}"), "Continue")),
+        );
+        reducer(
+            &mut state,
+            Action::Commit(assistant_thinking(&format!("a{index}"), thinking)),
+        );
+        let mut duration = system_info(&format!("d{index}"), "Worked 5s");
+        if let Message::System(system) = &mut duration {
+            system.subtype = "turn_duration".into();
+        }
+        reducer(&mut state, Action::Commit(duration));
+    }
+    let mut buffer = new_buf(80, 24);
+    render_transcript(
+        &state,
+        Rect::new(0, 0, 80, 24),
+        &mut buffer,
+        &RenderTheme::plain(),
+        0,
+        ToolOutputVerbosity::Compact,
+        0,
+        None,
+    );
+    let output = all_text(&buffer);
+    assert!(output.contains("Checking first result"), "{output:?}");
+    assert!(output.contains("Checking second result"), "{output:?}");
+    assert_eq!(output.matches("Worked 5s").count(), 2, "{output:?}");
+}
+
+#[test]
 fn committed_assistant_text_between_tool_uses_breaks_the_run() {
     // An assistant message that mixes text with tool_use (or is
     // pure text) must NOT be absorbed into a collapsed group.

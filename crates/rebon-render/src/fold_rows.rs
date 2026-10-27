@@ -599,6 +599,7 @@ pub fn message_allows_prior_thinking_preview(msg: &Message) -> bool {
                 UserContentBlock::Text(text) if user_text_is_coordinator_notification(&text.text)
             )
         }),
+        Message::System(system) => system.subtype == "turn_duration",
         _ => false,
     }
 }

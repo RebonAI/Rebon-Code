@@ -1214,6 +1214,16 @@ pub(super) fn find_latest_visible_thinking_block_id(
     None
 }
 
+fn thinking_before_turn_duration(rows: &[Message], index: usize) -> bool {
+    is_thinking_only_assistant(&rows[index])
+        && rows[index + 1..]
+            .iter()
+            .find(|row| !is_meta_user(row))
+            .is_some_and(
+                |row| matches!(row, Message::System(system) if system.subtype == "turn_duration"),
+            )
+}
+
 /// Render a [`TranscriptSegment`] into `area`.
 ///
 /// - `Single` → `render_message_inner`.
@@ -1249,7 +1259,11 @@ pub(super) fn render_segment(
             theme,
             verbosity,
             add_margin,
-            last_thinking_block_id,
+            if thinking_before_turn_duration(rows, *i) {
+                None
+            } else {
+                last_thinking_block_id
+            },
             true,
             extras,
         ),
@@ -1346,7 +1360,11 @@ pub(super) fn measure_segment_height(
             verbosity,
             add_margin,
             cache,
-            last_thinking_block_id,
+            if thinking_before_turn_duration(rows, *i) {
+                None
+            } else {
+                last_thinking_block_id
+            },
             extras,
         ),
         TranscriptSegment::AgentGroup { indices } => render_committed_agent_group(
