@@ -1123,6 +1123,7 @@ async fn drive_worker_events(
                 let _ = event_tx.send(WorkerEvent::Completed(final_result));
                 return;
             }
+            QueryEvent::TurnHookHistoryInjected { .. } => {}
             QueryEvent::Error(msg) => {
                 failed_with = Some(msg);
                 break;

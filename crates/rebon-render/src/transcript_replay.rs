@@ -85,6 +85,9 @@ pub fn replayed_rows(entries: &[TranscriptLine<'_>]) -> (Vec<Message>, ReplaySta
     let mut messages = Vec::with_capacity(entries.len());
 
     for entry in entries {
+        if entry.entry_type == "turn_hook_injection" {
+            continue;
+        }
         let msg = match serde_json::from_value::<Message>(entry.raw.clone()) {
             Ok(m) => m,
             Err(_) => match try_recover_message(entry) {
@@ -576,6 +579,22 @@ mod tests {
             })
             .collect();
         replayed_rows(&lines)
+    }
+
+    #[test]
+    fn hook_injection_diagnostics_do_not_render() {
+        let mut raw = fixture();
+        let (before, _) = rows_of(&raw);
+        raw.insert(1, json!({
+            "type": "turn_hook_injection", "uuid": "diag", "parentUuid": "u1",
+            "timestamp": "2026-09-06T00:00:00.000Z", "stage": "history_committed",
+            "message": {"role": "user", "content": [{"type": "text", "text": "private reminder"}]}
+        }));
+        let (after, _) = rows_of(&raw);
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(after).unwrap()
+        );
     }
 
     /// The one producer, pinned byte for byte. Every surface reads these

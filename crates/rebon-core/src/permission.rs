@@ -850,10 +850,10 @@ fn reason_opens_with_category(reason: &str, category: &str) -> bool {
 fn auto_mode_deny_reason(detail: &str) -> String {
     format!(
         "auto mode denied this call without asking the user: {detail}. \
-         Rewrite the command to avoid the flagged behavior, skip it if it \
-         is not essential, or ask the user for approval; the denied call \
-         is also listed in /permissions for approve or retry. Resubmitting \
-         it unchanged will be denied again."
+         Continue other independent authorized work. Rewrite the command to avoid \
+         the flagged behavior, skip it if it is not essential, or ask the user for approval \
+         if needed; the denied call is also listed in /permissions for approve or retry. \
+         Resubmitting it unchanged will be denied again."
     )
 }
 
@@ -4348,6 +4348,15 @@ mod tests {
         };
         assert!(reason.contains("auto mode denied"));
         assert!(reason.contains("Uploads local SSH keys"));
+        assert!(
+            reason.contains("Continue other independent authorized work"),
+            "{reason}"
+        );
+        assert!(reason.contains("ask the user for approval"), "{reason}");
+        assert!(
+            reason.contains("Resubmitting it unchanged will be denied again"),
+            "{reason}"
+        );
         assert!(rx.try_recv().is_err(), "deny must not open a dialog");
         let store = sink.store();
         assert_eq!(store.lock().unwrap().len(), 1);

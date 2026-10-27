@@ -1521,7 +1521,14 @@ fn commit_turn_hook_writeback(
 ) {
     context.extend_coordinator_report_paths(applied.coordinator_report_paths);
     for message in applied.history {
+        let user_message = (message.role == rebon_api::Role::User).then(|| message.clone());
         manager.push_message(message);
+        if let Some(message) = user_message {
+            let _ = tx.send(QueryEvent::TurnHookHistoryInjected {
+                iteration: announce_iteration,
+                message,
+            });
+        }
     }
     for attachment in applied.injected_attachments {
         let _ = tx.send(QueryEvent::AttachmentInjected {

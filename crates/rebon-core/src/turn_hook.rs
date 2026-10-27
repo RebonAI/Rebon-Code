@@ -615,7 +615,7 @@ impl TurnHook for TaskTurnReconciliationHook {
             content: message.content.clone(),
         });
         context.append_history(ApiMessage::user_text(format!(
-            "<system-reminder>\nBefore finishing, reconcile the tasks touched in this turn:\n{tasks}\nContinue any remaining work that is executable and authorized, even if another task is blocked. Respect permission decisions, a user pause, and any background work that is still running or waiting; do not bypass them. Mark completed work with TaskUpdate only when actually complete. Leave blocked or incomplete work open and explain any blocker not already communicated to the user; do not repeat a blocker already communicated in the terminal response. This reminder will not repeat.\n</system-reminder>"
+            "<system-reminder>\nBefore finishing, reconcile the tasks touched in this turn:\n{tasks}\nContinue any remaining work that is executable and authorized, even if another task is blocked. Respect permission decisions, a user pause, and any background work that is still running or waiting; do not bypass them. Mark completed work with TaskUpdate only when actually complete. Leave blocked or incomplete work open and explain any blocker not already communicated to the user; do not repeat a blocker already communicated in the terminal response. If no further action or new information is needed, end without another message. This reminder will not repeat.\n</system-reminder>"
         )));
         context.request_continue_reserving(TASK_RECONCILIATION_FOLLOWUP_ITERATIONS);
     }

@@ -2293,6 +2293,20 @@ impl TurnEventLoop<'_> {
                 // unattended one has no transcript to read.
                 self.hit_iteration_limit = true;
             }
+            QueryEvent::TurnHookHistoryInjected { iteration, message } => {
+                let entry = TranscriptWriteEntry::new(
+                    "turn_hook_injection",
+                    serde_json::json!({"stage": "history_committed", "iteration": iteration, "message": message}),
+                ).with_parent(self.parent_uuid.clone());
+                if let Err(err) = rebon_session::append_transcript_entry(
+                    &self.executor.projects_root,
+                    cwd,
+                    session_id,
+                    entry,
+                ) {
+                    tracing::warn!(error = %err, session_id = %session_id, "failed to persist turn hook injection");
+                }
+            }
             QueryEvent::AttachmentInjected { iteration, message } => {
                 return self.on_attachment_injected(iteration, message).await
             }

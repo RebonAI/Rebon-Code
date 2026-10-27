@@ -80,6 +80,49 @@ async fn task_reconciliation_replays_blocked_and_independent_work() {
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "current_thread")]
+async fn task_reconciliation_accepts_silent_followup_after_explained_wait() {
+    let _env = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _config_dir = EnvVarGuard::set("REBON_CONFIG_DIR", temp.path().to_str().unwrap());
+    let _tasks_enabled = EnvVarGuard::set("REBON_ENABLE_TASKS", "1");
+    let engine = build_engine_with(Arc::new(rebon_plugin_tasks::TaskCreateTool));
+    let client = MockModelClient::new();
+    client.push_turn(tool_turn(
+        "create",
+        "TaskCreate",
+        "call",
+        r#"{"subject":"Wait","description":"Job running"}"#,
+    ));
+    client.push_turn(text_turn(
+        "candidate",
+        "The background job is still running.",
+    ));
+    client.push_turn(text_turn("silent", ""));
+    let params = QueryParams::new("mock", vec![ApiMessage::user_text("run the job")])
+        .with_tools(tools_from_engine(&engine));
+    let mut rx = run_query(
+        engine,
+        SessionHandle::new(Arc::new(client)),
+        params,
+        ToolContext::new().with_task_list_id("replay-silent"),
+        CancelToken::new(),
+    );
+    let events = drain(&mut rx).await;
+    let visible: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            QueryEvent::IterationComplete { message, .. } if !message.text().is_empty() => {
+                Some(message.text())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(visible, vec!["The background job is still running."]);
+    assert!(matches!(events.last(), Some(QueryEvent::Done { .. })));
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "current_thread")]
 async fn task_reconciliation_gate_injects_once_for_pending_task() {
     let _env = env_lock();
     let temp = tempfile::tempdir().unwrap();
@@ -125,9 +168,20 @@ async fn task_reconciliation_gate_injects_once_for_pending_task() {
         .contains("Continue any remaining work that is executable and authorized"));
     assert!(final_request_text.contains("already communicated"));
     assert!(final_request_text.contains("do not repeat"));
+    assert!(final_request_text.contains("end without another message"));
     assert!(final_request_text.contains("permission"));
     assert!(final_request_text.contains("pause"));
     assert!(final_request_text.contains("background"));
+    let injected = events
+        .iter()
+        .find_map(|event| match event {
+            QueryEvent::TurnHookHistoryInjected { message, .. } => Some(message),
+            _ => None,
+        })
+        .expect("reconciliation diagnostic event");
+    assert!(text_message_texts(std::slice::from_ref(injected))
+        .join("\n")
+        .contains("Before finishing, reconcile the tasks touched"));
     assert_eq!(
         events
             .iter()
