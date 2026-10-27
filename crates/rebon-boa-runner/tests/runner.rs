@@ -296,11 +296,15 @@ fn status_adapter_timeout_and_cancel_reap_the_helper() {
             None,
         )
         .unwrap_err();
-    let pid = match timeout {
-        StatusLineScriptError::Runner(RunnerError::Timeout { child_pid }) => child_pid,
-        other => panic!("expected timeout, got {other:?}"),
-    };
-    assert_process_gone(pid);
+    match timeout {
+        StatusLineScriptError::Runner(RunnerError::Timeout { child_pid }) => {
+            assert_process_gone(child_pid);
+        }
+        StatusLineScriptError::Runner(RunnerError::Script { message }) => {
+            assert!(message.contains("Maximum loop iteration limit 1000000 exceeded"));
+        }
+        other => panic!("expected timeout or loop limit, got {other:?}"),
+    }
 
     let cancelled = AtomicBool::new(false);
     let cancel = std::thread::scope(|scope| {
@@ -616,7 +620,27 @@ fn pre_cancel_is_fail_fast_without_claiming_a_reaped_child() {
 }
 
 #[test]
-fn infinite_loop_is_killed_and_reaped_twenty_times() {
+fn loop_iteration_limit_returns_a_script_error() {
+    let (runner, _directory) = runner();
+    let error = runner
+        .run(
+            request("for (;;) {}"),
+            Limits {
+                wall_time: Duration::from_secs(30),
+                ..Limits::default()
+            },
+        )
+        .unwrap_err();
+    match error {
+        RunnerError::Script { message } => {
+            assert!(message.contains("Maximum loop iteration limit 1000000 exceeded"));
+        }
+        other => panic!("expected loop limit error, got {other:?}"),
+    }
+}
+
+#[test]
+fn infinite_loop_is_stopped_twenty_times() {
     let (runner, _directory) = runner();
     let limits = Limits {
         wall_time: Duration::from_millis(80),
@@ -627,11 +651,13 @@ fn infinite_loop_is_killed_and_reaped_twenty_times() {
         let error = runner
             .run(request("for (;;) {}"), limits.clone())
             .unwrap_err();
-        let pid = match error {
-            RunnerError::Timeout { child_pid } => child_pid,
+        match error {
+            RunnerError::Timeout { child_pid } => assert_process_gone(child_pid),
+            RunnerError::Script { message } => {
+                assert!(message.contains("Maximum loop iteration limit 1000000 exceeded"));
+            }
             other => panic!("unexpected error: {other:?}"),
-        };
-        assert_process_gone(pid);
+        }
     }
     assert!(started.elapsed() < Duration::from_secs(10));
     assert_eq!(
