@@ -172,6 +172,48 @@ fn render_code_sequence(
 }
 
 #[test]
+fn bash_command_header_folds_to_three_visual_lines_without_folding_output() {
+    let command = format!("START-{}-END", "x".repeat(400));
+    for status in [
+        ToolCallStatus::InProgress,
+        ToolCallStatus::Completed,
+        ToolCallStatus::Failed,
+    ] {
+        for width in [40, 80] {
+            let mut overlay = StreamingOverlay::new();
+            overlay.upsert_streaming_tool_use(streaming_tool_with_raw_output(
+                streaming_tool(
+                    "bash",
+                    "Bash",
+                    ToolKind::Execute,
+                    status,
+                    vec![("command", json!(command))],
+                ),
+                vec![("stdout", json!("OUTPUT-MARKER"))],
+            ));
+            for verbosity in [ToolOutputVerbosity::Compact, ToolOutputVerbosity::Normal] {
+                let snap = render_code_sequence(&overlay, verbosity, width);
+                let rows: Vec<_> = snap
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .collect();
+                assert!(rows[0].contains("START-"), "{snap}");
+                assert!(rows[1].contains('…'), "{snap}");
+                assert!(rows[2].contains("-END"), "{snap}");
+                assert!(
+                    rows[3..].iter().any(|row| row.contains("OUTPUT-MARKER")),
+                    "{snap}"
+                );
+            }
+            let verbose = render_code_sequence(&overlay, ToolOutputVerbosity::Verbose, width);
+            assert_eq!(verbose.matches('x').count(), 400, "{verbose}");
+            assert!(verbose.contains("-END"), "{verbose}");
+            assert!(verbose.contains("OUTPUT-MARKER"), "{verbose}");
+        }
+    }
+}
+
+#[test]
 fn shell_tabbed_output_renders_with_stable_columns() {
     for status in [
         ToolCallStatus::InProgress,
