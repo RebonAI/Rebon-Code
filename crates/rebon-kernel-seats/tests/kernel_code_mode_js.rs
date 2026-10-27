@@ -292,8 +292,8 @@ async fn one_program_orchestrates_reads_parallel_dispatch_and_logs() {
     let code = format!(
         r#"
 const [a, b] = await Promise.all([
-  tools.Read({{ file_path: "{a}" }}),
-  tools.Read({{ file_path: "{b}" }}),
+  tools.Read({{ targets: [{{ path: "{a}" }}] }}),
+  tools.Read({{ targets: [{{ path: "{b}" }}] }}),
 ]);
 console.log("both reads finished");
 const text = (value) => (typeof value === "string" ? value : JSON.stringify(value));
