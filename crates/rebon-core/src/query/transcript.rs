@@ -1,5 +1,15 @@
 use super::*;
 
+#[cfg(test)]
+#[test]
+fn batch_read_title_mentions_paths() {
+    let input = serde_json::json!({"targets": [{"path": "/a"}, {"path": "/b"}]});
+    assert_eq!(
+        build_tool_call_title("Read", input.as_object().unwrap()),
+        "Read /a, /b"
+    );
+}
+
 pub(super) fn build_tool_call_title(name: &str, input: &serde_json::Map<String, Value>) -> String {
     match name {
         "Grep" => match (input_str(input, "pattern"), input_str(input, "path")) {
@@ -12,9 +22,24 @@ pub(super) fn build_tool_call_title(name: &str, input: &serde_json::Map<String, 
             (Some(pattern), None) => format!("Glob {pattern}"),
             _ => "Glob".into(),
         },
-        "Read" => input_str(input, "file_path")
-            .map(|v| format!("Read {v}"))
-            .unwrap_or_else(|| "Read".into()),
+        "Read" => {
+            let paths = input
+                .get("targets")
+                .and_then(Value::as_array)
+                .map(|targets| {
+                    targets
+                        .iter()
+                        .filter_map(|target| target.get("path").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                });
+            paths
+                .as_deref()
+                .filter(|paths| !paths.is_empty())
+                .or_else(|| input_str(input, "file_path"))
+                .map(|v| format!("Read {}", truncate(v, 120)))
+                .unwrap_or_else(|| "Read".into())
+        }
         "Edit" => input_str(input, "file_path")
             .map(|v| format!("Edit {v}"))
             .unwrap_or_else(|| "Edit".into()),

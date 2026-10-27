@@ -86,7 +86,7 @@ use super::session_detach_attach::detach_current_session_to_agent_view;
 use super::slash_commands::selected_slash_command_needs_input;
 use super::status_bar::{
     active_agent_footer_status, footer_new_session_hint, has_active_background_agent,
-    has_active_background_shell, wall_clock_ms, StatusBarInfo,
+    has_active_background_shell, wall_clock_ms, CompactWarningTracker, StatusBarInfo,
 };
 use super::submit::submit_or_queue;
 use super::task_runtime::{drain_agent_generation, drain_ultraplan_reviewer_verdicts};
@@ -471,6 +471,7 @@ struct LoopState {
     prefix_scan_state: crate::file_scanner::PrefixScanState,
     last_agent_view_left_press_at: Option<Instant>,
     new_session_hint_idle_since: Instant,
+    compact_warning: CompactWarningTracker,
     last_registered_skill_slash_count: usize,
     /// Once an overflowing live overlay proves it is blocked by its first open
     /// block, avoid repeating the same reducer walk on every animation frame.
@@ -546,6 +547,7 @@ pub(in crate::tui::runner) fn event_loop_with_mode(
         prefix_scan_state: crate::file_scanner::PrefixScanState::new(),
         last_agent_view_left_press_at: None,
         new_session_hint_idle_since: Instant::now(),
+        compact_warning: CompactWarningTracker::default(),
         last_registered_skill_slash_count: slot
             .session()
             .map(|session| session.engine_half.skill_registry.user_invocable_count())
@@ -1269,6 +1271,11 @@ fn derive_frame_inputs<'slot>(
     // Pick a new random spinner verb on each loading transition.
     if is_loading && !app.was_loading {
         app.spinner_verb = crate::tui::spinner_verbs::pick_random_verb().to_string();
+    } else if !is_loading && app.was_loading {
+        app.turn_compact_manual = false;
+        if let Some(verb) = app.spinner_verb_before_compacting.take() {
+            app.spinner_verb = verb;
+        }
     }
     app.was_loading = is_loading;
     // Poll the retry notifier for display in prompt chrome. A mirror
@@ -1302,36 +1309,27 @@ fn derive_frame_inputs<'slot>(
     } else {
         String::new()
     };
-    // Context-budget percentage: how much room is left before
-    // auto-compact fires. Only shown after the first API response
-    // reports input_tokens (last_input_tokens > 0).
     let last_input_tokens = slot
         .session()
         .map(|session| session.model.prune_level.budget.last_input_tokens())
         .unwrap_or(0);
-    let context_left_pct = slot.session().and_then(|session| {
-        let budget = &session.model.prune_level.budget;
-        // A mirror's budget never sees a request: the model client
-        // that would update it runs in the owner. What the owner
-        // streams per response is the same input count, so the
-        // percentage is derived from that instead of showing nothing.
-        let tokens = if session.remote_background_attachment.is_some() {
-            app.usage().last_turn.input_tokens
-        } else {
-            budget.last_input_tokens()
-        };
-        if tokens > 0 {
-            let threshold = budget.auto_compact_threshold();
-            let pct = if threshold == 0 || tokens >= threshold {
-                0
-            } else {
-                (((threshold - tokens) as f64 / threshold as f64) * 100.0).round() as u32
-            };
-            Some(pct)
-        } else {
+    let context_left_pct = match slot.session() {
+        Some(session)
+            if session.remote_background_attachment.is_none()
+                && session.engine_half.runtime.session_agents.current_id() == "local" =>
+        {
+            state.compact_warning.update(
+                &session.session_id,
+                &session.model.prune_level.budget,
+                is_loading,
+            )
+        }
+        _ => {
+            // A remote owner's trigger and projected usage are not mirrored here.
+            state.compact_warning = CompactWarningTracker::default();
             None
         }
-    });
+    };
     // Gate the `/clear` hint behind an idleness check. Showing it
     // while the user is waiting on the engine, a foreground task, or
     // any coordinator-backed agent invites them to trash in-flight work.

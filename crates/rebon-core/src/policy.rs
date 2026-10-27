@@ -232,7 +232,75 @@ impl PolicyEvaluator {
     /// Within each behaviour class, the first matching rule wins —
     /// later rules of the same behaviour are ignored (they would
     /// produce the same outcome anyway).
+    /// Evaluate a batch under one consistent rule snapshot. Ask rules override
+    /// allows, and a deny on any target vetoes the entire call.
+    fn evaluate_read_batch(&self, tool_name: &str, input: &Value) -> Option<(PolicyOutcome, bool)> {
+        if !rebon_tools_core::builtin_tool_facts_for_name(tool_name)
+            .is_some_and(|facts| facts.name == "Read")
+            || input.get("targets").is_none()
+        {
+            return None;
+        }
+        let guard = self.store.inner.read().expect("policy store poisoned");
+        let Some(targets) = input.get("targets").and_then(Value::as_array) else {
+            return Some((PolicyOutcome::PassThrough, false));
+        };
+        let mut all_allowed = !targets.is_empty();
+        let mut first_allow = None;
+        let mut ask = false;
+        for target in targets {
+            let Some(path) = target.get("path").and_then(Value::as_str) else {
+                all_allowed = false;
+                continue;
+            };
+            let target_input = serde_json::json!({"file_path": path});
+            let mut allowed = false;
+            for rule in &guard.rules {
+                if !rule_applies_to_tool(&rule.rule_value.tool_name, tool_name)
+                    || !matches_input(
+                        &rule.rule_value,
+                        rule.rule_behavior,
+                        tool_name,
+                        &target_input,
+                        &guard.rules,
+                    )
+                {
+                    continue;
+                }
+                match rule.rule_behavior {
+                    PermissionBehavior::Deny => {
+                        return Some((
+                            PolicyOutcome::AutoDeny {
+                                matched: rule.rule_value.clone(),
+                            },
+                            false,
+                        ))
+                    }
+                    PermissionBehavior::Ask => ask = true,
+                    PermissionBehavior::Allow => {
+                        allowed = true;
+                        if first_allow.is_none() {
+                            first_allow = Some(rule.rule_value.clone());
+                        }
+                    }
+                }
+            }
+            all_allowed &= allowed;
+        }
+        let outcome = if all_allowed && !ask {
+            PolicyOutcome::AutoAllow {
+                matched: first_allow.expect("nonempty allowed batch"),
+            }
+        } else {
+            PolicyOutcome::PassThrough
+        };
+        Some((outcome, ask))
+    }
+
     pub fn evaluate(&self, tool_name: &str, input: &Value, cwd: Option<&str>) -> PolicyOutcome {
+        if let Some((outcome, _)) = self.evaluate_read_batch(tool_name, input) {
+            return outcome;
+        }
         // Ignore a leading working-directory wrapper when it points
         // at the session cwd, so rules match the command that follows.
         let input = normalize_shell_input(tool_name, input, cwd);
@@ -909,17 +977,41 @@ impl PermissionBroker for RulesBasedPermissionBroker {
         context: &ToolContext,
         decision: PermissionDecision,
     ) -> ToolResult<Value> {
-        match self
+        let effective_input = decision.updated_input.as_ref().unwrap_or(&input);
+        let batch = self
             .evaluator
-            .evaluate(tool.id().as_str(), &input, context.cwd())
+            .evaluate_read_batch(tool.id().as_str(), effective_input);
+        let is_batch = batch.is_some();
+        if batch.is_some() && decision.behavior == rebon_tools_core::PermissionBehavior::Deny {
+            return self.delegate.resolve(tool, input, context, decision).await;
+        }
+        if matches!(&batch, Some((PolicyOutcome::PassThrough, true)))
+            && decision.behavior != rebon_tools_core::PermissionBehavior::Deny
         {
+            let ask = PermissionDecision::ask(
+                rebon_tools_core::PermissionRequest::new(
+                    "Read files",
+                    "A stored rule requires approval for this batch.",
+                ),
+                Some(effective_input.clone()),
+            );
+            return self.delegate.resolve(tool, input, context, ask).await;
+        }
+        match batch.map(|(outcome, _)| outcome).unwrap_or_else(|| {
+            self.evaluator
+                .evaluate(tool.id().as_str(), &input, context.cwd())
+        }) {
             PolicyOutcome::AutoAllow { matched } => {
                 tracing::debug!(
                     tool = tool.id().as_str(),
                     rule = ?matched,
                     "rules-based broker: auto-allow from stored rule"
                 );
-                let allow = PermissionDecision::allow(input.clone());
+                let allow = PermissionDecision::allow(if is_batch {
+                    effective_input.clone()
+                } else {
+                    input.clone()
+                });
                 self.delegate.resolve(tool, input, context, allow).await
             }
             PolicyOutcome::AutoDeny { matched } => Err(ToolError::PermissionDenied {
@@ -953,6 +1045,41 @@ mod tests {
     use rebon_tools_core::{PermissionRequest, ToolId, ToolInputSchema};
     use serde_json::json;
     use std::sync::Mutex;
+
+    #[test]
+    fn batch_read_rules_check_all_targets_and_deny_overrides_ask() {
+        let store = PolicyStore::new();
+        let source = PermissionRuleSource::ProjectSettings;
+        store.allow("Read(/safe/**)", source);
+        store.push_rule(PermissionRule {
+            source,
+            rule_behavior: PermissionBehavior::Ask,
+            rule_value: permission_rule_value_from_string("Read(/safe/private/**)"),
+        });
+        store.deny("Read(/secret/**)", source);
+        let evaluator = PolicyEvaluator::new(store);
+        let batch = |paths: &[&str]| json!({"targets": paths.iter().map(|p| json!({"path": p})).collect::<Vec<_>>()});
+        assert!(matches!(
+            evaluator.evaluate("Read", &batch(&["/safe/a", "/other/b"]), None),
+            PolicyOutcome::PassThrough
+        ));
+        assert!(matches!(
+            evaluator.evaluate("Read", &batch(&["/safe/a", "/safe/b"]), None),
+            PolicyOutcome::AutoAllow { .. }
+        ));
+        assert!(matches!(
+            evaluator.evaluate_read_batch("Read", &batch(&["/safe/a", "/safe/private/b"])),
+            Some((PolicyOutcome::PassThrough, true))
+        ));
+        assert!(matches!(
+            evaluator.evaluate_read_batch("Read", &batch(&["/safe/private/b", "/secret/c"])),
+            Some((PolicyOutcome::AutoDeny { .. }, false))
+        ));
+        assert!(matches!(
+            evaluator.evaluate("Read", &json!({"file_path":"/safe/a"}), None),
+            PolicyOutcome::AutoAllow { .. }
+        ));
+    }
 
     #[test]
     fn poisoned_live_store_refuses_grant_without_panicking() {
@@ -1960,6 +2087,94 @@ mod tests {
             let _ = decision;
             tool.call(input, context).await
         }
+    }
+
+    struct BatchReadTool;
+
+    #[async_trait]
+    impl Tool for BatchReadTool {
+        fn id(&self) -> ToolId {
+            ToolId::new("Read")
+        }
+        fn description(&self) -> &str {
+            "test read"
+        }
+        fn input_schema(&self) -> ToolInputSchema {
+            json!({"type":"object"})
+        }
+        async fn call(&self, input: Value, _context: &ToolContext) -> ToolResult<Value> {
+            Ok(input)
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_rules_check_the_effective_input() {
+        let store = PolicyStore::new();
+        store.deny("Read(/secret/**)", PermissionRuleSource::ProjectSettings);
+        let broker = RulesBasedPermissionBroker::new(store, Arc::new(DenyAskPermissionBroker));
+        let original = json!({"targets": [{"path":"/safe/a"}]});
+        let updated = json!({"targets": [{"path":"/secret/a"}]});
+        let result = broker
+            .resolve(
+                &BatchReadTool,
+                original,
+                &ToolContext::new(),
+                PermissionDecision::allow(updated),
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::PermissionDenied { .. })));
+    }
+
+    #[tokio::test]
+    async fn batch_allow_rule_does_not_override_tool_denial() {
+        let store = PolicyStore::new();
+        store.allow("Read(/safe/**)", PermissionRuleSource::ProjectSettings);
+        let delegate = Arc::new(RecordingDelegate::default());
+        let broker = RulesBasedPermissionBroker::new(store, delegate.clone());
+        let input = json!({"targets": [{"path":"/safe/a"}]});
+        broker
+            .resolve(
+                &BatchReadTool,
+                input,
+                &ToolContext::new(),
+                PermissionDecision::deny("blocked"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            delegate.decisions()[0].behavior,
+            rebon_tools_core::PermissionBehavior::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_ask_forces_prompt_even_when_default_allows() {
+        let store = PolicyStore::new();
+        let source = PermissionRuleSource::ProjectSettings;
+        store.allow("Read(/safe/**)", source);
+        store.push_rule(PermissionRule {
+            source,
+            rule_behavior: PermissionBehavior::Ask,
+            rule_value: permission_rule_value_from_string("Read(/safe/private/**)"),
+        });
+        let delegate = Arc::new(RecordingDelegate::default());
+        let broker = RulesBasedPermissionBroker::new(store, delegate.clone());
+        let input = json!({"targets": [{"path":"/safe/a"}, {"path":"/safe/private/b"}]});
+        broker
+            .resolve(
+                &BatchReadTool,
+                input.clone(),
+                &ToolContext::new(),
+                PermissionDecision::allow(input),
+            )
+            .await
+            .unwrap();
+        let decisions = delegate.decisions();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(
+            decisions[0].behavior,
+            rebon_tools_core::PermissionBehavior::Ask
+        );
     }
 
     #[tokio::test]

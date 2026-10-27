@@ -626,7 +626,7 @@ async fn same_response_same_file_writes_do_not_both_succeed() {
         Arc::new(rebon_tool::WriteTool),
     ]);
     let client = MockModelClient::new();
-    let read_input = serde_json::to_string(&json!({ "file_path": file })).unwrap();
+    let read_input = serde_json::to_string(&json!({ "targets": [{"path": file}] })).unwrap();
     let first_write = serde_json::to_string(&json!({
         "file_path": file,
         "content": "first"

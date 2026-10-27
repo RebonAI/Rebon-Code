@@ -96,7 +96,7 @@ fn minimal_projection_starts_with_compact_bash_read_and_tool_search() {
     );
     assert_eq!(
         projection.provider_visible_tools[1].input_schema["required"],
-        json!(["file_path"])
+        json!(["targets"])
     );
     assert!(projection.tool_search_index.contains_name("Edit"));
     assert!(projection.tool_search_index.contains_name("Bash"));
@@ -140,7 +140,11 @@ fn normal_projection_keeps_full_tools_and_standard_deferred_behavior() {
         .iter()
         .find(|tool| tool.name == "Read")
         .expect("Normal mode should expose Read's full schema");
-    assert!(read.input_schema["properties"].get("pages").is_some());
+    assert!(
+        read.input_schema["properties"]["targets"]["items"]["properties"]
+            .get("pages")
+            .is_some()
+    );
 }
 
 #[test]

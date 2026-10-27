@@ -499,6 +499,7 @@ pub struct AppState {
     /// Captures the in-flight random verb so compact can display
     /// `"Compacting"` and then return to the same wording.
     pub spinner_verb_before_compacting: Option<String>,
+    pub turn_compact_manual: bool,
     /// Whether the previous frame was in loading state. Used to detect
     /// the `false → true` transition and pick a new spinner verb.
     pub was_loading: bool,
@@ -937,6 +938,7 @@ impl AppState {
                 crate::tui::runner::custom_status_line::CustomStatusLineState::default(),
             spinner_verb: String::from("Thinking"),
             spinner_verb_before_compacting: None,
+            turn_compact_manual: false,
             was_loading: false,
             help_open: false,
             help_tab_index: 0,

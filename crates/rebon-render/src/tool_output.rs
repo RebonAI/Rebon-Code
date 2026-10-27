@@ -242,6 +242,39 @@ pub fn tool_result_update_content(tool_use_result: &Value) -> Option<Vec<ToolCal
     if let Some(text) = tool_use_result.as_str() {
         return (!text.is_empty()).then(|| vec![text_content(text.to_string())]);
     }
+    if tool_use_result.get("type").and_then(Value::as_str) == Some("batch") {
+        let results = tool_use_result.get("results")?.as_array()?;
+        let mut content = Vec::new();
+        for result in results {
+            let path = result
+                .get("filePath")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    result
+                        .get("file")
+                        .and_then(|file| file.get("filePath"))
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or("<unknown>");
+            content.push(text_content(format!("File: {path}")));
+            if let Some(child) = tool_result_update_content(result) {
+                content.extend(child);
+            } else if let Some(error) = result.get("error") {
+                content.push(text_content(
+                    error
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| error.to_string()),
+                ));
+            } else if matches!(
+                result.get("type").and_then(Value::as_str),
+                Some("pdf" | "parts")
+            ) {
+                content.push(text_content(format!("PDF file: {path}")));
+            }
+        }
+        return Some(content);
+    }
     if tool_use_result.get("type").and_then(Value::as_str) == Some("computer_use") {
         let screenshot = tool_use_result.get("screenshot")?.as_object()?;
         let data = screenshot.get("base64")?.as_str()?;
@@ -402,6 +435,15 @@ pub fn trim_raw_output_for_transcript(tool_name: &str, value: Value) -> Value {
         return value;
     }
     if trim_read {
+        if value.get("type").and_then(Value::as_str) == Some("batch") {
+            let mut value = value;
+            if let Some(results) = value.get_mut("results").and_then(Value::as_array_mut) {
+                for result in results {
+                    *result = trim_raw_output_for_transcript("Read", std::mem::take(result));
+                }
+            }
+            return value;
+        }
         if let Some(trimmed_image) = trimmed_image_result_for_transcript(&value) {
             return trimmed_image;
         }
@@ -419,6 +461,14 @@ pub fn trim_raw_output_for_transcript(tool_name: &str, value: Value) -> Value {
     if trim_read {
         if let Some(Value::Object(file_map)) = map.get_mut("file") {
             file_map.remove("content");
+            file_map.remove("base64");
+            if let Some(pages) = file_map.get_mut("pages").and_then(Value::as_array_mut) {
+                for page in pages {
+                    if let Some(page) = page.as_object_mut() {
+                        page.remove("base64");
+                    }
+                }
+            }
         }
     }
     map.remove("content");
@@ -429,6 +479,25 @@ pub fn trim_raw_output_for_transcript(tool_name: &str, value: Value) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn batch_read_replays_without_binary_and_displays_errors() {
+        let value = json!({"type":"batch","results":[
+            {"type":"image","file":{"filePath":"/a","type":"image/png","base64":"secret-image"}},
+            {"type":"pdf","file":{"filePath":"/b","base64":"secret-pdf"}},
+            {"type":"parts","file":{"filePath":"/c","pages":[{"base64":"secret-page"}]}},
+            {"type":"error","filePath":"/d","error":"denied"}
+        ]});
+        let display = serde_json::to_string(&tool_result_update_content(&value).unwrap()).unwrap();
+        for expected in ["/a", "/b", "/c", "/d", "denied"] {
+            assert!(display.contains(expected), "missing {expected}");
+        }
+        let trimmed = trim_raw_output_for_transcript("Read", value);
+        let raw = trimmed.to_string();
+        assert!(!raw.contains("secret-"));
+        assert!(raw.contains("denied"));
+        assert!(tool_result_update_content(&trimmed).is_some());
+    }
 
     #[test]
     fn progress_content_preserves_metadata_without_duplicating_its_message() {

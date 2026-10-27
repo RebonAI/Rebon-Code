@@ -371,6 +371,9 @@ async fn manual_compact_call_path_preserves_current_plain_user_tail() {
         .last()
         .is_some_and(|text| text.contains("current tail")));
     assert!(texts.contains(&"current tail"));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, QueryEvent::CompactingStarted { manual: true, .. })));
 }
 
 #[tokio::test]
@@ -427,6 +430,9 @@ async fn auto_pre_turn_compact_call_path_preserves_current_plain_user_tail() {
         .last()
         .is_some_and(|text| text.contains("current tail")));
     assert!(texts.contains(&"current tail"));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, QueryEvent::CompactingStarted { manual: false, .. })));
 }
 
 #[tokio::test]

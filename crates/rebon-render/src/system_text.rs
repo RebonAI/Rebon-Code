@@ -486,7 +486,7 @@ pub fn project_system_text_message(input: &SystemTextMessageInput) -> SystemText
                 marker: (level != "info").then_some(SystemVisualMarker::BlackCircle),
                 color: (level == "warning").then(|| "warning".into()),
                 dim_color: level == "info",
-                content: if subtype == "turn_duration" {
+                content: if matches!(subtype.as_str(), "turn_duration" | "compact") {
                     format!("● {}", content.trim())
                 } else {
                     content.trim().to_string()

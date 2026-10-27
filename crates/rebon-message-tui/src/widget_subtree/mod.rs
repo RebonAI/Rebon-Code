@@ -2127,16 +2127,22 @@ fn system_text_layout(
         | SystemTextProjection::ScheduledTaskFire(display)
         | SystemTextProjection::Generic(display)
         | SystemTextProjection::Thinking(display) => (
-            vec![BodyRow::Line(render_system_line(
-                display.marker,
-                display.content.clone(),
-                match display.color.as_deref() {
-                    Some("warning") => theme.warning,
-                    Some("error") => theme.error,
-                    _ if display.dim_color => theme.dim,
-                    _ => theme.text,
-                },
-            ))],
+            display
+                .content
+                .split('\n')
+                .map(|line| {
+                    BodyRow::Line(render_system_line(
+                        display.marker,
+                        line.to_string(),
+                        match display.color.as_deref() {
+                            Some("warning") => theme.warning,
+                            Some("error") => theme.error,
+                            _ if display.dim_color => theme.dim,
+                            _ => theme.text,
+                        },
+                    ))
+                })
+                .collect(),
             None,
         ),
         SystemTextProjection::Hidden => (Vec::new(), None),

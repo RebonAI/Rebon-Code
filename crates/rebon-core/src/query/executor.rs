@@ -2344,13 +2344,19 @@ impl TurnEventLoop<'_> {
                     );
                 }
             }
-            QueryEvent::CompactingStarted { messages_before } => {
+            QueryEvent::CompactingStarted {
+                messages_before,
+                manual,
+            } => {
                 tracing::info!(messages_before, "executor: compaction started");
                 if let Some(pub_ref) = &update_publisher {
                     pub_ref
                         .publish_to(
                             &session_id,
-                            SessionUpdate::CompactingStarted { messages_before },
+                            SessionUpdate::CompactingStarted {
+                                messages_before,
+                                manual,
+                            },
                         )
                         .await;
                 }
@@ -4056,6 +4062,7 @@ impl EngineQueryExecutor {
                     &frame.session_id,
                     SessionUpdate::CompactingStarted {
                         messages_before: history.len(),
+                        manual: false,
                     },
                 )
                 .await;

@@ -69,9 +69,11 @@ async fn minimal_tool_search_promotes_full_schema_on_the_next_request() {
         .iter()
         .find(|tool| tool.name == "Read")
         .expect("Read should remain provider-visible after schema promotion");
-    assert!(promoted_read.input_schema["properties"]
-        .get("pages")
-        .is_some());
+    assert!(
+        promoted_read.input_schema["properties"]["targets"]["items"]["properties"]
+            .get("pages")
+            .is_some()
+    );
     let promoted = requests[1]
         .tools
         .iter()

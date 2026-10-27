@@ -329,6 +329,18 @@ fn apply_with_flush(app: &mut AppState, action: Action) {
     );
 }
 
+pub(crate) fn seal_overlay_before_transcript_message(app: &mut AppState) {
+    let timestamp = format_system_time_iso_ms(SystemTime::now());
+    reducer(&mut app.rebon_tui, Action::EndStreamingThinking);
+    reducer(
+        &mut app.rebon_tui,
+        Action::FlushSealedPrefix {
+            commit_timestamp: timestamp,
+            policy: SealedPrefixFlushPolicy::DrainClosedStableAndSealLiveText,
+        },
+    );
+}
+
 fn commit_queued_user_message(
     app: &mut AppState,
     uuid: String,
@@ -339,8 +351,6 @@ fn commit_queued_user_message(
         return;
     }
 
-    let timestamp = format_system_time_iso_ms(SystemTime::now());
-    reducer(&mut app.rebon_tui, Action::EndStreamingThinking);
     // Everything the model already said belongs ABOVE this message, and a
     // committed message always renders under the live overlay — so anything
     // left live here would render below an answer that came after it.
@@ -354,13 +364,8 @@ fn commit_queued_user_message(
     // that block is finished, so there is no partial last line to hold back for
     // deltas that are not coming. Later deltas open a fresh block, which is
     // right: what the model says next it says after the answer.
-    reducer(
-        &mut app.rebon_tui,
-        Action::FlushSealedPrefix {
-            commit_timestamp: timestamp.clone(),
-            policy: SealedPrefixFlushPolicy::DrainClosedStableAndSealLiveText,
-        },
-    );
+    seal_overlay_before_transcript_message(app);
+    let timestamp = format_system_time_iso_ms(SystemTime::now());
     let user_content = content
         .into_iter()
         .filter_map(|block| match block {
@@ -612,7 +617,8 @@ pub fn translate_session_update(app: &mut AppState, params: SessionUpdateParams)
         SessionUpdate::ContextReset { plan } => {
             crate::tui::runner::apply_context_reset_to_tui(app, plan);
         }
-        SessionUpdate::CompactingStarted { .. } => {
+        SessionUpdate::CompactingStarted { manual, .. } => {
+            app.turn_compact_manual = manual;
             // Override the spinner verb while compaction is in
             // progress. Capture the in-flight random verb first so
             // CompactingDone can restore the original wording
@@ -636,10 +642,16 @@ pub fn translate_session_update(app: &mut AppState, params: SessionUpdateParams)
             } else {
                 "truncation"
             };
+            let origin = if std::mem::take(&mut app.turn_compact_manual) {
+                ""
+            } else {
+                " automatically"
+            };
             let content = format!(
-                "Context was automatically compacted via {method}. \
+                "Context was{origin} compacted via {method}. \
                  History reduced to {messages_after} messages."
             );
+            seal_overlay_before_transcript_message(app);
             crate::tui::runner::inject_system_message(app, "compact", &content);
             app.follow_transcript_tail = true;
         }
@@ -684,13 +696,15 @@ pub(crate) fn project_remote_session_snapshot_update(app: &mut AppState, update:
             title: Some(title), ..
         } => app.session_title = Some(title.clone()),
         SessionUpdate::ContextReset { .. } => app.plan_entries.clear(),
-        SessionUpdate::CompactingStarted { .. } => {
+        SessionUpdate::CompactingStarted { manual, .. } => {
+            app.turn_compact_manual = *manual;
             if app.spinner_verb_before_compacting.is_none() {
                 app.spinner_verb_before_compacting = Some(app.spinner_verb.clone());
             }
             app.spinner_verb = "Compacting".to_string();
         }
         SessionUpdate::CompactingDone { .. } => {
+            app.turn_compact_manual = false;
             app.spinner_verb = app
                 .spinner_verb_before_compacting
                 .take()
@@ -830,7 +844,8 @@ pub(crate) fn project_remote_session_update(
             }
             effect.overlay_cleared = true;
         }
-        SessionUpdate::CompactingStarted { .. } => {
+        SessionUpdate::CompactingStarted { manual, .. } => {
+            app.turn_compact_manual = manual;
             if app.spinner_verb_before_compacting.is_none() {
                 app.spinner_verb_before_compacting = Some(app.spinner_verb.clone());
             }
@@ -849,11 +864,17 @@ pub(crate) fn project_remote_session_update(
             } else {
                 "truncation"
             };
+            let origin = if std::mem::take(&mut app.turn_compact_manual) {
+                ""
+            } else {
+                " automatically"
+            };
+            seal_overlay_before_transcript_message(app);
             crate::tui::runner::inject_system_message(
                 app,
                 "compact",
                 &format!(
-                    "Context was automatically compacted via {method}. \
+                    "Context was{origin} compacted via {method}. \
                      History reduced to {messages_after} messages."
                 ),
             );
@@ -992,6 +1013,124 @@ mod tests {
                 json!(path.to_string_lossy().replace('\\', "/")),
             ),
         ])
+    }
+
+    #[test]
+    fn compact_done_preserves_order_of_streamed_content_and_user_message() {
+        for remote in [false, true] {
+            let mut app = AppState::new();
+            reducer(
+                &mut app.rebon_tui,
+                Action::AppendStreamingText("earlier assistant".into()),
+            );
+            let mut hidden = HashSet::new();
+            let done = SessionUpdate::CompactingDone {
+                messages_after: 6,
+                used_model: true,
+            };
+            if remote {
+                project_remote_session_update(&mut app, params(done), &mut hidden);
+            } else {
+                translate_session_update(&mut app, params(done));
+            }
+            commit_queued_user_message(
+                &mut app,
+                "user-after".into(),
+                vec![ContentBlock::Text(TextContent {
+                    text: "next user".into(),
+                    annotations: None,
+                })],
+                None,
+            );
+            let rows = app.rebon_tui.transcript.rows();
+            assert_eq!(rows.len(), 3, "{rows:?}");
+            assert!(matches!(&rows[0], Message::Assistant(_)), "{rows:?}");
+            assert!(
+                matches!(&rows[1], Message::System(m) if m.subtype == "compact"),
+                "{rows:?}"
+            );
+            assert!(
+                matches!(&rows[2], Message::User(m) if m.uuid == "user-after"),
+                "{rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_turn_compaction_displays_auto_compacting_until_done() {
+        let mut app = AppState::new();
+        app.spinner_verb = "Thinking".into();
+        translate_session_update(
+            &mut app,
+            params(SessionUpdate::CompactingStarted {
+                messages_before: 100,
+                manual: false,
+            }),
+        );
+        assert!(crate::tui::compact_widget::build_view_model(&app).is_none());
+        assert!(!app.turn_compact_manual);
+        assert_eq!(app.spinner_verb, "Compacting");
+        translate_session_update(
+            &mut app,
+            params(SessionUpdate::CompactingDone {
+                messages_after: 5,
+                used_model: true,
+            }),
+        );
+        assert!(crate::tui::compact_widget::build_view_model(&app).is_none());
+        assert_eq!(app.spinner_verb, "Thinking");
+        project_remote_session_snapshot_update(
+            &mut app,
+            &SessionUpdate::CompactingStarted {
+                messages_before: 100,
+                manual: false,
+            },
+        );
+        assert!(crate::tui::compact_widget::build_view_model(&app).is_none());
+        assert!(!app.turn_compact_manual);
+        assert_eq!(app.spinner_verb, "Compacting");
+        project_remote_session_snapshot_update(
+            &mut app,
+            &SessionUpdate::CompactingDone {
+                messages_after: 5,
+                used_model: false,
+            },
+        );
+        assert!(crate::tui::compact_widget::build_view_model(&app).is_none());
+    }
+
+    #[test]
+    fn in_turn_manual_compaction_is_not_labelled_automatic() {
+        let mut app = AppState::new();
+        for projection in 0..3 {
+            let start = SessionUpdate::CompactingStarted {
+                messages_before: 100,
+                manual: true,
+            };
+            let mut hidden = HashSet::new();
+            match projection {
+                0 => translate_session_update(&mut app, params(start)),
+                1 => project_remote_session_snapshot_update(&mut app, &start),
+                _ => {
+                    project_remote_session_update(&mut app, params(start), &mut hidden);
+                }
+            }
+            assert!(crate::tui::compact_widget::build_view_model(&app).is_none());
+            assert!(app.turn_compact_manual);
+            assert_eq!(app.spinner_verb, "Compacting");
+            let done = SessionUpdate::CompactingDone {
+                messages_after: 5,
+                used_model: true,
+            };
+            match projection {
+                0 => translate_session_update(&mut app, params(done)),
+                1 => project_remote_session_snapshot_update(&mut app, &done),
+                _ => {
+                    project_remote_session_update(&mut app, params(done), &mut hidden);
+                }
+            }
+            assert!(crate::tui::compact_widget::build_view_model(&app).is_none());
+        }
     }
 
     fn sess() -> SessionId {
@@ -2084,6 +2223,7 @@ mod tests {
             &mut app,
             params(SessionUpdate::CompactingStarted {
                 messages_before: 42,
+                manual: false,
             }),
         );
         assert_eq!(app.spinner_verb, "Compacting");

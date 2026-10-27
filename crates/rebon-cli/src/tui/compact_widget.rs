@@ -1,4 +1,4 @@
-//! Progress widget for an immediate `/compact`.
+//! Progress widget for an immediate `/compact` or idle auto-compaction.
 //!
 //! Compaction is one long provider call — 30 seconds is normal — with no
 //! streamed output to watch. Before this widget the only feedback was the
@@ -11,7 +11,8 @@
 //! [`CompactRunState::progress_percent`]) because the provider reports
 //! nothing in between. It deliberately never reaches 100%: only the
 //! finished run clears this state, and the transcript report is what says
-//! "done".
+//! "done". Idle auto-compaction instead shows a blinking status without the
+//! time-paced bar; in-turn compaction uses the turn spinner.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -35,20 +36,24 @@ pub struct CompactViewModel {
     pub percent: u16,
     pub elapsed: String,
     pub messages_before: usize,
+    pub automatic: bool,
+    pub dot_bright: bool,
 }
 
 pub fn build_view_model(app: &AppState) -> Option<CompactViewModel> {
-    let run = app.compact_run.as_ref()?;
+    let run = app.compact_run.as_ref().filter(|run| !run.invalidated)?;
     Some(CompactViewModel {
         phase_label: run.phase.label(),
         percent: run.progress_percent(),
         elapsed: format_elapsed(run),
         messages_before: run.messages_before,
+        automatic: run.automatic,
+        dot_bright: (run.started_at.elapsed().as_millis() / 500) % 2 == 0,
     })
 }
 
 pub fn desired_height(app: &AppState, max_height: u16) -> u16 {
-    if app.compact_run.is_none() || max_height == 0 {
+    if build_view_model(app).is_none() || max_height == 0 {
         return 0;
     }
     COMPACT_WIDGET_ROWS.min(max_height)
@@ -74,6 +79,14 @@ fn view_model_line(vm: &CompactViewModel, theme: &RenderTheme, width: u16) -> Li
         .system_info
         .fg
         .unwrap_or_else(|| parse_theme_color(ds.subtle));
+
+    if vm.automatic {
+        let dot_color = if vm.dot_bright { accent } else { muted };
+        return Line::from(vec![
+            Span::styled("● ", Style::default().fg(dot_color)),
+            Span::styled("Auto Compacting…", Style::default().fg(accent)),
+        ]);
+    }
 
     // The label and trailing detail are fixed cost; the bar absorbs whatever
     // width is left so a narrow terminal degrades to a shorter bar instead of
@@ -140,6 +153,51 @@ mod tests {
     }
 
     #[test]
+    fn idle_automatic_run_shows_a_status_until_invalidated_or_finished() {
+        let mut app = AppState::new();
+        let mut run = run_state(CompactPhase::Summarizing, std::time::Duration::ZERO);
+        run.automatic = true;
+        app.compact_run = Some(run);
+        assert_eq!(desired_height(&app, 10), 1);
+        assert_eq!(desired_height(&app, 0), 0);
+        assert!(build_view_model(&app).unwrap().automatic);
+        app.compact_run.as_mut().unwrap().invalidated = true;
+        assert_eq!(desired_height(&app, 10), 0);
+        app.compact_run = None;
+        assert_eq!(desired_height(&app, 10), 0);
+    }
+
+    #[test]
+    fn idle_auto_compaction_changes_the_dot_style_without_changing_the_label() {
+        let theme = RenderTheme::plain();
+        let mut vm = CompactViewModel {
+            phase_label: "Summarizing conversation",
+            percent: 42,
+            elapsed: "0:12".into(),
+            messages_before: 9,
+            automatic: true,
+            dot_bright: true,
+        };
+        let bright = view_model_line(&vm, &theme, 80);
+        vm.dot_bright = false;
+        let dim = view_model_line(&vm, &theme, 80);
+        assert_ne!(bright.spans[0].style, dim.spans[0].style);
+        assert_eq!(bright.spans[1].content, "Auto Compacting…");
+        assert_eq!(bright.spans[1], dim.spans[1]);
+    }
+
+    #[test]
+    fn in_turn_compaction_uses_only_the_turn_spinner() {
+        let mut app = AppState::new();
+        app.spinner_verb_before_compacting = Some("Thinking".into());
+        for manual in [false, true] {
+            app.turn_compact_manual = manual;
+            assert_eq!(desired_height(&app, 10), 0);
+            assert!(build_view_model(&app).is_none());
+        }
+    }
+
+    #[test]
     fn an_active_run_claims_exactly_one_row_and_clamps_to_the_budget() {
         let mut app = AppState::new();
         app.compact_run = Some(run_state(
@@ -196,6 +254,8 @@ mod tests {
             percent: 42,
             elapsed: "0:12".into(),
             messages_before: 9,
+            automatic: false,
+            dot_bright: true,
         };
         let theme = RenderTheme::plain();
         for width in [20u16, 40, 80, 200] {

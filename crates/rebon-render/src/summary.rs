@@ -118,6 +118,17 @@ pub fn streaming_tool_summary(tool_name: &str, map: &HashMap<String, Value>) -> 
         );
     }
 
+    if matches!(tool_name, "Read" | "FileReadTool") {
+        if let Some(targets) = map.get("targets").and_then(Value::as_array) {
+            return targets
+                .iter()
+                .filter_map(|target| target.get("path").and_then(Value::as_str))
+                .map(|path| crate::display_path::display_path(path).into_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+        }
+    }
+
     if tool_name == "WebSearch" {
         return map
             .get("query")
@@ -275,6 +286,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn batched_read_summary_shows_paths() {
+        let input = HashMap::from([(
+            "targets".into(),
+            json!([{"path": "a.rs"}, {"path": "b.rs", "start": 20}]),
+        )]);
+        assert_eq!(streaming_tool_summary("Read", &input), "a.rs, b.rs");
+    }
 
     #[test]
     fn run_code_display_label_does_not_change_canonical_name_or_summary() {

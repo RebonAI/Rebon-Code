@@ -240,11 +240,27 @@ fn minimal_bootstrap_tool(name: &str) -> Option<ApiTool> {
         },
         "Read" => ApiTool {
             name: name.to_string(),
-            description: "Read a file by absolute path.".to_string(),
+            description: "Read files by absolute path. Put all needed files and ranges in targets."
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "properties": { "file_path": { "type": "string" } },
-                "required": ["file_path"],
+                "properties": { "targets": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "start": { "type": "integer" },
+                            "end": { "type": "integer" },
+                            "symbol": { "type": "string" },
+                            "pages": { "type": "string" }
+                        },
+                        "required": ["path"],
+                        "additionalProperties": false
+                    }
+                } },
+                "required": ["targets"],
                 "additionalProperties": false
             }),
         },

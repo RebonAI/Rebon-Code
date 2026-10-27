@@ -291,6 +291,7 @@ async fn compact_history(
 ) -> (u32, u32, bool) {
     let _ = tx.send(QueryEvent::CompactingStarted {
         messages_before: manager.len(),
+        manual: trigger == CompactTrigger::Manual,
     });
     let before_tokens = next_request_input_estimate(manager, params);
     let result =

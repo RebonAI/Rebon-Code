@@ -581,6 +581,7 @@ pub enum QueryEvent {
     CompactingStarted {
         /// Number of messages before compaction.
         messages_before: usize,
+        manual: bool,
     },
     /// Active compaction finished. The TUI should inject a system
     /// message and resume the normal spinner verb.

@@ -235,6 +235,94 @@ fn format_web_fetch_result_for_model(value: &Value) -> String {
 
 pub(super) fn read_tool_result_for_model(value: &Value, include_binary: bool) -> ToolResultContent {
     match value.get("type").and_then(Value::as_str) {
+        Some("batch") => {
+            let Some(results) = value.get("results").and_then(Value::as_array) else {
+                return ToolResultContent::text(truncate_tool_result_content(value.to_string()));
+            };
+            const SUMMARY_BUDGET: usize = rebon_tool::read::READ_BATCH_NOTICE_BUDGET;
+            let delivery = rebon_tool::read::read_batch_delivery(results, include_binary);
+            let mut blocks = Vec::new();
+            let mut text_bytes = 0usize;
+            let mut omitted = Vec::new();
+            let mut partially_returned = false;
+            for (index, result) in results.iter().enumerate() {
+                let path = result
+                    .get("filePath")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        result
+                            .get("file")
+                            .and_then(|file| file.get("filePath"))
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or("<unknown>");
+                if delivery[index] == rebon_tool::read::ReadBatchDelivery::Omitted {
+                    omitted.push((index + 1, path));
+                    continue;
+                }
+                let mut item = vec![ToolResultContentBlock::Text(TextBlock {
+                    text: format!("File: {path}"),
+                })];
+                match read_tool_result_for_model(result, include_binary) {
+                    ToolResultContent::Text(text) => {
+                        item.push(ToolResultContentBlock::Text(TextBlock { text }))
+                    }
+                    ToolResultContent::Blocks(content) => item.extend(content),
+                }
+                if delivery[index] == rebon_tool::read::ReadBatchDelivery::Partial {
+                    for block in item {
+                        if let ToolResultContentBlock::Text(mut text) = block {
+                            let remaining = (rebon_tool::read::READ_BATCH_TEXT_BUDGET
+                                - SUMMARY_BUDGET)
+                                .saturating_sub(text_bytes);
+                            if text.text.len() > remaining {
+                                let boundary = floor_char_boundary(&text.text, remaining);
+                                text.text.truncate(boundary);
+                            }
+                            text_bytes += text.text.len();
+                            blocks.push(ToolResultContentBlock::Text(text));
+                        }
+                    }
+                    partially_returned = true;
+                    omitted.push((index + 1, path));
+                } else {
+                    blocks.extend(item);
+                }
+            }
+            if !omitted.is_empty() {
+                let mut notice = format!("[{} Read result(s) partially returned or omitted due to the batch output budget. Retry these targets separately, with fewer PDF pages when needed:", omitted.len());
+                let mut listed = 0;
+                for (index, path) in &omitted {
+                    let status = if listed == 0 && partially_returned {
+                        " (partially returned)"
+                    } else {
+                        " (omitted)"
+                    };
+                    let display_path = if path.len() > 160 {
+                        let start = floor_char_boundary(path, 78);
+                        let mut end = path.len() - 79;
+                        while !path.is_char_boundary(end) {
+                            end += 1;
+                        }
+                        format!("{}...{}", &path[..start], &path[end..])
+                    } else {
+                        path.to_string()
+                    };
+                    let entry = format!("\n  result {index}: {display_path}{status}");
+                    if notice.len() + entry.len() + 128 > SUMMARY_BUDGET {
+                        break;
+                    }
+                    notice.push_str(&entry);
+                    listed += 1;
+                }
+                if listed < omitted.len() {
+                    notice.push_str(&format!("\n  and {} further results, starting at result {}; consult the original targets.", omitted.len() - listed, omitted[listed].0));
+                }
+                notice.push(']');
+                blocks.push(ToolResultContentBlock::Text(TextBlock { text: notice }));
+            }
+            ToolResultContent::blocks(blocks)
+        }
         Some("image") => read_image_tool_result_for_model(value),
         Some("pdf") => read_pdf_tool_result_for_model(value, include_binary),
         Some("parts") => read_pdf_parts_tool_result_for_model(value, include_binary),
@@ -543,6 +631,188 @@ pub(super) fn input_str<'a>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn omitted_batch_read_does_not_authorize_write_or_edit() {
+        use rebon_tool::{Tool, ToolContext};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = rebon_tools_core::file_state::FileStateCache::new();
+        let ctx = ToolContext::new().with_file_state_cache(cache.clone());
+        let mut paths = Vec::new();
+        for i in 0..10 {
+            let path = dir.path().join(format!("file-{i}.txt"));
+            let content = format!("marker-{i} {}\n", "x".repeat(95)).repeat(300);
+            std::fs::write(&path, content).unwrap();
+            paths.push(path);
+        }
+        let targets: Vec<_> = paths.iter().map(|path| json!({"path":path})).collect();
+        let result = rebon_tool::ReadTool
+            .call(json!({"targets": targets}), &ctx)
+            .await
+            .unwrap();
+        let projected = read_tool_result_for_model(&result, true).to_plain_text();
+        assert!(projected.contains("marker-0"));
+        assert!(!projected.contains("marker-9"));
+        assert!(cache.get(&paths[0]).is_some());
+        assert!(cache.get(&paths[9]).is_none());
+        assert!(rebon_tool::WriteTool
+            .call(json!({"file_path":paths[9],"content":"replacement"}), &ctx)
+            .await
+            .is_err());
+        assert!(rebon_tool::EditTool
+            .call(
+                json!({"file_path":paths[9],"old_string":"marker-9","new_string":"changed"}),
+                &ctx
+            )
+            .await
+            .is_err());
+        assert!(std::fs::read_to_string(&paths[9])
+            .unwrap()
+            .starts_with("marker-9"));
+
+        let reread = rebon_tool::ReadTool
+            .call(json!({"targets": [{"path": paths[9]}]}), &ctx)
+            .await
+            .unwrap();
+        assert!(read_tool_result_for_model(&reread, true)
+            .to_plain_text()
+            .contains("marker-9"));
+        let previous = cache.get(&paths[9]).unwrap();
+        std::fs::write(&paths[9], "external change").unwrap();
+        let targets: Vec<_> = paths.iter().map(|path| json!({"path":path})).collect();
+        let result = rebon_tool::ReadTool
+            .call(json!({"targets": targets}), &ctx)
+            .await
+            .unwrap();
+        assert!(!read_tool_result_for_model(&result, true)
+            .to_plain_text()
+            .contains("external change"));
+        assert_eq!(cache.get(&paths[9]).unwrap().content, previous.content);
+        let error = rebon_tool::WriteTool
+            .call(json!({"file_path":paths[9],"content":"replacement"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("modified since"), "{error}");
+
+        rebon_tool::ReadTool
+            .call(json!({"targets": [{"path": paths[9]}]}), &ctx)
+            .await
+            .unwrap();
+        rebon_tool::EditTool
+            .call(
+                json!({"file_path":paths[9],"old_string":"external change","new_string":"edited"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&paths[9]).unwrap(), "edited");
+        rebon_tool::WriteTool
+            .call(json!({"file_path":paths[0],"content":"replacement"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&paths[0]).unwrap(), "replacement");
+    }
+
+    #[test]
+    fn batch_read_enforces_combined_text_budget_and_names_omitted_results() {
+        let results: Vec<_> = (0..10)
+            .map(|i| json!({"type":"text", "file":{"filePath":format!("/file-{i}"), "content":"中".repeat(5000)}}))
+            .collect();
+        let value = json!({"type":"batch", "results":results});
+        for include_binary in [true, false] {
+            let content = read_tool_result_for_model(&value, include_binary);
+            let text = content.to_plain_text();
+            assert!(text.len() <= MAX_TOOL_RESULT_CHARS, "{}", text.len());
+            assert!(text.contains("/file-9"), "omitted path must be identified");
+            assert!(text.contains("omitted"), "omission must be explicit");
+        }
+    }
+
+    #[test]
+    fn batch_read_notice_lists_all_results_for_maximum_batch() {
+        let results: Vec<_> = (0..32)
+            .map(|i| json!({"type":"text", "file":{"filePath":format!("/file-{i}/{}", "x".repeat(300)), "content":"x".repeat(100_000)}}))
+            .collect();
+        let text = read_tool_result_for_model(&json!({"type":"batch", "results":results}), true)
+            .to_plain_text();
+        assert!(text.len() <= MAX_TOOL_RESULT_CHARS);
+        for i in 1..=32 {
+            assert!(
+                text.contains(&format!("result {i}: /file-{}", i - 1)),
+                "missing result {i}"
+            );
+        }
+        assert!(!text.contains("further results"));
+    }
+
+    #[test]
+    fn oversized_single_text_result_keeps_its_content_prefix() {
+        let value = json!({"type":"batch", "results":[
+            {"type":"text", "file":{"filePath":"/big", "content":format!("requested-line-500 {}", "x".repeat(120_000))}}
+        ]});
+        let text = read_tool_result_for_model(&value, true).to_plain_text();
+        assert!(text.len() <= MAX_TOOL_RESULT_CHARS);
+        assert!(text.contains("requested-line-500"));
+        assert!(text.contains("/big") && text.contains("partially returned"));
+    }
+
+    #[test]
+    fn batch_read_caps_binary_and_identifies_later_targets() {
+        let image = "x".repeat(15 * 1024 * 1024);
+        let value = json!({"type":"batch", "results":[
+            {"type":"image", "file":{"filePath":"/first.png", "type":"image/png", "base64":image}},
+            {"type":"image", "file":{"filePath":"/second.png", "type":"image/png", "base64":image}},
+            {"type":"text", "file":{"filePath":"/later", "content":"later"}}
+        ]});
+        let content = read_tool_result_for_model(&value, true);
+        let ToolResultContent::Blocks(blocks) = &content else {
+            panic!("expected blocks")
+        };
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| matches!(block, ToolResultContentBlock::Image(_)))
+                .count(),
+            1
+        );
+        let text = content.to_plain_text();
+        assert!(
+            text.contains("/second.png") && text.contains("/later") && text.contains("omitted")
+        );
+    }
+
+    #[test]
+    fn batch_read_projects_each_multimodal_result_and_error() {
+        let value = json!({"type":"batch","results":[
+            {"type":"text","file":{"filePath":"/a","content":"hello"}},
+            {"type":"image","file":{"filePath":"/b","type":"image/png","base64":"img"}},
+            {"type":"pdf","file":{"filePath":"/c","originalSize":3,"base64":"pdf"}},
+            {"type":"parts","file":{"filePath":"/d","count":1,"pages":[{"base64":"page"}]}},
+            {"type":"error","filePath":"/e","error":"denied"}
+        ]});
+        let ToolResultContent::Blocks(blocks) = read_tool_result_for_model(&value, true) else {
+            panic!("expected blocks")
+        };
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|b| matches!(b, ToolResultContentBlock::Image(_)))
+                .count(),
+            2
+        );
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|b| matches!(b, ToolResultContentBlock::Document(_)))
+                .count(),
+            1
+        );
+        let text = serde_json::to_string(&blocks).unwrap();
+        for expected in ["/a", "/b", "/c", "/d", "/e", "hello", "denied"] {
+            assert!(text.contains(expected), "missing {expected}");
+        }
+    }
 
     /// A tool with no projection of its own falls through to the generic
     /// path, whatever its result carries. The `ComputerUse` shape stands in
