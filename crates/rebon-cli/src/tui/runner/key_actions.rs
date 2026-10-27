@@ -277,6 +277,15 @@ fn handle_app_only_key_action(app: &mut AppState, action: KeyAction, ui_mode: Ui
             pop_undo(app);
             false
         }
+        KeyAction::AcceptPromptSuggestion => {
+            if app.input.is_empty() {
+                if let Some(text) = app.prompt_suggestion_text.as_ref() {
+                    app.input = text.clone();
+                    app.cursor_offset = app.input.len();
+                }
+            }
+            false
+        }
         KeyAction::CursorRight => {
             let chips = extract_all_ref_positions(&app.input);
             app.cursor_offset =
@@ -540,6 +549,26 @@ mod tests {
     use super::super::test_support::{insert_local_agent_task, make_test_tui_session};
     use super::super::ActivePrompt;
     use super::handle_key_action;
+
+    #[test]
+    fn prompt_suggestion_accepts_without_submit_or_overwrite() {
+        let mut app = AppState::new();
+        app.prompt_suggestion_text = Some("下一步".into());
+        assert!(!super::handle_app_only_key_action(
+            &mut app,
+            KeyAction::AcceptPromptSuggestion,
+            UiMode::Inline,
+        ));
+        assert_eq!(app.input, "下一步");
+        assert_eq!(app.cursor_offset, app.input.len());
+        app.input.push('!');
+        super::handle_app_only_key_action(
+            &mut app,
+            KeyAction::AcceptPromptSuggestion,
+            UiMode::Inline,
+        );
+        assert_eq!(app.input, "下一步!");
+    }
 
     fn make_immediate_handle() -> (Runtime, Handle) {
         let runtime = Builder::new_current_thread()
@@ -1239,7 +1268,10 @@ mod tests {
             &mut theme,
         );
 
-        assert!(session.model.service_tier.is_fast(), "the toggle still took");
+        assert!(
+            session.model.service_tier.is_fast(),
+            "the toggle still took"
+        );
         assert!(
             app.rebon_tui.transcript.is_empty(),
             "the empty screen stays empty rather than gaining a row"

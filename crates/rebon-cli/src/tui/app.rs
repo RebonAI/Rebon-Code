@@ -519,6 +519,9 @@ pub struct AppState {
     /// Cleared by `abort_prompt_suggestion` from the normalized
     /// change path.
     pub prompt_suggestion_active: bool,
+    pub prompt_suggestion_text: Option<String>,
+    pub prompt_suggestion_turn: u64,
+    pub prompt_suggestion_session: Option<String>,
     /// Whether the stash hint notification has been dismissed this
     /// session. Once set, the hint is never re-shown.
     pub stash_hint_dismissed: bool,
@@ -940,6 +943,9 @@ impl AppState {
             speculation_active: false,
             side_question_visible: false,
             prompt_suggestion_active: false,
+            prompt_suggestion_text: None,
+            prompt_suggestion_turn: 0,
+            prompt_suggestion_session: None,
             stash_hint_dismissed: false,
             mods_status: None,
             mods_band: None,
@@ -1207,7 +1213,11 @@ impl AppState {
             cursor_offset: self.cursor_offset,
             suggestion_count: 0,
             default_placeholder: resolved_placeholder.or_else(|| self.default_placeholder.clone()),
-            prompt_suggestion: None,
+            prompt_suggestion: if self.input.is_empty() {
+                self.prompt_suggestion_text.clone()
+            } else {
+                None
+            },
             prompt_suggestion_state: PromptSuggestionState {
                 text: None,
                 shown_at: 0,

@@ -430,6 +430,7 @@ struct LoopState {
     /// session may arrive after the first frame.
     foreground_control: Option<super::foreground_mailbox::ForegroundControl>,
     global_search_worker: Option<GlobalSearchWorker>,
+    suggestion_runtime: super::prompt_suggestion::SuggestionRuntime,
     resume_runtime: ResumeRuntime,
     task_notification_retry_after: Option<Instant>,
     task_notification_revision_rx: Option<tokio::sync::watch::Receiver<u64>>,
@@ -526,6 +527,7 @@ pub(in crate::tui::runner) fn event_loop_with_mode(
         pending_permission: None,
         foreground_control: None,
         global_search_worker: None,
+        suggestion_runtime: Default::default(),
         resume_runtime: ResumeRuntime::new(),
         task_notification_retry_after: None,
         task_notification_revision_rx: None,
@@ -1107,7 +1109,7 @@ fn session_pipeline(
         sync_resume_dialog(app, session, handle, &mut state.resume_runtime);
         super::compact_runtime::sync_compact_run(app, session);
         let snapshots = app.agent_task_snapshots();
-        let idle = state.active_prompt.is_none()
+        let suggestion_idle = state.active_prompt.is_none()
             && !app.is_loading
             && state.pending_permission.is_none()
             && app.resume_dialog.is_none()
@@ -1118,7 +1120,8 @@ fn session_pipeline(
             && app.pending_agent_prompts.is_empty()
             && app.deferred_internal_submit_payloads.is_empty()
             && session.remote_background_attachment.is_none()
-            && session.pending_hosted_session.is_none()
+            && session.pending_hosted_session.is_none();
+        let idle = suggestion_idle
             && active_agent_footer_status(
                 &snapshots,
                 wall_clock_ms(),
@@ -1133,6 +1136,12 @@ fn session_pipeline(
             handle,
             idle,
             state.new_session_hint_idle_since.elapsed(),
+        );
+        state.suggestion_runtime.sync(
+            app,
+            session,
+            handle,
+            suggestion_idle && !session.engine_half.compact_runtime.is_running(),
         );
         sync_permission_view(app, &state.pending_permission);
         // Publish this session's live status (busy + pending permission) so
