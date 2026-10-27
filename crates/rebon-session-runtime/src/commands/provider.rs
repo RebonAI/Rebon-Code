@@ -399,7 +399,7 @@ fn provider_add_model(parts: &[&str]) -> ProviderCommandResult {
 /// Blocks for the request (a few seconds at most; the client has a 20s
 /// timeout). A vendor with no list endpoint gets its documented catalogue,
 /// and the reply says so.
-fn provider_models(parts: &[&str]) -> ProviderCommandResult {
+pub(super) fn provider_models(parts: &[&str]) -> ProviderCommandResult {
     use crate::rebon_config::{get_active_custom_provider_name, sync_custom_provider_models};
 
     let name = match parts.first() {
