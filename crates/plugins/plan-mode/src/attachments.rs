@@ -233,14 +233,10 @@ pub fn plan_mode(input: &PlanModePollInput) -> PlanModePollOutput {
 const PLAN_MODE_FULL_CONTENT: &str = "Plan mode is active. The user indicated that they do not want you to execute yet -- you MUST NOT make any edits, run any non-readonly tools (including changing configs or making commits), or otherwise make any changes to the system. This supercedes any other instructions you have received.\n\n\
 ## Plan Workflow\n\n\
 ### Phase 1: Initial Understanding\n\
-Goal: Gain the understanding needed for the user's request by reading through code and asking them questions. Critical: when codebase exploration is needed in this phase you should only use the Explore subagent type.\n\n\
+Goal: Gain the understanding needed for the user's request by reading through code and asking them questions. Prefer direct investigation with Read, Glob and Grep, including multi-round and cross-module searches.\n\n\
 1. Focus on understanding the user's request and the code associated with their request. Actively search for existing functions, utilities, and patterns that can be reused; avoid proposing new code when suitable implementations already exist.\n\n\
-2. Launch up to 3 Explore agents IN PARALLEL only when exploration is needed to efficiently explore the codebase.\n\
-   - Use 1 agent when the task is isolated to known files, the user provided specific file paths, or you're making a small targeted change.\n\
-   - Use multiple agents when the scope is uncertain, multiple areas of the codebase are involved, or you need to understand existing patterns before planning.\n\
-   - Quality over quantity: 3 agents maximum, but use the minimum number necessary.\n\
-   - If using multiple agents, give each one a specific search focus or area to explore.\n\n\
-Do not perform exploratory Read, Glob, Grep, or Bash calls yourself in Phase 1. Wait for any Explore report, then synthesize findings. Use AskUserQuestion only when unresolved decisions that only the user can answer block the plan, and combine all foreseeable independent blocking decisions into one call.\n\n\
+2. Consider Explore only for genuinely extensive, separable research when independent parallel work or reduced context cost provides a concrete benefit. Uncertain scope or multiple files alone do not require delegation. If using multiple Explore agents, give each a distinct focus and use the minimum needed.\n\n\
+Synthesize your findings and any Explore reports yourself. Use AskUserQuestion only when unresolved decisions that only the user can answer block the plan, and combine all foreseeable independent blocking decisions into one call.\n\n\
 Do not invoke `subagent_type=Plan` at any phase. Plan mode assigns planning responsibility to you, the parent agent. You must synthesize the research, evaluate trade-offs, and produce the final plan yourself; delegate only codebase exploration to Explore when needed.\n\n\
 ### Phase 2: Design\n\
 Design the implementation approach yourself. Consider multiple approaches and their trade-offs. Think through edge cases, failure modes, and ordering constraints.\n\n\
@@ -853,6 +849,13 @@ mod tests {
             !returned.contains("Phase 4: Call ExitPlanMode"),
             "the workflow was sent twice:\n{returned}"
         );
+    }
+
+    #[test]
+    fn plan_workflow_prefers_direct_investigation() {
+        assert!(PLAN_MODE_FULL_CONTENT.contains("Prefer direct investigation"));
+        assert!(!PLAN_MODE_FULL_CONTENT.contains("Do not perform exploratory Read"));
+        assert!(!PLAN_MODE_FULL_CONTENT.contains("Use 1 agent when the task is isolated"));
     }
 
     /// The seat producer hands out a poller for any session, because the

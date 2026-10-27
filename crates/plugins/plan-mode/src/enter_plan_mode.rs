@@ -34,7 +34,7 @@ const INVALID_INPUT_CODE: i64 = 400;
 /// because session attachment state has no separate interview-phase mode.
 const PLAN_MODE_WORKFLOW: &str = "\n\n\
     In plan mode, you should:\n\
-    1. Thoroughly explore the codebase; when exploration is needed, use only the Explore subagent rather than performing exploratory Glob, Grep, Read, or Bash calls yourself\n\
+    1. Thoroughly explore the codebase. Prefer direct investigation with Read, Glob and Grep, including cross-module tracing; consider Explore only for extensive independent research with clear parallel or context benefits\n\
     2. Identify similar features and architectural approaches\n\
     3. Consider multiple approaches and their trade-offs\n\
     4. Do not invoke the Plan subagent; Plan Mode assigns planning, synthesis, and the final plan to you, the parent agent\n\
@@ -70,7 +70,7 @@ impl Tool for EnterPlanModeTool {
          for costs the user a round trip and delays the work.\n\
          \n\
          Once you are in plan mode you:\n\
-         1. Thoroughly explore the codebase; when exploration is needed, use only the Explore subagent rather than performing exploratory Glob, Grep, Read, or Bash calls yourself\n\
+         1. Thoroughly explore the codebase. Prefer direct investigation with Read, Glob and Grep, including cross-module tracing; consider Explore only for extensive independent research with clear parallel or context benefits\n\
          2. Understand existing patterns and architecture\n\
          3. Design the implementation approach yourself\n\
          4. Do not invoke the Plan subagent; Plan Mode assigns planning, synthesis, and the final plan to you, the parent agent\n\
@@ -188,7 +188,9 @@ mod tests {
         assert!(msg.contains("user's answers and your research are sufficient, stop asking"));
         assert!(msg.contains("call the existing ExitPlanMode tool directly"));
         assert!(msg.contains("never replace plan submission with an extra AskUserQuestion"));
-        assert!(msg.contains("use only the Explore subagent"));
+        assert!(msg.contains("Prefer direct investigation"));
+        assert!(tool().description().contains("Prefer direct investigation"));
+        assert!(!msg.contains("use only the Explore subagent"));
         assert!(msg.contains("Do not invoke the Plan subagent"));
         assert!(msg.contains("final plan to you, the parent agent"));
     }

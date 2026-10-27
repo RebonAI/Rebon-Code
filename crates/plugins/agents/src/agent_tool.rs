@@ -151,6 +151,10 @@ impl AgentTool {
              \n\
              ## When NOT to use the Agent tool:\n\
              \n\
+             - Prefer direct investigation with Read, Glob, and Grep, even when a search takes \
+             multiple rounds or crosses modules. Consider Explore only for genuinely extensive, \
+             separable research with clear independent parallel or context-saving benefits. \
+             Unclear scope or a missed probe alone does not warrant delegation.\n\
              - If you want to read a specific file path, use the Read tool or Glob tool \
              instead of the Agent tool, to find the match more quickly\n\
              - If you are searching for a specific class definition like \"class Foo\", \
@@ -167,7 +171,7 @@ impl AgentTool {
              omit them to inherit the selected agent definition and current session/provider \
              defaults; set them only when intentionally targeting exact configured identifiers. \
              Do not specify both `model` and `modelProfile`.\n\
-             - Launch multiple agents concurrently whenever possible, to maximize performance; \
+             - Launch multiple agents concurrently when their independent work offers a clear benefit; \
              to do that, use a single message with multiple tool uses\n\
              - Concurrent and background write-capable agents are automatically isolated in \
              runtime-created worktrees and their changes are merged back into the source branch \
@@ -221,19 +225,19 @@ impl AgentTool {
              \n\
              <example>\n\
              user: \"Where do we register the Read tool's permission rules?\"\n\
-             assistant: <thinking>The file isn't obvious from the name and could live in tools-core, tool, or engine — unknown scope across at least three crates. Delegate to Explore instead of running my own Glob/Grep loop.</thinking>\n\
-             assistant: Uses the Agent tool to launch the Explore agent with a prompt asking which crate registers Read's permission behavior and the exact file:line where it's wired in.\n\
+             assistant: <thinking>The registration may span crates, but I can search for the tool and permission symbols and read the relevant code myself.</thinking>\n\
+             assistant: Uses Grep and Read to locate the registration and trace its wiring.\n\
              <commentary>\n\
-             Codebase question with unknown scope across multiple crates. Explore beats running Grep yourself — it parallelizes the search and returns a single concise answer instead of polluting the parent context with raw matches.\n\
+             Uncertain location or multiple crates alone do not warrant delegation.\n\
              </commentary>\n\
              </example>\n\
              \n\
              <example>\n\
              user: \"Why does the streaming overlay flicker when a tool result is large?\"\n\
-             assistant: <thinking>I have one concrete lead (streaming overlay) but the cause could be in render, message accumulation, or the publisher — scope still unclear. One cheap probe first, then delegate.</thinking>\n\
-             assistant: Uses Grep to confirm \"streaming overlay\" lives in rebon-tui, then uses the Agent tool to launch Explore with: \"Trace how a tool_result block flows from rebon-core through rebon-render into rebon-tui's streaming overlay. Identify which component decides when to repaint and report file:line for each hop. Under 300 words.\"\n\
+             assistant: <thinking>I can trace the streaming overlay and its producers directly; the fact that the flow may cross crates does not itself justify delegation.</thinking>\n\
+             assistant: Uses Grep and Read to trace the data and repaint path, then investigates the cause.\n\
              <commentary>\n\
-             One probe was enough to pin the entry point; tracing across three crates is exactly the unknown-scope flow Explore is designed for. Don't continue the Grep search yourself.\n\
+             Continue direct investigation while it remains tractable, even if it takes several searches.\n\
              </commentary>\n\
              </example>\n\
              \n\
@@ -246,7 +250,7 @@ impl AgentTool {
              </example>"
         );
         let model_description = format!(
-            "Launch specialized sub-agents for complex tasks. Use subagent_type for a matching role; omit for general-purpose. `provider`, `model`, and `modelProfile` are optional routing overrides. Normally omit them to inherit the selected agent definition and current session/provider defaults; set them only when intentionally targeting exact configured identifiers. Do not specify both `model` and `modelProfile`. A named local agent is a reusable session teammate: the first call creates it, and later calls with the same name dispatch follow-up work while preserving its context. Set `name` only when that accumulated context is likely to be reused; do not name one-off searches, reviews, verifications, or implementations merely to label them. Named teammates use the execution boundary fixed by their teammate/session: never combine `name` with per-call `cwd`, `allowed_roots`, `isolation`, or `allowed_tools`. Concurrent/background write agents are auto-isolated in runtime-created worktrees and merged back serially; named teammates cannot be concurrent writers. Named teammates default to background; completion delivery and automatic continuation follow session-specific guidance; omit `run_in_background` unless the Agent call itself must block for the handoff. Omit name for a one-shot sub-agent. Choose a feasible execution mode before teammate reuse. Among feasible options, prefer relevant context from the current roster. Without automatic continuation, use foreground one-shot work or execute directly for necessary dependencies. Use SendMessage only to supplement or correct work already in progress. One-shot local agents default to foreground; named teammates and external ACP agents default to background. Before invoking an external ACP agent, first send the user a short visible status message describing the delegation. Keep one-shot Explore agents in the foreground when their findings determine your next step; do not force named Explore teammates foreground merely to wait for them. Yielding is not final delivery: retain responsibility for results and verification, following the user's latest pause, cancellation, or scope change.\n\nAvailable agent types:\n{agent_lines}"
+            "Launch specialized sub-agents for complex tasks. Prefer direct investigation with Read, Glob, and Grep, including multi-round and cross-module searches; use Explore for extensive separable research with clear independent parallel or context-saving benefits, not merely unclear scope. Use subagent_type for a matching role; omit for general-purpose. `provider`, `model`, and `modelProfile` are optional routing overrides. Normally omit them to inherit the selected agent definition and current session/provider defaults; set them only when intentionally targeting exact configured identifiers. Do not specify both `model` and `modelProfile`. A named local agent is a reusable session teammate: the first call creates it, and later calls with the same name dispatch follow-up work while preserving its context. Set `name` only when that accumulated context is likely to be reused; do not name one-off searches, reviews, verifications, or implementations merely to label them. Named teammates use the execution boundary fixed by their teammate/session: never combine `name` with per-call `cwd`, `allowed_roots`, `isolation`, or `allowed_tools`. Concurrent/background write agents are auto-isolated in runtime-created worktrees and merged back serially; named teammates cannot be concurrent writers. Named teammates default to background; completion delivery and automatic continuation follow session-specific guidance; omit `run_in_background` unless the Agent call itself must block for the handoff. Omit name for a one-shot sub-agent. Choose a feasible execution mode before teammate reuse. Among feasible options, prefer relevant context from the current roster. Without automatic continuation, use foreground one-shot work or execute directly for necessary dependencies. Use SendMessage only to supplement or correct work already in progress. One-shot local agents default to foreground; named teammates and external ACP agents default to background. Before invoking an external ACP agent, first send the user a short visible status message describing the delegation. Keep one-shot Explore agents in the foreground when their findings determine your next step; do not force named Explore teammates foreground merely to wait for them. Yielding is not final delivery: retain responsibility for results and verification, following the user's latest pause, cancellation, or scope change.\n\nAvailable agent types:\n{agent_lines}"
         );
         Self {
             description,
@@ -2886,6 +2890,11 @@ mod tests {
             desc.contains("If the agent description mentions that it should be used proactively")
         );
         assert!(desc.contains("Never delegate understanding"));
+        assert!(desc.contains("Prefer direct investigation"));
+        assert!(tool
+            .model_description()
+            .contains("Prefer direct investigation"));
+        assert!(!desc.contains("One probe was enough"));
         assert!(desc.contains("never combine `name` with per-call `cwd`"));
         assert!(desc.contains("Do not add a name merely to label a one-off"));
         assert!(desc.contains("Named teammates run in the background by default"));

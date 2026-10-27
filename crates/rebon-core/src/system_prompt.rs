@@ -1813,6 +1813,8 @@ mod tests {
         ));
         assert!(prompt.contains("subagent_type=Explore"));
         assert!(prompt.contains("Choose direct lookup or delegation by search scope"));
+        assert!(prompt.contains("Prefer direct investigation"));
+        assert!(prompt.contains("cross-module work alone"));
         assert!(prompt.contains("default for a one-shot Explore agent is foreground execution"));
         assert!(prompt.contains("Named Explore teammates instead operate asynchronously"));
         assert!(prompt.contains("Leave `run_in_background` unset for them too"));

@@ -20,7 +20,7 @@ const DESCRIPTION: &str = "- Fast file pattern matching tool
 - Returns matching file paths sorted by modification time
 - `*` and `**/*` match every file recursively; set `path` to the narrowest directory you need (default: the working directory). Do not run broad patterns on parent folders, drive roots, or build output (target/, node_modules/, a CARGO_TARGET_DIR); those are skipped below `path`, and the walk stops after 100k entries or 10s
 - Use this tool when you need to find files by name patterns
-- When you are doing an open ended search that may require multiple rounds of globbing and grepping, use the Agent tool instead";
+- Prefer investigating directly; consider Explore for extensive independent research with clear parallel or context benefits";
 const DEFAULT_LIMIT: usize = 100;
 /// Matches collected (each costing a metadata read) before the walk stops.
 /// Generous next to the 100 returned, so the newest-first order is real for
@@ -346,6 +346,13 @@ mod tests {
     use super::*;
     use crate::Tool;
     use std::time::Duration;
+
+    #[test]
+    fn description_does_not_force_delegation_for_multiple_searches() {
+        assert!(!GlobTool
+            .description()
+            .contains("use the Agent tool instead"));
+    }
 
     struct TempDir {
         inner: tempfile::TempDir,

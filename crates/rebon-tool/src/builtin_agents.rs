@@ -45,9 +45,8 @@ pub struct BuiltInAgentDef {
 /// Minimum query-count heuristic retained for compatibility with older
 /// callers/tests that import the constant.
 ///
-/// Prompt routing no longer uses this as the primary precondition for
-/// Explore delegation; current guidance routes by whether codebase
-/// search scope is known vs unknown.
+/// Prompt routing prefers direct investigation and considers delegation for
+/// extensive independent research with clear benefits.
 pub const EXPLORE_AGENT_MIN_QUERIES: usize = 3;
 
 /// Tool names denied for read-only planning and exploration agents.
@@ -495,13 +494,12 @@ request or bug"
 // ── Explore agent ──────────────────────────────────────────────────
 
 const EXPLORE_WHEN_TO_USE: &str = "\
-Fast read-only search agent for locating code. Use it to find files by pattern \
-(eg. \"src/components/**/*.tsx\"), grep for symbols or keywords (eg. \"API \
-endpoints\"), or answer \"where is X defined / which files reference Y.\" Prefer \
-this for cross-module tracing, substantial evidence gathering, or independent \
-parallel research. Use direct Glob/Grep/Read for small, well-bounded questions \
-that a few targeted searches can resolve; do not force delegation after one \
-missed probe or a fixed query count. \
+Fast read-only search agent for locating code. Prefer direct Glob/Grep/Read \
+for investigation, including multi-round searches and cross-module tracing. \
+Use Explore when a genuinely extensive, separable research question offers \
+clear independent parallel work or materially reduces context cost. A vague \
+request, an unknown starting point, or several files alone are not reasons \
+to delegate; do not force delegation after one missed probe or a fixed query count. \
 When calling, specify search breadth: \"quick\" for a single targeted lookup, \
 \"medium\" for moderate exploration, or \"very thorough\" to search across \
 multiple locations and naming conventions.";
@@ -657,10 +655,9 @@ mod tests {
     fn explore_when_to_use_routes_unknown_scope_codebase_search() {
         let def = explore_agent_def();
         assert!(def.when_to_use.contains("Fast read-only search agent"));
-        assert!(def.when_to_use.contains("cross-module tracing"));
-        assert!(def
-            .when_to_use
-            .contains("Use direct Glob/Grep/Read for small, well-bounded questions"));
+        assert!(def.when_to_use.contains("Prefer direct Glob/Grep/Read"));
+        assert!(def.when_to_use.contains("cross-module"));
+        assert!(def.when_to_use.contains("independent parallel"));
         assert!(def.when_to_use.contains("very thorough"));
     }
 
