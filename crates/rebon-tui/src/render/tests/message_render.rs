@@ -228,6 +228,21 @@ fn committed_markdown_links_use_labels_and_osc8() {
 }
 
 #[test]
+fn recording_file_markdown_link_paints_local_file_url() {
+    let mut theme = RenderTheme::plain();
+    theme.supports_hyperlinks = true;
+    let mut buf = new_buf(48, 5);
+    render_message(
+        &assistant_text("a1", "[查看录制视频](file:///tmp/video%20one.mp4)"),
+        Rect::new(0, 0, 48, 5),
+        &mut buf,
+        &theme,
+        ToolOutputVerbosity::Verbose,
+    );
+    assert!(!hyperlink_cells(&buf, "file:///tmp/video%20one.mp4").is_empty());
+}
+
+#[test]
 fn wrapped_markdown_link_patches_each_visible_row() {
     let mut theme = RenderTheme::plain();
     theme.supports_hyperlinks = true;
