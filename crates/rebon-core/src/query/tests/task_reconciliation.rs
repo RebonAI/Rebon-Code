@@ -4,6 +4,82 @@ use super::*;
 
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "current_thread")]
+async fn task_reconciliation_replays_blocked_and_independent_work() {
+    let _env = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _config_dir = EnvVarGuard::set("REBON_CONFIG_DIR", temp.path().to_str().unwrap());
+    let _tasks_enabled = EnvVarGuard::set("REBON_ENABLE_TASKS", "1");
+    for (list, candidate) in [
+        ("replay-blocked", "Access is denied."),
+        ("replay-waiting", "The background job is still running."),
+        ("replay-unexplained", "One task remains open."),
+    ] {
+        let engine = build_engine_with_tools(vec![
+            Arc::new(rebon_plugin_tasks::TaskCreateTool) as Arc<dyn Tool>,
+            Arc::new(rebon_plugin_tasks::TaskUpdateTool) as Arc<dyn Tool>,
+        ]);
+        let client = MockModelClient::new();
+        client.push_turn(tool_turn(
+            "create_1",
+            "TaskCreate",
+            "call_1",
+            r#"{"subject":"Blocked","description":"Needs an external condition"}"#,
+        ));
+        client.push_turn(tool_turn(
+            "create_2",
+            "TaskCreate",
+            "call_2",
+            r#"{"subject":"Independent","description":"Can be completed"}"#,
+        ));
+        client.push_turn(text_turn("candidate", candidate));
+        client.push_turn(tool_turn(
+            "complete",
+            "TaskUpdate",
+            "call_3",
+            r#"{"taskId":"2","status":"completed"}"#,
+        ));
+        client.push_turn(text_turn(
+            "final",
+            "Independent work completed; task 1 remains open.",
+        ));
+        let captured = client.clone();
+        let mut rx = run_query(
+            engine.clone(),
+            SessionHandle::new(Arc::new(client)),
+            QueryParams::new("mock", vec![ApiMessage::user_text("do both")])
+                .with_tools(tools_from_engine(&engine)),
+            ToolContext::new().with_task_list_id(list),
+            CancelToken::new(),
+        );
+        let events = drain(&mut rx).await;
+        let requests = captured.captured_requests();
+        assert_eq!(requests.len(), 5);
+        let text = text_message_texts(&requests[3].messages).join("\n");
+        assert!(text.contains(candidate));
+        assert!(text.contains("- #1: pending") && text.contains("- #2: pending"));
+        assert!(
+            text.contains("already communicated") && text.contains("executable and authorized")
+        );
+        assert!(matches!(events.last(), Some(QueryEvent::Done { .. })));
+        assert_eq!(
+            rebon_tool::tasks::get_task(list, "1")
+                .unwrap()
+                .unwrap()
+                .status,
+            rebon_tool::tasks::TaskListStatus::Pending
+        );
+        assert_eq!(
+            rebon_tool::tasks::get_task(list, "2")
+                .unwrap()
+                .unwrap()
+                .status,
+            rebon_tool::tasks::TaskListStatus::Completed
+        );
+    }
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "current_thread")]
 async fn task_reconciliation_gate_injects_once_for_pending_task() {
     let _env = env_lock();
     let temp = tempfile::tempdir().unwrap();
@@ -45,6 +121,13 @@ async fn task_reconciliation_gate_injects_once_for_pending_task() {
     let final_request_text = text_message_texts(&requests[2].messages).join("\n");
     assert!(final_request_text.contains("Before finishing, reconcile the tasks touched"));
     assert!(final_request_text.contains("- #1: pending"));
+    assert!(final_request_text
+        .contains("Continue any remaining work that is executable and authorized"));
+    assert!(final_request_text.contains("already communicated"));
+    assert!(final_request_text.contains("do not repeat"));
+    assert!(final_request_text.contains("permission"));
+    assert!(final_request_text.contains("pause"));
+    assert!(final_request_text.contains("background"));
     assert_eq!(
         events
             .iter()
