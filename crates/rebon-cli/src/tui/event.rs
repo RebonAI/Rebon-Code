@@ -245,7 +245,6 @@ pub fn translate_key(key: &KeyEvent, app: &AppState) -> KeyAction {
         && app.slash_picker.is_none()
         && app.at_mention_picker.is_none()
         && app.foregrounded_task_id.is_none()
-        && app.pasted_contents.is_empty()
         && app.mode == "prompt"
     {
         return KeyAction::AcceptPromptSuggestion;

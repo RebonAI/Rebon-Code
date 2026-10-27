@@ -281,6 +281,13 @@ fn handle_app_only_key_action(app: &mut AppState, action: KeyAction, ui_mode: Ui
             if app.input.is_empty() {
                 if let Some(text) = app.prompt_suggestion_text.as_ref() {
                     app.input = text.clone();
+                    for paste in app
+                        .pasted_contents
+                        .iter()
+                        .filter(|paste| paste.kind == "image")
+                    {
+                        app.input.push_str(&format!(" [Image #{}]", paste.id));
+                    }
                     app.cursor_offset = app.input.len();
                 }
             }
@@ -568,6 +575,35 @@ mod tests {
             UiMode::Inline,
         );
         assert_eq!(app.input, "下一步!");
+    }
+
+    #[test]
+    fn right_accepts_suggestion_with_pending_images_and_keeps_them_on_submit() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = AppState::new();
+        app.prompt_suggestion_text = Some("下一步".into());
+        for id in [1, 2] {
+            app.pasted_contents.push(rebon_types::PromptPasteContent {
+                id,
+                kind: "image".into(),
+                content: "image data".into(),
+                media_type: Some("image/png".into()),
+                filename: None,
+                source_path: None,
+            });
+        }
+        let action = crate::tui::event::translate_key(
+            &KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &app,
+        );
+        assert!(matches!(action, KeyAction::AcceptPromptSuggestion));
+        super::handle_app_only_key_action(&mut app, action, UiMode::Inline);
+        assert_eq!(app.input, "下一步 [Image #1] [Image #2]");
+        assert_eq!(app.cursor_offset, app.input.len());
+        let text = app.input.clone();
+        let payload = crate::tui::dispatch::take_submit_payload(&mut app, &text).unwrap();
+        assert_eq!(payload.image_pastes.len(), 2);
     }
 
     fn make_immediate_handle() -> (Runtime, Handle) {
