@@ -63,6 +63,8 @@ pub(crate) fn start_manual_compact(
         started_at: std::time::Instant::now(),
         messages_before: app.rebon_tui.transcript.rows().len(),
         respond_to_command_id,
+        automatic: false,
+        invalidated: false,
     });
 
     let projects_root = session.projects_root.clone();
@@ -92,13 +94,59 @@ pub(crate) fn start_manual_compact(
         if tx.send(CompactProgress::Summarizing).is_err() {
             return;
         }
-        let result =
-            handle.block_on(resume_replay.compact_now(&loaded.messages, instructions.as_deref()));
+        let result = handle.block_on(resume_replay.compact_session_now(
+            &projects_root,
+            &cwd,
+            &worker_session_id,
+            &loaded.messages,
+            instructions.as_deref(),
+        ));
         let _ = tx.send(CompactProgress::Done(Box::new(result)));
     });
 
     session.engine_half.compact_runtime.worker = Some(CompactWorker { session_id, rx });
     CompactStart::Started
+}
+
+pub(crate) fn invalidate_idle_compact(app: &mut AppState) {
+    app.auto_compact_generation = app.auto_compact_generation.wrapping_add(1);
+    if let Some(run) = app.compact_run.as_mut().filter(|run| run.automatic) {
+        run.invalidated = true;
+    }
+}
+
+pub(crate) fn maybe_start_idle_compact(
+    app: &mut AppState,
+    session: &mut TuiEngineSession,
+    handle: &Handle,
+    idle: bool,
+    idle_for: std::time::Duration,
+) -> bool {
+    let budget = &session.model.prune_level.budget;
+    if !idle
+        || idle_for < super::status_bar::NEW_SESSION_HINT_IDLE_DELAY
+        || budget.last_input_tokens() < super::status_bar::NEW_SESSION_HINT_TOKENS_THRESHOLD
+        || !budget.should_auto_compact_for_tokens(budget.auto_compact_threshold())
+        || session.engine_half.runtime.session_agents.current_id() != "local"
+        || session.engine_half.compact_runtime.is_running()
+        || app.auto_compact_attempt.as_ref()
+            == Some(&(session.session_id.clone(), app.auto_compact_generation))
+    {
+        return false;
+    }
+    if matches!(
+        start_manual_compact(app, session, handle, None, None),
+        CompactStart::Started
+    ) {
+        app.compact_run
+            .as_mut()
+            .expect("started compact run")
+            .automatic = true;
+        app.auto_compact_attempt = Some((session.session_id.clone(), app.auto_compact_generation));
+        true
+    } else {
+        false
+    }
 }
 
 /// Drain the compaction worker. Called once per frame from the event loop.
@@ -131,7 +179,12 @@ pub(crate) fn sync_compact_run(app: &mut AppState, session: &mut TuiEngineSessio
 
     let worker_session_id = worker.session_id;
     let run = app.compact_run.take();
+    let automatic = run.as_ref().is_some_and(|run| run.automatic);
+    let invalidated = run.as_ref().is_some_and(|run| run.invalidated);
     let respond_to = run.and_then(|run| run.respond_to_command_id);
+    if invalidated {
+        return;
+    }
 
     // A `/resume` or `/clear` mid-run points the TUI at a different session;
     // installing a baseline built from the old one would silently graft a
@@ -152,7 +205,36 @@ pub(crate) fn sync_compact_run(app: &mut AppState, session: &mut TuiEngineSessio
     }
 
     match result {
+        Ok((_, report)) if automatic && !report.used_model => {
+            session.model.prune_level.budget.record_compact_failure();
+            inject_system_message(app, "warning", "Idle auto-compaction could not summarize the conversation; the existing context was kept.");
+            app.follow_transcript_tail = true;
+        }
         Ok((prepared, report)) => {
+            if automatic {
+                let path = rebon_session::transcript_file_path(
+                    &session.projects_root,
+                    &session.cwd,
+                    &worker_session_id,
+                );
+                match rebon_session::load_transcript_from_file(&path) {
+                    Ok(Some(loaded)) if prepared.matches_transcript(&loaded.messages) => {}
+                    Ok(_) => {
+                        tracing::info!("idle compaction discarded because the transcript changed");
+                        return;
+                    }
+                    Err(error) => {
+                        session.model.prune_level.budget.record_compact_failure();
+                        inject_system_message(
+                            app,
+                            "warning",
+                            &format!("Could not verify idle compaction: {error}"),
+                        );
+                        app.follow_transcript_tail = true;
+                        return;
+                    }
+                }
+            }
             session
                 .engine_half
                 .resume_replay()
@@ -170,11 +252,19 @@ pub(crate) fn sync_compact_run(app: &mut AppState, session: &mut TuiEngineSessio
                 .report_estimated_usage(report.tokens_after);
             session.model.prune_level.budget.record_compact_success();
             let text = render_compact_report(&report);
+            let text = if automatic {
+                format!("Automatically compacted after extended idle time to reduce context resent after cache expiry.\n{text}")
+            } else {
+                text
+            };
             inject_system_message(app, "compact", &text);
             app.follow_transcript_tail = true;
             answer_deferred_command(session, &worker_session_id, respond_to.as_deref(), Ok(text));
         }
         Err(message) => {
+            if automatic {
+                session.model.prune_level.budget.record_compact_failure();
+            }
             let text = format!("Compaction failed: {message}");
             inject_system_message(app, "warning", &text);
             app.follow_transcript_tail = true;
@@ -192,6 +282,107 @@ pub(crate) fn sync_compact_run(app: &mut AppState, session: &mut TuiEngineSessio
 mod tests {
     use super::*;
     use crate::tui::app::CompactPhase;
+
+    #[tokio::test]
+    async fn idle_auto_compact_respects_budget_and_attempts_once_per_turn() {
+        let mut app = AppState::new();
+        let mut session = super::super::test_support::make_test_tui_session();
+        let handle = tokio::runtime::Handle::current();
+        let budget = session.model.prune_level.budget.clone();
+        let threshold = super::super::status_bar::NEW_SESSION_HINT_TOKENS_THRESHOLD;
+        let idle = super::super::status_bar::NEW_SESSION_HINT_IDLE_DELAY;
+        budget.report_usage(threshold.saturating_sub(1));
+        assert!(!maybe_start_idle_compact(
+            &mut app,
+            &mut session,
+            &handle,
+            true,
+            idle
+        ));
+        budget.report_usage(threshold);
+        assert!(!maybe_start_idle_compact(
+            &mut app,
+            &mut session,
+            &handle,
+            true,
+            idle - std::time::Duration::from_secs(1)
+        ));
+        assert!(!maybe_start_idle_compact(
+            &mut app,
+            &mut session,
+            &handle,
+            false,
+            idle
+        ));
+        budget.set_auto_compact_enabled(false);
+        assert!(!maybe_start_idle_compact(
+            &mut app,
+            &mut session,
+            &handle,
+            true,
+            idle
+        ));
+        budget.set_auto_compact_enabled(true);
+        assert!(maybe_start_idle_compact(
+            &mut app,
+            &mut session,
+            &handle,
+            true,
+            idle
+        ));
+        for _ in 0..200 {
+            sync_compact_run(&mut app, &mut session);
+            if !session.engine_half.compact_runtime.is_running() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!session.engine_half.compact_runtime.is_running());
+        assert_eq!(budget.consecutive_compact_failures(), 1);
+        assert!(!maybe_start_idle_compact(
+            &mut app,
+            &mut session,
+            &handle,
+            true,
+            idle
+        ));
+        app.auto_compact_generation += 1;
+        assert!(maybe_start_idle_compact(
+            &mut app,
+            &mut session,
+            &handle,
+            true,
+            idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_new_turn_invalidates_an_inflight_idle_compaction() {
+        let mut app = AppState::new();
+        let mut session = super::super::test_support::make_test_tui_session();
+        let handle = tokio::runtime::Handle::current();
+        let budget = session.model.prune_level.budget.clone();
+        let idle = super::super::status_bar::NEW_SESSION_HINT_IDLE_DELAY;
+        budget.report_usage(super::super::status_bar::NEW_SESSION_HINT_TOKENS_THRESHOLD);
+        assert!(maybe_start_idle_compact(
+            &mut app,
+            &mut session,
+            &handle,
+            true,
+            idle
+        ));
+        invalidate_idle_compact(&mut app);
+        for _ in 0..200 {
+            sync_compact_run(&mut app, &mut session);
+            if !session.engine_half.compact_runtime.is_running() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!session.engine_half.compact_runtime.is_running());
+        assert!(app.compact_run.is_none());
+        assert_eq!(budget.consecutive_compact_failures(), 0);
+    }
 
     #[tokio::test]
     async fn starting_a_run_arms_the_progress_widget_and_marks_the_session_busy() {

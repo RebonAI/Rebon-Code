@@ -1669,7 +1669,20 @@ fn run_model(cx: Cx<'_>, command: &str) -> Option<bool> {
         return Some(false);
     }
     let result = handle_model_command(command);
-    if result.is_err || result.runtime_update.is_none() {
+    if model_args.eq_ignore_ascii_case("refresh") {
+        let refresh_current = result.runtime_update.as_ref().is_some_and(|update| {
+            session.remote_background_attachment.is_none()
+                && session
+                    .model
+                    .provider_name
+                    .eq_ignore_ascii_case(&update.provider_name)
+                && session.model.name == update.model_name
+        });
+        if refresh_current {
+            refresh_runtime_model(app, session, result.runtime_update, handle);
+        }
+        command_result(app, result.is_err, &result.text);
+    } else if result.is_err || result.runtime_update.is_none() {
         command_result(app, result.is_err, &result.text);
     } else if refresh_runtime_model(app, session, result.runtime_update, handle)
         && !app.refresh_empty_startup_banner()

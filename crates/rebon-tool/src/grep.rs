@@ -117,7 +117,7 @@ impl Tool for GrepTool {
          \"count\" shows match counts\n\
          - Context in \"content\" mode: \"-A\" / \"-B\" / \"-C\" (or \"context\") add trailing / \
          leading / surrounding lines. A context row is printed with `-` where a match uses `:`\n\
-         - Use Agent tool for open-ended searches requiring multiple rounds\n\
+         - Prefer investigating directly; consider Explore for extensive independent research with clear parallel or context benefits\n\
          - Pattern syntax: Uses ripgrep (not grep) - literal braces need escaping \
          (use `interface\\\\{\\\\}` to find `interface{}` in Go code)\n\
          - Multiline matching: By default patterns match within single lines only. \
@@ -697,6 +697,13 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn description_does_not_force_delegation_for_multiple_searches() {
+        assert!(!GrepTool
+            .description()
+            .contains("Use Agent tool for open-ended"));
+    }
 
     struct TempDir {
         inner: tempfile::TempDir,

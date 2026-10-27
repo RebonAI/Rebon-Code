@@ -474,11 +474,12 @@ merely to reuse context."
              identified set of files."
         ));
         bullets.push(
-            " - Choose direct lookup or delegation by search scope, context cost, and real parallel benefit. Use \
-a few targeted searches directly for small, well-bounded questions. Use Agent with \
-subagent_type=Explore for cross-module tracing, substantial evidence gathering, or independent \
-parallel research. Do not force delegation after one missed probe or use a fixed query-count \
-threshold; delegate when scope keeps expanding instead of searching without bounds."
+            " - Choose direct lookup or delegation by search scope, context cost, and real parallel benefit. \
+Prefer direct investigation with Glob, Grep, and Read, including multi-round searches and tracing \
+across files or modules. Unclear scope, a missed probe, or cross-module work alone does not warrant \
+an Explore agent. Consider subagent_type=Explore for genuinely extensive, separable research when \
+independent parallel work or reduced context cost provides a concrete benefit. Do not force delegation \
+after one missed probe or use a fixed query-count threshold."
                 .to_string(),
         );
         bullets.push(

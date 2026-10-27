@@ -1227,6 +1227,9 @@ struct HelperLogState {
 }
 
 fn helper_js_error(error: boa_engine::JsError, context: &mut boa_engine::Context) -> String {
+    if let Some(native) = error.as_native().filter(|native| native.is_runtime_limit()) {
+        return bound_text(&native.to_string(), 512);
+    }
     let message = error
         .to_opaque(context)
         .to_string(context)
@@ -1609,6 +1612,18 @@ fn fixture_corruption(handoff: &ChildHandoff, corruption: FixtureCorruption) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_limit_errors_do_not_panic_when_formatted() {
+        let mut context = boa_engine::Context::default();
+        context.runtime_limits_mut().set_loop_iteration_limit(2);
+        let error = context
+            .eval(boa_engine::Source::from_bytes("for (;;) {}"))
+            .unwrap_err();
+        let message = helper_js_error(error, &mut context);
+        assert!(message.contains("Maximum loop iteration limit 2 exceeded"));
+    }
+
     #[test]
     fn strict_response_rejects_unknown_fields() {
         let body =

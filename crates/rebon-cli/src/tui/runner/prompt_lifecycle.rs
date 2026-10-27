@@ -902,6 +902,8 @@ fn admit_local_turn(
         return Err(reason);
     }
 
+    super::compact_runtime::invalidate_idle_compact(app);
+
     // Persist completed shell feedback before this turn acquires its replay.
     super::task_runtime::drain_inline_shell_commands(app, session, true);
 

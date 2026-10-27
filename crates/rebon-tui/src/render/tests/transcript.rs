@@ -4,6 +4,94 @@ use crate::state::{reducer, Action, SealedPrefixFlushPolicy};
 use serde_json::json;
 
 #[test]
+fn answered_questions_have_space_on_both_sides() {
+    let mut state = AppState::new();
+    for message in [
+        assistant_text("before", "Before the question"),
+        user(
+            "answer",
+            "Answered questions:\n- Which one?\n  Answer: First",
+        ),
+        assistant_text("after", "After the answer"),
+    ] {
+        reducer(&mut state, Action::Commit(message));
+    }
+    let mut buf = new_buf(60, 20);
+    render_transcript(
+        &state,
+        Rect::new(0, 0, 60, 20),
+        &mut buf,
+        &RenderTheme::plain(),
+        usize::MAX,
+        ToolOutputVerbosity::Compact,
+        0,
+        None,
+    );
+    let rows = all_rows(&buf);
+    let before = row_y_containing(&rows, "Before the question");
+    let header = row_y_containing(&rows, "Answered questions");
+    let footer = row_y_containing(&rows, "1 answer");
+    let after = row_y_containing(&rows, "After the answer");
+    assert_eq!(header, before + 2, "{rows:?}");
+    assert_eq!(after, footer + 2, "{rows:?}");
+}
+
+#[test]
+fn answered_questions_are_separated_from_streaming_reply() {
+    let mut state = AppState::new();
+    reducer(
+        &mut state,
+        Action::Commit(user(
+            "answer",
+            "Answered questions:\n- Which one?\n  Answer: First",
+        )),
+    );
+    state
+        .overlay
+        .blocks
+        .push(crate::streaming::StreamingContentBlock::Text(
+            "Streaming reply".into(),
+        ));
+    let mut buf = new_buf(60, 15);
+    render_transcript(
+        &state,
+        Rect::new(0, 0, 60, 15),
+        &mut buf,
+        &RenderTheme::plain(),
+        usize::MAX,
+        ToolOutputVerbosity::Compact,
+        0,
+        None,
+    );
+    let rows = all_rows(&buf);
+    let footer = row_y_containing(&rows, "1 answer");
+    let reply = row_y_containing(&rows, "Streaming reply");
+    assert_eq!(reply, footer + 2, "{rows:?}");
+}
+
+#[test]
+fn consecutive_user_prompt_cards_have_no_extra_blank_row() {
+    let mut state = AppState::new();
+    reducer(&mut state, Action::Commit(user("u1", "first queued")));
+    reducer(&mut state, Action::Commit(user("u2", "second queued")));
+    let mut buf = new_buf(60, 15);
+    render_transcript(
+        &state,
+        Rect::new(0, 0, 60, 15),
+        &mut buf,
+        &RenderTheme::plain(),
+        usize::MAX,
+        ToolOutputVerbosity::Compact,
+        0,
+        None,
+    );
+    let rows = all_rows(&buf);
+    let first = row_y_containing(&rows, "first queued");
+    let second = row_y_containing(&rows, "second queued");
+    assert_eq!(second, first + 3, "{rows:?}");
+}
+
+#[test]
 fn inline_pending_terminal_tool_cluster_renders_as_bounded_collapsed_live_tail() {
     let theme = RenderTheme::plain();
     let mut state = AppState::new();

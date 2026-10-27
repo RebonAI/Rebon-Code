@@ -36,6 +36,30 @@ fn hidden_info_system_message_consumes_zero_transcript_rows() {
 }
 
 #[test]
+fn compact_report_is_visible_in_compact_verbosity() {
+    let mut message = system_info(
+        "s-compact",
+        "Compacted successfully\n⎿ Recently accessed: notes.md",
+    );
+    let Message::System(system) = &mut message else {
+        unreachable!();
+    };
+    system.subtype = "compact".into();
+    let mut buf = new_buf(60, 8);
+    let used = render_message(
+        &message,
+        Rect::new(0, 0, 60, 8),
+        &mut buf,
+        &RenderTheme::plain(),
+        ToolOutputVerbosity::Compact,
+    );
+    let text = all_text(&buf);
+    assert!(used > 0, "{text}");
+    assert!(text.contains("Compacted successfully"), "{text}");
+    assert!(text.contains("Recently accessed: notes.md"), "{text}");
+}
+
+#[test]
 fn user_prompt_renders_with_prompt_gutter() {
     let mut buf = new_buf(40, 4);
     let used = render_message(
@@ -63,22 +87,20 @@ fn user_prompt_paints_message_background_only_under_content() {
         ToolOutputVerbosity::Verbose,
     );
 
-    // Row 0 is the message margin. The card's half-row edges (rows 1 and
-    // 3) are drawn in the card colour on the terminal's own background;
-    // only the text row between them is filled.
+    // The card's half-row edges are drawn in the card colour on the
+    // terminal's own background; only the text row between them is filled.
     let card = Color::Rgb(240, 240, 240);
-    assert_eq!(buf[(0, 0)].bg, Color::Reset);
-    assert_eq!(buf[(0, 0)].symbol(), " ");
-    for (y, glyph) in [(1, "▄"), (3, "▀")] {
+    for (y, glyph) in [(0, "▄"), (2, "▀")] {
         for x in [0, 39] {
             assert_eq!(buf[(x, y)].symbol(), glyph);
             assert_eq!(buf[(x, y)].fg, card);
             assert_eq!(buf[(x, y)].bg, Color::Reset);
         }
     }
-    assert_eq!(buf[(0, 2)].bg, card);
-    assert_eq!(buf[(2, 2)].bg, card);
-    assert_eq!(buf[(39, 2)].bg, card);
+    assert_eq!(buf[(0, 1)].bg, card);
+    assert_eq!(buf[(2, 1)].bg, card);
+    assert_eq!(buf[(39, 1)].bg, card);
+    assert_eq!(buf[(0, 3)].bg, Color::Reset);
 
     rebon_design_system::theme::set_active_theme(rebon_design_system::theme::ThemeName::Dark);
 }
@@ -227,6 +249,21 @@ fn committed_markdown_links_use_labels_and_osc8() {
     assert!(!hyperlink_cells(&buf, "https://example.com/docs").is_empty());
     assert!(!hyperlink_cells(&buf, "https://example.com/bare").is_empty());
     assert!(!rendered.contains('\x1b'));
+}
+
+#[test]
+fn recording_file_markdown_link_paints_local_file_url() {
+    let mut theme = RenderTheme::plain();
+    theme.supports_hyperlinks = true;
+    let mut buf = new_buf(48, 5);
+    render_message(
+        &assistant_text("a1", "[查看录制视频](file:///tmp/video%20one.mp4)"),
+        Rect::new(0, 0, 48, 5),
+        &mut buf,
+        &theme,
+        ToolOutputVerbosity::Verbose,
+    );
+    assert!(!hyperlink_cells(&buf, "file:///tmp/video%20one.mp4").is_empty());
 }
 
 #[test]

@@ -25,12 +25,14 @@ use crate::model::{
 
 /// Stable id used for action routing and native view lookup.
 pub const DIALOG_ID: &str = "model";
-/// The only action this dialog emits: switch to the highlighted model.
+/// Switch to the highlighted model.
 pub const ACTION_SELECT: &str = "select";
+/// 保存所选模型的 context window。
+pub const ACTION_SET_CONTEXT: &str = "set_context";
 
 /// Largest number of model rows shown at once; longer lists scroll.
 const MAX_VISIBLE: usize = 10;
-const FOOTER: &str = "↑/↓ select · Enter apply · Esc cancel";
+const FOOTER: &str = "↑/↓ select · Enter apply · e edit context · Esc cancel";
 
 /// One selectable model, and what the picker says about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +67,8 @@ pub struct ModelDialogState {
     current_model: String,
     /// Highlighted row.
     selected: usize,
+    context_input: Option<String>,
+    context_message: Option<String>,
 }
 
 impl ModelDialogState {
@@ -95,7 +99,26 @@ impl ModelDialogState {
             options,
             current_model,
             selected,
+            context_input: None,
+            context_message: None,
         })
+    }
+    /// 显示保存结果；成功时更新所选模型的 context。
+    pub fn context_result(&mut self, message: String, window: Option<u32>) {
+        self.context_message = Some(message);
+        if let Some(window) = window {
+            let row = &mut self.options[self.selected];
+            let price = row
+                .detail
+                .as_deref()
+                .and_then(|detail| detail.split_once(" · ").map(|(_, rest)| rest.to_string()));
+            row.detail = Some(match price {
+                Some(price) => format!("{window} ctx · {price}"),
+                None => format!("{window} ctx"),
+            });
+            row.configured = true;
+            self.context_input = None;
+        }
     }
 }
 
@@ -107,6 +130,39 @@ impl DialogModel for ModelDialogState {
     }
 
     fn on_key(&mut self, press: KeyPress) -> DialogOutcome {
+        if let Some(input) = &mut self.context_input {
+            match press.key {
+                DialogKey::Escape => {
+                    self.context_input = None;
+                    self.context_message = None;
+                }
+                DialogKey::Backspace => {
+                    input.pop();
+                }
+                DialogKey::Char { value, plain: true }
+                    if value.is_ascii_digit() && input.len() < 10 =>
+                {
+                    input.push(value)
+                }
+                DialogKey::Enter => {
+                    if input.parse::<u32>().is_ok_and(|value| value > 0) {
+                        return DialogOutcome::Action(DialogAction::staying_many(
+                            DIALOG_ID,
+                            ACTION_SET_CONTEXT,
+                            vec![
+                                self.options[self.selected].id.clone(),
+                                self.provider_name.clone(),
+                                input.clone(),
+                            ],
+                        ));
+                    }
+                    self.context_message =
+                        Some("Enter a positive token count (up to 4294967295).".into());
+                }
+                _ => {}
+            }
+            return DialogOutcome::None;
+        }
         let last = self.options.len().saturating_sub(1);
         match press.key {
             DialogKey::Escape => DialogOutcome::Close,
@@ -124,6 +180,14 @@ impl DialogModel for ModelDialogState {
                 } else {
                     self.selected + 1
                 };
+                DialogOutcome::None
+            }
+            DialogKey::Char {
+                value: 'e',
+                plain: true,
+            } => {
+                self.context_input = Some(String::new());
+                self.context_message = None;
                 DialogOutcome::None
             }
             DialogKey::Enter => self
@@ -173,13 +237,28 @@ impl DialogModel for ModelDialogState {
             .collect();
         ViewSpec::List(ListView {
             title: " Select model ".into(),
-            header: vec![
-                format!("Active provider: {}", self.provider_name),
-                String::new(),
-            ],
+            header: if let Some(input) = &self.context_input {
+                vec![
+                    format!(
+                        "Context tokens for {}: {}",
+                        self.options[self.selected].id, input
+                    ),
+                    self.context_message.clone().unwrap_or_default(),
+                ]
+            } else {
+                vec![
+                    format!("Active provider: {}", self.provider_name),
+                    self.context_message.clone().unwrap_or_default(),
+                ]
+            },
             rows,
             selected: self.selected,
-            footer: vec![FOOTER.into()],
+            footer: vec![if self.context_input.is_some() {
+                "Enter save · Esc cancel"
+            } else {
+                FOOTER
+            }
+            .into()],
             max_visible: Some(MAX_VISIBLE),
             accent: ListAccent::Brand,
             detail_follows_selection: false,
@@ -207,6 +286,8 @@ mod tests {
                 .collect(),
             current_model: current.into(),
             selected: models.iter().position(|m| *m == current).unwrap_or(0),
+            context_input: None,
+            context_message: None,
         }
     }
 
@@ -230,6 +311,42 @@ mod tests {
         let mut s = state(&["a", "b", "c"], "a");
         assert_eq!(s.on_key(DialogKey::Down.into()), DialogOutcome::None);
         assert_eq!(s.on_key(DialogKey::Enter.into()), select("b"));
+    }
+
+    #[test]
+    fn editing_context_targets_the_highlighted_model_and_validates_input() {
+        let mut s = state(&["a", "b"], "a");
+        s.on_key(DialogKey::Down.into());
+        assert_eq!(s.on_key(DialogKey::plain('e').into()), DialogOutcome::None);
+        assert!(list(&s).header.iter().any(|line| line.contains("Context")));
+        assert_eq!(s.on_key(DialogKey::Enter.into()), DialogOutcome::None);
+        for ch in "200000".chars() {
+            s.on_key(DialogKey::plain(ch).into());
+        }
+        assert_eq!(
+            s.on_key(DialogKey::Enter.into()),
+            DialogOutcome::Action(DialogAction::staying_many(
+                DIALOG_ID,
+                "set_context",
+                vec!["b".into(), "prov".into(), "200000".into()],
+            ))
+        );
+    }
+
+    #[test]
+    fn context_edit_can_be_cancelled_and_rejects_zero_and_overflow() {
+        let mut s = state(&["a"], "a");
+        s.on_key(DialogKey::plain('e').into());
+        for ch in "4294967296".chars() {
+            s.on_key(DialogKey::plain(ch).into());
+        }
+        assert_eq!(s.on_key(DialogKey::Enter.into()), DialogOutcome::None);
+        assert!(list(&s).header.iter().any(|line| line.contains("positive")));
+        assert_eq!(s.on_key(DialogKey::Escape.into()), DialogOutcome::None);
+        assert_eq!(s.on_key(DialogKey::Enter.into()), select("a"));
+        s.on_key(DialogKey::plain('e').into());
+        s.on_key(DialogKey::plain('0').into());
+        assert_eq!(s.on_key(DialogKey::Enter.into()), DialogOutcome::None);
     }
 
     #[test]
@@ -310,6 +427,8 @@ mod tests {
             ],
             current_model: "gpt-6-astra".into(),
             selected: 0,
+            context_input: None,
+            context_message: None,
         };
         let view = list(&dialog);
         assert_eq!(view.rows[0].badge.as_ref().unwrap().text, " (current)");
@@ -330,6 +449,8 @@ mod tests {
             options: many,
             current_model: "m0".into(),
             selected: 0,
+            context_input: None,
+            context_message: None,
         };
         // Capped at MAX_VISIBLE rows + chrome.
         assert_eq!(list(&big).desired_height(), (MAX_VISIBLE as u16) + 6);

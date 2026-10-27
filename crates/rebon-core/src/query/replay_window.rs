@@ -91,6 +91,15 @@ pub struct PreparedResumeSummary {
     prefix_hash: u64,
 }
 
+impl PreparedResumeSummary {
+    pub fn matches_transcript(&self, entries: &[rebon_session::TranscriptEntry]) -> bool {
+        entries
+            .last()
+            .is_some_and(|entry| entry.uuid == self.anchor_uuid)
+            && transcript_prefix_hash(entries) == self.prefix_hash
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ResumeSummaryBaseline {
     projection: Vec<ApiMessage>,
@@ -683,7 +692,7 @@ impl ReplayWindowStore {
         self.project_resume_summary_for_model(projects_root, cwd, session_id, raw, None)
     }
 
-    fn project_resume_summary_for_model(
+    pub(super) fn project_resume_summary_for_model(
         &self,
         projects_root: &std::path::Path,
         cwd: &str,

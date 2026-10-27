@@ -823,6 +823,68 @@ fn route_hosted_dialog_action(
             );
             app.follow_transcript_tail = true;
         }
+        (dialog::MODEL, rebon_dialog::model_dialog::ACTION_SET_CONTEXT) => {
+            let model = action.value();
+            let provider = action.value_at(1);
+            let window = action
+                .value_at(2)
+                .parse::<u32>()
+                .expect("dialog validates the context window");
+            let result =
+                crate::rebon_config::set_custom_provider_model_context(provider, model, window);
+            match result {
+                Ok(()) => {
+                    let is_current = session.model.provider_name.eq_ignore_ascii_case(provider)
+                        && session.model.name == model;
+                    let mirrored = session.remote_background_attachment.is_some();
+                    let applied = if is_current && !mirrored {
+                        match handle.block_on(
+                            crate::session::runtime_refresh::resolve_and_install_runtime(
+                                &mut session.session,
+                                crate::rebon_config::RuntimeOverride {
+                                    provider: Some(provider.into()),
+                                    model: Some(model.into()),
+                                    ..Default::default()
+                                },
+                            ),
+                        ) {
+                            Ok(()) => true,
+                            Err(err) => {
+                                super::inject_system_message(
+                                    app,
+                                    "error",
+                                    &format!("Failed to apply context: {err}"),
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        true
+                    };
+                    if let Some(dialog) = app
+                        .dialogs
+                        .top_as_mut::<rebon_dialog::model_dialog::ModelDialogState>()
+                    {
+                        let message = if mirrored {
+                            format!("Context for {model} saved; it applies when the worker rebuilds its session.")
+                        } else if applied {
+                            format!("Context for {model} saved: {window} tokens.")
+                        } else {
+                            format!("Context for {model} saved; runtime refresh failed.")
+                        };
+                        dialog.context_result(message, Some(window));
+                    }
+                }
+                Err(err) => {
+                    if let Some(dialog) = app
+                        .dialogs
+                        .top_as_mut::<rebon_dialog::model_dialog::ModelDialogState>()
+                    {
+                        dialog.context_result(format!("Could not save context: {err}"), None);
+                    }
+                }
+            }
+        }
         (dialog::MODEL, action::SELECT) => {
             let model = action.value().to_string();
             // Picking from the list means the same thing typing it does,

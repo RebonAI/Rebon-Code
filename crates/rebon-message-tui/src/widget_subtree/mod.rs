@@ -789,6 +789,7 @@ impl UserTextBodyWidget {
         } else {
             "❯"
         };
+        let add_margin = add_margin && !is_prompt_card(&projection);
         Self {
             projection,
             theme,
@@ -2396,6 +2397,7 @@ pub struct UserAskAnswersBodyWidget {
     pub prefix: &'static str,
     /// Gutter label style.
     pub label_style: Style,
+    add_margin: bool,
 }
 
 impl UserAskAnswersBodyWidget {
@@ -2404,12 +2406,14 @@ impl UserAskAnswersBodyWidget {
         answered: Vec<AnsweredQuestion>,
         theme: MessagesRenderTheme,
         label_style: Style,
+        add_margin: bool,
     ) -> Self {
         Self {
             answered,
             theme,
             prefix: "●",
             label_style,
+            add_margin,
         }
     }
 
@@ -2428,11 +2432,18 @@ impl UserAskAnswersBodyWidget {
     /// Height in rows at `width`.
     pub fn height(&self, width: u16) -> u16 {
         ruled_body_height(&ask_answers_body_text(&self.answered, &self.theme), width)
+            .saturating_add(u16::from(self.add_margin))
     }
 
     /// Paint the widget into `area`.
     pub fn render_to_buffer(self, area: Rect, buf: &mut Buffer) {
         let body = ask_answers_body_text(&self.answered, &self.theme);
+        let margin = u16::from(self.add_margin).min(area.height);
+        let area = Rect {
+            y: area.y.saturating_add(margin),
+            height: area.height.saturating_sub(margin),
+            ..area
+        };
         paint_ruled_body(
             area,
             buf,
@@ -2451,8 +2462,7 @@ fn ask_answers_body_text(
 ) -> Text<'static> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (index, item) in answered.iter().enumerate() {
-        // One blank row between pairs, and none before the first or after the
-        // last: the rules already hold the card apart from its neighbours.
+        // One blank row between pairs, and none before the first or after the last.
         if index > 0 {
             lines.push(Line::default());
         }

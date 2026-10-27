@@ -1,6 +1,8 @@
 use super::*;
 use rebon_render::auto_mode_allowed_note;
 
+const HIDDEN_COMMAND_TIMEOUT_MS: u64 = 600_000;
+
 fn is_streaming_plan_ledger(tool: &crate::streaming::StreamingToolUse) -> bool {
     tool.tool_name == PLAN_LEDGER_TOOL_NAME
         || (tool.tool_name == "InvokeDeferredTool"
@@ -1573,6 +1575,9 @@ pub(super) fn render_streaming_tool_use_with_content(
         .as_ref()
         .and_then(|input| input.get("timeout"))
         .and_then(Value::as_u64)
+        .filter(|timeout_ms| {
+            *timeout_ms != HIDDEN_COMMAND_TIMEOUT_MS || !matches!(tool.kind, ToolKind::Execute)
+        })
     {
         let timeout = format!(
             "Timeout: {}",

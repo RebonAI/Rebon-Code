@@ -477,6 +477,7 @@ mod tests {
 
     #[test]
     fn the_switch_takes_the_tools_off_the_seat_and_puts_them_back() {
+        let _env = EnvGuard::set("REBON_ENABLE_TASKS", "1");
         let (kernel, registry) = boot();
         let seat = seat(&kernel);
 

@@ -1291,6 +1291,33 @@ impl CustomProviderModels {
         }
     }
 
+    fn set_context_window(&mut self, id: &str, window: u32) {
+        self.ensure_id(id);
+        match self {
+            Self::List(entries) => {
+                let entry = entries
+                    .iter_mut()
+                    .find(|entry| entry.id() == id)
+                    .expect("model was inserted");
+                if matches!(entry, CustomProviderModelEntry::String(_)) {
+                    *entry = CustomProviderModelEntry::Object(CustomProviderModelObject {
+                        id: id.to_string(),
+                        details: CustomProviderModelDetails::default(),
+                    });
+                }
+                if let CustomProviderModelEntry::Object(model) = entry {
+                    model.details.context_window = Some(serde_json::json!(window));
+                }
+            }
+            Self::Map(entries) => {
+                entries
+                    .get_mut(id)
+                    .expect("model was inserted")
+                    .context_window = Some(serde_json::json!(window));
+            }
+        }
+    }
+
     fn model_options(&self) -> BTreeMap<String, ProviderOptions> {
         let mut out = BTreeMap::new();
         match self {
@@ -4354,14 +4381,34 @@ pub fn provider_model_options(provider: &CustomProviderInfo) -> Vec<String> {
 /// it at the top.
 pub fn provider_model_choices(provider: &CustomProviderInfo) -> Vec<ModelChoice> {
     ensure_model_table_installed();
+    let windows = read_config_roundtrip(&config_home_dir())
+        .ok()
+        .and_then(|config| {
+            config
+                .custom_providers
+                .into_iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(&provider.name))
+        })
+        .map(|entry| entry.models.context_windows())
+        .unwrap_or_default();
     let mut choices: Vec<ModelChoice> = Vec::new();
     let mut push = |id: String, configured: bool| {
         if choices.iter().any(|seen| seen.id.eq_ignore_ascii_case(&id)) {
             return;
         }
-        let detail = rebon_api::model_table::model(None, &id)
-            .as_ref()
-            .and_then(model_detail);
+        let catalogue = rebon_api::model_table::model(None, &id);
+        let detail = if let Some(window) = windows.get(&id) {
+            let price = catalogue
+                .as_ref()
+                .and_then(|model| model.cost.as_ref())
+                .and_then(|cost| Some(format!("${} / ${} per M", cost.input?, cost.output?)));
+            Some(match price {
+                Some(price) => format!("{} ctx · {price}", compact_token_count(*window)),
+                None => format!("{} ctx", compact_token_count(*window)),
+            })
+        } else {
+            catalogue.as_ref().and_then(model_detail)
+        };
         choices.push(ModelChoice {
             id,
             configured,
@@ -4752,6 +4799,32 @@ fn set_custom_provider_model_in(
         model: snapshot.model,
         models: snapshot.models.ids(),
     })
+}
+
+pub fn set_custom_provider_model_context(
+    provider_name: &str,
+    model: &str,
+    window: u32,
+) -> anyhow::Result<()> {
+    set_custom_provider_model_context_in(&config_home_dir(), provider_name, model, window)
+}
+
+fn set_custom_provider_model_context_in(
+    config_dir: &Path,
+    provider_name: &str,
+    model: &str,
+    window: u32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!model.trim().is_empty(), "Model name cannot be empty.");
+    anyhow::ensure!(window > 0, "Context window must be positive.");
+    let mut config = read_config_roundtrip(config_dir)?;
+    let provider = config
+        .custom_providers
+        .iter_mut()
+        .find(|provider| provider.name.eq_ignore_ascii_case(provider_name))
+        .ok_or_else(|| anyhow::anyhow!("Provider \"{provider_name}\" not found."))?;
+    provider.models.set_context_window(model, window);
+    write_config_roundtrip(config_dir, &config)
 }
 
 /// Snapshot of one provider's `modelProfiles` table, for display.
@@ -9037,6 +9110,38 @@ mod tests {
             resolve_model_output_token_limit(None, "unlisted-private-model"),
             None
         );
+    }
+
+    #[test]
+    fn model_context_edit_preserves_model_details_and_active_selection() {
+        for models in [
+            serde_json::json!(["a", {"id":"b", "limit":{"context":123, "output":45}, "custom":"keep"}]),
+            serde_json::json!({"a":{}, "b":{"limit":{"context":123, "output":45}, "custom":"keep"}}),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let config = serde_json::json!({"activeCustomProvider":"p", "customProviders":[{
+                "name":"p", "format":"openai", "baseUrl":"https://example.com", "apiKey":"sk", "model":"a", "models":models
+            }]});
+            write_config(tmp.path(), &config.to_string());
+            set_custom_provider_model_context_in(tmp.path(), "p", "a", 150_000).unwrap();
+            set_custom_provider_model_context_in(tmp.path(), "P", "b", 200_000).unwrap();
+            set_custom_provider_model_context_in(tmp.path(), "p", "new", 300_000).unwrap();
+            let provider = resolve_from_dir(tmp.path()).unwrap().unwrap();
+            assert_eq!(provider.model, "a");
+            assert_eq!(provider.model_context_windows["a"], 150_000);
+            assert_eq!(provider.model_context_windows["b"], 200_000);
+            assert_eq!(provider.model_context_windows["new"], 300_000);
+            assert_eq!(provider.model_output_token_limits["b"], 45);
+            let roundtrip = read_config_roundtrip(tmp.path()).unwrap();
+            let text = serde_json::to_string(&roundtrip).unwrap();
+            assert!(text.contains("keep"));
+            assert!(set_custom_provider_model_context_in(tmp.path(), "p", "b", 0).is_err());
+            assert!(set_custom_provider_model_context_in(tmp.path(), "missing", "b", 1).is_err());
+            assert_eq!(
+                serde_json::to_string(&read_config_roundtrip(tmp.path()).unwrap()).unwrap(),
+                text
+            );
+        }
     }
 
     #[test]

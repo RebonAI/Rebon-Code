@@ -58,6 +58,19 @@ fn refresh_model_table() -> (String, bool) {
     }
 }
 
+fn refresh_models(
+    table: impl FnOnce() -> (String, bool),
+    provider: impl FnOnce() -> crate::commands::provider::ProviderCommandResult,
+) -> ModelCommandResult {
+    let (table_text, table_err) = table();
+    let provider = provider();
+    ModelCommandResult {
+        text: format!("{table_text}\n\n{}", provider.text),
+        is_err: table_err || provider.is_err,
+        runtime_update: provider.runtime_update,
+    }
+}
+
 pub struct ModelCommandResult {
     pub text: String,
     pub is_err: bool,
@@ -138,12 +151,9 @@ pub fn handle_model_command(text: &str) -> ModelCommandResult {
     }
 
     if args.eq_ignore_ascii_case("refresh") {
-        let (text, is_err) = refresh_model_table();
-        return ModelCommandResult {
-            text,
-            is_err,
-            runtime_update: None,
-        };
+        return refresh_models(refresh_model_table, || {
+            crate::commands::provider::provider_models(&[&active_provider])
+        });
     }
 
     if args.eq_ignore_ascii_case("default") {
@@ -193,5 +203,33 @@ pub fn handle_model_command(text: &str) -> ModelCommandResult {
             is_err: true,
             runtime_update: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::provider::ProviderCommandResult;
+
+    #[test]
+    fn refresh_attempts_both_and_preserves_partial_results() {
+        for table_err in [false, true] {
+            for provider_err in [false, true] {
+                let result = refresh_models(
+                    || ("table result".into(), table_err),
+                    || ProviderCommandResult {
+                        text: "provider result".into(),
+                        is_err: provider_err,
+                        runtime_update: (!provider_err).then(|| ProviderRuntimeUpdate {
+                            provider_name: "test".into(),
+                            model_name: "model".into(),
+                        }),
+                    },
+                );
+                assert_eq!(result.is_err, table_err || provider_err);
+                assert_eq!(result.text, "table result\n\nprovider result");
+                assert_eq!(result.runtime_update.is_some(), !provider_err);
+            }
+        }
     }
 }

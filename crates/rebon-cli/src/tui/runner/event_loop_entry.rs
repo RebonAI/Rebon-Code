@@ -599,7 +599,10 @@ pub(in crate::tui::runner) fn event_loop_with_mode(
         let Event::Key(key) = evt else {
             continue;
         };
-        if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
+        if (key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat)
+            && state.new_session_hint_idle_since.elapsed()
+                < super::status_bar::NEW_SESSION_HINT_IDLE_DELAY
+        {
             state.new_session_hint_idle_since = Instant::now();
         }
 
@@ -1103,6 +1106,34 @@ fn session_pipeline(
         );
         sync_resume_dialog(app, session, handle, &mut state.resume_runtime);
         super::compact_runtime::sync_compact_run(app, session);
+        let snapshots = app.agent_task_snapshots();
+        let idle = state.active_prompt.is_none()
+            && !app.is_loading
+            && state.pending_permission.is_none()
+            && app.resume_dialog.is_none()
+            && app.expanding_command.is_none()
+            && app.queued_commands.is_empty()
+            && app.pending_channel_prompts.is_empty()
+            && app.pending_teammate_prompts.is_empty()
+            && app.pending_agent_prompts.is_empty()
+            && app.deferred_internal_submit_payloads.is_empty()
+            && session.remote_background_attachment.is_none()
+            && session.pending_hosted_session.is_none()
+            && active_agent_footer_status(
+                &snapshots,
+                wall_clock_ms(),
+                app.foregrounded_task_id.as_deref(),
+            )
+            .is_none()
+            && !has_active_background_agent(&snapshots)
+            && !has_active_background_shell(&snapshots);
+        super::compact_runtime::maybe_start_idle_compact(
+            app,
+            session,
+            handle,
+            idle,
+            state.new_session_hint_idle_since.elapsed(),
+        );
         sync_permission_view(app, &state.pending_permission);
         // Publish this session's live status (busy + pending permission) so
         // the desktop app can render controls for it. Throttled internally.
@@ -1292,7 +1323,7 @@ fn derive_frame_inputs<'slot>(
             None
         }
     });
-    // Gate the `/new` hint behind an idleness check. Showing it
+    // Gate the `/clear` hint behind an idleness check. Showing it
     // while the user is waiting on the engine, a foreground task, or
     // any coordinator-backed agent invites them to trash in-flight work.
     let task_snapshots = app.agent_task_snapshots();

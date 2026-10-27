@@ -131,9 +131,9 @@ pub(super) fn apply_markdown_hyperlink_layers(
             continue;
         }
         for hyperlink in &layer.hyperlinks {
-            if !is_safe_terminal_hyperlink(&hyperlink.target) {
+            let Some(target) = terminal_hyperlink_target(&hyperlink.target) else {
                 continue;
-            }
+            };
             let Some(mask_text) = hyperlink_mask_text(&layer.text, hyperlink, MARKER) else {
                 continue;
             };
@@ -165,7 +165,7 @@ pub(super) fn apply_markdown_hyperlink_layers(
                                 layer.area.x.saturating_add(start),
                                 layer.area.x.saturating_add(mask_x.saturating_sub(1)),
                                 layer.area.y.saturating_add(mask_y),
-                                &hyperlink.target,
+                                &target,
                             );
                             run_start = None;
                         }
@@ -233,20 +233,69 @@ fn patch_hyperlink_cell_run(buf: &mut Buffer, start_x: u16, end_x: u16, y: u16, 
     }
 }
 
-fn is_safe_terminal_hyperlink(target: &str) -> bool {
-    if target.is_empty()
-        || target
-            .chars()
-            .any(|ch| ch.is_control() || ch.is_whitespace())
-    {
-        return false;
+fn terminal_hyperlink_target(target: &str) -> Option<String> {
+    if target.is_empty() || target.chars().any(char::is_control) {
+        return None;
     }
-    target
-        .get(..8)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
-        || target
-            .get(..7)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+    if !target.chars().any(char::is_whitespace)
+        && (target
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+            || target
+                .get(..7)
+                .is_some_and(|p| p.eq_ignore_ascii_case("http://")))
+    {
+        return Some(target.to_owned());
+    }
+    if target
+        .get(..5)
+        .is_some_and(|p| p.eq_ignore_ascii_case("file:"))
+    {
+        if target.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let url = url::Url::parse(target).ok()?;
+        // Do not turn remote file shares into implicitly trusted local links.
+        if url
+            .host_str()
+            .is_some_and(|host| !host.eq_ignore_ascii_case("localhost"))
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.to_file_path().is_err()
+        {
+            return None;
+        }
+        return Some(url.to_string());
+    }
+    super::file_url::file_path_url(std::path::Path::new(target))
+}
+
+#[cfg(test)]
+mod hyperlink_target_tests {
+    use super::terminal_hyperlink_target;
+
+    #[test]
+    fn local_file_targets_are_safe_and_encoded() {
+        let path = std::env::current_dir().unwrap().join("recording #1.mp4");
+        let target = terminal_hyperlink_target(path.to_str().unwrap()).unwrap();
+        assert!(target.starts_with("file:"));
+        assert!(target.contains("%20%23"));
+        assert_eq!(terminal_hyperlink_target(&target), Some(target.clone()));
+    }
+
+    #[test]
+    fn unsafe_or_relative_targets_are_rejected() {
+        for target in [
+            "javascript:alert(1)",
+            "relative/video.mp4",
+            "file://remote/video.mp4",
+            "file:///video.mp4#fragment",
+            "file:///video\u{1b}x",
+            "https://host/a b",
+        ] {
+            assert_eq!(terminal_hyperlink_target(target), None, "{target:?}");
+        }
+    }
 }
 
 pub(super) fn strip_osc8_from_lines(lines: &[Line<'static>]) -> Vec<Line<'static>> {

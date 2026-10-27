@@ -467,7 +467,11 @@ pub fn project_system_text_message(input: &SystemTextMessageInput) -> SystemText
             // (`$.ui.toast`, a transcript `$.ui.log`): shown at any level.
             if !matches!(
                 subtype.as_str(),
-                "stop_hook_summary" | "turn_duration" | "provider_switch" | "mod_notice"
+                "stop_hook_summary"
+                    | "turn_duration"
+                    | "provider_switch"
+                    | "mod_notice"
+                    | "compact"
             ) && !input.verbose
                 && level == "info"
             {
@@ -924,6 +928,24 @@ mod tests {
                 };
                 assert_eq!(display.content, content.trim());
             }
+        }
+    }
+
+    #[test]
+    fn compact_report_is_visible_without_verbose_mode() {
+        for verbose in [false, true] {
+            let projection = project_system_text_message(&SystemTextMessageInput {
+                verbose,
+                ..input(SystemTextProjectionInput::Generic {
+                    subtype: "compact".into(),
+                    level: "info".into(),
+                    content: Some("Compacted\n⎿ Refer to notes.md".into()),
+                })
+            });
+            let SystemTextProjection::Generic(display) = projection else {
+                panic!("compact reports must remain visible");
+            };
+            assert!(display.content.contains("⎿ Refer to notes.md"));
         }
     }
 

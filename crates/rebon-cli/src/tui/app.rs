@@ -665,6 +665,8 @@ pub struct AppState {
     /// In-flight immediate `/compact`. Drives the progress widget and is
     /// cleared when the run finishes (either outcome).
     pub compact_run: Option<CompactRunState>,
+    pub auto_compact_generation: u64,
+    pub auto_compact_attempt: Option<(String, u64)>,
 }
 
 /// Which part of an immediate `/compact` is running.
@@ -712,6 +714,8 @@ pub struct CompactRunState {
     /// Foreground mailbox command awaiting this run's report, if the desktop
     /// app asked for it rather than the local user.
     pub respond_to_command_id: Option<String>,
+    pub automatic: bool,
+    pub invalidated: bool,
 }
 
 /// Nominal duration of a compaction, used only to pace the progress bar
@@ -980,6 +984,8 @@ impl AppState {
             pending_goal_clarification: None,
             goal: None,
             compact_run: None,
+            auto_compact_generation: 0,
+            auto_compact_attempt: None,
         }
     }
 
