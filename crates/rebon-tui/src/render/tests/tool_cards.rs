@@ -1118,6 +1118,88 @@ fn tool_footer_only_shows_configured_numeric_timeouts() {
 }
 
 #[test]
+fn command_footer_hides_only_the_common_600_second_timeout() {
+    for name in ["Bash", "PowerShell", "ShellOutput"] {
+        for status in [
+            ToolCallStatus::InProgress,
+            ToolCallStatus::Completed,
+            ToolCallStatus::Failed,
+        ] {
+            for (timeout, expected) in [(600_000, None), (60_000, Some("Timeout: 60s"))] {
+                let tool = streaming_tool_with_content(
+                    streaming_tool(
+                        "footer-1",
+                        name,
+                        ToolKind::Execute,
+                        status,
+                        vec![("command", json!("pwd")), ("timeout", json!(timeout))],
+                    ),
+                    vec![text_tool_content("command output")],
+                );
+                let snap = auto_mode_snapshot(tool, &[], 6);
+                assert!(snap.contains("command output"), "{name} {status:?}: {snap}");
+                assert_eq!(
+                    snap.contains("Timeout:"),
+                    expected.is_some(),
+                    "{name} {status:?}: {snap}"
+                );
+                if let Some(expected) = expected {
+                    assert!(snap.contains(expected), "{name} {status:?}: {snap}");
+                }
+            }
+        }
+    }
+
+    let non_command = streaming_tool(
+        "footer-2",
+        "CustomTool",
+        ToolKind::Other,
+        ToolCallStatus::Failed,
+        vec![("timeout", json!(600_000))],
+    );
+    let snap = auto_mode_snapshot(non_command, &[], 6);
+    assert!(snap.contains("Timeout: 600s"), "{snap}");
+}
+
+#[test]
+fn committed_command_footer_uses_the_same_timeout_rule() {
+    for (timeout, expected) in [(600_000, false), (60_000, true)] {
+        let mut msg = assistant_tool_uses(
+            "assistant-1",
+            vec![(
+                "bash-1",
+                "Bash",
+                json!({"command": "pwd", "timeout": timeout}),
+            )],
+        );
+        let Message::Assistant(assistant) = &mut msg else {
+            unreachable!();
+        };
+        let AssistantContentBlock::ToolUse(tool) = &mut assistant.message.content[0] else {
+            unreachable!();
+        };
+        tool.status = Some(ToolCallStatus::Completed);
+        let mut buf = new_buf(100, 10);
+        let used = streaming::render_committed_assistant_tool_step(
+            &msg,
+            Rect::new(0, 0, 100, 10),
+            &mut buf,
+            &RenderTheme::plain(),
+            ToolOutputVerbosity::Normal,
+            false,
+            None,
+            TranscriptRenderExtras::empty(),
+        );
+        assert!(used.is_some());
+        let snap = all_text(&buf);
+        assert_eq!(snap.contains("Timeout:"), expected, "{snap}");
+        if expected {
+            assert!(snap.contains("Timeout: 60s"), "{snap}");
+        }
+    }
+}
+
+#[test]
 fn tool_footer_never_displaces_output_in_a_short_viewport() {
     let tool = streaming_tool_with_content(
         streaming_tool(

@@ -312,6 +312,7 @@ fn build_body(
                 ask_user_answers_of(user).unwrap_or_default(),
                 child_theme_for(theme),
                 theme.metadata,
+                input.add_margin,
             ))
         }
         MessageRow::User(user) if user.content.len() == 1 => {
