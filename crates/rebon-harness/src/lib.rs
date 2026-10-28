@@ -1171,11 +1171,9 @@ fn resolve_env_runtime_model(overrides: &HarnessOverrides) -> anyhow::Result<Run
 /// 2. `customProviders[].models[model].contextWindow`
 /// 3. Inference from provider format and model name
 ///
-/// Whatever the window, auto-compact fires no later than
-/// [`rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT`] tokens (Codex's
-/// 272k × 90%). `REBON_AUTO_COMPACT_TOKEN_LIMIT`, or failing that
-/// `autoCompactTokenLimit` in `config.json`, replaces that cap; `0`
-/// removes it so the trigger follows the window alone.
+/// `REBON_AUTO_COMPACT_TOKEN_LIMIT`, or failing that `autoCompactTokenLimit`
+/// in `config.json`, can cap the window-relative trigger. A missing value or
+/// `0` leaves the trigger to follow the model window.
 pub fn prune_handle_from_env(
     format: &ProviderFormat,
     vendor: rebon_api::ProviderVendor,
@@ -1263,7 +1261,7 @@ fn total_context_windows(
 pub const AUTO_COMPACT_TOKEN_LIMIT_ENV: &str = "REBON_AUTO_COMPACT_TOKEN_LIMIT";
 
 /// The auto-compact cap a session runs with: the env var, then the saved
-/// `autoCompactTokenLimit`, then the default cap. `None` means no cap.
+/// `autoCompactTokenLimit`. `None` means no cap.
 pub fn configured_auto_compact_token_limit() -> Option<u32> {
     configured_auto_compact_token_limit_in_dir(&rebon_config::config_home_dir())
 }
@@ -1287,13 +1285,13 @@ fn resolve_auto_compact_token_limit(env: Option<&str>, saved: Option<u32>) -> Op
             Err(_) => {
                 tracing::warn!(
                     value = %value,
-                    "{AUTO_COMPACT_TOKEN_LIMIT_ENV} is not a token count; using the default cap"
+                    "{AUTO_COMPACT_TOKEN_LIMIT_ENV} is not a token count; following the model window"
                 );
-                return Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT);
+                return None;
             }
         },
         (None, Some(limit)) => limit,
-        (None, None) => return Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT),
+        (None, None) => return None,
     };
     (limit != 0).then_some(limit)
 }
@@ -3960,16 +3958,15 @@ mod tests {
         };
 
         // The subscription backend's 272k is input: the output rides on
-        // top, and compaction lands where Codex's does, before and after a
-        // model switch re-reads the per-model limits.
+        // top, before and after a model switch re-reads the per-model limits.
         let codex = build("https://chatgpt.com/backend-api/codex/responses");
         assert_eq!(codex.budget.context_window(), 400_000);
         assert_eq!(codex.budget.output_token_reserve(), 128_000);
         assert_eq!(codex.budget.input_token_budget(), 272_000);
-        assert_eq!(codex.budget.auto_compact_threshold(), 244_800);
+        assert_eq!(codex.budget.auto_compact_threshold(), 258_400);
         codex.set_context_window_for_model("gpt-6-astra");
         assert_eq!(codex.budget.context_window(), 400_000);
-        assert_eq!(codex.budget.auto_compact_threshold(), 244_800);
+        assert_eq!(codex.budget.auto_compact_threshold(), 258_400);
 
         // Everywhere else a window is the total, as configured.
         let api = build("https://api.openai.com/v1");
@@ -3978,7 +3975,39 @@ mod tests {
     }
 
     #[test]
-    fn auto_compact_is_capped_like_codex_whatever_the_window() {
+    fn auto_compact_follows_configured_and_unknown_model_windows_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("auto-compact-windows");
+        let _env = EnvRestore::new(&["REBON_CONTEXT_WINDOW", "REBON_AUTO_COMPACT_TOKEN_LIMIT"]);
+        std::env::remove_var("REBON_CONTEXT_WINDOW");
+        std::env::remove_var("REBON_AUTO_COMPACT_TOKEN_LIMIT");
+        let build = |window, output| {
+            prune_handle_from_env(
+                &ProviderFormat::OpenaiResponses,
+                rebon_api::ProviderVendor::Unknown,
+                "unlisted-private-model",
+                window,
+                output,
+                std::iter::empty::<(String, u32)>(),
+                std::iter::empty::<(String, u32)>(),
+            )
+        };
+
+        let configured = build(Some(872_000), Some(100_000));
+        assert_eq!(configured.budget.context_window(), 872_000);
+        assert_eq!(configured.budget.auto_compact_threshold(), 733_400);
+        assert!(!configured.budget.should_auto_compact_for_tokens(733_399));
+        assert!(configured.budget.should_auto_compact_for_tokens(733_400));
+
+        let unknown = build(None, None);
+        assert_eq!(unknown.budget.context_window(), 128_000);
+        assert_eq!(unknown.budget.auto_compact_threshold(), 121_600);
+        assert!(!unknown.budget.should_auto_compact_for_tokens(121_599));
+        assert!(unknown.budget.should_auto_compact_for_tokens(121_600));
+    }
+
+    #[test]
+    fn auto_compact_follows_window_unless_a_cap_is_set() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _env = EnvRestore::new(&["REBON_CONTEXT_WINDOW", "REBON_AUTO_COMPACT_TOKEN_LIMIT"]);
         std::env::remove_var("REBON_CONTEXT_WINDOW");
@@ -3998,14 +4027,12 @@ mod tests {
 
         let handle = build();
         assert_eq!(handle.budget.context_window(), 1_050_000);
-        assert_eq!(handle.budget.auto_compact_threshold(), 244_800);
-        // Switching models recomputes the window but keeps the cap, and so
-        // does a sub-agent fork.
+        assert_eq!(handle.budget.auto_compact_threshold(), 875_900);
         handle.set_context_window_for_model("gpt-6-sol");
-        assert_eq!(handle.budget.auto_compact_threshold(), 244_800);
+        assert_eq!(handle.budget.auto_compact_threshold(), 875_900);
         assert_eq!(
             handle.fork_for_sub_agent().budget.auto_compact_threshold(),
-            244_800
+            875_900
         );
 
         std::env::set_var("REBON_AUTO_COMPACT_TOKEN_LIMIT", "400000");
@@ -4039,6 +4066,8 @@ mod tests {
             .unwrap();
         let handle = build();
         assert_eq!(handle.budget.auto_compact_threshold(), 150_000);
+        assert!(!handle.budget.should_auto_compact_for_tokens(149_999));
+        assert!(handle.budget.should_auto_compact_for_tokens(150_000));
 
         // A live session picks up a change on its next refresh.
         rebon_config::save_auto_compact_token_limit_in_dir(config_home.path(), Some(0)).unwrap();
@@ -4046,13 +4075,19 @@ mod tests {
         assert_eq!(handle.budget.auto_compact_threshold(), 875_900);
         rebon_config::save_auto_compact_token_limit_in_dir(config_home.path(), None).unwrap();
         refresh_auto_compact_token_limit(&handle);
-        assert_eq!(handle.budget.auto_compact_threshold(), 244_800);
+        assert_eq!(handle.budget.auto_compact_threshold(), 875_900);
 
         rebon_config::save_auto_compact_token_limit_in_dir(config_home.path(), Some(150_000))
             .unwrap();
         std::env::set_var("REBON_AUTO_COMPACT_TOKEN_LIMIT", "90000");
         refresh_auto_compact_token_limit(&handle);
         assert_eq!(handle.budget.auto_compact_threshold(), 90_000);
+        std::env::set_var("REBON_AUTO_COMPACT_TOKEN_LIMIT", "0");
+        refresh_auto_compact_token_limit(&handle);
+        assert_eq!(handle.budget.auto_compact_threshold(), 875_900);
+        std::env::set_var("REBON_AUTO_COMPACT_TOKEN_LIMIT", "invalid");
+        refresh_auto_compact_token_limit(&handle);
+        assert_eq!(handle.budget.auto_compact_threshold(), 875_900);
     }
 
     #[test]
@@ -4148,8 +4183,7 @@ mod tests {
 
     #[test]
     fn auto_compact_cap_resolution_covers_every_source() {
-        let default = Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT);
-        assert_eq!(resolve_auto_compact_token_limit(None, None), default);
+        assert_eq!(resolve_auto_compact_token_limit(None, None), None);
         assert_eq!(
             resolve_auto_compact_token_limit(None, Some(120_000)),
             Some(120_000)
@@ -4163,11 +4197,10 @@ mod tests {
             resolve_auto_compact_token_limit(Some("0"), Some(120_000)),
             None
         );
-        // A malformed env var is the default cap, not the saved value: the
-        // person set the variable, and it is the one being honoured.
+        // A malformed env var still takes precedence over the saved value.
         assert_eq!(
             resolve_auto_compact_token_limit(Some("lots"), Some(120_000)),
-            default
+            None
         );
     }
 

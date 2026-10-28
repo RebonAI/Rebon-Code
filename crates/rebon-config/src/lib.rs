@@ -542,9 +542,8 @@ pub const FEATURES_CONFIG_KEY: &str = "features";
 /// Feature flag key for fast mode inside [`FEATURES_CONFIG_KEY`].
 pub const FAST_MODE_FEATURE_KEY: &str = "fastMode";
 /// Top-level config key for the auto-compact token cap. A count caps the
-/// trigger at that many input tokens, `0` removes the cap so the trigger
-/// follows the model's window alone, and no key means the engine's default
-/// cap. `REBON_AUTO_COMPACT_TOKEN_LIMIT` overrides it.
+/// trigger at that many input tokens. `0` or an absent key means the trigger
+/// follows the model's window. `REBON_AUTO_COMPACT_TOKEN_LIMIT` overrides it.
 pub const AUTO_COMPACT_TOKEN_LIMIT_CONFIG_KEY: &str = "autoCompactTokenLimit";
 /// Top-level config key for update preferences and dismissals.
 pub const UPDATES_CONFIG_KEY: &str = "updates";
@@ -5375,6 +5374,28 @@ pub fn save_theme(theme_id: &str) {
     }
 }
 
+pub fn saved_idle_auto_compact_enabled() -> bool {
+    let target = user_settings_file(&config_home_dir());
+    read_settings_json_object(&target)
+        .ok()
+        .and_then(|settings| {
+            settings
+                .get("idleAutoCompact")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(true)
+}
+
+pub fn save_idle_auto_compact_enabled(enabled: bool) -> anyhow::Result<()> {
+    let target = user_settings_file(&config_home_dir());
+    let mut settings = read_settings_json_object(&target)?;
+    settings.insert(
+        "idleAutoCompact".to_string(),
+        serde_json::Value::Bool(enabled),
+    );
+    write_settings_json_object(&target, &settings)
+}
+
 pub fn saved_fast_mode_enabled() -> bool {
     saved_fast_mode_enabled_in_dir(&config_home_dir())
 }
@@ -5424,14 +5445,14 @@ pub fn saved_auto_compact_token_limit_in_dir(config_dir: &Path) -> Option<u32> {
     if limit.is_none() {
         tracing::warn!(
             %value,
-            "{AUTO_COMPACT_TOKEN_LIMIT_CONFIG_KEY} is not a token count; using the default cap"
+            "{AUTO_COMPACT_TOKEN_LIMIT_CONFIG_KEY} is not a token count; following the model window"
         );
     }
     limit
 }
 
-/// Save the auto-compact token cap; `None` removes the key so the engine's
-/// default cap applies again.
+/// Save the auto-compact token cap; `None` removes the key so the trigger
+/// follows the model's window.
 pub fn save_auto_compact_token_limit(limit: Option<u32>) -> anyhow::Result<()> {
     save_auto_compact_token_limit_in_dir(&config_home_dir(), limit)
 }
@@ -9789,7 +9810,7 @@ mod tests {
         assert_eq!(parsed["autoCompactTokenLimit"], 120_000);
         assert_eq!(parsed["theme"], "dark");
 
-        // `0` is a value of its own ("no cap"), not the same as no key.
+        // `0` remains explicitly stored, even though an absent key also has no cap.
         save_auto_compact_token_limit_in_dir(tmp.path(), Some(0)).unwrap();
         assert_eq!(saved_auto_compact_token_limit_in_dir(tmp.path()), Some(0));
 

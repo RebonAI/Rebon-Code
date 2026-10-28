@@ -639,6 +639,12 @@ fn apply_settings_config(
             .prune_level
             .set(rebon_api::PruneLevel::from_config_value(&applied_value));
     }
+    if config_id == "idle_auto_compact" {
+        app.idle_auto_compact_enabled = crate::rebon_config::saved_idle_auto_compact_enabled();
+        if !app.idle_auto_compact_enabled {
+            super::compact_runtime::invalidate_idle_compact(app);
+        }
+    }
     if config_id == "auto_compact" {
         session
             .model

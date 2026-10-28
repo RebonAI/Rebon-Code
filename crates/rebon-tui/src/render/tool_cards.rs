@@ -1613,7 +1613,9 @@ pub(super) fn render_streaming_tool_use_with_content(
         .and_then(|input| input.get("timeout"))
         .and_then(Value::as_u64)
         .filter(|timeout_ms| {
-            *timeout_ms != HIDDEN_COMMAND_TIMEOUT_MS || !matches!(tool.kind, ToolKind::Execute)
+            !matches!(tool.kind, ToolKind::Execute)
+                || (*timeout_ms != HIDDEN_COMMAND_TIMEOUT_MS
+                    && !(*timeout_ms == 60_000 && matches!(name, "Bash" | "PowerShell")))
         })
     {
         let timeout = format!(

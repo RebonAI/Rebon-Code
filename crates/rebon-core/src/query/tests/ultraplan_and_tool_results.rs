@@ -494,9 +494,7 @@ fn mid_turn_compact_guard_honours_the_absolute_auto_compact_cap() {
     );
     assert_eq!(mid_turn_compact_guard_target(&handle, 4_000), 848_240);
 
-    handle
-        .budget
-        .set_auto_compact_token_limit(Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT));
+    handle.budget.set_auto_compact_token_limit(Some(244_800));
     assert_eq!(mid_turn_compact_guard_target(&handle, 4_000), 244_800);
     assert!(mid_turn_compact_allowed(&handle, 4_000, 244_800));
     assert!(!mid_turn_compact_allowed(&handle, 4_000, 244_799));
@@ -534,9 +532,7 @@ fn codex_window_keeps_the_hard_guard_behind_compaction() {
         std::iter::empty::<(String, u32)>(),
         std::iter::empty::<(String, u32)>(),
     );
-    handle
-        .budget
-        .set_auto_compact_token_limit(Some(rebon_api::DEFAULT_AUTO_COMPACT_TOKEN_LIMIT));
+    handle.budget.set_auto_compact_token_limit(Some(244_800));
 
     assert_eq!(handle.budget.auto_compact_threshold(), 244_800);
     assert_eq!(
