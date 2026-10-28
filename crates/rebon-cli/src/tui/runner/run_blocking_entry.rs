@@ -124,6 +124,7 @@ pub(super) fn install_session(
         session.session_start_hook = Some(rx);
     }
 
+    app.idle_auto_compact_enabled = crate::rebon_config::saved_idle_auto_compact_enabled();
     app.coordinator_mode = session.engine_half.coordinator_mode_handle.get();
     app.sync_task_snapshots(session.engine_half.tasks.snapshots());
     #[cfg(test)]

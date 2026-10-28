@@ -5374,6 +5374,28 @@ pub fn save_theme(theme_id: &str) {
     }
 }
 
+pub fn saved_idle_auto_compact_enabled() -> bool {
+    let target = user_settings_file(&config_home_dir());
+    read_settings_json_object(&target)
+        .ok()
+        .and_then(|settings| {
+            settings
+                .get("idleAutoCompact")
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(true)
+}
+
+pub fn save_idle_auto_compact_enabled(enabled: bool) -> anyhow::Result<()> {
+    let target = user_settings_file(&config_home_dir());
+    let mut settings = read_settings_json_object(&target)?;
+    settings.insert(
+        "idleAutoCompact".to_string(),
+        serde_json::Value::Bool(enabled),
+    );
+    write_settings_json_object(&target, &settings)
+}
+
 pub fn saved_fast_mode_enabled() -> bool {
     saved_fast_mode_enabled_in_dir(&config_home_dir())
 }

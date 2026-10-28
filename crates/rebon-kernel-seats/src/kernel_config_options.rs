@@ -82,6 +82,13 @@ pub fn register_core_options(seat: &Arc<ConfigSeat>, ctx: &Context) -> Result<()
     )?;
     seat.register(
         ctx,
+        ConfigOptionSpec::select("idle_auto_compact", "Idle auto compact")
+            .describe("Automatically compact while idle. Does not affect in-turn auto compact or /compact.")
+            .in_category("optimization"),
+        Arc::new(IdleAutoCompactOption),
+    )?;
+    seat.register(
+        ctx,
         ConfigOptionSpec::select("claude_codex_fallback", "Claude/Codex fallback")
             .describe(
                 "Load compatible skills and commands from .claude and .codex \
@@ -273,6 +280,33 @@ impl ConfigOptionProvider for FastModeOption {
         };
         rebon_config::save_fast_mode_enabled(enabled)
             .map_err(|error| format!("could not save fast mode: {error}"))
+    }
+}
+
+struct IdleAutoCompactOption;
+
+impl ConfigOptionProvider for IdleAutoCompactOption {
+    fn current(&self, _session: Option<&str>) -> String {
+        if rebon_config::saved_idle_auto_compact_enabled() {
+            "on"
+        } else {
+            "off"
+        }
+        .to_string()
+    }
+
+    fn choices(&self, _session: Option<&str>) -> Vec<ConfigOptionValue> {
+        on_off()
+    }
+
+    fn apply(&self, _session: Option<&str>, value: &str) -> Result<(), String> {
+        let enabled = match value {
+            "on" => true,
+            "off" => false,
+            other => return Err(format!("`{other}` is not on or off")),
+        };
+        rebon_config::save_idle_auto_compact_enabled(enabled)
+            .map_err(|error| format!("could not save idle auto compact: {error}"))
     }
 }
 
@@ -513,6 +547,26 @@ mod tests {
     }
 
     #[test]
+    fn idle_compact_setting_persists_and_defaults_on() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("idle-compact-setting");
+        let (_kernel, seat) = seat_with_core_options();
+        let current = || {
+            seat.options(None)
+                .into_iter()
+                .find(|option| option.id == "idle_auto_compact")
+                .expect("idle compact setting is registered")
+                .current_value
+        };
+        assert_eq!(current(), "on");
+        seat.apply(None, "idle_auto_compact", "off").unwrap();
+        assert_eq!(current(), "off");
+        assert!(seat.apply(None, "idle_auto_compact", "invalid").is_err());
+        assert_eq!(current(), "off");
+        seat.apply(None, "idle_auto_compact", "on").unwrap();
+        assert_eq!(current(), "on");
+    }
+
+    #[test]
     fn the_core_rows_are_registered_in_panel_order() {
         let (_kernel, seat) = seat_with_core_options();
         assert_eq!(
@@ -524,6 +578,7 @@ mod tests {
                 "language",
                 "shell_tool",
                 "fast_mode",
+                "idle_auto_compact",
                 "claude_codex_fallback",
                 MODEL_ROUTING_OPTION,
                 CODE_MODE_OPTION
@@ -747,7 +802,7 @@ mod tests {
         let seat = ConfigSeat::new();
         let scope = kernel.context().fork(PLUGIN_ID);
         register_core_options(&seat, &scope).expect("registers");
-        assert_eq!(seat.len(), 6);
+        assert_eq!(seat.len(), 7);
 
         scope.dispose();
         assert!(

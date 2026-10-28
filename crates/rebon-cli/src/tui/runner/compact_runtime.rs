@@ -123,7 +123,8 @@ pub(crate) fn maybe_start_idle_compact(
     idle_for: std::time::Duration,
 ) -> bool {
     let budget = &session.model.prune_level.budget;
-    if !idle
+    if !app.idle_auto_compact_enabled
+        || !idle
         || idle_for < super::status_bar::NEW_SESSION_HINT_IDLE_DELAY
         || budget.last_input_tokens() < super::status_bar::NEW_SESSION_HINT_TOKENS_THRESHOLD
         || !budget.should_auto_compact_for_tokens(budget.auto_compact_threshold())
@@ -286,6 +287,32 @@ pub(crate) fn sync_compact_run(app: &mut AppState, session: &mut TuiEngineSessio
 mod tests {
     use super::*;
     use crate::tui::app::CompactPhase;
+
+    #[tokio::test]
+    async fn disabled_idle_compact_leaves_manual_and_in_turn_compaction_available() {
+        let mut app = AppState::new();
+        app.idle_auto_compact_enabled = false;
+        let mut session = super::super::test_support::make_test_tui_session();
+        let handle = tokio::runtime::Handle::current();
+        let budget = session.model.prune_level.budget.clone();
+        let threshold = budget.auto_compact_threshold();
+        budget.report_usage(
+            threshold.max(super::super::status_bar::NEW_SESSION_HINT_TOKENS_THRESHOLD),
+        );
+        assert!(!maybe_start_idle_compact(
+            &mut app,
+            &mut session,
+            &handle,
+            true,
+            super::super::status_bar::NEW_SESSION_HINT_IDLE_DELAY,
+        ));
+        assert!(budget.should_auto_compact());
+        assert!(matches!(
+            start_manual_compact(&mut app, &mut session, &handle, None, None),
+            CompactStart::Started
+        ));
+        assert!(!app.compact_run.as_ref().unwrap().automatic);
+    }
 
     #[tokio::test]
     async fn idle_auto_compact_respects_budget_and_attempts_once_per_turn() {
