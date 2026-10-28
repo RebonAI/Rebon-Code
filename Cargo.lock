@@ -5159,6 +5159,7 @@ dependencies = [
  "libc",
  "rebon-agent-core",
  "rebon-api",
+ "rebon-config",
  "rebon-core",
  "rebon-kernel",
  "rebon-proto",

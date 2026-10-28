@@ -61,9 +61,9 @@ impl Drop for PendingReader {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SseMcpClient {
-    http: reqwest::Client,
+    http: Result<reqwest::Client, String>,
     servers: Arc<Mutex<HashMap<String, Arc<SseServer>>>>,
     /// Configs parked by `disconnect_server`, so `/mcp reconnect` can bring a
     /// disconnected server back. `remove_server` stays a true removal.
@@ -82,10 +82,16 @@ struct JsonRpcError {
     message: String,
 }
 
+impl Default for SseMcpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SseMcpClient {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::mcp_http::configured_http_client(),
             servers: Arc::new(Mutex::new(HashMap::new())),
             disconnected: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -120,8 +126,8 @@ impl SseMcpClient {
             tools_cache: Mutex::new(None),
         });
 
-        let connect = self
-            .http
+        let http = self.http.as_ref().map_err(|error| McpClientError::Transport(error.clone()))?;
+        let connect = http
             .get(&config.url)
             .headers(sse_get_headers(&server.headers))
             .timeout(config.effective_timeout())
@@ -168,7 +174,7 @@ impl SseMcpClient {
                 }
             };
             *server.post_url.lock().await = Some(post_url);
-            initialize_server(&self.http, &server).await
+            initialize_server(http, &server).await
         };
         let initialized = tokio::select! {
             biased;
@@ -266,7 +272,7 @@ impl McpClient for SseMcpClient {
             .await
             .ok_or_else(|| McpClientError::UnknownServer(call.server.clone()))?;
         let response = send_request(
-            &self.http,
+            self.http.as_ref().expect("a registered MCP server has an HTTP client"),
             &server,
             "tools/call",
             json!({"name": call.name, "arguments": call.arguments}),
@@ -305,7 +311,7 @@ impl McpClient for SseMcpClient {
         if let Some(cached) = state.tools_cache.lock().await.clone() {
             return Some(cached);
         }
-        let response = send_request(&self.http, &state, "tools/list", json!({}))
+        let response = send_request(self.http.as_ref().expect("a registered MCP server has an HTTP client"), &state, "tools/list", json!({}))
             .await
             .ok()?;
         let result = response.result?;
@@ -720,6 +726,43 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::{mpsc, oneshot};
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sse_mcp_uses_the_configured_proxy_for_the_initial_request() {
+        let home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-sse-proxy");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await.unwrap();
+                bytes.push(byte[0]);
+            }
+            stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+            String::from_utf8(bytes).unwrap()
+        });
+        rebon_config::save_mcp_proxy_in_dir(home.path(), Some(&proxy)).unwrap();
+        let client = SseMcpClient::new();
+        let error = client.add_server(SseServerConfig::new("proxy", "http://127.0.0.1:9/sse")).await.unwrap_err();
+        assert!(error.to_string().contains("502"));
+        assert!(server.await.unwrap().starts_with("GET http://127.0.0.1:9/sse "));
+        client.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sse_mcp_rejects_a_bad_proxy_before_connecting() {
+        let client = SseMcpClient {
+            http: Err("invalid MCP proxy URL".into()),
+            servers: Arc::new(Mutex::new(HashMap::new())),
+            disconnected: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let error = client.add_server(SseServerConfig::new("proxy", "http://127.0.0.1:9/sse")).await.unwrap_err();
+        assert!(error.to_string().contains("invalid MCP proxy URL"));
+        assert_eq!(client.server_count().await, 0);
+        client.shutdown().await;
+    }
+
     #[test]
     fn mcp_sse_parser_handles_endpoint_and_multiline_data() {
         let mut parser = SseParser::default();
@@ -750,6 +793,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_sse_client_initializes_lists_and_calls_tools() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-sse-client");
         let (url, seen_rx) = start_legacy_sse_server().await;
         let client = SseMcpClient::new();
         client
@@ -787,6 +831,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn erased_shutdown_closes_sse_reader_and_forgets_reconnect_config() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-sse-shutdown");
         let (url, _seen) = start_legacy_sse_server().await;
         let client = SseMcpClient::new();
         client
@@ -818,6 +863,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_sse_add_server_cleans_up_reader_when_endpoint_timeout() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-sse-endpoint-timeout");
         let (url, disconnected_rx) = start_sse_server_without_endpoint().await;
         let client = SseMcpClient::new();
         let mut config = SseServerConfig::new("no-endpoint", url);

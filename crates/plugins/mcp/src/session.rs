@@ -460,6 +460,7 @@ pub(super) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_turns_reuse_connection_and_empty_config_revokes_old_handle() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-session-concurrent");
         let server = Server::start(false, None).await;
         let runtime = SessionRuntime::new();
         let (a, b) = tokio::join!(
@@ -496,6 +497,7 @@ pub(super) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn construction_failure_is_sticky_until_configuration_changes() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-session-failure");
         let server = Server::start(true, None).await;
         let runtime = SessionRuntime::new();
         let first = runtime
@@ -527,6 +529,7 @@ pub(super) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn merged_view_shadows_host_and_never_falls_through_after_session_replacement() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-session-shadow");
         let server = Server::start(false, None).await;
         let host = Arc::new(crate::InMemoryMcpClient::new());
         host.register_tool("server", "ping", json!({"source":"host"}));
@@ -589,6 +592,7 @@ pub(super) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn host_shutdown_joins_transport_even_after_synchronous_dispose() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-session-host-shutdown");
         for off_runtime in [false, true] {
             let kernel = rebon_kernel::Kernel::new();
             kernel
@@ -654,6 +658,7 @@ pub(super) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replacement_cancels_pending_generation_without_waiting_for_old_io() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-session-replacement");
         for empty in [false, true] {
             let gate = Arc::new(Notify::new());
             let old_server = Server::start(false, Some(gate.clone())).await;
@@ -706,6 +711,7 @@ pub(super) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unload_cancels_pending_construction_and_prevents_cache_resurrection() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-session-unload");
         let gate = Arc::new(Notify::new());
         let server = Server::start(false, Some(gate)).await;
         let runtime = SessionRuntime::new();
@@ -729,6 +735,7 @@ pub(super) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replacement_and_host_join_close_unpublished_stdio_child() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-session-stdio");
         // A real stdio child that never answers: a script on the runner
         // (`REBON_VERVE`, or the `rebon-verve` this target directory built).
         let runner = std::env::var_os("REBON_VERVE")
@@ -808,6 +815,7 @@ pub(super) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unload_cancels_sse_handshake_and_closes_unpublished_reader() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-session-sse");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/sse", listener.local_addr().unwrap());
         let started = Arc::new(Notify::new());
@@ -856,6 +864,7 @@ pub(super) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn http_shutdown_removes_live_and_parked_connection_caches() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-session-http-shutdown");
         let server = Server::start(false, None).await;
         let client = HttpMcpClient::new();
         client
@@ -881,6 +890,7 @@ pub(super) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn partial_transport_failure_does_not_publish_a_client() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-session-partial-failure");
         let server = Server::start(false, None).await;
         let runtime = SessionRuntime::new();
         let broken = McpServerConfig::Http {

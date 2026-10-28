@@ -239,6 +239,7 @@ fn tool_turn(id: &str, tool_name: &str, tool_id: &str, input_json: &str) -> Vec<
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_proxy_tools_are_announced_and_dispatch_directly() {
+    let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-proxy-announce");
     let (host, _plugin, engine) = test_engine();
     let client = Arc::new(InMemoryMcpClient::new());
     client.register_tool_definition(
@@ -278,6 +279,7 @@ async fn mcp_proxy_tools_are_announced_and_dispatch_directly() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dispatch_accepts_announced_mcp_proxy_tool_names() {
+    let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-proxy-dispatch");
     let (host, _plugin, engine) = test_engine();
     let client = Arc::new(InMemoryMcpClient::new());
     client.register_tool_definition(
@@ -318,6 +320,7 @@ async fn dispatch_accepts_announced_mcp_proxy_tool_names() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn invoke_deferred_tool_accepts_discovered_mcp_proxy_names() {
+    let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-proxy-deferred");
     let (host, _plugin, engine) = test_engine();
     let client = Arc::new(InMemoryMcpClient::new());
     client.register_tool_definition(
@@ -367,6 +370,7 @@ async fn invoke_deferred_tool_accepts_discovered_mcp_proxy_names() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rust_lsp_mcp_proxy_tools_are_visible_and_dispatch() {
+    let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-proxy-lsp");
     let (host, _plugin, engine) = test_engine();
     let client = Arc::new(InMemoryMcpClient::new());
     client.register_tool_definition(
@@ -463,6 +467,7 @@ async fn rust_lsp_mcp_proxy_tools_are_visible_and_dispatch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deferred_dispatch_respects_index_and_cannot_survive_plugin_disposal() {
+    let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-deferred-index");
     let (host, plugin, engine) = test_engine();
     let client = Arc::new(InMemoryMcpClient::new());
     let mut definition = McpToolDefinition::new("ping");
@@ -513,6 +518,7 @@ async fn deferred_dispatch_respects_index_and_cannot_survive_plugin_disposal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_rejects_nonobject_missing_client_and_transport_failure() {
+    let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-proxy-rejects");
     let (host, _plugin, engine) = test_engine();
     let client = Arc::new(InMemoryMcpClient::new());
     let mut definition = McpToolDefinition::new("ping");
@@ -552,6 +558,7 @@ async fn proxy_rejects_nonobject_missing_client_and_transport_failure() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_session_http_client_discovers_and_executes_both_routes() {
+    let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-production-http");
     let (host, _plugin, engine) = test_engine();
     let server = session::tests::Server::start(false, None).await;
     let mock = MockModelClient::new();
@@ -608,6 +615,7 @@ async fn production_session_http_client_discovers_and_executes_both_routes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_filter_blocks_mcp_announcement_discovery_and_execution() {
+    let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-production-filter");
     for always_load in [true, false] {
         let (host, _plugin, engine) = test_engine();
         let client = Arc::new(InMemoryMcpClient::new());

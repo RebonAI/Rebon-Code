@@ -10,6 +10,7 @@ description = "MCP tools, transports and session runtime on typed kernel seats."
 [dependencies]
 rebon-kernel.workspace = true
 rebon-core.workspace = true
+rebon-config.workspace = true
 rebon-tool.workspace = true
 rebon-tools-core.workspace = true
 rebon-proto.workspace = true
@@ -32,5 +33,6 @@ rebon-types.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+rebon-tool = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 rebon-api.workspace = true

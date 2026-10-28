@@ -47,9 +47,9 @@ struct HttpServer {
     tools_cache: Mutex<Option<Vec<McpToolDefinition>>>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HttpMcpClient {
-    http: reqwest::Client,
+    http: Result<reqwest::Client, String>,
     servers: Arc<Mutex<HashMap<String, Arc<HttpServer>>>>,
     /// Configs parked by `disconnect_server`, so `/mcp reconnect` can bring a
     /// disconnected server back. `remove_server` stays a true removal.
@@ -68,10 +68,31 @@ struct JsonRpcError {
     message: String,
 }
 
+pub(crate) fn configured_http_client() -> Result<reqwest::Client, String> {
+    let proxy = rebon_config::saved_mcp_proxy().map_err(|error| error.to_string())?;
+    http_client_with_proxy(proxy.as_deref())
+}
+
+fn http_client_with_proxy(proxy: Option<&str>) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder();
+    if let Some(proxy) = proxy {
+        let proxy = reqwest::Proxy::all(proxy)
+            .map_err(|_| "invalid MCP proxy URL".to_string())?;
+        builder = builder.no_proxy().proxy(proxy);
+    }
+    builder.build().map_err(|error| error.to_string())
+}
+
+impl Default for HttpMcpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HttpMcpClient {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: configured_http_client(),
             servers: Arc::new(Mutex::new(HashMap::new())),
             disconnected: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -87,7 +108,8 @@ impl HttpMcpClient {
             tools_cache: Mutex::new(None),
         });
 
-        initialize_server(&self.http, &server).await?;
+        let http = self.http.as_ref().map_err(|error| McpClientError::Transport(error.clone()))?;
+        initialize_server(http, &server).await?;
         self.disconnected.lock().await.remove(&config.name);
         self.servers.lock().await.insert(config.name, server);
         Ok(())
@@ -118,7 +140,7 @@ impl McpClient for HttpMcpClient {
             .await
             .ok_or_else(|| McpClientError::UnknownServer(call.server.clone()))?;
         let response = send_request(
-            &self.http,
+            self.http.as_ref().expect("a registered MCP server has an HTTP client"),
             &server,
             "tools/call",
             json!({
@@ -160,7 +182,7 @@ impl McpClient for HttpMcpClient {
         if let Some(cached) = state.tools_cache.lock().await.clone() {
             return Some(cached);
         }
-        let response = send_request(&self.http, &state, "tools/list", json!({}))
+        let response = send_request(self.http.as_ref().expect("a registered MCP server has an HTTP client"), &state, "tools/list", json!({}))
             .await
             .ok()?;
         let result = response.result?;
@@ -498,6 +520,7 @@ mod tests {
 
     #[derive(Debug)]
     struct TestRequest {
+        target: String,
         headers: HashMap<String, String>,
         body: Value,
     }
@@ -533,7 +556,8 @@ mod tests {
             bytes.extend_from_slice(&buffer[..read]);
         }
         let body = serde_json::from_slice(&bytes[header_end..header_end + content_length]).unwrap();
-        TestRequest { headers, body }
+        let target = header_text.lines().next().unwrap().to_string();
+        TestRequest { target, headers, body }
     }
 
     fn write_response(stream: &mut TcpStream, status: &str, headers: &[(&str, &str)], body: &str) {
@@ -572,6 +596,61 @@ mod tests {
             }
         });
         url
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_mcp_uses_the_configured_proxy_even_for_local_addresses() {
+        let home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-http-proxy");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let proxy = start_test_server(2, move |request| {
+            recorded.lock().expect("proxy request log poisoned").push(request.target);
+            if request.body["method"] == "initialize" {
+                ("200 OK".into(), vec![("Content-Type".into(), "application/json".into())],
+                    json!({"jsonrpc":"2.0","id":request.body["id"],"result":{}}).to_string())
+            } else {
+                ("202 Accepted".into(), Vec::new(), String::new())
+            }
+        });
+        rebon_config::save_mcp_proxy_in_dir(home.path(), Some(&proxy)).unwrap();
+        let client = HttpMcpClient::new();
+        client.add_server(HttpServerConfig::new("proxy", "http://127.0.0.1:9/mcp")).await.unwrap();
+        let targets = seen.lock().expect("proxy request log poisoned");
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().all(|target| target.contains("http://127.0.0.1:9/mcp")));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_mcp_rejects_a_bad_proxy_before_connecting() {
+        let client = HttpMcpClient {
+            http: Err("invalid MCP proxy URL".into()),
+            servers: Arc::new(Mutex::new(HashMap::new())),
+            disconnected: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let error = client.add_server(HttpServerConfig::new("proxy", "http://127.0.0.1:9/mcp")).await.unwrap_err();
+        assert!(error.to_string().contains("invalid MCP proxy URL"));
+        assert_eq!(client.server_count().await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unavailable_proxy_does_not_fall_back_to_the_server() {
+        let home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-http-proxy-unavailable");
+        let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        let worker = thread::spawn(move || {
+            let (stream, _) = proxy.accept().unwrap();
+            drop(stream);
+        });
+        rebon_config::save_mcp_proxy_in_dir(home.path(), Some(&proxy_url)).unwrap();
+        let client = HttpMcpClient::new();
+        let mut config = HttpServerConfig::new("proxy", format!("http://{}/mcp", destination.local_addr().unwrap()));
+        config.request_timeout = Some(Duration::from_secs(2));
+        assert!(client.add_server(config).await.is_err());
+        worker.join().unwrap();
+        assert_eq!(destination.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(client.server_count().await, 0);
     }
 
     #[test]
@@ -627,6 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn persists_session_id_for_initialized_list_and_call() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-http-session-id");
         let seen_methods = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen_methods_for_server = seen_methods.clone();
         let url = start_test_server(4, move |request| {
@@ -698,6 +778,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialized_notification_accepts_empty_204_response() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-http-empty-response");
         let url = start_test_server(2, move |request| {
             match request.body["method"].as_str().unwrap() {
                 "initialize" => (
@@ -722,6 +803,7 @@ mod tests {
 
     #[tokio::test]
     async fn parses_sse_tools_list_response() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("mcp-http-sse-response");
         let url = start_test_server(3, move |request| {
             match request.body["method"].as_str().unwrap() {
                 "initialize" => (
