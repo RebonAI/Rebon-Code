@@ -88,7 +88,7 @@ members = [
 exclude = ["services/rc-server"]
 
 [workspace.package]
-version = "1.22.2"
+version = "1.23.0"
 edition = "2021"
 license = "Apache-2.0"
 # Verve's Boa needs 1.91.
