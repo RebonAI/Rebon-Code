@@ -675,10 +675,6 @@ pub struct AppState {
 }
 
 /// Which part of an immediate `/compact` is running.
-///
-/// The summariser call is one long request with no intermediate signal, so
-/// these are the only honest boundaries there are — the widget shows real
-/// phases plus elapsed time rather than a fabricated per-percent trickle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactPhase {
     /// Reading the session transcript off disk.
@@ -689,63 +685,16 @@ pub enum CompactPhase {
     Summarizing,
 }
 
-impl CompactPhase {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Reading => "Reading session history",
-            Self::Summarizing => "Summarizing conversation",
-        }
-    }
-
-    /// Fraction of the run this phase has completed by, as a 0-100 floor and
-    /// ceiling. Summarizing owns nearly the whole bar because it owns nearly
-    /// the whole wall clock.
-    pub fn progress_bounds(self) -> (u16, u16) {
-        match self {
-            Self::Reading => (0, 8),
-            Self::Summarizing => (8, 95),
-        }
-    }
-}
-
 /// An immediate `/compact` in flight.
 #[derive(Debug, Clone)]
 pub struct CompactRunState {
     pub phase: CompactPhase,
     pub started_at: std::time::Instant,
-    /// Transcript rows the session had when the run started — the "N messages"
-    /// the widget names while it waits.
-    pub messages_before: usize,
     /// Foreground mailbox command awaiting this run's report, if the desktop
     /// app asked for it rather than the local user.
     pub respond_to_command_id: Option<String>,
     pub automatic: bool,
     pub invalidated: bool,
-}
-
-/// Nominal duration of a compaction, used only to pace the progress bar
-/// inside [`CompactPhase::Summarizing`]. Measured, not guessed: a
-/// haiku-class summariser over a full context lands near here. The bar
-/// never reaches the phase ceiling on time alone, so a slow run reads as
-/// "still working" instead of "stuck at 100%".
-pub const COMPACT_NOMINAL_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
-
-impl CompactRunState {
-    /// Progress percentage to paint, 0-99. Never 100 — only a finished run
-    /// is finished, and it clears this state rather than filling the bar.
-    pub fn progress_percent(&self) -> u16 {
-        let (floor, ceiling) = self.phase.progress_bounds();
-        if self.phase != CompactPhase::Summarizing {
-            return floor;
-        }
-        let elapsed = self.started_at.elapsed().as_millis() as u64;
-        let nominal = COMPACT_NOMINAL_DURATION.as_millis() as u64;
-        // Asymptotic: half the remaining span per nominal duration, so the
-        // bar keeps creeping without ever claiming the phase is done.
-        let span = u64::from(ceiling - floor);
-        let advanced = span.saturating_mul(elapsed) / nominal.saturating_add(elapsed);
-        floor.saturating_add(advanced.min(span) as u16)
-    }
 }
 
 /// Records when a task was marked completed.

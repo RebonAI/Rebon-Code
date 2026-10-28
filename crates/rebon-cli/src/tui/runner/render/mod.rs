@@ -97,7 +97,7 @@ fn tasks_footer_is_selected(app: &AppState) -> bool {
 
 /// Rows the progress strip above the prompt wants.
 ///
-/// The compaction bar and the `/ultraplan` widget share one layout slot:
+/// The compaction status and the `/ultraplan` widget share one layout slot:
 /// they never both apply (an ultraplan run drives turns, and `/compact` only
 /// starts an immediate run at an idle prompt), and giving each its own chunk
 /// would cost every layout site a constraint that is zero almost always.
@@ -214,7 +214,6 @@ mod tests {
         app.compact_run = Some(crate::tui::app::CompactRunState {
             phase: crate::tui::app::CompactPhase::Summarizing,
             started_at: std::time::Instant::now(),
-            messages_before: 142,
             respond_to_command_id: None,
             automatic: false,
             invalidated: false,
@@ -235,23 +234,23 @@ mod tests {
     }
 
     #[test]
-    fn a_running_compaction_paints_its_bar_above_the_prompt() {
+    fn a_running_manual_compaction_shows_the_auto_compact_status_above_the_prompt() {
         let rows = render_screen_rows(compacting_app(), 120, 20);
 
-        let bar = rows
+        let status = rows
             .iter()
-            .find(|row| row.contains("Compacting"))
-            .unwrap_or_else(|| panic!("the compaction bar must be on screen: {rows:?}"));
-        assert!(bar.contains('▕') && bar.contains('▏'), "{bar}");
-        assert!(bar.contains("Summarizing conversation"), "{bar}");
-        assert!(bar.contains("142 messages"), "{bar}");
+            .find(|row| row.contains("Auto Compacting…"))
+            .unwrap_or_else(|| panic!("the compaction status must be on screen: {rows:?}"));
+        assert!(!status.contains('▕') && !status.contains('%'), "{status}");
+        assert!(!status.contains("Summarizing conversation"), "{status}");
+        assert!(!status.contains("142 messages"), "{status}");
     }
 
-    /// The bar and the `/ultraplan` widget share one layout slot. A run that
+    /// The compaction status and the `/ultraplan` widget share one layout slot. A run that
     /// starts while an ultraplan is on screen must not stack a second strip
     /// on top of it — nor lose the ultraplan widget once it finishes.
     #[test]
-    fn the_compaction_bar_takes_the_progress_slot_from_the_ultraplan_widget() {
+    fn the_compaction_status_takes_the_progress_slot_from_the_ultraplan_widget() {
         let mut app = app_with_ultraplan_phase(UltraplanPhase::Executing);
         let ultraplan_only = progress_widget_height(&app, 8);
         assert!(ultraplan_only > 0, "fixture must show the ultraplan widget");

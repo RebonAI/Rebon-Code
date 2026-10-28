@@ -9,7 +9,7 @@
 //! Here the command runs the compaction the moment it is typed. The work is
 //! a provider call that cannot be done on the event-loop thread, so it lives
 //! on a worker thread (the same shape `resume_runtime` uses for its summary
-//! worker) while [`crate::tui::compact_widget`] paints progress above the
+//! worker) while [`crate::tui::compact_widget`] paints a status above the
 //! prompt. When it lands, the compacted history is installed as the
 //! session's replay baseline — so the *next* turn replays it with no extra
 //! work — and the transcript gets a report of what survived.
@@ -61,7 +61,6 @@ pub(crate) fn start_manual_compact(
     app.compact_run = Some(CompactRunState {
         phase: CompactPhase::Reading,
         started_at: std::time::Instant::now(),
-        messages_before: app.rebon_tui.transcript.rows().len(),
         respond_to_command_id,
         automatic: false,
         invalidated: false,
