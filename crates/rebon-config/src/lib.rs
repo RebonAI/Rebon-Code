@@ -5375,7 +5375,11 @@ pub fn save_theme(theme_id: &str) {
 }
 
 pub fn saved_idle_auto_compact_enabled() -> bool {
-    let target = user_settings_file(&config_home_dir());
+    saved_idle_auto_compact_enabled_in_dir(&config_home_dir())
+}
+
+pub fn saved_idle_auto_compact_enabled_in_dir(config_dir: &Path) -> bool {
+    let target = user_settings_file(config_dir);
     read_settings_json_object(&target)
         .ok()
         .and_then(|settings| {
@@ -5387,13 +5391,141 @@ pub fn saved_idle_auto_compact_enabled() -> bool {
 }
 
 pub fn save_idle_auto_compact_enabled(enabled: bool) -> anyhow::Result<()> {
-    let target = user_settings_file(&config_home_dir());
+    save_idle_auto_compact_enabled_in_dir(&config_home_dir(), enabled)
+}
+
+pub fn save_idle_auto_compact_enabled_in_dir(
+    config_dir: &Path,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    let target = user_settings_file(config_dir);
     let mut settings = read_settings_json_object(&target)?;
     settings.insert(
         "idleAutoCompact".to_string(),
         serde_json::Value::Bool(enabled),
     );
     write_settings_json_object(&target, &settings)
+}
+
+#[cfg(test)]
+mod idle_auto_compact_settings_tests {
+    use super::{save_idle_auto_compact_enabled_in_dir, saved_idle_auto_compact_enabled_in_dir};
+
+    #[test]
+    fn default_and_round_trip_preserve_other_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(saved_idle_auto_compact_enabled_in_dir(dir.path()));
+        let path = super::user_settings_file(dir.path());
+        std::fs::write(&path, r#"{"other":42}"#).unwrap();
+        save_idle_auto_compact_enabled_in_dir(dir.path(), false).unwrap();
+        assert!(!saved_idle_auto_compact_enabled_in_dir(dir.path()));
+        let settings: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&path).unwrap(),
+        ).unwrap();
+        assert_eq!(settings["other"], 42);
+        save_idle_auto_compact_enabled_in_dir(dir.path(), true).unwrap();
+        assert!(saved_idle_auto_compact_enabled_in_dir(dir.path()));
+    }
+
+    #[test]
+    fn invalid_settings_cannot_be_overwritten_by_the_toggle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = super::user_settings_file(dir.path());
+        std::fs::write(&path, "invalid json").unwrap();
+        assert!(saved_idle_auto_compact_enabled_in_dir(dir.path()));
+        assert!(save_idle_auto_compact_enabled_in_dir(dir.path(), false).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "invalid json");
+    }
+}
+
+const MCP_PROXY_CONFIG_KEY: &str = "mcpProxy";
+
+fn validate_mcp_proxy(address: &str) -> anyhow::Result<()> {
+    let url = reqwest::Url::parse(address)
+        .map_err(|_| anyhow::anyhow!("invalid MCP proxy URL"))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "MCP proxy must be an HTTP or HTTPS address without credentials or a path"
+    );
+    Ok(())
+}
+
+pub fn saved_mcp_proxy() -> anyhow::Result<Option<String>> {
+    saved_mcp_proxy_in_dir(&config_home_dir())
+}
+
+pub fn saved_mcp_proxy_in_dir(config_dir: &Path) -> anyhow::Result<Option<String>> {
+    let config = read_config_roundtrip(config_dir)?;
+    let Some(value) = config.extra.get(MCP_PROXY_CONFIG_KEY) else {
+        return Ok(None);
+    };
+    let address = value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("MCP proxy must be a URL string"))?;
+    validate_mcp_proxy(address)?;
+    Ok(Some(address.to_owned()))
+}
+
+pub fn save_mcp_proxy_in_dir(config_dir: &Path, address: Option<&str>) -> anyhow::Result<()> {
+    if let Some(address) = address {
+        validate_mcp_proxy(address)?;
+    }
+    let mut config = read_config_roundtrip(config_dir)?;
+    match address {
+        Some(address) => {
+            config.extra.insert(
+                MCP_PROXY_CONFIG_KEY.to_owned(),
+                serde_json::Value::String(address.to_owned()),
+            );
+        }
+        None => {
+            config.extra.remove(MCP_PROXY_CONFIG_KEY);
+        }
+    }
+    write_config_roundtrip(config_dir, &config)
+}
+
+#[cfg(test)]
+mod mcp_proxy_settings_tests {
+    use super::{save_mcp_proxy_in_dir, saved_mcp_proxy_in_dir};
+
+    #[test]
+    fn proxy_round_trips_without_changing_other_config() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(saved_mcp_proxy_in_dir(dir.path()).unwrap(), None);
+        std::fs::write(dir.path().join("config.json"), r#"{"unrelated":42}"#).unwrap();
+        save_mcp_proxy_in_dir(dir.path(), Some("http://127.0.0.1:7890")).unwrap();
+        assert_eq!(saved_mcp_proxy_in_dir(dir.path()).unwrap().as_deref(), Some("http://127.0.0.1:7890"));
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join("config.json")).unwrap()).unwrap();
+        assert_eq!(value["unrelated"], 42);
+        save_mcp_proxy_in_dir(dir.path(), None).unwrap();
+        assert_eq!(saved_mcp_proxy_in_dir(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn malformed_saved_proxy_is_not_treated_as_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        for value in [serde_json::json!(42), serde_json::json!("http://user:secret@host")] {
+            std::fs::write(dir.path().join("config.json"), serde_json::json!({"mcpProxy": value}).to_string()).unwrap();
+            let error = saved_mcp_proxy_in_dir(dir.path()).unwrap_err().to_string();
+            assert!(!error.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn invalid_proxy_and_credentials_are_rejected_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        for address in ["not a URL", "socks5://127.0.0.1:7890", "http://user:secret@127.0.0.1:7890", "http://127.0.0.1/path"] {
+            assert!(save_mcp_proxy_in_dir(dir.path(), Some(address)).is_err(), "{address}");
+            assert_eq!(saved_mcp_proxy_in_dir(dir.path()).unwrap(), None);
+        }
+    }
 }
 
 pub fn saved_fast_mode_enabled() -> bool {
