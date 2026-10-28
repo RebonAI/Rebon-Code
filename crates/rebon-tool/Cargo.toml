@@ -54,7 +54,10 @@ globset = "0.4"
 # `node_modules`/`target`/minified bundles the way a raw `walkdir` did.
 ignore = "0.4"
 regex.workspace = true
-tree-sitter = "0.25"
+# The desktop app draws code blocks with gpui-component, whose grammars need
+# tree-sitter 0.26. tree-sitter links a native library, so only one version may
+# exist in a graph that contains both — and the app's graph does.
+tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
 tree-sitter-python = "0.25"
 tree-sitter-javascript = "0.25"
