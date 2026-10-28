@@ -1090,7 +1090,7 @@ fn tool_footer_orders_output_timeout_and_allowance_across_states() {
                         name,
                         ToolKind::Execute,
                         status,
-                        vec![("command", json!("pwd")), ("timeout", json!(60000))],
+                        vec![("command", json!("pwd")), ("timeout", json!(90000))],
                     ),
                     vec![text_tool_content("command output")],
                 );
@@ -1108,7 +1108,7 @@ fn tool_footer_orders_output_timeout_and_allowance_across_states() {
                 );
                 let snap = all_text(&buf);
                 let output = snap.find("command output").expect(&snap);
-                let timeout = snap.find("Timeout: 60s").expect(&snap);
+                let timeout = snap.find("Timeout: 90s").expect(&snap);
                 let allowance = snap.find("Allowed by auto mode classifier").expect(&snap);
                 assert!(
                     output < timeout && timeout < allowance,
@@ -1132,7 +1132,8 @@ fn tool_footer_only_shows_configured_numeric_timeouts() {
         (Some(json!("60000")), None),
         (Some(json!(25)), Some("Timeout: 25ms")),
         (Some(json!(1500)), Some("Timeout: 1.5s")),
-        (Some(json!(60000)), Some("Timeout: 60s")),
+        (Some(json!(60000)), None),
+        (Some(json!(90000)), Some("Timeout: 90s")),
     ] {
         let mut input = vec![("command", json!("pwd"))];
         if let Some(timeout) = timeout {
@@ -1160,14 +1161,18 @@ fn tool_footer_only_shows_configured_numeric_timeouts() {
 }
 
 #[test]
-fn command_footer_hides_only_the_common_600_second_timeout() {
+fn command_footer_hides_common_command_timeouts() {
     for name in ["Bash", "PowerShell", "ShellOutput"] {
         for status in [
             ToolCallStatus::InProgress,
             ToolCallStatus::Completed,
             ToolCallStatus::Failed,
         ] {
-            for (timeout, expected) in [(600_000, None), (60_000, Some("Timeout: 60s"))] {
+            for (timeout, expected) in [
+                (600_000, None),
+                (60_000, (name == "ShellOutput").then_some("Timeout: 60s")),
+                (90_000, Some("Timeout: 90s")),
+            ] {
                 let tool = streaming_tool_with_content(
                     streaming_tool(
                         "footer-1",
@@ -1192,20 +1197,22 @@ fn command_footer_hides_only_the_common_600_second_timeout() {
         }
     }
 
-    let non_command = streaming_tool(
-        "footer-2",
-        "CustomTool",
-        ToolKind::Other,
-        ToolCallStatus::Failed,
-        vec![("timeout", json!(600_000))],
-    );
-    let snap = auto_mode_snapshot(non_command, &[], 6);
-    assert!(snap.contains("Timeout: 600s"), "{snap}");
+    for (timeout, expected) in [(600_000, "Timeout: 600s"), (60_000, "Timeout: 60s")] {
+        let non_command = streaming_tool(
+            "footer-2",
+            "CustomTool",
+            ToolKind::Other,
+            ToolCallStatus::Failed,
+            vec![("timeout", json!(timeout))],
+        );
+        let snap = auto_mode_snapshot(non_command, &[], 6);
+        assert!(snap.contains(expected), "{snap}");
+    }
 }
 
 #[test]
 fn committed_command_footer_uses_the_same_timeout_rule() {
-    for (timeout, expected) in [(600_000, false), (60_000, true)] {
+    for (timeout, expected) in [(600_000, false), (60_000, false), (90_000, true)] {
         let mut msg = assistant_tool_uses(
             "assistant-1",
             vec![(
@@ -1236,7 +1243,7 @@ fn committed_command_footer_uses_the_same_timeout_rule() {
         let snap = all_text(&buf);
         assert_eq!(snap.contains("Timeout:"), expected, "{snap}");
         if expected {
-            assert!(snap.contains("Timeout: 60s"), "{snap}");
+            assert!(snap.contains("Timeout: 90s"), "{snap}");
         }
     }
 }
@@ -1249,7 +1256,7 @@ fn tool_footer_never_displaces_output_in_a_short_viewport() {
             "Bash",
             ToolKind::Execute,
             ToolCallStatus::Completed,
-            vec![("command", json!("pwd")), ("timeout", json!(60000))],
+            vec![("command", json!("pwd")), ("timeout", json!(90000))],
         ),
         vec![text_tool_content("command output")],
     );
@@ -1272,7 +1279,7 @@ fn tool_footer_never_displaces_output_in_a_short_viewport() {
         );
         let snap = all_text(&buf);
         assert!(snap.contains("command output"), "{snap}");
-        assert_eq!(snap.contains("Timeout: 60s"), height >= 3, "{snap}");
+        assert_eq!(snap.contains("Timeout: 90s"), height >= 3, "{snap}");
         assert_eq!(snap.contains("Allowed by"), height >= 4, "{snap}");
         assert_eq!(consumed, height);
     }
@@ -1313,14 +1320,14 @@ fn tool_footer_survives_empty_output() {
         "Bash",
         ToolKind::Execute,
         ToolCallStatus::InProgress,
-        vec![("command", json!("pwd")), ("timeout", json!(60000))],
+        vec![("command", json!("pwd")), ("timeout", json!(90000))],
     );
     let snap = auto_mode_snapshot(
         tool,
         &[("empty-1", rebon_types::AutoModeAllowSource::Classifier)],
         4,
     );
-    let timeout = snap.find("Timeout: 60s").expect(&snap);
+    let timeout = snap.find("Timeout: 90s").expect(&snap);
     let allowance = snap.find("Allowed by auto mode classifier").expect(&snap);
     assert!(timeout < allowance, "{snap}");
     let workflow = streaming_tool(
