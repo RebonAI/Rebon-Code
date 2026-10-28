@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Context};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use rebon_types::{AppVisualEffectManifest, KernelPluginManifest};
+use rebon_types::{AppVisualEffectManifest, DshClientManifest, KernelPluginManifest};
 
 use crate::acp_agent_manifest::AcpAgentManifest;
 use crate::model_provider_manifest::ModelProviderManifest;
@@ -52,6 +52,8 @@ pub struct PluginCapabilities {
     pub acp_agents: BTreeMap<String, AcpAgentManifest>,
     #[serde(default, rename = "appVisualEffects")]
     pub app_visual_effects: Vec<AppVisualEffectManifest>,
+    #[serde(default, rename = "dshClients")]
+    pub dsh_clients: BTreeMap<String, DshClientManifest>,
     /// Plugins this package puts on the kernel plugin plane, keyed by the name
     /// a composition refers to.
     ///
@@ -180,6 +182,22 @@ impl PluginManifest {
             effect.validate().map_err(|message| {
                 anyhow!("invalid app visual effect `{}`: {message}", effect.id)
             })?;
+        }
+        for (name, client) in &self.capabilities.dsh_clients {
+            validate_identifier("dsh client name", name)?;
+            for (field, path) in [("entry", &client.entry), ("runtime", &client.runtime)] {
+                let relative = validate_relative_asset_path(path).map_err(|error| {
+                    anyhow!("invalid dsh client `{name}` {field} `{path}`: {error}")
+                })?;
+                if let Some(root) = root {
+                    ensure_path_inside_root(root, &root.join(relative)).map_err(|error| {
+                        anyhow!("invalid dsh client `{name}` {field} `{path}`: {error}")
+                    })?;
+                }
+            }
+            if !client.has_safe_route() {
+                bail!("invalid dsh client `{name}` route `{}`", client.route);
+            }
         }
         for (name, plugin) in &self.capabilities.kernel_plugins {
             validate_identifier("kernel plugin name", name)?;
@@ -325,6 +343,9 @@ impl PluginManifest {
                 "{} app visual effect(s)",
                 self.capabilities.app_visual_effects.len()
             ));
+        }
+        if !self.capabilities.dsh_clients.is_empty() {
+            out.push(format!("{} DSH client(s)", self.capabilities.dsh_clients.len()));
         }
         if !self.capabilities.kernel_plugins.is_empty() {
             out.push(format!(
@@ -570,6 +591,36 @@ mod tests {
             .capability_summary()
             .iter()
             .any(|line| line.contains("kernel plugin")));
+    }
+
+    #[test]
+    fn dsh_client_manifest_checks_paths_ids_and_route_boundaries() {
+        let client = |entry: &str, runtime: &str, route: &str| {
+            manifest_json(serde_json::json!({
+                "name": "dsh-pet",
+                "version": "1.0.0",
+                "capabilities": {"dshClients": {"pet": {
+                    "entry": entry, "runtime": runtime, "route": route
+                }}}
+            }))
+        };
+        let valid = client("client.js", "runtime.json", "/dsh-pet/");
+        valid.validate(None).unwrap();
+        assert!(valid.capabilities.dsh_clients.contains_key("pet"));
+        for (entry, runtime, route) in [
+            ("../outside.js", "runtime.json", "/dsh-pet/"),
+            ("client.js", "../runtime.json", "/dsh-pet/"),
+            ("client.js", "runtime.json", "/"),
+            ("client.js", "runtime.json", "/dsh-pet"),
+            ("client.js", "runtime.json", "/a/../b/"),
+            ("client.js", "runtime.json", "/a/?token=x"),
+        ] {
+            assert!(client(entry, runtime, route).validate(None).is_err());
+        }
+        let mut invalid = serde_json::to_value(valid).unwrap();
+        invalid["capabilities"]["dshClients"]["bad/name"] = invalid["capabilities"]["dshClients"]["pet"].clone();
+        let invalid: PluginManifest = serde_json::from_value(invalid).unwrap();
+        assert!(invalid.validate(None).is_err());
     }
 
     #[test]
