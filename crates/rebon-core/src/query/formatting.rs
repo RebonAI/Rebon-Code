@@ -652,6 +652,7 @@ mod tests {
             .await
             .unwrap();
         let projected = read_tool_result_for_model(&result, true).to_plain_text();
+        assert!(projected.len() <= 32 * 1024, "{}", projected.len());
         assert!(projected.contains("marker-0"));
         assert!(!projected.contains("marker-9"));
         assert!(cache.get(&paths[0]).is_some());
@@ -723,10 +724,24 @@ mod tests {
         for include_binary in [true, false] {
             let content = read_tool_result_for_model(&value, include_binary);
             let text = content.to_plain_text();
-            assert!(text.len() <= MAX_TOOL_RESULT_CHARS, "{}", text.len());
+            assert!(text.len() <= 32 * 1024, "{}", text.len());
+            assert!(text.contains("/file-0"));
             assert!(text.contains("/file-9"), "omitted path must be identified");
             assert!(text.contains("omitted"), "omission must be explicit");
         }
+    }
+
+    #[test]
+    fn small_batch_read_returns_every_target() {
+        let results: Vec<_> = (0..16)
+            .map(|i| json!({"type":"text", "file":{"filePath":format!("/file-{i}"), "content":format!("content-{i}")}}))
+            .collect();
+        let text = read_tool_result_for_model(&json!({"type":"batch", "results":results}), true)
+            .to_plain_text();
+        for i in 0..16 {
+            assert!(text.contains(&format!("content-{i}\"")));
+        }
+        assert!(!text.contains("omitted"));
     }
 
     #[test]
@@ -752,7 +767,7 @@ mod tests {
             {"type":"text", "file":{"filePath":"/big", "content":format!("requested-line-500 {}", "x".repeat(120_000))}}
         ]});
         let text = read_tool_result_for_model(&value, true).to_plain_text();
-        assert!(text.len() <= MAX_TOOL_RESULT_CHARS);
+        assert!(text.len() <= 32 * 1024);
         assert!(text.contains("requested-line-500"));
         assert!(text.contains("/big") && text.contains("partially returned"));
     }

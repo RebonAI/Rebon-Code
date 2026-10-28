@@ -242,14 +242,6 @@ fn auto_compact_threshold_for_window(context_window: u32, output_token_reserve: 
 }
 const WARNING_THRESHOLD_BUFFER: u32 = 20_000;
 
-/// Absolute ceiling on the auto-compact trigger, matching Codex: its model
-/// catalogue advertises a 272k working window even for 1M-capable models and
-/// compacts at 90% of it. A long session otherwise resends several hundred
-/// thousand tokens on every tool round before the window-relative trigger
-/// fires, and cached input still counts against the account's quota.
-/// Callers opt in through [`ContextBudget::set_auto_compact_token_limit`].
-pub const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT: u32 = 272_000 * 9 / 10;
-
 // ── Microcompact thresholds ────────────────────────────────────
 // Microcompact trims stale tool results before heavier summarization.
 // The default is window-relative so large-context providers can use their
@@ -3475,10 +3467,10 @@ mod tests {
         assert_eq!(small.window_auto_compact_threshold(), 129_200);
         assert!(small.window_auto_compact_threshold() > small.auto_compact_red_zone_start());
 
-        // 1M / 128k: the default cap (244.8k) is far below the red zone.
+        // An explicit 244.8k cap is far below the red zone.
         let large = ContextBudget::with_output_reserve(1_000_000, 128_000);
         assert_eq!(large.auto_compact_red_zone_start(), 852_000);
-        large.set_auto_compact_token_limit(Some(DEFAULT_AUTO_COMPACT_TOKEN_LIMIT));
+        large.set_auto_compact_token_limit(Some(244_800));
         assert!(large.auto_compact_threshold() < large.auto_compact_red_zone_start());
     }
 

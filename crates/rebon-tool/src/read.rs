@@ -20,7 +20,7 @@ use tokio::process::Command;
 
 const FILE_READ_TOOL_NAME: &str = "Read";
 const MAX_READ_TARGETS: usize = 16;
-pub const READ_BATCH_TEXT_BUDGET: usize = 100_000;
+pub const READ_BATCH_TEXT_BUDGET: usize = 32 * 1024;
 pub const READ_BATCH_NOTICE_BUDGET: usize = 8192;
 const READ_BATCH_BINARY_BUDGET: usize = 28 * 1024 * 1024;
 
@@ -123,7 +123,7 @@ pub fn read_batch_delivery(results: &[Value], include_binary: bool) -> Vec<ReadB
     delivery
 }
 const DESCRIPTION: &str = "Reads files from the local filesystem. Put all files and ranges needed for this step into one call. Provide a non-empty `targets` array of at most 16 items; each target requires an absolute `path` and may specify inclusive 1-indexed `start` and `end`, a `symbol`, or PDF `pages`. If a symbol and range are both given, both are read.\n\
-Text files of at most 600 lines are selected in full; larger files use windows of at least 300 lines, expanded to symbol boundaries where available for Rust, Python, JavaScript and TypeScript. Adjacent or overlapping windows in one call are merged. Each rendered text result has a 16 KiB output budget and lines over 4 KiB are clipped, so selection may be truncated. Text files over 16 MiB require search instead.\n\
+Text files of at most 600 lines are selected in full; larger files use windows of at least 300 lines, expanded to symbol boundaries where available for Rust, Python, JavaScript and TypeScript. Adjacent or overlapping windows in one call are merged. Each rendered text result has a 16 KiB output budget and lines over 4 KiB are clipped. Batch text output is limited to 32 KiB; omitted results are identified for retry. Text files over 16 MiB require search instead.\n\
 Example: targets=[{path:\"/work/view.rs\"},{path:\"/work/draw.rs\",symbol:\"draw_node\"},{path:\"/work/style.rs\",start:1,end:200}].\n\
 Images are returned as visual payloads. PDFs over 10 pages require `pages`; at most 20 pages per target. Files only, not directories.";
 /// Default lines to read when the model does not provide an explicit

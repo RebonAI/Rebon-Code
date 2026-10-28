@@ -1678,6 +1678,18 @@ fn render_inline_pass(
         .context("query terminal size for inline overflow measurement")?;
     let pre_flush_committed_rows = state.inline_runtime.commit_cursor.committed_row_count();
     let viewport_floor = state.inline_runtime.initial_viewport_height.max(1);
+    let pending_prefix = inline_pinned_live_prefix(
+        state.active_prompt.as_ref(),
+        app.rebon_tui.transcript.rows(),
+        pre_flush_committed_rows,
+        app.rebon_tui.overlay.is_empty(),
+        remote_attachment_live_prefix(
+            slot.session()
+                .and_then(|session| session.remote_background_attachment.as_ref()),
+            app.rebon_tui.transcript.rows(),
+        ),
+    )
+    .min(super::task_runtime::inline_shell_live_prefix(app));
     inline_force_drain_overflow(
         app,
         theme,
@@ -1685,6 +1697,7 @@ fn render_inline_pass(
         terminal_area_pre_flush,
         viewport_floor,
         pre_flush_committed_rows,
+        pending_prefix,
         frame_inputs.status.elapsed_ms,
     );
     let pinned_live_prefix = inline_pinned_live_prefix(
@@ -1752,6 +1765,18 @@ fn render_inline_pass(
         .context("draw inline TUI frame")?;
     Ok(())
 }
+fn inline_overflow_after_pending_commits(
+    app: &AppState,
+    theme: &RenderTheme,
+    mut input: render::InlineViewportHeightInput,
+    pending_prefix: usize,
+) -> bool {
+    // The same frame commits these rows before painting; counting them here
+    // needlessly seals an otherwise fitting, still-growing tool group.
+    input.committed_rows = input.committed_rows.max(pending_prefix);
+    render::inline_live_content_overflows_viewport(app, theme, input)
+}
+
 /// Step 1 of the inline overflow resolution: when even a full-height viewport
 /// cannot hold the live tail, push the sealed prefix into real scrollback.
 fn inline_force_drain_overflow(
@@ -1761,6 +1786,7 @@ fn inline_force_drain_overflow(
     terminal_area_pre_flush: ratatui::layout::Size,
     viewport_floor: u16,
     pre_flush_committed_rows: usize,
+    pending_prefix: usize,
     elapsed_ms: u64,
 ) {
     // Do NOT gate this on `current_viewport_height <
@@ -1779,7 +1805,7 @@ fn inline_force_drain_overflow(
     // stands, the full overflow measurement is pure
     // waste — the drain would be skipped anyway.
     if state.stalled_force_drain.should_attempt(app)
-        && render::inline_live_content_overflows_viewport(
+        && inline_overflow_after_pending_commits(
             app,
             theme,
             render::InlineViewportHeightInput {
@@ -1789,6 +1815,7 @@ fn inline_force_drain_overflow(
                 committed_rows: pre_flush_committed_rows,
                 elapsed_ms: elapsed_ms,
             },
+            pending_prefix,
         )
     {
         let transcript_len_before_force_drain = app.rebon_tui.transcript.len();
@@ -3338,6 +3365,112 @@ mod tests {
             false,
             true,
         ));
+    }
+
+    #[test]
+    fn pending_inline_commit_does_not_force_drain_a_fitting_tool_group() {
+        let mut app = AppState::default();
+        app.rebon_tui.transcript =
+            rebon_tui::TranscriptStore::from_rows(vec![pin_user_row_with_text(
+                "prompt",
+                &"long prompt ".repeat(300),
+            )]);
+        for (id, name, kind) in [
+            ("read", "Read", rebon_types::ToolKind::Read),
+            ("search", "Search", rebon_types::ToolKind::Search),
+        ] {
+            app.rebon_tui
+                .overlay
+                .upsert_streaming_tool_use(rebon_tui::StreamingToolUse {
+                    call_id: id.into(),
+                    tool_name: name.into(),
+                    kind,
+                    status: rebon_types::ToolCallStatus::Completed,
+                    title: None,
+                    content: None,
+                    locations: None,
+                    raw_input: None,
+                    raw_output: None,
+                });
+        }
+        app.rebon_tui
+            .overlay
+            .append_streaming_thinking("thinking about the results");
+        let input = render::InlineViewportHeightInput {
+            width: 80,
+            terminal_height: 20,
+            base_height: 4,
+            committed_rows: 0,
+            elapsed_ms: 0,
+        };
+        let theme = RenderTheme::plain();
+        assert!(render::inline_live_content_overflows_viewport(
+            &app, &theme, input
+        ));
+        assert!(!inline_overflow_after_pending_commits(
+            &app, &theme, input, 1
+        ));
+        assert!(inline_overflow_after_pending_commits(
+            &app, &theme, input, 0
+        ));
+        assert!(inline_overflow_after_pending_commits(
+            &app,
+            &theme,
+            render::InlineViewportHeightInput {
+                terminal_height: 1,
+                ..input
+            },
+            1,
+        ));
+
+        if inline_overflow_after_pending_commits(&app, &theme, input, 1) {
+            crate::tui::update::force_drain_overlay_sealed_prefix(&mut app);
+        }
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Inline(4),
+            },
+        )
+        .expect("inline terminal constructs");
+        let mut runtime = InlineRuntimeState::with_initial_viewport_height(4);
+        flush_inline_commits(&mut terminal, &mut app, &theme, &mut runtime, 1)
+            .expect("commit the prompt");
+        assert_eq!(runtime.commit_cursor.committed_row_count(), 1);
+        assert_eq!(app.rebon_tui.overlay.tool_use_count(), 2);
+
+        app.rebon_tui
+            .overlay
+            .upsert_streaming_tool_use(rebon_tui::StreamingToolUse {
+                call_id: "search-2".into(),
+                tool_name: "Search".into(),
+                kind: rebon_types::ToolKind::Search,
+                status: rebon_types::ToolCallStatus::Completed,
+                title: None,
+                content: None,
+                locations: None,
+                raw_input: None,
+                raw_output: None,
+            });
+        let area = ratatui::layout::Rect::new(0, 0, 80, 20);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        rebon_tui::render_transcript_cached_with_running_hints(
+            &app.rebon_tui,
+            area,
+            &mut buf,
+            &theme,
+            usize::MAX,
+            rebon_tui::ToolOutputVerbosity::Compact,
+            0,
+            None,
+            &mut rebon_tui::TranscriptMeasureCache::new(),
+            false,
+            rebon_tui::TranscriptRenderExtras::empty(),
+        );
+        let rendered: String = buf.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(rendered.contains("Searched for 2 patterns"), "{rendered}");
+        assert!(rendered.contains("read 1 file"), "{rendered}");
     }
 
     #[test]
