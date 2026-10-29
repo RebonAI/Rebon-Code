@@ -15,6 +15,7 @@ mod mods_request;
 mod owner_descriptor_gate;
 mod pending_prompt;
 mod permissions_questions;
+mod scheduled_prompt;
 mod supervisor_process_reaper;
 mod task_bridge;
 mod task_bridge_worker;

@@ -89,6 +89,9 @@ pub enum PendingPromptOrigin {
         #[serde(rename = "fromAgent")]
         from_agent: String,
     },
+    /// The session's cron scheduler fired it. The text opens with
+    /// `rebon_tool::cron::SCHEDULED_PROMPT_MARKER`.
+    Scheduled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +145,14 @@ impl PendingPrompt {
     /// `user_prompt`, which the auto-mode classifier reads as user intent.
     pub fn is_agent_message(&self) -> bool {
         matches!(self.origin, Some(PendingPromptOrigin::AgentMessage { .. }))
+    }
+
+    /// Whether a person typed this. Anything with an origin was produced by
+    /// the system (another agent, the scheduler): it runs no
+    /// `UserPromptSubmit` hook, is not offered as user intent, and is not
+    /// shown as a queued user message.
+    pub fn typed_by_user(&self) -> bool {
+        self.origin.is_none()
     }
 }
 

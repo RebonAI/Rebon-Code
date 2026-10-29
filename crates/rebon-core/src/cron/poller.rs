@@ -59,10 +59,19 @@ impl CronPoller {
     /// without tools — would wait for the next user prompt. A front end that
     /// owns the time between turns takes them here and runs them as a turn.
     pub fn take_marked_prompts(&self) -> Vec<String> {
-        let mut queue = self.queue.lock().expect("cron queue poisoned");
-        queue
+        self.take_prompts()
+            .iter()
+            .map(|prompt| rebon_tool::cron::mark_scheduled_prompt(prompt))
+            .collect()
+    }
+
+    /// Drain every waiting prompt as the scheduler stored it, unmarked, for a
+    /// caller that may have to put some back with [`Self::enqueue`].
+    pub fn take_prompts(&self) -> Vec<String> {
+        self.queue
+            .lock()
+            .expect("cron queue poisoned")
             .drain(..)
-            .map(|prompt| rebon_tool::cron::mark_scheduled_prompt(&prompt))
             .collect()
     }
 }

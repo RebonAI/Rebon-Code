@@ -1,7 +1,8 @@
 //! What a worker keeps across the sessions it builds.
 //!
 //! A worker outlives any one of its sessions. The ownership lock, MCP stack,
-//! and kernel session-scope table therefore return to the worker between turns.
+//! kernel session-scope table and cron scheduler therefore return to the
+//! worker between turns.
 
 use std::sync::Arc;
 
@@ -15,6 +16,35 @@ pub struct HandedBack {
     pub session_lock: Option<rebon_session::HeldSessionLock>,
     pub mcp: Option<crate::mcp::SessionMcp>,
     pub kernel_scopes: Option<HeldKernelScopes>,
+    pub cron: Option<HeldCron>,
+}
+
+/// A session's cron scheduler and the queue it fires into, kept between the
+/// sessions a worker builds for one conversation.
+///
+/// A scheduler built with each turn's session died with it: nothing fired
+/// between turns, and a prompt still queued when the turn ended was dropped.
+/// Kept here, it runs for as long as the worker does, holding the cwd's
+/// owner lock, and the worker delivers what it fires while idle.
+pub struct HeldCron {
+    pub session_id: String,
+    pub cwd: String,
+    pub poller: Arc<rebon_core::cron::CronPoller>,
+    pub session_store: Arc<rebon_tool::SessionCronStore>,
+    pub scheduler: rebon_core::cron::SchedulerHandle,
+}
+
+impl HeldCron {
+    /// Lend the scheduler only to the same session in the same directory; a
+    /// mismatch drops it, which stops it and releases the lock.
+    pub(crate) fn take_for(
+        held: Option<Self>,
+        session_id: Option<&str>,
+        cwd: &str,
+    ) -> Option<Self> {
+        let held = held?;
+        (session_id == Some(held.session_id.as_str()) && held.cwd == cwd).then_some(held)
+    }
 }
 
 /// A bounded kernel scope table retained for one exact session.
@@ -55,6 +85,25 @@ mod tests {
                 rebon_harness::projects_root(),
             ),
         }
+    }
+
+    #[tokio::test]
+    async fn held_cron_is_lent_only_to_its_own_session_and_directory() {
+        let held = |session_id: &str| HeldCron {
+            session_id: session_id.to_string(),
+            cwd: "/work".to_string(),
+            poller: rebon_core::cron::CronPoller::new(),
+            session_store: rebon_tool::SessionCronStore::new(),
+            scheduler: rebon_core::cron::start_scheduler(
+                rebon_core::cron::SchedulerConfig::new(std::env::temp_dir()),
+                rebon_core::cron::CronPoller::new(),
+            ),
+        };
+        assert!(HeldCron::take_for(Some(held("s1")), Some("s1"), "/work").is_some());
+        assert!(HeldCron::take_for(Some(held("s1")), Some("s2"), "/work").is_none());
+        assert!(HeldCron::take_for(Some(held("s1")), Some("s1"), "/elsewhere").is_none());
+        assert!(HeldCron::take_for(Some(held("s1")), None, "/work").is_none());
+        assert!(HeldCron::take_for(None, Some("s1"), "/work").is_none());
     }
 
     #[test]

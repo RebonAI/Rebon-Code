@@ -1839,7 +1839,8 @@ async fn execute_background_job_inner(
     // has no UserPromptSubmit to run. The hook exists to let a person's input
     // be annotated or refused; both applied to a teammate message would make
     // the hook speak for a user who typed nothing.
-    let worktree = if claimed_pending_prompt(state).is_some_and(PendingPrompt::is_agent_message) {
+    // Nor is a prompt the cron scheduler fired.
+    let worktree = if claimed_pending_prompt(state).is_some_and(|prompt| !prompt.typed_by_user()) {
         worktree
     } else {
         match run_user_prompt_submit_hook(
@@ -1998,6 +1999,17 @@ async fn release_session_keeping_lock(
         session_id: session.session_id.clone(),
         scopes: Arc::clone(&session.engine_half.kernel_scopes),
     });
+    // Keep the scheduler running, and its queue, for the next session and
+    // for the idle time before it.
+    if let Some(scheduler) = session.engine_half.cron_scheduler.take() {
+        handed_back.cron = Some(crate::session_handoff::HeldCron {
+            session_id: session.session_id.clone(),
+            cwd: session.cwd.clone(),
+            poller: Arc::clone(&session.engine_half.cron_poller),
+            session_store: Arc::clone(&session.engine_half.session_cron_store),
+            scheduler,
+        });
+    }
 }
 
 pub(crate) async fn refresh_agent_view_completion_summary(
@@ -2227,6 +2239,7 @@ async fn wait_for_first_prompt_on_warm_session(
         if let Some(first) = ipc.try_recv_command() {
             run_idle_background_commands(store, state, ipc, session, first).await;
         }
+        queue_idle_cron_fires(store, job_id, &session.engine_half.cron_poller);
         let current = store.read_state(job_id)?;
         if !owner.matches(&current) {
             tracing::info!(
@@ -2305,6 +2318,39 @@ async fn wait_for_first_prompt_on_warm_session(
     }
 }
 
+/// Queue what the session's cron fired while no turn was running, as scheduled
+/// prompts the idle loop then claims like any other pending prompt.
+///
+/// A running turn drains the same queue itself, after a tool round; this is
+/// for the time between turns, when nothing else would. A prompt that cannot
+/// be written goes back in the queue for the next pass.
+pub(crate) fn queue_idle_cron_fires(
+    store: &BackgroundStore,
+    job_id: &str,
+    cron: &rebon_core::cron::CronPoller,
+) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut prompts = cron.take_prompts().into_iter();
+    while let Some(prompt) = prompts.next() {
+        let id = format!(
+            "u-internal-scheduled-{}-{}",
+            now_ms(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let text = rebon_tool::cron::mark_scheduled_prompt(&prompt);
+        if let Err(error) =
+            rebon_session_host::append_background_scheduled_prompt(store, job_id, id, text)
+        {
+            tracing::warn!(%job_id, %error, "rebon: could not queue a cron fire; retrying");
+            cron.enqueue(prompt);
+            for rest in prompts {
+                cron.enqueue(rest);
+            }
+            return;
+        }
+    }
+}
+
 pub(crate) async fn wait_for_terminal_worker_reuse(
     store: &BackgroundStore,
     job_id: &str,
@@ -2316,6 +2362,9 @@ pub(crate) async fn wait_for_terminal_worker_reuse(
         // A tick, or sooner: a reply that came in over IPC rings `wake`, and
         // a prompt sent to a parked worker should not wait out the tick.
         let _ = tokio::time::timeout(Duration::from_secs(1), ipc.wake.notified()).await;
+        if let Some(cron) = handed_back.cron.as_ref() {
+            queue_idle_cron_fires(store, job_id, &cron.poller);
+        }
         let state = store.read_state(job_id)?;
         process_idle_background_commands(store, &state, ipc, handed_back).await;
         publish_held_mcp_status(store, &state, ipc, &mut handed_back.mcp).await;
