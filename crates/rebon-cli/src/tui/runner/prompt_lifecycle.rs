@@ -570,6 +570,19 @@ fn maybe_spawn_next_queued_prompt_in_main_view(
 ) {
     reconcile_mid_turn_consumed_queued_submits(app);
 
+    // Nothing leaves its queue unless a turn can start: a payload taken off
+    // first and then refused admission was gone, transcript row and all.
+    let has_next = !app.deferred_goal_submit_payloads.is_empty()
+        || !app.deferred_internal_submit_payloads.is_empty()
+        || (!app.queued_auto_drain_paused_after_withdrawal && !app.queued_commands.is_empty());
+    if !has_next {
+        return;
+    }
+    if let Some(reason) = local_turn_rejection(app, session, active_prompt.as_ref()) {
+        report_local_turn_rejection(app, &reason);
+        return;
+    }
+
     if !app.deferred_goal_submit_payloads.is_empty() {
         let mut submit = app.deferred_goal_submit_payloads.remove(0);
         prepare_for_new_prompt_after_withdrawal(app, &mut session.engine_half.update_rx);
@@ -921,6 +934,12 @@ pub(super) fn admit_idle_context_prompt(
     handle: &Handle,
     active_prompt: Option<&ActivePrompt>,
 ) -> Option<ActivePrompt> {
+    // The idle pass asks again every time round while context is pending,
+    // so a refusal stays quiet here: reporting it added an error row to the
+    // transcript on every pass for as long as the session could not run it.
+    if local_turn_rejection(app, session, active_prompt).is_some() {
+        return None;
+    }
     match admit_local_turn(
         app,
         session,
@@ -2808,6 +2827,95 @@ mod tests {
         assert!(prompt_text.contains(&format!("<output-file>{output_file}</output-file>")));
 
         drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    fn attach_to_remote_worker(session: &mut TuiEngineSession) {
+        session.remote_background_attachment =
+            Some(crate::background::RemoteBackgroundAttachment::new(
+                "bg-remote".into(),
+                session.session_id.clone(),
+                "/remote".into(),
+                crate::background::BackgroundJobStatus::Running,
+                0,
+                crate::background::BackgroundIpcEndpoint {
+                    pid: 1,
+                    port: 1,
+                    token: "token".into(),
+                },
+            ));
+    }
+
+    fn system_error_rows(app: &AppState) -> usize {
+        app.rebon_tui
+            .transcript
+            .rows()
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row,
+                    rebon_tui::Message::System(system)
+                        if system.level == Some(rebon_tui::SystemLevel::Error)
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn refused_idle_context_stays_pending_without_an_error_row() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        attach_to_remote_worker(&mut session);
+        app.pending_teammate_prompts
+            .push("<teammate-message>hi</teammate-message>".into());
+
+        for _ in 0..3 {
+            assert!(admit_idle_context_prompt(&mut app, &session, &handle, None).is_none());
+        }
+        runtime.block_on(tokio::task::yield_now());
+
+        assert_eq!(system_error_rows(&app), 0);
+        assert_eq!(app.pending_teammate_prompts.len(), 1);
+        assert!(recorder.take_requests().is_empty());
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn refused_follow_up_keeps_the_queued_prompt() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        crate::tui::dispatch::enqueue_submit_payload_in_mode(
+            &mut app,
+            admission_test_submit("run after"),
+            "prompt".into(),
+        );
+        app.deferred_internal_submit_payloads
+            .push(admission_test_submit("internal follow-up"));
+        attach_to_remote_worker(&mut session);
+        let rows_before = app.rebon_tui.transcript.rows().len();
+        let mut active_prompt = None;
+
+        maybe_spawn_next_queued_prompt_in_main_view(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active_prompt,
+        );
+        runtime.block_on(tokio::task::yield_now());
+
+        assert!(active_prompt.is_none());
+        assert_eq!(app.queued_commands.len(), 1);
+        assert_eq!(app.deferred_internal_submit_payloads.len(), 1);
+        // The refusal is reported once, and nothing else reached the transcript.
+        assert_eq!(system_error_rows(&app), 1);
+        assert_eq!(app.rebon_tui.transcript.rows().len(), rows_before + 1);
+        assert!(recorder.take_requests().is_empty());
         runtime.shutdown_background();
     }
 
