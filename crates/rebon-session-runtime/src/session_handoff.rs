@@ -17,6 +17,26 @@ pub struct HandedBack {
     pub mcp: Option<crate::mcp::SessionMcp>,
     pub kernel_scopes: Option<HeldKernelScopes>,
     pub cron: Option<HeldCron>,
+    pub session_loop: Option<HeldSessionLoop>,
+}
+
+/// The session loop a worker's turns run through, kept across the sessions it
+/// builds for one conversation so the loop, and what waits in its inbox,
+/// outlive any single turn's session.
+pub struct HeldSessionLoop {
+    pub session_id: String,
+    pub session_loop: crate::session_loop::SessionLoop,
+}
+
+impl HeldSessionLoop {
+    /// Lend the loop only to the session it belongs to.
+    pub(crate) fn take_for(
+        held: Option<Self>,
+        session_id: &str,
+    ) -> Option<crate::session_loop::SessionLoop> {
+        held.filter(|held| held.session_id == session_id)
+            .map(|held| held.session_loop)
+    }
 }
 
 /// A session's cron scheduler and the queue it fires into, kept between the

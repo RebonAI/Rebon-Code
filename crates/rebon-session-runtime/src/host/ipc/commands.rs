@@ -280,13 +280,14 @@ pub(crate) async fn execute_background_permission_replay(
         replay_requests,
         skill_invocations: Vec::new(),
     };
-    session
-        .engine_half
-        .executor
-        .execute(request)
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    crate::host::worker::execution::run_through_session_loop(
+        session,
+        request,
+        crate::session_loop::TurnOrigin::PermissionReplay,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 pub(crate) fn queue_live_background_reply(

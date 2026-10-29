@@ -14,7 +14,7 @@ use crate::runtime::{
     DeferredEngineCore, DeferredEnginePromptExecutor, EngineCoreInputs, SessionEngineHalf,
     SessionRuntime, SessionRuntimeFactory,
 };
-use crate::session_handoff::{HandedBack, HeldCron, HeldKernelScopes};
+use crate::session_handoff::{HandedBack, HeldCron, HeldKernelScopes, HeldSessionLoop};
 use crate::startup::SessionStartupParams;
 use rebon_acp::{DefaultHandler, ServerState};
 use rebon_acp_client::{AcpAgentBackend, TranscriptJournal, TranscriptSink};
@@ -1944,6 +1944,8 @@ pub async fn build_session_with_runtime_controller(
     mut handed_back: HandedBack,
 ) -> anyhow::Result<SessionBuild> {
     let startup_started = std::time::Instant::now();
+    // Installed on the finished session below, if it is the same one.
+    let held_session_loop = handed_back.session_loop.take();
     tracing::info!("rebon startup: tui wiring started");
     let (wiring, runtime_resolved) = resolve_session_wiring(&overrides, startup_started).await?;
     let startup_cwd_str = wiring.startup_cwd.to_string_lossy().to_string();
@@ -2221,7 +2223,11 @@ pub async fn build_session_with_runtime_controller(
         additional_attachment_poller,
         overrides_startup_notices,
     })?;
-    finish_session_build(records)
+    let mut build = finish_session_build(records)?;
+    if let Some(held) = HeldSessionLoop::take_for(held_session_loop, &build.session.session_id) {
+        build.session.engine_half.session_loop = held;
+    }
+    Ok(build)
 }
 
 pub fn system_prompt_config_for_engine(

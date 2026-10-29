@@ -872,18 +872,63 @@ pub(crate) fn spawn_background_update_pump(
     BackgroundUpdatePump { stop, task }
 }
 
+/// Hand a turn to the session's loop, and return its result as the turn's.
+pub(crate) fn run_through_session_loop(
+    session: &crate::EngineSession,
+    request: rebon_agent_core::PromptRequest,
+    origin: crate::session_loop::TurnOrigin,
+) -> impl std::future::Future<
+    Output = Result<rebon_agent_core::PromptOutcome, rebon_agent_core::PromptExecutorError>,
+> {
+    let result = session.engine_half.session_loop.submit_turn(
+        &tokio::runtime::Handle::current(),
+        crate::session_loop::TurnInput {
+            runtime: Arc::clone(&session.engine_half.runtime),
+            request,
+            origin,
+            deliveries: Default::default(),
+        },
+    );
+    async move {
+        result.await.unwrap_or_else(|_| {
+            Err(rebon_agent_core::PromptExecutorError::Execution(
+                "the session loop ended before the turn reported a result".into(),
+            ))
+        })
+    }
+}
+
+/// What produced the turn a worker is about to run: the prompt it claimed.
+fn worker_turn_origin(state: &BackgroundJobState) -> crate::session_loop::TurnOrigin {
+    use crate::session_loop::TurnOrigin;
+    match claimed_pending_prompt(state) {
+        Some(prompt) => match &prompt.origin {
+            Some(rebon_session_host::PendingPromptOrigin::AgentMessage { .. }) => {
+                TurnOrigin::IdleContext
+            }
+            Some(rebon_session_host::PendingPromptOrigin::Scheduled) => TurnOrigin::Scheduled,
+            None if prompt.id.starts_with("u-internal-task-notification-") => {
+                TurnOrigin::TaskNotification
+            }
+            None => TurnOrigin::User,
+        },
+        None => TurnOrigin::User,
+    }
+}
+
 /// Own the execution/completion boundary: steering must stop claiming queue
 /// entries and updates must drain before the exact outcome reaches callers.
 pub(crate) async fn execute_claimed_prompt(
     store: &BackgroundStore,
     state: &BackgroundJobState,
     ipc: &BackgroundIpcServer,
-    executor: &dyn rebon_agent_core::PromptExecutor,
-    request: rebon_agent_core::PromptRequest,
+    turn: impl std::future::Future<
+        Output = Result<rebon_agent_core::PromptOutcome, rebon_agent_core::PromptExecutorError>,
+    >,
     steer_pump: Option<BackgroundSteerPumpHandle>,
     update_pump: Option<BackgroundUpdatePump>,
 ) -> Result<rebon_agent_core::PromptOutcome, rebon_agent_core::PromptExecutorError> {
-    let mut execution = executor.execute(request).await;
+    let mut execution = turn.await;
     if let Some(steer_pump) = steer_pump {
         steer_pump.stop().await;
     }
@@ -937,7 +982,6 @@ async fn run_background_turn(
             session.session_id.clone(),
         )
     });
-    let executor = Arc::clone(&session.engine_half.executor);
     // The turn lists its tools once, as it starts, so the servers have to be
     // up by then or the model runs this turn without them. Only the worker's
     // first turn pays this wait: the stack is kept across turns, so every
@@ -952,12 +996,12 @@ async fn run_background_turn(
     // effort this turn runs under, above all, which the top of the turn may
     // just have re-read from a `/model` another client sent.
     ipc.publish_status_now(store, &state.identity.job_id);
+    let turn = run_through_session_loop(session, request, worker_turn_origin(state));
     let mut execution_future = Box::pin(execute_claimed_prompt(
         store,
         state,
         ipc,
-        executor.as_ref(),
-        request,
+        turn,
         steer_pump,
         Some(update_pump),
     ));
@@ -2001,6 +2045,10 @@ async fn release_session_keeping_lock(
     });
     // Keep the scheduler running, and its queue, for the next session and
     // for the idle time before it.
+    handed_back.session_loop = Some(crate::session_handoff::HeldSessionLoop {
+        session_id: session.session_id.clone(),
+        session_loop: std::mem::take(&mut session.engine_half.session_loop),
+    });
     if let Some(scheduler) = session.engine_half.cron_scheduler.take() {
         handed_back.cron = Some(crate::session_handoff::HeldCron {
             session_id: session.session_id.clone(),

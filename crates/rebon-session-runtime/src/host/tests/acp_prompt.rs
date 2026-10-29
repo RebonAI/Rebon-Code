@@ -179,8 +179,7 @@ fn start_execution_with_updates(
                     &worker_store,
                     &worker_state,
                     &worker_ipc,
-                    &executor,
-                    request,
+                    executor.execute(request),
                     None,
                     Some(update_pump),
                 )
