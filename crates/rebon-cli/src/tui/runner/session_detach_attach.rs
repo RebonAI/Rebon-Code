@@ -2890,9 +2890,17 @@ mod tests {
 
         session.start_cron_scheduler();
         assert!(session.engine_half.cron_scheduler.is_some());
+        // Probing the lock takes it for a moment, and a scheduler that finds
+        // it taken waits a full probe interval before trying again. So wait
+        // for the scheduler to say it holds the lock, then probe once.
         wait_until("the session's scheduler to take the cwd's lock", || {
-            !lock_is_free()
+            session
+                .engine_half
+                .cron_scheduler
+                .as_ref()
+                .is_some_and(|scheduler| scheduler.owns_lock())
         });
+        assert!(!lock_is_free());
         // Twice is once: a second start does not stack a second scheduler.
         session.start_cron_scheduler();
 
