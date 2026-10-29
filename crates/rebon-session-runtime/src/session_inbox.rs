@@ -47,6 +47,25 @@ impl PendingContext {
     }
 }
 
+/// A kind of input that can start a turn while the session is idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyInput {
+    /// Channel, teammate or agent context is waiting.
+    Context,
+    /// Background tasks may have notifications to deliver.
+    TaskNotifications,
+    /// Cron tasks fired with no turn to drain them.
+    Scheduled,
+}
+
+/// The order idle inputs are offered in: what other parties sent this
+/// session, then what its own background work reported, then the clock.
+const IDLE_PRIORITY: [ReadyInput; 3] = [
+    ReadyInput::Context,
+    ReadyInput::TaskNotifications,
+    ReadyInput::Scheduled,
+];
+
 /// When background-task notifications are next worth looking for.
 ///
 /// Looking means asking the task registry what is unnotified, so it happens
@@ -166,6 +185,23 @@ impl SessionInbox {
         self.task_notifications().retry_after = Some(Instant::now() + TASK_NOTIFICATION_RETRY);
     }
 
+    /// The inputs ready to start a turn, in [`IDLE_PRIORITY`] order.
+    ///
+    /// Lazy: each input is checked only when the iterator reaches it, so a
+    /// caller that stops at the first turn it starts leaves the rest alone.
+    /// Reaching [`ReadyInput::TaskNotifications`] uses up the reason to look
+    /// for them (see [`Self::take_task_notification_look`]).
+    pub fn ready_inputs<'a>(
+        &'a self,
+        cron: &'a rebon_core::cron::CronPoller,
+    ) -> impl Iterator<Item = ReadyInput> + 'a {
+        IDLE_PRIORITY.into_iter().filter(move |input| match input {
+            ReadyInput::Context => self.has_context(),
+            ReadyInput::TaskNotifications => self.take_task_notification_look(),
+            ReadyInput::Scheduled => cron.has_pending(),
+        })
+    }
+
     /// Whether a failed delivery is waiting out its retry.
     pub fn task_notification_retry_pending(&self) -> bool {
         self.task_notifications().retry_after.is_some()
@@ -224,6 +260,37 @@ mod tests {
 
         inbox.observe_task_notifications(revision_rx.clone(), true);
         assert!(inbox.take_task_notification_look());
+    }
+
+    #[test]
+    fn ready_inputs_come_in_priority_order_and_only_when_reached() {
+        let inbox = SessionInbox::default();
+        let cron = rebon_core::cron::CronPoller::default();
+        assert!(inbox.take_task_notification_look());
+        assert_eq!(inbox.ready_inputs(&cron).count(), 0);
+
+        cron.enqueue("check the build".into());
+        inbox.push_context(ContextSource::Teammate, ["hi".to_string()]);
+        inbox.retry_task_notifications_later();
+        inbox.task_notifications_settled();
+        let (_revision_tx, revision_rx) = tokio::sync::watch::channel(0u64);
+        inbox.observe_task_notifications(revision_rx, false);
+
+        // Stopping at the first leaves the task-notification look unspent.
+        assert_eq!(inbox.ready_inputs(&cron).next(), Some(ReadyInput::Context));
+        assert_eq!(
+            inbox.ready_inputs(&cron).collect::<Vec<_>>(),
+            [
+                ReadyInput::Context,
+                ReadyInput::TaskNotifications,
+                ReadyInput::Scheduled
+            ]
+        );
+        // That pass spent it.
+        assert_eq!(
+            inbox.ready_inputs(&cron).collect::<Vec<_>>(),
+            [ReadyInput::Context, ReadyInput::Scheduled]
+        );
     }
 
     #[test]

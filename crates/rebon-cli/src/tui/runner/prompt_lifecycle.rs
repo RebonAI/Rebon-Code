@@ -19,6 +19,7 @@ use rebon_types::{
     TextContent, ToolCallContent, ToolCallStatus,
 };
 
+use crate::session::session_inbox::ReadyInput;
 use crate::session::submit_payload::{ensure_internal_submit_payload_user_uuid, SubmitPayload};
 use crate::session::ultraplan_run::UltraplanPhase;
 use crate::tui::app::{AppState, PromptCompletionStatus};
@@ -601,7 +602,7 @@ fn maybe_spawn_next_queued_prompt_in_main_view(
     }
 }
 
-pub(super) fn maybe_spawn_task_notification_prompt(
+fn maybe_spawn_task_notification_prompt(
     app: &mut AppState,
     session: &TuiEngineSession,
     handle: &Handle,
@@ -691,13 +692,62 @@ pub(super) fn maybe_spawn_task_notification_prompt(
     spawned
 }
 
+/// Start a turn from what the session's inbox has ready, trying each ready
+/// input in the inbox's priority order until one starts.
+pub(super) fn maybe_spawn_ready_idle_turn(
+    app: &mut AppState,
+    session: &TuiEngineSession,
+    handle: &Handle,
+    active_prompt: &mut Option<ActivePrompt>,
+) {
+    let inbox = session.engine_half.session_loop.inbox();
+    for input in inbox.ready_inputs(&session.engine_half.cron_poller) {
+        let started = match input {
+            ReadyInput::Context => {
+                match admit_idle_context_prompt(app, session, handle, active_prompt.as_ref()) {
+                    Some(admitted) => {
+                        *active_prompt = Some(admitted);
+                        app.is_loading = true;
+                        true
+                    }
+                    None => false,
+                }
+            }
+            ReadyInput::TaskNotifications => {
+                let started =
+                    maybe_spawn_task_notification_prompt(app, session, handle, active_prompt);
+                let undelivered = !session
+                    .engine_half
+                    .task_notification_poller
+                    .unnotified_notifications_for_session(&session.session_id)
+                    .is_empty()
+                    || !session
+                        .engine_half
+                        .tasks
+                        .unnotified_question_escalation_notifications()
+                        .is_empty();
+                if !started && undelivered {
+                    inbox.retry_task_notifications_later();
+                }
+                started
+            }
+            ReadyInput::Scheduled => {
+                maybe_spawn_scheduled_prompt(app, session, handle, active_prompt)
+            }
+        };
+        if started {
+            return;
+        }
+    }
+}
+
 /// Run the cron prompts that fired while no turn was there to drain them.
 ///
 /// The engine hands a fired task to the model only after a tool round, so
 /// a task that fires while the session is idle, or during a turn the model
 /// answers without tools, would otherwise sit until the user types again.
 /// Returns whether a turn started.
-pub(super) fn maybe_spawn_scheduled_prompt(
+fn maybe_spawn_scheduled_prompt(
     app: &mut AppState,
     session: &TuiEngineSession,
     handle: &Handle,
@@ -867,7 +917,7 @@ pub(super) fn admit_permission_replay_turn(
     }
 }
 
-pub(super) fn admit_idle_context_prompt(
+fn admit_idle_context_prompt(
     app: &mut AppState,
     session: &TuiEngineSession,
     handle: &Handle,
@@ -2862,6 +2912,70 @@ mod tests {
         // The refusal is reported once, and nothing else reached the transcript.
         assert_eq!(system_error_rows(&app), 1);
         assert_eq!(app.rebon_tui.transcript.rows().len(), rows_before + 1);
+        assert!(recorder.take_requests().is_empty());
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn idle_inputs_start_one_turn_in_priority_order() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        session
+            .engine_half
+            .cron_poller
+            .enqueue("check the build".into());
+        session.engine_half.session_loop.inbox().push_context(
+            crate::session::session_inbox::ContextSource::Teammate,
+            ["<teammate-message>hi</teammate-message>".to_string()],
+        );
+        let mut active_prompt = None;
+
+        maybe_spawn_ready_idle_turn(&mut app, &session, &handle, &mut active_prompt);
+        runtime.block_on(tokio::task::yield_now());
+
+        let active = active_prompt.as_ref().expect("an idle turn started");
+        assert_eq!(active.source, LocalTurnSource::IdleContext);
+        assert!(!session.engine_half.session_loop.inbox().has_context());
+        assert!(
+            session.engine_half.cron_poller.has_pending(),
+            "the cron fire waits for the next idle pass"
+        );
+        assert_eq!(recorder.take_requests().len(), 1);
+
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn idle_inputs_wait_quietly_while_no_turn_can_start() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        attach_to_remote_worker(&mut session);
+        session
+            .engine_half
+            .cron_poller
+            .enqueue("check the build".into());
+        session.engine_half.session_loop.inbox().push_context(
+            crate::session::session_inbox::ContextSource::Channel,
+            ["<channel>ping</channel>".to_string()],
+        );
+        let mut active_prompt = None;
+
+        for _ in 0..3 {
+            maybe_spawn_ready_idle_turn(&mut app, &session, &handle, &mut active_prompt);
+        }
+        runtime.block_on(tokio::task::yield_now());
+
+        assert!(active_prompt.is_none());
+        assert_eq!(system_error_rows(&app), 0);
+        assert!(session.engine_half.session_loop.inbox().has_context());
+        assert!(session.engine_half.cron_poller.has_pending());
         assert!(recorder.take_requests().is_empty());
         runtime.shutdown_background();
     }

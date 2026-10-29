@@ -76,8 +76,7 @@ use super::paste_echo::{
 };
 use super::permission_flow::{maybe_handle_permission_key, sync_permission_view};
 use super::prompt_lifecycle::{
-    admit_idle_context_prompt, drain_ui_channels, maybe_spawn_scheduled_prompt,
-    maybe_spawn_task_notification_prompt, maybe_update_loading_state,
+    drain_ui_channels, maybe_spawn_ready_idle_turn, maybe_update_loading_state,
 };
 use super::remote_background_attachment::refresh_remote_background_attachment;
 use super::render::{self, drain_file_list, render_frame};
@@ -1027,62 +1026,14 @@ fn session_pipeline(
             );
         }
 
-        // Auto-trigger: when teammate messages arrived and the leader
-        // is idle (no active prompt, no queued commands), auto-submit
-        // the pending teammate messages as a new model turn.
-        if app.resume_dialog.is_none()
-            && session.engine_half.session_loop.inbox().has_context()
-            && state.active_prompt.is_none()
-            && app.queued_commands.is_empty()
-        {
-            if let Some(admitted) =
-                admit_idle_context_prompt(app, session, handle, state.active_prompt.as_ref())
-            {
-                state.active_prompt = Some(admitted);
-                app.is_loading = true;
-            }
-        }
-
-        // Auto-trigger: background tasks report terminal results via
-        // task-notification XML. Feed those notifications back into the
-        // coordinator as a fresh turn once the UI is idle.
-        if app.resume_dialog.is_none()
-            && state.active_prompt.is_none()
-            && app.queued_commands.is_empty()
-            && session
-                .engine_half
-                .session_loop
-                .inbox()
-                .take_task_notification_look()
-        {
-            if !maybe_spawn_task_notification_prompt(app, session, handle, &mut state.active_prompt)
-                && (!session
-                    .engine_half
-                    .task_notification_poller
-                    .unnotified_notifications_for_session(&session.session_id)
-                    .is_empty()
-                    || !session
-                        .engine_half
-                        .tasks
-                        .unnotified_question_escalation_notifications()
-                        .is_empty())
-            {
-                session
-                    .engine_half
-                    .session_loop
-                    .inbox()
-                    .retry_task_notifications_later();
-            }
-        }
-
-        // Auto-trigger: cron tasks that fired while nothing was running.
-        // The engine drains them only after a tool round, so without this
-        // they would wait for the user's next prompt.
+        // Auto-trigger: start a turn from whatever waits in the session's
+        // inbox — context other parties sent, background-task notifications,
+        // cron fires — once nothing else claims the session.
         if app.resume_dialog.is_none()
             && state.active_prompt.is_none()
             && app.queued_commands.is_empty()
         {
-            maybe_spawn_scheduled_prompt(app, session, handle, &mut state.active_prompt);
+            maybe_spawn_ready_idle_turn(app, session, handle, &mut state.active_prompt);
         }
 
         let skill_count = session.engine_half.skill_registry.user_invocable_count();
