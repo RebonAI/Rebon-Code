@@ -39,8 +39,8 @@ use super::ultraplan::{
 };
 use super::{
     commit_goal_continuation_feedback, drain_main_agent_updates, drain_model_context_prompts,
-    maybe_prepare_goal_continuation, reconcile_mid_turn_consumed_queued_submits,
-    repin_transcript_to_bottom, sync_follow_tail_after_updates, sync_foreground_agent_view,
+    finish_goal_check, reconcile_mid_turn_consumed_queued_submits, repin_transcript_to_bottom,
+    start_goal_check, sync_follow_tail_after_updates, sync_foreground_agent_view,
     with_main_agent_view, ActivePrompt, LocalTurnSource, PromptResultRx, WithdrawDestination,
     WithdrawableSubmit,
 };
@@ -103,6 +103,11 @@ pub(super) fn maybe_update_loading_state(
                     // as orphaned overlay text.
                     app.rebon_tui.overlay.clear();
                 });
+            }
+            if active_prompt.is_none()
+                && finish_pending_goal_check(app, session, handle, active_prompt)
+            {
+                return;
             }
             if active_prompt.is_none()
                 && !turn_runs_elsewhere
@@ -217,15 +222,15 @@ pub(super) fn maybe_update_loading_state(
     if restore_foreground_agent_after_main_finalize {
         sync_foreground_agent_view(app, session.engine_half.tasks.as_ref());
     }
-    let goal_action = if !failed && !restore_foreground_agent_after_main_finalize {
-        completed_stop_reason.map(|reason| {
-            maybe_prepare_goal_continuation(app, session, handle, Some(format!("{reason:?}")))
-        })
-    } else {
-        None
-    };
-    if let Some(action) = goal_action.as_ref() {
-        commit_goal_continuation_feedback(app, action);
+    let goal_check_started = !failed
+        && !restore_foreground_agent_after_main_finalize
+        && completed_stop_reason.is_some_and(|reason| {
+            start_goal_check(app, session, handle, Some(format!("{reason:?}")))
+        });
+    // Whatever runs next waits for the goal check, which may move the goal on
+    // to a fresh session; `finish_pending_goal_check` picks it up from there.
+    if goal_check_started {
+        return;
     }
     maybe_spawn_next_queued_prompt(app, session, handle, active_prompt);
     if active_prompt.is_some() {
@@ -665,6 +670,26 @@ fn maybe_spawn_task_notification_prompt(
         }
     });
     spawned
+}
+
+/// Apply a goal check that has finished, then start whatever was waiting on
+/// it: the goal's next session, or the queued prompts. Returns whether a
+/// check finished.
+fn finish_pending_goal_check(
+    app: &mut AppState,
+    session: &mut TuiEngineSession,
+    handle: &Handle,
+    active_prompt: &mut Option<ActivePrompt>,
+) -> bool {
+    let Some(action) = finish_goal_check(app, session, handle) else {
+        return false;
+    };
+    commit_goal_continuation_feedback(app, &action);
+    maybe_spawn_next_queued_prompt(app, session, handle, active_prompt);
+    if active_prompt.is_some() {
+        app.prompt_completion_status = None;
+    }
+    true
 }
 
 /// Start a turn from what the session's inbox has ready, trying each ready
@@ -1149,6 +1174,11 @@ pub(super) fn local_turn_rejection(
 ) -> Option<String> {
     if active_prompt.is_some() {
         return Some("Cannot start another local turn while a prompt is running.".to_string());
+    }
+    if app.goal_check.is_pending() {
+        return Some(
+            "The goal is still being checked; the next turn starts when that finishes.".to_string(),
+        );
     }
     if let Some(remote) = session.remote_background_attachment.as_ref() {
         return Some(if remote.is_live() {
@@ -2987,6 +3017,57 @@ mod tests {
         assert_eq!(system_error_rows(&app), 1);
         assert_eq!(app.rebon_tui.transcript.rows().len(), rows_before + 1);
         assert!(recorder.take_requests().is_empty());
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn work_sent_during_a_goal_check_waits_for_it() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        let finish = app.goal_check.start_for_test();
+        session
+            .engine_half
+            .cron_poller
+            .enqueue("check the build".into());
+        let mut active_prompt = None;
+
+        // Neither a cron fire nor a typed prompt starts while it runs.
+        maybe_spawn_ready_idle_turn(&mut app, &session, &handle, &mut active_prompt);
+        assert!(active_prompt.is_none());
+        assert_eq!(system_error_rows(&app), 0);
+        assert!(!super::super::submit::submit_or_queue(
+            &mut app,
+            "typed meanwhile".into(),
+            &mut session,
+            &handle,
+            &mut active_prompt,
+            &mut None,
+            crate::ui_config::UiMode::Screen,
+        ));
+        assert!(active_prompt.is_none());
+        assert_eq!(app.queued_commands.len(), 1);
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active_prompt);
+        assert!(active_prompt.is_none(), "still checking");
+
+        finish
+            .send(Ok(
+                super::super::goal_continuation::GoalContinuationAction::None,
+            ))
+            .unwrap();
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active_prompt);
+        runtime.block_on(tokio::task::yield_now());
+
+        assert!(!app.goal_check.is_pending());
+        let active = active_prompt
+            .as_ref()
+            .expect("the queued prompt runs once it is done");
+        assert_eq!(active.source, LocalTurnSource::QueuedFollowUp);
+        assert!(app.queued_commands.is_empty());
+        assert_eq!(recorder.take_requests().len(), 1);
+        drop(active_prompt.take());
         runtime.shutdown_background();
     }
 

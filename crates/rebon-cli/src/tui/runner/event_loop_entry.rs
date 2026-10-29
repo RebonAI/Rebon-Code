@@ -1210,7 +1210,9 @@ fn derive_frame_inputs<'slot>(
         .or(hosted_turn_started_at)
         .map(|started_at| started_at.elapsed().as_millis() as u64)
         .unwrap_or(0);
-    let is_loading = state.active_prompt.is_some() || hosted_turn_started_at.is_some();
+    let is_loading = state.active_prompt.is_some()
+        || hosted_turn_started_at.is_some()
+        || app.goal_check.is_pending();
     app.is_loading = is_loading;
     // Pick a new random spinner verb on each loading transition.
     if is_loading && !app.was_loading {
