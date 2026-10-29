@@ -694,7 +694,9 @@ async fn finish_background_turn(
         CommandDrainPhase::AfterTurn,
     ));
     if !replay_requests.is_empty() {
-        if let Err(error) = execute_background_permission_replay(session, replay_requests).await {
+        if let Err(error) =
+            execute_background_permission_replay(session, state, replay_requests).await
+        {
             tracing::warn!(
                 job_id = %state.identity.job_id,
                 %error,
@@ -2239,7 +2241,9 @@ async fn run_idle_background_commands(
         CommandDrainPhase::Idle,
     ));
     if !replay_requests.is_empty() {
-        if let Err(error) = execute_background_permission_replay(session, replay_requests).await {
+        if let Err(error) =
+            execute_background_permission_replay(session, state, replay_requests).await
+        {
             tracing::warn!(
                 job_id = %state.identity.job_id,
                 %error,

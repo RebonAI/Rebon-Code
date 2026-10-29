@@ -1049,20 +1049,24 @@ fn admit_local_turn(
         }
         LocalTurnRequest::IdleContext => {
             let injected_context = drain_model_context_prompts(session);
+            // At the session's effort, like any other turn: a teammate's or
+            // another agent's message is answered as thoroughly as the
+            // person asked for, and a hosted session already does so.
+            let thinking = resolve_thinking_from_effort(app.effort_level, app.effort_provider_kind);
             (
                 rebon_agent_core::PromptRequest {
                     session_id: runtime.session_id.clone(),
                     cwd: runtime.cwd.clone(),
                     prompt: prompt_blocks(String::new(), Vec::new(), injected_context),
                     user_prompt: None,
-                    effort_is_session_default: false,
+                    effort_is_session_default: true,
                     update_publisher: Some(runtime.update_publisher.clone()),
                     permission_publisher: None,
                     mcp_servers: Vec::new(),
                     cancel: cancel.clone(),
-                    thinking_budget: None,
-                    max_tokens: None,
-                    reasoning_effort_ordinal: None,
+                    thinking_budget: thinking.thinking_budget,
+                    max_tokens: thinking.max_tokens,
+                    reasoning_effort_ordinal: thinking.reasoning_effort_ordinal,
                     additional_working_directories: session.startup.add_dirs.clone(),
                     coordinator_mode: Some(session.engine_half.coordinator_mode_handle.get()),
                     coordinator_report_paths: Vec::new(),
@@ -1077,33 +1081,38 @@ fn admit_local_turn(
                 TurnDeliveries::default(),
             )
         }
-        LocalTurnRequest::PermissionReplay { replay_requests } => (
-            rebon_agent_core::PromptRequest {
-                session_id: runtime.session_id.clone(),
-                cwd: runtime.cwd.clone(),
-                prompt: Vec::new(),
-                user_prompt: None,
-                effort_is_session_default: false,
-                update_publisher: Some(runtime.update_publisher.clone()),
-                permission_publisher: None,
-                mcp_servers: Vec::new(),
-                cancel: cancel.clone(),
-                thinking_budget: None,
-                max_tokens: None,
-                reasoning_effort_ordinal: None,
-                additional_working_directories: session.startup.add_dirs.clone(),
-                coordinator_mode: Some(session.engine_half.coordinator_mode_handle.get()),
-                coordinator_report_paths: Vec::new(),
-                user_message_uuid: None,
-                background_agent_system: None,
-                background_agent_tool_filter: None,
-                execution_policy: None,
-                replay_requests,
-                skill_invocations: Vec::new(),
-            },
-            None,
-            TurnDeliveries::default(),
-        ),
+        LocalTurnRequest::PermissionReplay { replay_requests } => {
+            // The replay finishes the work the denied calls were part of, at
+            // the effort that work was started with.
+            let thinking = resolve_thinking_from_effort(app.effort_level, app.effort_provider_kind);
+            (
+                rebon_agent_core::PromptRequest {
+                    session_id: runtime.session_id.clone(),
+                    cwd: runtime.cwd.clone(),
+                    prompt: Vec::new(),
+                    user_prompt: None,
+                    effort_is_session_default: true,
+                    update_publisher: Some(runtime.update_publisher.clone()),
+                    permission_publisher: None,
+                    mcp_servers: Vec::new(),
+                    cancel: cancel.clone(),
+                    thinking_budget: thinking.thinking_budget,
+                    max_tokens: thinking.max_tokens,
+                    reasoning_effort_ordinal: thinking.reasoning_effort_ordinal,
+                    additional_working_directories: session.startup.add_dirs.clone(),
+                    coordinator_mode: Some(session.engine_half.coordinator_mode_handle.get()),
+                    coordinator_report_paths: Vec::new(),
+                    user_message_uuid: None,
+                    background_agent_system: None,
+                    background_agent_tool_filter: None,
+                    execution_policy: None,
+                    replay_requests,
+                    skill_invocations: Vec::new(),
+                },
+                None,
+                TurnDeliveries::default(),
+            )
+        }
     };
 
     // What the turn carries, for the prompt to show; the loop settles it.
@@ -3068,6 +3077,61 @@ mod tests {
         assert!(app.queued_commands.is_empty());
         assert_eq!(recorder.take_requests().len(), 1);
         drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn idle_context_and_permission_replay_turns_run_at_the_session_effort() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        app.effort_level = Some(rebon_types::ReasoningEffort::Low);
+        let expected = resolve_thinking_from_effort(app.effort_level, app.effort_provider_kind);
+        assert!(
+            expected.thinking_budget.is_some() || expected.reasoning_effort_ordinal.is_some(),
+            "low effort has to say something for this test to mean anything"
+        );
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+
+        session.engine_half.session_loop.inbox().push_context(
+            crate::session::session_inbox::ContextSource::Teammate,
+            ["<teammate-message>hi</teammate-message>".to_string()],
+        );
+        let idle = admit_idle_context_prompt(&mut app, &session, &handle, None).expect("idle turn");
+        runtime.block_on(tokio::task::yield_now());
+        drop(idle);
+        let replay = admit_permission_replay_turn(
+            &mut app,
+            &session,
+            &handle,
+            None,
+            LocalTurnSource::PermissionRetry,
+            vec![rebon_agent_core::DenialReplayRequest {
+                denial_id: "d-1".into(),
+                tool_use_id: "call-1".into(),
+                tool_name: "Bash".into(),
+                tool_input: "{}".into(),
+                reason: "denied".into(),
+                task_id: None,
+                conversation_id: None,
+            }],
+        )
+        .expect("replay turn");
+        runtime.block_on(tokio::task::yield_now());
+        drop(replay);
+
+        let requests = recorder.take_requests();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert!(request.effort_is_session_default);
+            assert_eq!(request.thinking_budget, expected.thinking_budget);
+            assert_eq!(request.max_tokens, expected.max_tokens);
+            assert_eq!(
+                request.reasoning_effort_ordinal,
+                expected.reasoning_effort_ordinal
+            );
+        }
         runtime.shutdown_background();
     }
 
