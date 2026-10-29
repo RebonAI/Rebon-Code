@@ -318,14 +318,13 @@ pub(super) fn apply_interrupt(
 fn cancel_active_prompt(
     app: &mut AppState,
     session: &TuiEngineSession,
-    mut active: ActivePrompt,
+    active: ActivePrompt,
     ui_mode: UiMode,
 ) {
     if ui_mode == UiMode::Inline && !app.input.is_empty() {
         clear_input(app);
     }
-    active.finish_question_escalation_notifications();
-    active.finish_task_notification_claim(false);
+    // The session loop settles what the turn carried once it stops.
     active.cancel.cancel();
     if app.foregrounded_task_id.is_some() {
         switch_to_main_agent(app);
@@ -631,8 +630,7 @@ mod tests {
     use crate::ui_config::UiMode;
 
     use super::super::test_support::{
-        insert_local_agent_task, insert_terminal_agent_notification, make_test_tui_session,
-        push_test_user_message,
+        insert_local_agent_task, make_test_tui_session, push_test_user_message,
     };
     use super::super::{ActivePrompt, PromptResultRx, WithdrawDestination, WithdrawableSubmit};
 
@@ -969,68 +967,6 @@ mod tests {
         assert!(active.is_none());
         assert_eq!(app.input, "draft");
         assert_eq!(app.cursor_offset, 5);
-    }
-
-    #[test]
-    fn cancelling_task_notification_prompt_leaves_notifications_retryable() {
-        let mut app = AppState::new();
-        insert_terminal_agent_notification(&mut app, "agent-cancel", "/tmp/agent-cancel.report.md");
-        let (_tx, rx) = oneshot::channel();
-        let cancel = PromptCancel::new();
-        let mut session = session_with_app_tasks(&app);
-        session.engine_half.task_notification_poller =
-            crate::task_notification_poller::TaskNotificationPoller::new(
-                app.tasks.as_ref().clone(),
-            );
-        let task_id = rebon_plugin_tasks::runtime::TaskId::new("agent-cancel");
-        let turn_id = format!("{}:notification-cancel", session.session_id);
-        let claimed_ids = session
-            .engine_half
-            .task_notification_poller
-            .reserve_task_ids(
-                &session.session_id,
-                &turn_id,
-                std::slice::from_ref(&task_id),
-            );
-        assert_eq!(claimed_ids, vec![task_id.clone()]);
-        let mut active = Some(
-            ActivePrompt::with_task_notifications(rx, cancel.clone(), vec![task_id], Vec::new())
-                .with_task_notification_claim(
-                    session.engine_half.task_notification_poller.clone(),
-                    session.session_id.clone(),
-                    turn_id,
-                ),
-        );
-        assert!(session
-            .engine_half
-            .task_notification_poller
-            .unnotified_notifications_for_session(&session.session_id)
-            .is_empty());
-
-        assert!(apply_interrupt(
-            &mut app,
-            &session,
-            &mut active,
-            UiMode::Screen
-        ));
-
-        assert!(cancel.is_cancelled());
-        assert!(active.is_none());
-        assert!(
-            !app.tasks
-                .snapshot(&rebon_plugin_tasks::runtime::TaskId::new("agent-cancel"))
-                .expect("task snapshot")
-                .notified
-        );
-        assert_eq!(app.tasks.unnotified_terminal_agent_notifications().len(), 1);
-        assert_eq!(
-            session
-                .engine_half
-                .task_notification_poller
-                .unnotified_notifications_for_session(&session.session_id)
-                .len(),
-            1
-        );
     }
 
     #[test]

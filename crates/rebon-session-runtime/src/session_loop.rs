@@ -71,6 +71,102 @@ pub struct TurnInput {
     pub runtime: Arc<SessionRuntime>,
     pub request: PromptRequest,
     pub origin: TurnOrigin,
+    /// What the turn delivers that has to be acknowledged once it ends.
+    pub deliveries: TurnDeliveries,
+}
+
+/// Task notifications a turn carries, reserved for it in the poller.
+pub struct TaskNotificationClaim {
+    pub poller: Arc<crate::task_notification_poller::TaskNotificationPoller>,
+    /// The session and turn the claims were reserved under.
+    pub session_id: String,
+    pub turn_id: String,
+    pub task_ids: Vec<rebon_plugin_tasks::runtime::TaskId>,
+}
+
+/// Question escalations a turn carries.
+pub struct EscalationDelivery {
+    pub registry: rebon_tool::EscalationRegistry,
+    pub ids: Vec<rebon_tool::EscalationId>,
+}
+
+/// What a turn delivers that is acknowledged when it ends, by the loop,
+/// before anyone hears how it ended: so a surface that stops watching the
+/// turn leaves nothing unsettled, and one that sees the result sees the
+/// acknowledgement already made.
+#[derive(Default)]
+pub struct TurnDeliveries {
+    pub task_notifications: Option<TaskNotificationClaim>,
+    pub escalations: Option<EscalationDelivery>,
+}
+
+/// How a turn ended, as far as its deliveries care.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnEnding {
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+impl TurnEnding {
+    fn of(result: &TurnResult) -> Self {
+        match result {
+            Ok(outcome) if outcome.stop_reason == rebon_types::StopReason::Cancelled => {
+                TurnEnding::Cancelled
+            }
+            Ok(_) => TurnEnding::Completed,
+            Err(PromptExecutorError::Cancelled) => TurnEnding::Cancelled,
+            Err(_) => TurnEnding::Failed,
+        }
+    }
+}
+
+impl TurnDeliveries {
+    fn carries_anything(&self) -> bool {
+        self.task_notifications
+            .as_ref()
+            .is_some_and(|claim| !claim.task_ids.is_empty())
+            || self
+                .escalations
+                .as_ref()
+                .is_some_and(|escalations| !escalations.ids.is_empty())
+    }
+
+    /// Acknowledge what the turn delivered.
+    ///
+    /// A completed turn delivered everything. A failed one delivered
+    /// nothing, and what it carried is offered again after the inbox's
+    /// retry. A cancelled one hands its task notifications back at once;
+    /// its question escalations count as delivered, since the person who
+    /// stopped the turn saw them.
+    fn settle(self, ending: TurnEnding, inbox: &SessionInbox) {
+        let carried = self.carries_anything();
+        if let Some(claim) = self.task_notifications {
+            claim.poller.finish_claim(
+                &claim.session_id,
+                &claim.turn_id,
+                ending == TurnEnding::Completed,
+            );
+        }
+        if let Some(escalations) = self.escalations {
+            if ending != TurnEnding::Failed {
+                escalations
+                    .registry
+                    .mark_notifications_delivered(&escalations.ids);
+            }
+        }
+        if !carried {
+            return;
+        }
+        match ending {
+            TurnEnding::Completed => inbox.task_notifications_settled(),
+            TurnEnding::Failed => {
+                tracing::warn!("notification turn failed; leaving notifications unacked for retry");
+                inbox.retry_task_notifications_later();
+            }
+            TurnEnding::Cancelled => {}
+        }
+    }
 }
 
 /// Something for the session loop to act on.
@@ -90,7 +186,7 @@ pub enum SessionInput {
 #[derive(Default)]
 pub struct SessionLoop {
     sender: Mutex<Option<mpsc::UnboundedSender<SessionInput>>>,
-    inbox: SessionInbox,
+    inbox: Arc<SessionInbox>,
 }
 
 impl SessionLoop {
@@ -129,7 +225,7 @@ impl SessionLoop {
             None => input,
         };
         let (tx, rx) = mpsc::unbounded_channel();
-        handle.spawn(run_session(rx));
+        handle.spawn(run_session(rx, self.inbox.clone()));
         // A fresh receiver is alive until this function returns.
         let _ = tx.send(input);
         *sender = Some(tx);
@@ -137,15 +233,17 @@ impl SessionLoop {
 }
 
 /// The loop itself: take the next input, act on it, repeat.
-async fn run_session(mut inbox: mpsc::UnboundedReceiver<SessionInput>) {
-    while let Some(input) = inbox.recv().await {
+async fn run_session(mut inputs: mpsc::UnboundedReceiver<SessionInput>, inbox: Arc<SessionInbox>) {
+    while let Some(input) = inputs.recv().await {
         match input {
             SessionInput::Turn {
-                turn,
+                mut turn,
                 turn_guard,
                 reply,
             } => {
+                let deliveries = std::mem::take(&mut turn.deliveries);
                 let result = run_turn(turn, turn_guard).await;
+                deliveries.settle(TurnEnding::of(&result), &inbox);
                 let _ = reply.send(result);
             }
         }
@@ -157,6 +255,7 @@ async fn run_turn(turn: TurnInput, turn_guard: QueuedSubmitTurnGuard) -> TurnRes
         runtime,
         request,
         origin,
+        deliveries: _,
     } = turn;
     let executor = runtime.executor.clone();
     // Its own task, so a turn that panics reports an error instead of

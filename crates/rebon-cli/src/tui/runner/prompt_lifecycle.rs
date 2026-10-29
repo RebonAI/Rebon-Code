@@ -20,6 +20,7 @@ use rebon_types::{
 };
 
 use crate::session::session_inbox::ReadyInput;
+use crate::session::session_loop::{EscalationDelivery, TaskNotificationClaim, TurnDeliveries};
 use crate::session::submit_payload::{ensure_internal_submit_payload_user_uuid, SubmitPayload};
 use crate::session::ultraplan_run::UltraplanPhase;
 use crate::tui::app::{AppState, PromptCompletionStatus};
@@ -56,8 +57,7 @@ pub(super) fn maybe_update_loading_state(
     let active_prompt_elapsed = active_prompt
         .as_ref()
         .map(|prompt| prompt.started_at.elapsed());
-    let prompt_result =
-        poll_active_prompt(app, active_prompt, session.engine_half.session_loop.inbox());
+    let prompt_result = poll_active_prompt(app, active_prompt);
     let mut completed_elapsed = None;
     let mut completed_stop_reason = None;
     let mut completed_usage = rebon_types::Usage::default();
@@ -393,7 +393,6 @@ pub(super) fn commit_prompt_failure_message(
 pub(super) fn poll_active_prompt(
     _app: &mut AppState,
     active_prompt: &mut Option<ActivePrompt>,
-    inbox: &crate::session::session_inbox::SessionInbox,
 ) -> PromptPollResult {
     let Some(active) = active_prompt.as_mut() else {
         return PromptPollResult::Pending;
@@ -404,13 +403,6 @@ pub(super) fn poll_active_prompt(
             tracing::info!(stop_reason = ?outcome.stop_reason, "rebon-cli: prompt turn completed");
             let mut active = active_prompt.take().expect("active prompt present");
             let user_message_uuid = active.user_message_uuid.take();
-            let had_pending_notifications = !active.pending_task_notification_ids.is_empty()
-                || !active.pending_question_escalation_ids.is_empty();
-            active.finish_task_notification_claim(true);
-            if had_pending_notifications {
-                inbox.task_notifications_settled();
-            }
-            active.finish_question_escalation_notifications();
             let stop_reason = outcome.stop_reason;
             let usage = outcome.usage;
             let usage_model = active.usage_model.take();
@@ -428,17 +420,6 @@ pub(super) fn poll_active_prompt(
             tracing::warn!(error = %err, "rebon-cli: prompt turn failed");
             let mut active = active_prompt.take().expect("active prompt present");
             let runtime = active.runtime.take();
-            active.finish_task_notification_claim(false);
-            if !active.pending_task_notification_ids.is_empty()
-                || !active.pending_question_escalation_ids.is_empty()
-            {
-                inbox.retry_task_notifications_later();
-                tracing::warn!(
-                    task_count = active.pending_task_notification_ids.len(),
-                    escalation_count = active.pending_question_escalation_ids.len(),
-                    "notification turn failed; leaving notifications unacked for retry"
-                );
-            }
             PromptPollResult::Failed {
                 error: err,
                 runtime,
@@ -450,12 +431,6 @@ pub(super) fn poll_active_prompt(
             tracing::warn!(error = %err, "rebon-cli: prompt oneshot closed without a result");
             let mut active = active_prompt.take().expect("active prompt present");
             let runtime = active.runtime.take();
-            active.finish_task_notification_claim(false);
-            if !active.pending_task_notification_ids.is_empty()
-                || !active.pending_question_escalation_ids.is_empty()
-            {
-                inbox.retry_task_notifications_later();
-            }
             PromptPollResult::Failed {
                 error: err,
                 runtime,
@@ -834,8 +809,7 @@ pub(super) fn admit_active_prompt(
         source,
         LocalTurnRequest::Prompt {
             submit,
-            pending_task_notification_ids: Vec::new(),
-            pending_question_escalation_ids: Vec::new(),
+            deliveries: TurnDeliveries::default(),
             coordinator_report_paths: Vec::new(),
         },
     ) {
@@ -859,6 +833,19 @@ fn admit_active_prompt_with_task_notifications(
     task_notification_turn_id: String,
 ) -> Option<ActivePrompt> {
     stamp_goal_script_continuity(app, &mut submit);
+    // The session loop acknowledges these when the turn ends.
+    let deliveries = TurnDeliveries {
+        task_notifications: Some(TaskNotificationClaim {
+            poller: session.engine_half.task_notification_poller.clone(),
+            session_id: session.session_id.clone(),
+            turn_id: task_notification_turn_id.clone(),
+            task_ids: pending_task_notification_ids,
+        }),
+        escalations: Some(EscalationDelivery {
+            registry: session.engine_half.tasks.escalation_registry(),
+            ids: pending_question_escalation_ids,
+        }),
+    };
     match admit_local_turn(
         app,
         session,
@@ -867,20 +854,12 @@ fn admit_active_prompt_with_task_notifications(
         LocalTurnSource::TaskNotification,
         LocalTurnRequest::Prompt {
             submit,
-            pending_task_notification_ids,
-            pending_question_escalation_ids,
+            deliveries,
             coordinator_report_paths,
         },
     ) {
-        Ok(active) => Some(
-            active
-                .with_task_notification_claim(
-                    session.engine_half.task_notification_poller.clone(),
-                    session.session_id.clone(),
-                    task_notification_turn_id,
-                )
-                .with_question_escalation_registry(session.engine_half.tasks.escalation_registry()),
-        ),
+        Ok(active) => Some(active),
+        // Refused before the loop saw it: nobody else will release the claim.
         Err(reason) => {
             session.engine_half.task_notification_poller.finish_claim(
                 &session.session_id,
@@ -948,8 +927,7 @@ fn admit_idle_context_prompt(
 enum LocalTurnRequest {
     Prompt {
         submit: SubmitPayload,
-        pending_task_notification_ids: Vec<rebon_plugin_tasks::runtime::TaskId>,
-        pending_question_escalation_ids: Vec<rebon_tool::EscalationId>,
+        deliveries: TurnDeliveries,
         coordinator_report_paths: Vec<String>,
     },
     IdleContext,
@@ -980,11 +958,10 @@ fn admit_local_turn(
     // steer pump, cleanup, and permission retry, uses this exact Arc.
     let runtime = session.engine_half.runtime.clone();
     let cancel = PromptCancel::new();
-    let (request, user_message_uuid, pending_task_ids, pending_escalation_ids) = match request {
+    let (request, user_message_uuid, deliveries) = match request {
         LocalTurnRequest::Prompt {
             submit,
-            pending_task_notification_ids,
-            pending_question_escalation_ids,
+            deliveries,
             coordinator_report_paths,
         } => {
             let injected_context = drain_model_context_prompts(session);
@@ -1042,8 +1019,7 @@ fn admit_local_turn(
                     skill_invocations,
                 },
                 user_message_uuid,
-                pending_task_notification_ids,
-                pending_question_escalation_ids,
+                deliveries,
             )
         }
         LocalTurnRequest::IdleContext => {
@@ -1073,8 +1049,7 @@ fn admit_local_turn(
                     skill_invocations: Vec::new(),
                 },
                 None,
-                Vec::new(),
-                Vec::new(),
+                TurnDeliveries::default(),
             )
         }
         LocalTurnRequest::PermissionReplay { replay_requests } => (
@@ -1102,12 +1077,29 @@ fn admit_local_turn(
                 skill_invocations: Vec::new(),
             },
             None,
-            Vec::new(),
-            Vec::new(),
+            TurnDeliveries::default(),
         ),
     };
 
-    let rx = dispatch_admitted_local_turn(handle, session, runtime.clone(), request, source);
+    // What the turn carries, for the prompt to show; the loop settles it.
+    let pending_task_ids = deliveries
+        .task_notifications
+        .as_ref()
+        .map(|claim| claim.task_ids.clone())
+        .unwrap_or_default();
+    let pending_escalation_ids = deliveries
+        .escalations
+        .as_ref()
+        .map(|escalations| escalations.ids.clone())
+        .unwrap_or_default();
+    let rx = dispatch_admitted_local_turn(
+        handle,
+        session,
+        runtime.clone(),
+        request,
+        source,
+        deliveries,
+    );
     if matches!(
         source,
         LocalTurnSource::DirectUserSubmit | LocalTurnSource::Command
@@ -1251,6 +1243,7 @@ fn dispatch_admitted_local_turn(
     runtime: Arc<crate::session::runtime::SessionRuntime>,
     request: rebon_agent_core::PromptRequest,
     source: LocalTurnSource,
+    deliveries: TurnDeliveries,
 ) -> PromptResultRx {
     session.engine_half.session_loop.submit_turn(
         handle,
@@ -1258,6 +1251,7 @@ fn dispatch_admitted_local_turn(
             runtime,
             request,
             origin: source.turn_origin(),
+            deliveries,
         },
     )
 }
@@ -1300,7 +1294,14 @@ fn dispatch_local_turn_for_test(
         replay_requests: Vec::new(),
         skill_invocations,
     };
-    dispatch_admitted_local_turn(handle, session, runtime, request, LocalTurnSource::TestOnly)
+    dispatch_admitted_local_turn(
+        handle,
+        session,
+        runtime,
+        request,
+        LocalTurnSource::TestOnly,
+        TurnDeliveries::default(),
+    )
 }
 
 pub(super) fn sync_current_session_title(app: &mut AppState, session: &TuiEngineSession) {
@@ -2106,8 +2107,7 @@ mod tests {
                 .with_usage_model("provider-before-switch", "model-before-switch"),
         );
 
-        let inbox = crate::session::session_inbox::SessionInbox::default();
-        let result = poll_active_prompt(&mut app, &mut active, &inbox);
+        let result = poll_active_prompt(&mut app, &mut active);
 
         assert!(matches!(
             result,
@@ -2258,8 +2258,7 @@ mod tests {
         .unwrap();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
 
-        let inbox = crate::session::session_inbox::SessionInbox::default();
-        let result = poll_active_prompt(&mut app, &mut active, &inbox);
+        let result = poll_active_prompt(&mut app, &mut active);
 
         assert!(matches!(result, PromptPollResult::Failed { .. }));
         assert!(active.is_none());
@@ -2297,6 +2296,7 @@ mod tests {
     /// others wait for a permit before they end.
     struct GatedPromptExecutor {
         log: Mutex<Vec<String>>,
+        requests: Mutex<Vec<PromptRequest>>,
         permits: tokio::sync::Semaphore,
     }
 
@@ -2304,6 +2304,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 log: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
                 permits: tokio::sync::Semaphore::new(0),
             }
         }
@@ -2320,6 +2321,7 @@ mod tests {
                 _ => String::new(),
             };
             self.log.lock().unwrap().push(format!("start {name}"));
+            self.requests.lock().unwrap().push(request);
             if name == "boom" {
                 panic!("synthetic executor panic");
             }
@@ -2447,9 +2449,8 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         drop(tx);
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let inbox = crate::session::session_inbox::SessionInbox::default();
 
-        let result = poll_active_prompt(&mut app, &mut active, &inbox);
+        let result = poll_active_prompt(&mut app, &mut active);
 
         let PromptPollResult::Failed { error, .. } = result else {
             panic!("expected closed result channel to fail prompt");
@@ -3208,11 +3209,7 @@ mod tests {
         );
 
         assert!(matches!(
-            poll_active_prompt(
-                &mut app,
-                &mut active_prompt,
-                session.engine_half.session_loop.inbox()
-            ),
+            poll_active_prompt(&mut app, &mut active_prompt),
             PromptPollResult::Failed { .. }
         ));
         assert!(active_prompt.is_none());
@@ -3246,14 +3243,73 @@ mod tests {
         runtime.shutdown_background();
     }
 
+    /// Runs until its turn is cancelled, then reports the cancellation.
+    struct RunsUntilCancelled;
+
+    #[async_trait::async_trait]
+    impl rebon_agent_core::PromptExecutor for RunsUntilCancelled {
+        async fn execute(
+            &self,
+            request: PromptRequest,
+        ) -> Result<PromptOutcome, PromptExecutorError> {
+            while !request.cancel.is_cancelled() {
+                request.cancel.notified().await;
+            }
+            Err(PromptExecutorError::Cancelled)
+        }
+    }
+
+    #[test]
+    fn cancelling_a_task_notification_turn_leaves_its_notifications_retryable() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        let mut session = make_test_tui_session();
+        app.tasks = session.engine_half.tasks.clone();
+        session.set_test_executor(Arc::new(RunsUntilCancelled));
+        insert_terminal_agent_notification(&mut app, "agent-cancel", "/tmp/agent-cancel.report.md");
+        let unnotified = |session: &TuiEngineSession| {
+            session
+                .engine_half
+                .task_notification_poller
+                .unnotified_notifications_for_session(&session.session_id)
+                .len()
+        };
+        let mut active_prompt = None;
+
+        maybe_spawn_task_notification_prompt(&mut app, &session, &handle, &mut active_prompt);
+        settle(&runtime);
+        assert!(active_prompt.is_some());
+        assert_eq!(unnotified(&session), 0, "claimed by the running turn");
+
+        assert!(apply_interrupt(
+            &mut app,
+            &session,
+            &mut active_prompt,
+            UiMode::Screen
+        ));
+        assert!(active_prompt.is_none());
+        settle(&runtime);
+
+        assert_eq!(unnotified(&session), 1, "handed back once the turn stopped");
+        assert!(
+            !session
+                .engine_half
+                .session_loop
+                .inbox()
+                .task_notification_retry_pending(),
+            "a cancel is not a failure to retry"
+        );
+        runtime.shutdown_background();
+    }
+
     #[test]
     fn question_escalation_prompt_injects_xml_and_acks_after_success() {
         let (runtime, handle) = make_immediate_handle();
         let mut app = AppState::new();
         let mut session = make_test_tui_session();
         app.tasks = session.engine_half.tasks.clone();
-        let recorder = Arc::new(RecordingPromptExecutor::default());
-        session.set_test_executor(recorder.clone());
+        let executor = Arc::new(GatedPromptExecutor::default());
+        session.set_test_executor(executor.clone());
         let client = app
             .tasks
             .escalation_registry()
@@ -3272,16 +3328,19 @@ mod tests {
         let active = active_prompt.as_ref().expect("escalation prompt spawned");
         assert!(active.pending_task_notification_ids.is_empty());
         assert_eq!(active.pending_question_escalation_ids.len(), 1);
-        let requests = recorder.take_requests();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].coordinator_report_paths.is_empty());
-        let prompt_text = match &requests[0].prompt[0] {
-            ContentBlock::Text(text) => text.text.as_str(),
-            other => panic!("expected question escalation text prompt, got {other:?}"),
-        };
-        assert!(prompt_text.contains("<question-escalation>"));
-        assert!(prompt_text.contains("<agent-id>agent-question</agent-id>"));
-        assert!(prompt_text.contains("Which path should I take?"));
+        {
+            let requests = executor.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].coordinator_report_paths.is_empty());
+            let prompt_text = match &requests[0].prompt[0] {
+                ContentBlock::Text(text) => text.text.as_str(),
+                other => panic!("expected question escalation text prompt, got {other:?}"),
+            };
+            assert!(prompt_text.contains("<question-escalation>"));
+            assert!(prompt_text.contains("<agent-id>agent-question</agent-id>"));
+            assert!(prompt_text.contains("Which path should I take?"));
+        }
+        // Still undelivered while the turn runs.
         assert_eq!(
             app.tasks
                 .unnotified_question_escalation_notifications()
@@ -3289,12 +3348,10 @@ mod tests {
             1
         );
 
+        executor.permits.add_permits(1);
+        settle(&runtime);
         assert!(matches!(
-            poll_active_prompt(
-                &mut app,
-                &mut active_prompt,
-                session.engine_half.session_loop.inbox()
-            ),
+            poll_active_prompt(&mut app, &mut active_prompt),
             PromptPollResult::Succeeded { .. }
         ));
         assert!(app
@@ -3336,11 +3393,7 @@ mod tests {
         assert!(first_requests[0].coordinator_report_paths.is_empty());
 
         assert!(matches!(
-            poll_active_prompt(
-                &mut app,
-                &mut active_prompt,
-                session.engine_half.session_loop.inbox()
-            ),
+            poll_active_prompt(&mut app, &mut active_prompt),
             PromptPollResult::Failed { .. }
         ));
         assert!(active_prompt.is_none());
