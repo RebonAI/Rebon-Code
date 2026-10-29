@@ -76,8 +76,7 @@ use super::paste_echo::{
 };
 use super::permission_flow::{maybe_handle_permission_key, sync_permission_view};
 use super::prompt_lifecycle::{
-    admit_idle_context_prompt, drain_ui_channels, maybe_spawn_task_notification_prompt,
-    maybe_update_loading_state,
+    drain_ui_channels, maybe_spawn_ready_idle_turn, maybe_update_loading_state,
 };
 use super::remote_background_attachment::refresh_remote_background_attachment;
 use super::render::{self, drain_file_list, render_frame};
@@ -432,9 +431,6 @@ struct LoopState {
     global_search_worker: Option<GlobalSearchWorker>,
     suggestion_runtime: super::prompt_suggestion::SuggestionRuntime,
     resume_runtime: ResumeRuntime,
-    task_notification_retry_after: Option<Instant>,
-    task_notification_revision_rx: Option<tokio::sync::watch::Receiver<u64>>,
-    task_notification_scan_pending: bool,
     agent_gen_rx: Option<
         oneshot::Receiver<Result<rebon_plugin_agents::surface::generate::GeneratedAgent, String>>,
     >,
@@ -530,9 +526,6 @@ pub(in crate::tui::runner) fn event_loop_with_mode(
         global_search_worker: None,
         suggestion_runtime: Default::default(),
         resume_runtime: ResumeRuntime::new(),
-        task_notification_retry_after: None,
-        task_notification_revision_rx: None,
-        task_notification_scan_pending: true,
         agent_gen_rx: None,
         command_expansion_rx,
         paste_burst: PasteBurst::new(),
@@ -767,7 +760,6 @@ fn inline_surface_gates(
                 handle,
                 &mut state.active_prompt,
                 &mut state.pending_permission,
-                &mut state.task_notification_retry_after,
             ) {
                 tracing::warn!(%err, "inline background tasks overlay failed");
             }
@@ -962,37 +954,22 @@ fn session_pipeline(
                 state.ui_mode,
             );
         }
-        maybe_update_loading_state(
-            app,
-            session,
-            handle,
-            &mut state.active_prompt,
-            &mut state.task_notification_retry_after,
-        );
-        if super::task_runtime::task_notification_scan_needed(
-            &mut state.task_notification_revision_rx,
-            session
-                .engine_half
-                .task_notification_poller
-                .subscribe_notification_revision(),
-        ) {
-            state.task_notification_scan_pending = true;
-        }
-        if !session
+        maybe_update_loading_state(app, session, handle, &mut state.active_prompt);
+        session
             .engine_half
-            .tasks
-            .unnotified_question_escalation_notifications()
-            .is_empty()
-        {
-            state.task_notification_scan_pending = true;
-        }
-        if state
-            .task_notification_retry_after
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            state.task_notification_retry_after = None;
-            state.task_notification_scan_pending = true;
-        }
+            .session_loop
+            .inbox()
+            .observe_task_notifications(
+                session
+                    .engine_half
+                    .task_notification_poller
+                    .subscribe_notification_revision(),
+                !session
+                    .engine_half
+                    .tasks
+                    .unnotified_question_escalation_notifications()
+                    .is_empty(),
+            );
         refresh_remote_background_attachment(app, session, &mut state.pending_permission);
         // `--hosted` fires from here rather than at startup because the
         // session it means is not settled yet at startup: a resume dialog
@@ -1038,56 +1015,25 @@ fn session_pipeline(
         // both in the same process would race on the read-modify-write
         // cycle inside `drain_unread_mailbox` and silently drop one
         // side's messages. The idle-path drain stays here so the
-        // auto-submit (pending_teammate_prompts -> new turn) still
+        // auto-submit (pending teammate context -> new turn) still
         // fires when nothing is running.
         if state.active_prompt.is_none() {
-            drain_mcp_channel_notifications(app, session);
-            drain_team_mailbox(app, &session.session_id);
+            drain_mcp_channel_notifications(session);
+            drain_team_mailbox(
+                app,
+                session.engine_half.session_loop.inbox(),
+                &session.session_id,
+            );
         }
 
-        // Auto-trigger: when teammate messages arrived and the leader
-        // is idle (no active prompt, no queued commands), auto-submit
-        // the pending teammate messages as a new model turn.
-        if app.resume_dialog.is_none()
-            && (!app.pending_channel_prompts.is_empty()
-                || !app.pending_teammate_prompts.is_empty()
-                || !app.pending_agent_prompts.is_empty())
-            && state.active_prompt.is_none()
-            && app.queued_commands.is_empty()
-        {
-            if let Some(admitted) =
-                admit_idle_context_prompt(app, session, handle, state.active_prompt.as_ref())
-            {
-                state.active_prompt = Some(admitted);
-                app.is_loading = true;
-            }
-        }
-
-        // Auto-trigger: background tasks report terminal results via
-        // task-notification XML. Feed those notifications back into the
-        // coordinator as a fresh turn once the UI is idle.
+        // Auto-trigger: start a turn from whatever waits in the session's
+        // inbox — context other parties sent, background-task notifications,
+        // cron fires — once nothing else claims the session.
         if app.resume_dialog.is_none()
             && state.active_prompt.is_none()
             && app.queued_commands.is_empty()
-            && state.task_notification_retry_after.is_none()
-            && state.task_notification_scan_pending
         {
-            state.task_notification_scan_pending = false;
-            if !maybe_spawn_task_notification_prompt(app, session, handle, &mut state.active_prompt)
-                && (!session
-                    .engine_half
-                    .task_notification_poller
-                    .unnotified_notifications_for_session(&session.session_id)
-                    .is_empty()
-                    || !session
-                        .engine_half
-                        .tasks
-                        .unnotified_question_escalation_notifications()
-                        .is_empty())
-            {
-                state.task_notification_retry_after =
-                    Some(Instant::now() + Duration::from_secs(10));
-            }
+            maybe_spawn_ready_idle_turn(app, session, handle, &mut state.active_prompt);
         }
 
         let skill_count = session.engine_half.skill_registry.user_invocable_count();
@@ -1117,9 +1063,7 @@ fn session_pipeline(
             && app.resume_dialog.is_none()
             && app.expanding_command.is_none()
             && app.queued_commands.is_empty()
-            && app.pending_channel_prompts.is_empty()
-            && app.pending_teammate_prompts.is_empty()
-            && app.pending_agent_prompts.is_empty()
+            && !session.engine_half.session_loop.inbox().has_context()
             && app.deferred_internal_submit_payloads.is_empty()
             && session.remote_background_attachment.is_none()
             && session.pending_hosted_session.is_none();
@@ -1266,7 +1210,9 @@ fn derive_frame_inputs<'slot>(
         .or(hosted_turn_started_at)
         .map(|started_at| started_at.elapsed().as_millis() as u64)
         .unwrap_or(0);
-    let is_loading = state.active_prompt.is_some() || hosted_turn_started_at.is_some();
+    let is_loading = state.active_prompt.is_some()
+        || hosted_turn_started_at.is_some()
+        || app.goal_check.is_pending();
     app.is_loading = is_loading;
     // Pick a new random spinner verb on each loading transition.
     if is_loading && !app.was_loading {
@@ -4537,18 +4483,11 @@ fn run_inline_background_tasks_overlay(
     handle: &Handle,
     active_prompt: &mut Option<ActivePrompt>,
     pending_permission: &mut Option<PendingPermission>,
-    task_notification_retry_after: &mut Option<Instant>,
 ) -> anyhow::Result<()> {
     let mut guard = AltScreenOverlayGuard::enter()?;
     loop {
         drain_ui_channels(app, session, pending_permission, active_prompt);
-        maybe_update_loading_state(
-            app,
-            session,
-            handle,
-            active_prompt,
-            task_notification_retry_after,
-        );
+        maybe_update_loading_state(app, session, handle, active_prompt);
         refresh_background_tasks_dialog(app);
         refresh_live_agent_tool_activity(app);
 

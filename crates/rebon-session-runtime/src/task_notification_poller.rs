@@ -180,8 +180,12 @@ impl TaskNotificationPoller {
         claimed_ids
     }
 
-    pub fn finish_claim(&self, turn_id: &str, succeeded: bool) {
-        self.finish(DEFAULT_TURN_ID, turn_id, succeeded);
+    /// Settle the claims [`Self::reserve_task_ids`] took for `turn_id`.
+    ///
+    /// `session_id` is the one the claims were reserved under: a
+    /// session-resolving poller finds the registry to acknowledge through it.
+    pub fn finish_claim(&self, session_id: &str, turn_id: &str, succeeded: bool) {
+        self.finish(session_id, turn_id, succeeded);
     }
 
     pub fn unnotified_notifications_for_session(&self, session_id: &str) -> Vec<TaskNotification> {
@@ -576,6 +580,39 @@ mod tests {
             1
         );
         poller.finish_turn_for_query("session-switch", "reenabled", true);
+        assert!(registry.unnotified_terminal_notifications().is_empty());
+    }
+
+    /// A turn the engine never runs (an external agent's) has only the
+    /// terminal's settlement to acknowledge what it delivered.
+    #[test]
+    fn a_reserved_claim_is_acknowledged_in_its_session_registry() {
+        let scopes = rebon_kernel_seats::kernel_services::SessionKernelScopes::new(
+            Kernel::new(),
+            Arc::new(rebon_core::Engine::new()),
+            std::env::temp_dir(),
+        );
+        let lease = scopes.acquire("session-claim");
+        lease.context().emit(&PluginStateChanged {
+            id: rebon_plugin_tasks::PLUGIN_ID.to_string(),
+            from: PluginState::Disabled,
+            to: PluginState::Loaded,
+            generation: 1,
+        });
+        let registry = scopes.host_task_registry("session-claim");
+        let poller = TaskNotificationPoller::new_session_resolving(
+            scopes.task_registry_resolver(),
+            registry.subscribe_notification_revision(),
+        );
+        let task_id = insert_failed_agent(&registry, "agent-claim", Some("session-claim"));
+        let turn_id = "session-claim:u-internal-1";
+
+        assert_eq!(
+            poller.reserve_task_ids("session-claim", turn_id, &[task_id]),
+            vec![TaskId::new("agent-claim")]
+        );
+        poller.finish_claim("session-claim", turn_id, true);
+
         assert!(registry.unnotified_terminal_notifications().is_empty());
     }
 

@@ -85,7 +85,11 @@ pub(super) fn format_teammate_message(
     )
 }
 
-pub(super) fn drain_team_mailbox(app: &mut AppState, session_id: &str) {
+pub(super) fn drain_team_mailbox(
+    app: &mut AppState,
+    inbox: &crate::session::session_inbox::SessionInbox,
+    session_id: &str,
+) {
     let mut team_names = Vec::new();
     // In-process teammate tasks are the runtime authority for mailbox ownership.
     // Filter by parent session so an idle TUI never consumes another session's
@@ -115,7 +119,7 @@ pub(super) fn drain_team_mailbox(app: &mut AppState, session_id: &str) {
     }
     super::live_agent_view::with_main_agent_view(app, move |app| {
         for (team_name, unread) in unread_by_team {
-            project_team_mailbox_messages(app, &team_name, unread);
+            project_team_mailbox_messages(app, inbox, &team_name, unread);
         }
     });
 }
@@ -135,13 +139,18 @@ fn drain_unread_team_mailbox(team_name: &str) -> Vec<rebon_tool::TeamMailboxMess
 }
 
 #[cfg(test)]
-fn drain_team_mailbox_for_team(app: &mut AppState, team_name: &str) {
+fn drain_team_mailbox_for_team(
+    app: &mut AppState,
+    inbox: &crate::session::session_inbox::SessionInbox,
+    team_name: &str,
+) {
     let unread = drain_unread_team_mailbox(team_name);
-    project_team_mailbox_messages(app, team_name, unread);
+    project_team_mailbox_messages(app, inbox, team_name, unread);
 }
 
 fn project_team_mailbox_messages(
     app: &mut AppState,
+    inbox: &crate::session::session_inbox::SessionInbox,
     team_name: &str,
     unread: Vec<rebon_tool::TeamMailboxMessage>,
 ) {
@@ -179,7 +188,10 @@ fn project_team_mailbox_messages(
         // Queue the teammate XML so spawn_prompt_turn injects it into
         // the model's next prompt. Without this, the model never sees
         // teammate messages  - they only appear in the visual transcript.
-        app.pending_teammate_prompts.push(xml.clone());
+        inbox.push_context(
+            crate::session::session_inbox::ContextSource::Teammate,
+            [xml.clone()],
+        );
         rebon_tui::reducer(
             &mut app.rebon_tui,
             rebon_tui::Action::Commit(rebon_tui::Message::User(rebon_tui::UserMessage {
@@ -217,6 +229,10 @@ fn escape_xml_attr(input: &str) -> String {
 mod tests {
     use super::*;
 
+    fn teammate_context(inbox: &crate::session::session_inbox::SessionInbox) -> Vec<String> {
+        inbox.pending_context(crate::session::session_inbox::ContextSource::Teammate)
+    }
+
     #[test]
     fn drain_team_mailbox_commits_unread_messages_to_transcript() {
         let _guard = crate::test_env::lock_env();
@@ -238,7 +254,8 @@ mod tests {
         .unwrap();
 
         let mut app = AppState::new();
-        drain_team_mailbox_for_team(&mut app, &team_name);
+        let inbox = crate::session::session_inbox::SessionInbox::default();
+        drain_team_mailbox_for_team(&mut app, &inbox, &team_name);
 
         assert_eq!(app.rebon_tui.transcript.len(), 1);
         match &app.rebon_tui.transcript.rows()[0] {
@@ -281,6 +298,7 @@ mod tests {
         .unwrap();
 
         let mut app = AppState::new();
+        let inbox = crate::session::session_inbox::SessionInbox::default();
         let registry = rebon_plugin_tasks::runtime::TaskRegistry::new();
         super::super::test_support::insert_local_agent_task(
             &registry,
@@ -317,7 +335,7 @@ mod tests {
         ));
         let child_rows = app.rebon_tui.transcript.rows().to_vec();
 
-        drain_team_mailbox(&mut app, &session_id);
+        drain_team_mailbox(&mut app, &inbox, &session_id);
 
         assert_eq!(app.foregrounded_task_id.as_deref(), Some("agent-1"));
         assert_eq!(app.rebon_tui.transcript.rows(), child_rows.as_slice());
@@ -330,7 +348,7 @@ mod tests {
             panic!("expected teammate text block");
         };
         assert!(text.text.contains("main-only update"));
-        assert_eq!(app.pending_teammate_prompts.len(), 1);
+        assert_eq!(teammate_context(&inbox).len(), 1);
 
         let _ = std::fs::remove_dir_all(rebon_tool::team_files::team_dir(&team_name));
     }
@@ -343,12 +361,13 @@ mod tests {
         let team_name = format!("runner-empty-mailbox-{}-{nonce}", std::process::id());
 
         let mut app = AppState::new();
+        let inbox = crate::session::session_inbox::SessionInbox::default();
         app.rebon_tui.overlay.set_streaming_text("foreground child");
         let child_overlay_blocks = app.rebon_tui.overlay.blocks.len();
         app.foregrounded_task_id = Some("agent-1".into());
         app.main_agent_view = None;
 
-        drain_team_mailbox(&mut app, "empty-session");
+        drain_team_mailbox(&mut app, &inbox, "empty-session");
 
         assert_eq!(app.foregrounded_task_id.as_deref(), Some("agent-1"));
         assert!(app.main_agent_view.is_none());
@@ -383,6 +402,7 @@ mod tests {
         .unwrap();
 
         let mut app = AppState::new();
+        let inbox = crate::session::session_inbox::SessionInbox::default();
         rebon_plugin_tasks::runtime::register_in_process_teammate_task(
             &app.tasks,
             rebon_plugin_tasks::runtime::InProcessTeammateTaskSpec {
@@ -404,11 +424,11 @@ mod tests {
             },
         );
 
-        drain_team_mailbox(&mut app, "leader");
+        drain_team_mailbox(&mut app, &inbox, "leader");
 
         assert_eq!(app.rebon_tui.transcript.len(), 1);
-        assert_eq!(app.pending_teammate_prompts.len(), 1);
-        assert!(app.pending_teammate_prompts[0].contains("idle_notification"));
+        assert_eq!(teammate_context(&inbox).len(), 1);
+        assert!(teammate_context(&inbox)[0].contains("idle_notification"));
         let _ = std::fs::remove_dir_all(rebon_tool::team_files::team_dir(&team_name));
     }
 
@@ -441,6 +461,7 @@ mod tests {
         }
 
         let mut app = AppState::new();
+        let inbox = crate::session::session_inbox::SessionInbox::default();
         for (id, team_name, agent_name, parent_session_id) in [
             ("tm-session-a", &team_a, "alice", &session_a),
             ("tm-session-b", &team_b, "bob", &session_b),
@@ -467,11 +488,11 @@ mod tests {
             );
         }
 
-        drain_team_mailbox(&mut app, &session_a);
+        drain_team_mailbox(&mut app, &inbox, &session_a);
 
-        assert_eq!(app.pending_teammate_prompts.len(), 1);
-        assert!(app.pending_teammate_prompts[0].contains("message for session a"));
-        assert!(!app.pending_teammate_prompts[0].contains("message for session b"));
+        assert_eq!(teammate_context(&inbox).len(), 1);
+        assert!(teammate_context(&inbox)[0].contains("message for session a"));
+        assert!(!teammate_context(&inbox)[0].contains("message for session b"));
         assert!(rebon_tool::read_mailbox(&team_a, TEAM_LEAD_NAME).unwrap()[0].read);
         assert!(!rebon_tool::read_mailbox(&team_b, TEAM_LEAD_NAME).unwrap()[0].read);
 

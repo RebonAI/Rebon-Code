@@ -884,6 +884,13 @@ struct Inner {
     /// the host died and took every call with it. [`PluginHostSupervisor::await_drain`]
     /// re-reads the registry on each wake, so a spurious one costs a lock.
     drains: Notify,
+    /// The host epoch [`PluginHostSupervisor::shutdown`] asked to leave, or 0.
+    ///
+    /// A host answers the shutdown request and exits on its own, so the
+    /// reader can see its EOF before `shutdown` has recorded why. Set before
+    /// the request goes out, it lets that EOF be recorded as the shutdown it
+    /// is rather than as a host that closed its output.
+    shutdown_requested: std::sync::atomic::AtomicU64,
 }
 
 impl Inner {
@@ -1048,6 +1055,7 @@ impl PluginHostSupervisor {
             exposed_seats: config.exposed_seats.clone(),
             event_publisher: config.event_publisher.clone(),
             drains: Notify::new(),
+            shutdown_requested: std::sync::atomic::AtomicU64::new(0),
         });
 
         tokio::spawn(drain_stderr(stderr, Arc::clone(&inner.stderr)));
@@ -1814,6 +1822,9 @@ impl PluginHostSupervisor {
             let identity = {
                 let mut state = self.inner.state.lock().await;
                 let call_id = state.next_call_id();
+                self.inner
+                    .shutdown_requested
+                    .store(state.host_epoch(), std::sync::atomic::Ordering::Release);
                 CallIdentity::platform_control(state.host_epoch(), call_id)
                     .map_err(|error| HostCallError::State(StateError::Lifecycle(error.into())))
             };
@@ -1940,6 +1951,16 @@ async fn read_frames(mut stdout: HostOutput, inner: Arc<Inner>, epoch: u64) {
     let mut buffer = [0u8; 8192];
     let reason = loop {
         let read = match stdout.read(&mut buffer).await {
+            // Asked to leave, it left: the reader can get here before
+            // `shutdown` records the reason, so it records the same one.
+            Ok(0)
+                if inner
+                    .shutdown_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == epoch =>
+            {
+                break SHUTDOWN_REASON.to_owned()
+            }
             Ok(0) => break "plugin host closed its output".to_owned(),
             Ok(read) => read,
             Err(error) => break format!("reading from the plugin host failed: {error}"),
@@ -2444,6 +2465,7 @@ mod tests {
             exposed_seats: BTreeSet::new(),
             event_publisher: None,
             drains: Notify::new(),
+            shutdown_requested: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2476,6 +2498,43 @@ mod tests {
 
         let state = inner.state.lock().await;
         assert!(!state.is_alive());
+        assert_eq!(
+            state.failure().map(|failure| failure.reason.as_str()),
+            Some("plugin host closed its output")
+        );
+    }
+
+    /// A host answers the shutdown request and exits on its own, so its
+    /// reader can reach EOF before `shutdown` records why. That EOF is the
+    /// shutdown, not a host that closed its output: on a loaded machine the
+    /// race went to the reader and a requested shutdown read as a crash.
+    #[tokio::test]
+    async fn eof_after_a_shutdown_request_is_recorded_as_the_shutdown() {
+        let inner = Arc::new(inner_at_epoch(2));
+        inner
+            .shutdown_requested
+            .store(2, std::sync::atomic::Ordering::Release);
+
+        read_frames(Box::new(tokio::io::empty()), inner.clone(), 2).await;
+
+        let state = inner.state.lock().await;
+        assert_eq!(
+            state.failure().map(|failure| failure.reason.as_str()),
+            Some(SHUTDOWN_REASON)
+        );
+    }
+
+    /// A shutdown asked of an earlier host says nothing about this one's EOF.
+    #[tokio::test]
+    async fn eof_without_a_shutdown_request_is_still_a_closed_output() {
+        let inner = Arc::new(inner_at_epoch(2));
+        inner
+            .shutdown_requested
+            .store(1, std::sync::atomic::Ordering::Release);
+
+        read_frames(Box::new(tokio::io::empty()), inner.clone(), 2).await;
+
+        let state = inner.state.lock().await;
         assert_eq!(
             state.failure().map(|failure| failure.reason.as_str()),
             Some("plugin host closed its output")

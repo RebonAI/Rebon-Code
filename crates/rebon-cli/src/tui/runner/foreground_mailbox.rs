@@ -44,6 +44,7 @@ use rebon_session_host::{
 use crate::background::{
     command_was_already_resolved, is_compact_command, validate_question_answer,
 };
+use crate::session::session_inbox::ContextSource;
 use crate::session_shell::session_command_inputs_from_app;
 use crate::tui::app::AppState;
 use crate::tui::permission_modal::{PendingPermission, PermissionKind, PermissionModalAction};
@@ -274,7 +275,6 @@ impl ForegroundControl {
     /// `take_pending_agent_messages` and joins the same idle path.
     fn apply_pending_agent_messages(
         &self,
-        app: &mut AppState,
         session: &TuiEngineSession,
         active_prompt: &Option<ActivePrompt>,
     ) {
@@ -290,14 +290,17 @@ impl ForegroundControl {
             }
             return;
         }
-        app.pending_agent_prompts.extend(
+        let inbox = session.engine_half.session_loop.inbox();
+        inbox.push_context(
+            ContextSource::Agent,
             session
                 .engine_half
                 .runtime
                 .mid_turn_queue
                 .take_pending_agent_messages(),
         );
-        app.pending_agent_prompts.extend(
+        inbox.push_context(
+            ContextSource::Agent,
             pending
                 .into_iter()
                 .map(|envelope| rebon_session_host::frame_agent_message(&envelope)),
@@ -321,7 +324,7 @@ impl ForegroundControl {
         if !self.mailbox.enabled() {
             return;
         }
-        self.apply_pending_agent_messages(app, session, active_prompt);
+        self.apply_pending_agent_messages(session, active_prompt);
         for claim in self.mailbox.claims() {
             let command_id = claim.envelope.command_id.clone();
             let is_run_command = matches!(
@@ -503,7 +506,7 @@ impl ForegroundControl {
                 // paths is still delivered once.
                 if let Some(envelope) = command.into_agent_message() {
                     let _ = self.agent_inbox.accept(envelope);
-                    self.apply_pending_agent_messages(app, session, active_prompt);
+                    self.apply_pending_agent_messages(session, active_prompt);
                 }
                 Ok(None)
             }
@@ -705,7 +708,7 @@ mod tests {
         );
         assert!(matches!(applied, Ok(None)), "got {applied:?}");
         assert!(
-            app.pending_agent_prompts.is_empty(),
+            !session.engine_half.session_loop.inbox().has_context(),
             "a running turn does not wait for the idle trigger"
         );
         assert_eq!(session.engine_half.runtime.mid_turn_queue.pending_len(), 1);
@@ -789,15 +792,19 @@ mod tests {
             session.engine_half.runtime.mid_turn_queue.pending_len() == 0,
             "an idle session has no tool round to wait for"
         );
-        assert_eq!(app.pending_agent_prompts.len(), 1);
-        assert!(app.pending_agent_prompts[0].starts_with("<teammate-message"));
-        assert!(app.pending_agent_prompts[0].contains("wake up"));
+        let pending = session
+            .engine_half
+            .session_loop
+            .inbox()
+            .pending_context(ContextSource::Agent);
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].starts_with("<teammate-message"));
+        assert!(pending[0].contains("wake up"));
         assert!(app.input.is_empty());
 
-        let expected = app.pending_agent_prompts[0].clone();
-        let context = super::super::context_prompts::drain_model_context_prompts(&mut app);
-        assert_eq!(context, vec![expected]);
-        assert!(app.pending_agent_prompts.is_empty());
+        let context = super::super::context_prompts::drain_model_context_prompts(&session);
+        assert_eq!(context, pending);
+        assert!(!session.engine_half.session_loop.inbox().has_context());
         assert!(context[0].contains("wake up"));
     }
 

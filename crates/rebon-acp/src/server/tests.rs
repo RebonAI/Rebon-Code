@@ -981,6 +981,57 @@ fn assert_prompt_lifecycle_released(handler: &DefaultHandler, sid: &str) {
         .contains_key(sid));
 }
 
+/// Panics on its first turn, answers on the next.
+struct PanicThenSuccessExecutor {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl PromptExecutor for PanicThenSuccessExecutor {
+    async fn execute(
+        &self,
+        _request: PromptRequest,
+    ) -> Result<rebon_agent_core::prompt_executor::PromptOutcome, PromptExecutorError> {
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            panic!("synthetic executor panic");
+        }
+        Ok(rebon_agent_core::prompt_executor::PromptOutcome::end_turn())
+    }
+}
+
+/// An ACP turn runs on the session loop, so a turn that panics is reported
+/// to the client as an error and the session takes its next prompt.
+#[tokio::test]
+async fn a_panicking_turn_is_answered_as_an_error_and_the_session_carries_on() {
+    let executor = Arc::new(PanicThenSuccessExecutor {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let (handler, sid) = lifecycle_test_session(executor).await;
+
+    let err = handler
+        .handle_request(
+            "session/prompt",
+            Some(lifecycle_prompt_params(&sid, "boom")),
+        )
+        .await
+        .expect_err("a panicking turn is an error, not a lost request");
+    assert!(
+        err.message.contains("main prompt executor task panicked"),
+        "{}",
+        err.message
+    );
+    assert_prompt_lifecycle_released(&handler, &sid);
+
+    let result = handler
+        .handle_request(
+            "session/prompt",
+            Some(lifecycle_prompt_params(&sid, "next")),
+        )
+        .await
+        .expect("the next prompt runs");
+    assert_eq!(result["stopReason"], "end_turn");
+}
+
 #[tokio::test]
 async fn dropped_pending_prompt_cleans_lifecycle_and_allows_next_prompt() {
     let executor = Arc::new(AbortThenSuccessExecutor {
@@ -5869,9 +5920,6 @@ async fn serve_with_publishers_ignores_duplicate_permission_response() {
 
 // ---- sub_agents ConfigOption -----------------------------------
 
-
-
-
 #[test]
 fn session_scoped_permission_config_updates_do_not_change_shared_default() {
     for mode in ["plan", "bypassPermissions"] {
@@ -6125,7 +6173,6 @@ fn ultrawork_reminder_preserves_policy_across_fresh_and_saved_user_resume() {
         }
     }
 }
-
 
 // --- `_session/steering` ---
 

@@ -158,9 +158,9 @@ pub(crate) fn claimed_pending_prompt(state: &BackgroundJobState) -> Option<&Pend
 /// The text this turn may offer a classifier as the user's own words.
 ///
 /// `None` when there is nothing to offer, when the row is already durable after
-/// a crash, when the prompt is a coordinator report, and when it is a message
-/// from another agent: the auto-mode classifier reads this field as user
-/// intent, and another agent's message is not that.
+/// a crash, when the prompt is a coordinator report, and when nobody typed it
+/// (another agent's message, a cron fire): the auto-mode classifier reads this
+/// field as user intent, and those are not that.
 pub(crate) fn background_user_prompt(
     state: &BackgroundJobState,
     resume_saved_user: bool,
@@ -169,7 +169,7 @@ pub(crate) fn background_user_prompt(
         .filter(|pending| {
             !resume_saved_user
                 && pending.coordinator_report_paths.is_empty()
-                && !pending.is_agent_message()
+                && pending.typed_by_user()
         })
         .map(|pending| pending.text.clone())
 }
@@ -359,7 +359,7 @@ pub(crate) fn spawn_background_steer_pump(
                     // The steer blocks already carry the framed message; a
                     // queued-user row would render it as something the user
                     // typed, which it is not.
-                    if !prompt.is_agent_message() {
+                    if prompt.typed_by_user() {
                         publish_steered_pending_prompt(&update_publisher, &session_id, &prompt)
                             .await;
                     }
@@ -424,9 +424,10 @@ pub(crate) async fn publish_steered_pending_prompt(
 }
 
 pub(crate) fn pending_prompt_attachment_message(prompt: &PendingPrompt) -> rebon_api::Message {
-    // An agent message is the framed `<teammate-message>` and nothing else: no
-    // queued-user marker (it is not user input) and no queued-message row.
-    if prompt.is_agent_message() {
+    // An agent message is the framed `<teammate-message>`, a scheduled prompt
+    // the marked cron prompt, and nothing else: no queued-user marker (neither
+    // is user input) and no queued-message row.
+    if !prompt.typed_by_user() {
         return rebon_api::Message {
             role: rebon_api::Role::User,
             content: vec![rebon_api::ContentBlock::Text(rebon_api::TextBlock {
@@ -876,7 +877,7 @@ pub(crate) fn pending_prompt_transcript_state(
         claimed
             .iter()
             .skip(1)
-            .filter(|prompt| !prompt.is_agent_message())
+            .filter(|prompt| prompt.typed_by_user())
             .map(|prompt| prompt.id.as_str()),
     );
     pending_prompts_transcript_state_in_messages(&loaded.messages, &ids)

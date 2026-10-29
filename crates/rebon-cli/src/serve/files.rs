@@ -171,7 +171,15 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    // Held across the awaits on purpose: it only serialises tests that touch
+    // the environment, and nothing on this test's thread takes it.
+    #[allow(clippy::await_holding_lock)]
     async fn path_shaped_queries_read_the_directory_and_others_the_index() {
+        // The scan runs `git` and `rg` off `PATH`, which the file scanner's
+        // tests point at fakes (one sleeps past the git timeout) while they
+        // hold this lock. Without it, a scan that met those fakes outlasted
+        // the wait below.
+        let _env = crate::test_env::lock_env();
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();

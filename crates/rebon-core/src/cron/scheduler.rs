@@ -41,7 +41,7 @@ use rebon_tool::cron::tasks::{
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -53,9 +53,16 @@ const FILE_STABILITY_MS: u64 = 300;
 pub struct SchedulerHandle {
     stop_tx: Option<mpsc::Sender<()>>,
     join: Option<tokio::task::JoinHandle<()>>,
+    owns_lock: Arc<AtomicBool>,
 }
 
 impl SchedulerHandle {
+    /// Whether this scheduler currently holds the cwd's owner lock, and so
+    /// is the one that fires.
+    pub fn owns_lock(&self) -> bool {
+        self.owns_lock.load(Ordering::Acquire)
+    }
+
     /// Request shutdown and wait for the scheduler task to finish.
     pub async fn stop(mut self) {
         if let Some(tx) = self.stop_tx.take() {
@@ -116,10 +123,34 @@ pub fn start_scheduler_with_session_store(
     session_store: Option<Arc<SessionCronStore>>,
 ) -> SchedulerHandle {
     let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
-    let join = tokio::spawn(run_scheduler(config, poller, session_store, stop_rx));
+    let owns_lock = Arc::new(AtomicBool::new(false));
+    let join = tokio::spawn(run_scheduler(
+        config,
+        poller,
+        session_store,
+        stop_rx,
+        OwnerFlag(owns_lock.clone()),
+    ));
     SchedulerHandle {
         stop_tx: Some(stop_tx),
         join: Some(join),
+        owns_lock,
+    }
+}
+
+/// The scheduler task's side of [`SchedulerHandle::owns_lock`]. Cleared when
+/// the task ends, however it ends, since the lock goes with it.
+struct OwnerFlag(Arc<AtomicBool>);
+
+impl OwnerFlag {
+    fn set(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for OwnerFlag {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -128,6 +159,7 @@ async fn run_scheduler(
     poller: Arc<CronPoller>,
     session_store: Option<Arc<SessionCronStore>>,
     mut stop_rx: mpsc::Receiver<()>,
+    owner_flag: OwnerFlag,
 ) {
     if cron_disabled() {
         tracing::debug!("[CronScheduler] disabled by REBON_DISABLE_CRON");
@@ -167,6 +199,9 @@ async fn run_scheduler(
         &mut tasks,
         &mut next_fire,
     );
+    if owner.is_some() {
+        owner_flag.set();
+    }
 
     loop {
         tokio::select! {
@@ -201,6 +236,9 @@ async fn run_scheduler(
                     &mut tasks,
                     &mut next_fire,
                 );
+                if owner.is_some() {
+                    owner_flag.set();
+                }
             }
             _ = reload_rx.recv() => {
                 if cron_disabled() || owner.is_none() {

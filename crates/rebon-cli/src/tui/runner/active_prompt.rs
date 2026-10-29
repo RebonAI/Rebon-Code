@@ -10,7 +10,6 @@ use rebon_types::PromptPasteContent;
 use tokio::sync::oneshot;
 
 use crate::session::submit_payload::SubmitPayload;
-use crate::task_notification_poller::TaskNotificationPoller;
 
 /// oneshot receiver holding the final `PromptOutcome` (or error) of
 /// an in-flight prompt turn spawned onto the tokio runtime.
@@ -24,6 +23,8 @@ pub(super) enum LocalTurnSource {
     AutomaticFollowUp,
     IdleContext,
     TaskNotification,
+    /// A cron task that fired with no turn running to drain it.
+    Scheduled,
     PermissionRetry,
     ForegroundPermissionRetry,
     AgentViewAttachment,
@@ -58,13 +59,6 @@ pub(super) struct ActivePrompt {
     pub(super) cancel: PromptCancel,
     pub(super) pending_task_notification_ids: Vec<rebon_plugin_tasks::runtime::TaskId>,
     pub(super) pending_question_escalation_ids: Vec<rebon_tool::EscalationId>,
-    task_notification_claim: Option<(Arc<TaskNotificationPoller>, String)>,
-    /// Registry handle for settling question-escalation notifications
-    /// once the turn's real outcome is known. Carried on the prompt so
-    /// detached turns (which no longer have `app` in reach) can ack on
-    /// success and leave the escalations undelivered — retryable — on
-    /// failure.
-    question_escalation_registry: Option<rebon_tool::EscalationRegistry>,
     pub(super) withdrawable: Option<WithdrawableSubmit>,
     pub(super) user_message_uuid: Option<String>,
     /// Exact runtime provider/model captured when this turn was submitted.
@@ -117,6 +111,28 @@ impl SteerPumpHandle {
     }
 }
 
+impl LocalTurnSource {
+    /// The origin the session loop records for a turn from this entry point.
+    pub(super) fn turn_origin(self) -> crate::session::session_loop::TurnOrigin {
+        use crate::session::session_loop::TurnOrigin;
+        match self {
+            LocalTurnSource::DirectUserSubmit => TurnOrigin::User,
+            LocalTurnSource::Command => TurnOrigin::Command,
+            LocalTurnSource::QueuedFollowUp => TurnOrigin::Queued,
+            LocalTurnSource::AutomaticFollowUp => TurnOrigin::FollowUp,
+            LocalTurnSource::IdleContext => TurnOrigin::IdleContext,
+            LocalTurnSource::TaskNotification => TurnOrigin::TaskNotification,
+            LocalTurnSource::Scheduled => TurnOrigin::Scheduled,
+            LocalTurnSource::PermissionRetry | LocalTurnSource::ForegroundPermissionRetry => {
+                TurnOrigin::PermissionReplay
+            }
+            LocalTurnSource::AgentViewAttachment => TurnOrigin::AgentViewAttachment,
+            #[cfg(test)]
+            LocalTurnSource::TestOnly => TurnOrigin::User,
+        }
+    }
+}
+
 impl ActivePrompt {
     pub(super) fn new(rx: PromptResultRx, cancel: PromptCancel) -> Self {
         Self {
@@ -124,8 +140,6 @@ impl ActivePrompt {
             cancel,
             pending_task_notification_ids: Vec::new(),
             pending_question_escalation_ids: Vec::new(),
-            task_notification_claim: None,
-            question_escalation_registry: None,
             withdrawable: None,
             user_message_uuid: None,
             usage_model: None,
@@ -157,8 +171,6 @@ impl ActivePrompt {
             cancel,
             pending_task_notification_ids,
             pending_question_escalation_ids,
-            task_notification_claim: None,
-            question_escalation_registry: None,
             withdrawable: None,
             user_message_uuid: None,
             usage_model: None,
@@ -193,35 +205,6 @@ impl ActivePrompt {
     pub(super) fn with_steer_pump(mut self, pump: Option<SteerPumpHandle>) -> Self {
         self.steer_pump = pump;
         self
-    }
-
-    pub(super) fn with_task_notification_claim(
-        mut self,
-        poller: Arc<TaskNotificationPoller>,
-        turn_id: String,
-    ) -> Self {
-        self.task_notification_claim = Some((poller, turn_id));
-        self
-    }
-
-    pub(super) fn with_question_escalation_registry(
-        mut self,
-        registry: rebon_tool::EscalationRegistry,
-    ) -> Self {
-        self.question_escalation_registry = Some(registry);
-        self
-    }
-
-    pub(super) fn finish_question_escalation_notifications(&mut self) {
-        if let Some(registry) = self.question_escalation_registry.take() {
-            registry.mark_notifications_delivered(&self.pending_question_escalation_ids);
-        }
-    }
-
-    pub(super) fn finish_task_notification_claim(&mut self, succeeded: bool) {
-        if let Some((poller, turn_id)) = self.task_notification_claim.take() {
-            poller.finish_claim(&turn_id, succeeded);
-        }
     }
 
     pub(super) fn with_user_message_uuid(mut self, user_message_uuid: Option<String>) -> Self {

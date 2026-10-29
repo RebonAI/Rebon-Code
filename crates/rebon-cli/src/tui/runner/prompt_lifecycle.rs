@@ -6,12 +6,10 @@
 //! into flight. The checked local-turn admission API and its private raw
 //! executor dispatch live here too — everything that touches an `ActivePrompt`.
 
-use std::any::Any;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::runtime::Handle;
-use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 
 use rebon_render::normalize_system_api_error_text;
@@ -21,6 +19,8 @@ use rebon_types::{
     TextContent, ToolCallContent, ToolCallStatus,
 };
 
+use crate::session::session_inbox::ReadyInput;
+use crate::session::session_loop::{EscalationDelivery, TaskNotificationClaim, TurnDeliveries};
 use crate::session::submit_payload::{ensure_internal_submit_payload_user_uuid, SubmitPayload};
 use crate::session::ultraplan_run::UltraplanPhase;
 use crate::tui::app::{AppState, PromptCompletionStatus};
@@ -39,8 +39,8 @@ use super::ultraplan::{
 };
 use super::{
     commit_goal_continuation_feedback, drain_main_agent_updates, drain_model_context_prompts,
-    maybe_prepare_goal_continuation, reconcile_mid_turn_consumed_queued_submits,
-    repin_transcript_to_bottom, sync_follow_tail_after_updates, sync_foreground_agent_view,
+    finish_goal_check, reconcile_mid_turn_consumed_queued_submits, repin_transcript_to_bottom,
+    start_goal_check, sync_follow_tail_after_updates, sync_foreground_agent_view,
     with_main_agent_view, ActivePrompt, LocalTurnSource, PromptResultRx, WithdrawDestination,
     WithdrawableSubmit,
 };
@@ -53,12 +53,11 @@ pub(super) fn maybe_update_loading_state(
     session: &mut TuiEngineSession,
     handle: &Handle,
     active_prompt: &mut Option<ActivePrompt>,
-    task_notification_retry_after: &mut Option<Instant>,
 ) {
     let active_prompt_elapsed = active_prompt
         .as_ref()
         .map(|prompt| prompt.started_at.elapsed());
-    let prompt_result = poll_active_prompt(app, active_prompt, task_notification_retry_after);
+    let prompt_result = poll_active_prompt(app, active_prompt);
     let mut completed_elapsed = None;
     let mut completed_stop_reason = None;
     let mut completed_usage = rebon_types::Usage::default();
@@ -104,6 +103,11 @@ pub(super) fn maybe_update_loading_state(
                     // as orphaned overlay text.
                     app.rebon_tui.overlay.clear();
                 });
+            }
+            if active_prompt.is_none()
+                && finish_pending_goal_check(app, session, handle, active_prompt)
+            {
+                return;
             }
             if active_prompt.is_none()
                 && !turn_runs_elsewhere
@@ -218,15 +222,15 @@ pub(super) fn maybe_update_loading_state(
     if restore_foreground_agent_after_main_finalize {
         sync_foreground_agent_view(app, session.engine_half.tasks.as_ref());
     }
-    let goal_action = if !failed && !restore_foreground_agent_after_main_finalize {
-        completed_stop_reason.map(|reason| {
-            maybe_prepare_goal_continuation(app, session, handle, Some(format!("{reason:?}")))
-        })
-    } else {
-        None
-    };
-    if let Some(action) = goal_action.as_ref() {
-        commit_goal_continuation_feedback(app, action);
+    let goal_check_started = !failed
+        && !restore_foreground_agent_after_main_finalize
+        && completed_stop_reason.is_some_and(|reason| {
+            start_goal_check(app, session, handle, Some(format!("{reason:?}")))
+        });
+    // Whatever runs next waits for the goal check, which may move the goal on
+    // to a fresh session; `finish_pending_goal_check` picks it up from there.
+    if goal_check_started {
+        return;
     }
     maybe_spawn_next_queued_prompt(app, session, handle, active_prompt);
     if active_prompt.is_some() {
@@ -394,7 +398,6 @@ pub(super) fn commit_prompt_failure_message(
 pub(super) fn poll_active_prompt(
     _app: &mut AppState,
     active_prompt: &mut Option<ActivePrompt>,
-    task_notification_retry_after: &mut Option<Instant>,
 ) -> PromptPollResult {
     let Some(active) = active_prompt.as_mut() else {
         return PromptPollResult::Pending;
@@ -405,13 +408,6 @@ pub(super) fn poll_active_prompt(
             tracing::info!(stop_reason = ?outcome.stop_reason, "rebon-cli: prompt turn completed");
             let mut active = active_prompt.take().expect("active prompt present");
             let user_message_uuid = active.user_message_uuid.take();
-            let had_pending_notifications = !active.pending_task_notification_ids.is_empty()
-                || !active.pending_question_escalation_ids.is_empty();
-            active.finish_task_notification_claim(true);
-            if had_pending_notifications {
-                *task_notification_retry_after = None;
-            }
-            active.finish_question_escalation_notifications();
             let stop_reason = outcome.stop_reason;
             let usage = outcome.usage;
             let usage_model = active.usage_model.take();
@@ -429,17 +425,6 @@ pub(super) fn poll_active_prompt(
             tracing::warn!(error = %err, "rebon-cli: prompt turn failed");
             let mut active = active_prompt.take().expect("active prompt present");
             let runtime = active.runtime.take();
-            active.finish_task_notification_claim(false);
-            if !active.pending_task_notification_ids.is_empty()
-                || !active.pending_question_escalation_ids.is_empty()
-            {
-                *task_notification_retry_after = Some(Instant::now() + Duration::from_secs(10));
-                tracing::warn!(
-                    task_count = active.pending_task_notification_ids.len(),
-                    escalation_count = active.pending_question_escalation_ids.len(),
-                    "notification turn failed; leaving notifications unacked for retry"
-                );
-            }
             PromptPollResult::Failed {
                 error: err,
                 runtime,
@@ -451,12 +436,6 @@ pub(super) fn poll_active_prompt(
             tracing::warn!(error = %err, "rebon-cli: prompt oneshot closed without a result");
             let mut active = active_prompt.take().expect("active prompt present");
             let runtime = active.runtime.take();
-            active.finish_task_notification_claim(false);
-            if !active.pending_task_notification_ids.is_empty()
-                || !active.pending_question_escalation_ids.is_empty()
-            {
-                *task_notification_retry_after = Some(Instant::now() + Duration::from_secs(10));
-            }
             PromptPollResult::Failed {
                 error: err,
                 runtime,
@@ -465,71 +444,10 @@ pub(super) fn poll_active_prompt(
     }
 }
 
-fn spawn_prompt_executor_task(
-    handle: &Handle,
-    runtime: Arc<crate::session::runtime::SessionRuntime>,
-    executor: Arc<dyn rebon_agent_core::PromptExecutor>,
-    request: rebon_agent_core::PromptRequest,
-    turn_kind: &'static str,
-) -> PromptResultRx {
-    let (tx, rx) = oneshot::channel();
-    let turn_guard = runtime.mid_turn_queue.begin_turn();
-    let worker = handle.spawn(async move {
-        let _turn_guard = turn_guard;
-        let _runtime_guard = runtime;
-        executor.execute(request).await
-    });
-    handle.spawn(async move {
-        let result = match worker.await {
-            Ok(result) => result,
-            Err(err) => Err(prompt_executor_task_join_error(turn_kind, err)),
-        };
-        let _ = tx.send(result);
-    });
-    rx
-}
-
-fn prompt_executor_task_join_error(
-    turn_kind: &'static str,
-    err: tokio::task::JoinError,
-) -> rebon_agent_core::PromptExecutorError {
-    if err.is_panic() {
-        let join_error = err.to_string();
-        let panic = panic_payload_message(err.into_panic());
-        tracing::error!(
-            turn_kind,
-            panic = %panic,
-            join_error = %join_error,
-            "rebon-cli: prompt executor task panicked"
-        );
-        return rebon_agent_core::PromptExecutorError::Execution(format!(
-            "{turn_kind} prompt executor task panicked: {panic}"
-        ));
-    }
-
-    let message = if err.is_cancelled() {
-        format!("{turn_kind} prompt executor task was aborted before reporting a result")
-    } else {
-        format!("{turn_kind} prompt executor task failed before reporting a result: {err}")
-    };
-    tracing::error!(turn_kind, error = %err, "rebon-cli: prompt executor task failed");
-    rebon_agent_core::PromptExecutorError::Execution(message)
-}
-
 pub(super) fn prompt_result_channel_closed_error() -> rebon_agent_core::PromptExecutorError {
     rebon_agent_core::PromptExecutorError::Execution(
         "prompt executor result channel closed; task may have been aborted or the runtime shut down before reporting a result".to_string(),
     )
-}
-
-fn panic_payload_message(payload: Box<dyn Any + Send + 'static>) -> String {
-    if let Some(message) = payload.downcast_ref::<&'static str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_string()
-    }
 }
 
 pub(super) fn finalize_turn(app: &mut AppState, session_id: &str) {
@@ -569,6 +487,19 @@ fn maybe_spawn_next_queued_prompt_in_main_view(
     active_prompt: &mut Option<ActivePrompt>,
 ) {
     reconcile_mid_turn_consumed_queued_submits(app);
+
+    // Nothing leaves its queue unless a turn can start: a payload taken off
+    // first and then refused admission was gone, transcript row and all.
+    let has_next = !app.deferred_goal_submit_payloads.is_empty()
+        || !app.deferred_internal_submit_payloads.is_empty()
+        || (!app.queued_auto_drain_paused_after_withdrawal && !app.queued_commands.is_empty());
+    if !has_next {
+        return;
+    }
+    if let Some(reason) = local_turn_rejection(app, session, active_prompt.as_ref()) {
+        report_local_turn_rejection(app, &reason);
+        return;
+    }
 
     if !app.deferred_goal_submit_payloads.is_empty() {
         let mut submit = app.deferred_goal_submit_payloads.remove(0);
@@ -651,7 +582,7 @@ fn maybe_spawn_next_queued_prompt_in_main_view(
     }
 }
 
-pub(super) fn maybe_spawn_task_notification_prompt(
+fn maybe_spawn_task_notification_prompt(
     app: &mut AppState,
     session: &TuiEngineSession,
     handle: &Handle,
@@ -741,6 +672,132 @@ pub(super) fn maybe_spawn_task_notification_prompt(
     spawned
 }
 
+/// Apply a goal check that has finished, then start whatever was waiting on
+/// it: the goal's next session, or the queued prompts. Returns whether a
+/// check finished.
+fn finish_pending_goal_check(
+    app: &mut AppState,
+    session: &mut TuiEngineSession,
+    handle: &Handle,
+    active_prompt: &mut Option<ActivePrompt>,
+) -> bool {
+    let Some(action) = finish_goal_check(app, session, handle) else {
+        return false;
+    };
+    commit_goal_continuation_feedback(app, &action);
+    maybe_spawn_next_queued_prompt(app, session, handle, active_prompt);
+    if active_prompt.is_some() {
+        app.prompt_completion_status = None;
+    }
+    true
+}
+
+/// Start a turn from what the session's inbox has ready, trying each ready
+/// input in the inbox's priority order until one starts.
+pub(super) fn maybe_spawn_ready_idle_turn(
+    app: &mut AppState,
+    session: &TuiEngineSession,
+    handle: &Handle,
+    active_prompt: &mut Option<ActivePrompt>,
+) {
+    let inbox = session.engine_half.session_loop.inbox();
+    for input in inbox.ready_inputs(&session.engine_half.cron_poller) {
+        let started = match input {
+            ReadyInput::Context => {
+                match admit_idle_context_prompt(app, session, handle, active_prompt.as_ref()) {
+                    Some(admitted) => {
+                        *active_prompt = Some(admitted);
+                        app.is_loading = true;
+                        true
+                    }
+                    None => false,
+                }
+            }
+            ReadyInput::TaskNotifications => {
+                let started =
+                    maybe_spawn_task_notification_prompt(app, session, handle, active_prompt);
+                let undelivered = !session
+                    .engine_half
+                    .task_notification_poller
+                    .unnotified_notifications_for_session(&session.session_id)
+                    .is_empty()
+                    || !session
+                        .engine_half
+                        .tasks
+                        .unnotified_question_escalation_notifications()
+                        .is_empty();
+                if !started && undelivered {
+                    inbox.retry_task_notifications_later();
+                }
+                started
+            }
+            ReadyInput::Scheduled => {
+                maybe_spawn_scheduled_prompt(app, session, handle, active_prompt)
+            }
+        };
+        if started {
+            return;
+        }
+    }
+}
+
+/// Run the cron prompts that fired while no turn was there to drain them.
+///
+/// The engine hands a fired task to the model only after a tool round, so
+/// a task that fires while the session is idle, or during a turn the model
+/// answers without tools, would otherwise sit until the user types again.
+/// Returns whether a turn started.
+fn maybe_spawn_scheduled_prompt(
+    app: &mut AppState,
+    session: &TuiEngineSession,
+    handle: &Handle,
+    active_prompt: &mut Option<ActivePrompt>,
+) -> bool {
+    let cron = &session.engine_half.cron_poller;
+    if !cron.has_pending() {
+        return false;
+    }
+    // Leave the queue alone when no turn could start: the prompts are only
+    // taken once they are sure to be delivered.
+    if local_turn_rejection(app, session, active_prompt.as_ref()).is_some() {
+        return false;
+    }
+    let prompts = cron.take_marked_prompts();
+    if prompts.is_empty() {
+        return false;
+    }
+    let mut submit = SubmitPayload {
+        text: prompts.join("\n\n"),
+        model_text: None,
+        user_message_uuid: None,
+        image_pastes: Vec::new(),
+        directory_attachments: Vec::new(),
+        execution_policy: None,
+        skill_invocations: Vec::new(),
+    };
+    ensure_internal_submit_payload_user_uuid(&mut submit, &session.session_id);
+    with_main_agent_view(app, |app| {
+        let Some(submit) = apply_internal_submit(app, submit, &session.session_id) else {
+            return false;
+        };
+        repin_transcript_to_bottom(app);
+        if let Some(active) = admit_active_prompt(
+            app,
+            session,
+            handle,
+            active_prompt.as_ref(),
+            LocalTurnSource::Scheduled,
+            submit,
+        ) {
+            *active_prompt = Some(active);
+            app.is_loading = true;
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// An active goal runs unattended across many turns, so its turns opt
 /// into the relaxed auto-mode script review profile. Turns that already
 /// carry an ultraplan planning policy are left alone: those phases are
@@ -777,8 +834,7 @@ pub(super) fn admit_active_prompt(
         source,
         LocalTurnRequest::Prompt {
             submit,
-            pending_task_notification_ids: Vec::new(),
-            pending_question_escalation_ids: Vec::new(),
+            deliveries: TurnDeliveries::default(),
             coordinator_report_paths: Vec::new(),
         },
     ) {
@@ -802,6 +858,19 @@ fn admit_active_prompt_with_task_notifications(
     task_notification_turn_id: String,
 ) -> Option<ActivePrompt> {
     stamp_goal_script_continuity(app, &mut submit);
+    // The session loop acknowledges these when the turn ends.
+    let deliveries = TurnDeliveries {
+        task_notifications: Some(TaskNotificationClaim {
+            poller: session.engine_half.task_notification_poller.clone(),
+            session_id: session.session_id.clone(),
+            turn_id: task_notification_turn_id.clone(),
+            task_ids: pending_task_notification_ids,
+        }),
+        escalations: Some(EscalationDelivery {
+            registry: session.engine_half.tasks.escalation_registry(),
+            ids: pending_question_escalation_ids,
+        }),
+    };
     match admit_local_turn(
         app,
         session,
@@ -810,24 +879,18 @@ fn admit_active_prompt_with_task_notifications(
         LocalTurnSource::TaskNotification,
         LocalTurnRequest::Prompt {
             submit,
-            pending_task_notification_ids,
-            pending_question_escalation_ids,
+            deliveries,
             coordinator_report_paths,
         },
     ) {
-        Ok(active) => Some(
-            active
-                .with_task_notification_claim(
-                    session.engine_half.task_notification_poller.clone(),
-                    task_notification_turn_id,
-                )
-                .with_question_escalation_registry(session.engine_half.tasks.escalation_registry()),
-        ),
+        Ok(active) => Some(active),
+        // Refused before the loop saw it: nobody else will release the claim.
         Err(reason) => {
-            session
-                .engine_half
-                .task_notification_poller
-                .finish_claim(&task_notification_turn_id, false);
+            session.engine_half.task_notification_poller.finish_claim(
+                &session.session_id,
+                &task_notification_turn_id,
+                false,
+            );
             report_local_turn_rejection(app, &reason);
             None
         }
@@ -858,12 +921,18 @@ pub(super) fn admit_permission_replay_turn(
     }
 }
 
-pub(super) fn admit_idle_context_prompt(
+fn admit_idle_context_prompt(
     app: &mut AppState,
     session: &TuiEngineSession,
     handle: &Handle,
     active_prompt: Option<&ActivePrompt>,
 ) -> Option<ActivePrompt> {
+    // The idle pass asks again every time round while context is pending,
+    // so a refusal stays quiet here: reporting it added an error row to the
+    // transcript on every pass for as long as the session could not run it.
+    if local_turn_rejection(app, session, active_prompt).is_some() {
+        return None;
+    }
     match admit_local_turn(
         app,
         session,
@@ -883,8 +952,7 @@ pub(super) fn admit_idle_context_prompt(
 enum LocalTurnRequest {
     Prompt {
         submit: SubmitPayload,
-        pending_task_notification_ids: Vec<rebon_plugin_tasks::runtime::TaskId>,
-        pending_question_escalation_ids: Vec<rebon_tool::EscalationId>,
+        deliveries: TurnDeliveries,
         coordinator_report_paths: Vec<String>,
     },
     IdleContext,
@@ -915,14 +983,13 @@ fn admit_local_turn(
     // steer pump, cleanup, and permission retry, uses this exact Arc.
     let runtime = session.engine_half.runtime.clone();
     let cancel = PromptCancel::new();
-    let (request, user_message_uuid, pending_task_ids, pending_escalation_ids) = match request {
+    let (request, user_message_uuid, deliveries) = match request {
         LocalTurnRequest::Prompt {
             submit,
-            pending_task_notification_ids,
-            pending_question_escalation_ids,
+            deliveries,
             coordinator_report_paths,
         } => {
-            let injected_context = drain_model_context_prompts(app);
+            let injected_context = drain_model_context_prompts(session);
             let user_message_uuid = submit.user_message_uuid.clone();
             runtime.file_history_tracker.clear_current_message_id();
             if let Some(message_id) = user_message_uuid.clone() {
@@ -977,26 +1044,29 @@ fn admit_local_turn(
                     skill_invocations,
                 },
                 user_message_uuid,
-                pending_task_notification_ids,
-                pending_question_escalation_ids,
+                deliveries,
             )
         }
         LocalTurnRequest::IdleContext => {
-            let injected_context = drain_model_context_prompts(app);
+            let injected_context = drain_model_context_prompts(session);
+            // At the session's effort, like any other turn: a teammate's or
+            // another agent's message is answered as thoroughly as the
+            // person asked for, and a hosted session already does so.
+            let thinking = resolve_thinking_from_effort(app.effort_level, app.effort_provider_kind);
             (
                 rebon_agent_core::PromptRequest {
                     session_id: runtime.session_id.clone(),
                     cwd: runtime.cwd.clone(),
                     prompt: prompt_blocks(String::new(), Vec::new(), injected_context),
                     user_prompt: None,
-                    effort_is_session_default: false,
+                    effort_is_session_default: true,
                     update_publisher: Some(runtime.update_publisher.clone()),
                     permission_publisher: None,
                     mcp_servers: Vec::new(),
                     cancel: cancel.clone(),
-                    thinking_budget: None,
-                    max_tokens: None,
-                    reasoning_effort_ordinal: None,
+                    thinking_budget: thinking.thinking_budget,
+                    max_tokens: thinking.max_tokens,
+                    reasoning_effort_ordinal: thinking.reasoning_effort_ordinal,
                     additional_working_directories: session.startup.add_dirs.clone(),
                     coordinator_mode: Some(session.engine_half.coordinator_mode_handle.get()),
                     coordinator_report_paths: Vec::new(),
@@ -1008,41 +1078,62 @@ fn admit_local_turn(
                     skill_invocations: Vec::new(),
                 },
                 None,
-                Vec::new(),
-                Vec::new(),
+                TurnDeliveries::default(),
             )
         }
-        LocalTurnRequest::PermissionReplay { replay_requests } => (
-            rebon_agent_core::PromptRequest {
-                session_id: runtime.session_id.clone(),
-                cwd: runtime.cwd.clone(),
-                prompt: Vec::new(),
-                user_prompt: None,
-                effort_is_session_default: false,
-                update_publisher: Some(runtime.update_publisher.clone()),
-                permission_publisher: None,
-                mcp_servers: Vec::new(),
-                cancel: cancel.clone(),
-                thinking_budget: None,
-                max_tokens: None,
-                reasoning_effort_ordinal: None,
-                additional_working_directories: session.startup.add_dirs.clone(),
-                coordinator_mode: Some(session.engine_half.coordinator_mode_handle.get()),
-                coordinator_report_paths: Vec::new(),
-                user_message_uuid: None,
-                background_agent_system: None,
-                background_agent_tool_filter: None,
-                execution_policy: None,
-                replay_requests,
-                skill_invocations: Vec::new(),
-            },
-            None,
-            Vec::new(),
-            Vec::new(),
-        ),
+        LocalTurnRequest::PermissionReplay { replay_requests } => {
+            // The replay finishes the work the denied calls were part of, at
+            // the effort that work was started with.
+            let thinking = resolve_thinking_from_effort(app.effort_level, app.effort_provider_kind);
+            (
+                rebon_agent_core::PromptRequest {
+                    session_id: runtime.session_id.clone(),
+                    cwd: runtime.cwd.clone(),
+                    prompt: Vec::new(),
+                    user_prompt: None,
+                    effort_is_session_default: true,
+                    update_publisher: Some(runtime.update_publisher.clone()),
+                    permission_publisher: None,
+                    mcp_servers: Vec::new(),
+                    cancel: cancel.clone(),
+                    thinking_budget: thinking.thinking_budget,
+                    max_tokens: thinking.max_tokens,
+                    reasoning_effort_ordinal: thinking.reasoning_effort_ordinal,
+                    additional_working_directories: session.startup.add_dirs.clone(),
+                    coordinator_mode: Some(session.engine_half.coordinator_mode_handle.get()),
+                    coordinator_report_paths: Vec::new(),
+                    user_message_uuid: None,
+                    background_agent_system: None,
+                    background_agent_tool_filter: None,
+                    execution_policy: None,
+                    replay_requests,
+                    skill_invocations: Vec::new(),
+                },
+                None,
+                TurnDeliveries::default(),
+            )
+        }
     };
 
-    let rx = dispatch_admitted_local_turn(handle, runtime.clone(), request, source);
+    // What the turn carries, for the prompt to show; the loop settles it.
+    let pending_task_ids = deliveries
+        .task_notifications
+        .as_ref()
+        .map(|claim| claim.task_ids.clone())
+        .unwrap_or_default();
+    let pending_escalation_ids = deliveries
+        .escalations
+        .as_ref()
+        .map(|escalations| escalations.ids.clone())
+        .unwrap_or_default();
+    let rx = dispatch_admitted_local_turn(
+        handle,
+        session,
+        runtime.clone(),
+        request,
+        source,
+        deliveries,
+    );
     if matches!(
         source,
         LocalTurnSource::DirectUserSubmit | LocalTurnSource::Command
@@ -1092,6 +1183,11 @@ pub(super) fn local_turn_rejection(
 ) -> Option<String> {
     if active_prompt.is_some() {
         return Some("Cannot start another local turn while a prompt is running.".to_string());
+    }
+    if app.goal_check.is_pending() {
+        return Some(
+            "The goal is still being checked; the next turn starts when that finishes.".to_string(),
+        );
     }
     if let Some(remote) = session.remote_background_attachment.as_ref() {
         return Some(if remote.is_live() {
@@ -1179,20 +1275,24 @@ fn prompt_blocks(
     prompt_blocks
 }
 
+/// Every local turn the terminal starts goes to the session loop from here.
 fn dispatch_admitted_local_turn(
     handle: &Handle,
+    session: &TuiEngineSession,
     runtime: Arc<crate::session::runtime::SessionRuntime>,
     request: rebon_agent_core::PromptRequest,
     source: LocalTurnSource,
+    deliveries: TurnDeliveries,
 ) -> PromptResultRx {
-    let executor = runtime.executor.clone();
-    let label = match source {
-        LocalTurnSource::PermissionRetry | LocalTurnSource::ForegroundPermissionRetry => {
-            "permission replay"
-        }
-        _ => "main",
-    };
-    spawn_prompt_executor_task(handle, runtime, executor, request, label)
+    session.engine_half.session_loop.submit_turn(
+        handle,
+        crate::session::session_loop::TurnInput {
+            runtime,
+            request,
+            origin: source.turn_origin(),
+            deliveries,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1233,7 +1333,14 @@ fn dispatch_local_turn_for_test(
         replay_requests: Vec::new(),
         skill_invocations,
     };
-    dispatch_admitted_local_turn(handle, runtime, request, LocalTurnSource::TestOnly)
+    dispatch_admitted_local_turn(
+        handle,
+        session,
+        runtime,
+        request,
+        LocalTurnSource::TestOnly,
+        TurnDeliveries::default(),
+    )
 }
 
 pub(super) fn sync_current_session_title(app: &mut AppState, session: &TuiEngineSession) {
@@ -1399,6 +1506,7 @@ mod tests {
             production_part(include_str!("foreground_mailbox.rs")),
             production_part(include_str!("session_detach_attach.rs")),
             production_part(include_str!("event_loop_entry.rs")),
+            production_part(include_str!("native_commands.rs")),
         ]
         .join("\n");
         for variant in [
@@ -1408,6 +1516,7 @@ mod tests {
             "AutomaticFollowUp",
             "IdleContext",
             "TaskNotification",
+            "Scheduled",
             "PermissionRetry",
             "ForegroundPermissionRetry",
             "AgentViewAttachment",
@@ -1423,18 +1532,18 @@ mod tests {
             production_part(include_str!("foreground_mailbox.rs")),
             production_part(include_str!("session_detach_attach.rs")),
             production_part(include_str!("event_loop_entry.rs")),
+            production_part(include_str!("native_commands.rs")),
         ] {
-            assert!(!source.contains("spawn_prompt_executor_task"));
             assert!(!source.contains("dispatch_admitted_local_turn"));
             assert!(!source.contains(".execute(request)"));
         }
-        let raw_dispatch_marker = concat!("spawn_prompt_executor", "_task(");
+        // The executor is only ever reached through the session loop.
+        assert!(!production_prompt_lifecycle.contains(".execute("));
+        let loop_marker = concat!("session_loop", ".submit_turn(");
         assert_eq!(
-            production_prompt_lifecycle
-                .matches(raw_dispatch_marker)
-                .count(),
-            2,
-            "the raw executor task must have only its definition and the private admitted call"
+            production_prompt_lifecycle.matches(loop_marker).count(),
+            1,
+            "local turns reach the session loop from one dispatch point"
         );
         assert!(prompt_lifecycle.contains("fn dispatch_local_turn_for_test("));
         let test_seam = prompt_lifecycle
@@ -1686,15 +1795,8 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         tx.send(Ok(outcome)).unwrap();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         let usage = app.usage();
         assert_eq!(usage.last_turn.total_input_tokens, 203_000);
@@ -1723,15 +1825,8 @@ mod tests {
         session.swap_runtime("new-session", "/new", false).unwrap();
         let new = session.engine_half.runtime.clone();
         new.file_history_tracker.set_current_message_id("new-turn");
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert_eq!(
             rebon_agent_core::file_history::FileHistoryTracker::is_armed(&old.file_history_tracker),
@@ -1768,15 +1863,8 @@ mod tests {
         );
         app.rebon_tui.overlay.set_streaming_text("流上来的半句");
         let mut active = None;
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
         assert_eq!(
             app.rebon_tui.overlay.combined_streaming_text().as_deref(),
             Some("流上来的半句"),
@@ -1784,13 +1872,7 @@ mod tests {
         );
 
         session.remote_background_attachment = None;
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
         assert!(
             app.rebon_tui.overlay.is_empty(),
             "a local session with no prompt still clears late deltas"
@@ -1809,15 +1891,8 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         tx.send(Ok(outcome)).unwrap();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert_eq!(
             app.prompt_completion_status,
@@ -1876,19 +1951,12 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         tx.send(Ok(PromptOutcome::end_turn())).unwrap();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let mut retry_after = None;
         let mut session = make_test_tui_session();
         session.engine_half.tasks = reg;
         session.engine_half.update_rx = rebon_agent_core::ChannelSessionUpdatePublisher::new().1;
         let (runtime, handle) = make_immediate_handle();
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert!(active.is_none());
         assert_eq!(
@@ -1948,15 +2016,8 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         tx.send(Ok(PromptOutcome::end_turn())).unwrap();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
         runtime.block_on(tokio::task::yield_now());
 
         assert!(active.is_some());
@@ -2011,15 +2072,8 @@ mod tests {
         )))
         .unwrap();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert!(active.is_none());
         assert!(app.foregrounded_task_id.is_none());
@@ -2047,17 +2101,10 @@ mod tests {
         app.main_agent_view = Some(main);
         app.foregrounded_task_id = Some("agent-1".into());
         let mut active = None;
-        let mut retry_after = None;
         let mut session = make_test_tui_session();
         let (runtime, handle) = make_immediate_handle();
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert_eq!(app.foregrounded_task_id.as_deref(), Some("agent-1"));
         assert_eq!(app.rebon_tui.overlay.blocks.len(), child_overlay_blocks);
@@ -2076,17 +2123,10 @@ mod tests {
         app.prompt_completion_status = Some(PromptCompletionStatus::Failed);
         let (_tx, rx) = oneshot::channel();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let mut retry_after = None;
         let mut session = make_test_tui_session();
         let (runtime, handle) = make_immediate_handle();
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert!(active.is_some());
         assert_eq!(app.prompt_completion_status, None);
@@ -2106,8 +2146,7 @@ mod tests {
                 .with_usage_model("provider-before-switch", "model-before-switch"),
         );
 
-        let mut retry_after = None;
-        let result = poll_active_prompt(&mut app, &mut active, &mut retry_after);
+        let result = poll_active_prompt(&mut app, &mut active);
 
         assert!(matches!(
             result,
@@ -2143,17 +2182,10 @@ mod tests {
             .with_user_message_uuid(Some("u-worked".into()));
         prompt.started_at = Instant::now() - Duration::from_secs(3_723);
         let mut active = Some(prompt);
-        let mut retry_after = None;
         let mut session = make_test_tui_session();
         let (runtime, handle) = make_immediate_handle();
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert!(active.is_none());
         let rows = app.rebon_tui.transcript.rows();
@@ -2180,17 +2212,10 @@ mod tests {
             .with_user_message_uuid(Some("u-failed".into()));
         prompt.started_at = Instant::now() - Duration::from_secs(62);
         let mut active = Some(prompt);
-        let mut retry_after = None;
         let mut session = make_test_tui_session();
         let (runtime, handle) = make_immediate_handle();
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert!(app.rebon_tui.transcript.rows().iter().all(|row| !matches!(
             row,
@@ -2219,15 +2244,8 @@ mod tests {
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
         let mut session = make_test_tui_session();
         let (runtime, handle) = make_immediate_handle();
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert!(active.is_none());
         assert!(app.ultraplan_status.is_none());
@@ -2261,15 +2279,8 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         tx.send(Ok(PromptOutcome::end_turn())).unwrap();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert!(active.is_none());
         assert!(app.ultraplan_status.is_none());
@@ -2286,8 +2297,7 @@ mod tests {
         .unwrap();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
 
-        let mut retry_after = None;
-        let result = poll_active_prompt(&mut app, &mut active, &mut retry_after);
+        let result = poll_active_prompt(&mut app, &mut active);
 
         assert!(matches!(result, PromptPollResult::Failed { .. }));
         assert!(active.is_none());
@@ -2319,6 +2329,196 @@ mod tests {
             prompt_failure_display_text("Prompt turn failed: prompt executor failed: model stream error: model client bad request: 400: ws error (websocket_connection_limit_reached): Responses websocket connection limit reached (60 minutes)."),
             "Responses websocket connection limit reached (60 minutes)."
         );
+    }
+
+    /// Logs each turn's start and end; a turn named "boom" panics, and the
+    /// others wait for a permit before they end.
+    struct GatedPromptExecutor {
+        log: Mutex<Vec<String>>,
+        requests: Mutex<Vec<PromptRequest>>,
+        permits: tokio::sync::Semaphore,
+    }
+
+    impl Default for GatedPromptExecutor {
+        fn default() -> Self {
+            Self {
+                log: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
+                permits: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl rebon_agent_core::PromptExecutor for GatedPromptExecutor {
+        async fn execute(
+            &self,
+            request: PromptRequest,
+        ) -> Result<PromptOutcome, PromptExecutorError> {
+            let name = match request.prompt.first() {
+                Some(ContentBlock::Text(text)) => text.text.clone(),
+                _ => String::new(),
+            };
+            self.log.lock().unwrap().push(format!("start {name}"));
+            self.requests.lock().unwrap().push(request);
+            if name == "boom" {
+                panic!("synthetic executor panic");
+            }
+            self.permits.acquire().await.unwrap().forget();
+            self.log.lock().unwrap().push(format!("end {name}"));
+            Ok(PromptOutcome::end_turn())
+        }
+    }
+
+    fn dispatch_named_turn(
+        session: &TuiEngineSession,
+        handle: &Handle,
+        name: &str,
+    ) -> PromptResultRx {
+        dispatch_local_turn_for_test(
+            session,
+            handle,
+            name.into(),
+            Vec::new(),
+            Vec::new(),
+            PromptCancel::new(),
+            ThinkingOverrides {
+                thinking_budget: None,
+                max_tokens: None,
+                reasoning_effort_ordinal: None,
+            },
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn settle(runtime: &tokio::runtime::Runtime) {
+        runtime.block_on(async {
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+
+    #[test]
+    fn session_loop_runs_turns_one_at_a_time_in_arrival_order() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let executor = Arc::new(GatedPromptExecutor::default());
+        session.set_test_executor(executor.clone());
+
+        let first = dispatch_named_turn(&session, &handle, "first");
+        let second = dispatch_named_turn(&session, &handle, "second");
+        settle(&runtime);
+        assert_eq!(*executor.log.lock().unwrap(), ["start first"]);
+
+        executor.permits.add_permits(1);
+        assert!(runtime.block_on(first).unwrap().is_ok());
+        settle(&runtime);
+        assert_eq!(
+            *executor.log.lock().unwrap(),
+            ["start first", "end first", "start second"]
+        );
+
+        executor.permits.add_permits(1);
+        assert!(runtime.block_on(second).unwrap().is_ok());
+        runtime.shutdown_background();
+    }
+
+    /// Pushes `dropped` to the log when the work holding it is dropped.
+    struct DropMark(Arc<GatedPromptExecutor>);
+
+    impl Drop for DropMark {
+        fn drop(&mut self) {
+            self.0.log.lock().unwrap().push("work dropped".into());
+        }
+    }
+
+    #[test]
+    fn a_turn_sent_during_a_compaction_waits_for_it() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let executor = Arc::new(GatedPromptExecutor::default());
+        session.set_test_executor(executor.clone());
+        executor.permits.add_permits(1);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (log, gate) = (executor.clone(), release.clone());
+        session.engine_half.session_loop.submit_history_work(
+            &handle,
+            crate::session::session_loop::HistoryWork {
+                work: Box::pin(async move {
+                    log.log.lock().unwrap().push("work start".into());
+                    gate.notified().await;
+                    log.log.lock().unwrap().push("work end".into());
+                }),
+                yields: false,
+            },
+        );
+        let turn = dispatch_named_turn(&session, &handle, "after");
+        settle(&runtime);
+        assert_eq!(*executor.log.lock().unwrap(), ["work start"]);
+
+        release.notify_one();
+        assert!(runtime.block_on(turn).unwrap().is_ok());
+        assert_eq!(
+            *executor.log.lock().unwrap(),
+            ["work start", "work end", "start after", "end after"]
+        );
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn an_idle_compaction_gives_way_to_a_turn() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let executor = Arc::new(GatedPromptExecutor::default());
+        session.set_test_executor(executor.clone());
+        executor.permits.add_permits(1);
+        let mark = DropMark(executor.clone());
+        let log = executor.clone();
+        session.engine_half.session_loop.submit_history_work(
+            &handle,
+            crate::session::session_loop::HistoryWork {
+                work: Box::pin(async move {
+                    let _mark = mark;
+                    log.log.lock().unwrap().push("work start".into());
+                    std::future::pending::<()>().await;
+                }),
+                yields: true,
+            },
+        );
+        settle(&runtime);
+
+        let turn = dispatch_named_turn(&session, &handle, "after");
+        assert!(runtime.block_on(turn).unwrap().is_ok());
+        assert_eq!(
+            *executor.log.lock().unwrap(),
+            ["work start", "work dropped", "start after", "end after"]
+        );
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn session_loop_survives_a_turn_that_panics() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let executor = Arc::new(GatedPromptExecutor::default());
+        session.set_test_executor(executor.clone());
+        executor.permits.add_permits(1);
+
+        let boom = dispatch_named_turn(&session, &handle, "boom");
+        let after = dispatch_named_turn(&session, &handle, "after");
+
+        let err = runtime.block_on(boom).unwrap().unwrap_err().to_string();
+        assert!(err.contains("main prompt executor task panicked"), "{err}");
+        assert!(runtime.block_on(after).unwrap().is_ok());
+        assert_eq!(
+            *executor.log.lock().unwrap(),
+            ["start boom", "start after", "end after"]
+        );
+        runtime.shutdown_background();
     }
 
     #[test]
@@ -2361,9 +2561,8 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         drop(tx);
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let mut retry_after = None;
 
-        let result = poll_active_prompt(&mut app, &mut active, &mut retry_after);
+        let result = poll_active_prompt(&mut app, &mut active);
 
         let PromptPollResult::Failed { error, .. } = result else {
             panic!("expected closed result channel to fail prompt");
@@ -2400,15 +2599,8 @@ mod tests {
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
         let mut session = make_test_tui_session();
         let (runtime, handle) = make_immediate_handle();
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert!(active.is_none());
         assert_eq!(
@@ -2475,14 +2667,7 @@ mod tests {
                 let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
                 let mut session = make_test_tui_session();
                 let (runtime, handle) = make_immediate_handle();
-                let mut retry_after = None;
-                maybe_update_loading_state(
-                    &mut app,
-                    &mut session,
-                    &handle,
-                    &mut active,
-                    &mut retry_after,
-                );
+                maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
                 assert!(active.is_none());
                 assert_eq!(
                     app.prompt_completion_status,
@@ -2753,6 +2938,321 @@ mod tests {
         runtime.shutdown_background();
     }
 
+    fn attach_to_remote_worker(session: &mut TuiEngineSession) {
+        session.remote_background_attachment =
+            Some(crate::background::RemoteBackgroundAttachment::new(
+                "bg-remote".into(),
+                session.session_id.clone(),
+                "/remote".into(),
+                crate::background::BackgroundJobStatus::Running,
+                0,
+                crate::background::BackgroundIpcEndpoint {
+                    pid: 1,
+                    port: 1,
+                    token: "token".into(),
+                },
+            ));
+    }
+
+    fn system_error_rows(app: &AppState) -> usize {
+        app.rebon_tui
+            .transcript
+            .rows()
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row,
+                    rebon_tui::Message::System(system)
+                        if system.level == Some(rebon_tui::SystemLevel::Error)
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn refused_idle_context_stays_pending_without_an_error_row() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        attach_to_remote_worker(&mut session);
+        session.engine_half.session_loop.inbox().push_context(
+            crate::session::session_inbox::ContextSource::Teammate,
+            ["<teammate-message>hi</teammate-message>".to_string()],
+        );
+
+        for _ in 0..3 {
+            assert!(admit_idle_context_prompt(&mut app, &session, &handle, None).is_none());
+        }
+        runtime.block_on(tokio::task::yield_now());
+
+        assert_eq!(system_error_rows(&app), 0);
+        assert!(session.engine_half.session_loop.inbox().has_context());
+        assert!(recorder.take_requests().is_empty());
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn refused_follow_up_keeps_the_queued_prompt() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        crate::tui::dispatch::enqueue_submit_payload_in_mode(
+            &mut app,
+            admission_test_submit("run after"),
+            "prompt".into(),
+        );
+        app.deferred_internal_submit_payloads
+            .push(admission_test_submit("internal follow-up"));
+        attach_to_remote_worker(&mut session);
+        let rows_before = app.rebon_tui.transcript.rows().len();
+        let mut active_prompt = None;
+
+        maybe_spawn_next_queued_prompt_in_main_view(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active_prompt,
+        );
+        runtime.block_on(tokio::task::yield_now());
+
+        assert!(active_prompt.is_none());
+        assert_eq!(app.queued_commands.len(), 1);
+        assert_eq!(app.deferred_internal_submit_payloads.len(), 1);
+        // The refusal is reported once, and nothing else reached the transcript.
+        assert_eq!(system_error_rows(&app), 1);
+        assert_eq!(app.rebon_tui.transcript.rows().len(), rows_before + 1);
+        assert!(recorder.take_requests().is_empty());
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn work_sent_during_a_goal_check_waits_for_it() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        let finish = app.goal_check.start_for_test();
+        session
+            .engine_half
+            .cron_poller
+            .enqueue("check the build".into());
+        let mut active_prompt = None;
+
+        // Neither a cron fire nor a typed prompt starts while it runs.
+        maybe_spawn_ready_idle_turn(&mut app, &session, &handle, &mut active_prompt);
+        assert!(active_prompt.is_none());
+        assert_eq!(system_error_rows(&app), 0);
+        assert!(!super::super::submit::submit_or_queue(
+            &mut app,
+            "typed meanwhile".into(),
+            &mut session,
+            &handle,
+            &mut active_prompt,
+            &mut None,
+            crate::ui_config::UiMode::Screen,
+        ));
+        assert!(active_prompt.is_none());
+        assert_eq!(app.queued_commands.len(), 1);
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active_prompt);
+        assert!(active_prompt.is_none(), "still checking");
+
+        finish
+            .send(Ok(
+                super::super::goal_continuation::GoalContinuationAction::None,
+            ))
+            .unwrap();
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active_prompt);
+        runtime.block_on(tokio::task::yield_now());
+
+        assert!(!app.goal_check.is_pending());
+        let active = active_prompt
+            .as_ref()
+            .expect("the queued prompt runs once it is done");
+        assert_eq!(active.source, LocalTurnSource::QueuedFollowUp);
+        assert!(app.queued_commands.is_empty());
+        assert_eq!(recorder.take_requests().len(), 1);
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn idle_context_and_permission_replay_turns_run_at_the_session_effort() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        app.effort_level = Some(rebon_types::ReasoningEffort::Low);
+        let expected = resolve_thinking_from_effort(app.effort_level, app.effort_provider_kind);
+        assert!(
+            expected.thinking_budget.is_some() || expected.reasoning_effort_ordinal.is_some(),
+            "low effort has to say something for this test to mean anything"
+        );
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+
+        session.engine_half.session_loop.inbox().push_context(
+            crate::session::session_inbox::ContextSource::Teammate,
+            ["<teammate-message>hi</teammate-message>".to_string()],
+        );
+        let idle = admit_idle_context_prompt(&mut app, &session, &handle, None).expect("idle turn");
+        runtime.block_on(tokio::task::yield_now());
+        drop(idle);
+        let replay = admit_permission_replay_turn(
+            &mut app,
+            &session,
+            &handle,
+            None,
+            LocalTurnSource::PermissionRetry,
+            vec![rebon_agent_core::DenialReplayRequest {
+                denial_id: "d-1".into(),
+                tool_use_id: "call-1".into(),
+                tool_name: "Bash".into(),
+                tool_input: "{}".into(),
+                reason: "denied".into(),
+                task_id: None,
+                conversation_id: None,
+            }],
+        )
+        .expect("replay turn");
+        runtime.block_on(tokio::task::yield_now());
+        drop(replay);
+
+        let requests = recorder.take_requests();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert!(request.effort_is_session_default);
+            assert_eq!(request.thinking_budget, expected.thinking_budget);
+            assert_eq!(request.max_tokens, expected.max_tokens);
+            assert_eq!(
+                request.reasoning_effort_ordinal,
+                expected.reasoning_effort_ordinal
+            );
+        }
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn idle_inputs_start_one_turn_in_priority_order() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        session
+            .engine_half
+            .cron_poller
+            .enqueue("check the build".into());
+        session.engine_half.session_loop.inbox().push_context(
+            crate::session::session_inbox::ContextSource::Teammate,
+            ["<teammate-message>hi</teammate-message>".to_string()],
+        );
+        let mut active_prompt = None;
+
+        maybe_spawn_ready_idle_turn(&mut app, &session, &handle, &mut active_prompt);
+        runtime.block_on(tokio::task::yield_now());
+
+        let active = active_prompt.as_ref().expect("an idle turn started");
+        assert_eq!(active.source, LocalTurnSource::IdleContext);
+        assert!(!session.engine_half.session_loop.inbox().has_context());
+        assert!(
+            session.engine_half.cron_poller.has_pending(),
+            "the cron fire waits for the next idle pass"
+        );
+        assert_eq!(recorder.take_requests().len(), 1);
+
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn idle_inputs_wait_quietly_while_no_turn_can_start() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        attach_to_remote_worker(&mut session);
+        session
+            .engine_half
+            .cron_poller
+            .enqueue("check the build".into());
+        session.engine_half.session_loop.inbox().push_context(
+            crate::session::session_inbox::ContextSource::Channel,
+            ["<channel>ping</channel>".to_string()],
+        );
+        let mut active_prompt = None;
+
+        for _ in 0..3 {
+            maybe_spawn_ready_idle_turn(&mut app, &session, &handle, &mut active_prompt);
+        }
+        runtime.block_on(tokio::task::yield_now());
+
+        assert!(active_prompt.is_none());
+        assert_eq!(system_error_rows(&app), 0);
+        assert!(session.engine_half.session_loop.inbox().has_context());
+        assert!(session.engine_half.cron_poller.has_pending());
+        assert!(recorder.take_requests().is_empty());
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn idle_cron_fire_starts_a_scheduled_turn() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        session
+            .engine_half
+            .cron_poller
+            .enqueue("check the build".into());
+        let mut active_prompt = None;
+
+        assert!(maybe_spawn_scheduled_prompt(
+            &mut app,
+            &session,
+            &handle,
+            &mut active_prompt
+        ));
+        runtime.block_on(tokio::task::yield_now());
+
+        let active = active_prompt.as_ref().expect("scheduled prompt spawned");
+        assert_eq!(active.source, LocalTurnSource::Scheduled);
+        assert!(!session.engine_half.cron_poller.has_pending());
+        let requests = recorder.take_requests();
+        assert_eq!(requests.len(), 1);
+        // Not the user typing: no user prompt for hooks or the classifier.
+        assert_eq!(requests[0].user_prompt, None);
+        let prompt_text = match &requests[0].prompt[0] {
+            ContentBlock::Text(text) => text.text.as_str(),
+            other => panic!("expected scheduled text prompt, got {other:?}"),
+        };
+        assert_eq!(
+            prompt_text,
+            rebon_tool::cron::mark_scheduled_prompt("check the build")
+        );
+
+        // A second fire while that turn runs stays queued for the engine.
+        session
+            .engine_half
+            .cron_poller
+            .enqueue("and the tests".into());
+        assert!(!maybe_spawn_scheduled_prompt(
+            &mut app,
+            &session,
+            &handle,
+            &mut active_prompt
+        ));
+        assert!(session.engine_half.cron_poller.has_pending());
+
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
     #[test]
     fn task_notification_prompt_inherits_active_goal_continuity_policy() {
         let (runtime, handle) = make_immediate_handle();
@@ -2916,7 +3416,6 @@ mod tests {
         };
         insert_terminal_agent_notification(&mut app, "agent-retry", output_file);
         let mut active_prompt = None;
-        let mut retry_after = None;
 
         maybe_spawn_task_notification_prompt(&mut app, &session, &handle, &mut active_prompt);
         runtime.block_on(tokio::task::yield_now());
@@ -2928,11 +3427,15 @@ mod tests {
         );
 
         assert!(matches!(
-            poll_active_prompt(&mut app, &mut active_prompt, &mut retry_after),
+            poll_active_prompt(&mut app, &mut active_prompt),
             PromptPollResult::Failed { .. }
         ));
         assert!(active_prompt.is_none());
-        assert!(retry_after.is_some_and(|deadline| deadline > Instant::now()));
+        assert!(session
+            .engine_half
+            .session_loop
+            .inbox()
+            .task_notification_retry_pending());
         assert!(
             !app.tasks
                 .snapshot(&rebon_plugin_tasks::runtime::TaskId::new("agent-retry"))
@@ -2958,14 +3461,73 @@ mod tests {
         runtime.shutdown_background();
     }
 
+    /// Runs until its turn is cancelled, then reports the cancellation.
+    struct RunsUntilCancelled;
+
+    #[async_trait::async_trait]
+    impl rebon_agent_core::PromptExecutor for RunsUntilCancelled {
+        async fn execute(
+            &self,
+            request: PromptRequest,
+        ) -> Result<PromptOutcome, PromptExecutorError> {
+            while !request.cancel.is_cancelled() {
+                request.cancel.notified().await;
+            }
+            Err(PromptExecutorError::Cancelled)
+        }
+    }
+
+    #[test]
+    fn cancelling_a_task_notification_turn_leaves_its_notifications_retryable() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        let mut session = make_test_tui_session();
+        app.tasks = session.engine_half.tasks.clone();
+        session.set_test_executor(Arc::new(RunsUntilCancelled));
+        insert_terminal_agent_notification(&mut app, "agent-cancel", "/tmp/agent-cancel.report.md");
+        let unnotified = |session: &TuiEngineSession| {
+            session
+                .engine_half
+                .task_notification_poller
+                .unnotified_notifications_for_session(&session.session_id)
+                .len()
+        };
+        let mut active_prompt = None;
+
+        maybe_spawn_task_notification_prompt(&mut app, &session, &handle, &mut active_prompt);
+        settle(&runtime);
+        assert!(active_prompt.is_some());
+        assert_eq!(unnotified(&session), 0, "claimed by the running turn");
+
+        assert!(apply_interrupt(
+            &mut app,
+            &session,
+            &mut active_prompt,
+            UiMode::Screen
+        ));
+        assert!(active_prompt.is_none());
+        settle(&runtime);
+
+        assert_eq!(unnotified(&session), 1, "handed back once the turn stopped");
+        assert!(
+            !session
+                .engine_half
+                .session_loop
+                .inbox()
+                .task_notification_retry_pending(),
+            "a cancel is not a failure to retry"
+        );
+        runtime.shutdown_background();
+    }
+
     #[test]
     fn question_escalation_prompt_injects_xml_and_acks_after_success() {
         let (runtime, handle) = make_immediate_handle();
         let mut app = AppState::new();
         let mut session = make_test_tui_session();
         app.tasks = session.engine_half.tasks.clone();
-        let recorder = Arc::new(RecordingPromptExecutor::default());
-        session.set_test_executor(recorder.clone());
+        let executor = Arc::new(GatedPromptExecutor::default());
+        session.set_test_executor(executor.clone());
         let client = app
             .tasks
             .escalation_registry()
@@ -2977,7 +3539,6 @@ mod tests {
         });
         runtime.block_on(tokio::task::yield_now());
         let mut active_prompt = None;
-        let mut retry_after = None;
 
         maybe_spawn_task_notification_prompt(&mut app, &session, &handle, &mut active_prompt);
         runtime.block_on(tokio::task::yield_now());
@@ -2985,16 +3546,19 @@ mod tests {
         let active = active_prompt.as_ref().expect("escalation prompt spawned");
         assert!(active.pending_task_notification_ids.is_empty());
         assert_eq!(active.pending_question_escalation_ids.len(), 1);
-        let requests = recorder.take_requests();
-        assert_eq!(requests.len(), 1);
-        assert!(requests[0].coordinator_report_paths.is_empty());
-        let prompt_text = match &requests[0].prompt[0] {
-            ContentBlock::Text(text) => text.text.as_str(),
-            other => panic!("expected question escalation text prompt, got {other:?}"),
-        };
-        assert!(prompt_text.contains("<question-escalation>"));
-        assert!(prompt_text.contains("<agent-id>agent-question</agent-id>"));
-        assert!(prompt_text.contains("Which path should I take?"));
+        {
+            let requests = executor.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].coordinator_report_paths.is_empty());
+            let prompt_text = match &requests[0].prompt[0] {
+                ContentBlock::Text(text) => text.text.as_str(),
+                other => panic!("expected question escalation text prompt, got {other:?}"),
+            };
+            assert!(prompt_text.contains("<question-escalation>"));
+            assert!(prompt_text.contains("<agent-id>agent-question</agent-id>"));
+            assert!(prompt_text.contains("Which path should I take?"));
+        }
+        // Still undelivered while the turn runs.
         assert_eq!(
             app.tasks
                 .unnotified_question_escalation_notifications()
@@ -3002,8 +3566,10 @@ mod tests {
             1
         );
 
+        executor.permits.add_permits(1);
+        settle(&runtime);
         assert!(matches!(
-            poll_active_prompt(&mut app, &mut active_prompt, &mut retry_after),
+            poll_active_prompt(&mut app, &mut active_prompt),
             PromptPollResult::Succeeded { .. }
         ));
         assert!(app
@@ -3037,7 +3603,6 @@ mod tests {
             runtime.spawn(async move { client.escalate("Retry this?".into(), None, None).await });
         runtime.block_on(tokio::task::yield_now());
         let mut active_prompt = None;
-        let mut retry_after = None;
 
         maybe_spawn_task_notification_prompt(&mut app, &session, &handle, &mut active_prompt);
         runtime.block_on(tokio::task::yield_now());
@@ -3046,11 +3611,15 @@ mod tests {
         assert!(first_requests[0].coordinator_report_paths.is_empty());
 
         assert!(matches!(
-            poll_active_prompt(&mut app, &mut active_prompt, &mut retry_after),
+            poll_active_prompt(&mut app, &mut active_prompt),
             PromptPollResult::Failed { .. }
         ));
         assert!(active_prompt.is_none());
-        assert!(retry_after.is_some_and(|deadline| deadline > Instant::now()));
+        assert!(session
+            .engine_half
+            .session_loop
+            .inbox()
+            .task_notification_retry_pending());
         assert_eq!(
             app.tasks
                 .unnotified_question_escalation_notifications()
@@ -3186,17 +3755,10 @@ mod tests {
         app.foregrounded_task_id = Some("agent-foreground".into());
         sync_foreground_agent_view(&mut app, session.engine_half.tasks.as_ref());
         let mut active_prompt = None;
-        let mut retry_after = None;
 
         maybe_spawn_task_notification_prompt(&mut app, &session, &handle, &mut active_prompt);
         runtime.block_on(tokio::task::yield_now());
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active_prompt,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active_prompt);
 
         assert!(active_prompt.is_none());
         assert_eq!(
@@ -3316,13 +3878,7 @@ mod tests {
         .await
         .expect("shell result persisted");
         let mut active_prompt = None;
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active_prompt,
-            &mut None,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active_prompt);
         assert!(
             active_prompt.is_some(),
             "shell completion must start an agent reply without user input"
@@ -3370,7 +3926,7 @@ mod tests {
                 "active" => active = Some(ActivePrompt::new(rx, PromptCancel::new())),
                 _ => unreachable!(),
             }
-            maybe_update_loading_state(&mut app, &mut session, &handle, &mut active, &mut None);
+            maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
             assert_eq!(app.deferred_internal_submit_payloads.len(), 1, "{blocked}");
             assert_eq!(active.is_some(), blocked == "active");
             assert!(app.rebon_tui.transcript.is_empty());

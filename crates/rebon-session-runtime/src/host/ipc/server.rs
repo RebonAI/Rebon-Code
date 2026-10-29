@@ -1556,6 +1556,19 @@ pub(crate) fn restated_pending_permission(
     })
 }
 
+/// The query a permission event asks, if it is one.
+///
+/// A permission is written to the job record before it is published, so a
+/// client that subscribes between the two finds it pending (and is given it
+/// as a restatement) and then receives the live event too. Subscribers use
+/// this to let the live copy of what they restated go by.
+pub(crate) fn permission_query_id(event: &rebon_session_host::SessionEvent) -> Option<u64> {
+    match event {
+        rebon_session_host::SessionEvent::Permission { query, .. } => Some(query.query_id),
+        _ => None,
+    }
+}
+
 /// Whether a request changes state every attached client has to agree with.
 ///
 /// Answering a permission and cancelling a turn count: both move the session
@@ -1643,8 +1656,9 @@ fn stream_session_events(
     // that never hears it leaves the tool blocked until the turn is
     // cancelled. So it is restated to this subscriber alone, and only when the
     // replay did not already carry it.
-    let restated = restated_pending_permission(&state, &subscription.replay, subscription.cursor)
-        .and_then(|event| serde_json::to_string(&event).ok());
+    let restated = restated_pending_permission(&state, &subscription.replay, subscription.cursor);
+    let mut restated_query = restated.as_ref().and_then(permission_query_id);
+    let restated = restated.and_then(|event| serde_json::to_string(&event).ok());
     for line in subscription.replay {
         if write_event_line(&mut stream, &line).is_err() {
             return;
@@ -1656,6 +1670,17 @@ fn stream_session_events(
         }
     }
     while let Ok(line) = subscription.events.recv() {
+        if restated_query.is_some() {
+            let repeats = serde_json::from_str::<rebon_session_host::SessionEvent>(&line)
+                .ok()
+                .as_ref()
+                .and_then(permission_query_id)
+                == restated_query;
+            if repeats {
+                restated_query = None;
+                continue;
+            }
+        }
         if write_event_line(&mut stream, &line).is_err() {
             return;
         }

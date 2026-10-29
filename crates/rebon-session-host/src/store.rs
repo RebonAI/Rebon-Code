@@ -2068,6 +2068,29 @@ pub fn append_agent_message_to_background_job(
     )
 }
 
+/// Queue a prompt the session's cron scheduler fired, for a running worker to
+/// claim as a turn of its own.
+pub fn append_background_scheduled_prompt(
+    store: &BackgroundStore,
+    job_id: &str,
+    pending_prompt_id: String,
+    message: String,
+) -> anyhow::Result<PendingPromptAcceptance> {
+    if !pending_prompt_id.starts_with("u-internal-") {
+        anyhow::bail!("scheduled background prompt id must start with `u-internal-`");
+    }
+    let mut prompt = PendingPrompt::new(pending_prompt_id, message, Vec::new(), now_ms())?;
+    prompt.origin = Some(crate::PendingPromptOrigin::Scheduled);
+    append_pending_prompt_durably(
+        store,
+        job_id,
+        prompt,
+        None,
+        "scheduled_prompt_queued",
+        serde_json::json!({}),
+    )
+}
+
 /// The one pending-prompt append transaction.
 ///
 /// `start_supervisor` is `Some(executable)` only for a prompt that must wake

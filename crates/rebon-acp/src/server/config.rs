@@ -113,8 +113,6 @@ mod tests {
             ]
         );
     }
-
-
 }
 
 fn permissions_config_option() -> ConfigOption {
@@ -259,4 +257,3 @@ fn auto_compact_config_option() -> ConfigOption {
         ],
     }
 }
-

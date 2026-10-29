@@ -56,28 +56,6 @@ pub(super) fn spawn_shell_task(
     Ok(id)
 }
 
-pub(super) fn task_notification_scan_needed(
-    subscription: &mut Option<tokio::sync::watch::Receiver<u64>>,
-    current: tokio::sync::watch::Receiver<u64>,
-) -> bool {
-    let revision = match subscription {
-        Some(revision) if revision.same_channel(&current) => revision,
-        _ => {
-            let mut current = current;
-            let _ = current.borrow_and_update();
-            *subscription = Some(current);
-            // Results may already exist before a resumed session is subscribed.
-            return true;
-        }
-    };
-    if revision.has_changed().unwrap_or(false) {
-        let _ = revision.borrow_and_update();
-        true
-    } else {
-        false
-    }
-}
-
 /// App snapshots share the pending work, never duplicate its result receivers.
 #[derive(Clone, Default)]
 pub(crate) struct InlineShellCommands(Arc<std::sync::Mutex<Vec<InlineShellCommand>>>);
@@ -857,9 +835,17 @@ mod tests {
     };
 
     use super::*;
+    use crate::session::session_inbox::SessionInbox;
     use crate::session::ultraplan_run::{UltraplanPhase, UltraplanStatus};
     use crate::tui::app::AppState;
     use crate::tui::runner::test_support::make_test_tui_session;
+
+    /// Whether the inbox would look for task notifications after seeing
+    /// `revision`.
+    fn scan_needed(inbox: &SessionInbox, revision: tokio::sync::watch::Receiver<u64>) -> bool {
+        inbox.observe_task_notifications(revision, false);
+        inbox.take_task_notification_look()
+    }
 
     #[test]
     fn task_notification_subscription_follows_new_session_terminal_results() {
@@ -870,13 +856,13 @@ mod tests {
         ] {
             let previous = AppState::default();
             let current = AppState::default();
-            let mut subscription = None;
-            task_notification_scan_needed(
-                &mut subscription,
+            let subscription = SessionInbox::default();
+            scan_needed(
+                &subscription,
                 previous.tasks.subscribe_notification_revision(),
             );
-            task_notification_scan_needed(
-                &mut subscription,
+            scan_needed(
+                &subscription,
                 current.tasks.subscribe_notification_revision(),
             );
             insert_terminal_snapshot(
@@ -888,14 +874,14 @@ mod tests {
                 None,
             );
             assert!(
-                task_notification_scan_needed(
-                    &mut subscription,
+                scan_needed(
+                    &subscription,
                     current.tasks.subscribe_notification_revision(),
                 ),
                 "{status:?} must wake the resumed session"
             );
-            assert!(!task_notification_scan_needed(
-                &mut subscription,
+            assert!(!scan_needed(
+                &subscription,
                 current.tasks.subscribe_notification_revision(),
             ));
         }
@@ -905,9 +891,9 @@ mod tests {
     fn task_notification_subscription_scans_existing_results_on_rebind() {
         let previous = AppState::default();
         let current = AppState::default();
-        let mut subscription = None;
-        task_notification_scan_needed(
-            &mut subscription,
+        let subscription = SessionInbox::default();
+        scan_needed(
+            &subscription,
             previous.tasks.subscribe_notification_revision(),
         );
         insert_terminal_snapshot(
@@ -918,8 +904,8 @@ mod tests {
             Some("connection reset".into()),
             None,
         );
-        assert!(task_notification_scan_needed(
-            &mut subscription,
+        assert!(scan_needed(
+            &subscription,
             current.tasks.subscribe_notification_revision(),
         ));
         assert_eq!(current.tasks.unnotified_notifications().len(), 1);
@@ -928,9 +914,9 @@ mod tests {
     #[test]
     fn task_notification_subscription_keeps_unread_revision_without_repeating() {
         let current = AppState::default();
-        let mut subscription = None;
-        task_notification_scan_needed(
-            &mut subscription,
+        let subscription = SessionInbox::default();
+        scan_needed(
+            &subscription,
             current.tasks.subscribe_notification_revision(),
         );
         insert_terminal_snapshot(
@@ -941,12 +927,12 @@ mod tests {
             None,
             None,
         );
-        assert!(task_notification_scan_needed(
-            &mut subscription,
+        assert!(scan_needed(
+            &subscription,
             current.tasks.subscribe_notification_revision(),
         ));
-        assert!(!task_notification_scan_needed(
-            &mut subscription,
+        assert!(!scan_needed(
+            &subscription,
             current.tasks.subscribe_notification_revision(),
         ));
     }
@@ -955,13 +941,13 @@ mod tests {
     fn task_notification_subscription_ignores_previous_session() {
         let previous = AppState::default();
         let current = AppState::default();
-        let mut subscription = None;
-        task_notification_scan_needed(
-            &mut subscription,
+        let subscription = SessionInbox::default();
+        scan_needed(
+            &subscription,
             previous.tasks.subscribe_notification_revision(),
         );
-        task_notification_scan_needed(
-            &mut subscription,
+        scan_needed(
+            &subscription,
             current.tasks.subscribe_notification_revision(),
         );
         insert_terminal_snapshot(
@@ -972,8 +958,8 @@ mod tests {
             Some("connection reset".into()),
             None,
         );
-        assert!(!task_notification_scan_needed(
-            &mut subscription,
+        assert!(!scan_needed(
+            &subscription,
             current.tasks.subscribe_notification_revision(),
         ));
         assert_eq!(previous.tasks.unnotified_notifications().len(), 1);

@@ -14,7 +14,7 @@ use crate::runtime::{
     DeferredEngineCore, DeferredEnginePromptExecutor, EngineCoreInputs, SessionEngineHalf,
     SessionRuntime, SessionRuntimeFactory,
 };
-use crate::session_handoff::{HandedBack, HeldKernelScopes};
+use crate::session_handoff::{HandedBack, HeldCron, HeldKernelScopes, HeldSessionLoop};
 use crate::startup::SessionStartupParams;
 use rebon_acp::{DefaultHandler, ServerState};
 use rebon_acp_client::{AcpAgentBackend, TranscriptJournal, TranscriptSink};
@@ -1380,6 +1380,7 @@ struct SessionAssemblyParts {
     skill_loader_template: SkillLoaderConfig,
     cron_poller: Arc<CronPoller>,
     session_cron_store: Arc<SessionCronStore>,
+    held_cron_scheduler: Option<rebon_core::cron::SchedulerHandle>,
     mid_turn_queue: Arc<crate::mid_turn_queue::MidTurnQueuedSubmitPoller>,
     additional_attachment_poller: Option<Arc<dyn AttachmentPoller>>,
     overrides_startup_notices: Vec<String>,
@@ -1423,6 +1424,7 @@ struct SessionRecords {
     mcp: Option<SessionMcp>,
     cron_poller: Arc<CronPoller>,
     session_cron_store: Arc<SessionCronStore>,
+    held_cron_scheduler: Option<rebon_core::cron::SchedulerHandle>,
     bound: SessionBound,
     tasks: Arc<TaskRegistry>,
     task_notification_poller: Arc<crate::task_notification_poller::TaskNotificationPoller>,
@@ -1469,6 +1471,7 @@ fn finish_session_build(records: SessionRecords) -> anyhow::Result<SessionBuild>
         mcp,
         cron_poller,
         session_cron_store,
+        held_cron_scheduler,
         bound,
         tasks,
         task_notification_poller,
@@ -1515,7 +1518,9 @@ fn finish_session_build(records: SessionRecords) -> anyhow::Result<SessionBuild>
     // as fired. The lock belongs to whichever process runs the session;
     // `TuiEngineSession::start_cron_scheduler` is for the session that
     // becomes this process's after all.
-    let cron_scheduler = if mirror {
+    let cron_scheduler = if let Some(held) = held_cron_scheduler {
+        Some(held)
+    } else if mirror {
         None
     } else {
         let config = rebon_core::cron::SchedulerConfig::new(std::path::PathBuf::from(&cwd));
@@ -1554,6 +1559,7 @@ fn finish_session_build(records: SessionRecords) -> anyhow::Result<SessionBuild>
         session: crate::EngineSession {
             engine_half: SessionEngineHalf {
                 runtime: initial_runtime.clone(),
+                session_loop: crate::session_loop::SessionLoop::new(),
                 runtime_factory: Some(runtime_factory),
                 handler,
                 update_publisher: tui_update_publisher,
@@ -1632,6 +1638,7 @@ fn assemble_session_build(parts: SessionAssemblyParts) -> anyhow::Result<Session
         skill_loader_template,
         cron_poller,
         session_cron_store,
+        held_cron_scheduler,
         mid_turn_queue,
         additional_attachment_poller,
         overrides_startup_notices,
@@ -1896,6 +1903,7 @@ fn assemble_session_build(parts: SessionAssemblyParts) -> anyhow::Result<Session
         mcp,
         cron_poller,
         session_cron_store,
+        held_cron_scheduler,
         bound,
         tasks,
         task_notification_poller,
@@ -1936,6 +1944,8 @@ pub async fn build_session_with_runtime_controller(
     mut handed_back: HandedBack,
 ) -> anyhow::Result<SessionBuild> {
     let startup_started = std::time::Instant::now();
+    // Installed on the finished session below, if it is the same one.
+    let held_session_loop = handed_back.session_loop.take();
     tracing::info!("rebon startup: tui wiring started");
     let (wiring, runtime_resolved) = resolve_session_wiring(&overrides, startup_started).await?;
     let startup_cwd_str = wiring.startup_cwd.to_string_lossy().to_string();
@@ -2060,8 +2070,16 @@ pub async fn build_session_with_runtime_controller(
     // Cron poller: the model-facing queue the scheduler pushes fired
     // prompts into. Handed to the executor's composite attachment poller
     // and cloned into `start_scheduler` below once the cwd is known.
-    let cron_poller = CronPoller::new();
-    let session_cron_store = SessionCronStore::new();
+    // A worker lends back the scheduler its previous session ran, so cron
+    // keeps firing between turns; anyone else starts with a fresh one.
+    let (cron_poller, session_cron_store, held_cron_scheduler) = match HeldCron::take_for(
+        handed_back.cron.take(),
+        resume_session_id.as_deref(),
+        &startup_cwd_str,
+    ) {
+        Some(held) => (held.poller, held.session_store, Some(held.scheduler)),
+        None => (CronPoller::new(), SessionCronStore::new(), None),
+    };
     // A mirror's executor gets an empty seam: it never runs a turn here,
     // and the servers behind a real one belong to the owner.
     let mcp_client: Arc<dyn McpClient> = match mcp.as_ref() {
@@ -2200,11 +2218,16 @@ pub async fn build_session_with_runtime_controller(
         skill_loader_template,
         cron_poller,
         session_cron_store,
+        held_cron_scheduler,
         mid_turn_queue,
         additional_attachment_poller,
         overrides_startup_notices,
     })?;
-    finish_session_build(records)
+    let mut build = finish_session_build(records)?;
+    if let Some(held) = HeldSessionLoop::take_for(held_session_loop, &build.session.session_id) {
+        build.session.engine_half.session_loop = held;
+    }
+    Ok(build)
 }
 
 pub fn system_prompt_config_for_engine(

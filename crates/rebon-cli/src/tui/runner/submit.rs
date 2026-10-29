@@ -366,7 +366,9 @@ fn submit_after_command_dispatch(
         return done;
     }
 
-    if active_prompt.is_some() {
+    // A goal check is the tail of the turn that just ended: what is typed
+    // meanwhile waits behind it, like a prompt typed during the turn.
+    if active_prompt.is_some() || app.goal_check.is_pending() {
         save_to_history_for_session_if_needed(app, session, text.trim_end());
         let Some(submit) = take_submit_payload_with_images(app, &text, injected_images.clone())
         else {
@@ -377,6 +379,9 @@ fn submit_after_command_dispatch(
             submit.user_message_uuid = user_message_uuid.clone();
         }
         if !attach_skill_invocation_if_registered(app, session, &mut submit) {
+            return false;
+        }
+        if !run_user_prompt_submit_hook(app, session, handle, &mut submit) {
             return false;
         }
         maybe_prepare_implicit_ultraplan_submit(app, session, &mut submit);
@@ -402,46 +407,8 @@ fn submit_after_command_dispatch(
         return false;
     }
     maybe_prepare_implicit_ultrawork_submit(app, &mut submit);
-    {
-        let verdict = handle.block_on(session.engine_half.runtime.policy.emit(
-            rebon_core::policy_seat::HookEventPayload::UserPromptSubmit {
-                prompt: submit.prompt_text().to_string(),
-            },
-        ));
-        // The same projection a worker applies before it runs a claimed
-        // prompt (`rebon_core::hooks::apply_user_prompt_submit_effects`):
-        // a hosted session's UserPromptSubmit runs over there, and what
-        // a hook may do to a prompt must not depend on where the turn runs.
-        let decision = match verdict.denial() {
-            Some(reason) => UserPromptSubmitDecision::Blocked {
-                reason: reason.to_string(),
-            },
-            None => apply_user_prompt_submit_effects(verdict.effects()),
-        };
-        match decision {
-            UserPromptSubmitDecision::Blocked { reason } => {
-                inject_system_message(app, "error", &reason);
-                app.follow_transcript_tail = true;
-                return false;
-            }
-            UserPromptSubmitDecision::Continue(effects) => {
-                if let Some(text) = effects.replacement {
-                    submit.text = text;
-                }
-                for context_text in &effects.additional_context {
-                    append_additional_context(&mut submit.text, context_text);
-                }
-                if let Some(title) = effects.session_title {
-                    apply_session_title(app, session, handle, title);
-                }
-                if effects.mark_session_complete {
-                    mark_session_title_completed(app, session, handle);
-                }
-                for text in &effects.system_messages {
-                    inject_system_message(app, "info", text);
-                }
-            }
-        }
+    if !run_user_prompt_submit_hook(app, session, handle, &mut submit) {
+        return false;
     }
     maybe_prepare_implicit_ultraplan_submit(app, session, &mut submit);
     maybe_prepare_implicit_ultrawork_submit(app, &mut submit);
@@ -464,6 +431,61 @@ fn submit_after_command_dispatch(
         app.is_loading = true;
     }
     false
+}
+
+/// Run the session's `UserPromptSubmit` hook on a prompt the user just
+/// submitted, applying what it asks for. Returns false when the hook refused
+/// the prompt; the refusal is already on screen.
+///
+/// Every prompt the user submits goes through here, whether it starts a turn
+/// now or waits in the queue: a queued prompt is handed to the model later,
+/// mid-turn or as the next turn, and nothing on either path asks the hook.
+fn run_user_prompt_submit_hook(
+    app: &mut AppState,
+    session: &mut TuiEngineSession,
+    handle: &Handle,
+    submit: &mut crate::session::submit_payload::SubmitPayload,
+) -> bool {
+    let verdict = handle.block_on(session.engine_half.runtime.policy.emit(
+        rebon_core::policy_seat::HookEventPayload::UserPromptSubmit {
+            prompt: submit.prompt_text().to_string(),
+        },
+    ));
+    // The same projection a worker applies before it runs a claimed
+    // prompt (`rebon_core::hooks::apply_user_prompt_submit_effects`):
+    // a hosted session's UserPromptSubmit runs over there, and what
+    // a hook may do to a prompt must not depend on where the turn runs.
+    let decision = match verdict.denial() {
+        Some(reason) => UserPromptSubmitDecision::Blocked {
+            reason: reason.to_string(),
+        },
+        None => apply_user_prompt_submit_effects(verdict.effects()),
+    };
+    match decision {
+        UserPromptSubmitDecision::Blocked { reason } => {
+            inject_system_message(app, "error", &reason);
+            app.follow_transcript_tail = true;
+            false
+        }
+        UserPromptSubmitDecision::Continue(effects) => {
+            if let Some(text) = effects.replacement {
+                submit.text = text;
+            }
+            for context_text in &effects.additional_context {
+                append_additional_context(&mut submit.text, context_text);
+            }
+            if let Some(title) = effects.session_title {
+                apply_session_title(app, session, handle, title);
+            }
+            if effects.mark_session_complete {
+                mark_session_title_completed(app, session, handle);
+            }
+            for text in &effects.system_messages {
+                inject_system_message(app, "info", text);
+            }
+            true
+        }
+    }
 }
 
 /// Run a `Prompt` command's expansion off the event loop, and say on screen
@@ -1271,7 +1293,7 @@ pub(super) fn submit_model_text(
     cursor_offset_before_submit: usize,
     transcript_len_before_submit: usize,
 ) {
-    if active_prompt.is_some() {
+    if active_prompt.is_some() || app.goal_check.is_pending() {
         let Some(mut submit) = take_submit_payload(app, prompt) else {
             return;
         };
@@ -2076,6 +2098,77 @@ mod tests {
             "the abandoned expansion must not be submitted as /fast"
         );
         assert!(app.expanding_command.is_none());
+
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    /// Refuses every `UserPromptSubmit`.
+    struct RefusePrompts;
+
+    impl rebon_core::policy_seat::PolicySubscriber for RefusePrompts {
+        fn interest(&self, kind: rebon_core::policy_seat::PolicyEventKind) -> bool {
+            kind == rebon_core::policy_seat::PolicyEventKind::UserPromptSubmit
+        }
+
+        fn decide<'a>(
+            &'a self,
+            _request: &'a rebon_core::policy_seat::PolicyRequest,
+        ) -> rebon_core::policy_seat::PolicyFuture<'a> {
+            Box::pin(async {
+                rebon_core::policy_seat::Verdict::Deny {
+                    reason: "prompt refused by hook".into(),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn a_prompt_queued_during_a_turn_goes_through_the_user_prompt_submit_hook() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        {
+            let installed = Arc::get_mut(&mut session.engine_half.runtime)
+                .expect("test runtime is not captured yet");
+            installed.policy = installed.policy.clone().with_subscriber(
+                "refuse-prompts",
+                rebon_core::turn_hook::Order::NORMAL,
+                Arc::new(RefusePrompts),
+            );
+        }
+        let mut app = AppState::new();
+        let (_result_tx, result_rx) = oneshot::channel();
+        let mut active_prompt = Some(ActivePrompt::new(
+            result_rx,
+            rebon_types::PromptCancel::new(),
+        ));
+        app.is_loading = true;
+        app.input = "queued while busy".into();
+        app.cursor_offset = app.input.len();
+
+        assert!(!submit_or_queue(
+            &mut app,
+            "queued while busy".into(),
+            &mut session,
+            &handle,
+            &mut active_prompt,
+            &mut None,
+            UiMode::Screen,
+        ));
+        runtime.block_on(tokio::task::yield_now());
+
+        assert!(
+            app.queued_commands.is_empty(),
+            "a refused prompt is not queued"
+        );
+        assert!(app.rebon_tui.transcript.rows().iter().any(|row| matches!(
+            row,
+            rebon_tui::Message::System(system)
+                if system.content.as_deref() == Some("prompt refused by hook")
+        )));
+        assert!(recorder.take_requests().is_empty());
 
         drop(active_prompt.take());
         runtime.shutdown_background();

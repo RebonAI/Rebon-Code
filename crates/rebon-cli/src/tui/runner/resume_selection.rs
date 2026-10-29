@@ -1422,6 +1422,13 @@ mod tests {
                 Ok(Some(_))
             )
         }
+        fn scheduler_owns_lock(session: &crate::tui::wiring::TuiEngineSession) -> bool {
+            session
+                .engine_half
+                .cron_scheduler
+                .as_ref()
+                .is_some_and(|scheduler| scheduler.owns_lock())
+        }
         fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while !condition() {
@@ -1451,9 +1458,13 @@ mod tests {
         )
         .expect("a fresh directory is unclaimed");
         session.start_cron_scheduler();
+        // Probing the lock takes it for a moment, and a scheduler that finds
+        // it taken waits a full probe interval before trying again. So wait
+        // for the scheduler to say it holds the lock, then probe once.
         wait_until("the first directory's scheduler to take its lock", || {
-            !scheduler_lock_is_free(&first)
+            scheduler_owns_lock(&session)
         });
+        assert!(!scheduler_lock_is_free(&first));
 
         let resume_id = "resumed-elsewhere";
         write_resume_transcript(
@@ -1481,8 +1492,9 @@ mod tests {
         assert_eq!(session.cwd, second, "the session moved directories");
 
         wait_until("the resumed directory's scheduler to take its lock", || {
-            !scheduler_lock_is_free(&second)
+            scheduler_owns_lock(&session)
         });
+        assert!(!scheduler_lock_is_free(&second));
         wait_until(
             "the previous directory's scheduler lock to be released",
             || scheduler_lock_is_free(&first),

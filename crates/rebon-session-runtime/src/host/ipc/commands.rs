@@ -252,14 +252,23 @@ pub(crate) fn drain_background_commands(
 
 pub(crate) async fn execute_background_permission_replay(
     session: &crate::EngineSession,
+    state: &BackgroundJobState,
     replay_requests: Vec<rebon_agent_core::DenialReplayRequest>,
 ) -> Result<(), String> {
     if replay_requests.is_empty() {
         return Ok(());
     }
+    // The replay finishes the work the denied calls were part of, at the
+    // effort the job runs at, like every other turn the worker runs.
+    let thinking = crate::commands::effort::resolve_thinking_from_effort(
+        crate::host::runtime_fields::effort_level_from_runtime(&state.identity.runtime)
+            .ok()
+            .flatten(),
+        crate::commands::effort::provider_kind_from_format(session.model.provider_format),
+    );
     let request = rebon_agent_core::PromptRequest {
         user_prompt: None,
-        effort_is_session_default: false,
+        effort_is_session_default: true,
         session_id: session.session_id.clone(),
         cwd: session.cwd.clone(),
         prompt: Vec::new(),
@@ -267,9 +276,9 @@ pub(crate) async fn execute_background_permission_replay(
         permission_publisher: None,
         mcp_servers: Vec::new(),
         cancel: rebon_types::PromptCancel::new(),
-        thinking_budget: None,
-        max_tokens: None,
-        reasoning_effort_ordinal: None,
+        thinking_budget: thinking.thinking_budget,
+        max_tokens: thinking.max_tokens,
+        reasoning_effort_ordinal: thinking.reasoning_effort_ordinal,
         additional_working_directories: session.startup.add_dirs.clone(),
         coordinator_mode: Some(session.engine_half.coordinator_mode_handle.get()),
         coordinator_report_paths: Vec::new(),
@@ -280,13 +289,14 @@ pub(crate) async fn execute_background_permission_replay(
         replay_requests,
         skill_invocations: Vec::new(),
     };
-    session
-        .engine_half
-        .executor
-        .execute(request)
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    crate::host::worker::execution::run_through_session_loop(
+        session,
+        request,
+        crate::session_loop::TurnOrigin::PermissionReplay,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 pub(crate) fn queue_live_background_reply(

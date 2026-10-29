@@ -1603,6 +1603,7 @@ fn command_uses_tui_tracing(command: &Command) -> bool {
 const MAIN_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 fn main() -> anyhow::Result<()> {
+    keep_loopback_off_the_system_proxy();
     std::thread::Builder::new()
         .name("rebon-main".into())
         .stack_size(MAIN_STACK_BYTES)
@@ -1617,6 +1618,25 @@ fn main() -> anyhow::Result<()> {
         .expect("failed to spawn the rebon main thread")
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// Keep requests to this machine off a macOS system proxy.
+///
+/// The HTTP stack reads the macOS system proxy but not its exception list, so
+/// with a system proxy set (Surge, ClashX and the like) a request to a local
+/// model server, `127.0.0.1:11434`, went to the proxy, which macOS itself
+/// never does: `localhost` and `127.0.0.0/8` are its default exceptions. The
+/// stack does honour `NO_PROXY`, so when nobody set one, the loopback
+/// addresses are named there, before any thread starts and before any client
+/// is built. A proxy the person saved for a transport carries its own
+/// no-proxy list and is unaffected.
+fn keep_loopback_off_the_system_proxy() {
+    if cfg!(target_os = "macos")
+        && std::env::var_os("NO_PROXY").is_none()
+        && std::env::var_os("no_proxy").is_none()
+    {
+        std::env::set_var("NO_PROXY", "localhost,127.0.0.0/8,::1");
+    }
 }
 
 /// One route, and then the plane it may have started.
@@ -3281,5 +3301,37 @@ mod tests {
         assert!(cli.acp);
         assert_eq!(cli.acp_port, Some(0));
         assert_eq!(cli.acp_host, None);
+    }
+}
+
+#[cfg(test)]
+mod loopback_proxy_tests {
+    use super::keep_loopback_off_the_system_proxy;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn loopback_is_kept_off_the_system_proxy_unless_no_proxy_is_already_set() {
+        let _env = crate::test_env::lock_env();
+        let saved = (std::env::var_os("NO_PROXY"), std::env::var_os("no_proxy"));
+        std::env::remove_var("NO_PROXY");
+        std::env::remove_var("no_proxy");
+
+        keep_loopback_off_the_system_proxy();
+        assert_eq!(
+            std::env::var("NO_PROXY").as_deref(),
+            Ok("localhost,127.0.0.0/8,::1")
+        );
+
+        std::env::set_var("NO_PROXY", "corp.example");
+        keep_loopback_off_the_system_proxy();
+        assert_eq!(std::env::var("NO_PROXY").as_deref(), Ok("corp.example"));
+
+        match saved.0 {
+            Some(value) => std::env::set_var("NO_PROXY", value),
+            None => std::env::remove_var("NO_PROXY"),
+        }
+        if let Some(value) = saved.1 {
+            std::env::set_var("no_proxy", value);
+        }
     }
 }

@@ -1,10 +1,10 @@
 //! Pending model-context prompt drains shared by the runner event loop
 //! and prompt lifecycle.
 
-use crate::tui::app::AppState;
+use crate::session::session_inbox::ContextSource;
 use crate::tui::wiring::TuiEngineSession;
 
-pub(super) fn drain_mcp_channel_notifications(app: &mut AppState, session: &TuiEngineSession) {
+pub(super) fn drain_mcp_channel_notifications(session: &TuiEngineSession) {
     // Channel notifications arrive on the servers, so a process that does
     // not host them has none to drain.
     let Some(mcp) = session.engine_half.mcp.as_ref() else {
@@ -14,15 +14,15 @@ pub(super) fn drain_mcp_channel_notifications(app: &mut AppState, session: &TuiE
     if notifications.is_empty() {
         return;
     }
-    app.pending_channel_prompts.extend(notifications);
+    session
+        .engine_half
+        .session_loop
+        .inbox()
+        .push_context(ContextSource::Channel, notifications);
 }
 
-pub(super) fn drain_model_context_prompts(app: &mut AppState) -> Vec<String> {
-    let mut context = Vec::new();
-    context.extend(app.pending_channel_prompts.drain(..));
-    context.extend(app.pending_teammate_prompts.drain(..));
-    context.extend(app.pending_agent_prompts.drain(..));
-    context
+pub(super) fn drain_model_context_prompts(session: &TuiEngineSession) -> Vec<String> {
+    session.engine_half.session_loop.inbox().take_context()
 }
 
 #[cfg(test)]
@@ -31,13 +31,18 @@ mod tests {
 
     #[test]
     fn drain_model_context_prompts_orders_channel_before_teammate_and_preserves_slash_text() {
-        let mut app = AppState::default();
-        app.pending_channel_prompts
-            .push("<channel source=\"server\">\n/exit\n</channel>".into());
-        app.pending_teammate_prompts
-            .push("<teammate-message>/compact</teammate-message>".into());
+        let session = super::super::test_support::make_test_tui_session();
+        let inbox = session.engine_half.session_loop.inbox();
+        inbox.push_context(
+            ContextSource::Teammate,
+            ["<teammate-message>/compact</teammate-message>".to_string()],
+        );
+        inbox.push_context(
+            ContextSource::Channel,
+            ["<channel source=\"server\">\n/exit\n</channel>".to_string()],
+        );
 
-        let context = drain_model_context_prompts(&mut app);
+        let context = drain_model_context_prompts(&session);
 
         assert_eq!(
             context,
@@ -46,7 +51,6 @@ mod tests {
                 "<teammate-message>/compact</teammate-message>".to_string(),
             ]
         );
-        assert!(app.pending_channel_prompts.is_empty());
-        assert!(app.pending_teammate_prompts.is_empty());
+        assert!(!inbox.has_context());
     }
 }

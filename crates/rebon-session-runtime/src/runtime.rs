@@ -809,6 +809,9 @@ pub struct SessionEngineHalf {
     /// Atomically installed immutable resources for the current session.
     /// Prompt dispatch clones this Arc before spawning.
     pub runtime: Arc<SessionRuntime>,
+    /// Where this session's turns run, one at a time. See
+    /// [`crate::session_loop`].
+    pub session_loop: crate::session_loop::SessionLoop,
     pub runtime_factory: Option<Arc<SessionRuntimeFactory>>,
     /// Fully-wired ACP handler. Owns its own clones of the prompt
     /// executor, the update publisher, and the permission publisher.

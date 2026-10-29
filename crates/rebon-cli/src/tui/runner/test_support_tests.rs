@@ -234,6 +234,7 @@ pub(super) fn make_test_tui_session_with_projects_root(
         session: crate::session::EngineSession {
             engine_half: crate::session::runtime::SessionEngineHalf {
                 runtime,
+                session_loop: crate::session::session_loop::SessionLoop::new(),
                 runtime_factory: None,
                 handler,
                 update_publisher,

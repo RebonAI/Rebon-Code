@@ -56,8 +56,20 @@ fn entry_is_meta_user(entry: &rebon_session::TranscriptEntry) -> bool {
             .unwrap_or(false)
 }
 
+/// Whether a user entry opens a turn.
+///
+/// Meta entries mostly ride inside a turn (attachments, runtime context) and
+/// are not boundaries. The exception is an internal prompt (`u-internal-…`):
+/// a task notification, a cron fire, a follow-up the session queued for
+/// itself. It is meta because nobody typed it, but it is what the turn was
+/// started from. Missing it left a mirror on the previous boundary, so the
+/// streamed text of every such turn piled up in one overlay that was never
+/// cleared.
 fn entry_is_user_turn(entry: &rebon_session::TranscriptEntry) -> bool {
-    if entry.entry_type != "user" || entry_is_meta_user(entry) {
+    if entry.entry_type != "user" {
+        return false;
+    }
+    if entry_is_meta_user(entry) && !entry.uuid.starts_with("u-internal-") {
         return false;
     }
     let Some(content) = entry
@@ -1067,6 +1079,47 @@ mod tests {
             image_paste_ids: None,
             plan_content: None,
         })
+    }
+
+    fn meta_user_entry(uuid: &str, text: &str) -> rebon_session::TranscriptEntry {
+        let mut entry = transcript_entry(
+            "user",
+            uuid,
+            serde_json::json!([{"type": "text", "text": text}]),
+        );
+        entry.raw["isMeta"] = serde_json::json!(true);
+        entry
+    }
+
+    #[test]
+    fn an_internal_prompt_opens_a_turn_but_an_attachment_does_not() {
+        let entries = vec![
+            transcript_entry(
+                "user",
+                "u-user-1",
+                serde_json::json!([{"type": "text", "text": "hi"}]),
+            ),
+            transcript_entry(
+                "assistant",
+                "a-1",
+                serde_json::json!([{"type": "text", "text": "hello"}]),
+            ),
+            meta_user_entry("u-internal-scheduled-1-0", "[Scheduled task] tick"),
+            transcript_entry(
+                "assistant",
+                "a-2",
+                serde_json::json!([{"type": "text", "text": "TICK"}]),
+            ),
+            meta_user_entry("u-attach-1", "<system-reminder>skills</system-reminder>"),
+        ];
+
+        assert_eq!(
+            last_remote_user_turn_uuid(&entries).as_deref(),
+            Some("u-internal-scheduled-1-0")
+        );
+        let first = persisted_remote_turn(&entries, "u-user-1");
+        assert!(first.next_user_found, "the cron fire ends the typed turn");
+        assert_eq!(first.assistant_text, "hello");
     }
 
     #[test]

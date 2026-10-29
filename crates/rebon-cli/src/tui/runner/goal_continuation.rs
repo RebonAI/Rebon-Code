@@ -41,40 +41,148 @@ pub(super) enum GoalContinuationAction {
     },
 }
 
+/// A goal check running in the background. App snapshots share it, so the
+/// result is taken exactly once.
+#[derive(Clone, Default)]
+pub(crate) struct GoalCheck(Arc<std::sync::Mutex<Option<PendingGoalCheck>>>);
+
+impl std::fmt::Debug for GoalCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoalCheck")
+            .field("pending", &self.is_pending())
+            .finish()
+    }
+}
+
+struct PendingGoalCheck {
+    result: tokio::sync::oneshot::Receiver<Result<GoalContinuationAction, String>>,
+    previous_session_context: Option<String>,
+}
+
+impl GoalCheck {
+    /// Whether a check is still running. While one is, the session must not
+    /// start a turn: the check may move the goal on to a fresh session.
+    pub(crate) fn is_pending(&self) -> bool {
+        self.0.lock().expect("goal check poisoned").is_some()
+    }
+
+    /// Start a check that finishes when the test sends its result.
+    #[cfg(test)]
+    pub(super) fn start_for_test(
+        &self,
+    ) -> tokio::sync::oneshot::Sender<Result<GoalContinuationAction, String>> {
+        let (tx, result) = tokio::sync::oneshot::channel();
+        self.start(PendingGoalCheck {
+            result,
+            previous_session_context: None,
+        });
+        tx
+    }
+
+    fn start(&self, pending: PendingGoalCheck) {
+        *self.0.lock().expect("goal check poisoned") = Some(pending);
+    }
+
+    /// The finished check's result, once there is one.
+    fn take_finished(&self) -> Option<(Result<GoalContinuationAction, String>, Option<String>)> {
+        let mut slot = self.0.lock().expect("goal check poisoned");
+        let pending = slot.as_mut()?;
+        let result = match pending.result.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return None,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                Err("Goal check stopped before it reported.".to_string())
+            }
+        };
+        let pending = slot.take().expect("checked above");
+        Some((result, pending.previous_session_context))
+    }
+}
+
+/// Start checking an active goal after a turn, in the background.
+///
+/// The check asks the model whether the goal is met, which takes seconds; it
+/// used to run on the event-loop thread and froze the screen, keys and all,
+/// for as long as it took. Returns whether a check started; its outcome is
+/// applied by [`finish_goal_check`].
+pub(super) fn start_goal_check(
+    app: &mut AppState,
+    session: &TuiEngineSession,
+    handle: &Handle,
+    stop_reason: Option<String>,
+) -> bool {
+    let Some(goal) = app.goal.as_ref().filter(|goal| goal.is_active()) else {
+        return false;
+    };
+    let goal_snapshot = goal.clone();
+    let transcript_summary = transcript_summary(app);
+    let previous_session_context =
+        (!transcript_summary.trim().is_empty()).then(|| transcript_summary.clone());
+    let hook = GoalHookInputs {
+        model: session.model.name.clone(),
+        client: session.engine_half.client.clone(),
+        context: session.engine_half.runtime.policy.context().clone(),
+    };
+    let (tx, result) = tokio::sync::oneshot::channel();
+    handle.spawn(async move {
+        let action =
+            run_goal_session_end_hook(goal_snapshot, hook, stop_reason, transcript_summary).await;
+        let _ = tx.send(action);
+    });
+    app.goal_check.start(PendingGoalCheck {
+        result,
+        previous_session_context,
+    });
+    true
+}
+
+/// Apply a finished goal check: continue in a fresh session, complete, or
+/// pause. `None` while the check is still running or none was started.
+pub(super) fn finish_goal_check(
+    app: &mut AppState,
+    session: &mut TuiEngineSession,
+    handle: &Handle,
+) -> Option<GoalContinuationAction> {
+    let (action, previous_session_context) = app.goal_check.take_finished()?;
+    let action = match action {
+        Ok(action) => action,
+        Err(message) => GoalContinuationAction::Error { message },
+    };
+    Some(apply_goal_check(
+        app,
+        session,
+        handle,
+        previous_session_context,
+        action,
+    ))
+}
+
+/// Start a goal check and wait for it. Tests only: the terminal never waits.
+#[cfg(test)]
 pub(super) fn maybe_prepare_goal_continuation(
     app: &mut AppState,
     session: &mut TuiEngineSession,
     handle: &Handle,
     stop_reason: Option<String>,
 ) -> GoalContinuationAction {
-    let Some(goal) = app.goal.as_ref() else {
-        return GoalContinuationAction::None;
-    };
-    if !goal.is_active() {
+    if !start_goal_check(app, session, handle, stop_reason) {
         return GoalContinuationAction::None;
     }
+    loop {
+        if let Some(action) = finish_goal_check(app, session, handle) {
+            return action;
+        }
+        handle.block_on(async { tokio::time::sleep(std::time::Duration::from_millis(5)).await });
+    }
+}
 
-    let goal_snapshot = goal.clone();
-    let old_session_id = session.session_id.clone();
-    let transcript_summary = transcript_summary(app);
-    let previous_session_context = if transcript_summary.trim().is_empty() {
-        None
-    } else {
-        Some(transcript_summary.clone())
-    };
-    let action = handle.block_on(run_goal_session_end_hook(
-        goal_snapshot,
-        session,
-        &old_session_id,
-        stop_reason,
-        transcript_summary,
-    ));
-
-    let action = match action {
-        Ok(action) => action,
-        Err(message) => GoalContinuationAction::Error { message },
-    };
-
+fn apply_goal_check(
+    app: &mut AppState,
+    session: &mut TuiEngineSession,
+    handle: &Handle,
+    previous_session_context: Option<String>,
+    action: GoalContinuationAction,
+) -> GoalContinuationAction {
     match &action {
         GoalContinuationAction::Continue { prompt, reason } => {
             if !app.goal.as_ref().is_some_and(|goal| goal.can_continue()) {
@@ -157,10 +265,17 @@ fn goal_session_end_snapshot(
     }
 }
 
+/// What the goal hook needs from the session, owned so it can run off the
+/// event loop.
+struct GoalHookInputs {
+    model: String,
+    client: Arc<dyn ModelClient>,
+    context: rebon_hooks::HookInvocationContext,
+}
+
 async fn run_goal_session_end_hook(
     goal: crate::goal::GoalState,
-    session: &TuiEngineSession,
-    _old_session_id: &str,
+    session: GoalHookInputs,
     stop_reason: Option<String>,
     transcript_summary: String,
 ) -> Result<GoalContinuationAction, String> {
@@ -170,7 +285,7 @@ async fn run_goal_session_end_hook(
             prompt: crate::goal::build_goal_check_prompt(&goal.prompt, &transcript_summary),
             r#if: None,
             timeout: Some(120),
-            model: Some(session.model.name.clone()),
+            model: Some(session.model.clone()),
             status_message: Some("Checking goal".into()),
             once: None,
         }),
@@ -188,8 +303,8 @@ async fn run_goal_session_end_hook(
             .with_command(Box::new(rebon_hooks::CommandExecutor::new()))
             .with_http(Box::new(rebon_hooks::HttpExecutor::new()))
             .with_prompt(Box::new(GoalPromptExecutor {
-                client: session.engine_half.client.clone(),
-                model: session.model.name.clone(),
+                client: session.client.clone(),
+                model: session.model.clone(),
             })),
     );
     // Not a policy event: this is the goal feature using the hook runtime as
@@ -199,7 +314,7 @@ async fn run_goal_session_end_hook(
     // invocation context so both paths agree on where the session is.
     let runtime = rebon_hooks::HookRuntime::new(provider, metadata, executor);
     let input = HookInvocationInput::new(
-        session.engine_half.runtime.policy.context().clone(),
+        session.context,
         HookEventPayload::SessionEnd {
             reason: stop_reason,
         },

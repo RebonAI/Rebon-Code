@@ -32,7 +32,7 @@ mod footer_navigation;
 mod foreground_agent_submit;
 mod foreground_mailbox;
 mod global_search;
-mod goal_continuation;
+pub(crate) mod goal_continuation;
 mod inline_banner;
 mod inline_commit_cursor;
 mod input_latency_probe;
@@ -90,7 +90,9 @@ pub(in crate::tui::runner) use self::active_prompt::{
 use self::commands::apply_new_session;
 use self::context_prompts::drain_model_context_prompts;
 use self::global_search::apply_global_search_action;
-use self::goal_continuation::{commit_goal_continuation_feedback, maybe_prepare_goal_continuation};
+use self::goal_continuation::{
+    commit_goal_continuation_feedback, finish_goal_check, start_goal_check,
+};
 use self::layout_and_scroll::{
     build_scroll_snapshot, repin_transcript_to_bottom, reset_transcript_page_state,
     sync_follow_tail_after_updates, to_message_lite, visual_lines_with_cursor,
