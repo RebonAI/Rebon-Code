@@ -179,6 +179,20 @@ pub enum SessionInput {
         turn_guard: QueuedSubmitTurnGuard,
         reply: oneshot::Sender<TurnResult>,
     },
+    /// Rewrite the session's history between turns: a compaction. It runs
+    /// alone, like a turn, so history has one writer at a time.
+    HistoryWork(HistoryWork),
+}
+
+/// Work that rewrites a session's history, and how it shares the loop.
+pub struct HistoryWork {
+    /// The work. It reports its own progress and result.
+    pub work: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    /// Work nobody asked for (an idle compaction) gives way: any input that
+    /// arrives while it runs cancels it and goes next, so the person never
+    /// waits on it. Work someone asked for (`/compact`) runs to the end,
+    /// and a turn sent meanwhile waits its turn.
+    pub yields: bool,
 }
 
 /// The sending end of a session's loop. The loop task starts on the first
@@ -214,6 +228,11 @@ impl SessionLoop {
         result
     }
 
+    /// Hand the loop work that rewrites history (see [`HistoryWork`]).
+    pub fn submit_history_work(&self, handle: &Handle, work: HistoryWork) {
+        self.send(handle, SessionInput::HistoryWork(work));
+    }
+
     fn send(&self, handle: &Handle, input: SessionInput) {
         let mut sender = self.sender.lock().expect("session loop sender poisoned");
         let input = match sender.as_ref() {
@@ -234,7 +253,16 @@ impl SessionLoop {
 
 /// The loop itself: take the next input, act on it, repeat.
 async fn run_session(mut inputs: mpsc::UnboundedReceiver<SessionInput>, inbox: Arc<SessionInbox>) {
-    while let Some(input) = inputs.recv().await {
+    // An input that arrived while yielding work ran, and cancelled it.
+    let mut next = None;
+    loop {
+        let input = match next.take() {
+            Some(input) => input,
+            None => match inputs.recv().await {
+                Some(input) => input,
+                None => break,
+            },
+        };
         match input {
             SessionInput::Turn {
                 mut turn,
@@ -245,6 +273,20 @@ async fn run_session(mut inputs: mpsc::UnboundedReceiver<SessionInput>, inbox: A
                 let result = run_turn(turn, turn_guard).await;
                 deliveries.settle(TurnEnding::of(&result), &inbox);
                 let _ = reply.send(result);
+            }
+            SessionInput::HistoryWork(HistoryWork {
+                work,
+                yields: false,
+            }) => work.await,
+            SessionInput::HistoryWork(HistoryWork { work, yields: true }) => {
+                tokio::select! {
+                    () = work => {}
+                    arrived = inputs.recv() => match arrived {
+                        // Dropping the work cancels it.
+                        Some(input) => next = Some(input),
+                        None => break,
+                    },
+                }
             }
         }
     }

@@ -2388,6 +2388,79 @@ mod tests {
         runtime.shutdown_background();
     }
 
+    /// Pushes `dropped` to the log when the work holding it is dropped.
+    struct DropMark(Arc<GatedPromptExecutor>);
+
+    impl Drop for DropMark {
+        fn drop(&mut self) {
+            self.0.log.lock().unwrap().push("work dropped".into());
+        }
+    }
+
+    #[test]
+    fn a_turn_sent_during_a_compaction_waits_for_it() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let executor = Arc::new(GatedPromptExecutor::default());
+        session.set_test_executor(executor.clone());
+        executor.permits.add_permits(1);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (log, gate) = (executor.clone(), release.clone());
+        session.engine_half.session_loop.submit_history_work(
+            &handle,
+            crate::session::session_loop::HistoryWork {
+                work: Box::pin(async move {
+                    log.log.lock().unwrap().push("work start".into());
+                    gate.notified().await;
+                    log.log.lock().unwrap().push("work end".into());
+                }),
+                yields: false,
+            },
+        );
+        let turn = dispatch_named_turn(&session, &handle, "after");
+        settle(&runtime);
+        assert_eq!(*executor.log.lock().unwrap(), ["work start"]);
+
+        release.notify_one();
+        assert!(runtime.block_on(turn).unwrap().is_ok());
+        assert_eq!(
+            *executor.log.lock().unwrap(),
+            ["work start", "work end", "start after", "end after"]
+        );
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn an_idle_compaction_gives_way_to_a_turn() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let executor = Arc::new(GatedPromptExecutor::default());
+        session.set_test_executor(executor.clone());
+        executor.permits.add_permits(1);
+        let mark = DropMark(executor.clone());
+        let log = executor.clone();
+        session.engine_half.session_loop.submit_history_work(
+            &handle,
+            crate::session::session_loop::HistoryWork {
+                work: Box::pin(async move {
+                    let _mark = mark;
+                    log.log.lock().unwrap().push("work start".into());
+                    std::future::pending::<()>().await;
+                }),
+                yields: true,
+            },
+        );
+        settle(&runtime);
+
+        let turn = dispatch_named_turn(&session, &handle, "after");
+        assert!(runtime.block_on(turn).unwrap().is_ok());
+        assert_eq!(
+            *executor.log.lock().unwrap(),
+            ["work start", "work dropped", "start after", "end after"]
+        );
+        runtime.shutdown_background();
+    }
+
     #[test]
     fn session_loop_survives_a_turn_that_panics() {
         let (runtime, handle) = make_immediate_handle();

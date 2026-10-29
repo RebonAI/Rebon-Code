@@ -7,12 +7,14 @@
 //! ran in front of their answer with only a spinner verb to show for it.
 //!
 //! Here the command runs the compaction the moment it is typed. The work is
-//! a provider call that cannot be done on the event-loop thread, so it lives
-//! on a worker thread (the same shape `resume_runtime` uses for its summary
-//! worker) while [`crate::tui::compact_widget`] paints a status above the
-//! prompt. When it lands, the compacted history is installed as the
-//! session's replay baseline — so the *next* turn replays it with no extra
-//! work — and the transcript gets a report of what survived.
+//! a provider call that cannot be done on the event-loop thread, so it runs
+//! on the session loop, between turns, while [`crate::tui::compact_widget`]
+//! paints a status above the prompt. It installs the compacted history as
+//! the session's replay baseline before the loop moves on, so the *next*
+//! turn replays it with no extra work and no turn ever starts against a
+//! half-written history. The transcript then gets a report of what
+//! survived. A turn sent during a `/compact` waits for it; an idle
+//! compaction gives way to anything sent while it runs.
 //!
 //! A turn already in flight keeps the old deferred behaviour: the engine's
 //! in-turn manual-compact path owns the live `ContextManager` and would
@@ -28,7 +30,7 @@ use crate::tui::wiring::TuiEngineSession;
 
 use super::transcript_messages::inject_system_message;
 use crate::session::compact::{
-    answer_deferred_command, render_compact_report, CompactProgress, CompactWorker,
+    answer_deferred_command, render_compact_report, CompactDone, CompactProgress, CompactWorker,
 };
 
 /// Outcome of asking for a compaction, for the caller to surface.
@@ -52,6 +54,26 @@ pub(crate) fn start_manual_compact(
     instructions: Option<String>,
     respond_to_command_id: Option<String>,
 ) -> CompactStart {
+    start_compact(
+        app,
+        session,
+        handle,
+        instructions,
+        respond_to_command_id,
+        false,
+    )
+}
+
+/// Start a compaction on the session loop. `automatic` marks an idle one,
+/// which gives way to anything sent while it runs.
+fn start_compact(
+    app: &mut AppState,
+    session: &mut TuiEngineSession,
+    handle: &Handle,
+    instructions: Option<String>,
+    respond_to_command_id: Option<String>,
+    automatic: bool,
+) -> CompactStart {
     if session.engine_half.compact_runtime.is_running() {
         return CompactStart::Rejected(
             "A compaction is already running for this session.".to_string(),
@@ -62,7 +84,7 @@ pub(crate) fn start_manual_compact(
         phase: CompactPhase::Reading,
         started_at: std::time::Instant::now(),
         respond_to_command_id,
-        automatic: false,
+        automatic,
         invalidated: false,
     });
 
@@ -71,37 +93,26 @@ pub(crate) fn start_manual_compact(
     let session_id = session.session_id.clone();
     let worker_session_id = session_id.clone();
     let resume_replay = session.engine_half.resume_replay();
-    let handle = handle.clone();
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let path = rebon_session::transcript_file_path(&projects_root, &cwd, &worker_session_id);
-        let loaded = match rebon_session::load_transcript_from_file(&path) {
-            Ok(Some(loaded)) => loaded,
-            Ok(None) => {
-                let _ = tx.send(CompactProgress::Done(Box::new(Err(
-                    "This session has no transcript to compact yet.".to_string(),
-                ))));
-                return;
-            }
-            Err(err) => {
-                let _ = tx.send(CompactProgress::Done(Box::new(Err(format!(
-                    "Could not read this session's transcript: {err}"
-                )))));
-                return;
-            }
-        };
-        if tx.send(CompactProgress::Summarizing).is_err() {
-            return;
-        }
-        let result = handle.block_on(resume_replay.compact_session_now(
-            &projects_root,
-            &cwd,
-            &worker_session_id,
-            &loaded.messages,
-            instructions.as_deref(),
-        ));
-        let _ = tx.send(CompactProgress::Done(Box::new(result)));
-    });
+    // The session loop runs it between turns, so nothing else writes this
+    // session's history while it does, and what it installs is in place
+    // before the next turn starts.
+    let work = crate::session::compact::compact_and_install(
+        resume_replay,
+        projects_root,
+        cwd,
+        worker_session_id,
+        instructions,
+        automatic,
+        tx,
+    );
+    session.engine_half.session_loop.submit_history_work(
+        handle,
+        crate::session::session_loop::HistoryWork {
+            work: Box::pin(work),
+            yields: automatic,
+        },
+    );
 
     session.engine_half.compact_runtime.worker = Some(CompactWorker { session_id, rx });
     CompactStart::Started
@@ -135,13 +146,9 @@ pub(crate) fn maybe_start_idle_compact(
         return false;
     }
     if matches!(
-        start_manual_compact(app, session, handle, None, None),
+        start_compact(app, session, handle, None, None, true),
         CompactStart::Started
     ) {
-        app.compact_run
-            .as_mut()
-            .expect("started compact run")
-            .automatic = true;
         app.auto_compact_attempt = Some((session.session_id.clone(), app.auto_compact_generation));
         true
     } else {
@@ -172,7 +179,9 @@ pub(crate) fn sync_compact_run(app: &mut AppState, session: &mut TuiEngineSessio
                 return;
             }
             Err(mpsc::TryRecvError::Disconnected) => {
-                break Err("Compaction stopped before returning a result.".to_string())
+                break CompactDone::Failed(
+                    "Compaction stopped before returning a result.".to_string(),
+                )
             }
         }
     };
@@ -182,13 +191,16 @@ pub(crate) fn sync_compact_run(app: &mut AppState, session: &mut TuiEngineSessio
     let automatic = run.as_ref().is_some_and(|run| run.automatic);
     let invalidated = run.as_ref().is_some_and(|run| run.invalidated);
     let respond_to = run.and_then(|run| run.respond_to_command_id);
-    if invalidated {
+    // An idle run the person overtook was cancelled on the loop. One that
+    // finished first was installed before their turn began, so it still
+    // stands and is reported.
+    if invalidated && !matches!(result, CompactDone::Installed(_)) {
         return;
     }
 
-    // A `/resume` or `/clear` mid-run points the TUI at a different session;
-    // installing a baseline built from the old one would silently graft a
-    // stranger's history onto it.
+    // A `/resume` or `/clear` mid-run points the TUI at a different session.
+    // The run installed its baseline for the session it compacted, not this
+    // one; its report belongs to that session too.
     if session.session_id != worker_session_id {
         tracing::info!(
             worker_session_id,
@@ -205,47 +217,24 @@ pub(crate) fn sync_compact_run(app: &mut AppState, session: &mut TuiEngineSessio
     }
 
     match result {
-        Ok((_, report)) if automatic && !report.used_model => {
+        CompactDone::NoSummary(_) => {
             session.model.prune_level.budget.record_compact_failure();
             crate::tui::update::seal_overlay_before_transcript_message(app);
             inject_system_message(app, "warning", "Idle auto-compaction could not summarize the conversation; the existing context was kept.");
             app.follow_transcript_tail = true;
         }
-        Ok((prepared, report)) => {
-            if automatic {
-                let path = rebon_session::transcript_file_path(
-                    &session.projects_root,
-                    &session.cwd,
-                    &worker_session_id,
-                );
-                match rebon_session::load_transcript_from_file(&path) {
-                    Ok(Some(loaded)) if prepared.matches_transcript(&loaded.messages) => {}
-                    Ok(_) => {
-                        tracing::info!("idle compaction discarded because the transcript changed");
-                        return;
-                    }
-                    Err(error) => {
-                        session.model.prune_level.budget.record_compact_failure();
-                        crate::tui::update::seal_overlay_before_transcript_message(app);
-                        inject_system_message(
-                            app,
-                            "warning",
-                            &format!("Could not verify idle compaction: {error}"),
-                        );
-                        app.follow_transcript_tail = true;
-                        return;
-                    }
-                }
-            }
-            session
-                .engine_half
-                .resume_replay()
-                .install_persistent_summary(
-                    &session.projects_root,
-                    &session.cwd,
-                    worker_session_id.clone(),
-                    prepared,
-                );
+        CompactDone::Stale => {}
+        CompactDone::Unverified(error) => {
+            session.model.prune_level.budget.record_compact_failure();
+            crate::tui::update::seal_overlay_before_transcript_message(app);
+            inject_system_message(
+                app,
+                "warning",
+                &format!("Could not verify idle compaction: {error}"),
+            );
+            app.follow_transcript_tail = true;
+        }
+        CompactDone::Installed(report) => {
             // Keep the status bar and `/context` honest immediately rather
             // than waiting for the next turn's usage report to arrive.
             session
@@ -264,7 +253,7 @@ pub(crate) fn sync_compact_run(app: &mut AppState, session: &mut TuiEngineSessio
             app.follow_transcript_tail = true;
             answer_deferred_command(session, &worker_session_id, respond_to.as_deref(), Ok(text));
         }
-        Err(message) => {
+        CompactDone::Failed(message) => {
             if automatic {
                 session.model.prune_level.budget.record_compact_failure();
             }

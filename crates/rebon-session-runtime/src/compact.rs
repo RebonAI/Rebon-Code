@@ -10,7 +10,7 @@
 
 use std::sync::mpsc::Receiver;
 
-use rebon_core::query::{ManualCompactReport, PreparedResumeSummary};
+use rebon_core::query::ManualCompactReport;
 
 /// Gutter glyph the report's detail lines use, matching how tool output
 /// continuation rows are drawn elsewhere in the transcript.
@@ -47,7 +47,112 @@ pub struct CompactWorker {
 pub enum CompactProgress {
     /// The transcript is loaded; the provider call has begun.
     Summarizing,
-    Done(Box<Result<(PreparedResumeSummary, ManualCompactReport), String>>),
+    Done(Box<CompactDone>),
+}
+
+/// How a compaction ended. Whatever was installed, was installed before this
+/// is reported, on the session loop, with no turn running.
+pub enum CompactDone {
+    /// The summary is the session's replay baseline now.
+    Installed(ManualCompactReport),
+    /// An idle compaction whose summariser fell back without the model;
+    /// nothing was installed.
+    NoSummary(ManualCompactReport),
+    /// An idle compaction whose transcript moved on while it ran; dropped.
+    Stale,
+    /// An idle compaction that could not be checked against the transcript.
+    Unverified(String),
+    Failed(String),
+}
+
+/// Compact a session's history and install the result, reporting progress.
+///
+/// Meant to run as session-loop history work: nothing else writes the
+/// history while it does, so the baseline it installs is in place before the
+/// next turn starts. An idle (`automatic`) run installs only a summary the
+/// model actually wrote, and only if the transcript is still the one it read.
+pub async fn compact_and_install(
+    resume_replay: rebon_core::query::ResumeReplayHandle,
+    projects_root: std::path::PathBuf,
+    cwd: String,
+    session_id: String,
+    instructions: Option<String>,
+    automatic: bool,
+    progress: std::sync::mpsc::Sender<CompactProgress>,
+) {
+    let done = compact_and_install_inner(
+        &resume_replay,
+        &projects_root,
+        &cwd,
+        &session_id,
+        instructions.as_deref(),
+        automatic,
+        &progress,
+    )
+    .await;
+    let _ = progress.send(CompactProgress::Done(Box::new(done)));
+}
+
+async fn compact_and_install_inner(
+    resume_replay: &rebon_core::query::ResumeReplayHandle,
+    projects_root: &std::path::Path,
+    cwd: &str,
+    session_id: &str,
+    instructions: Option<&str>,
+    automatic: bool,
+    progress: &std::sync::mpsc::Sender<CompactProgress>,
+) -> CompactDone {
+    let loaded = match load_transcript(projects_root, cwd, session_id).await {
+        Ok(Some(loaded)) => loaded,
+        Ok(None) => {
+            return CompactDone::Failed("This session has no transcript to compact yet.".into())
+        }
+        Err(err) => {
+            return CompactDone::Failed(format!("Could not read this session's transcript: {err}"))
+        }
+    };
+    let _ = progress.send(CompactProgress::Summarizing);
+    let (prepared, report) = match resume_replay
+        .compact_session_now(
+            projects_root,
+            cwd,
+            session_id,
+            &loaded.messages,
+            instructions,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(message) => return CompactDone::Failed(message),
+    };
+    if automatic {
+        if !report.used_model {
+            return CompactDone::NoSummary(report);
+        }
+        match load_transcript(projects_root, cwd, session_id).await {
+            Ok(Some(current)) if prepared.matches_transcript(&current.messages) => {}
+            Ok(_) => {
+                tracing::info!("idle compaction discarded because the transcript changed");
+                return CompactDone::Stale;
+            }
+            Err(err) => return CompactDone::Unverified(err.to_string()),
+        }
+    }
+    resume_replay.install_persistent_summary(projects_root, cwd, session_id.to_string(), prepared);
+    CompactDone::Installed(report)
+}
+
+async fn load_transcript(
+    projects_root: &std::path::Path,
+    cwd: &str,
+    session_id: &str,
+) -> anyhow::Result<Option<rebon_session::LoadedTranscript>> {
+    let path = rebon_session::transcript_file_path(projects_root, cwd, session_id);
+    let loaded =
+        tokio::task::spawn_blocking(move || rebon_session::load_transcript_from_file(&path))
+            .await
+            .map_err(|err| anyhow::anyhow!("transcript read stopped: {err}"))??;
+    Ok(loaded)
 }
 
 /// Write the mailbox response a deferred foreground `/compact` owes its
