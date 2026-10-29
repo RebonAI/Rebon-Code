@@ -436,12 +436,41 @@ pub(super) fn detect_paste_batch_after_enter<S: EventSource>(
     // first-poll grace the Enter appeared "standalone" and the runner
     // submitted it — the failure mode for short-first-line pastes like
     // `"a\nbcdef\n…"` where the Enter arrives before the tail batch.
-    detect_paste_batch_with_timeout(
+    let detected = detect_paste_batch_with_timeout(
         stashed_events,
         source,
         PASTE_BATCH_ENTER_GRACE,
         PASTE_BATCH_ENTER_GRACE,
-    )
+    )?;
+    if !detected
+        || !matches!(
+            stashed_events.front(),
+            Some(Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            }))
+        )
+    {
+        return Ok(detected);
+    }
+
+    // 连续 Enter 也可能来自输入法选词和用户按键，需等到粘贴内容才能判定为多行。
+    while source.poll(PASTE_BATCH_ENTER_GRACE)? {
+        let event = source.read()?;
+        let decision = match &event {
+            Event::Key(key) if key.kind == KeyEventKind::Release => None,
+            Event::Key(key) if is_paste_batch_key(key) => match key.code {
+                KeyCode::Enter => None,
+                _ => Some(true),
+            },
+            _ => Some(false),
+        };
+        stashed_events.push_back(event);
+        if let Some(is_batch) = decision {
+            return Ok(is_batch);
+        }
+    }
+    Ok(false)
 }
 
 pub(super) const PASTE_BATCH_MODE_SHORTCUT_GRACE: Duration = BURST_CONTINUATION_INTERVAL;
@@ -1478,6 +1507,64 @@ mod tests {
     }
 
     #[test]
+    fn double_enter_is_not_a_paste_batch() {
+        for with_release in [false, true] {
+            let mut src = FakeEventSource::new();
+            let mut stashed = VecDeque::new();
+            if with_release {
+                src.push(0, release(CKeyCode::Enter));
+            }
+            src.push(1, press(CKeyCode::Enter));
+            if with_release {
+                src.push(2, release(CKeyCode::Enter));
+            }
+
+            assert!(!detect_paste_batch_after_enter(&mut stashed, &mut src).unwrap());
+            assert_eq!(stashed.front(), Some(&press(CKeyCode::Enter)));
+        }
+    }
+
+    #[test]
+    fn enter_followed_by_empty_lines_and_text_is_a_paste_batch() {
+        for with_release in [false, true] {
+            let mut src = FakeEventSource::new();
+            let mut stashed = VecDeque::new();
+            if with_release {
+                src.push(0, release(CKeyCode::Enter));
+            }
+            src.push(1, press(CKeyCode::Enter));
+            if with_release {
+                src.push(2, release(CKeyCode::Enter));
+            }
+            src.push(3, press(CKeyCode::Enter));
+            if with_release {
+                src.push(4, release(CKeyCode::Enter));
+            }
+            src.push(5, press(CKeyCode::Char('中')));
+
+            assert!(detect_paste_batch_after_enter(&mut stashed, &mut src).unwrap());
+            let mut burst = PasteBurst::new();
+            burst.force_activate_with_newline("a", Instant::now());
+            drain_burst_queue(&mut burst, &mut stashed, &mut src).unwrap();
+            assert_eq!(burst.pending_text(), "a\n\n\n中");
+        }
+    }
+
+    #[test]
+    fn enter_followed_by_enter_and_navigation_preserves_event_order() {
+        let mut src = FakeEventSource::new();
+        let mut stashed = VecDeque::new();
+        src.push(0, press(CKeyCode::Enter));
+        src.push(0, release(CKeyCode::Enter));
+        src.push(0, press(CKeyCode::Esc));
+
+        assert!(!detect_paste_batch_after_enter(&mut stashed, &mut src).unwrap());
+        assert_eq!(stashed.pop_front(), Some(press(CKeyCode::Enter)));
+        assert_eq!(stashed.pop_front(), Some(release(CKeyCode::Enter)));
+        assert_eq!(stashed.pop_front(), Some(press(CKeyCode::Esc)));
+    }
+
+    #[test]
     fn mode_shortcut_paste_detection_waits_for_delayed_tail_after_release() {
         let mut src = FakeEventSource::new();
         let mut stashed = VecDeque::new();
@@ -2194,6 +2281,32 @@ mod tests {
             result.submits
         );
         assert_eq!(result.final_input, "");
+    }
+
+    #[test]
+    fn paste_simulation_ime_commit_and_double_enter_do_not_insert_newlines() {
+        let mut src = FakeEventSource::new();
+        src.push(0, press(CKeyCode::Char('中')));
+        src.push(1, release(CKeyCode::Char('中')));
+        src.push(80, press(CKeyCode::Enter));
+        src.push(81, release(CKeyCode::Enter));
+        src.push(85, press(CKeyCode::Enter));
+        src.push(86, release(CKeyCode::Enter));
+
+        let result = simulate_paste(&mut src);
+        assert!(result.paste_flushes.is_empty());
+        assert_eq!(result.submits.first().map(String::as_str), Some("中"));
+        assert!(!result.final_input.contains('\n'));
+    }
+
+    #[test]
+    fn paste_simulation_short_line_and_consecutive_empty_lines_stay_together() {
+        let mut src = FakeEventSource::new();
+        push_paste_batch(&mut src, 0, "a\n\n\n中文");
+
+        let result = simulate_paste(&mut src);
+        assert!(result.submits.is_empty());
+        assert_eq!(result.final_input, "a\n\n\n中文");
     }
 
     /// Regression: short single-line paste chunks can still be one
