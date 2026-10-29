@@ -889,15 +889,17 @@ fn admit_active_prompt_with_task_notifications(
             active
                 .with_task_notification_claim(
                     session.engine_half.task_notification_poller.clone(),
+                    session.session_id.clone(),
                     task_notification_turn_id,
                 )
                 .with_question_escalation_registry(session.engine_half.tasks.escalation_registry()),
         ),
         Err(reason) => {
-            session
-                .engine_half
-                .task_notification_poller
-                .finish_claim(&task_notification_turn_id, false);
+            session.engine_half.task_notification_poller.finish_claim(
+                &session.session_id,
+                &task_notification_turn_id,
+                false,
+            );
             report_local_turn_rejection(app, &reason);
             None
         }

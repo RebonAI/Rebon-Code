@@ -997,6 +997,7 @@ mod tests {
             ActivePrompt::with_task_notifications(rx, cancel.clone(), vec![task_id], Vec::new())
                 .with_task_notification_claim(
                     session.engine_half.task_notification_poller.clone(),
+                    session.session_id.clone(),
                     turn_id,
                 ),
         );

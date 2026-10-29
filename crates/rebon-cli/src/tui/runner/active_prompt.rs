@@ -60,7 +60,9 @@ pub(super) struct ActivePrompt {
     pub(super) cancel: PromptCancel,
     pub(super) pending_task_notification_ids: Vec<rebon_plugin_tasks::runtime::TaskId>,
     pub(super) pending_question_escalation_ids: Vec<rebon_tool::EscalationId>,
-    task_notification_claim: Option<(Arc<TaskNotificationPoller>, String)>,
+    /// The poller, session and turn this prompt's task notifications were
+    /// reserved under, settled once the turn's outcome is known.
+    task_notification_claim: Option<(Arc<TaskNotificationPoller>, String, String)>,
     /// Registry handle for settling question-escalation notifications
     /// once the turn's real outcome is known. Carried on the prompt so
     /// detached turns (which no longer have `app` in reach) can ack on
@@ -200,9 +202,10 @@ impl ActivePrompt {
     pub(super) fn with_task_notification_claim(
         mut self,
         poller: Arc<TaskNotificationPoller>,
+        session_id: String,
         turn_id: String,
     ) -> Self {
-        self.task_notification_claim = Some((poller, turn_id));
+        self.task_notification_claim = Some((poller, session_id, turn_id));
         self
     }
 
@@ -221,8 +224,8 @@ impl ActivePrompt {
     }
 
     pub(super) fn finish_task_notification_claim(&mut self, succeeded: bool) {
-        if let Some((poller, turn_id)) = self.task_notification_claim.take() {
-            poller.finish_claim(&turn_id, succeeded);
+        if let Some((poller, session_id, turn_id)) = self.task_notification_claim.take() {
+            poller.finish_claim(&session_id, &turn_id, succeeded);
         }
     }
 
