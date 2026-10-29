@@ -432,9 +432,6 @@ struct LoopState {
     global_search_worker: Option<GlobalSearchWorker>,
     suggestion_runtime: super::prompt_suggestion::SuggestionRuntime,
     resume_runtime: ResumeRuntime,
-    task_notification_retry_after: Option<Instant>,
-    task_notification_revision_rx: Option<tokio::sync::watch::Receiver<u64>>,
-    task_notification_scan_pending: bool,
     agent_gen_rx: Option<
         oneshot::Receiver<Result<rebon_plugin_agents::surface::generate::GeneratedAgent, String>>,
     >,
@@ -530,9 +527,6 @@ pub(in crate::tui::runner) fn event_loop_with_mode(
         global_search_worker: None,
         suggestion_runtime: Default::default(),
         resume_runtime: ResumeRuntime::new(),
-        task_notification_retry_after: None,
-        task_notification_revision_rx: None,
-        task_notification_scan_pending: true,
         agent_gen_rx: None,
         command_expansion_rx,
         paste_burst: PasteBurst::new(),
@@ -767,7 +761,6 @@ fn inline_surface_gates(
                 handle,
                 &mut state.active_prompt,
                 &mut state.pending_permission,
-                &mut state.task_notification_retry_after,
             ) {
                 tracing::warn!(%err, "inline background tasks overlay failed");
             }
@@ -962,37 +955,22 @@ fn session_pipeline(
                 state.ui_mode,
             );
         }
-        maybe_update_loading_state(
-            app,
-            session,
-            handle,
-            &mut state.active_prompt,
-            &mut state.task_notification_retry_after,
-        );
-        if super::task_runtime::task_notification_scan_needed(
-            &mut state.task_notification_revision_rx,
-            session
-                .engine_half
-                .task_notification_poller
-                .subscribe_notification_revision(),
-        ) {
-            state.task_notification_scan_pending = true;
-        }
-        if !session
+        maybe_update_loading_state(app, session, handle, &mut state.active_prompt);
+        session
             .engine_half
-            .tasks
-            .unnotified_question_escalation_notifications()
-            .is_empty()
-        {
-            state.task_notification_scan_pending = true;
-        }
-        if state
-            .task_notification_retry_after
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            state.task_notification_retry_after = None;
-            state.task_notification_scan_pending = true;
-        }
+            .session_loop
+            .inbox()
+            .observe_task_notifications(
+                session
+                    .engine_half
+                    .task_notification_poller
+                    .subscribe_notification_revision(),
+                !session
+                    .engine_half
+                    .tasks
+                    .unnotified_question_escalation_notifications()
+                    .is_empty(),
+            );
         refresh_remote_background_attachment(app, session, &mut state.pending_permission);
         // `--hosted` fires from here rather than at startup because the
         // session it means is not settled yet at startup: a resume dialog
@@ -1071,10 +1049,12 @@ fn session_pipeline(
         if app.resume_dialog.is_none()
             && state.active_prompt.is_none()
             && app.queued_commands.is_empty()
-            && state.task_notification_retry_after.is_none()
-            && state.task_notification_scan_pending
+            && session
+                .engine_half
+                .session_loop
+                .inbox()
+                .take_task_notification_look()
         {
-            state.task_notification_scan_pending = false;
             if !maybe_spawn_task_notification_prompt(app, session, handle, &mut state.active_prompt)
                 && (!session
                     .engine_half
@@ -1087,8 +1067,11 @@ fn session_pipeline(
                         .unnotified_question_escalation_notifications()
                         .is_empty())
             {
-                state.task_notification_retry_after =
-                    Some(Instant::now() + Duration::from_secs(10));
+                session
+                    .engine_half
+                    .session_loop
+                    .inbox()
+                    .retry_task_notifications_later();
             }
         }
 
@@ -4547,18 +4530,11 @@ fn run_inline_background_tasks_overlay(
     handle: &Handle,
     active_prompt: &mut Option<ActivePrompt>,
     pending_permission: &mut Option<PendingPermission>,
-    task_notification_retry_after: &mut Option<Instant>,
 ) -> anyhow::Result<()> {
     let mut guard = AltScreenOverlayGuard::enter()?;
     loop {
         drain_ui_channels(app, session, pending_permission, active_prompt);
-        maybe_update_loading_state(
-            app,
-            session,
-            handle,
-            active_prompt,
-            task_notification_retry_after,
-        );
+        maybe_update_loading_state(app, session, handle, active_prompt);
         refresh_background_tasks_dialog(app);
         refresh_live_agent_tool_activity(app);
 

@@ -51,12 +51,12 @@ pub(super) fn maybe_update_loading_state(
     session: &mut TuiEngineSession,
     handle: &Handle,
     active_prompt: &mut Option<ActivePrompt>,
-    task_notification_retry_after: &mut Option<Instant>,
 ) {
     let active_prompt_elapsed = active_prompt
         .as_ref()
         .map(|prompt| prompt.started_at.elapsed());
-    let prompt_result = poll_active_prompt(app, active_prompt, task_notification_retry_after);
+    let prompt_result =
+        poll_active_prompt(app, active_prompt, session.engine_half.session_loop.inbox());
     let mut completed_elapsed = None;
     let mut completed_stop_reason = None;
     let mut completed_usage = rebon_types::Usage::default();
@@ -392,7 +392,7 @@ pub(super) fn commit_prompt_failure_message(
 pub(super) fn poll_active_prompt(
     _app: &mut AppState,
     active_prompt: &mut Option<ActivePrompt>,
-    task_notification_retry_after: &mut Option<Instant>,
+    inbox: &crate::session::session_inbox::SessionInbox,
 ) -> PromptPollResult {
     let Some(active) = active_prompt.as_mut() else {
         return PromptPollResult::Pending;
@@ -407,7 +407,7 @@ pub(super) fn poll_active_prompt(
                 || !active.pending_question_escalation_ids.is_empty();
             active.finish_task_notification_claim(true);
             if had_pending_notifications {
-                *task_notification_retry_after = None;
+                inbox.task_notifications_settled();
             }
             active.finish_question_escalation_notifications();
             let stop_reason = outcome.stop_reason;
@@ -431,7 +431,7 @@ pub(super) fn poll_active_prompt(
             if !active.pending_task_notification_ids.is_empty()
                 || !active.pending_question_escalation_ids.is_empty()
             {
-                *task_notification_retry_after = Some(Instant::now() + Duration::from_secs(10));
+                inbox.retry_task_notifications_later();
                 tracing::warn!(
                     task_count = active.pending_task_notification_ids.len(),
                     escalation_count = active.pending_question_escalation_ids.len(),
@@ -453,7 +453,7 @@ pub(super) fn poll_active_prompt(
             if !active.pending_task_notification_ids.is_empty()
                 || !active.pending_question_escalation_ids.is_empty()
             {
-                *task_notification_retry_after = Some(Instant::now() + Duration::from_secs(10));
+                inbox.retry_task_notifications_later();
             }
             PromptPollResult::Failed {
                 error: err,
@@ -1705,15 +1705,8 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         tx.send(Ok(outcome)).unwrap();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         let usage = app.usage();
         assert_eq!(usage.last_turn.total_input_tokens, 203_000);
@@ -1742,15 +1735,8 @@ mod tests {
         session.swap_runtime("new-session", "/new", false).unwrap();
         let new = session.engine_half.runtime.clone();
         new.file_history_tracker.set_current_message_id("new-turn");
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert_eq!(
             rebon_agent_core::file_history::FileHistoryTracker::is_armed(&old.file_history_tracker),
@@ -1787,15 +1773,8 @@ mod tests {
         );
         app.rebon_tui.overlay.set_streaming_text("流上来的半句");
         let mut active = None;
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
         assert_eq!(
             app.rebon_tui.overlay.combined_streaming_text().as_deref(),
             Some("流上来的半句"),
@@ -1803,13 +1782,7 @@ mod tests {
         );
 
         session.remote_background_attachment = None;
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
         assert!(
             app.rebon_tui.overlay.is_empty(),
             "a local session with no prompt still clears late deltas"
@@ -1828,15 +1801,8 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         tx.send(Ok(outcome)).unwrap();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert_eq!(
             app.prompt_completion_status,
@@ -1895,19 +1861,12 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         tx.send(Ok(PromptOutcome::end_turn())).unwrap();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let mut retry_after = None;
         let mut session = make_test_tui_session();
         session.engine_half.tasks = reg;
         session.engine_half.update_rx = rebon_agent_core::ChannelSessionUpdatePublisher::new().1;
         let (runtime, handle) = make_immediate_handle();
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert!(active.is_none());
         assert_eq!(
@@ -1967,15 +1926,8 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         tx.send(Ok(PromptOutcome::end_turn())).unwrap();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
         runtime.block_on(tokio::task::yield_now());
 
         assert!(active.is_some());
@@ -2030,15 +1982,8 @@ mod tests {
         )))
         .unwrap();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert!(active.is_none());
         assert!(app.foregrounded_task_id.is_none());
@@ -2066,17 +2011,10 @@ mod tests {
         app.main_agent_view = Some(main);
         app.foregrounded_task_id = Some("agent-1".into());
         let mut active = None;
-        let mut retry_after = None;
         let mut session = make_test_tui_session();
         let (runtime, handle) = make_immediate_handle();
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert_eq!(app.foregrounded_task_id.as_deref(), Some("agent-1"));
         assert_eq!(app.rebon_tui.overlay.blocks.len(), child_overlay_blocks);
@@ -2095,17 +2033,10 @@ mod tests {
         app.prompt_completion_status = Some(PromptCompletionStatus::Failed);
         let (_tx, rx) = oneshot::channel();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let mut retry_after = None;
         let mut session = make_test_tui_session();
         let (runtime, handle) = make_immediate_handle();
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert!(active.is_some());
         assert_eq!(app.prompt_completion_status, None);
@@ -2125,8 +2056,8 @@ mod tests {
                 .with_usage_model("provider-before-switch", "model-before-switch"),
         );
 
-        let mut retry_after = None;
-        let result = poll_active_prompt(&mut app, &mut active, &mut retry_after);
+        let inbox = crate::session::session_inbox::SessionInbox::default();
+        let result = poll_active_prompt(&mut app, &mut active, &inbox);
 
         assert!(matches!(
             result,
@@ -2162,17 +2093,10 @@ mod tests {
             .with_user_message_uuid(Some("u-worked".into()));
         prompt.started_at = Instant::now() - Duration::from_secs(3_723);
         let mut active = Some(prompt);
-        let mut retry_after = None;
         let mut session = make_test_tui_session();
         let (runtime, handle) = make_immediate_handle();
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert!(active.is_none());
         let rows = app.rebon_tui.transcript.rows();
@@ -2199,17 +2123,10 @@ mod tests {
             .with_user_message_uuid(Some("u-failed".into()));
         prompt.started_at = Instant::now() - Duration::from_secs(62);
         let mut active = Some(prompt);
-        let mut retry_after = None;
         let mut session = make_test_tui_session();
         let (runtime, handle) = make_immediate_handle();
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert!(app.rebon_tui.transcript.rows().iter().all(|row| !matches!(
             row,
@@ -2238,15 +2155,8 @@ mod tests {
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
         let mut session = make_test_tui_session();
         let (runtime, handle) = make_immediate_handle();
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert!(active.is_none());
         assert!(app.ultraplan_status.is_none());
@@ -2280,15 +2190,8 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         tx.send(Ok(PromptOutcome::end_turn())).unwrap();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert!(active.is_none());
         assert!(app.ultraplan_status.is_none());
@@ -2305,8 +2208,8 @@ mod tests {
         .unwrap();
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
 
-        let mut retry_after = None;
-        let result = poll_active_prompt(&mut app, &mut active, &mut retry_after);
+        let inbox = crate::session::session_inbox::SessionInbox::default();
+        let result = poll_active_prompt(&mut app, &mut active, &inbox);
 
         assert!(matches!(result, PromptPollResult::Failed { .. }));
         assert!(active.is_none());
@@ -2494,9 +2397,9 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         drop(tx);
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
-        let mut retry_after = None;
+        let inbox = crate::session::session_inbox::SessionInbox::default();
 
-        let result = poll_active_prompt(&mut app, &mut active, &mut retry_after);
+        let result = poll_active_prompt(&mut app, &mut active, &inbox);
 
         let PromptPollResult::Failed { error, .. } = result else {
             panic!("expected closed result channel to fail prompt");
@@ -2533,15 +2436,8 @@ mod tests {
         let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
         let mut session = make_test_tui_session();
         let (runtime, handle) = make_immediate_handle();
-        let mut retry_after = None;
 
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
 
         assert!(active.is_none());
         assert_eq!(
@@ -2608,14 +2504,7 @@ mod tests {
                 let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
                 let mut session = make_test_tui_session();
                 let (runtime, handle) = make_immediate_handle();
-                let mut retry_after = None;
-                maybe_update_loading_state(
-                    &mut app,
-                    &mut session,
-                    &handle,
-                    &mut active,
-                    &mut retry_after,
-                );
+                maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
                 assert!(active.is_none());
                 assert_eq!(
                     app.prompt_completion_status,
@@ -3194,7 +3083,6 @@ mod tests {
         };
         insert_terminal_agent_notification(&mut app, "agent-retry", output_file);
         let mut active_prompt = None;
-        let mut retry_after = None;
 
         maybe_spawn_task_notification_prompt(&mut app, &session, &handle, &mut active_prompt);
         runtime.block_on(tokio::task::yield_now());
@@ -3206,11 +3094,19 @@ mod tests {
         );
 
         assert!(matches!(
-            poll_active_prompt(&mut app, &mut active_prompt, &mut retry_after),
+            poll_active_prompt(
+                &mut app,
+                &mut active_prompt,
+                session.engine_half.session_loop.inbox()
+            ),
             PromptPollResult::Failed { .. }
         ));
         assert!(active_prompt.is_none());
-        assert!(retry_after.is_some_and(|deadline| deadline > Instant::now()));
+        assert!(session
+            .engine_half
+            .session_loop
+            .inbox()
+            .task_notification_retry_pending());
         assert!(
             !app.tasks
                 .snapshot(&rebon_plugin_tasks::runtime::TaskId::new("agent-retry"))
@@ -3255,7 +3151,6 @@ mod tests {
         });
         runtime.block_on(tokio::task::yield_now());
         let mut active_prompt = None;
-        let mut retry_after = None;
 
         maybe_spawn_task_notification_prompt(&mut app, &session, &handle, &mut active_prompt);
         runtime.block_on(tokio::task::yield_now());
@@ -3281,7 +3176,11 @@ mod tests {
         );
 
         assert!(matches!(
-            poll_active_prompt(&mut app, &mut active_prompt, &mut retry_after),
+            poll_active_prompt(
+                &mut app,
+                &mut active_prompt,
+                session.engine_half.session_loop.inbox()
+            ),
             PromptPollResult::Succeeded { .. }
         ));
         assert!(app
@@ -3315,7 +3214,6 @@ mod tests {
             runtime.spawn(async move { client.escalate("Retry this?".into(), None, None).await });
         runtime.block_on(tokio::task::yield_now());
         let mut active_prompt = None;
-        let mut retry_after = None;
 
         maybe_spawn_task_notification_prompt(&mut app, &session, &handle, &mut active_prompt);
         runtime.block_on(tokio::task::yield_now());
@@ -3324,11 +3222,19 @@ mod tests {
         assert!(first_requests[0].coordinator_report_paths.is_empty());
 
         assert!(matches!(
-            poll_active_prompt(&mut app, &mut active_prompt, &mut retry_after),
+            poll_active_prompt(
+                &mut app,
+                &mut active_prompt,
+                session.engine_half.session_loop.inbox()
+            ),
             PromptPollResult::Failed { .. }
         ));
         assert!(active_prompt.is_none());
-        assert!(retry_after.is_some_and(|deadline| deadline > Instant::now()));
+        assert!(session
+            .engine_half
+            .session_loop
+            .inbox()
+            .task_notification_retry_pending());
         assert_eq!(
             app.tasks
                 .unnotified_question_escalation_notifications()
@@ -3464,17 +3370,10 @@ mod tests {
         app.foregrounded_task_id = Some("agent-foreground".into());
         sync_foreground_agent_view(&mut app, session.engine_half.tasks.as_ref());
         let mut active_prompt = None;
-        let mut retry_after = None;
 
         maybe_spawn_task_notification_prompt(&mut app, &session, &handle, &mut active_prompt);
         runtime.block_on(tokio::task::yield_now());
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active_prompt,
-            &mut retry_after,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active_prompt);
 
         assert!(active_prompt.is_none());
         assert_eq!(
@@ -3594,13 +3493,7 @@ mod tests {
         .await
         .expect("shell result persisted");
         let mut active_prompt = None;
-        maybe_update_loading_state(
-            &mut app,
-            &mut session,
-            &handle,
-            &mut active_prompt,
-            &mut None,
-        );
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active_prompt);
         assert!(
             active_prompt.is_some(),
             "shell completion must start an agent reply without user input"
@@ -3648,7 +3541,7 @@ mod tests {
                 "active" => active = Some(ActivePrompt::new(rx, PromptCancel::new())),
                 _ => unreachable!(),
             }
-            maybe_update_loading_state(&mut app, &mut session, &handle, &mut active, &mut None);
+            maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
             assert_eq!(app.deferred_internal_submit_payloads.len(), 1, "{blocked}");
             assert_eq!(active.is_some(), blocked == "active");
             assert!(app.rebon_tui.transcript.is_empty());
