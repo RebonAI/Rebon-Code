@@ -6,12 +6,10 @@
 //! into flight. The checked local-turn admission API and its private raw
 //! executor dispatch live here too — everything that touches an `ActivePrompt`.
 
-use std::any::Any;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::runtime::Handle;
-use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 
 use rebon_render::normalize_system_api_error_text;
@@ -465,71 +463,10 @@ pub(super) fn poll_active_prompt(
     }
 }
 
-fn spawn_prompt_executor_task(
-    handle: &Handle,
-    runtime: Arc<crate::session::runtime::SessionRuntime>,
-    executor: Arc<dyn rebon_agent_core::PromptExecutor>,
-    request: rebon_agent_core::PromptRequest,
-    turn_kind: &'static str,
-) -> PromptResultRx {
-    let (tx, rx) = oneshot::channel();
-    let turn_guard = runtime.mid_turn_queue.begin_turn();
-    let worker = handle.spawn(async move {
-        let _turn_guard = turn_guard;
-        let _runtime_guard = runtime;
-        executor.execute(request).await
-    });
-    handle.spawn(async move {
-        let result = match worker.await {
-            Ok(result) => result,
-            Err(err) => Err(prompt_executor_task_join_error(turn_kind, err)),
-        };
-        let _ = tx.send(result);
-    });
-    rx
-}
-
-fn prompt_executor_task_join_error(
-    turn_kind: &'static str,
-    err: tokio::task::JoinError,
-) -> rebon_agent_core::PromptExecutorError {
-    if err.is_panic() {
-        let join_error = err.to_string();
-        let panic = panic_payload_message(err.into_panic());
-        tracing::error!(
-            turn_kind,
-            panic = %panic,
-            join_error = %join_error,
-            "rebon-cli: prompt executor task panicked"
-        );
-        return rebon_agent_core::PromptExecutorError::Execution(format!(
-            "{turn_kind} prompt executor task panicked: {panic}"
-        ));
-    }
-
-    let message = if err.is_cancelled() {
-        format!("{turn_kind} prompt executor task was aborted before reporting a result")
-    } else {
-        format!("{turn_kind} prompt executor task failed before reporting a result: {err}")
-    };
-    tracing::error!(turn_kind, error = %err, "rebon-cli: prompt executor task failed");
-    rebon_agent_core::PromptExecutorError::Execution(message)
-}
-
 pub(super) fn prompt_result_channel_closed_error() -> rebon_agent_core::PromptExecutorError {
     rebon_agent_core::PromptExecutorError::Execution(
         "prompt executor result channel closed; task may have been aborted or the runtime shut down before reporting a result".to_string(),
     )
-}
-
-fn panic_payload_message(payload: Box<dyn Any + Send + 'static>) -> String {
-    if let Some(message) = payload.downcast_ref::<&'static str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_string()
-    }
 }
 
 pub(super) fn finalize_turn(app: &mut AppState, session_id: &str) {
@@ -1120,7 +1057,7 @@ fn admit_local_turn(
         ),
     };
 
-    let rx = dispatch_admitted_local_turn(handle, runtime.clone(), request, source);
+    let rx = dispatch_admitted_local_turn(handle, session, runtime.clone(), request, source);
     if matches!(
         source,
         LocalTurnSource::DirectUserSubmit | LocalTurnSource::Command
@@ -1257,20 +1194,22 @@ fn prompt_blocks(
     prompt_blocks
 }
 
+/// Every local turn the terminal starts goes to the session loop from here.
 fn dispatch_admitted_local_turn(
     handle: &Handle,
+    session: &TuiEngineSession,
     runtime: Arc<crate::session::runtime::SessionRuntime>,
     request: rebon_agent_core::PromptRequest,
     source: LocalTurnSource,
 ) -> PromptResultRx {
-    let executor = runtime.executor.clone();
-    let label = match source {
-        LocalTurnSource::PermissionRetry | LocalTurnSource::ForegroundPermissionRetry => {
-            "permission replay"
-        }
-        _ => "main",
-    };
-    spawn_prompt_executor_task(handle, runtime, executor, request, label)
+    session.engine_half.session_loop.submit_turn(
+        handle,
+        crate::session::session_loop::TurnInput {
+            runtime,
+            request,
+            origin: source.turn_origin(),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1311,7 +1250,7 @@ fn dispatch_local_turn_for_test(
         replay_requests: Vec::new(),
         skill_invocations,
     };
-    dispatch_admitted_local_turn(handle, runtime, request, LocalTurnSource::TestOnly)
+    dispatch_admitted_local_turn(handle, session, runtime, request, LocalTurnSource::TestOnly)
 }
 
 pub(super) fn sync_current_session_title(app: &mut AppState, session: &TuiEngineSession) {
@@ -1477,6 +1416,7 @@ mod tests {
             production_part(include_str!("foreground_mailbox.rs")),
             production_part(include_str!("session_detach_attach.rs")),
             production_part(include_str!("event_loop_entry.rs")),
+            production_part(include_str!("native_commands.rs")),
         ]
         .join("\n");
         for variant in [
@@ -1502,18 +1442,18 @@ mod tests {
             production_part(include_str!("foreground_mailbox.rs")),
             production_part(include_str!("session_detach_attach.rs")),
             production_part(include_str!("event_loop_entry.rs")),
+            production_part(include_str!("native_commands.rs")),
         ] {
-            assert!(!source.contains("spawn_prompt_executor_task"));
             assert!(!source.contains("dispatch_admitted_local_turn"));
             assert!(!source.contains(".execute(request)"));
         }
-        let raw_dispatch_marker = concat!("spawn_prompt_executor", "_task(");
+        // The executor is only ever reached through the session loop.
+        assert!(!production_prompt_lifecycle.contains(".execute("));
+        let loop_marker = concat!("session_loop", ".submit_turn(");
         assert_eq!(
-            production_prompt_lifecycle
-                .matches(raw_dispatch_marker)
-                .count(),
-            2,
-            "the raw executor task must have only its definition and the private admitted call"
+            production_prompt_lifecycle.matches(loop_marker).count(),
+            1,
+            "local turns reach the session loop from one dispatch point"
         );
         assert!(prompt_lifecycle.contains("fn dispatch_local_turn_for_test("));
         let test_seam = prompt_lifecycle
@@ -2398,6 +2338,120 @@ mod tests {
             prompt_failure_display_text("Prompt turn failed: prompt executor failed: model stream error: model client bad request: 400: ws error (websocket_connection_limit_reached): Responses websocket connection limit reached (60 minutes)."),
             "Responses websocket connection limit reached (60 minutes)."
         );
+    }
+
+    /// Logs each turn's start and end; a turn named "boom" panics, and the
+    /// others wait for a permit before they end.
+    struct GatedPromptExecutor {
+        log: Mutex<Vec<String>>,
+        permits: tokio::sync::Semaphore,
+    }
+
+    impl Default for GatedPromptExecutor {
+        fn default() -> Self {
+            Self {
+                log: Mutex::new(Vec::new()),
+                permits: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl rebon_agent_core::PromptExecutor for GatedPromptExecutor {
+        async fn execute(
+            &self,
+            request: PromptRequest,
+        ) -> Result<PromptOutcome, PromptExecutorError> {
+            let name = match request.prompt.first() {
+                Some(ContentBlock::Text(text)) => text.text.clone(),
+                _ => String::new(),
+            };
+            self.log.lock().unwrap().push(format!("start {name}"));
+            if name == "boom" {
+                panic!("synthetic executor panic");
+            }
+            self.permits.acquire().await.unwrap().forget();
+            self.log.lock().unwrap().push(format!("end {name}"));
+            Ok(PromptOutcome::end_turn())
+        }
+    }
+
+    fn dispatch_named_turn(
+        session: &TuiEngineSession,
+        handle: &Handle,
+        name: &str,
+    ) -> PromptResultRx {
+        dispatch_local_turn_for_test(
+            session,
+            handle,
+            name.into(),
+            Vec::new(),
+            Vec::new(),
+            PromptCancel::new(),
+            ThinkingOverrides {
+                thinking_budget: None,
+                max_tokens: None,
+                reasoning_effort_ordinal: None,
+            },
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn settle(runtime: &tokio::runtime::Runtime) {
+        runtime.block_on(async {
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+
+    #[test]
+    fn session_loop_runs_turns_one_at_a_time_in_arrival_order() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let executor = Arc::new(GatedPromptExecutor::default());
+        session.set_test_executor(executor.clone());
+
+        let first = dispatch_named_turn(&session, &handle, "first");
+        let second = dispatch_named_turn(&session, &handle, "second");
+        settle(&runtime);
+        assert_eq!(*executor.log.lock().unwrap(), ["start first"]);
+
+        executor.permits.add_permits(1);
+        assert!(runtime.block_on(first).unwrap().is_ok());
+        settle(&runtime);
+        assert_eq!(
+            *executor.log.lock().unwrap(),
+            ["start first", "end first", "start second"]
+        );
+
+        executor.permits.add_permits(1);
+        assert!(runtime.block_on(second).unwrap().is_ok());
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn session_loop_survives_a_turn_that_panics() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let executor = Arc::new(GatedPromptExecutor::default());
+        session.set_test_executor(executor.clone());
+        executor.permits.add_permits(1);
+
+        let boom = dispatch_named_turn(&session, &handle, "boom");
+        let after = dispatch_named_turn(&session, &handle, "after");
+
+        let err = runtime.block_on(boom).unwrap().unwrap_err().to_string();
+        assert!(err.contains("main prompt executor task panicked"), "{err}");
+        assert!(runtime.block_on(after).unwrap().is_ok());
+        assert_eq!(
+            *executor.log.lock().unwrap(),
+            ["start boom", "start after", "end after"]
+        );
+        runtime.shutdown_background();
     }
 
     #[test]

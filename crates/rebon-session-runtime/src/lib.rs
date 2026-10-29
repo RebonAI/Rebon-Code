@@ -65,6 +65,7 @@ pub mod resume_listing;
 pub mod resume_resolution;
 pub mod runtime;
 pub mod runtime_refresh;
+pub mod session_loop;
 pub mod settings_rows;
 pub mod startup;
 pub mod submit_payload;

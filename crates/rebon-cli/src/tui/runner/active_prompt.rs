@@ -121,6 +121,28 @@ impl SteerPumpHandle {
     }
 }
 
+impl LocalTurnSource {
+    /// The origin the session loop records for a turn from this entry point.
+    pub(super) fn turn_origin(self) -> crate::session::session_loop::TurnOrigin {
+        use crate::session::session_loop::TurnOrigin;
+        match self {
+            LocalTurnSource::DirectUserSubmit => TurnOrigin::User,
+            LocalTurnSource::Command => TurnOrigin::Command,
+            LocalTurnSource::QueuedFollowUp => TurnOrigin::Queued,
+            LocalTurnSource::AutomaticFollowUp => TurnOrigin::FollowUp,
+            LocalTurnSource::IdleContext => TurnOrigin::IdleContext,
+            LocalTurnSource::TaskNotification => TurnOrigin::TaskNotification,
+            LocalTurnSource::Scheduled => TurnOrigin::Scheduled,
+            LocalTurnSource::PermissionRetry | LocalTurnSource::ForegroundPermissionRetry => {
+                TurnOrigin::PermissionReplay
+            }
+            LocalTurnSource::AgentViewAttachment => TurnOrigin::AgentViewAttachment,
+            #[cfg(test)]
+            LocalTurnSource::TestOnly => TurnOrigin::User,
+        }
+    }
+}
+
 impl ActivePrompt {
     pub(super) fn new(rx: PromptResultRx, cancel: PromptCancel) -> Self {
         Self {

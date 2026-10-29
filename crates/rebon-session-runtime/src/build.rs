@@ -1554,6 +1554,7 @@ fn finish_session_build(records: SessionRecords) -> anyhow::Result<SessionBuild>
         session: crate::EngineSession {
             engine_half: SessionEngineHalf {
                 runtime: initial_runtime.clone(),
+                session_loop: crate::session_loop::SessionLoop::new(),
                 runtime_factory: Some(runtime_factory),
                 handler,
                 update_publisher: tui_update_publisher,
