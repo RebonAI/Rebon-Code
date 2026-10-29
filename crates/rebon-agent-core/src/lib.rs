@@ -52,6 +52,7 @@ pub mod publisher;
 pub mod registry;
 pub mod routing;
 pub mod turn_gate;
+pub mod turn_loop;
 
 pub use backend::{
     AgentBackend, AgentBackendError, AgentBackendKind, AgentBackendSwitch, AgentCapabilities,

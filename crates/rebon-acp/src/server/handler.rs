@@ -648,6 +648,10 @@ pub struct DefaultHandler {
     /// Map of session_id → cancel handle held while a prompt is in
     /// flight. `session/cancel` trips the handle to abort the turn.
     pub(super) active_cancels: Arc<Mutex<HashMap<String, ActivePromptCancel>>>,
+    /// Map of session_id → the loop that session's turns run through, the
+    /// same one the terminal and the hosted worker use. Created on a
+    /// session's first turn.
+    pub(super) turn_loops: Arc<Mutex<HashMap<String, Arc<rebon_agent_core::turn_loop::TurnLoop>>>>,
     /// Optional `_session/steering` mailbox. When wired, `initialize`
     /// advertises `_meta.steering.supported` and `_session/steering`
     /// injects into the active turn (or starts a fresh one). When
@@ -721,6 +725,7 @@ impl Default for DefaultHandler {
             permission_publisher: None,
             prompt_executor: Arc::new(StubPromptExecutor::default()),
             active_cancels: Arc::new(Mutex::new(HashMap::new())),
+            turn_loops: Arc::new(Mutex::new(HashMap::new())),
             steering_sink: None,
             #[cfg(test)]
             prompt_setup_hook: None,
@@ -932,8 +937,7 @@ impl DefaultHandler {
     /// Whether the seat owns `config_id`, in which case applying it is the
     /// registrar's business and not this handler's.
     fn seat_owns(config_id: &str) -> bool {
-        rebon_config_seat::process_config_seat()
-            .is_some_and(|seat| seat.has(config_id))
+        rebon_config_seat::process_config_seat().is_some_and(|seat| seat.has(config_id))
     }
 
     pub fn config_options_for_session(&self, session_id: &str) -> Vec<ConfigOption> {
@@ -1379,6 +1383,16 @@ impl DefaultHandler {
         }
     }
 
+    /// The loop `session_id`'s turns run through.
+    fn turn_loop_for(&self, session_id: &str) -> Arc<rebon_agent_core::turn_loop::TurnLoop> {
+        self.turn_loops
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .entry(session_id.to_string())
+            .or_default()
+            .clone()
+    }
+
     /// Drive one acquired prompt turn through the executor and release
     /// the slot. Shared by `session/prompt` and steering-spawned turns,
     /// so both run the same permission/update wiring and both hand
@@ -1437,9 +1451,24 @@ impl DefaultHandler {
             skill_invocations,
         };
 
-        // Drive the executor. Explicitly dropping the same guard used by every
-        // unwind/cancellation path keeps normal completion cleanup identical.
-        let outcome = executor.execute(request).await;
+        // Run the turn on the session's loop. Explicitly dropping the same
+        // guard used by every unwind/cancellation path keeps normal
+        // completion cleanup identical.
+        let result = self.turn_loop_for(&session_id).submit_turn(
+            &tokio::runtime::Handle::current(),
+            rebon_agent_core::turn_loop::TurnJob {
+                run: Box::pin(async move { executor.execute(request).await }),
+                kind: "main",
+                settle: None,
+                // Dropping this request is how ACP aborts its turn.
+                stop_when_abandoned: true,
+            },
+        );
+        let outcome = result.await.unwrap_or_else(|_| {
+            Err(PromptExecutorError::Execution(
+                "the session loop ended before the turn reported a result".into(),
+            ))
+        });
         drop(lifecycle);
 
         // Steering messages that raced this turn's ending never reached
