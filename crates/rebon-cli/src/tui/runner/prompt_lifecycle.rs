@@ -741,6 +741,63 @@ pub(super) fn maybe_spawn_task_notification_prompt(
     spawned
 }
 
+/// Run the cron prompts that fired while no turn was there to drain them.
+///
+/// The engine hands a fired task to the model only after a tool round, so
+/// a task that fires while the session is idle, or during a turn the model
+/// answers without tools, would otherwise sit until the user types again.
+/// Returns whether a turn started.
+pub(super) fn maybe_spawn_scheduled_prompt(
+    app: &mut AppState,
+    session: &TuiEngineSession,
+    handle: &Handle,
+    active_prompt: &mut Option<ActivePrompt>,
+) -> bool {
+    let cron = &session.engine_half.cron_poller;
+    if !cron.has_pending() {
+        return false;
+    }
+    // Leave the queue alone when no turn could start: the prompts are only
+    // taken once they are sure to be delivered.
+    if local_turn_rejection(app, session, active_prompt.as_ref()).is_some() {
+        return false;
+    }
+    let prompts = cron.take_marked_prompts();
+    if prompts.is_empty() {
+        return false;
+    }
+    let mut submit = SubmitPayload {
+        text: prompts.join("\n\n"),
+        model_text: None,
+        user_message_uuid: None,
+        image_pastes: Vec::new(),
+        directory_attachments: Vec::new(),
+        execution_policy: None,
+        skill_invocations: Vec::new(),
+    };
+    ensure_internal_submit_payload_user_uuid(&mut submit, &session.session_id);
+    with_main_agent_view(app, |app| {
+        let Some(submit) = apply_internal_submit(app, submit, &session.session_id) else {
+            return false;
+        };
+        repin_transcript_to_bottom(app);
+        if let Some(active) = admit_active_prompt(
+            app,
+            session,
+            handle,
+            active_prompt.as_ref(),
+            LocalTurnSource::Scheduled,
+            submit,
+        ) {
+            *active_prompt = Some(active);
+            app.is_loading = true;
+            true
+        } else {
+            false
+        }
+    })
+}
+
 /// An active goal runs unattended across many turns, so its turns opt
 /// into the relaxed auto-mode script review profile. Turns that already
 /// carry an ultraplan planning policy are left alone: those phases are
@@ -1408,6 +1465,7 @@ mod tests {
             "AutomaticFollowUp",
             "IdleContext",
             "TaskNotification",
+            "Scheduled",
             "PermissionRetry",
             "ForegroundPermissionRetry",
             "AgentViewAttachment",
@@ -2748,6 +2806,60 @@ mod tests {
             other => panic!("expected notification text prompt, got {other:?}"),
         };
         assert!(prompt_text.contains(&format!("<output-file>{output_file}</output-file>")));
+
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    #[test]
+    fn idle_cron_fire_starts_a_scheduled_turn() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        session
+            .engine_half
+            .cron_poller
+            .enqueue("check the build".into());
+        let mut active_prompt = None;
+
+        assert!(maybe_spawn_scheduled_prompt(
+            &mut app,
+            &session,
+            &handle,
+            &mut active_prompt
+        ));
+        runtime.block_on(tokio::task::yield_now());
+
+        let active = active_prompt.as_ref().expect("scheduled prompt spawned");
+        assert_eq!(active.source, LocalTurnSource::Scheduled);
+        assert!(!session.engine_half.cron_poller.has_pending());
+        let requests = recorder.take_requests();
+        assert_eq!(requests.len(), 1);
+        // Not the user typing: no user prompt for hooks or the classifier.
+        assert_eq!(requests[0].user_prompt, None);
+        let prompt_text = match &requests[0].prompt[0] {
+            ContentBlock::Text(text) => text.text.as_str(),
+            other => panic!("expected scheduled text prompt, got {other:?}"),
+        };
+        assert_eq!(
+            prompt_text,
+            rebon_tool::cron::mark_scheduled_prompt("check the build")
+        );
+
+        // A second fire while that turn runs stays queued for the engine.
+        session
+            .engine_half
+            .cron_poller
+            .enqueue("and the tests".into());
+        assert!(!maybe_spawn_scheduled_prompt(
+            &mut app,
+            &session,
+            &handle,
+            &mut active_prompt
+        ));
+        assert!(session.engine_half.cron_poller.has_pending());
 
         drop(active_prompt.take());
         runtime.shutdown_background();

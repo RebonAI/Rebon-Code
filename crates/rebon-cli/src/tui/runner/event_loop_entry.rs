@@ -76,8 +76,8 @@ use super::paste_echo::{
 };
 use super::permission_flow::{maybe_handle_permission_key, sync_permission_view};
 use super::prompt_lifecycle::{
-    admit_idle_context_prompt, drain_ui_channels, maybe_spawn_task_notification_prompt,
-    maybe_update_loading_state,
+    admit_idle_context_prompt, drain_ui_channels, maybe_spawn_scheduled_prompt,
+    maybe_spawn_task_notification_prompt, maybe_update_loading_state,
 };
 use super::remote_background_attachment::refresh_remote_background_attachment;
 use super::render::{self, drain_file_list, render_frame};
@@ -1088,6 +1088,16 @@ fn session_pipeline(
                 state.task_notification_retry_after =
                     Some(Instant::now() + Duration::from_secs(10));
             }
+        }
+
+        // Auto-trigger: cron tasks that fired while nothing was running.
+        // The engine drains them only after a tool round, so without this
+        // they would wait for the user's next prompt.
+        if app.resume_dialog.is_none()
+            && state.active_prompt.is_none()
+            && app.queued_commands.is_empty()
+        {
+            maybe_spawn_scheduled_prompt(app, session, handle, &mut state.active_prompt);
         }
 
         let skill_count = session.engine_half.skill_registry.user_invocable_count();

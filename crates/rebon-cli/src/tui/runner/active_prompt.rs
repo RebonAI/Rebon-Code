@@ -24,6 +24,8 @@ pub(super) enum LocalTurnSource {
     AutomaticFollowUp,
     IdleContext,
     TaskNotification,
+    /// A cron task that fired with no turn running to drain it.
+    Scheduled,
     PermissionRetry,
     ForegroundPermissionRetry,
     AgentViewAttachment,

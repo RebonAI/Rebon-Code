@@ -45,6 +45,26 @@ impl CronPoller {
     pub(crate) fn pending_len(&self) -> usize {
         self.queue.lock().expect("cron queue poisoned").len()
     }
+
+    /// Whether any fired prompt is still waiting to be delivered.
+    pub fn has_pending(&self) -> bool {
+        !self.queue.lock().expect("cron queue poisoned").is_empty()
+    }
+
+    /// Drain every waiting prompt, each opened by
+    /// [`rebon_tool::cron::SCHEDULED_PROMPT_MARKER`].
+    ///
+    /// The engine only drains the queue after a tool round, so a task that
+    /// fires while the session is idle — or during a turn the model answers
+    /// without tools — would wait for the next user prompt. A front end that
+    /// owns the time between turns takes them here and runs them as a turn.
+    pub fn take_marked_prompts(&self) -> Vec<String> {
+        let mut queue = self.queue.lock().expect("cron queue poisoned");
+        queue
+            .drain(..)
+            .map(|prompt| rebon_tool::cron::mark_scheduled_prompt(&prompt))
+            .collect()
+    }
 }
 
 impl AttachmentPoller for CronPoller {
@@ -52,14 +72,10 @@ impl AttachmentPoller for CronPoller {
         if request.phase == AttachmentPollPhase::Eager {
             return Vec::new();
         }
-        let mut queue = self.queue.lock().expect("cron queue poisoned");
-        let mut out = Vec::with_capacity(queue.len());
-        while let Some(prompt) = queue.pop_front() {
-            out.push(ApiMessage::user_text(
-                rebon_tool::cron::mark_scheduled_prompt(&prompt),
-            ));
-        }
-        out
+        self.take_marked_prompts()
+            .into_iter()
+            .map(ApiMessage::user_text)
+            .collect()
     }
 }
 
@@ -243,6 +259,23 @@ mod tests {
             poller.poll(request(1, AttachmentPollPhase::Regular)).len(),
             1
         );
+    }
+
+    #[test]
+    fn take_marked_prompts_drains_what_an_idle_session_would_miss() {
+        let poller = CronPoller::default();
+        assert!(!poller.has_pending());
+        poller.enqueue("check the build".into());
+        assert!(poller.has_pending());
+
+        assert_eq!(
+            poller.take_marked_prompts(),
+            vec![rebon_tool::cron::mark_scheduled_prompt("check the build")]
+        );
+        assert!(!poller.has_pending());
+        assert!(poller
+            .poll(request(1, AttachmentPollPhase::Regular))
+            .is_empty());
     }
 
     #[test]
