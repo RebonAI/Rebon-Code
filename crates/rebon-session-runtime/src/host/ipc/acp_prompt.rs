@@ -340,6 +340,7 @@ mod tests {
             subscription.id,
             subscription.cursor,
             &events,
+            None,
         );
         assert_eq!(*wire.subscription.lock().unwrap(), None);
         assert_eq!(events.subscriber_count(), 0);

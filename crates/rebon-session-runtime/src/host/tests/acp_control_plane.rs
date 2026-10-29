@@ -1434,6 +1434,56 @@ fn resuming_from_a_cursor_the_owner_never_reached_is_a_gap() {
     );
 }
 
+/// A permission is written to the job record before it is published. A client
+/// that subscribes between the two is restated it from the record, and must
+/// not be asked it a second time when the live event lands.
+#[test]
+fn a_permission_raised_while_a_client_subscribes_is_asked_once() {
+    let (_dir, store, mut state, ipc) = hosted_job();
+    state.process.status = BackgroundJobStatus::Running;
+    state.process.turn_generation = 1;
+    let query = rebon_session_host::BackgroundPermissionQuerySnapshot {
+        query_id: 77,
+        turn_generation: 1,
+        endpoint: None,
+        tool: Some("Bash".into()),
+        tool_call_id: Some("call-1".into()),
+        session_id: Some("session-under-test".into()),
+        title: Some("Run a command".into()),
+        message: Some("rm -rf /tmp/x".into()),
+        tool_input: None,
+        metadata: None,
+        options: vec![rebon_session_host::BackgroundPermissionOptionSnapshot {
+            option_id: "allow_once".into(),
+            label: "Allow once".into(),
+            kind: "allow_once".into(),
+        }],
+    };
+    // Written, not yet published: the window a subscriber can land in.
+    state.outcome.pending_permission = Some(query.clone());
+    store.write_state(&state).unwrap();
+    let mut peer = attached(&ipc);
+
+    peer.call("_session/subscribe", serde_json::json!({}));
+    let hello = peer.read().expect("hello");
+    assert_eq!(hello["method"], serde_json::json!("_session/hello"));
+    let restated = peer.read().expect("the pending permission is restated");
+    assert_eq!(
+        restated["method"],
+        serde_json::json!("session/request_permission")
+    );
+
+    // Now the publish lands.
+    ipc.events.publish_permission(query);
+    let ping_id = peer.send("_session/ping", serde_json::json!({}));
+    let next = peer.read().expect("the ping is answered");
+    assert_eq!(
+        next["id"],
+        serde_json::json!(ping_id),
+        "the permission was asked twice: {next}"
+    );
+}
+
 /// The question and the answer travel in opposite directions on one socket at
 /// the same time.
 ///

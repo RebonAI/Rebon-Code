@@ -254,9 +254,11 @@ fn start_stream(
             return Err(JsonRpcError::internal_error("prompt event replay failed"));
         }
     }
-    if let Some(event) =
-        restated_pending_permission(&state, &subscription.replay, subscription.cursor)
-    {
+    let restated = restated_pending_permission(&state, &subscription.replay, subscription.cursor);
+    let restated_query = restated
+        .as_ref()
+        .and_then(super::server::permission_query_id);
+    if let Some(event) = restated {
         forward(wire, &session_id, event);
     }
 
@@ -275,6 +277,7 @@ fn start_stream(
                 id,
                 from_cursor,
                 &ring_cursor,
+                restated_query,
             );
         })
         .map_err(|error| {
@@ -291,10 +294,18 @@ pub(super) fn forward_live_stream(
     id: u64,
     from_cursor: u64,
     ring: &super::events::SessionEventStream,
+    mut restated_query: Option<u64>,
 ) {
     while let Ok(line) = events.recv() {
         let event = serde_json::from_str::<rebon_session_host::SessionEvent>(&line)
             .expect("event stream serializes SessionEvent");
+        // The live copy of a permission this subscriber was just given as a
+        // restatement (see `permission_query_id`).
+        if restated_query.is_some() && super::server::permission_query_id(&event) == restated_query
+        {
+            restated_query = None;
+            continue;
+        }
         if !forward_stream_event(wire, id, session_id, event) {
             break;
         }
