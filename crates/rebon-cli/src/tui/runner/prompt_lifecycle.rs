@@ -937,7 +937,7 @@ fn admit_local_turn(
             pending_question_escalation_ids,
             coordinator_report_paths,
         } => {
-            let injected_context = drain_model_context_prompts(app);
+            let injected_context = drain_model_context_prompts(session);
             let user_message_uuid = submit.user_message_uuid.clone();
             runtime.file_history_tracker.clear_current_message_id();
             if let Some(message_id) = user_message_uuid.clone() {
@@ -997,7 +997,7 @@ fn admit_local_turn(
             )
         }
         LocalTurnRequest::IdleContext => {
-            let injected_context = drain_model_context_prompts(app);
+            let injected_context = drain_model_context_prompts(session);
             (
                 rebon_agent_core::PromptRequest {
                     session_id: runtime.session_id.clone(),
@@ -2925,8 +2925,10 @@ mod tests {
         let recorder = Arc::new(RecordingPromptExecutor::default());
         session.set_test_executor(recorder.clone());
         attach_to_remote_worker(&mut session);
-        app.pending_teammate_prompts
-            .push("<teammate-message>hi</teammate-message>".into());
+        session.engine_half.session_loop.inbox().push_context(
+            crate::session::session_inbox::ContextSource::Teammate,
+            ["<teammate-message>hi</teammate-message>".to_string()],
+        );
 
         for _ in 0..3 {
             assert!(admit_idle_context_prompt(&mut app, &session, &handle, None).is_none());
@@ -2934,7 +2936,7 @@ mod tests {
         runtime.block_on(tokio::task::yield_now());
 
         assert_eq!(system_error_rows(&app), 0);
-        assert_eq!(app.pending_teammate_prompts.len(), 1);
+        assert!(session.engine_half.session_loop.inbox().has_context());
         assert!(recorder.take_requests().is_empty());
         runtime.shutdown_background();
     }

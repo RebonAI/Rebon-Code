@@ -1038,20 +1038,22 @@ fn session_pipeline(
         // both in the same process would race on the read-modify-write
         // cycle inside `drain_unread_mailbox` and silently drop one
         // side's messages. The idle-path drain stays here so the
-        // auto-submit (pending_teammate_prompts -> new turn) still
+        // auto-submit (pending teammate context -> new turn) still
         // fires when nothing is running.
         if state.active_prompt.is_none() {
-            drain_mcp_channel_notifications(app, session);
-            drain_team_mailbox(app, &session.session_id);
+            drain_mcp_channel_notifications(session);
+            drain_team_mailbox(
+                app,
+                session.engine_half.session_loop.inbox(),
+                &session.session_id,
+            );
         }
 
         // Auto-trigger: when teammate messages arrived and the leader
         // is idle (no active prompt, no queued commands), auto-submit
         // the pending teammate messages as a new model turn.
         if app.resume_dialog.is_none()
-            && (!app.pending_channel_prompts.is_empty()
-                || !app.pending_teammate_prompts.is_empty()
-                || !app.pending_agent_prompts.is_empty())
+            && session.engine_half.session_loop.inbox().has_context()
             && state.active_prompt.is_none()
             && app.queued_commands.is_empty()
         {
@@ -1127,9 +1129,7 @@ fn session_pipeline(
             && app.resume_dialog.is_none()
             && app.expanding_command.is_none()
             && app.queued_commands.is_empty()
-            && app.pending_channel_prompts.is_empty()
-            && app.pending_teammate_prompts.is_empty()
-            && app.pending_agent_prompts.is_empty()
+            && !session.engine_half.session_loop.inbox().has_context()
             && app.deferred_internal_submit_payloads.is_empty()
             && session.remote_background_attachment.is_none()
             && session.pending_hosted_session.is_none();

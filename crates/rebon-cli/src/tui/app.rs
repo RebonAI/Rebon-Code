@@ -606,21 +606,6 @@ pub struct AppState {
     /// Provider kind for effort labelling. Determines whether the UI
     /// says "effort" (Anthropic) or "thinking" (OpenAI-compatible).
     pub effort_provider_kind: EffortProviderKind,
-    /// Pending teammate messages (as `<teammate-message>` XML) to
-    /// inject into the next prompt the model sees. Drained from the
-    /// team mailbox by `drain_team_mailbox`, consumed by
-    /// `spawn_prompt_turn` so the model receives teammate context.
-    pub pending_teammate_prompts: Vec<String>,
-    /// Pending MCP channel notifications (as `<channel>` XML) to inject into
-    /// the next prompt the model sees. Drained from the MCP stdio runtime and
-    /// consumed by `spawn_prompt_turn`, bypassing slash-command parsing.
-    pub pending_channel_prompts: Vec<String>,
-    /// Framed `<teammate-message>` text from another session's agent, waiting
-    /// for an idle turn. Unlike [`Self::pending_teammate_prompts`] these are
-    /// never committed to the transcript: the message is another agent's
-    /// output, not something the person typed, and the hosted worker delivers
-    /// it the same way — as context only, with no `user_prompt`.
-    pub pending_agent_prompts: Vec<String>,
     /// In-app text selection state. Replaces terminal-native selection
     /// which drifts when the TUI scrolls (content changes under fixed
     /// screen coordinates). Selection coordinates are in screen-space
@@ -924,9 +909,6 @@ impl AppState {
             coordinator_mode,
             effort_level: None,
             effort_provider_kind: EffortProviderKind::Anthropic,
-            pending_teammate_prompts: Vec::new(),
-            pending_channel_prompts: Vec::new(),
-            pending_agent_prompts: Vec::new(),
             selection: rebon_tui::SelectionState::new(),
             selection_owner: SelectionOwner::Transcript,
             prev_scroll_offset: 0,

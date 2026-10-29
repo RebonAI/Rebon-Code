@@ -25,6 +25,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::mid_turn_queue::QueuedSubmitTurnGuard;
 use crate::runtime::SessionRuntime;
+use crate::session_inbox::SessionInbox;
 
 /// What produced a turn's input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,12 +89,18 @@ pub enum SessionInput {
 /// input and restarts if the runtime it ran on has gone away.
 #[derive(Default)]
 pub struct SessionLoop {
-    inbox: Mutex<Option<mpsc::UnboundedSender<SessionInput>>>,
+    sender: Mutex<Option<mpsc::UnboundedSender<SessionInput>>>,
+    inbox: SessionInbox,
 }
 
 impl SessionLoop {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// What waits for this session's next turn.
+    pub fn inbox(&self) -> &SessionInbox {
+        &self.inbox
     }
 
     /// Hand the loop a turn. Returns the receiver its result arrives on.
@@ -112,8 +119,8 @@ impl SessionLoop {
     }
 
     fn send(&self, handle: &Handle, input: SessionInput) {
-        let mut inbox = self.inbox.lock().expect("session loop inbox poisoned");
-        let input = match inbox.as_ref() {
+        let mut sender = self.sender.lock().expect("session loop sender poisoned");
+        let input = match sender.as_ref() {
             Some(tx) => match tx.send(input) {
                 Ok(()) => return,
                 // The loop's runtime went away; start it again below.
@@ -125,7 +132,7 @@ impl SessionLoop {
         handle.spawn(run_session(rx));
         // A fresh receiver is alive until this function returns.
         let _ = tx.send(input);
-        *inbox = Some(tx);
+        *sender = Some(tx);
     }
 }
 
