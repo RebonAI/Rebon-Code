@@ -44,7 +44,7 @@ use rebon_session_host::{
 use crate::background::{
     command_was_already_resolved, is_compact_command, validate_question_answer,
 };
-use crate::session::session_inbox::ContextSource;
+use crate::session::session_inbox::{ContextItem, ContextSource};
 use crate::session_shell::session_command_inputs_from_app;
 use crate::tui::app::AppState;
 use crate::tui::permission_modal::{PendingPermission, PermissionKind, PermissionModalAction};
@@ -281,47 +281,74 @@ impl ForegroundControl {
     /// running turn never reached — it ended first, or it is an external agent
     /// with no tool rounds at all — comes back out through
     /// `take_pending_agent_messages` and joins the same idle path.
+    ///
+    /// A message the listener accepted but refused a turn of its own goes into
+    /// the inbox without being a reason to start one: it rides into the next
+    /// turn somebody else starts. Dropping it instead would lose a message the
+    /// sender was told had been accepted.
     fn apply_pending_agent_messages(
         &self,
         session: &TuiEngineSession,
         active_prompt: &Option<ActivePrompt>,
     ) {
-        let pending = self.agent_inbox.take_pending();
+        let pending = self.agent_inbox.take_pending_messages();
         if active_prompt.is_some() {
-            for envelope in pending {
-                let framed = rebon_session_host::frame_agent_message(&envelope);
+            for accepted in pending {
+                let framed = rebon_session_host::frame_agent_message(&accepted.envelope);
                 session
                     .engine_half
                     .runtime
                     .mid_turn_queue
                     .enqueue_agent_message(
-                        envelope.message_id.clone(),
+                        accepted.envelope.message_id.clone(),
                         framed,
-                        &envelope.from_session_id,
-                        envelope.hops,
+                        &accepted.envelope.from_session_id,
+                        accepted.envelope.hops,
                     );
             }
             return;
         }
         let inbox = session.engine_half.session_loop.inbox();
-        inbox.push_context(
+        inbox.push_items(
             ContextSource::Agent,
-            session
-                .engine_half
-                .runtime
-                .mid_turn_queue
-                .take_pending_agent_messages(),
-        );
-        inbox.push_context(
-            ContextSource::Agent,
-            pending
+            self.deferred_agent_messages(session)
                 .into_iter()
-                .map(|envelope| rebon_session_host::frame_agent_message(&envelope)),
+                .map(|agent_message| {
+                    ContextItem::agent(
+                        agent_message.text,
+                        agent_message.from_session_id,
+                        agent_message.hops,
+                    )
+                }),
+        );
+        inbox.push_items(
+            ContextSource::Agent,
+            pending.into_iter().map(|accepted| {
+                let item = ContextItem::agent(
+                    rebon_session_host::frame_agent_message(&accepted.envelope),
+                    accepted.envelope.from_session_id,
+                    accepted.envelope.hops,
+                );
+                if accepted.may_wake {
+                    item
+                } else {
+                    item.deferred()
+                }
+            }),
         );
     }
 
-    /// Drain and apply every command queued for this session. Runs on the idle
-    /// background-pipeline pass, so it never competes with hot key handling.
+    /// What a finished turn never injected, as the messages they are.
+    fn deferred_agent_messages(
+        &self,
+        session: &TuiEngineSession,
+    ) -> Vec<rebon_session_runtime::mid_turn_queue::DeferredAgentMessage> {
+        session
+            .engine_half
+            .runtime
+            .mid_turn_queue
+            .take_pending_agent_messages()
+    }
     #[allow(clippy::too_many_arguments)]
     pub(super) fn drain(
         &mut self,
@@ -867,6 +894,170 @@ mod tests {
         assert_eq!(context, pending);
         assert!(!session.engine_half.session_loop.inbox().has_context());
         assert!(context[0].contains("wake up"));
+    }
+
+    /// A message whose chain has gone too deep is still delivered — but not by
+    /// starting a turn of its own. The idle trigger must not see it as a reason
+    /// to run, and the next turn somebody else starts must carry it.
+    #[tokio::test]
+    async fn an_agent_message_past_the_hop_bound_waits_for_the_next_turn() {
+        let mut session = super::super::test_support::make_test_tui_session();
+        let control = ForegroundControl::new(&session);
+        let mut app = AppState::new();
+        let handle = tokio::runtime::Handle::current();
+        let mut active = None;
+
+        let applied = control.apply(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active,
+            &mut None,
+            UiMode::Screen,
+            "cmd-agent-deep",
+            ForegroundCommand::AgentMessage {
+                message_id: "m-deep".into(),
+                from_session_id: "sess-sender".into(),
+                from_agent: "main".into(),
+                from_cwd: None,
+                from_handle: None,
+                from_name: None,
+                summary: None,
+                text: "the fifth hand-off".into(),
+                hops: rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1,
+            },
+        );
+        assert!(matches!(applied, Ok(None)), "got {applied:?}");
+
+        assert!(
+            session.engine_half.session_loop.inbox().has_context(),
+            "an accepted message is never dropped"
+        );
+        assert!(
+            !session
+                .engine_half
+                .session_loop
+                .inbox()
+                .has_waking_context(),
+            "a chain past the bound may not start a turn"
+        );
+
+        // A later message the bounds do allow is a reason to run; the waiting
+        // one rides into that turn instead of being lost.
+        let allowed = control.apply(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active,
+            &mut None,
+            UiMode::Screen,
+            "cmd-agent-allowed",
+            ForegroundCommand::AgentMessage {
+                message_id: "m-allowed".into(),
+                from_session_id: "sess-other".into(),
+                from_agent: "main".into(),
+                from_cwd: None,
+                from_handle: None,
+                from_name: None,
+                summary: None,
+                text: "a fresh question".into(),
+                hops: 0,
+            },
+        );
+        assert!(matches!(allowed, Ok(None)), "got {allowed:?}");
+        assert!(session
+            .engine_half
+            .session_loop
+            .inbox()
+            .has_waking_context());
+
+        let items = super::super::context_prompts::drain_model_context_items(&session);
+        assert_eq!(items.len(), 2, "both messages are delivered");
+        assert!(
+            items[0].text.contains("the fifth hand-off"),
+            "{:?}",
+            items[0].text
+        );
+        assert!(!items[0].may_wake);
+        assert!(
+            items[1].text.contains("a fresh question"),
+            "{:?}",
+            items[1].text
+        );
+        assert!(items[1].may_wake);
+        assert_eq!(
+            items[0].inbound,
+            Some((
+                "sess-sender".to_string(),
+                rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1
+            )),
+            "the depth travels with the message, not with the turn"
+        );
+    }
+
+    /// A message that arrived over the reception path and then started an idle
+    /// turn makes that turn the one answering its sender: the reply it writes
+    /// carries one hop more than the message did.
+    #[tokio::test]
+    async fn an_idle_turn_started_by_a_received_message_replies_one_hop_deeper() {
+        let mut session = super::super::test_support::make_test_tui_session();
+        let control = ForegroundControl::new(&session);
+        let mut app = AppState::new();
+        let handle = tokio::runtime::Handle::current();
+        let mut active = None;
+        let peer = "sess-hops-received";
+
+        let applied = control.apply(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active,
+            &mut None,
+            UiMode::Screen,
+            "cmd-agent-hops",
+            ForegroundCommand::AgentMessage {
+                message_id: "m-hops".into(),
+                from_session_id: peer.into(),
+                from_agent: "main".into(),
+                from_cwd: None,
+                from_handle: None,
+                from_name: None,
+                summary: None,
+                text: "two of us have spoken already".into(),
+                hops: 2,
+            },
+        );
+        assert!(matches!(applied, Ok(None)), "got {applied:?}");
+
+        super::super::prompt_lifecycle::maybe_spawn_ready_idle_turn(
+            &mut app,
+            &session,
+            &handle,
+            &mut active,
+        );
+        assert!(active.is_some(), "the message starts the turn it came for");
+
+        assert_eq!(
+            session
+                .engine_half
+                .runtime
+                .mid_turn_queue
+                .reply_ledger()
+                .reply_hops(peer),
+            3,
+            "the turn answers a message that had already made two hand-offs"
+        );
+        assert_eq!(
+            session
+                .engine_half
+                .runtime
+                .mid_turn_queue
+                .reply_ledger()
+                .reply_hops("sess-unrelated"),
+            0,
+            "a conversation this turn was not answering starts at zero"
+        );
+        drop(active);
     }
 
     /// `/compact` from the desktop app runs a ~30s provider call. Answering

@@ -353,12 +353,22 @@ pub(crate) fn queue_live_background_agent_message(
     let mut wake = false;
     store.update_state(job_id, |state| {
         owner.ensure_matches(state)?;
+        // A retry must not spend a wake the sender then misses on a fresh
+        // message, so it is recognised before any bound is consulted. It is not
+        // short-circuited here: `append_pending_prompt` is what answers a repeat
+        // (`appended: false`) and refuses the same id with different words, and
+        // the delivery reported has to be the one the current state implies.
+        let duplicate = state
+            .identity
+            .pending_prompts
+            .iter()
+            .any(|existing| existing.id == prompt.id);
         let status = state.process.status;
         let running = matches!(
             status,
             BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput
         );
-        wake = if running {
+        wake = if running || duplicate {
             // A running turn claims it at its next tool round. A person is
             // watching that turn, so the hop and wake bounds do not apply to it.
             false

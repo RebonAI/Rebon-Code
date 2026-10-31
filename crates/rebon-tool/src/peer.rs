@@ -45,10 +45,15 @@ const WAKE_WINDOW_MS: u64 = 60 * 60 * 1000;
 ///
 /// The hop count is turn-scoped — a reply inherits the depth of the message it
 /// answers, and the next user prompt starts again at zero — so [`end_turn`]
-/// clears it. The wake counts are not: they exist to slow a peer down across
-/// turns, and clearing them per turn would make them count nothing.
+/// clears it. What a turn answers is also bound to the turn it was recorded in:
+/// a message that arrives after the executor has finished its turn must not be
+/// attributed to whatever turn starts next, which may be one the person typed.
+/// [`begin_turn`] therefore opens a fresh slate. The wake counts are not turn
+/// scoped: they exist to slow a peer down across turns, and clearing them per
+/// turn would make them count nothing.
 ///
 /// [`end_turn`]: AgentReplyLedger::end_turn
+/// [`begin_turn`]: AgentReplyLedger::begin_turn
 #[derive(Debug, Default)]
 pub struct AgentReplyLedger {
     state: Mutex<LedgerState>,
@@ -56,9 +61,23 @@ pub struct AgentReplyLedger {
 
 #[derive(Debug, Default)]
 struct LedgerState {
-    /// The peer whose message this turn is answering, and how deep it already
-    /// came. `None` for a turn the person started.
-    inbound: Option<(String, u8)>,
+    /// Bumped for every turn opened here, so a note taken during one turn is
+    /// never read as belonging to the next.
+    generation: u64,
+    /// The turn currently open, and therefore the only one a note may belong
+    /// to. `None` between turns.
+    open: Option<u64>,
+    /// The peer whose message the open turn is answering, how deep it already
+    /// came, and the turn it was recorded for. `None` for a turn the person
+    /// started.
+    inbound: Option<(u64, String, u8)>,
+    /// What the turn that has not started yet will be answering. Staged by the
+    /// code that builds that turn — the idle path that drains the inbox, the
+    /// worker claiming an agent-message prompt — and adopted by [`begin_turn`].
+    /// Kept apart from `inbound` so a note cannot be read before its turn
+    /// exists, and so a note taken after one turn ended is not mistaken for
+    /// one about the next.
+    staged: Option<(String, u8)>,
     /// Turn-start times per source session, oldest first.
     wakes: HashMap<String, Vec<u64>>,
 }
@@ -85,18 +104,80 @@ impl AgentReplyLedger {
         Self::default()
     }
 
-    /// Record that this turn is answering `from_session_id` at depth `hops`.
+    /// A turn is starting: note what any message arriving from now on belongs
+    /// to, and take over whatever the caller staged for it.
     ///
-    /// The last message wins: a turn that received two messages answers the one
-    /// it read second, which is the one whose context is freshest.
-    pub fn note_inbound(&self, from_session_id: &str, hops: u8) {
+    /// Returns the generation the new turn was given; every later
+    /// [`note_inbound`] recorded before the next `begin_turn` belongs to it.
+    pub fn begin_turn(&self) -> u64 {
+        let mut state = self.state.lock().expect("agent reply ledger poisoned");
+        state.generation = state.generation.wrapping_add(1);
+        let generation = state.generation;
+        state.open = Some(generation);
+        state.inbound = state
+            .staged
+            .take()
+            .map(|(from, hops)| (generation, from, hops));
+        generation
+    }
+
+    /// Say what the turn that is about to start will be answering.
+    ///
+    /// For the paths that know, before the turn exists, which message it
+    /// carries: the idle path draining an agent message into a fresh turn, and
+    /// the worker claiming an agent-message prompt. Call it before
+    /// [`begin_turn`], which adopts it. A later `begin_turn` for a turn somebody
+    /// else's input started (a prompt the person typed, a task notification)
+    /// leaves it in place, so the next agent-message turn still inherits its
+    /// own depth rather than a stranger's.
+    pub fn stage_inbound(&self, from_session_id: &str, hops: u8) {
         if from_session_id.trim().is_empty() {
             return;
         }
         self.state
             .lock()
             .expect("agent reply ledger poisoned")
-            .inbound = Some((from_session_id.to_string(), hops));
+            .staged = Some((from_session_id.to_string(), hops));
+    }
+
+    /// Record that the turn `generation` is answering `from_session_id` at depth
+    /// `hops`.
+    ///
+    /// The last message wins: a turn that received two messages answers the one
+    /// it read second, which is the one whose context is freshest. A note for a
+    /// turn that has already ended is dropped — the executor finishes its turn
+    /// before the event loop has seen it end, and a message read in that window
+    /// belongs to the next turn, not the one that just finished.
+    pub fn note_inbound(&self, generation: u64, from_session_id: &str, hops: u8) {
+        if from_session_id.trim().is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().expect("agent reply ledger poisoned");
+        if state.open != Some(generation) {
+            return;
+        }
+        state.inbound = Some((generation, from_session_id.to_string(), hops));
+    }
+
+    /// Record a note for whichever turn is open right now.
+    ///
+    /// For the paths that read a message while a turn is running without
+    /// naming it: the mid-turn injection queues on both halves, and a steer
+    /// into an external agent. Between turns there is no turn to attribute it
+    /// to and the note is dropped, so a message that arrives after the executor
+    /// finished its turn can no longer be read as belonging to the next one —
+    /// which may be a turn the person typed, and must report no hops at all.
+    /// The idle path stages its own depth with
+    /// [`Self::stage_inbound`] instead.
+    pub fn note_inbound_now(&self, from_session_id: &str, hops: u8) {
+        if from_session_id.trim().is_empty() {
+            return;
+        }
+        let mut state = self.state.lock().expect("agent reply ledger poisoned");
+        let Some(generation) = state.open else {
+            return;
+        };
+        state.inbound = Some((generation, from_session_id.to_string(), hops));
     }
 
     /// The depth a reply to `target_session_id` should carry.
@@ -105,10 +186,16 @@ impl AgentReplyLedger {
     /// started itself is not a hand-off, however deep the turn it happens in.
     pub fn reply_hops(&self, target_session_id: &str) -> u8 {
         let state = self.state.lock().expect("agent reply ledger poisoned");
-        match state.inbound.as_ref() {
-            Some((from, hops)) if from == target_session_id => hops.saturating_add(1),
-            _ => 0,
+        let Some((generation, from, hops)) = state.inbound.as_ref() else {
+            return 0;
+        };
+        // A note from a turn that has ended cannot be answered any more: the
+        // turn it belonged to is over, so a reply written now is a fresh
+        // conversation rather than the next link in that chain.
+        if state.open != Some(*generation) || from != target_session_id {
+            return 0;
         }
+        hops.saturating_add(1)
     }
 
     /// Whether one more message from `from_session_id` may start a turn now.
@@ -133,10 +220,9 @@ impl AgentReplyLedger {
 
     /// The turn is over; what it was answering no longer applies.
     pub fn end_turn(&self) {
-        self.state
-            .lock()
-            .expect("agent reply ledger poisoned")
-            .inbound = None;
+        let mut state = self.state.lock().expect("agent reply ledger poisoned");
+        state.open = None;
+        state.inbound = None;
     }
 }
 
@@ -482,7 +568,8 @@ mod tests {
         let ledger = AgentReplyLedger::new();
         assert_eq!(ledger.reply_hops("sess-a"), 0, "nothing arrived yet");
 
-        ledger.note_inbound("sess-a", 2);
+        let generation = ledger.begin_turn();
+        ledger.note_inbound(generation, "sess-a", 2);
         assert_eq!(ledger.reply_hops("sess-a"), 3);
         assert_eq!(
             ledger.reply_hops("sess-b"),
@@ -496,6 +583,49 @@ mod tests {
             0,
             "the next turn answers nobody"
         );
+    }
+
+    /// A note recorded for a turn that has ended belongs to nobody: the
+    /// executor finishes its turn before the event loop has seen it end, and a
+    /// message read in that window must not make the next turn — possibly one
+    /// the person typed — report a depth it never answered.
+    #[test]
+    fn a_note_from_a_finished_turn_does_not_reach_the_next_one() {
+        let ledger = AgentReplyLedger::new();
+        let finished = ledger.begin_turn();
+
+        ledger.note_inbound(finished, "sess-a", 3);
+        assert_eq!(ledger.reply_hops("sess-a"), 4);
+
+        let next = ledger.begin_turn();
+        assert_eq!(
+            ledger.reply_hops("sess-a"),
+            0,
+            "a new turn starts by answering nobody"
+        );
+
+        // The executor of the finished turn finishing late is what the
+        // generation is for: its note cannot land in the new turn.
+        ledger.note_inbound(finished, "sess-a", 3);
+        assert_eq!(ledger.reply_hops("sess-a"), 0);
+
+        ledger.note_inbound(next, "sess-a", 1);
+        assert_eq!(ledger.reply_hops("sess-a"), 2);
+    }
+
+    /// The idle path knows, before its turn exists, which message the turn is
+    /// carrying: it stages that depth and the turn adopts it.
+    #[test]
+    fn a_staged_depth_belongs_to_the_turn_that_starts_next() {
+        let ledger = AgentReplyLedger::new();
+        ledger.stage_inbound("sess-a", 2);
+        ledger.begin_turn();
+        assert_eq!(ledger.reply_hops("sess-a"), 3);
+
+        // Staged once, adopted once: a later turn answers nobody.
+        ledger.end_turn();
+        ledger.begin_turn();
+        assert_eq!(ledger.reply_hops("sess-a"), 0);
     }
 
     /// Two agents answering each other deepen the chain every round; past the
@@ -562,7 +692,8 @@ mod tests {
     #[test]
     fn the_ledger_is_reached_by_session() {
         let first = session_reply_ledger("sess-ledger-a");
-        first.note_inbound("sess-peer", 1);
+        let generation = first.begin_turn();
+        first.note_inbound(generation, "sess-peer", 1);
         let second = session_reply_ledger("sess-ledger-b");
         assert_eq!(second.reply_hops("sess-peer"), 0);
         assert_eq!(

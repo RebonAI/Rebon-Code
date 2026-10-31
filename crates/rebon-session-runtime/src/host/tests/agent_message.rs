@@ -440,3 +440,79 @@ fn one_peer_may_only_wake_this_session_so_many_times_an_hour() {
         "a refused wake is not a refused message"
     );
 }
+
+/// A hosted turn that exists because another agent's message was claimed
+/// answers that sender. The depth comes from the claimed prompt, which is what
+/// the reception path wrote, so a reply to the same peer carries one hop more.
+#[test]
+fn a_worker_turn_answering_an_agent_message_replies_one_hop_deeper() {
+    use crate::host::worker::execution::stage_inbound_for_claimed_prompt;
+    use rebon_tool::peer::AgentReplyLedger;
+
+    let hosted = hosted(BackgroundJobStatus::Idle, "sess-hops-hosted");
+    let mut from_peer = envelope("m-hops", "second hand-off already");
+    from_peer.hops = 2;
+    assert_eq!(
+        result_of(deliver(&hosted, &from_peer)).outcome,
+        AgentMessageDelivery::StartedNewTurn
+    );
+
+    let mut state: BackgroundJobState = hosted
+        .store
+        .read_state(&hosted.state.identity.job_id)
+        .unwrap();
+    let generation = state.process.turn_generation;
+    state.identity.pending_prompts[0].claimed_turn_generation = Some(generation);
+
+    let ledger = AgentReplyLedger::new();
+    stage_inbound_for_claimed_prompt(&ledger, &state);
+    ledger.begin_turn();
+
+    assert_eq!(
+        ledger.reply_hops("sess-sender"),
+        3,
+        "the turn answers a message that had already made two hand-offs"
+    );
+    assert_eq!(
+        ledger.reply_hops("sess-other"),
+        0,
+        "a conversation this turn was not answering starts at zero"
+    );
+}
+
+/// A turn the person typed answers nobody, however much context was waiting in
+/// the queue behind it. Its reply must not claim to continue someone's chain.
+#[test]
+fn a_worker_turn_a_person_typed_reports_no_hops() {
+    use crate::host::worker::execution::stage_inbound_for_claimed_prompt;
+    use rebon_tool::peer::AgentReplyLedger;
+
+    let hosted = hosted(BackgroundJobStatus::Queued, "sess-hops-typed");
+    let mut state: BackgroundJobState = hosted
+        .store
+        .read_state(&hosted.state.identity.job_id)
+        .unwrap();
+    // An agent message waits behind the typed prompt: it is context, not the
+    // reason the turn exists.
+    let mut waiting = pending_prompt("m-waits", "and then also this", Vec::new());
+    waiting.origin = Some(PendingPromptOrigin::AgentMessage {
+        from_session_id: "sess-sender".into(),
+        from_agent: "main".into(),
+        from_handle: None,
+        from_name: None,
+        hops: 3,
+    });
+    let mut typed = pending_prompt("u-typed", "what the person typed", Vec::new());
+    typed.claimed_turn_generation = Some(state.process.turn_generation);
+    state.identity.pending_prompts = vec![typed, waiting];
+
+    let ledger = AgentReplyLedger::new();
+    stage_inbound_for_claimed_prompt(&ledger, &state);
+    ledger.begin_turn();
+
+    assert_eq!(
+        ledger.reply_hops("sess-sender"),
+        0,
+        "a typed turn answers the person, not the message that was queued after it"
+    );
+}

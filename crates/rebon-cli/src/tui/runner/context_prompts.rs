@@ -1,7 +1,7 @@
 //! Pending model-context prompt drains shared by the runner event loop
 //! and prompt lifecycle.
 
-use crate::session::session_inbox::ContextSource;
+use crate::session::session_inbox::{ContextItem, ContextSource};
 use crate::tui::wiring::TuiEngineSession;
 
 pub(super) fn drain_mcp_channel_notifications(session: &TuiEngineSession) {
@@ -21,10 +21,46 @@ pub(super) fn drain_mcp_channel_notifications(session: &TuiEngineSession) {
         .push_context(ContextSource::Channel, notifications);
 }
 
-pub(super) fn drain_model_context_prompts(session: &TuiEngineSession) -> Vec<String> {
-    session.engine_half.session_loop.inbox().take_context()
+/// The context a turn is about to carry, with what each item says about it.
+pub(super) fn drain_model_context_items(session: &TuiEngineSession) -> Vec<ContextItem> {
+    session
+        .engine_half
+        .session_loop
+        .inbox()
+        .take_context_items()
 }
 
+pub(super) fn drain_model_context_prompts(session: &TuiEngineSession) -> Vec<String> {
+    drain_model_context_items(session)
+        .into_iter()
+        .map(|item| item.text)
+        .collect()
+}
+
+/// Tell the session's ledger whose message the turn about to start is
+/// answering.
+///
+/// A turn started by the prompt the person typed answers nobody, however much
+/// context rides in with it: the reply is the person's, not a link in some other
+/// conversation's chain. Only a turn that exists *because* of an agent message
+/// inherits that message's depth, which is why only the idle-context path calls
+/// this — and why the depth comes from the item the inbox kept rather than from
+/// whatever arrived most recently.
+pub(super) fn stage_inbound_for_context(session: &TuiEngineSession, items: &[ContextItem]) {
+    let Some((from, hops)) = items
+        .iter()
+        .filter_map(|item| item.inbound.as_ref())
+        .next_back()
+    else {
+        return;
+    };
+    session
+        .engine_half
+        .runtime
+        .mid_turn_queue
+        .reply_ledger()
+        .stage_inbound(from, *hops);
+}
 #[cfg(test)]
 mod tests {
     use super::*;

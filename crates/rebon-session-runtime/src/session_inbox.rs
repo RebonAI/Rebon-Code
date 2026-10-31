@@ -32,18 +32,74 @@ pub enum ContextSource {
 
 #[derive(Default)]
 struct PendingContext {
-    channel: Vec<String>,
-    teammate: Vec<String>,
-    agent: Vec<String>,
+    channel: Vec<ContextItem>,
+    teammate: Vec<ContextItem>,
+    agent: Vec<ContextItem>,
+}
+
+/// One piece of context waiting for the next turn.
+#[derive(Debug, Clone)]
+pub struct ContextItem {
+    /// What the model reads.
+    pub text: String,
+    /// Whether this item is a reason to start a turn.
+    ///
+    /// An agent message that arrived while nobody could start a turn is not:
+    /// the hop or wake bounds refused it a turn of its own, so it waits for one
+    /// somebody else starts and rides into that. It is still carried — a
+    /// message that was accepted is never dropped — it just cannot be the
+    /// reason the turn exists.
+    pub may_wake: bool,
+    /// The session whose message this is, and how deep it already came, when
+    /// it is another agent's. The turn it rides into answers that session, so
+    /// its reply carries one more hop.
+    pub inbound: Option<(String, u8)>,
+}
+
+impl ContextItem {
+    /// Context that is a reason to start a turn and answers nobody: a channel
+    /// notification or a teammate's mailbox message.
+    pub fn waking(text: String) -> Self {
+        Self {
+            text,
+            may_wake: true,
+            inbound: None,
+        }
+    }
+
+    /// A message from another agent session, which the turn carrying it
+    /// answers.
+    pub fn agent(text: String, from_session_id: String, hops: u8) -> Self {
+        Self {
+            text,
+            may_wake: true,
+            inbound: Some((from_session_id, hops)),
+        }
+    }
+
+    /// The same message, but not a reason to start a turn: the bounds refused
+    /// it one, so it waits for a turn somebody else starts.
+    pub fn deferred(mut self) -> Self {
+        self.may_wake = false;
+        self
+    }
 }
 
 impl PendingContext {
-    fn queue(&mut self, source: ContextSource) -> &mut Vec<String> {
+    fn queue(&mut self, source: ContextSource) -> &mut Vec<ContextItem> {
         match source {
             ContextSource::Channel => &mut self.channel,
             ContextSource::Teammate => &mut self.teammate,
             ContextSource::Agent => &mut self.agent,
         }
+    }
+
+    fn may_wake(&self) -> bool {
+        self.channel
+            .iter()
+            .chain(&self.teammate)
+            .chain(&self.agent)
+            .any(|item| item.may_wake)
     }
 }
 
@@ -98,18 +154,43 @@ pub struct SessionInbox {
 impl SessionInbox {
     /// Add context for the next turn to carry.
     pub fn push_context(&self, source: ContextSource, prompts: impl IntoIterator<Item = String>) {
-        self.lock().queue(source).extend(prompts);
+        self.push_items(source, prompts.into_iter().map(ContextItem::waking));
     }
 
-    /// Whether any context is waiting.
+    /// Add context items that decide for themselves whether they may start a
+    /// turn.
+    pub fn push_items(&self, source: ContextSource, items: impl IntoIterator<Item = ContextItem>) {
+        self.lock().queue(source).extend(items);
+    }
+
+    /// Whether any context is waiting, including context that may not start a
+    /// turn.
     pub fn has_context(&self) -> bool {
         let context = self.lock();
         !(context.channel.is_empty() && context.teammate.is_empty() && context.agent.is_empty())
     }
 
+    /// Whether any waiting context is a reason to start a turn.
+    ///
+    /// A message the bounds refused a turn of its own stays in the inbox and is
+    /// carried by the next turn somebody else starts; asking this rather than
+    /// [`Self::has_context`] is what keeps it from starting that turn itself.
+    pub fn has_waking_context(&self) -> bool {
+        self.lock().may_wake()
+    }
+
     /// Take everything waiting, for the turn about to start: channel
     /// notifications first, then teammate messages, then agent messages.
     pub fn take_context(&self) -> Vec<String> {
+        self.take_context_items()
+            .into_iter()
+            .map(|item| item.text)
+            .collect()
+    }
+
+    /// Take everything waiting, with what each item says about the turn that
+    /// carries it.
+    pub fn take_context_items(&self) -> Vec<ContextItem> {
         let mut context = self.lock();
         let mut taken = std::mem::take(&mut context.channel);
         taken.append(&mut context.teammate);
@@ -119,6 +200,15 @@ impl SessionInbox {
 
     /// A copy of what is waiting from one source, leaving it in place.
     pub fn pending_context(&self, source: ContextSource) -> Vec<String> {
+        self.lock()
+            .queue(source)
+            .iter()
+            .map(|item| item.text.clone())
+            .collect()
+    }
+
+    /// A copy of what is waiting from one source as items.
+    pub fn pending_context_items(&self, source: ContextSource) -> Vec<ContextItem> {
         self.lock().queue(source).clone()
     }
 
@@ -196,7 +286,7 @@ impl SessionInbox {
         cron: &'a rebon_core::cron::CronPoller,
     ) -> impl Iterator<Item = ReadyInput> + 'a {
         IDLE_PRIORITY.into_iter().filter(move |input| match input {
-            ReadyInput::Context => self.has_context(),
+            ReadyInput::Context => self.has_waking_context(),
             ReadyInput::TaskNotifications => self.take_task_notification_look(),
             ReadyInput::Scheduled => cron.has_pending(),
         })
@@ -309,5 +399,42 @@ mod tests {
         inbox.task_notifications_settled();
         assert!(!inbox.task_notification_retry_pending());
         assert!(inbox.take_task_notification_look());
+    }
+
+    /// A message the bounds refused a turn of its own is still waiting, but it
+    /// is not a reason to start one: it rides into the next turn somebody else
+    /// starts, which is the only way it is ever delivered.
+    #[test]
+    fn a_deferred_message_waits_without_starting_a_turn() {
+        let inbox = SessionInbox::default();
+        let cron = rebon_core::cron::CronPoller::default();
+        assert!(inbox.take_task_notification_look());
+
+        inbox.push_items(
+            ContextSource::Agent,
+            [ContextItem::agent("refused".into(), "sess-peer".into(), 9).deferred()],
+        );
+        assert!(inbox.has_context(), "the message is kept");
+        assert!(!inbox.has_waking_context());
+        assert_eq!(inbox.ready_inputs(&cron).count(), 0);
+
+        // Only a later waking item turns the idle path on; the deferred one
+        // still comes along.
+        inbox.push_context(ContextSource::Teammate, ["hello".into()]);
+        assert_eq!(inbox.ready_inputs(&cron).next(), Some(ReadyInput::Context));
+        let items = inbox.take_context_items();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.text.as_str(), item.may_wake))
+                .collect::<Vec<_>>(),
+            [("hello", true), ("refused", false)]
+        );
+        assert_eq!(
+            items[1].inbound,
+            Some(("sess-peer".to_string(), 9)),
+            "the depth travels with the message, not with the turn"
+        );
+        assert!(!inbox.has_context());
     }
 }

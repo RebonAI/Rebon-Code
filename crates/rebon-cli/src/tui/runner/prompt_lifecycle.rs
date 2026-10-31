@@ -1048,7 +1048,16 @@ fn admit_local_turn(
             )
         }
         LocalTurnRequest::IdleContext => {
-            let injected_context = drain_model_context_prompts(session);
+            let injected_context = super::context_prompts::drain_model_context_items(session);
+            // The turn exists because of one of these messages, so it answers
+            // that sender and its reply carries one more hop. Staged before the
+            // turn starts, which is what binds it to this turn rather than to
+            // whatever runs next.
+            super::context_prompts::stage_inbound_for_context(session, &injected_context);
+            let injected_context = injected_context
+                .into_iter()
+                .map(|item| item.text)
+                .collect::<Vec<_>>();
             // At the session's effort, like any other turn: a teammate's or
             // another agent's message is answered as thoroughly as the
             // person asked for, and a hosted session already does so.
@@ -3132,6 +3141,57 @@ mod tests {
                 expected.reasoning_effort_ordinal
             );
         }
+        runtime.shutdown_background();
+    }
+
+    /// The same context arriving as part of a prompt the person typed is not
+    /// what that turn answers: their reply is their own, so it starts at zero.
+    #[test]
+    fn a_typed_turn_carries_no_hops_however_much_context_rides_with_it() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        let peer = "sess-hops-typed-peer";
+
+        session.engine_half.session_loop.inbox().push_items(
+            crate::session::session_inbox::ContextSource::Agent,
+            [crate::session::session_inbox::ContextItem::agent(
+                "<teammate-message>go</teammate-message>".into(),
+                peer.into(),
+                3,
+            )],
+        );
+        let active = admit_active_prompt(
+            &mut app,
+            &session,
+            &handle,
+            None,
+            LocalTurnSource::DirectUserSubmit,
+            admission_test_submit("what the person typed"),
+        )
+        .expect("typed turn");
+        runtime.block_on(tokio::task::yield_now());
+
+        assert_eq!(
+            session
+                .engine_half
+                .runtime
+                .mid_turn_queue
+                .reply_ledger()
+                .reply_hops(peer),
+            0,
+            "a turn the person started answers nobody, however deep its context"
+        );
+        let requests = recorder.take_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].user_prompt.as_deref(),
+            Some("what the person typed"),
+            "a typed turn still tells hooks and the classifier what was typed"
+        );
+        drop(active);
         runtime.shutdown_background();
     }
 

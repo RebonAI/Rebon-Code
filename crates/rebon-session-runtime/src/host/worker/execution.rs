@@ -948,6 +948,40 @@ pub(crate) async fn execute_claimed_prompt(
     execution
 }
 
+/// What the turn this worker is about to run is answering, if anything.
+///
+/// Only a claimed prompt that another agent sent makes the turn an answer: a
+/// prompt the person typed and a cron fire both leave the depth at zero however
+/// much context rode in with them.
+pub(crate) fn claimed_prompt_inbound(state: &BackgroundJobState) -> Option<(&str, u8)> {
+    let prompt = claimed_pending_prompt(state)?;
+    let rebon_session_host::PendingPromptOrigin::AgentMessage {
+        from_session_id,
+        hops,
+        ..
+    } = prompt.origin.as_ref()?
+    else {
+        return None;
+    };
+    Some((from_session_id.as_str(), *hops))
+}
+
+/// Tell this turn's ledger whose message it is answering.
+///
+/// A hosted turn that exists because another agent's message was claimed
+/// answers that sender, so its reply carries one more hop. Staged before the
+/// turn is submitted, which is what binds the depth to this turn rather than to
+/// whatever runs next.
+pub(crate) fn stage_inbound_for_claimed_prompt(
+    ledger: &rebon_tool::peer::AgentReplyLedger,
+    state: &BackgroundJobState,
+) {
+    let Some((from_session_id, hops)) = claimed_prompt_inbound(state) else {
+        return;
+    };
+    ledger.stage_inbound(from_session_id, hops);
+}
+
 /// Run the turn, publishing progress while it runs.
 ///
 /// The MCP stack has to be up before the turn lists its tools, and the turn
@@ -998,6 +1032,10 @@ async fn run_background_turn(
     // effort this turn runs under, above all, which the top of the turn may
     // just have re-read from a `/model` another client sent.
     ipc.publish_status_now(store, &state.identity.job_id);
+    stage_inbound_for_claimed_prompt(
+        &session.engine_half.runtime.mid_turn_queue.reply_ledger(),
+        state,
+    );
     let turn = run_through_session_loop(session, request, worker_turn_origin(state));
     let mut execution_future = Box::pin(execute_claimed_prompt(
         store,

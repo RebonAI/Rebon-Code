@@ -2531,7 +2531,8 @@ mod tests {
             PeerDelivery::Injected,
         ));
         let ledger = Arc::new(rebon_tool::peer::AgentReplyLedger::new());
-        ledger.note_inbound("peer-one", 2);
+        let generation = ledger.begin_turn();
+        ledger.note_inbound(generation, "peer-one", 2);
         let context = ToolContext::new()
             .with_session_id("caller-session")
             .with_peer_messenger(messenger.clone() as Arc<dyn PeerMessenger>)

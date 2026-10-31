@@ -356,6 +356,18 @@ pub(crate) fn spawn_background_steer_pump(
                 .await
             {
                 Ok(rebon_agent_core::SteerOutcome::Injected) => {
+                    // The running turn is now reading this message, so a reply
+                    // to its sender carries one more hop — the same thing the
+                    // tool round's poller does for the local engine.
+                    if let Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
+                        from_session_id,
+                        hops,
+                        ..
+                    }) = prompt.origin.as_ref()
+                    {
+                        rebon_tool::peer::session_reply_ledger(&session_id)
+                            .note_inbound_now(from_session_id, *hops);
+                    }
                     // The steer blocks already carry the framed message; a
                     // queued-user row would render it as something the user
                     // typed, which it is not.
@@ -489,6 +501,18 @@ impl AttachmentPoller for BackgroundPendingPromptPoller {
                             .entry(request.turn_id.to_string())
                             .or_default()
                             .extend(prompt.coordinator_report_paths.iter().map(PathBuf::from));
+                    }
+                    // The running turn is now reading this message, so a reply
+                    // to its sender carries one more hop — the hosted half of
+                    // what the local engine's mid-turn queue records.
+                    if let Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
+                        from_session_id,
+                        hops,
+                        ..
+                    }) = prompt.origin.as_ref()
+                    {
+                        rebon_tool::peer::session_reply_ledger(request.session_id)
+                            .note_inbound_now(from_session_id, *hops);
                     }
                     let _ = self.store.append_event(
                         &self.job_id,
