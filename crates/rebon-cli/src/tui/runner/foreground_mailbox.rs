@@ -56,7 +56,7 @@ use super::permission_flow::{
     apply_permission_modal_action_for_session, set_permission_mode_for_session,
     submit_ask_user_question_if_ready,
 };
-use super::submit::submit_or_queue_with_images_and_uuid;
+use super::submit::{submit_or_queue_from, TypedLine};
 use super::ActivePrompt;
 
 /// Runs one mailbox `RunCommand`.
@@ -459,7 +459,9 @@ impl ForegroundControl {
                 // Runs the prompt now, or queues it behind the in-flight turn —
                 // same path as a locally-typed submit. The "should exit" return
                 // is ignored: a remote controller cannot quit the local TUI.
-                let _ = submit_or_queue_with_images_and_uuid(
+                // Never read as `@name message`: only a line typed at this
+                // terminal is an address.
+                let _ = submit_or_queue_from(
                     app,
                     message,
                     images,
@@ -469,6 +471,7 @@ impl ForegroundControl {
                     active_prompt,
                     pending_permission,
                     ui_mode,
+                    TypedLine::Injected,
                 );
                 Ok(None)
             }
