@@ -18,7 +18,11 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::store::BackgroundStore;
-use crate::{BackgroundJobState, BackgroundJobStatus, ForegroundSessionStatus, OwnerHandle};
+use crate::{
+    background_task_event_summary, BackgroundJobEvent, BackgroundJobState, BackgroundJobStatus,
+    BackgroundTaskEventBatch, BackgroundTaskEventKind, ForegroundSessionStatus, OwnerHandle,
+    BACKGROUND_SUMMARY_UPDATE_INTERVAL_MS,
+};
 
 /// How stale a foreground heartbeat may be and still count as running.
 ///
@@ -66,6 +70,11 @@ pub struct PeerSession {
     /// an endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
+    /// What this session is doing right now — the owner's own summary while it
+    /// is fresh, and the last tool it started once that summary has gone stale.
+    /// `None` for a session that is running but has said nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
 }
 
 /// The peer list, read from the records the session host already keeps.
@@ -168,6 +177,7 @@ impl PeerDirectory {
         // still has the durable queue behind it.
         let unreachable_endpoint = !endpoint_reachable && endpoint.is_some();
         let name = job.name().trim();
+        let activity = self.hosted_activity(job);
         Some(PeerSession {
             session_id: session_id.to_string(),
             handle: rebon_session::load_session_handle(&self.projects_root, job.cwd(), session_id),
@@ -183,7 +193,34 @@ impl PeerDirectory {
             terminal_id: descriptor
                 .as_ref()
                 .and_then(|descriptor| descriptor.terminal_id.clone()),
+            activity,
         })
+    }
+
+    /// What a hosted session is doing right now.
+    ///
+    /// The owner's own summary is the best answer and the only one written for
+    /// this purpose, but the owner refreshes it on an interval, so a summary
+    /// older than two intervals describes a turn that may already be over. Past
+    /// that the event log is the fallback: the last tool the session started is
+    /// still what a caller wants to know, and it costs one bounded tail read of
+    /// a file the owner is already writing.
+    fn hosted_activity(&self, job: &BackgroundJobState) -> Option<String> {
+        if !matches!(job.status(), BackgroundJobStatus::Running) {
+            return None;
+        }
+        let fresh_window = BACKGROUND_SUMMARY_UPDATE_INTERVAL_MS.saturating_mul(2);
+        let now = crate::now_ms();
+        if let Some(summary) = job.summary().map(str::trim).filter(|s| !s.is_empty()) {
+            let fresh = job
+                .outcome
+                .summary_updated_at_ms
+                .is_some_and(|updated| now.saturating_sub(updated) <= fresh_window);
+            if fresh {
+                return Some(summary.to_string());
+            }
+        }
+        latest_tool_start_activity(&self.store, job.job_id())
     }
 
     /// Every `.live.json` under the projects root that is fresh.
@@ -225,8 +262,60 @@ impl PeerDirectory {
             reachable,
             job_id: None,
             terminal_id: status.terminal_id,
+            activity: status.activity.clone(),
         })
     }
+}
+
+/// How much of a job's event log the fallback activity read looks at.
+///
+/// A turn can write thousands of lines; the tool that started most recently is
+/// what a peer card shows, and the last 64 KiB of the log holds it unless the
+/// turn has written that much since its last tool call — in which case the tool
+/// is genuinely not what the session is doing any more.
+const ACTIVITY_EVENT_TAIL_BYTES: usize = 64 * 1024;
+
+/// Lines of the event-log tail this fallback parses.
+const ACTIVITY_EVENT_TAIL_LINES: usize = 256;
+
+/// The activity the session's most recent started tool was doing.
+///
+/// Reads the tail of the job's event file rather than the whole thing: this runs
+/// once per peer for every `ListPeers`, and the answer is always at the end.
+fn latest_tool_start_activity(store: &BackgroundStore, job_id: &str) -> Option<String> {
+    let path = store.events_path(job_id);
+    let lines = crate::store::read_tail_lines_bounded(
+        &path,
+        ACTIVITY_EVENT_TAIL_LINES,
+        ACTIVITY_EVENT_TAIL_BYTES,
+    )
+    .ok()?;
+    lines
+        .iter()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<BackgroundJobEvent>(line).ok())
+        .find_map(|event| last_tool_start_in_batch(&event))
+}
+
+/// The activity carried by the last `ToolStart` in a `task_live_batch` event.
+///
+/// The batch is written into `data` with its own camelCase shape, so this reads
+/// it back as a [`BackgroundTaskEventBatch`] rather than reaching for keys. The
+/// line is that summary because that is exactly what the Agent View row shows
+/// for a started tool.
+fn last_tool_start_in_batch(event: &BackgroundJobEvent) -> Option<String> {
+    if event.kind != "task_live_batch" {
+        return None;
+    }
+    let batch = serde_json::from_value::<BackgroundTaskEventBatch>(event.data.clone()).ok()?;
+    batch
+        .events
+        .iter()
+        .rev()
+        .find(|entry| matches!(entry.event, BackgroundTaskEventKind::ToolStart { .. }))
+        .map(|entry| background_task_event_summary(&entry.event))
+        .map(|activity| activity.trim().to_string())
+        .filter(|activity| !activity.is_empty())
 }
 
 /// Whether a foreground status names a way to take an agent message.
@@ -325,6 +414,7 @@ mod tests {
             terminal_id: None,
             agent_endpoint: None,
             capabilities: Vec::new(),
+            activity: None,
         }
     }
 
@@ -572,6 +662,184 @@ mod tests {
             vec!["sess-b"]
         );
         drop(locks);
+    }
+
+    /// A fresh owner summary is the activity; the reader never has to parse the
+    /// event log for the common case.
+    #[test]
+    fn a_fresh_summary_is_the_activity() {
+        let (_dir, store, projects_root) = store_and_projects();
+        let job_id = host_job(&store, "sess-fresh", "F:/work/fresh");
+        store
+            .update_state(&job_id, |state| {
+                state.outcome.summary = Some("Bash cargo test".into());
+                state.outcome.summary_updated_at_ms = Some(crate::now_ms());
+                Ok(())
+            })
+            .unwrap();
+        let _lock = rebon_session::try_acquire_session_active_lock(
+            &projects_root,
+            "F:/work/fresh",
+            "sess-fresh",
+        )
+        .expect("the lock probe works")
+        .expect("the session lock is free");
+
+        let peers = PeerDirectory::new(store, &projects_root).list();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].activity.as_deref(), Some("Bash cargo test"));
+    }
+
+    /// A summary older than two publish intervals may describe a turn that is
+    /// already over, so the event log answers instead.
+    #[test]
+    fn a_stale_summary_falls_back_to_the_last_started_tool() {
+        let (_dir, store, projects_root) = store_and_projects();
+        let job_id = host_job(&store, "sess-stale-summary", "F:/work/stale-summary");
+        store
+            .update_state(&job_id, |state| {
+                state.outcome.summary = Some("an older turn".into());
+                state.outcome.summary_updated_at_ms = Some(
+                    crate::now_ms()
+                        - BACKGROUND_SUMMARY_UPDATE_INTERVAL_MS * 3,
+                );
+                Ok(())
+            })
+            .unwrap();
+        append_tool_start_batch(&store, &job_id, "Read crates/rebon-core/src/lib.rs");
+        let _lock = rebon_session::try_acquire_session_active_lock(
+            &projects_root,
+            "F:/work/stale-summary",
+            "sess-stale-summary",
+        )
+        .expect("the lock probe works")
+        .expect("the session lock is free");
+
+        let peers = PeerDirectory::new(store, &projects_root).list();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0].activity.as_deref(),
+            Some("Read crates/rebon-core/src/lib.rs")
+        );
+    }
+
+    /// Nothing fresh and nothing started: the session is running but has no
+    /// activity to report, which is `None` rather than an invented sentence.
+    #[test]
+    fn a_running_session_with_no_summary_and_no_tool_reports_no_activity() {
+        let (_dir, store, projects_root) = store_and_projects();
+        host_job(&store, "sess-quiet", "F:/work/quiet");
+        let _lock = rebon_session::try_acquire_session_active_lock(
+            &projects_root,
+            "F:/work/quiet",
+            "sess-quiet",
+        )
+        .expect("the lock probe works")
+        .expect("the session lock is free");
+
+        let peers = PeerDirectory::new(store, &projects_root).list();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].activity, None);
+    }
+
+    /// A session that is not running has nothing to report even when its record
+    /// still carries the summary of its last turn.
+    #[test]
+    fn an_idle_session_reports_no_activity() {
+        let (_dir, store, projects_root) = store_and_projects();
+        let job_id = host_job(&store, "sess-needs-input", "F:/work/needs-input");
+        store
+            .update_state(&job_id, |state| {
+                state.outcome.summary = Some("Bash cargo test".into());
+                state.outcome.summary_updated_at_ms = Some(crate::now_ms());
+                state.process.status = BackgroundJobStatus::NeedsInput;
+                Ok(())
+            })
+            .unwrap();
+        let _lock = rebon_session::try_acquire_session_active_lock(
+            &projects_root,
+            "F:/work/needs-input",
+            "sess-needs-input",
+        )
+        .expect("the lock probe works")
+        .expect("the session lock is free");
+
+        let peers = PeerDirectory::new(store, &projects_root).list();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].activity, None);
+    }
+
+    /// The foreground half publishes the activity itself, and discovery passes
+    /// it through untouched.
+    #[test]
+    fn a_foreground_peer_reports_the_activity_its_heartbeat_carries() {
+        let (_dir, store, projects_root) = store_and_projects();
+        let mut status = foreground_status("sess-working", "F:/work/working");
+        status.activity = Some("Edit src/main.rs".into());
+        assert!(crate::write_foreground_status(&projects_root, &status));
+        let _lock = rebon_session::try_acquire_session_active_lock(
+            &projects_root,
+            &status.cwd,
+            &status.session_id,
+        )
+        .expect("the lock probe works")
+        .expect("the session lock is free");
+
+        let peers = PeerDirectory::new(store, &projects_root).list();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].activity.as_deref(), Some("Edit src/main.rs"));
+    }
+
+    /// A `.live.json` written before the field existed still parses, and simply
+    /// has no activity.
+    #[test]
+    fn a_heartbeat_from_before_the_field_existed_still_parses() {
+        let (_dir, store, projects_root) = store_and_projects();
+        let cwd = "F:/work/old-heartbeat";
+        let session_id = "sess-old-heartbeat";
+        let path = crate::legacy_foreground::foreground_status_path(&projects_root, cwd, session_id);
+        std::fs::create_dir_all(
+            path.parent().expect("the status file has a parent"),
+        )
+        .unwrap();
+        let body = format!(
+            r#"{{"pid":{},"sessionId":"{session_id}","cwd":"{cwd}","heartbeatMs":{},"busy":true,"lastCommandAtMs":0}}"#,
+            std::process::id(),
+            crate::now_ms()
+        );
+        std::fs::write(&path, body).unwrap();
+        let _lock =
+            rebon_session::try_acquire_session_active_lock(&projects_root, cwd, session_id)
+                .expect("the lock probe works")
+                .expect("the session lock is free");
+
+        let peers = PeerDirectory::new(store, &projects_root).list();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].session_id, session_id);
+        assert_eq!(peers[0].activity, None);
+    }
+
+    fn append_tool_start_batch(store: &BackgroundStore, job_id: &str, summary: &str) {
+        let batch = BackgroundTaskEventBatch {
+            schema: 1,
+            stream_id: "stream-1".into(),
+            from_cursor: 1,
+            through_cursor: 1,
+            cursor_was_stale: false,
+            reset_tasks: Vec::new(),
+            events: vec![crate::BackgroundTaskEvent {
+                cursor: 1,
+                task_id: "task-1".into(),
+                timestamp_ms: crate::now_ms(),
+                task: None,
+                event: BackgroundTaskEventKind::ToolStart {
+                    tool_use_id: "tool-1".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({ "file_path": summary.trim_start_matches("Read ") }),
+                },
+            }],
+        };
+        store.append_task_event_batch(job_id, &batch).unwrap();
     }
 
     /// The request the peers feature exists for must at least spell itself.

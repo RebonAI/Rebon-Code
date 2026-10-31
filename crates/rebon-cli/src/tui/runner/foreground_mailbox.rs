@@ -184,15 +184,17 @@ impl ForegroundControl {
 
     /// Publish the status sidecar for what is on screen right now.
     ///
-    /// The mailbox is told three facts rather than shown the screen: whether a
-    /// turn is running, the pending permission as a background snapshot, and the
-    /// questions an interactive prompt is asking. Reading those off the screen is
-    /// the terminal's job; writing the file is not.
+    /// The mailbox is told four facts rather than shown the screen: whether a
+    /// turn is running, the pending permission as a background snapshot, the
+    /// questions an interactive prompt is asking, and what the running turn is
+    /// working on. Reading those off the screen is the terminal's job; writing
+    /// the file is not.
     pub(super) fn publish(
         &mut self,
         active_prompt: &Option<ActivePrompt>,
         pending_permission: &Option<PendingPermission>,
         paused: bool,
+        activity: Option<&str>,
     ) -> bool {
         let busy = active_prompt.is_some();
         // The listener answers a sender before the event loop can act, so it
@@ -212,6 +214,7 @@ impl ForegroundControl {
             busy,
             pending_snapshot.as_ref(),
             ask_user_questions.as_deref(),
+            activity,
         )
     }
 
@@ -325,6 +328,7 @@ impl ForegroundControl {
             return;
         }
         self.apply_pending_agent_messages(session, active_prompt);
+        let activity = current_streaming_activity(app);
         for claim in self.mailbox.claims() {
             let command_id = claim.envelope.command_id.clone();
             let is_run_command = matches!(
@@ -356,6 +360,7 @@ impl ForegroundControl {
                     active_prompt,
                     pending_permission,
                     app.resume_dialog.is_some(),
+                    activity.as_deref(),
                 ) {
                     self.mailbox.complete(&claim);
                 }
@@ -404,6 +409,7 @@ impl ForegroundControl {
                 active_prompt,
                 pending_permission,
                 app.resume_dialog.is_some(),
+                current_streaming_activity(app).as_deref(),
             ) {
                 self.mailbox.complete(&claim);
             }
@@ -512,6 +518,45 @@ impl ForegroundControl {
             }
         }
     }
+}
+
+/// What the running turn is working on, for the status sidecar.
+///
+/// The peer list shows this next to a session's name, so it has to be the same
+/// sentence the transcript row carries: the newest tool still in flight, named
+/// and summarised the way the tool card names it. A turn that has only produced
+/// text has nothing to report — "thinking" tells a reader less than nothing
+/// does, and the busy flag already says a turn is running.
+pub(super) fn current_streaming_activity(app: &AppState) -> Option<String> {
+    app.rebon_tui
+        .overlay
+        .blocks
+        .iter()
+        .rev()
+        .find_map(|block| match block {
+            rebon_tui::StreamingContentBlock::ToolUse(tool)
+                if matches!(
+                    tool.status,
+                    rebon_types::ToolCallStatus::Pending | rebon_types::ToolCallStatus::InProgress
+                ) =>
+            {
+                let name = rebon_render::streaming_tool_display_name(
+                    &tool.tool_name,
+                    tool.raw_input.as_ref(),
+                );
+                let summary = tool
+                    .raw_input
+                    .as_ref()
+                    .map(|input| rebon_render::streaming_tool_summary(&tool.tool_name, input))
+                    .unwrap_or_default();
+                Some(if summary.trim().is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{name} {summary}")
+                })
+            }
+            _ => None,
+        })
 }
 
 /// Resolve a remote permission answer against the currently-pending prompt.

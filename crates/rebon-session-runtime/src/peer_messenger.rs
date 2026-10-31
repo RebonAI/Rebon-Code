@@ -123,6 +123,7 @@ fn peer_info(peer: PeerSession) -> PeerInfo {
         busy: peer.busy,
         reachable: peer.reachable,
         terminal_id: peer.terminal_id,
+        activity: peer.activity,
     }
 }
 
@@ -170,6 +171,7 @@ mod tests {
             terminal_id: Some("term-7".into()),
             agent_endpoint: None,
             capabilities: Vec::new(),
+            activity: None,
         }
     }
 

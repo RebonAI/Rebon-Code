@@ -845,6 +845,7 @@ fn an_agent_message_for_a_foreground_terminal_without_a_channel_is_refused() {
             terminal_id: None,
             agent_endpoint: None,
             capabilities: Vec::new(),
+            activity: None,
         }
     ));
 
@@ -893,6 +894,7 @@ fn an_agent_message_reaches_a_foreground_agent_endpoint() {
             // Deliberately no capability: the endpoint rung must work on its
             // own, not because the mailbox happens to be advertised too.
             capabilities: Vec::new(),
+            activity: None,
         }
     ));
 
@@ -947,6 +949,7 @@ fn an_agent_message_uses_the_capability_mailbox_rung() {
             terminal_id: None,
             agent_endpoint: None,
             capabilities: vec![crate::AGENT_MESSAGE_CAPABILITY.to_string()],
+            activity: None,
         }
     ));
 

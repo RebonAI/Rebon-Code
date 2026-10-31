@@ -673,6 +673,8 @@ pub struct PeerInfo {
     pub busy: bool,
     pub reachable: bool,
     pub terminal_id: Option<String>,
+    /// What the session is doing right now, when its owner can say.
+    pub activity: Option<String>,
 }
 
 /// One plain-text message addressed to another session.

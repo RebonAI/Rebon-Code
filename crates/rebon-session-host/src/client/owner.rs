@@ -1166,6 +1166,9 @@ pub fn foreground_status_from_owner(
         // descriptor is how it is reached.
         agent_endpoint: None,
         capabilities: Vec::new(),
+        // What the owner is doing is published on its job record, which the
+        // peer directory reads directly; this projection is the mailbox shape.
+        activity: None,
     }
 }
 

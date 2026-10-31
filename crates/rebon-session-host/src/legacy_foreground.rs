@@ -449,6 +449,11 @@ pub struct ForegroundSessionStatus {
     /// before the field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// What this session is doing right now — the tool or file it is working
+    /// on. Absent while it is idle, and on every status written before the
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
 }
 
 /// Environment variable the desktop app sets in the terminals it launches.
@@ -1416,6 +1421,7 @@ mod tests {
             terminal_id: None,
             agent_endpoint: None,
             capabilities: Vec::new(),
+            activity: None,
         };
         write_foreground_status(&root, &status);
         let read = read_foreground_status(&root, &status.cwd, &status.session_id).unwrap();
@@ -1460,6 +1466,7 @@ mod tests {
             terminal_id: None,
             agent_endpoint: None,
             capabilities: Vec::new(),
+            activity: None,
         };
         let path = foreground_status_path(&root, &cwd, &status.session_id);
         assert!(
@@ -1524,6 +1531,7 @@ mod tests {
             terminal_id: Some("term-9".into()),
             agent_endpoint: None,
             capabilities: Vec::new(),
+            activity: None,
         };
         assert!(write_foreground_status(&root, &status));
         let path = foreground_status_path(&root, cwd, sid);
@@ -1564,6 +1572,7 @@ mod tests {
                 token_path: "/home/u/.rebon/projects/p/sess.agent-token".into(),
             }),
             capabilities: vec![AGENT_MESSAGE_CAPABILITY.into()],
+            activity: None,
         };
         assert!(write_foreground_status(&root, &status));
         let path = foreground_status_path(&root, cwd, sid);

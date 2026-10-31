@@ -53,6 +53,14 @@ use crate::session::EngineSession;
 /// a heartbeat so the controller can detect a hung/crashed publisher.
 const STATUS_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(1000);
 
+/// How often (at most) the sidecar is rewritten when only the activity moved.
+///
+/// A streaming tool updates its summary on every delta, and each rewrite is a
+/// file the peer list reads. A second is finer than a reader can tell apart,
+/// and the heartbeat interval already forces a write on its own schedule — so
+/// this only ever *delays* a write, never prevents one.
+const ACTIVITY_REWRITE_INTERVAL: Duration = Duration::from_millis(1000);
+
 /// How many recently-processed command ids to remember for idempotency. Bounds
 /// the dedup set so a long-lived session does not grow it without limit.
 const PROCESSED_HISTORY: usize = 64;
@@ -102,14 +110,16 @@ fn foreground_status_fingerprint(
     pending_permission: Option<&rebon_session_host::BackgroundPermissionQuerySnapshot>,
     ask_user_questions: Option<&[ForegroundQuestion]>,
     last_command_id: Option<&str>,
+    activity: Option<&str>,
 ) -> String {
     let questions = serde_json::to_string(&ask_user_questions).unwrap_or_default();
     format!(
-        "{busy}|{}|{questions}|{}",
+        "{busy}|{}|{questions}|{}|{}",
         pending_permission
             .map(|permission| permission.query_id)
             .unwrap_or(0),
-        last_command_id.unwrap_or("")
+        last_command_id.unwrap_or(""),
+        activity.unwrap_or("")
     )
 }
 
@@ -126,6 +136,9 @@ pub(crate) struct ForegroundMailbox {
     session_id: String,
     last_status_publish: Option<Instant>,
     last_status_fp: String,
+    /// The activity last written to the sidecar, so a rewrite caused only by an
+    /// activity change can be told apart from one caused by anything else.
+    last_activity: Option<String>,
     /// Recently-processed command ids (most-recent at the back) for idempotency.
     processed: VecDeque<String>,
     /// Acknowledgement of the most recently processed command, mirrored into the
@@ -153,6 +166,7 @@ impl ForegroundMailbox {
             session_id: session.session_id.clone(),
             last_status_publish: None,
             last_status_fp: String::new(),
+            last_activity: None,
             processed: VecDeque::with_capacity(PROCESSED_HISTORY),
             last_command_id: None,
             last_command_at_ms: 0,
@@ -202,6 +216,7 @@ impl ForegroundMailbox {
         self.session_id = session.session_id.clone();
         self.last_status_publish = None;
         self.last_status_fp.clear();
+        self.last_activity = None;
         self.processed.clear();
         self.last_command_id = None;
         self.last_command_at_ms = 0;
@@ -301,22 +316,37 @@ impl ForegroundMailbox {
         busy: bool,
         pending_permission: Option<&rebon_session_host::BackgroundPermissionQuerySnapshot>,
         ask_user_questions: Option<&[ForegroundQuestion]>,
+        activity: Option<&str>,
     ) -> bool {
         if !self.enabled {
             return false;
         }
+        let port = self
+            .agent_endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.port)
+            .unwrap_or(0);
         let fp = format!(
-            "{}|{}",
+            "{}|{port}",
             foreground_status_fingerprint(
                 busy,
                 pending_permission,
                 ask_user_questions,
                 self.last_command_id.as_deref(),
-            ),
-            self.agent_endpoint
-                .as_ref()
-                .map(|endpoint| endpoint.port)
-                .unwrap_or(0),
+                activity,
+            )
+        );
+        // The fingerprint this would have had if the activity had not moved. If
+        // that is what was last written, the activity is the only difference.
+        let fp_without_new_activity = format!(
+            "{}|{port}",
+            foreground_status_fingerprint(
+                busy,
+                pending_permission,
+                ask_user_questions,
+                self.last_command_id.as_deref(),
+                self.last_activity.as_deref(),
+            )
         );
         let now = Instant::now();
         let heartbeat_due = self
@@ -325,6 +355,18 @@ impl ForegroundMailbox {
             .unwrap_or(true);
         if fp == self.last_status_fp && !heartbeat_due {
             return true;
+        }
+        // A streaming tool rewrites its summary on every delta. Everything else
+        // is unchanged here, so this is the one case worth waiting out rather
+        // than writing a file per delta.
+        if fp_without_new_activity == self.last_status_fp && !heartbeat_due {
+            let activity_rewrite_due = self
+                .last_status_publish
+                .map(|t| now.duration_since(t) >= ACTIVITY_REWRITE_INTERVAL)
+                .unwrap_or(true);
+            if !activity_rewrite_due {
+                return true;
+            }
         }
         let status = ForegroundSessionStatus {
             pid: std::process::id(),
@@ -344,10 +386,12 @@ impl ForegroundMailbox {
             // listener could not bind, so the capability is advertised whenever
             // the mailbox itself is.
             capabilities: vec![rebon_session_host::AGENT_MESSAGE_CAPABILITY.to_string()],
+            activity: activity.map(str::to_string),
         };
         let written = rebon_session_host::write_foreground_status(&self.projects_root, &status);
         if written {
             self.last_status_fp = fp;
+            self.last_activity = activity.map(str::to_string);
             self.last_status_publish = Some(now);
         }
         written
@@ -520,9 +564,10 @@ mod tests {
 
     #[test]
     fn status_fingerprint_tracks_question_presence() {
-        let without_questions = foreground_status_fingerprint(false, None, None, None);
+        let without_questions = foreground_status_fingerprint(false, None, None, None, None);
         let questions = vec![question("继续")];
-        let with_questions = foreground_status_fingerprint(false, None, Some(&questions), None);
+        let with_questions =
+            foreground_status_fingerprint(false, None, Some(&questions), None, None);
         assert_ne!(without_questions, with_questions);
     }
 
@@ -531,8 +576,8 @@ mod tests {
         let first = vec![question("继续")];
         let second = vec![question("执行")];
         assert_ne!(
-            foreground_status_fingerprint(true, None, Some(&first), Some("command")),
-            foreground_status_fingerprint(true, None, Some(&second), Some("command"))
+            foreground_status_fingerprint(true, None, Some(&first), Some("command"), None),
+            foreground_status_fingerprint(true, None, Some(&second), Some("command"), None)
         );
     }
 
@@ -540,8 +585,69 @@ mod tests {
     fn status_fingerprint_is_stable_for_identical_questions() {
         let questions = vec![question("继续")];
         assert_eq!(
-            foreground_status_fingerprint(true, None, Some(&questions), Some("command")),
-            foreground_status_fingerprint(true, None, Some(&questions), Some("command"))
+            foreground_status_fingerprint(true, None, Some(&questions), Some("command"), None),
+            foreground_status_fingerprint(true, None, Some(&questions), Some("command"), None)
+        );
+    }
+
+    #[test]
+    fn status_fingerprint_tracks_the_activity() {
+        let idle = foreground_status_fingerprint(true, None, None, None, None);
+        let working = foreground_status_fingerprint(true, None, None, None, Some("Bash cargo test"));
+        assert_ne!(idle, working);
+    }
+
+    /// The sidecar carries the activity, and an activity-only change is held
+    /// back rather than written once per streaming delta. Anything else moving
+    /// writes immediately, activity included.
+    #[test]
+    fn the_status_carries_the_activity_and_holds_back_an_activity_only_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects_root = dir.path().to_path_buf();
+        std::fs::create_dir_all(&projects_root).unwrap();
+        let cwd = "F:/work/publish";
+        let session_id = "sess-publish";
+        let mut session = crate::tui::runner::test_support::make_test_tui_session();
+        session.projects_root = projects_root.clone();
+        session.cwd = cwd.into();
+        session.session_id = session_id.into();
+        session.session_active_lock = Some(
+            rebon_session::try_acquire_session_active_lock(&projects_root, cwd, session_id)
+                .expect("the lock probe works")
+                .expect("the session lock is free"),
+        );
+        let mut mailbox = ForegroundMailbox::new(&session);
+        let read = || {
+            rebon_session_host::read_foreground_status(&projects_root, cwd, session_id)
+                .expect("the status was written")
+        };
+
+        assert!(mailbox.publish(true, None, None, Some("Bash cargo test")));
+        assert_eq!(read().activity.as_deref(), Some("Bash cargo test"));
+
+        // Only the activity moved. The claim is still acknowledged — a caller
+        // waits on `true` — but the file keeps the older activity until the
+        // rewrite interval has passed.
+        assert!(mailbox.publish(
+            true,
+            None,
+            None,
+            Some("Read crates/rebon-core/src/lib.rs")
+        ));
+        assert_eq!(read().activity.as_deref(), Some("Bash cargo test"));
+
+        // The turn ending is not an activity change, so it writes at once.
+        assert!(mailbox.publish(
+            false,
+            None,
+            None,
+            Some("Read crates/rebon-core/src/lib.rs")
+        ));
+        let settled = read();
+        assert!(!settled.busy);
+        assert_eq!(
+            settled.activity.as_deref(),
+            Some("Read crates/rebon-core/src/lib.rs")
         );
     }
 }

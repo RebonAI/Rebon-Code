@@ -1183,6 +1183,7 @@ mod tests {
             busy: false,
             reachable: true,
             terminal_id: Some("term-peer".into()),
+            activity: None,
         }
     }
 

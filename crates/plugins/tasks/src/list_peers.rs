@@ -26,6 +26,8 @@ struct PeerEntry {
     reachable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activity: Option<String>,
 }
 
 impl From<PeerInfo> for PeerEntry {
@@ -39,6 +41,7 @@ impl From<PeerInfo> for PeerEntry {
             busy: peer.busy,
             reachable: peer.reachable,
             terminal_id: peer.terminal_id,
+            activity: peer.activity,
         }
     }
 }
@@ -208,6 +211,7 @@ mod tests {
             busy: false,
             reachable,
             terminal_id: Some("term-1".into()),
+            activity: None,
         }
     }
 
