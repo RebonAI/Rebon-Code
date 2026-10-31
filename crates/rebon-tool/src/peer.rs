@@ -468,15 +468,59 @@ mod tests {
     #[test]
     fn a_name_matches_whatever_its_case() {
         let peers = peers();
+        // Both assertions are name lookups: a case-folded name must reach the
+        // name step, and a name that is not an id must still resolve by name.
         assert_eq!(
             resolve_peer(&peers, "Other").unwrap().session_id,
             "abcde-fghij-klmno-zzzz"
         );
         assert_eq!(
-            resolve_peer(&peers, "11111-22222-33333-44444")
-                .unwrap()
-                .session_id,
-            "11111-22222-33333-44444"
+            resolve_peer(&peers, "WORKER").unwrap().session_id,
+            "abcde-fghij-klmno-pqrst"
+        );
+    }
+
+    /// The most specific step decides on its own: two sessions sharing a full
+    /// handle is an error even though a longer string could have distinguished
+    /// them, because the caller named that handle and nothing else.
+    #[test]
+    fn an_ambiguous_full_handle_lists_the_candidates_and_stops() {
+        let peers = vec![
+            peer("abcde-one", Some("repo-qrst"), Some("worker")),
+            peer("abcde-two", Some("repo-qrst"), Some("other")),
+        ];
+        let error = resolve_peer(&peers, "@repo-qrst").unwrap_err();
+        assert_eq!(
+            error,
+            PeerResolveError::Ambiguous {
+                requested: "repo-qrst".into(),
+                candidates: vec!["@repo-qrst".into(), "@repo-qrst".into()],
+            }
+        );
+        assert_eq!(
+            error.candidates().len(),
+            2,
+            "an ambiguous step never falls through to a step that would match"
+        );
+    }
+
+    /// Falling through after an ambiguity would deliver a message the caller did
+    /// not address: the second peer is also named `worker`, so the name step
+    /// would have found something, and the answer must still be the ambiguity.
+    #[test]
+    fn an_ambiguous_step_reports_ambiguity_even_when_a_later_step_would_match() {
+        let peers = vec![
+            peer("abcdef-one", Some("repo-alpha"), Some("worker")),
+            peer("abcdef-two", Some("repo-alpine"), Some("worker")),
+            peer("zzzzzz-three", None, Some("repo-al")),
+        ];
+        // The handle prefix is what is ambiguous; the name step would otherwise
+        // have matched `repo-al` uniquely.
+        let error = resolve_peer(&peers, "repo-al").unwrap_err();
+        assert_eq!(
+            error.candidates(),
+            ["@repo-alpha", "@repo-alpine"],
+            "the handle-prefix step decides, and it matched two"
         );
     }
 

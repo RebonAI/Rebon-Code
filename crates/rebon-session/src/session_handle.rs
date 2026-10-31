@@ -10,11 +10,11 @@
 //! A handle has to be unique among every session on this machine that has ever
 //! held one, not just among the sessions running now — a sender may be naming a
 //! session it expects to come back. The claim is therefore a file in a
-//! machine-wide index, created with `create_new` so two processes racing for the
-//! same handle cannot both win: the loser lengthens its id tail and tries
-//! again.
+//! machine-wide index, staged and then linked into place without overwriting, so
+//! two processes racing for the same handle cannot both win: the loser lengthens
+//! its id tail and tries again.
 
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 /// Longest the project half of a handle may be.
@@ -70,14 +70,39 @@ fn slugify(name: &str) -> String {
     }
 }
 
-/// The session half of a handle, before it is shortened to a suffix: the
-/// session id without its group separators, lowercased.
+/// The session half of a handle: the characters of the id a handle may contain,
+/// lowercased, with everything else dropped.
+///
+/// A handle is one path component in the machine-wide index, so an id carrying
+/// `_`, `.` or `/` must not reach the candidate at all — `..` would name a
+/// directory outside the index. Filtering first, then taking the suffix by
+/// character rather than by byte, is what keeps a non-ASCII id from panicking on
+/// a char boundary.
 fn handle_tail(session_id: &str) -> String {
     session_id
         .chars()
-        .filter(|ch| *ch != '-')
+        .filter(char::is_ascii_alphanumeric)
         .map(|ch| ch.to_ascii_lowercase())
         .collect()
+}
+
+/// What the tail falls back to when an id contains nothing a handle may hold.
+///
+/// Derived from the id rather than from a counter, so the same session asked
+/// twice gets the same name and two sessions never share one by construction.
+fn handle_tail_fallback(session_id: &str) -> String {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(session_id.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The last `take` characters of the tail, never splitting a character apart.
+fn handle_tail_suffix(tail: &str, take: usize) -> Option<String> {
+    let total = tail.chars().count();
+    if total < take {
+        return None;
+    }
+    Some(tail.chars().skip(total - take).collect())
 }
 
 /// `<slug>-<last n characters of the id>`, or `None` when the id is too short to
@@ -89,12 +114,18 @@ pub fn session_handle_candidate(cwd: &str, session_id: &str, extra_chars: usize)
 
 fn session_handle_for_slug(slug: &str, session_id: &str, extra_chars: usize) -> Option<String> {
     let tail = handle_tail(session_id);
-    let take = SESSION_HANDLE_TAIL_CHARS + extra_chars;
-    if tail.len() < take {
-        return None;
-    }
-    let start = tail.len() - take;
-    Some(format!("{slug}-{}", &tail[start..]))
+    // An id with no usable characters at all still needs a name: an empty
+    // candidate would be the bare slug, which every such session would share.
+    let tail = if tail.is_empty() {
+        if session_id.trim().is_empty() {
+            return None;
+        }
+        handle_tail_fallback(session_id)
+    } else {
+        tail
+    };
+    let suffix = handle_tail_suffix(&tail, SESSION_HANDLE_TAIL_CHARS + extra_chars)?;
+    Some(format!("{slug}-{suffix}"))
 }
 
 /// The handle this session's metadata sidecar records, if any.
@@ -165,29 +196,56 @@ pub fn ensure_session_handle(
 
 /// Claim `handle` for `session_id`, or report that somebody else already did.
 ///
-/// `create_new` is the whole mutual exclusion: a name that appears is one
-/// exactly one process created. A file that already names this session is this
-/// session's own earlier claim — the sidecar write after it must have failed —
-/// rather than a conflict.
+/// The index entry is written to a temporary file and then linked into place,
+/// which is the whole mutual exclusion: `hard_link` refuses to replace an
+/// existing name, so exactly one process's link lands, and the file it publishes
+/// already holds its full contents. Creating the target directly and writing to
+/// it afterwards would leave an empty file behind a crash or a full disk, and
+/// that empty file would hold the handle forever — nobody else could claim it
+/// and it would not name this session either.
+///
+/// A file that already names this session is this session's own earlier claim —
+/// the sidecar write after it must have failed — rather than a conflict.
 fn claim_handle(projects_root: &Path, handle: &str, session_id: &str) -> std::io::Result<bool> {
     let dir = projects_root.join(SESSION_HANDLE_INDEX_DIR);
     std::fs::create_dir_all(&dir)?;
     let path = handle_index_path(&dir, handle);
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-    {
-        Ok(mut file) => {
-            file.write_all(session_id.as_bytes())?;
-            Ok(true)
-        }
+    if let Ok(owner) = std::fs::read_to_string(&path) {
+        return Ok(owner.trim() == session_id);
+    }
+    // Written beside the index rather than inside it, so a crash between the
+    // write and the link cannot leave a partial entry a reader would mistake for
+    // a claim. The name carries the process id, so two processes never collide.
+    let staged = dir.join(format!(
+        ".{handle}.{}-{}",
+        std::process::id(),
+        monotonic_suffix()
+    ));
+    let written = std::fs::write(&staged, session_id.as_bytes());
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
+    }
+    let linked = std::fs::hard_link(&staged, &path);
+    // The staged name is only a vehicle for the contents; whatever happened, it
+    // must not survive as a second entry.
+    let _ = std::fs::remove_file(&staged);
+    match linked {
+        Ok(()) => Ok(true),
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            let owner = std::fs::read_to_string(&path).unwrap_or_default();
+            let owner = std::fs::read_to_string(&path)?;
             Ok(owner.trim() == session_id)
         }
         Err(error) => Err(error),
     }
+}
+
+/// A per-call suffix that keeps two claims in one process from staging under the
+/// same name, since the handle alone cannot distinguish them.
+fn monotonic_suffix() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 fn handle_index_path(index_dir: &Path, handle: &str) -> PathBuf {
@@ -228,11 +286,88 @@ mod tests {
     fn a_slug_longer_than_the_limit_is_truncated_without_a_trailing_dash() {
         let long = format!("/tmp/{}", "abcdefghij".repeat(4));
         let slug = handle_project_slug(&long);
-        assert_eq!(slug.len(), SESSION_HANDLE_SLUG_CHARS);
+        assert_eq!(slug.chars().count(), SESSION_HANDLE_SLUG_CHARS);
         assert_eq!(slug, "abcdefghijabcdefghijabcd");
 
-        let trimmed = handle_project_slug("/tmp/abcdefghijabcdefghijabc/def");
-        assert!(!trimmed.ends_with('-'), "{trimmed}");
+        // The separator sits exactly at the truncation point: the first
+        // twenty-four characters end with it, and a handle that ended there
+        // would be a name no recipient could be typed as.
+        let name = format!("{}-bcdefg", "a".repeat(SESSION_HANDLE_SLUG_CHARS - 1));
+        let truncated_on_a_dash = handle_project_slug(&format!("/tmp/{name}"));
+        assert_eq!(
+            truncated_on_a_dash,
+            "a".repeat(SESSION_HANDLE_SLUG_CHARS - 1)
+        );
+        assert!(!truncated_on_a_dash.ends_with('-'));
+    }
+
+    /// An id may carry characters a handle cannot: `_`, `.`, `/` would make the
+    /// index entry a different path, and `..` would leave the index entirely.
+    /// They are dropped before the suffix is taken, so what survives is a name in
+    /// `[a-z0-9-]` that stays one path component.
+    #[test]
+    fn an_id_with_characters_outside_the_alphabet_yields_a_legal_handle() {
+        for (session_id, expected) in [
+            ("a_b.c/de", "repo-bcde"),
+            ("a/b_c.d/e", "repo-bcde"),
+            ("a.b/c_d", "repo-abcd"),
+        ] {
+            let handle = session_handle_candidate("/repo", session_id, 0)
+                .unwrap_or_else(|| panic!("{session_id} must still get a handle"));
+            assert_eq!(handle, expected, "{session_id}");
+            assert!(
+                !Path::new(&handle).components().any(|component| matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )),
+                "{handle} must stay one index entry"
+            );
+        }
+    }
+
+    /// Nothing a handle may hold: the tail still has to be derived and unique, or
+    /// every punctuation-only id would share one name.
+    #[test]
+    fn an_id_with_no_legal_character_still_gets_a_distinct_handle() {
+        let first = session_handle_candidate("/repo", "\u{00e9}\u{00e9}", 0);
+        let second = session_handle_candidate("/repo", "\u{4f60}\u{597d}", 0);
+        let first = first.expect("a non-ASCII id still yields a handle");
+        let second = second.expect("a non-ASCII id still yields a handle");
+        assert_ne!(first, second, "two such ids must not share one name");
+        assert!(
+            first
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'),
+            "{first}"
+        );
+    }
+
+    /// A non-ASCII id used to panic on a byte boundary. The suffix is taken by
+    /// character, so a multi-byte id yields the characters it does have and a
+    /// too-short one reports no candidate rather than a split character.
+    #[test]
+    fn a_non_ascii_id_never_panics_taking_its_suffix() {
+        // Four multi-byte characters hold nothing a handle may contain, so the
+        // tail falls back to a digest of the id — legal, but not the id itself.
+        let handle = session_handle_candidate("/repo", "\u{4f60}\u{597d}\u{4e16}\u{754c}", 0)
+            .expect("a non-ASCII id still gets a handle");
+        assert!(
+            handle
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'),
+            "{handle}"
+        );
+        // ASCII survives the filter; taking the suffix by character cannot split
+        // the multi-byte ones that were dropped.
+        assert_eq!(
+            session_handle_candidate("/repo", "ab\u{4f60}cd", 0).as_deref(),
+            Some("repo-abcd")
+        );
+        assert_eq!(
+            session_handle_candidate("/repo", "ab\u{4f60}", 0),
+            None,
+            "one ASCII character is not a four-character suffix"
+        );
     }
 
     #[test]
