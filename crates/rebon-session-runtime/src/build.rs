@@ -1760,6 +1760,9 @@ fn assemble_session_build(parts: SessionAssemblyParts) -> anyhow::Result<Session
             crate::host::cli_default_store(),
             projects_root(),
             crate::host::rebon_exe(),
+            // The cwd this session was keyed under, not whatever directory a
+            // tool later runs in: the sender's own sidecar is looked up here.
+            cwd.clone(),
         )),
         tasks: tasks.clone(),
         task_registry_resolver: task_registry_resolver.clone(),

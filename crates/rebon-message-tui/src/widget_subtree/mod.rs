@@ -14,7 +14,8 @@
 
 use crate::projection_render::{
     fold_separator_style, parse_theme_color, render_assistant_text_projection,
-    render_assistant_thinking_projection, render_user_text_projection, MessagesRenderTheme,
+    render_assistant_thinking_projection, render_user_text_projection_for_width,
+    MessagesRenderTheme,
 };
 use ratatui::{
     buffer::Buffer,
@@ -30,9 +31,8 @@ use rebon_render::{
     RenderedLine, WordColor,
 };
 use rebon_render::{
-    format_user_prompt_hidden_separator, project_assistant_text_message,
-    project_assistant_thinking_message, project_assistant_tool_use, project_attachment_message,
-    project_user_prompt_display_lines_for_width, project_user_text, project_user_tool_result,
+    project_assistant_text_message, project_assistant_thinking_message, project_assistant_tool_use,
+    project_attachment_message, project_user_text, project_user_tool_result,
     AssistantMarkdownDisplay, AssistantTextMessageInput, AssistantTextMessageProjection,
     AssistantThinkingMessageInput, AssistantThinkingMessageProjection, AssistantToolDefinition,
     AssistantToolRenderOutputs, AssistantToolSecondaryDisplay, AssistantToolUseInput,
@@ -41,9 +41,8 @@ use rebon_render::{
     AttachmentTaskStatusDisplay, AttachmentTeammateMailboxDisplay,
     AttachmentTeammateMailboxItemDisplay, AttachmentTone, DiagnosticsProjection,
     PlanApprovalRenderable, PlanApprovalResponseDisplay, StopHookSummaryDisplay,
-    SystemTextProjection, SystemVisualMarker, TeammateMessageContentDisplay, UserPromptDisplayLine,
-    UserTextInput, UserTextProjection, UserToolErrorProjection, UserToolResultInput,
-    UserToolResultProjection,
+    SystemTextProjection, SystemVisualMarker, TeammateMessageContentDisplay, UserTextInput,
+    UserTextProjection, UserToolErrorProjection, UserToolResultInput, UserToolResultProjection,
 };
 
 use rebon_render::UserToolSuccessProjection;
@@ -921,40 +920,6 @@ fn paint_user_text_background(area: Rect, text_height: u16, buf: &mut Buffer) {
                 cell.set_bg(bg);
             }
         }
-    }
-}
-
-fn render_user_text_projection_for_width(
-    projection: &UserTextProjection,
-    theme: &MessagesRenderTheme,
-    width: u16,
-) -> Text<'static> {
-    match projection {
-        UserTextProjection::Prompt {
-            text,
-            verbose,
-            is_transcript_mode,
-            ..
-        } => Text::from(
-            project_user_prompt_display_lines_for_width(
-                text,
-                *verbose,
-                *is_transcript_mode,
-                width as usize,
-            )
-            .into_iter()
-            .map(|line| match line {
-                UserPromptDisplayLine::Text(line) => Line::from(Span::styled(line, theme.text)),
-                UserPromptDisplayLine::HiddenSeparator { hidden_line_count } => {
-                    Line::from(Span::styled(
-                        format_user_prompt_hidden_separator(hidden_line_count, width as usize),
-                        fold_separator_style(),
-                    ))
-                }
-            })
-            .collect::<Vec<_>>(),
-        ),
-        _ => render_user_text_projection(projection, theme),
     }
 }
 

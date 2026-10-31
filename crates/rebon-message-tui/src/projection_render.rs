@@ -27,7 +27,7 @@ use rebon_render::{
     },
     tool_results::{UserToolErrorProjection, UserToolResultProjection},
     user_text::{
-        format_user_prompt_hidden_separator, project_user_prompt_display_lines,
+        format_user_prompt_hidden_separator, project_user_prompt_display_lines_for_width,
         UserPromptDisplayLine, UserTextProjection, USER_PROMPT_FOLD_DEFAULT_WIDTH,
     },
 };
@@ -156,11 +156,7 @@ pub fn render_user_text_projection(
     projection: &UserTextProjection,
     theme: &MessagesRenderTheme,
 ) -> Text<'static> {
-    render_user_text_projection_for_width(
-        projection,
-        theme,
-        USER_PROMPT_FOLD_DEFAULT_WIDTH as u16,
-    )
+    render_user_text_projection_for_width(projection, theme, USER_PROMPT_FOLD_DEFAULT_WIDTH as u16)
 }
 
 /// [`render_user_text_projection`] for a row painted `width` columns wide.
@@ -192,21 +188,23 @@ pub fn render_user_text_projection_for_width(
             is_transcript_mode,
             ..
         } => Text::from(
-            project_user_prompt_display_lines(text, *verbose, *is_transcript_mode)
-                .into_iter()
-                .map(|line| match line {
-                    UserPromptDisplayLine::Text(line) => Line::from(Span::styled(line, theme.text)),
-                    UserPromptDisplayLine::HiddenSeparator { hidden_line_count } => {
-                        Line::from(Span::styled(
-                            format_user_prompt_hidden_separator(
-                                hidden_line_count,
-                                USER_PROMPT_FOLD_DEFAULT_WIDTH,
-                            ),
-                            fold_separator_style(),
-                        ))
-                    }
-                })
-                .collect::<Vec<_>>(),
+            project_user_prompt_display_lines_for_width(
+                text,
+                *verbose,
+                *is_transcript_mode,
+                width as usize,
+            )
+            .into_iter()
+            .map(|line| match line {
+                UserPromptDisplayLine::Text(line) => Line::from(Span::styled(line, theme.text)),
+                UserPromptDisplayLine::HiddenSeparator { hidden_line_count } => {
+                    Line::from(Span::styled(
+                        format_user_prompt_hidden_separator(hidden_line_count, width as usize),
+                        fold_separator_style(),
+                    ))
+                }
+            })
+            .collect::<Vec<_>>(),
         ),
         UserTextProjection::Teammate(renderables) => {
             render_teammate_renderables(renderables, theme, width as usize)
@@ -656,16 +654,20 @@ fn render_user_teammate_plain_content(
     };
     let mut header = vec![
         Span::styled("Message from ", theme.dim),
-        Span::styled(format!("@{}", plain.display_name), name_style),
+        Span::styled(
+            rebon_render::teammate_messages::sender_label(&plain.display_name),
+            name_style,
+        ),
     ];
-    if let Some(summary) = plain.summary.as_deref().filter(|summary| !summary.is_empty()) {
+    if let Some(summary) = plain
+        .summary
+        .as_deref()
+        .filter(|summary| !summary.is_empty())
+    {
         header.push(Span::styled(format!(": {summary}"), theme.text));
     }
-    let body = rebon_render::project_teammate_body_lines(
-        &plain.content,
-        plain.is_transcript_mode,
-        width,
-    );
+    let body =
+        rebon_render::project_teammate_body_lines(&plain.content, plain.is_transcript_mode, width);
     let folded = body
         .iter()
         .any(|line| matches!(line, UserPromptDisplayLine::HiddenSeparator { .. }));
@@ -1347,6 +1349,51 @@ mod tests {
             "a transcript shows the whole body: {transcript:?}"
         );
         assert!(transcript.len() > 40, "every line survives: {transcript:?}");
+    }
+
+    /// A teammate body folds at the width it is actually painted at. The live
+    /// view is the one with a terminal to ask; a fixed fallback width would make
+    /// a narrow terminal count the wrong number of hidden lines and draw a
+    /// separator wider than the row.
+    #[test]
+    fn a_teammate_body_folds_at_the_width_it_is_painted_at() {
+        let narrow = 70u16;
+        let wide = 120u16;
+
+        let narrow_lines = lines(render_user_text_projection_for_width(
+            &long_teammate_plain(false),
+            &MessagesRenderTheme::plain(),
+            narrow,
+        ));
+        let wide_lines = lines(render_user_text_projection_for_width(
+            &long_teammate_plain(false),
+            &MessagesRenderTheme::plain(),
+            wide,
+        ));
+
+        let separator = |rendered: &[String]| {
+            rendered
+                .iter()
+                .find(|line| line.contains("hidden)"))
+                .cloned()
+                .unwrap_or_else(|| panic!("no fold separator in {rendered:?}"))
+        };
+        let narrow_separator = separator(&narrow_lines);
+        let wide_separator = separator(&wide_lines);
+        assert_ne!(
+            narrow_separator, wide_separator,
+            "the separator names how many lines are hidden, which depends on the width"
+        );
+        for line in narrow_lines.iter().chain(wide_lines.iter()) {
+            assert!(
+                line.chars().count() <= wide as usize,
+                "a row may not be painted wider than the row it is drawn in: {line:?}"
+            );
+        }
+        assert!(
+            narrow_separator.chars().count() <= narrow as usize,
+            "the separator has to fit the narrow row it is drawn in: {narrow_separator:?}"
+        );
     }
 
     /// A summary rides on the header; without one the header is just the

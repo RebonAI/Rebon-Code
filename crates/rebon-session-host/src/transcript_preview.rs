@@ -106,20 +106,21 @@ pub fn read_transcript_preview(state: &BackgroundJobState, max_entries: usize) -
 }
 
 fn transcript_entry_is_meta(raw: &serde_json::Value) -> bool {
-    let top = raw
-        .get("isMeta")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let flag = |key: &str| {
+        raw.get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
     let nested = raw
         .get("message")
         .and_then(|m| m.get("isMeta"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let runtime_context = raw
-        .get("runtimeContext")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    top || nested || runtime_context
+    // A message another agent sent is written into the turn it arrived in as a
+    // visible attachment, which is a row the person never typed. Calling it user
+    // text would put somebody else's words in the preview as an excerpt of this
+    // conversation.
+    flag("isMeta") || nested || flag("runtimeContext") || flag("runtimeAttachment")
 }
 
 fn extract_transcript_entry_text(raw: &serde_json::Value) -> Option<String> {

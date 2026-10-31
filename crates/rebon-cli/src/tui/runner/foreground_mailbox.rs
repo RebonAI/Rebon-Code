@@ -757,10 +757,15 @@ fn answer_ask_user_questions(
 mod tests {
     use super::*;
 
-    /// A running turn takes an agent message at its next tool round, as the
-    /// framed text another agent wrote — never as a queued user submit.
+    /// A running turn takes an agent message at its next tool round, as a
+    /// visible runtime attachment carrying the frame another agent wrote — never
+    /// as a queued user submit.
+    ///
+    /// The attachment marker is what makes the injection a transcript row a
+    /// resume can draw again; the frame's `from_handle` is what lets that row name
+    /// its sender instead of a session id.
     #[tokio::test]
-    async fn an_agent_message_joins_a_running_turn_as_plain_framed_text() {
+    async fn an_agent_message_joins_a_running_turn_as_a_visible_attachment() {
         use rebon_core::query::{AttachmentPollPhase, AttachmentPollRequest, AttachmentPoller};
 
         let mut session = super::super::test_support::make_test_tui_session();
@@ -811,7 +816,17 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, rebon_api::Role::User);
         let text = serde_json::to_string(&messages[0]).unwrap();
+        assert!(
+            text.contains(
+                "<rebon-visible-runtime-attachment uuid=\\\"u-agent-message-m-running\\\">"
+            ),
+            "the injection is a visible attachment, not a bare user message: {text}"
+        );
         assert!(text.contains("<teammate-message"), "{text}");
+        assert!(
+            text.contains("from_handle=\\\"repo-qrst\\\""),
+            "the frame names its sender by handle, which is what the row shows: {text}"
+        );
         assert!(text.contains("please continue"), "{text}");
         assert!(
             !text.contains("rebon-queued-user-input"),

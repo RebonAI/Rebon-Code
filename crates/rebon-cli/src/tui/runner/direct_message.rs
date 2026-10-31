@@ -287,6 +287,9 @@ fn peer_messenger(session: &TuiEngineSession) -> Arc<dyn PeerMessenger> {
             crate::background::cli_default_store(),
             session.projects_root.clone(),
             crate::background::rebon_exe(),
+            // The cwd the session was keyed under: the sender's own sidecar is
+            // looked up there, not in whatever directory a tool runs in.
+            session.cwd.clone(),
         ),
     )
 }

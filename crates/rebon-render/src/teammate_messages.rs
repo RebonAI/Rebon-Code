@@ -205,6 +205,19 @@ pub fn parsed_display_name(message: &ParsedTeammateMessage) -> String {
     teammate_display_name(&message.teammate_id)
 }
 
+/// [`parsed_display_name`] as a sender is written: `@handle`, or the bare
+/// `session:<id>` when there is no handle to address.
+///
+/// The sigil is what makes a handle a handle. A session id is not one, and
+/// `@session:01234567` names nothing anybody could type.
+pub fn sender_label(display_name: &str) -> String {
+    if display_name.starts_with("session:") {
+        display_name.to_string()
+    } else {
+        format!("@{display_name}")
+    }
+}
+
 fn parse_json(content: &str) -> Option<Value> {
     serde_json::from_str(content).ok()
 }
@@ -391,6 +404,15 @@ mod tests {
             !parsed_display_name(&parsed[1]).contains("main@session:"),
             "the internal spelling does not go on screen"
         );
+    }
+
+    /// The sigil belongs to a handle. A sender with none is named by its session,
+    /// and `@session:01234567` addresses nothing anybody could type.
+    #[test]
+    fn a_sender_with_a_handle_is_at_addressed_and_one_without_is_not() {
+        assert_eq!(sender_label("repo-qrst"), "@repo-qrst");
+        assert_eq!(sender_label("session:01234567"), "session:01234567");
+        assert_eq!(sender_label("alice"), "@alice");
     }
 
     /// An escaped frame is unescaped once, on the way in, so a sender's own

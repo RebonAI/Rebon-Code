@@ -38,16 +38,18 @@ pub(crate) struct PersistedRemoteTurn {
 }
 
 fn entry_is_meta_user(entry: &rebon_session::TranscriptEntry) -> bool {
-    entry
-        .raw
-        .get("isMeta")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-        || entry
+    let flag = |key: &str| {
+        entry
             .raw
-            .get("runtimeContext")
+            .get(key)
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
+    };
+    // A message another agent sent is a visible attachment inside the turn it
+    // arrived in, so it is not what the person typed and not what opened a turn.
+    flag("isMeta")
+        || flag("runtimeContext")
+        || flag("runtimeAttachment")
         || entry
             .raw
             .get("message")
@@ -1120,6 +1122,49 @@ mod tests {
         let first = persisted_remote_turn(&entries, "u-user-1");
         assert!(first.next_user_found, "the cron fire ends the typed turn");
         assert_eq!(first.assistant_text, "hello");
+    }
+
+    /// A message another agent sent reaches the transcript as a visible
+    /// attachment, which is a user entry the person never typed. It rides inside
+    /// the turn it arrived in, so it neither opens a turn nor ends one — a
+    /// boundary it moved would take `last_remote_user_turn_uuid` with it.
+    #[test]
+    fn a_persisted_agent_message_attachment_is_not_a_user_turn() {
+        let mut attachment = transcript_entry(
+            "user",
+            "u-agent-message-m-1",
+            serde_json::json!([
+                {"type": "text", "text": "<rebon-visible-runtime-attachment uuid=\"u-agent-message-m-1\">"},
+                {"type": "text", "text": "<teammate-message teammate_id=\"main@session:sess-sender\">go</teammate-message>"}
+            ]),
+        );
+        attachment.raw["runtimeAttachment"] = serde_json::json!(true);
+
+        let entries = vec![
+            transcript_entry(
+                "user",
+                "u-typed",
+                serde_json::json!([{"type": "text", "text": "do the work"}]),
+            ),
+            attachment,
+            transcript_entry(
+                "assistant",
+                "a-1",
+                serde_json::json!([{"type": "text", "text": "done"}]),
+            ),
+        ];
+
+        assert_eq!(
+            last_remote_user_turn_uuid(&entries).as_deref(),
+            Some("u-typed"),
+            "the attachment is not what the conversation was last opened by"
+        );
+        let turn = persisted_remote_turn(&entries, "u-typed");
+        assert!(
+            !turn.next_user_found,
+            "the attachment did not end the turn it arrived in"
+        );
+        assert_eq!(turn.assistant_text, "done");
     }
 
     #[test]
