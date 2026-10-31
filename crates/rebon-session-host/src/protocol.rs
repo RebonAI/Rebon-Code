@@ -244,6 +244,13 @@ pub enum BackgroundIpcRequest {
         from_agent: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_cwd: Option<String>,
+        /// The sender's handle, when its owner claimed one, and its display
+        /// name when it has one. Both are additive: an owner that does not
+        /// know them still reads the message, and falls back to the id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_handle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
         text: String,

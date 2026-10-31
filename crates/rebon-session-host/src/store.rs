@@ -2054,6 +2054,8 @@ pub fn append_agent_message_to_background_job(
     prompt.origin = Some(crate::PendingPromptOrigin::AgentMessage {
         from_session_id: envelope.from_session_id.clone(),
         from_agent: envelope.from_agent.clone(),
+        from_handle: envelope.from_handle.clone(),
+        from_name: envelope.from_name.clone(),
     });
     append_pending_prompt_durably(
         store,
@@ -2064,6 +2066,8 @@ pub fn append_agent_message_to_background_job(
         serde_json::json!({
             "fromSessionId": envelope.from_session_id,
             "fromAgent": envelope.from_agent,
+            "fromHandle": envelope.from_handle,
+            "fromName": envelope.from_name,
         }),
     )
 }

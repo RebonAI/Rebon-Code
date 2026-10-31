@@ -61,7 +61,7 @@ impl PeerMessenger for SessionPeerMessenger {
         target_session_id: &str,
         message: PeerMessage,
     ) -> Result<PeerDelivery, String> {
-        let envelope = envelope(message)?;
+        let envelope = envelope(self.client.projects_root(), message)?;
         let client = self.client.clone();
         let target = target_session_id.to_string();
         let result =
@@ -78,14 +78,33 @@ impl PeerMessenger for SessionPeerMessenger {
 
 /// A new id per send means a retry is a new message to the owner rather than a
 /// duplicate it silently drops.
-fn envelope(message: PeerMessage) -> Result<AgentMessageEnvelope, String> {
+fn envelope(
+    projects_root: &std::path::Path,
+    message: PeerMessage,
+) -> Result<AgentMessageEnvelope, String> {
     let message_id = rebon_types::secure_random_hex_token()
         .map_err(|error| format!("could not mint a message id: {error}"))?;
+    // The sender's own sidecar is where its handle and title live. Read here
+    // rather than in the tool: the projects root is this adapter's fact, and a
+    // tool that guessed at it would read somebody else's config home.
+    let (from_handle, from_name) = match message.from_cwd.as_deref() {
+        Some(cwd) if !message.from_session_id.is_empty() => (
+            message.from_handle.clone().or_else(|| {
+                rebon_session::load_session_handle(projects_root, cwd, &message.from_session_id)
+            }),
+            message.from_name.clone().or_else(|| {
+                rebon_session::load_session_title(projects_root, cwd, &message.from_session_id)
+            }),
+        ),
+        _ => (message.from_handle, message.from_name),
+    };
     Ok(AgentMessageEnvelope {
         message_id,
         from_session_id: message.from_session_id,
         from_agent: message.from_agent,
         from_cwd: message.from_cwd,
+        from_handle,
+        from_name,
         summary: message.summary,
         text: message.text,
     })
@@ -207,6 +226,8 @@ mod tests {
                     from_session_id: "sess-caller".into(),
                     from_agent: "main".into(),
                     from_cwd: None,
+                    from_handle: None,
+                    from_name: None,
                     summary: None,
                     text: "hello".into(),
                 },
@@ -222,11 +243,14 @@ mod tests {
             from_session_id: "sess-caller".into(),
             from_agent: "main".into(),
             from_cwd: None,
+            from_handle: None,
+            from_name: None,
             summary: None,
             text: "hello".into(),
         };
-        let first = envelope(message()).unwrap();
-        let second = envelope(message()).unwrap();
+        let root = std::path::Path::new("/nonexistent-projects");
+        let first = envelope(root, message()).unwrap();
+        let second = envelope(root, message()).unwrap();
         assert_ne!(first.message_id, second.message_id);
         assert_eq!(first.text, "hello");
         assert_eq!(first.from_session_id, "sess-caller");

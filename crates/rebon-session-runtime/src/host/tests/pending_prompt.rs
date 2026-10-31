@@ -464,6 +464,8 @@ async fn background_steer_pump_does_not_echo_an_agent_message_as_user_input() {
         from_session_id: "sess-other".into(),
         from_agent: "main".into(),
         from_cwd: None,
+        from_handle: None,
+        from_name: None,
         summary: None,
         text: "take the next step".into(),
     };
@@ -472,6 +474,8 @@ async fn background_steer_pump_does_not_echo_an_agent_message_as_user_input() {
     prompt.origin = Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
         from_session_id: "sess-other".into(),
         from_agent: "main".into(),
+        from_handle: None,
+        from_name: None,
     });
     state.identity.pending_prompts = vec![prompt];
     store.write_state(&state).unwrap();

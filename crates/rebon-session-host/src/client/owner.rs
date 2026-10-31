@@ -759,6 +759,8 @@ impl OwnerHandle {
             from_session_id,
             from_agent,
             from_cwd,
+            from_handle,
+            from_name,
             summary,
             text,
         } = envelope;
@@ -768,6 +770,8 @@ impl OwnerHandle {
                 from_session_id,
                 from_agent,
                 from_cwd,
+                from_handle,
+                from_name,
                 summary,
                 text,
             },

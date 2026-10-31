@@ -4428,6 +4428,8 @@ fn agent_message_envelope(message_id: &str, text: &str) -> crate::AgentMessageEn
         from_session_id: "sess-sender".into(),
         from_agent: "main".into(),
         from_cwd: Some("F:/work/sender".into()),
+        from_handle: None,
+        from_name: None,
         summary: Some("handoff".into()),
         text: text.into(),
     }
@@ -4460,6 +4462,8 @@ fn an_agent_message_is_queued_without_starting_a_worker() {
         Some(crate::PendingPromptOrigin::AgentMessage {
             from_session_id: "sess-sender".into(),
             from_agent: "main".into(),
+            from_handle: None,
+            from_name: None,
         })
     );
     assert!(

@@ -814,6 +814,8 @@ fn an_agent_message_over_acp_reaches_the_jobs_queue() {
         from_session_id: "sess-sender".into(),
         from_agent: "main".into(),
         from_cwd: Some("F:/work/sender".into()),
+        from_handle: None,
+        from_name: None,
         summary: Some("handoff".into()),
         text: "look at the build".into(),
     };
@@ -830,6 +832,8 @@ fn an_agent_message_over_acp_reaches_the_jobs_queue() {
         Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
             from_session_id: "sess-sender".into(),
             from_agent: "main".into(),
+            from_handle: None,
+            from_name: None,
         })
     );
 

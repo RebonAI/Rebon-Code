@@ -366,6 +366,8 @@ fn handle_legacy_request(
             from_session_id,
             from_agent,
             from_cwd,
+            from_handle,
+            from_name,
             summary,
             text,
         } => BackgroundIpcResponse::with_data(&sink.deliver_agent_message(AgentMessageEnvelope {
@@ -373,6 +375,8 @@ fn handle_legacy_request(
             from_session_id,
             from_agent,
             from_cwd,
+            from_handle,
+            from_name,
             summary,
             text,
         })),
@@ -446,6 +450,8 @@ fn handle_acp_request(
                     from_session_id: params.from_session_id,
                     from_agent: params.from_agent,
                     from_cwd: params.from_cwd,
+                    from_handle: params.from_handle,
+                    from_name: params.from_name,
                     summary: params.summary,
                     text: params.text,
                 }))
@@ -501,6 +507,8 @@ impl ForegroundCommand {
                 from_session_id,
                 from_agent,
                 from_cwd,
+                from_handle,
+                from_name,
                 summary,
                 text,
             } => Some(AgentMessageEnvelope {
@@ -508,6 +516,8 @@ impl ForegroundCommand {
                 from_session_id,
                 from_agent,
                 from_cwd,
+                from_handle,
+                from_name,
                 summary,
                 text,
             }),
@@ -595,6 +605,8 @@ mod tests {
             from_session_id: "sess-sender".to_string(),
             from_agent: "main".to_string(),
             from_cwd: None,
+            from_handle: None,
+            from_name: None,
             summary: Some("greeting".to_string()),
             text: "hello".to_string(),
         }
@@ -824,6 +836,8 @@ mod tests {
             from_session_id: "s".to_string(),
             from_agent: "a".to_string(),
             from_cwd: None,
+            from_handle: None,
+            from_name: None,
             summary: None,
             text: "hello".to_string(),
         });
@@ -837,6 +851,8 @@ mod tests {
             from_session_id: "s".to_string(),
             from_agent: "a".to_string(),
             from_cwd: None,
+            from_handle: None,
+            from_name: None,
             summary: None,
             text: "hello".to_string(),
         });
@@ -852,6 +868,8 @@ mod tests {
             from_session_id: "s".to_string(),
             from_agent: "a".to_string(),
             from_cwd: None,
+            from_handle: None,
+            from_name: None,
             summary: None,
             text: "hello".to_string(),
         });
@@ -864,6 +882,8 @@ mod tests {
             from_session_id: "s".to_string(),
             from_agent: "a".to_string(),
             from_cwd: None,
+            from_handle: None,
+            from_name: None,
             summary: None,
             text: "hello".to_string(),
         });

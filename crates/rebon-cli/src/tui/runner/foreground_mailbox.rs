@@ -286,7 +286,7 @@ impl ForegroundControl {
                     .engine_half
                     .runtime
                     .mid_turn_queue
-                    .enqueue_agent_message(framed);
+                    .enqueue_agent_message(envelope.message_id.clone(), framed);
             }
             return;
         }
@@ -692,6 +692,8 @@ mod tests {
             from_session_id: "sess-sender".into(),
             from_agent: "main".into(),
             from_cwd: None,
+            from_handle: Some("repo-qrst".into()),
+            from_name: Some("worker".into()),
             summary: Some("handoff".into()),
             text: "please continue".into(),
         };
@@ -783,6 +785,8 @@ mod tests {
                 from_session_id: "sess-sender".into(),
                 from_agent: "main".into(),
                 from_cwd: None,
+                from_handle: None,
+                from_name: None,
                 summary: None,
                 text: "wake up".into(),
             },

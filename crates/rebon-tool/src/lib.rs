@@ -681,6 +681,12 @@ pub struct PeerMessage {
     pub from_session_id: String,
     pub from_agent: String,
     pub from_cwd: Option<String>,
+    /// The sender's handle and display name, so the receiver can say
+    /// `@repo-qrst` instead of an id nobody can read. The messenger fills both
+    /// from the sender's own metadata; a tool builds neither and leaves them
+    /// `None`.
+    pub from_handle: Option<String>,
+    pub from_name: Option<String>,
     pub summary: Option<String>,
     pub text: String,
 }

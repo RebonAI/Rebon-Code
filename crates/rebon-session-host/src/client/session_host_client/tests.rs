@@ -723,6 +723,8 @@ fn message_envelope(message_id: &str, text: &str) -> crate::AgentMessageEnvelope
         from_session_id: "sess-sender".into(),
         from_agent: "main".into(),
         from_cwd: Some("F:/work/sender".into()),
+        from_handle: None,
+        from_name: None,
         summary: Some("handoff".into()),
         text: text.into(),
     }
@@ -789,6 +791,8 @@ fn an_agent_message_for_a_free_session_with_a_job_is_queued() {
         Some(crate::PendingPromptOrigin::AgentMessage {
             from_session_id: "sess-sender".into(),
             from_agent: "main".into(),
+            from_handle: None,
+            from_name: None,
         })
     );
     assert!(

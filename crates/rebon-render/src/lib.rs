@@ -491,10 +491,12 @@ pub use user_prompt::{
     TRUNCATE_HEAD_CHARS, TRUNCATE_TAIL_CHARS,
 };
 pub use user_text::{
-    format_user_prompt_hidden_separator, project_user_prompt_display_lines,
-    project_user_prompt_display_lines_for_width, project_user_text, UserPromptDisplayLine,
-    UserTextInput, UserTextProjection, NO_CONTENT_MESSAGE, USER_PROMPT_FOLD_DEFAULT_WIDTH,
-    USER_PROMPT_FOLD_HEAD_LINES, USER_PROMPT_FOLD_TAIL_LINES, USER_PROMPT_FOLD_THRESHOLD_LINES,
+    format_user_prompt_hidden_separator, project_teammate_body_lines,
+    project_user_prompt_display_lines, project_user_prompt_display_lines_for_width,
+    project_user_text, UserPromptDisplayLine, UserTextInput, UserTextProjection,
+    NO_CONTENT_MESSAGE, TEAMMATE_BODY_FOLD_HEAD_ROWS, TEAMMATE_BODY_FOLD_TAIL_ROWS,
+    TEAMMATE_BODY_FOLD_THRESHOLD_ROWS, USER_PROMPT_FOLD_DEFAULT_WIDTH, USER_PROMPT_FOLD_HEAD_LINES,
+    USER_PROMPT_FOLD_TAIL_LINES, USER_PROMPT_FOLD_THRESHOLD_LINES,
 };
 pub use workflow_body::{workflow_body_lines, workflow_tool_summary};
 pub use wrappers::{

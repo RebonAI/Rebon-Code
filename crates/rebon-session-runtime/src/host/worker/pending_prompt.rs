@@ -424,9 +424,19 @@ pub(crate) async fn publish_steered_pending_prompt(
 }
 
 pub(crate) fn pending_prompt_attachment_message(prompt: &PendingPrompt) -> rebon_api::Message {
-    // An agent message is the framed `<teammate-message>`, a scheduled prompt
-    // the marked cron prompt, and nothing else: no queued-user marker (neither
-    // is user input) and no queued-message row.
+    // An agent message is a visible runtime attachment: the frame is what the
+    // model reads and what the transcript keeps, so a resume draws the same
+    // row instead of losing a message that only ever existed in one request.
+    // A scheduled prompt is the marked cron prompt, and neither is user input:
+    // no queued-user marker, and no queued-message row.
+    if prompt.is_agent_message() {
+        let framed = prompt.text.clone();
+        return rebon_core::query::visible_runtime_attachment_message(
+            &format!("u-agent-message-{}", prompt.id),
+            framed.clone(),
+            framed,
+        );
+    }
     if !prompt.typed_by_user() {
         return rebon_api::Message {
             role: rebon_api::Role::User,

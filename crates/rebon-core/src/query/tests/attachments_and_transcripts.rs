@@ -686,6 +686,47 @@ fn build_tool_call_title_keeps_general_purpose_agent_label() {
     );
 }
 
+/// A cross-session message injected into a running turn is a visible runtime
+/// attachment, so the row a resume reads back is the frame it was delivered
+/// as — not a message that only ever existed in one request.
+#[test]
+fn a_cross_session_frame_replays_after_a_resume() {
+    let frame = "<teammate-message teammate_id=\"main@session:sess-a\" from_session=\"sess-a\" from_handle=\"repo-qrst\">\\nhandoff\\n</teammate-message>";
+    let message = visible_runtime_attachment_message(
+        "u-agent-message-m-1",
+        frame.to_string(),
+        frame.to_string(),
+    );
+    assert!(
+        is_visible_runtime_attachment(&message),
+        "the injected message is a visible attachment, which is what makes replay draw it"
+    );
+
+    let entries = vec![rebon_session::TranscriptEntry {
+        entry_type: "user".into(),
+        uuid: "u-agent-message-m-1".into(),
+        parent_uuid: None,
+        timestamp: None,
+        raw: json!({
+            "queuedCommand": true,
+            "runtimeAttachment": true,
+            "message": {
+                "role": "user",
+                "content": visible_message_for_attachment(&message).content,
+            },
+            "modelContent": model_message_for_attachment(&message).content,
+        }),
+    }];
+
+    let messages = transcript_to_api_messages(&entries);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(
+        messages[0],
+        model_message_for_attachment(&message),
+        "the model sees the frame it was sent, with no queued-user wrapper"
+    );
+}
+
 #[test]
 fn transcript_replay_sends_runtime_attachment_model_text_unwrapped() {
     let message = visible_runtime_attachment_message(

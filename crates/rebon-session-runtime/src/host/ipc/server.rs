@@ -2124,6 +2124,8 @@ pub(crate) fn handle_background_ipc_request(
             from_session_id,
             from_agent,
             from_cwd,
+            from_handle,
+            from_name,
             summary,
             text,
         } => {
@@ -2132,6 +2134,8 @@ pub(crate) fn handle_background_ipc_request(
                 from_session_id,
                 from_agent,
                 from_cwd,
+                from_handle,
+                from_name,
                 summary,
                 text,
             };

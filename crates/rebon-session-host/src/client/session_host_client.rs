@@ -553,6 +553,8 @@ fn foreground_agent_message_command(
         from_session_id: envelope.from_session_id.clone(),
         from_agent: envelope.from_agent.clone(),
         from_cwd: envelope.from_cwd.clone(),
+        from_handle: envelope.from_handle.clone(),
+        from_name: envelope.from_name.clone(),
         summary: envelope.summary.clone(),
         text: envelope.text.clone(),
     }

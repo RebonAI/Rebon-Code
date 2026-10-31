@@ -133,6 +133,13 @@ pub enum ForegroundCommand {
         from_agent: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_cwd: Option<String>,
+        /// The sender's handle and display name, when the sender has them.
+        /// Additive for the same reason the variant is: the receipt stays
+        /// readable to the sender that wrote it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_handle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
         text: String,
@@ -1589,6 +1596,8 @@ mod tests {
             from_session_id: "sess-sender".into(),
             from_agent: "main".into(),
             from_cwd: Some("/work/sender".into()),
+            from_handle: None,
+            from_name: None,
             summary: Some("handoff".into()),
             text: "please continue".into(),
         };
@@ -1608,6 +1617,8 @@ mod tests {
                 from_session_id: "sess-sender".into(),
                 from_agent: "main".into(),
                 from_cwd: Some("/work/sender".into()),
+                from_handle: None,
+                from_name: None,
                 summary: Some("handoff".into()),
                 text: "please continue".into(),
             })

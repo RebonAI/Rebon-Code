@@ -10,6 +10,15 @@ use crate::submit_payload::{
 
 const LOCAL_QUEUED_MODEL_TEXT_MARKER_PREFIX: &str = "<rebon-queued-user-model-text>\n";
 
+/// One agent message waiting for the running turn's next tool round.
+#[derive(Debug)]
+struct QueuedAgentMessage {
+    /// The envelope's idempotency key, which also names the transcript row.
+    message_id: String,
+    /// The `<teammate-message>` frame, already escaped by its sender.
+    framed: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueuedSubmitWithdrawal {
     PendingRemoved,
@@ -29,7 +38,7 @@ pub struct MidTurnQueuedSubmitPoller {
     /// uuid, while an agent message is another agent's output and must arrive as
     /// plain framed text, exactly as the hosted worker's
     /// `pending_prompt_attachment_message` delivers it.
-    agent_messages: Mutex<VecDeque<String>>,
+    agent_messages: Mutex<VecDeque<QueuedAgentMessage>>,
     consumed_user_message_uuids: Mutex<HashSet<String>>,
     /// Messages handed to a steer that has not answered yet, keyed by
     /// their uuid and holding the payload so every exit path can put
@@ -371,14 +380,22 @@ impl MidTurnQueuedSubmitPoller {
 
     /// Queue another agent's framed message for the running turn.
     ///
-    /// The next tool round publishes it as a plain user message; the event loop
-    /// moves anything still here to the idle path when the turn ends, so a turn
-    /// that finishes before its next tool round does not strand the message.
-    pub fn enqueue_agent_message(&self, framed: String) {
+    /// The next tool round publishes it; the event loop moves anything still
+    /// here to the idle path when the turn ends, so a turn that finishes before
+    /// its next tool round does not strand the message.
+    ///
+    /// `message_id` is the frame's own idempotency key and doubles as the
+    /// attachment uuid, which is what makes the injection a transcript row a
+    /// resume can draw again rather than a message that only ever existed in
+    /// one request.
+    pub fn enqueue_agent_message(&self, message_id: String, framed: String) {
         self.agent_messages
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push_back(framed);
+            .push_back(QueuedAgentMessage {
+                message_id,
+                framed,
+            });
     }
 
     /// Take back every agent message the running turn never injected.
@@ -391,6 +408,7 @@ impl MidTurnQueuedSubmitPoller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .drain(..)
+            .map(|message| message.framed)
             .collect()
     }
 
@@ -607,9 +625,15 @@ impl AttachmentPoller for MidTurnQueuedSubmitPoller {
             .agent_messages
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        messages.extend(agent_messages.drain(..).map(|text| ApiMessage {
-            role: rebon_api::Role::User,
-            content: vec![ApiContentBlock::Text(TextBlock { text })],
+        // A visible runtime attachment, not a bare user message: the frame is
+        // both what the model reads and what the transcript shows, and the
+        // marker is what lets a resumed turn draw the same row again.
+        messages.extend(agent_messages.drain(..).map(|message| {
+            rebon_core::query::visible_runtime_attachment_message(
+                &format!("u-agent-message-{}", message.message_id),
+                message.framed.clone(),
+                message.framed,
+            )
         }));
         drop(agent_messages);
 
@@ -643,11 +667,14 @@ mod tests {
         }
     }
 
+    /// A cross-session message enters the turn as a visible runtime
+    /// attachment: the frame is both what the model reads and what the
+    /// transcript shows, so a resume can draw the same row again.
     #[test]
-    fn an_agent_message_is_injected_as_plain_framed_text() {
+    fn an_agent_message_is_injected_as_a_visible_framed_attachment() {
         let poller = MidTurnQueuedSubmitPoller::new("session");
         let frame = "<teammate-message teammate_id=\"main@session:s\" from_session=\"s\">\nhello\n</teammate-message>";
-        poller.enqueue_agent_message(frame.to_string());
+        poller.enqueue_agent_message("m-1".into(), frame.to_string());
         assert_eq!(poller.pending_len(), 1);
 
         let eager = AttachmentPollRequest::new("session", "turn", 1, AttachmentPollPhase::Eager);
@@ -660,30 +687,47 @@ mod tests {
         let messages = poller.poll(request(1));
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, Role::User);
+        let blocks = messages[0]
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text(text) => text.text.as_str(),
+                other => panic!("expected only text blocks, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            messages[0].content.len(),
-            1,
-            "no marker block may ride along"
+            blocks.len(),
+            3,
+            "the attachment is a marker, the visible frame, and the model text: {blocks:?}"
         );
-        match &messages[0].content[0] {
-            ContentBlock::Text(text) => {
-                assert_eq!(text.text, frame);
-                assert!(
-                    !text.text.contains("rebon-queued-user-input"),
-                    "an agent message is not a queued user submit: {}",
-                    text.text
-                );
-            }
-            other => panic!("expected one text block, got {other:?}"),
-        }
+        assert!(
+            blocks[0].starts_with("<rebon-visible-runtime-attachment uuid=\"u-agent-message-m-1\">"),
+            "{blocks:?}"
+        );
+        assert_eq!(
+            blocks[1], frame,
+            "what the transcript shows is the frame itself"
+        );
+        assert!(
+            blocks[2].ends_with(frame),
+            "the model reads the frame too: {blocks:?}"
+        );
+        assert!(
+            !messages[0]
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text(text)
+                    if text.text.contains("rebon-queued-user-input"))),
+            "an agent message is not a queued user submit: {blocks:?}"
+        );
         assert_eq!(poller.pending_len(), 0);
     }
 
     #[test]
     fn an_agent_message_the_turn_never_reached_is_taken_back_for_idle() {
         let poller = MidTurnQueuedSubmitPoller::new("session");
-        poller.enqueue_agent_message("first".into());
-        poller.enqueue_agent_message("second".into());
+        poller.enqueue_agent_message("m-1".into(), "first".into());
+        poller.enqueue_agent_message("m-2".into(), "second".into());
         assert_eq!(poller.pending_len(), 2);
 
         assert_eq!(
@@ -693,7 +737,7 @@ mod tests {
         assert_eq!(poller.pending_len(), 0);
         assert!(poller.poll(request(1)).is_empty());
 
-        poller.enqueue_agent_message("third".into());
+        poller.enqueue_agent_message("m-3".into(), "third".into());
         poller.clear_pending();
         assert_eq!(poller.pending_len(), 0);
         assert!(poller.take_pending_agent_messages().is_empty());

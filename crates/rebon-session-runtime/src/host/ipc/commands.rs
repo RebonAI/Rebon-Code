@@ -344,6 +344,8 @@ pub(crate) fn queue_live_background_agent_message(
     prompt.origin = Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
         from_session_id: envelope.from_session_id.clone(),
         from_agent: envelope.from_agent.clone(),
+        from_handle: envelope.from_handle.clone(),
+        from_name: envelope.from_name.clone(),
     });
     let mut delivery = rebon_session_host::AgentMessageDelivery::Queued;
     let mut appended = false;

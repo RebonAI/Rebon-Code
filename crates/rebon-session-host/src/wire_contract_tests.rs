@@ -663,6 +663,8 @@ fn every_request_variant_has_the_encoding_it_has_today() {
                 from_session_id: "s1".to_string(),
                 from_agent: "main".to_string(),
                 from_cwd: None,
+                from_handle: None,
+                from_name: None,
                 summary: None,
                 text: "hi".to_string(),
             },

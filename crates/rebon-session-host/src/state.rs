@@ -88,6 +88,12 @@ pub enum PendingPromptOrigin {
         from_session_id: String,
         #[serde(rename = "fromAgent")]
         from_agent: String,
+        /// The sender's handle and display name, echoed so a resumed turn can
+        /// still say who it came from after the frame itself is replayed.
+        #[serde(rename = "fromHandle", default, skip_serializing_if = "Option::is_none")]
+        from_handle: Option<String>,
+        #[serde(rename = "fromName", default, skip_serializing_if = "Option::is_none")]
+        from_name: Option<String>,
     },
     /// The session's cron scheduler fired it. The text opens with
     /// `rebon_tool::cron::SCHEDULED_PROMPT_MARKER`.

@@ -583,6 +583,8 @@ mod tests {
                 from_session_id: "s1".into(),
                 from_agent: "main".into(),
                 from_cwd: None,
+                from_handle: None,
+                from_name: None,
                 summary: None,
                 text: "hi".into(),
             })

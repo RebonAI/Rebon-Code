@@ -802,6 +802,10 @@ impl SendMessageTool {
                 .map(|identity| identity.agent_name.clone())
                 .unwrap_or_else(|| "main".to_string()),
             from_cwd: context.cwd().map(str::to_string),
+            // The messenger fills these from the sender's own sidecar; a tool
+            // has no projects root to read.
+            from_handle: None,
+            from_name: None,
             summary,
             text,
         };
