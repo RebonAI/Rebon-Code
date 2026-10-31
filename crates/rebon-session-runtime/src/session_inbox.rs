@@ -250,6 +250,13 @@ impl SessionInbox {
         taken
     }
 
+    /// Take only the messages other agent sessions sent, leaving channel and
+    /// teammate context in place — for handing them back to the session they
+    /// were sent to when the inbox moves on to another one.
+    pub fn take_agent_items(&self) -> Vec<ContextItem> {
+        std::mem::take(&mut self.lock().agent)
+    }
+
     /// A copy of what is waiting from one source, leaving it in place.
     pub fn pending_context(&self, source: ContextSource) -> Vec<String> {
         self.lock()
