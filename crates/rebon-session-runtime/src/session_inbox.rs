@@ -54,6 +54,9 @@ pub struct ContextItem {
     /// it is another agent's. The turn it rides into answers that session, so
     /// its reply carries one more hop.
     pub inbound: Option<(String, u8)>,
+    /// The message's own id, when it is another agent's: a turn it starts
+    /// names its prompt row after it.
+    pub agent_message_id: Option<String>,
 }
 
 impl ContextItem {
@@ -64,16 +67,18 @@ impl ContextItem {
             text,
             may_wake: true,
             inbound: None,
+            agent_message_id: None,
         }
     }
 
     /// A message from another agent session, which the turn carrying it
     /// answers.
-    pub fn agent(text: String, from_session_id: String, hops: u8) -> Self {
+    pub fn agent(message_id: String, text: String, from_session_id: String, hops: u8) -> Self {
         Self {
             text,
             may_wake: true,
             inbound: Some((from_session_id, hops)),
+            agent_message_id: Some(message_id),
         }
     }
 
@@ -161,6 +166,53 @@ impl SessionInbox {
     /// turn.
     pub fn push_items(&self, source: ContextSource, items: impl IntoIterator<Item = ContextItem>) {
         self.lock().queue(source).extend(items);
+    }
+
+    /// Add messages other agent sessions sent, settling for each whether it may
+    /// be the reason for a turn.
+    ///
+    /// One the bounds admitted may start a turn and one they refused may not.
+    /// One nobody judged yet — it joined a running turn that ended before
+    /// reading it, or it waited behind a turn already owed — is judged here, but
+    /// only if it would be the reason: when something waiting already starts a
+    /// turn, it rides into that one and spends nothing. Arriving while a turn
+    /// ran is therefore never a way past the bounds. Judged in arrival order,
+    /// and the decision and the check of what is already owed happen under the
+    /// inbox's lock, so a batch spends at most the one wake it needs.
+    pub fn push_agent_messages(
+        &self,
+        messages: impl IntoIterator<Item = crate::mid_turn_queue::DeferredAgentMessage>,
+        ledger: &rebon_tool::peer::AgentReplyLedger,
+    ) {
+        use rebon_tool::peer::WakeVerdict;
+        let messages = messages.into_iter().collect::<Vec<_>>();
+        let mut context = self.lock();
+        let mut turn_owed = context.may_wake()
+            || messages
+                .iter()
+                .any(|message| message.verdict == WakeVerdict::Admitted);
+        for message in messages {
+            let may_wake = match message.verdict {
+                WakeVerdict::Admitted => true,
+                WakeVerdict::Refused => false,
+                WakeVerdict::Unjudged if turn_owed => false,
+                WakeVerdict::Unjudged => {
+                    let admitted = ledger.judge_wake(
+                        &message.from_session_id,
+                        message.hops,
+                        rebon_types::wall_clock_ms(),
+                    ) == WakeVerdict::Admitted;
+                    turn_owed |= admitted;
+                    admitted
+                }
+            };
+            context.agent.push(ContextItem {
+                text: message.text,
+                may_wake,
+                inbound: Some((message.from_session_id, message.hops)),
+                agent_message_id: Some(message.message_id),
+            });
+        }
     }
 
     /// Whether any context is waiting, including context that may not start a
@@ -307,6 +359,10 @@ impl SessionInbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mid_turn_queue::DeferredAgentMessage;
+    use rebon_tool::peer::{
+        AgentReplyLedger, WakeVerdict, AGENT_MESSAGE_WAKES_PER_HOUR, MAX_AGENT_MESSAGE_HOPS,
+    };
 
     #[test]
     fn context_is_taken_by_source_then_arrival() {
@@ -412,7 +468,10 @@ mod tests {
 
         inbox.push_items(
             ContextSource::Agent,
-            [ContextItem::agent("refused".into(), "sess-peer".into(), 9).deferred()],
+            [
+                ContextItem::agent("m-refused".into(), "refused".into(), "sess-peer".into(), 9)
+                    .deferred(),
+            ],
         );
         assert!(inbox.has_context(), "the message is kept");
         assert!(!inbox.has_waking_context());
@@ -436,5 +495,139 @@ mod tests {
             "the depth travels with the message, not with the turn"
         );
         assert!(!inbox.has_context());
+    }
+
+    fn waiting(text: &str, hops: u8, verdict: WakeVerdict) -> DeferredAgentMessage {
+        DeferredAgentMessage {
+            message_id: format!("m-{text}"),
+            text: text.into(),
+            from_session_id: "sess-peer".into(),
+            hops,
+            verdict,
+        }
+    }
+
+    fn agent_wakes(inbox: &SessionInbox) -> Vec<(String, bool)> {
+        inbox
+            .pending_context_items(ContextSource::Agent)
+            .into_iter()
+            .map(|item| (item.text, item.may_wake))
+            .collect()
+    }
+
+    /// A message that joined a running turn and came back unread was never
+    /// judged. It must be before it may start a turn of its own: a peer whose
+    /// budget is spent cannot get a turn by writing while one runs.
+    #[test]
+    fn an_unjudged_message_is_judged_before_it_may_wake() {
+        let ledger = AgentReplyLedger::new();
+        for _ in 0..AGENT_MESSAGE_WAKES_PER_HOUR {
+            assert!(ledger
+                .admit_wake("sess-peer", 0, rebon_types::wall_clock_ms())
+                .is_allowed());
+        }
+        let inbox = SessionInbox::default();
+        inbox.push_agent_messages([waiting("returned", 0, WakeVerdict::Unjudged)], &ledger);
+        assert_eq!(agent_wakes(&inbox), [("returned".to_string(), false)]);
+        assert!(inbox.has_context(), "refused, not dropped");
+        assert!(!inbox.has_waking_context());
+
+        let deep = SessionInbox::default();
+        deep.push_agent_messages(
+            [waiting(
+                "too deep",
+                MAX_AGENT_MESSAGE_HOPS + 1,
+                WakeVerdict::Unjudged,
+            )],
+            &AgentReplyLedger::new(),
+        );
+        assert!(
+            !deep.has_waking_context(),
+            "the hop bound applies to it too"
+        );
+    }
+
+    /// Within the bounds, a returned message is judged and may start the turn
+    /// it was waiting for, spending one wake.
+    #[test]
+    fn an_unjudged_message_within_the_bounds_may_wake_and_spends_one_wake() {
+        let ledger = AgentReplyLedger::new();
+        let inbox = SessionInbox::default();
+        inbox.push_agent_messages([waiting("returned", 1, WakeVerdict::Unjudged)], &ledger);
+        assert_eq!(agent_wakes(&inbox), [("returned".to_string(), true)]);
+        for spent in 1..AGENT_MESSAGE_WAKES_PER_HOUR {
+            assert!(
+                ledger
+                    .admit_wake("sess-peer", 0, rebon_types::wall_clock_ms())
+                    .is_allowed(),
+                "wake {spent}"
+            );
+        }
+        assert!(
+            !ledger
+                .admit_wake("sess-peer", 0, rebon_types::wall_clock_ms())
+                .is_allowed(),
+            "the judged message spent exactly one wake"
+        );
+    }
+
+    /// Nothing is judged — and nothing spent — for a message that rides into a
+    /// turn already owed, whether that turn is owed to something already waiting
+    /// or to an admitted message in the same batch.
+    #[test]
+    fn an_unjudged_message_behind_an_owed_turn_rides_along_without_spending() {
+        let ledger = AgentReplyLedger::new();
+        let inbox = SessionInbox::default();
+        inbox.push_agent_messages(
+            [
+                waiting("returned", 0, WakeVerdict::Unjudged),
+                waiting("admitted", 0, WakeVerdict::Admitted),
+                waiting("refused", 9, WakeVerdict::Refused),
+            ],
+            &ledger,
+        );
+        assert_eq!(
+            agent_wakes(&inbox),
+            [
+                ("returned".to_string(), false),
+                ("admitted".to_string(), true),
+                ("refused".to_string(), false),
+            ]
+        );
+
+        let teammate_first = SessionInbox::default();
+        teammate_first.push_context(ContextSource::Teammate, ["hello".into()]);
+        teammate_first
+            .push_agent_messages([waiting("returned", 0, WakeVerdict::Unjudged)], &ledger);
+        assert_eq!(
+            agent_wakes(&teammate_first),
+            [("returned".to_string(), false)]
+        );
+
+        for spent in 0..AGENT_MESSAGE_WAKES_PER_HOUR {
+            assert!(
+                ledger
+                    .admit_wake("sess-peer", 0, rebon_types::wall_clock_ms())
+                    .is_allowed(),
+                "wake {spent}: nothing above spent one"
+            );
+        }
+    }
+
+    /// A refused message that is already waiting is not a turn owed: a later
+    /// unjudged one is still judged on its own.
+    #[test]
+    fn a_refused_message_waiting_does_not_hold_back_a_later_one() {
+        let ledger = AgentReplyLedger::new();
+        let inbox = SessionInbox::default();
+        inbox.push_agent_messages([waiting("refused", 9, WakeVerdict::Refused)], &ledger);
+        inbox.push_agent_messages([waiting("returned", 0, WakeVerdict::Unjudged)], &ledger);
+        assert_eq!(
+            agent_wakes(&inbox),
+            [
+                ("refused".to_string(), false),
+                ("returned".to_string(), true),
+            ]
+        );
     }
 }

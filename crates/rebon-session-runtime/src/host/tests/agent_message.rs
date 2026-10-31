@@ -410,6 +410,54 @@ fn a_message_past_the_hop_bound_still_joins_a_running_turn() {
     assert_eq!(stored_prompts(&hosted).len(), 1);
 }
 
+/// The turn a woken worker runs, gone by: the job is parked again with nothing
+/// waiting, as a finished turn leaves it.
+fn park_after_its_turn(hosted: &Hosted) {
+    hosted
+        .store
+        .update_state(&hosted.state.identity.job_id, |state| {
+            state.process.status = BackgroundJobStatus::Idle;
+            state.identity.pending_prompts.clear();
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// The worker claiming the turn the job owes, the way it does after a wake.
+fn claim(hosted: &Hosted) -> BackgroundJobState {
+    match claim_background_job(
+        &hosted.store,
+        &hosted.state.identity.job_id,
+        std::process::id(),
+        hosted.ipc.port,
+        &hosted.ipc.token,
+        |_| Some(true),
+    )
+    .unwrap()
+    {
+        WorkerClaim::Claimed(state) => *state,
+        other => panic!("expected the worker to claim the owed turn, got {other:?}"),
+    }
+}
+
+/// What the worker does to start the turn it claimed, against the session's
+/// own ledger: stage what the claimed prompt answers, then open the turn the
+/// way the session loop does.
+fn begin_claimed_turn(
+    claimed: &BackgroundJobState,
+) -> (
+    Arc<crate::mid_turn_queue::MidTurnQueuedSubmitPoller>,
+    crate::mid_turn_queue::QueuedSubmitTurnGuard,
+) {
+    use crate::host::worker::execution::stage_inbound_for_claimed_prompt;
+
+    let session_id = claimed.identity.session_id.clone().unwrap();
+    let mid_turn_queue = crate::mid_turn_queue::MidTurnQueuedSubmitPoller::new(session_id);
+    stage_inbound_for_claimed_prompt(&mid_turn_queue.reply_ledger(), claimed);
+    let turn = mid_turn_queue.begin_turn();
+    (mid_turn_queue, turn)
+}
+
 /// One peer may only start so many turns here an hour. Past that the messages
 /// keep arriving in the inbox; they just stop waking the worker.
 #[test]
@@ -424,6 +472,7 @@ fn one_peer_may_only_wake_this_session_so_many_times_an_hour() {
             AgentMessageDelivery::StartedNewTurn,
             "wake {step} is within the budget"
         );
+        park_after_its_turn(&hosted);
     }
 
     let refused = envelope("m-wake-over", "the item after the budget");
@@ -434,21 +483,80 @@ fn one_peer_may_only_wake_this_session_so_many_times_an_hour() {
             duplicate: false,
         }
     );
+    let state = hosted
+        .store
+        .read_state(&hosted.state.identity.job_id)
+        .unwrap();
+    assert_eq!(state.process.status, BackgroundJobStatus::Idle);
     assert_eq!(
-        stored_prompts(&hosted).len(),
-        wake_budget + 1,
+        state.identity.pending_prompts.len(),
+        1,
         "a refused wake is not a refused message"
     );
 }
 
+/// A job that already owes a turn starts nothing new for a message: it rides
+/// into that turn, so it is reported as queued and spends none of its sender's
+/// wakes.
+#[test]
+fn a_message_to_a_session_that_already_owes_a_turn_spends_no_wake() {
+    let hosted = hosted(BackgroundJobStatus::Queued, "sess-already-owed");
+    assert_eq!(
+        result_of(deliver(&hosted, &envelope("m-owed", "ride along"))).outcome,
+        AgentMessageDelivery::Queued
+    );
+    park_after_its_turn(&hosted);
+
+    for step in 0..rebon_tool::peer::AGENT_MESSAGE_WAKES_PER_HOUR {
+        assert_eq!(
+            result_of(deliver(
+                &hosted,
+                &envelope(&format!("m-after-{step}"), "next")
+            ))
+            .outcome,
+            AgentMessageDelivery::StartedNewTurn,
+            "wake {step}: the message that rode along spent nothing"
+        );
+        park_after_its_turn(&hosted);
+    }
+    assert_eq!(
+        result_of(deliver(&hosted, &envelope("m-over", "past the budget"))).outcome,
+        AgentMessageDelivery::Queued
+    );
+}
+
+/// A hosted session whose last turn finished is parked, not done: a message
+/// from another session within the bounds wakes it, the same as one whose turn
+/// was cancelled.
+#[test]
+fn a_session_whose_last_turn_finished_is_woken_by_a_message() {
+    for status in [BackgroundJobStatus::Succeeded, BackgroundJobStatus::Failed] {
+        let hosted = hosted(status, &format!("sess-finished-{}", status.as_str()));
+        assert_eq!(
+            result_of(deliver(&hosted, &envelope("m-finished", "next item"))).outcome,
+            AgentMessageDelivery::StartedNewTurn,
+            "{status:?}"
+        );
+        assert_eq!(
+            hosted
+                .store
+                .read_state(&hosted.state.identity.job_id)
+                .unwrap()
+                .process
+                .status,
+            BackgroundJobStatus::Queued,
+            "{status:?}"
+        );
+    }
+}
+
 /// A hosted turn that exists because another agent's message was claimed
-/// answers that sender. The depth comes from the claimed prompt, which is what
-/// the reception path wrote, so a reply to the same peer carries one hop more.
+/// answers that sender. Through the real path: the reception path queues it,
+/// the worker claims the turn, stages what the claimed prompt answers into the
+/// session's own ledger — the one the turn's tools read — and the session loop
+/// opens the turn. A reply to the same peer carries one hop more.
 #[test]
 fn a_worker_turn_answering_an_agent_message_replies_one_hop_deeper() {
-    use crate::host::worker::execution::stage_inbound_for_claimed_prompt;
-    use rebon_tool::peer::AgentReplyLedger;
-
     let hosted = hosted(BackgroundJobStatus::Idle, "sess-hops-hosted");
     let mut from_peer = envelope("m-hops", "second hand-off already");
     from_peer.hops = 2;
@@ -457,17 +565,15 @@ fn a_worker_turn_answering_an_agent_message_replies_one_hop_deeper() {
         AgentMessageDelivery::StartedNewTurn
     );
 
-    let mut state: BackgroundJobState = hosted
-        .store
-        .read_state(&hosted.state.identity.job_id)
-        .unwrap();
-    let generation = state.process.turn_generation;
-    state.identity.pending_prompts[0].claimed_turn_generation = Some(generation);
+    let claimed = claim(&hosted);
+    assert_eq!(
+        claimed_pending_prompt(&claimed).map(|prompt| prompt.id.as_str()),
+        Some("m-hops")
+    );
+    assert_eq!(background_user_prompt(&claimed, false), None);
+    let (_queue, turn) = begin_claimed_turn(&claimed);
 
-    let ledger = AgentReplyLedger::new();
-    stage_inbound_for_claimed_prompt(&ledger, &state);
-    ledger.begin_turn();
-
+    let ledger = rebon_tool::peer::session_reply_ledger("sess-hops-hosted");
     assert_eq!(
         ledger.reply_hops("sess-sender"),
         3,
@@ -478,41 +584,288 @@ fn a_worker_turn_answering_an_agent_message_replies_one_hop_deeper() {
         0,
         "a conversation this turn was not answering starts at zero"
     );
+    drop(turn);
+    assert_eq!(ledger.reply_hops("sess-sender"), 0, "the turn is over");
 }
 
-/// A turn the person typed answers nobody, however much context was waiting in
-/// the queue behind it. Its reply must not claim to continue someone's chain.
+/// A message the bounds refused waits at the head of the queue; the person
+/// then types. In the real order — the message first, the prompt after — the
+/// turn is still the person's: it is claimed for what they typed, offers that
+/// text as user intent, and answers nobody. The waiting message rides along at
+/// the turn's first poll without lending it its depth.
 #[test]
 fn a_worker_turn_a_person_typed_reports_no_hops() {
-    use crate::host::worker::execution::stage_inbound_for_claimed_prompt;
-    use rebon_tool::peer::AgentReplyLedger;
+    let hosted = hosted(BackgroundJobStatus::Idle, "sess-hops-typed");
+    let mut deep = envelope("m-waits", "and then also this");
+    deep.hops = rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1;
+    assert_eq!(
+        result_of(deliver(&hosted, &deep)).outcome,
+        AgentMessageDelivery::Queued
+    );
+    queue_live_background_reply(
+        &hosted.store,
+        &hosted.state.identity.job_id,
+        &hosted.ipc.owner(),
+        "what the person typed".into(),
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        stored_prompts(&hosted)
+            .iter()
+            .map(|prompt| prompt.typed_by_user())
+            .collect::<Vec<_>>(),
+        [false, true],
+        "the message arrived first"
+    );
 
-    let hosted = hosted(BackgroundJobStatus::Queued, "sess-hops-typed");
-    let mut state: BackgroundJobState = hosted
-        .store
-        .read_state(&hosted.state.identity.job_id)
-        .unwrap();
-    // An agent message waits behind the typed prompt: it is context, not the
-    // reason the turn exists.
-    let mut waiting = pending_prompt("m-waits", "and then also this", Vec::new());
-    waiting.origin = Some(PendingPromptOrigin::AgentMessage {
-        from_session_id: "sess-sender".into(),
-        from_agent: "main".into(),
-        from_handle: None,
-        from_name: None,
-        hops: 3,
-    });
-    let mut typed = pending_prompt("u-typed", "what the person typed", Vec::new());
-    typed.claimed_turn_generation = Some(state.process.turn_generation);
-    state.identity.pending_prompts = vec![typed, waiting];
-
-    let ledger = AgentReplyLedger::new();
-    stage_inbound_for_claimed_prompt(&ledger, &state);
-    ledger.begin_turn();
-
+    let claimed = claim(&hosted);
+    let head = claimed_pending_prompt(&claimed).expect("a claimed prompt");
+    assert!(head.typed_by_user(), "claimed {:?}", head.id);
+    assert_eq!(head.text, "what the person typed");
+    assert_eq!(
+        background_user_prompt(&claimed, false).as_deref(),
+        Some("what the person typed"),
+        "the classifier sees what the person typed"
+    );
+    let (_queue, _turn) = begin_claimed_turn(&claimed);
+    let ledger = rebon_tool::peer::session_reply_ledger("sess-hops-typed");
     assert_eq!(
         ledger.reply_hops("sess-sender"),
         0,
-        "a typed turn answers the person, not the message that was queued after it"
+        "a typed turn answers the person, not the message waiting beside it"
+    );
+
+    let poller = BackgroundPendingPromptPoller::new(hosted.store.clone(), &claimed, &hosted.ipc);
+    let delivered = poller.poll(AttachmentPollRequest::new(
+        "sess-hops-typed",
+        "turn-typed",
+        0,
+        AttachmentPollPhase::Eager,
+    ));
+    assert_eq!(
+        delivered.len(),
+        1,
+        "the waiting message rides into the turn"
+    );
+    assert_eq!(
+        ledger.reply_hops("sess-sender"),
+        0,
+        "riding along is not what the turn answers"
+    );
+}
+
+/// A message another session sent while the hosted turn ran is read at the
+/// turn's next poll, and from then on the turn answers that sender.
+#[test]
+fn a_message_read_by_the_running_hosted_turn_makes_it_reply_one_hop_deeper() {
+    let hosted = hosted(BackgroundJobStatus::Running, "sess-hops-poll");
+    let state = hosted
+        .store
+        .read_state(&hosted.state.identity.job_id)
+        .unwrap();
+    let poller = BackgroundPendingPromptPoller::new(hosted.store.clone(), &state, &hosted.ipc);
+    let mid_turn_queue = crate::mid_turn_queue::MidTurnQueuedSubmitPoller::new("sess-hops-poll");
+    let _turn = mid_turn_queue.begin_turn();
+
+    let mut during = envelope("m-during", "while you were working");
+    during.hops = 1;
+    assert_eq!(
+        result_of(deliver(&hosted, &during)).outcome,
+        AgentMessageDelivery::Injected
+    );
+    let ledger = rebon_tool::peer::session_reply_ledger("sess-hops-poll");
+    assert_eq!(ledger.reply_hops("sess-sender"), 0, "not read yet");
+
+    let delivered = poller.poll(AttachmentPollRequest::new(
+        "sess-hops-poll",
+        "turn-poll",
+        2,
+        AttachmentPollPhase::Regular,
+    ));
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(ledger.reply_hops("sess-sender"), 2);
+}
+
+/// A message that joined a running turn and was never read is not admitted by
+/// having arrived: when the turn ends, it starts the next turn only if the
+/// bounds admit it now. Past them it waits, still queued, for a turn somebody
+/// else starts.
+#[test]
+fn a_message_the_turn_never_read_is_judged_before_it_starts_the_next_turn() {
+    let wake_budget = rebon_tool::peer::AGENT_MESSAGE_WAKES_PER_HOUR;
+    let ledger = rebon_tool::peer::session_reply_ledger("sess-unread-over");
+    for _ in 0..wake_budget {
+        assert!(ledger.admit_wake("sess-sender", 0, now_ms()).is_allowed());
+    }
+    let over = hosted(BackgroundJobStatus::Running, "sess-unread-over");
+    assert_eq!(
+        result_of(deliver(&over, &envelope("m-unread", "while you worked"))).outcome,
+        AgentMessageDelivery::Injected,
+        "joining a running turn is not judged"
+    );
+    let state = over.store.read_state(&over.state.identity.job_id).unwrap();
+    assert_eq!(
+        finalize_completed_background_turn(&over.store, &state, &over.ipc, "done", now_ms())
+            .unwrap(),
+        BackgroundTurnFinalization::Applied
+    );
+    let finalized = over.store.read_state(&over.state.identity.job_id).unwrap();
+    assert_eq!(
+        finalized.process.status,
+        BackgroundJobStatus::Succeeded,
+        "a peer whose wakes are spent does not get a turn by writing during one"
+    );
+    assert_eq!(
+        finalized.identity.pending_prompts.len(),
+        1,
+        "the message still waits for the next turn"
+    );
+
+    let within = hosted(BackgroundJobStatus::Running, "sess-unread-within");
+    deliver(&within, &envelope("m-unread", "while you worked")).unwrap();
+    let state = within
+        .store
+        .read_state(&within.state.identity.job_id)
+        .unwrap();
+    assert_eq!(
+        finalize_completed_background_turn(&within.store, &state, &within.ipc, "done", now_ms())
+            .unwrap(),
+        BackgroundTurnFinalization::Queued,
+        "within the bounds the unread message starts the next turn"
+    );
+}
+
+/// When something somebody asked for is left waiting too, it is what starts the
+/// next turn; the unread message rides along and is not judged.
+#[test]
+fn an_unread_message_rides_into_the_turn_a_waiting_prompt_starts() {
+    let hosted = hosted(BackgroundJobStatus::Running, "sess-unread-typed");
+    let ledger = rebon_tool::peer::session_reply_ledger("sess-unread-typed");
+    for _ in 0..rebon_tool::peer::AGENT_MESSAGE_WAKES_PER_HOUR {
+        assert!(ledger.admit_wake("sess-sender", 0, now_ms()).is_allowed());
+    }
+    deliver(&hosted, &envelope("m-unread", "while you worked")).unwrap();
+    queue_live_background_reply(
+        &hosted.store,
+        &hosted.state.identity.job_id,
+        &hosted.ipc.owner(),
+        "and this".into(),
+        Vec::new(),
+    )
+    .unwrap();
+    let state = hosted
+        .store
+        .read_state(&hosted.state.identity.job_id)
+        .unwrap();
+    assert_eq!(
+        finalize_completed_background_turn(&hosted.store, &state, &hosted.ipc, "done", now_ms())
+            .unwrap(),
+        BackgroundTurnFinalization::Queued
+    );
+
+    let claimed = claim(&hosted);
+    assert!(
+        claimed_pending_prompt(&claimed).is_some_and(PendingPrompt::typed_by_user),
+        "the turn is the person's"
+    );
+}
+
+/// Of several unread messages, the first the bounds admit is what the next
+/// turn is claimed for — not a message ahead of it that the bounds refuse.
+#[test]
+fn the_admitted_message_leads_the_turn_it_starts() {
+    let hosted = hosted(BackgroundJobStatus::Running, "sess-unread-lead");
+    let mut deep = envelope("m-deep", "too far down the chain");
+    deep.hops = rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1;
+    deliver(&hosted, &deep).unwrap();
+    let mut fresh = envelope("m-fresh", "a fresh question");
+    fresh.hops = 1;
+    deliver(&hosted, &fresh).unwrap();
+    let state = hosted
+        .store
+        .read_state(&hosted.state.identity.job_id)
+        .unwrap();
+    assert_eq!(
+        finalize_completed_background_turn(&hosted.store, &state, &hosted.ipc, "done", now_ms())
+            .unwrap(),
+        BackgroundTurnFinalization::Queued
+    );
+
+    let claimed = claim(&hosted);
+    assert_eq!(
+        claimed_pending_prompt(&claimed).map(|prompt| prompt.id.as_str()),
+        Some("m-fresh")
+    );
+    let (_queue, _turn) = begin_claimed_turn(&claimed);
+    assert_eq!(
+        rebon_tool::peer::session_reply_ledger("sess-unread-lead").reply_hops("sess-sender"),
+        2,
+        "the turn answers the message it was started for"
+    );
+}
+
+/// A message the bounds refused waits at the back; a later one they admit is
+/// what the turn is claimed for.
+#[test]
+fn a_message_admitted_while_a_refused_one_waits_leads_the_turn() {
+    let hosted = hosted(BackgroundJobStatus::Idle, "sess-refused-then-admitted");
+    let mut deep = envelope("m-deep", "too far down the chain");
+    deep.hops = rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1;
+    assert_eq!(
+        result_of(deliver(&hosted, &deep)).outcome,
+        AgentMessageDelivery::Queued
+    );
+    assert_eq!(
+        result_of(deliver(&hosted, &envelope("m-fresh", "a fresh question"))).outcome,
+        AgentMessageDelivery::StartedNewTurn
+    );
+
+    let claimed = claim(&hosted);
+    assert_eq!(
+        claimed_pending_prompt(&claimed).map(|prompt| prompt.id.as_str()),
+        Some("m-fresh")
+    );
+    assert_eq!(
+        claimed
+            .identity
+            .pending_prompts
+            .iter()
+            .map(|prompt| prompt.id.as_str())
+            .collect::<Vec<_>>(),
+        ["m-fresh", "m-deep"],
+        "the refused message rides along behind it"
+    );
+}
+
+/// A head an earlier turn was already claimed for — the worker died mid-turn —
+/// is taken up again first, even when it is another session's message and a
+/// prompt the person typed waits behind it: its row may already be durable, and
+/// passing it over would write that message into the transcript a second time.
+#[test]
+fn a_head_an_earlier_turn_was_claimed_for_is_resumed_before_a_typed_prompt() {
+    let hosted = hosted(BackgroundJobStatus::Idle, "sess-resume-head");
+    assert_eq!(
+        result_of(deliver(&hosted, &envelope("m-started", "started a turn"))).outcome,
+        AgentMessageDelivery::StartedNewTurn
+    );
+    claim(&hosted);
+    hosted
+        .store
+        .update_state(&hosted.state.identity.job_id, |state| {
+            state.process.status = BackgroundJobStatus::Queued;
+            state.identity.pending_prompts.push(pending_prompt(
+                "u-typed-after-crash",
+                "and this",
+                Vec::new(),
+            ));
+            Ok(())
+        })
+        .unwrap();
+
+    let reclaimed = claim(&hosted);
+    assert_eq!(
+        claimed_pending_prompt(&reclaimed).map(|prompt| prompt.id.as_str()),
+        Some("m-started")
     );
 }

@@ -4486,6 +4486,55 @@ fn an_agent_message_is_queued_without_starting_a_worker() {
     assert_eq!(duplicate.queue_depth, 1);
 }
 
+/// Messages from other sessions may take only part of the queue. A peer that
+/// keeps writing to a session it may no longer wake fills its share and is
+/// refused past it — told so, rather than having the message dropped — and
+/// what a person types still has room.
+#[test]
+fn agent_messages_cannot_fill_the_queue_a_person_types_into() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.identity.session_id = Some("sess-agent-share".into());
+    state.process.status = BackgroundJobStatus::Running;
+    let job_id = state.identity.job_id.clone();
+    store.write_state(&state).unwrap();
+
+    for index in 0..MAX_PENDING_AGENT_MESSAGES {
+        let envelope = agent_message_envelope(&format!("m-share-{index}"), "one more");
+        assert!(
+            append_agent_message_to_background_job(&store, &job_id, &envelope)
+                .unwrap()
+                .appended
+        );
+    }
+    let before = store.read_state(&job_id).unwrap();
+    let error = append_agent_message_to_background_job(
+        &store,
+        &job_id,
+        &agent_message_envelope("m-share-over", "one too many"),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("messages from other sessions"),
+        "{error}"
+    );
+    assert_eq!(store.read_state(&job_id).unwrap(), before);
+
+    let typed = append_background_prompt_with_images(
+        &store,
+        &job_id,
+        "pp-typed-after-agents".into(),
+        "what the person typed".into(),
+        Vec::new(),
+        false,
+        &rebon_exe(),
+    )
+    .unwrap();
+    assert!(typed.appended, "the person's prompt still has room");
+}
+
 /// The old atomic writer left `roster.json.<pid>-<seq>.tmp` files beside the
 /// roster. Writing a new roster clears the old litter and leaves a live
 /// writer's fresh temp file alone.

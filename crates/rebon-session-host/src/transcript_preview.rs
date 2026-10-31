@@ -453,14 +453,19 @@ mod tests {
     /// it would show somebody else's words as this conversation's user text.
     #[test]
     fn transcript_entry_is_meta_detects_a_visible_agent_message_attachment() {
+        // As the executor persists it: the marker stripped, the frame in one
+        // block, queued into the running turn.
         let raw = serde_json::json!({
             "type": "user",
+            "uuid": "u-agent-message-m-1",
+            "queuedCommand": true,
+            "iteration": 1,
             "runtimeAttachment": true,
             "message": {
                 "role": "user",
                 "content": [{
                     "type": "text",
-                    "text": "<teammate-message teammate_id=\"main@session:sess-sender\">go</teammate-message>"
+                    "text": "<teammate-message teammate_id=\"main@session:sess-sender\" from_session=\"sess-sender\">\ngo\n</teammate-message>"
                 }]
             },
         });
@@ -471,6 +476,29 @@ mod tests {
                 "message": { "role": "user", "content": "typed by the person" },
             })),
             "a line the person typed is still user text"
+        );
+    }
+
+    /// A turn another session's message started opens with that message as its
+    /// prompt row. It is no more the person's words than the same message
+    /// queued into a running turn, and is marked the same way.
+    #[test]
+    fn transcript_entry_is_meta_detects_a_turn_another_session_started() {
+        // As the executor persists a turn's prompt row: one text block, written
+        // as a string.
+        let raw = serde_json::json!({
+            "type": "user",
+            "uuid": "u-agent-message-m-2",
+            "runtimeAttachment": true,
+            "message": {
+                "role": "user",
+                "content": "<teammate-message teammate_id=\"main@session:sess-sender\" from_session=\"sess-sender\">\nnext\n</teammate-message>"
+            },
+        });
+        assert!(transcript_entry_is_meta(&raw));
+        assert!(
+            extract_transcript_entry_text(&raw).is_some(),
+            "the row has text; only its marking keeps it out of the preview"
         );
     }
 

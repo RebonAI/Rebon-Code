@@ -89,13 +89,18 @@ struct InboxState {
 /// it.
 pub struct AcceptedMessage {
     pub envelope: AgentMessageEnvelope,
-    /// Whether this message is allowed to start a turn of its own.
+    /// Whether this message may start a turn of its own.
     ///
-    /// False when a bound refused it — too deep a chain, or a peer that keeps
-    /// starting turns here — or when a turn is already owed and this one would
-    /// ride along. Either way the event loop still carries it into the next
-    /// turn; what it must not do is be the reason that turn exists.
-    pub may_wake: bool,
+    /// `Admitted` when it reached a terminal with nothing running and nothing
+    /// owed and the bounds let it start a turn — at once, or once a resume
+    /// dialog closes. `Refused` when a bound refused it — too deep a chain, or
+    /// a peer that keeps starting turns here. `Unjudged` when it joined a
+    /// running turn or rode behind a turn already owed: it was not going to
+    /// start anything, so nothing was spent on it, and the event loop judges
+    /// it if it is still waiting once there is no turn for it to ride in.
+    /// Every accepted message is carried into a turn; the verdict only says
+    /// whether it may be the reason that turn exists.
+    pub verdict: rebon_tool::peer::WakeVerdict,
 }
 
 /// The terminal half of the endpoint: messages accepted, waiting for the event
@@ -183,26 +188,18 @@ impl ForegroundAgentInbox {
     ///
     /// The bounds live in the ledger rather than here because the hosted half
     /// applies the same two to the same session id — see
-    /// [`rebon_tool::peer::AgentReplyLedger::admit_wake`].
-    fn may_wake(
-        &self,
+    /// [`rebon_tool::peer::AgentReplyLedger::judge_wake`]. An inbox with no
+    /// session has no bounds to apply.
+    fn judge_wake(
         ledger: Option<&Arc<rebon_tool::peer::AgentReplyLedger>>,
         envelope: &AgentMessageEnvelope,
-    ) -> bool {
-        let Some(ledger) = ledger else {
-            return true;
-        };
-        let admission =
-            ledger.admit_wake(&envelope.from_session_id, envelope.hops, crate::now_ms());
-        if !admission.is_allowed() {
-            tracing::info!(
-                from = %envelope.from_session_id,
-                hops = envelope.hops,
-                ?admission,
-                "rebon: a cross-session message will wait instead of starting a turn"
-            );
+    ) -> rebon_tool::peer::WakeVerdict {
+        match ledger {
+            Some(ledger) => {
+                ledger.judge_wake(&envelope.from_session_id, envelope.hops, crate::now_ms())
+            }
+            None => rebon_tool::peer::WakeVerdict::Admitted,
         }
-        admission.is_allowed()
     }
 
     /// Accept one message. A repeated `message_id` changes nothing and answers
@@ -211,7 +208,7 @@ impl ForegroundAgentInbox {
     ///
     /// A message the bounds refuse is still accepted — it waits for the next
     /// turn somebody else starts. What it must not be is the reason for a turn,
-    /// which is what `may_wake` on the queued item carries to the event loop.
+    /// which is what the verdict on the queued item carries to the event loop.
     pub fn accept(&self, envelope: AgentMessageEnvelope) -> AgentMessageResult {
         let ledger = self
             .reply_ledger
@@ -233,22 +230,41 @@ impl ForegroundAgentInbox {
         }
         // Only a message that could actually be the reason for a turn pays for
         // the admission check: one that joins a running turn, or that waits
-        // behind a turn already owed, is not going to start anything.
-        let admission = (!state.busy && !state.blocked && state.pending.is_empty())
-            .then(|| self.may_wake(ledger.as_ref(), &envelope));
-        let outcome = if state.busy {
-            // A person is watching this turn, so the bounds do not apply to it.
-            AgentMessageDelivery::Injected
-        } else if state.blocked || !state.pending.is_empty() {
-            // Blocked, or behind a message the idle trigger has not picked up
-            // yet: either way this one will join a turn that is already owed.
-            AgentMessageDelivery::Queued
-        } else if admission == Some(true) {
-            AgentMessageDelivery::StartedNewTurn
+        // behind a turn already owed, is not going to start anything. What is
+        // owed is a waiting message that was admitted — one that was refused
+        // starts nothing, so it must not make a later message wait with it.
+        let turn_owed = state
+            .pending
+            .iter()
+            .any(|waiting| waiting.verdict == rebon_tool::peer::WakeVerdict::Admitted);
+        let (outcome, verdict) = if state.busy {
+            // A person is watching this turn, so the bounds do not apply to
+            // joining it. If the turn ends before reading the message, the
+            // event loop judges it before it may start one of its own.
+            (
+                AgentMessageDelivery::Injected,
+                rebon_tool::peer::WakeVerdict::Unjudged,
+            )
+        } else if turn_owed {
+            // Behind a message the idle trigger has not picked up yet: this one
+            // rides into the turn that message starts.
+            (
+                AgentMessageDelivery::Queued,
+                rebon_tool::peer::WakeVerdict::Unjudged,
+            )
         } else {
-            // Too deep a chain, or a peer that keeps starting turns here: the
-            // message waits for a person rather than starting another round.
-            AgentMessageDelivery::Queued
+            let verdict = Self::judge_wake(ledger.as_ref(), &envelope);
+            let outcome = if verdict == rebon_tool::peer::WakeVerdict::Admitted && !state.blocked {
+                AgentMessageDelivery::StartedNewTurn
+            } else {
+                // Refused — too deep a chain, or a peer that keeps starting
+                // turns here — so the message waits for a turn somebody else
+                // starts. Or admitted while the terminal cannot start a turn
+                // yet (a resume dialog is open): it waits, and starts its turn
+                // once the terminal can.
+                AgentMessageDelivery::Queued
+            };
+            (outcome, verdict)
         };
         state.seen.insert(envelope.message_id.clone());
         state.seen_order.push_back(envelope.message_id.clone());
@@ -257,10 +273,9 @@ impl ForegroundAgentInbox {
                 state.seen.remove(&expired);
             }
         }
-        state.pending.push_back(AcceptedMessage {
-            envelope,
-            may_wake: matches!(outcome, AgentMessageDelivery::StartedNewTurn),
-        });
+        state
+            .pending
+            .push_back(AcceptedMessage { envelope, verdict });
         drop(state);
         AgentMessageResult {
             outcome,
@@ -642,6 +657,7 @@ mod tests {
     use crate::legacy_foreground::{foreground_agent_token_path, read_foreground_status};
     use crate::protocol_probe::{probe, OwnerProtocol};
     use crate::BACKGROUND_IPC_PROTOCOL_VERSION;
+    use rebon_tool::peer::WakeVerdict;
     use tempfile::TempDir;
 
     #[derive(Default)]
@@ -1042,8 +1058,9 @@ mod tests {
 
         let pending = inbox.take_pending_messages();
         assert_eq!(pending.len(), 1, "an accepted message is never dropped");
-        assert!(
-            !pending[0].may_wake,
+        assert_eq!(
+            pending[0].verdict,
+            WakeVerdict::Refused,
             "it asked for more than the bound allows, so it may not start the turn"
         );
         assert_eq!(pending[0].envelope.message_id, "m-deep");
@@ -1068,27 +1085,43 @@ mod tests {
         assert_eq!(throttled.outcome, AgentMessageDelivery::Queued);
         let pending = inbox.take_pending_messages();
         assert_eq!(pending.len(), 1);
-        assert!(!pending[0].may_wake);
+        assert_eq!(pending[0].verdict, WakeVerdict::Refused);
     }
 
     /// A retry is answered, not redelivered, and it costs nothing: a duplicate
     /// must not spend a wake the sender would then miss on a fresh message.
+    ///
+    /// The retry comes while the budget still has room, which is the only
+    /// state in which spending on it shows: every fresh message after it must
+    /// still start a turn, up to exactly the budget.
     #[test]
     fn a_duplicate_spends_no_wake() {
         let inbox = bounded_inbox("duplicate");
-        for index in 0..rebon_tool::peer::AGENT_MESSAGE_WAKES_PER_HOUR {
-            assert_eq!(
-                inbox.accept(message(&format!("m-{index}"), 0)).outcome,
-                AgentMessageDelivery::StartedNewTurn
-            );
-            inbox.take_pending_messages();
-        }
-        // The budget is spent; a retry of an accepted id is still a duplicate.
+        assert_eq!(
+            inbox.accept(message("m-0", 0)).outcome,
+            AgentMessageDelivery::StartedNewTurn
+        );
+        assert_eq!(inbox.take_pending_messages().len(), 1);
+
         let retry = inbox.accept(message("m-0", 0));
         assert!(retry.duplicate);
         assert!(
             inbox.take_pending_messages().is_empty(),
             "a retry delivers nothing"
+        );
+
+        for index in 1..rebon_tool::peer::AGENT_MESSAGE_WAKES_PER_HOUR {
+            assert_eq!(
+                inbox.accept(message(&format!("m-{index}"), 0)).outcome,
+                AgentMessageDelivery::StartedNewTurn,
+                "wake {index} is within the budget the retry did not touch"
+            );
+            inbox.take_pending_messages();
+        }
+        assert_eq!(
+            inbox.accept(message("m-over", 0)).outcome,
+            AgentMessageDelivery::Queued,
+            "and the budget is exactly what the fresh messages spent"
         );
     }
 
@@ -1103,7 +1136,7 @@ mod tests {
         );
         let waiting = inbox.take_pending_messages();
         assert_eq!(waiting.len(), 1);
-        assert!(!waiting[0].may_wake);
+        assert_eq!(waiting[0].verdict, WakeVerdict::Refused);
 
         // A later message the bounds allow is a reason to start a turn; the
         // waiting one rides along with it rather than being dropped.
@@ -1113,7 +1146,85 @@ mod tests {
         );
         let started = inbox.take_pending_messages();
         assert_eq!(started.len(), 1);
-        assert!(started[0].may_wake);
+        assert_eq!(started[0].verdict, WakeVerdict::Admitted);
         assert_eq!(started[0].envelope.message_id, "m-allowed");
+    }
+
+    /// A terminal that cannot start a turn yet (a resume dialog is open) still
+    /// judges the message: one within the bounds is told it waits, but it
+    /// keeps its right to start the turn once the terminal can.
+    #[test]
+    fn a_message_accepted_while_blocked_may_still_wake_once_unblocked() {
+        let inbox = bounded_inbox("blocked");
+        inbox.set_blocked(true);
+        assert_eq!(
+            inbox.accept(message("m-blocked", 0)).outcome,
+            AgentMessageDelivery::Queued,
+            "the turn does not start while the terminal is blocked"
+        );
+        assert_eq!(
+            inbox.accept(message("m-blocked-deep", 9)).outcome,
+            AgentMessageDelivery::Queued
+        );
+
+        let pending = inbox.take_pending_messages();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|accepted| accepted.verdict)
+                .collect::<Vec<_>>(),
+            [WakeVerdict::Admitted, WakeVerdict::Unjudged],
+            "the first may start the turn once the dialog closes; the second \
+             rides into that turn without spending a wake"
+        );
+    }
+
+    /// Only an admitted message makes a later one wait behind it. A refused one
+    /// starts nothing, so a fresh message from within the bounds is judged on
+    /// its own instead of being stranded beside it.
+    #[test]
+    fn a_refused_message_waiting_does_not_make_the_next_one_wait() {
+        let inbox = bounded_inbox("behind-refused");
+        assert_eq!(
+            inbox.accept(message("m-refused", 9)).outcome,
+            AgentMessageDelivery::Queued
+        );
+        assert_eq!(
+            inbox.accept(message("m-fresh", 0)).outcome,
+            AgentMessageDelivery::StartedNewTurn
+        );
+        assert_eq!(
+            inbox.accept(message("m-rider", 0)).outcome,
+            AgentMessageDelivery::Queued,
+            "behind an admitted message, a third one rides along"
+        );
+
+        let pending = inbox.take_pending_messages();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|accepted| accepted.verdict)
+                .collect::<Vec<_>>(),
+            [
+                WakeVerdict::Refused,
+                WakeVerdict::Admitted,
+                WakeVerdict::Unjudged
+            ]
+        );
+    }
+
+    /// Joining a running turn is not judged — the bounds are about waking —
+    /// so it spends nothing, and the event loop judges the message only if the
+    /// turn ends without reading it.
+    #[test]
+    fn a_message_for_a_running_turn_is_left_unjudged() {
+        let inbox = bounded_inbox("busy");
+        inbox.set_busy(true);
+        assert_eq!(
+            inbox.accept(message("m-busy", 9)).outcome,
+            AgentMessageDelivery::Injected
+        );
+        let pending = inbox.take_pending_messages();
+        assert_eq!(pending[0].verdict, WakeVerdict::Unjudged);
     }
 }

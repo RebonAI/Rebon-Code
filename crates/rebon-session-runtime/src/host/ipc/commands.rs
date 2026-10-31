@@ -353,54 +353,35 @@ pub(crate) fn queue_live_background_agent_message(
     let mut wake = false;
     store.update_state(job_id, |state| {
         owner.ensure_matches(state)?;
-        // A retry must not spend a wake the sender then misses on a fresh
-        // message, so it is recognised before any bound is consulted. It is not
-        // short-circuited here: `append_pending_prompt` is what answers a repeat
-        // (`appended: false`) and refuses the same id with different words, and
-        // the delivery reported has to be the one the current state implies.
-        let duplicate = state
-            .identity
-            .pending_prompts
-            .iter()
-            .any(|existing| existing.id == prompt.id);
         let status = state.process.status;
         let running = matches!(
             status,
             BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput
         );
-        wake = if running || duplicate {
-            // A running turn claims it at its next tool round. A person is
-            // watching that turn, so the hop and wake bounds do not apply to it.
-            false
-        } else if matches!(
+        // Parked: no turn is running and none is owed, so a turn would start
+        // only because of this message. A job whose last turn succeeded or
+        // failed is parked the same as one whose turn was cancelled.
+        let parked = matches!(
             status,
-            BackgroundJobStatus::Idle | BackgroundJobStatus::Queued
-        ) {
-            // Waking an idle session is what the bounds are for: a chain that has
-            // gone too deep, or one peer that keeps starting turns here, leaves
-            // the message in the inbox where a person will read it.
-            let ledger = state
-                .identity
-                .session_id
-                .as_deref()
-                .map(rebon_tool::peer::session_reply_ledger);
-            ledger.is_none_or(|ledger| {
-                let admission =
-                    ledger.admit_wake(&envelope.from_session_id, envelope.hops, queued_at);
-                if !admission.is_allowed() {
-                    tracing::info!(
-                        job_id,
-                        from = %envelope.from_session_id,
-                        hops = envelope.hops,
-                        ?admission,
-                        "rebon: a cross-session message will wait instead of starting a turn"
-                    );
-                }
-                admission.is_allowed()
-            })
-        } else {
-            false
-        };
+            BackgroundJobStatus::Idle
+                | BackgroundJobStatus::Succeeded
+                | BackgroundJobStatus::Failed
+        );
+        // `append_pending_prompt` answers a repeat (`appended: false`) and
+        // refuses the same id with different words or a queue already holding
+        // its share of agent messages, so it runs before any bound is
+        // consulted: a retry, or a message that is not taken, spends no wake.
+        let acceptance = state.append_pending_prompt(prompt.clone())?;
+        appended = acceptance.appended;
+        // Only a message that would be the reason for a turn is judged, because
+        // judging spends a wake. A running turn claims it at its next tool
+        // round — a person is watching that turn, and if it ends without
+        // reading the message, finalization judges it then. A `Queued` job
+        // already owes a turn, which this message rides into.
+        wake = parked
+            && appended
+            && judge_agent_prompt_wake(state, &prompt, queued_at)
+                == rebon_tool::peer::WakeVerdict::Admitted;
         delivery = if running {
             rebon_session_host::AgentMessageDelivery::Injected
         } else if wake {
@@ -409,8 +390,6 @@ pub(crate) fn queue_live_background_agent_message(
         } else {
             rebon_session_host::AgentMessageDelivery::Queued
         };
-        let acceptance = state.append_pending_prompt(prompt.clone())?;
-        appended = acceptance.appended;
         if !acceptance.appended {
             return Ok(());
         }
@@ -421,6 +400,10 @@ pub(crate) fn queue_live_background_agent_message(
             return Ok(());
         }
         if wake {
+            // The turn is claimed for its head; a message refused earlier must
+            // not be what that turn answers.
+            let index = state.identity.pending_prompts.len() - 1;
+            lead_agent_messages_with(state, index);
             state.process.status = BackgroundJobStatus::Queued;
             state.outcome.pending_permission = None;
             state.outcome.summary = None;

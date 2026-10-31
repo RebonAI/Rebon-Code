@@ -48,9 +48,11 @@ const WAKE_WINDOW_MS: u64 = 60 * 60 * 1000;
 /// clears it. What a turn answers is also bound to the turn it was recorded in:
 /// a message that arrives after the executor has finished its turn must not be
 /// attributed to whatever turn starts next, which may be one the person typed.
-/// [`begin_turn`] therefore opens a fresh slate. The wake counts are not turn
-/// scoped: they exist to slow a peer down across turns, and clearing them per
-/// turn would make them count nothing.
+/// [`begin_turn`] therefore opens a fresh slate, and [`end_turn`] closes only
+/// the turn it names: a cancelled turn still winding down after the next one
+/// has begun must not close that one. The wake counts are not turn scoped:
+/// they exist to slow a peer down across turns, and clearing them per turn
+/// would make them count nothing.
 ///
 /// [`end_turn`]: AgentReplyLedger::end_turn
 /// [`begin_turn`]: AgentReplyLedger::begin_turn
@@ -99,6 +101,26 @@ impl WakeAdmission {
     }
 }
 
+/// What has been decided about whether one received message may start a turn.
+///
+/// A message is judged when it could be the reason for a turn — it reached a
+/// session with nothing running and nothing owed — and only then, because
+/// judging spends a wake. One that joined a running turn, or waited behind a
+/// turn already owed, was never going to start anything and is left
+/// [`Self::Unjudged`]; if it outlives that turn unread it is judged before it
+/// may start one, so arriving mid-turn is not a way around the bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeVerdict {
+    /// The bounds admitted it and the wake is already counted: it may start a
+    /// turn.
+    Admitted,
+    /// A bound refused it. It is still delivered — into the next turn somebody
+    /// else starts — but it may not start one.
+    Refused,
+    /// Not judged yet: it was going to ride in a turn that existed anyway.
+    Unjudged,
+}
+
 impl AgentReplyLedger {
     pub fn new() -> Self {
         Self::default()
@@ -108,7 +130,8 @@ impl AgentReplyLedger {
     /// to, and take over whatever the caller staged for it.
     ///
     /// Returns the generation the new turn was given; every later
-    /// [`note_inbound`] recorded before the next `begin_turn` belongs to it.
+    /// [`Self::note_inbound`] recorded before the next `begin_turn` belongs to
+    /// it.
     pub fn begin_turn(&self) -> u64 {
         let mut state = self.state.lock().expect("agent reply ledger poisoned");
         state.generation = state.generation.wrapping_add(1);
@@ -125,11 +148,10 @@ impl AgentReplyLedger {
     ///
     /// For the paths that know, before the turn exists, which message it
     /// carries: the idle path draining an agent message into a fresh turn, and
-    /// the worker claiming an agent-message prompt. Call it before
-    /// [`begin_turn`], which adopts it. A later `begin_turn` for a turn somebody
-    /// else's input started (a prompt the person typed, a task notification)
-    /// leaves it in place, so the next agent-message turn still inherits its
-    /// own depth rather than a stranger's.
+    /// the worker claiming an agent-message prompt. Call it immediately before
+    /// the turn is submitted: the next [`Self::begin_turn`] takes it, whatever
+    /// turn that is, so a value staged for a turn that then never starts would
+    /// be adopted by the next one — which may be a turn the person typed.
     pub fn stage_inbound(&self, from_session_id: &str, hops: u8) {
         if from_session_id.trim().is_empty() {
             return;
@@ -218,9 +240,35 @@ impl AgentReplyLedger {
         WakeAdmission::Allowed
     }
 
-    /// The turn is over; what it was answering no longer applies.
-    pub fn end_turn(&self) {
+    /// Judge whether a received message may start a turn, spending a wake if
+    /// it may.
+    ///
+    /// The one place a refusal is reported, so both halves of a session log the
+    /// same sentence for it.
+    pub fn judge_wake(&self, from_session_id: &str, hops: u8, now_ms: u64) -> WakeVerdict {
+        let admission = self.admit_wake(from_session_id, hops, now_ms);
+        if admission.is_allowed() {
+            return WakeVerdict::Admitted;
+        }
+        tracing::info!(
+            from = %from_session_id,
+            hops,
+            ?admission,
+            "rebon: a cross-session message will wait instead of starting a turn"
+        );
+        WakeVerdict::Refused
+    }
+
+    /// Turn `generation` is over; what it was answering no longer applies.
+    ///
+    /// Only that turn: a cancelled turn's executor can still be winding down
+    /// when the next turn begins, and its end must not wipe what the new turn
+    /// is answering.
+    pub fn end_turn(&self, generation: u64) {
         let mut state = self.state.lock().expect("agent reply ledger poisoned");
+        if state.open != Some(generation) {
+            return;
+        }
         state.open = None;
         state.inbound = None;
     }
@@ -846,7 +894,7 @@ mod tests {
             "a fresh conversation is not a hand-off, however deep the turn"
         );
 
-        ledger.end_turn();
+        ledger.end_turn(generation);
         assert_eq!(
             ledger.reply_hops("sess-a"),
             0,
@@ -888,11 +936,11 @@ mod tests {
     fn a_staged_depth_belongs_to_the_turn_that_starts_next() {
         let ledger = AgentReplyLedger::new();
         ledger.stage_inbound("sess-a", 2);
-        ledger.begin_turn();
+        let staged_turn = ledger.begin_turn();
         assert_eq!(ledger.reply_hops("sess-a"), 3);
 
         // Staged once, adopted once: a later turn answers nobody.
-        ledger.end_turn();
+        ledger.end_turn(staged_turn);
         ledger.begin_turn();
         assert_eq!(ledger.reply_hops("sess-a"), 0);
     }
@@ -948,13 +996,55 @@ mod tests {
         for _ in 0..AGENT_MESSAGE_WAKES_PER_HOUR {
             assert!(ledger.admit_wake("sess-a", 0, 1_000).is_allowed());
         }
-        ledger.end_turn();
+        let generation = ledger.begin_turn();
+        ledger.end_turn(generation);
         assert_eq!(
             ledger.admit_wake("sess-a", 0, 1_000),
             WakeAdmission::RateLimited {
                 window_ms: WAKE_WINDOW_MS
             }
         );
+    }
+
+    /// A cancelled turn's executor can still be finishing after the next turn
+    /// began. Its end closes only itself: the turn that is running keeps
+    /// answering the peer it was started for, so its reply does not restart the
+    /// chain at zero.
+    #[test]
+    fn ending_an_older_turn_leaves_the_running_one_open() {
+        let ledger = AgentReplyLedger::new();
+        let cancelled = ledger.begin_turn();
+        ledger.stage_inbound("sess-a", 2);
+        let running = ledger.begin_turn();
+        assert_eq!(ledger.reply_hops("sess-a"), 3);
+
+        ledger.end_turn(cancelled);
+        assert_eq!(
+            ledger.reply_hops("sess-a"),
+            3,
+            "the late end of a cancelled turn must not close the one after it"
+        );
+
+        ledger.end_turn(running);
+        assert_eq!(ledger.reply_hops("sess-a"), 0);
+    }
+
+    /// Judging spends a wake only when it admits, and says which way it went.
+    #[test]
+    fn judging_a_wake_admits_within_the_bounds_and_refuses_past_them() {
+        let ledger = AgentReplyLedger::new();
+        assert_eq!(
+            ledger.judge_wake("sess-a", MAX_AGENT_MESSAGE_HOPS + 1, 1_000),
+            WakeVerdict::Refused
+        );
+        for _ in 0..AGENT_MESSAGE_WAKES_PER_HOUR {
+            assert_eq!(
+                ledger.judge_wake("sess-a", 0, 1_000),
+                WakeVerdict::Admitted,
+                "a refusal past the hop bound spent nothing"
+            );
+        }
+        assert_eq!(ledger.judge_wake("sess-a", 0, 1_000), WakeVerdict::Refused);
     }
 
     /// A ledger is per session: one session's depth is not another's.

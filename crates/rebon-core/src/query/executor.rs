@@ -3638,6 +3638,14 @@ impl EngineQueryExecutor {
                 false,
                 false,
             );
+            // A turn another session's message started opens with that
+            // message, not with anything the person typed: marked the way the
+            // same message is when it joins a running turn, so a reader that
+            // excerpts user text does not put the sender's words in the
+            // person's mouth.
+            if opens_turn_with_agent_message(&user_uuid) {
+                user_payload[RUNTIME_ATTACHMENT_ENTRY_KEY] = serde_json::Value::Bool(true);
+            }
             if replay_only {
                 user_payload.as_object_mut().unwrap().insert(
                     "permissionReplay".to_string(),

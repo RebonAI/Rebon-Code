@@ -127,7 +127,7 @@ pub use tool_projection::{
     ToolNameSnapshot, ToolSnapshot,
 };
 pub use traits::{AttachmentPollPhase, AttachmentPollRequest, AttachmentPoller};
-pub use transcript::visible_runtime_attachment_message;
+pub use transcript::{agent_message_row_uuid, visible_runtime_attachment_message};
 pub use transcript::{
     estimate_transcript_input_tokens, transcript_to_api_messages,
     transcript_to_api_messages_for_model,

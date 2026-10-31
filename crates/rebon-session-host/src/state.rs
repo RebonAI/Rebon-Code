@@ -90,7 +90,11 @@ pub enum PendingPromptOrigin {
         from_agent: String,
         /// The sender's handle and display name, echoed so a resumed turn can
         /// still say who it came from after the frame itself is replayed.
-        #[serde(rename = "fromHandle", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "fromHandle",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         from_handle: Option<String>,
         #[serde(rename = "fromName", default, skip_serializing_if = "Option::is_none")]
         from_name: Option<String>,
@@ -98,10 +102,7 @@ pub enum PendingPromptOrigin {
         /// it arrived. Defaulted so a record written before the field existed
         /// reads as a first message, and skipped at zero so a first message's
         /// record is unchanged.
-        #[serde(
-            default,
-            skip_serializing_if = "crate::agent_message::hops_is_zero"
-        )]
+        #[serde(default, skip_serializing_if = "crate::agent_message::hops_is_zero")]
         hops: u8,
     },
     /// The session's cron scheduler fired it. The text opens with
@@ -1378,6 +1379,22 @@ impl BackgroundJobState {
                 "background job {} already has the maximum of {} pending prompts",
                 self.identity.job_id,
                 MAX_PENDING_PROMPTS
+            );
+        }
+        if prompt.is_agent_message()
+            && self
+                .identity
+                .pending_prompts
+                .iter()
+                .filter(|waiting| waiting.is_agent_message())
+                .count()
+                >= MAX_PENDING_AGENT_MESSAGES
+        {
+            anyhow::bail!(
+                "background job {} already holds the maximum of {} messages from other sessions; \
+                 they are delivered with its next turn",
+                self.identity.job_id,
+                MAX_PENDING_AGENT_MESSAGES
             );
         }
         self.grant_coordinator_report_paths(&prompt.coordinator_report_paths);

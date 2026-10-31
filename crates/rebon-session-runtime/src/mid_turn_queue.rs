@@ -22,16 +22,24 @@ struct QueuedAgentMessage {
     /// eventually carries it still answers its sender.
     from_session_id: String,
     hops: u8,
+    /// What its reception decided about starting a turn. A message that only
+    /// joined this turn was never judged, and must be before a turn of its own.
+    verdict: rebon_tool::peer::WakeVerdict,
 }
 
-/// An agent message handed back because the turn it was queued for ended
-/// before reaching it.
+/// An agent message waiting for a turn: handed back because the turn it was
+/// queued for ended before reaching it, or accepted while the session was idle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredAgentMessage {
+    /// The envelope's idempotency key, which names the row the message is
+    /// written as wherever it lands.
+    pub message_id: String,
     /// The `<teammate-message>` frame, already escaped by its sender.
     pub text: String,
     pub from_session_id: String,
     pub hops: u8,
+    /// Whether it may start a turn, as far as that has been decided.
+    pub verdict: rebon_tool::peer::WakeVerdict,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,15 +94,23 @@ pub struct MidTurnQueuedSubmitPoller {
     active_turns: Mutex<usize>,
 }
 
-pub struct QueuedSubmitTurnGuard(Arc<MidTurnQueuedSubmitPoller>);
+/// One turn's hold on the queue, and the generation the reply ledger gave it.
+pub struct QueuedSubmitTurnGuard {
+    poller: Arc<MidTurnQueuedSubmitPoller>,
+    generation: u64,
+}
 
 impl Drop for QueuedSubmitTurnGuard {
     fn drop(&mut self) {
         *self
-            .0
+            .poller
             .active_turns
             .lock()
             .expect("queued submit turns poisoned") -= 1;
+        // Closes this turn only. A cancelled turn's executor can outlive the
+        // moment the next turn was admitted, and ending "whatever is open"
+        // here would wipe what that next turn is answering.
+        self.poller.reply_ledger.end_turn(self.generation);
     }
 }
 
@@ -116,16 +132,20 @@ impl MidTurnQueuedSubmitPoller {
 
     /// Acquire before spawning a foreground executor; drop only after it exits.
     ///
-    /// Opening a turn here also opens it in the reply ledger, which is what
-    /// binds what that turn answers to that turn: a message read after this
-    /// turn's executor finished can no longer be attributed to the next one.
+    /// Opening a turn here also opens it in the reply ledger, and dropping the
+    /// guard closes it there, which is what binds what that turn answers to
+    /// that turn: a message read after it can no longer be attributed to it,
+    /// and its end cannot close the turn after it.
     pub fn begin_turn(self: &Arc<Self>) -> QueuedSubmitTurnGuard {
         *self
             .active_turns
             .lock()
             .expect("queued submit turns poisoned") += 1;
-        self.reply_ledger.begin_turn();
-        QueuedSubmitTurnGuard(self.clone())
+        let generation = self.reply_ledger.begin_turn();
+        QueuedSubmitTurnGuard {
+            poller: self.clone(),
+            generation,
+        }
     }
 
     /// Save feedback not consumed by attachment injection for the next replay.
@@ -414,22 +434,18 @@ impl MidTurnQueuedSubmitPoller {
     /// attachment uuid, which is what makes the injection a transcript row a
     /// resume can draw again rather than a message that only ever existed in
     /// one request.
+    ///
+    /// Queuing it does not make the turn an answer to its sender; reading it
+    /// does (see [`AttachmentPoller::poll`] below). A turn that ends before its
+    /// next tool round never read the message, and must not reply as if it had.
     pub fn enqueue_agent_message(
         &self,
         message_id: String,
         framed: String,
         from_session_id: &str,
         hops: u8,
+        verdict: rebon_tool::peer::WakeVerdict,
     ) {
-        // The turn now knows whose message it is reading, so a reply to that
-        // peer carries one more hop than the message did. A turn that received
-        // two answers the second, which is the one whose context is freshest.
-        //
-        // Noted against the turn this queue is filling: the executor finishes
-        // its turn before the event loop sees it end, and a message read in
-        // that window belongs to the next turn, which may be one the person
-        // typed. The ledger drops a note whose turn is no longer open.
-        self.reply_ledger.note_inbound_now(from_session_id, hops);
         self.agent_messages
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -438,6 +454,7 @@ impl MidTurnQueuedSubmitPoller {
                 framed,
                 from_session_id: from_session_id.to_string(),
                 hops,
+                verdict,
             });
     }
 
@@ -450,16 +467,21 @@ impl MidTurnQueuedSubmitPoller {
     ///
     /// Called once the turn is over (or while the session is idle), so the
     /// message can start a fresh turn instead of waiting for a tool round that
-    /// may never come — an external agent turn has none at all.
+    /// may never come — an external agent turn has none at all. Whether it may
+    /// is still the wake bounds' decision: each message keeps the verdict its
+    /// reception reached, and one that only joined the turn comes back
+    /// unjudged.
     pub fn take_pending_agent_messages(&self) -> Vec<DeferredAgentMessage> {
         self.agent_messages
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .drain(..)
             .map(|message| DeferredAgentMessage {
+                message_id: message.message_id,
                 text: message.framed,
                 from_session_id: message.from_session_id,
                 hops: message.hops,
+                verdict: message.verdict,
             })
             .collect()
     }
@@ -681,8 +703,15 @@ impl AttachmentPoller for MidTurnQueuedSubmitPoller {
         // both what the model reads and what the transcript shows, and the
         // marker is what lets a resumed turn draw the same row again.
         messages.extend(agent_messages.drain(..).map(|message| {
+            // The turn is reading this message now, so a reply to its sender
+            // carries one more hop than it did. A turn that read two answers
+            // the second, whose context is the freshest. Noted here rather than
+            // when the message was queued, because only a turn that reads it
+            // answers it: one that ended first never saw it.
+            self.reply_ledger
+                .note_inbound_now(&message.from_session_id, message.hops);
             rebon_core::query::visible_runtime_attachment_message(
-                &format!("u-agent-message-{}", message.message_id),
+                &rebon_core::query::agent_message_row_uuid(&message.message_id),
                 message.framed.clone(),
                 message.framed,
             )
@@ -691,20 +720,13 @@ impl AttachmentPoller for MidTurnQueuedSubmitPoller {
 
         messages
     }
-
-    /// The turn is over, so what it was answering no longer applies.
-    ///
-    /// The wake counts are deliberately not cleared: they exist to slow one
-    /// peer down across turns, and a per-turn reset would count nothing.
-    fn finish_turn_for_query(&self, _session_id: &str, _turn_id: &str, _succeeded: bool) {
-        self.reply_ledger.end_turn();
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rebon_api::{ContentBlock, Role};
+    use rebon_tool::peer::WakeVerdict;
 
     fn request(next_iteration: u64) -> AttachmentPollRequest<'static> {
         AttachmentPollRequest::new(
@@ -734,7 +756,13 @@ mod tests {
     fn an_agent_message_is_injected_as_a_visible_framed_attachment() {
         let poller = MidTurnQueuedSubmitPoller::new("session");
         let frame = "<teammate-message teammate_id=\"main@session:s\" from_session=\"s\">\nhello\n</teammate-message>";
-        poller.enqueue_agent_message("m-1".into(), frame.to_string(), "sess-sender", 0);
+        poller.enqueue_agent_message(
+            "m-1".into(),
+            frame.to_string(),
+            "sess-sender",
+            0,
+            WakeVerdict::Unjudged,
+        );
         assert_eq!(poller.pending_len(), 1);
 
         let eager = AttachmentPollRequest::new("session", "turn", 1, AttachmentPollPhase::Eager);
@@ -787,8 +815,20 @@ mod tests {
     #[test]
     fn an_agent_message_the_turn_never_reached_is_taken_back_for_idle() {
         let poller = MidTurnQueuedSubmitPoller::new("session");
-        poller.enqueue_agent_message("m-1".into(), "first".into(), "sess-sender", 0);
-        poller.enqueue_agent_message("m-2".into(), "second".into(), "sess-sender", 0);
+        poller.enqueue_agent_message(
+            "m-1".into(),
+            "first".into(),
+            "sess-sender",
+            0,
+            WakeVerdict::Unjudged,
+        );
+        poller.enqueue_agent_message(
+            "m-2".into(),
+            "second".into(),
+            "sess-sender",
+            0,
+            WakeVerdict::Unjudged,
+        );
         assert_eq!(poller.pending_len(), 2);
 
         assert_eq!(
@@ -802,7 +842,13 @@ mod tests {
         assert_eq!(poller.pending_len(), 0);
         assert!(poller.poll(request(1)).is_empty());
 
-        poller.enqueue_agent_message("m-3".into(), "third".into(), "sess-sender", 0);
+        poller.enqueue_agent_message(
+            "m-3".into(),
+            "third".into(),
+            "sess-sender",
+            0,
+            WakeVerdict::Unjudged,
+        );
         poller.clear_pending();
         assert_eq!(poller.pending_len(), 0);
         assert!(poller.take_pending_agent_messages().is_empty());
@@ -1185,14 +1231,26 @@ mod tests {
     }
 
     /// A message read inside a running turn makes that turn the one answering
-    /// its sender, and the message the turn never reaches keeps its depth so
-    /// the turn that finally carries it still answers.
+    /// its sender. Reading is what does it, not queuing: the note is taken when
+    /// the tool round hands the message to the model.
     #[test]
     fn an_injected_agent_message_makes_the_running_turn_reply_one_hop_deeper() {
         let poller = MidTurnQueuedSubmitPoller::new("sess-hops-injected");
         let _guard = poller.begin_turn();
-        poller.enqueue_agent_message("m-1".into(), "frame".into(), "sess-peer", 2);
+        poller.enqueue_agent_message(
+            "m-1".into(),
+            "frame".into(),
+            "sess-peer",
+            2,
+            WakeVerdict::Unjudged,
+        );
+        assert_eq!(
+            poller.reply_ledger().reply_hops("sess-peer"),
+            0,
+            "a message the turn has not read yet is not something it answers"
+        );
 
+        assert_eq!(poller.poll(request(1)).len(), 1);
         assert_eq!(poller.reply_ledger().reply_hops("sess-peer"), 3);
         assert_eq!(
             poller.reply_ledger().reply_hops("sess-other"),
@@ -1202,39 +1260,83 @@ mod tests {
     }
 
     /// The turn ended before its next tool round, so the message is handed back
-    /// with what it needs to be answered later rather than becoming an
-    /// unattributed turn.
+    /// with what it needs to be answered later — and with its verdict, so one
+    /// that only joined the turn is judged before it may start a turn of its
+    /// own — rather than becoming an unattributed turn.
     #[test]
-    fn a_message_taken_back_for_idle_keeps_its_sender_and_depth() {
+    fn a_message_taken_back_for_idle_keeps_its_sender_depth_and_verdict() {
         let poller = MidTurnQueuedSubmitPoller::new("sess-hops-deferred");
-        let _guard = poller.begin_turn();
-        poller.enqueue_agent_message("m-1".into(), "frame".into(), "sess-peer", 4);
+        let guard = poller.begin_turn();
+        poller.enqueue_agent_message(
+            "m-1".into(),
+            "frame".into(),
+            "sess-peer",
+            4,
+            WakeVerdict::Unjudged,
+        );
+        poller.enqueue_agent_message(
+            "m-2".into(),
+            "admitted".into(),
+            "sess-peer",
+            1,
+            WakeVerdict::Admitted,
+        );
+        drop(guard);
 
         assert_eq!(
             poller.take_pending_agent_messages(),
-            vec![DeferredAgentMessage {
-                text: "frame".into(),
-                from_session_id: "sess-peer".into(),
-                hops: 4,
-            }]
+            vec![
+                DeferredAgentMessage {
+                    message_id: "m-1".into(),
+                    text: "frame".into(),
+                    from_session_id: "sess-peer".into(),
+                    hops: 4,
+                    verdict: WakeVerdict::Unjudged,
+                },
+                DeferredAgentMessage {
+                    message_id: "m-2".into(),
+                    text: "admitted".into(),
+                    from_session_id: "sess-peer".into(),
+                    hops: 1,
+                    verdict: WakeVerdict::Admitted,
+                },
+            ]
+        );
+        assert_eq!(
+            poller.reply_ledger().reply_hops("sess-peer"),
+            0,
+            "the turn that never read them does not answer their sender"
         );
     }
 
-    /// A message that arrived after the executor finished its turn cannot be
+    /// A message queued for a turn that ends without reading it cannot be
     /// attributed to the next one, which may be a prompt the person typed: that
     /// turn must report no hops at all.
     #[test]
-    fn a_message_read_between_turns_does_not_deepen_the_next_turn() {
+    fn a_message_queued_but_never_read_does_not_deepen_the_next_turn() {
         let poller = MidTurnQueuedSubmitPoller::new("sess-hops-between");
         let guard = poller.begin_turn();
-        poller.enqueue_agent_message("m-1".into(), "frame".into(), "sess-peer", 1);
+        poller.enqueue_agent_message(
+            "m-1".into(),
+            "frame".into(),
+            "sess-peer",
+            1,
+            WakeVerdict::Unjudged,
+        );
+        assert_eq!(poller.poll(request(1)).len(), 1);
         assert_eq!(poller.reply_ledger().reply_hops("sess-peer"), 2);
 
-        // The executor is done and closed the turn; the event loop has not seen
-        // it yet, and a second message arrives in that window.
-        poller.reply_ledger().end_turn();
-        poller.enqueue_agent_message("m-2".into(), "frame".into(), "sess-peer", 1);
+        // The executor is done; the event loop has not seen it yet, and a
+        // second message is queued in that window.
+        poller.enqueue_agent_message(
+            "m-2".into(),
+            "frame".into(),
+            "sess-peer",
+            1,
+            WakeVerdict::Unjudged,
+        );
         drop(guard);
+        assert_eq!(poller.reply_ledger().reply_hops("sess-peer"), 0);
 
         let _next = poller.begin_turn();
         assert_eq!(
@@ -1242,5 +1344,29 @@ mod tests {
             0,
             "the next turn answers nobody unless the idle path staged a message for it"
         );
+    }
+
+    /// Esc hands the prompt back before the cancelled executor has exited, so
+    /// the next turn can be admitted while the old one still holds its guard.
+    /// The old guard's drop must close only its own turn: the new one keeps the
+    /// depth it was staged with.
+    #[test]
+    fn a_cancelled_turn_ending_late_does_not_close_the_turn_after_it() {
+        let poller = MidTurnQueuedSubmitPoller::new("sess-hops-cancel-race");
+        let cancelled = poller.begin_turn();
+
+        poller.reply_ledger().stage_inbound("sess-peer", 2);
+        let next = poller.begin_turn();
+        assert_eq!(poller.reply_ledger().reply_hops("sess-peer"), 3);
+
+        drop(cancelled);
+        assert_eq!(
+            poller.reply_ledger().reply_hops("sess-peer"),
+            3,
+            "the turn now running still answers the message that started it"
+        );
+
+        drop(next);
+        assert_eq!(poller.reply_ledger().reply_hops("sess-peer"), 0);
     }
 }

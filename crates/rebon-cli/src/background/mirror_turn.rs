@@ -61,17 +61,30 @@ fn entry_is_meta_user(entry: &rebon_session::TranscriptEntry) -> bool {
 /// Whether a user entry opens a turn.
 ///
 /// Meta entries mostly ride inside a turn (attachments, runtime context) and
-/// are not boundaries. The exception is an internal prompt (`u-internal-…`):
-/// a task notification, a cron fire, a follow-up the session queued for
-/// itself. It is meta because nobody typed it, but it is what the turn was
-/// started from. Missing it left a mirror on the previous boundary, so the
-/// streamed text of every such turn piled up in one overlay that was never
-/// cleared.
+/// are not boundaries. The exceptions are rows nobody typed that a turn was
+/// started from. An internal prompt (`u-internal-…`) — a task notification, a
+/// cron fire, a follow-up the session queued for itself — is meta. Another
+/// session's message that started a turn is a runtime attachment like the same
+/// message queued into a running turn, but written as the turn's own prompt
+/// rather than queued (`queuedCommand`). Missing either left a mirror on the
+/// previous boundary, so the streamed text of every such turn piled up in one
+/// overlay that was never cleared.
 fn entry_is_user_turn(entry: &rebon_session::TranscriptEntry) -> bool {
     if entry.entry_type != "user" {
         return false;
     }
-    if entry_is_meta_user(entry) && !entry.uuid.starts_with("u-internal-") {
+    let flag = |key: &str| {
+        entry
+            .raw
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    let opened_by_another_session = flag("runtimeAttachment") && !flag("queuedCommand");
+    if entry_is_meta_user(entry)
+        && !entry.uuid.starts_with("u-internal-")
+        && !opened_by_another_session
+    {
         return false;
     }
     let Some(content) = entry
@@ -1130,15 +1143,18 @@ mod tests {
     /// boundary it moved would take `last_remote_user_turn_uuid` with it.
     #[test]
     fn a_persisted_agent_message_attachment_is_not_a_user_turn() {
+        // As the executor persists it: the marker stripped, the frame in one
+        // block, queued into the running turn.
         let mut attachment = transcript_entry(
             "user",
             "u-agent-message-m-1",
             serde_json::json!([
-                {"type": "text", "text": "<rebon-visible-runtime-attachment uuid=\"u-agent-message-m-1\">"},
-                {"type": "text", "text": "<teammate-message teammate_id=\"main@session:sess-sender\">go</teammate-message>"}
+                {"type": "text", "text": "<teammate-message teammate_id=\"main@session:sess-sender\" from_session=\"sess-sender\">\ngo\n</teammate-message>"}
             ]),
         );
         attachment.raw["runtimeAttachment"] = serde_json::json!(true);
+        attachment.raw["queuedCommand"] = serde_json::json!(true);
+        attachment.raw["iteration"] = serde_json::json!(1);
 
         let entries = vec![
             transcript_entry(
@@ -1165,6 +1181,55 @@ mod tests {
             "the attachment did not end the turn it arrived in"
         );
         assert_eq!(turn.assistant_text, "done");
+    }
+
+    /// A turn another session's message started opens with that message's row,
+    /// marked as a runtime attachment so it does not read as the person's words.
+    /// It is still what the turn was started from: it ends the turn before it
+    /// and is the boundary the mirror follows.
+    #[test]
+    fn a_turn_another_session_started_opens_at_the_message_row() {
+        // As the executor persists a turn's prompt row: one text block, written
+        // as a string, and not queued into a running turn.
+        let mut opening = transcript_entry(
+            "user",
+            "u-agent-message-m-2",
+            serde_json::json!("<teammate-message teammate_id=\"main@session:sess-sender\" from_session=\"sess-sender\">\nnext\n</teammate-message>"),
+        );
+        opening.raw["runtimeAttachment"] = serde_json::json!(true);
+
+        let entries = vec![
+            transcript_entry(
+                "user",
+                "u-typed",
+                serde_json::json!([{"type": "text", "text": "do the work"}]),
+            ),
+            transcript_entry(
+                "assistant",
+                "a-1",
+                serde_json::json!([{"type": "text", "text": "done"}]),
+            ),
+            opening,
+            transcript_entry(
+                "assistant",
+                "a-2",
+                serde_json::json!([{"type": "text", "text": "on it"}]),
+            ),
+        ];
+
+        assert_eq!(
+            last_remote_user_turn_uuid(&entries).as_deref(),
+            Some("u-agent-message-m-2")
+        );
+        let typed = persisted_remote_turn(&entries, "u-typed");
+        assert!(
+            typed.next_user_found,
+            "the message's turn ends the typed one"
+        );
+        assert_eq!(typed.assistant_text, "done");
+        let opened = persisted_remote_turn(&entries, "u-agent-message-m-2");
+        assert!(opened.boundary_found);
+        assert_eq!(opened.assistant_text, "on it");
     }
 
     #[test]

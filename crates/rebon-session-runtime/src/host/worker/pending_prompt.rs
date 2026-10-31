@@ -123,9 +123,19 @@ pub(crate) fn claim_background_job(
             next_generation,
         ));
         current.process.status = BackgroundJobStatus::Running;
+        // A head an earlier turn was already claimed for may have a durable
+        // row; it is taken up again rather than passed over.
+        let resumes_head = current
+            .identity
+            .pending_prompts
+            .first()
+            .is_some_and(|prompt| prompt.claimed_turn_generation.is_some());
         for prompt in &mut current.identity.pending_prompts {
             prompt.claimed_turn_generation = None;
             prompt.completed_turn_generation = None;
+        }
+        if !resumes_head {
+            lead_with_turn_driver(&mut current.identity.pending_prompts);
         }
         if let Some(prompt) = current.identity.pending_prompts.first_mut() {
             prompt.claimed_turn_generation = Some(current.process.turn_generation);
@@ -139,6 +149,111 @@ pub(crate) fn claim_background_job(
         // the transcript UUID to resume without duplicating the user row.
         Ok(WorkerClaim::Claimed(Box::new(current.clone())))
     })
+}
+
+/// Move the prompt a turn starting now is for to the head of the queue, where
+/// the claim takes it.
+///
+/// That is the first prompt that is not another session's message — something
+/// a person typed, a cron fire, a report — moved ahead of any such message
+/// waiting before it. That message was either refused a turn of its own or is
+/// riding along with one; either way the turn must not be claimed for it, or a
+/// person's prompt would run as the rider while the message spoke for the turn
+/// (its depth, its origin, no `user_prompt`). The messages it passes stay in
+/// order behind it and reach the turn at its first poll. When every waiting
+/// prompt is another session's message, the head stays the head: that is
+/// where the one admitted to start this turn was put (see
+/// [`lead_agent_messages_with`]).
+fn lead_with_turn_driver(prompts: &mut [PendingPrompt]) {
+    if let Some(driver) = prompts.iter().position(|prompt| !prompt.is_agent_message()) {
+        prompts[..=driver].rotate_right(1);
+    }
+}
+
+/// Put the agent message at `index` ahead of every other waiting agent
+/// message, because the bounds admitted it to start a turn and the claim takes
+/// the head. Prompts already claimed keep their place.
+pub(crate) fn lead_agent_messages_with(state: &mut BackgroundJobState, index: usize) {
+    let prompts = &mut state.identity.pending_prompts;
+    let Some(first_waiting) = prompts
+        .iter()
+        .position(|prompt| prompt.is_agent_message() && prompt.claimed_turn_generation.is_none())
+    else {
+        return;
+    };
+    if first_waiting < index {
+        prompts[first_waiting..=index].rotate_right(1);
+    }
+}
+
+/// Whether another session's message may start a turn here, judged by this
+/// session's own bounds and spending a wake if it may.
+///
+/// A job with no session yet has no bounds to apply.
+pub(crate) fn judge_agent_prompt_wake(
+    state: &BackgroundJobState,
+    prompt: &PendingPrompt,
+    now_ms: u64,
+) -> rebon_tool::peer::WakeVerdict {
+    let Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
+        from_session_id,
+        hops,
+        ..
+    }) = prompt.origin.as_ref()
+    else {
+        return rebon_tool::peer::WakeVerdict::Admitted;
+    };
+    match state.identity.session_id.as_deref() {
+        Some(session_id) => rebon_tool::peer::session_reply_ledger(session_id).judge_wake(
+            from_session_id,
+            *hops,
+            now_ms,
+        ),
+        None => rebon_tool::peer::WakeVerdict::Admitted,
+    }
+}
+
+/// Whether what is still waiting once a turn is over starts another turn.
+///
+/// Anything but another session's message does: somebody asked for it. A
+/// message from another session left waiting was never read by the turn — it
+/// arrived while the turn ran, or rode in one that ended before reaching it —
+/// and joining a turn was never judged against the wake bounds. So it starts a
+/// turn only if the bounds admit it now; the first one they admit leads the
+/// queue so the turn is claimed for it, and the rest ride along. None admitted:
+/// they wait for a turn somebody else starts.
+pub(crate) fn waiting_prompts_start_a_turn(state: &mut BackgroundJobState, now_ms: u64) -> bool {
+    if state
+        .identity
+        .pending_prompts
+        .iter()
+        .any(|prompt| !prompt.is_agent_message())
+    {
+        return true;
+    }
+    for index in 0..state.identity.pending_prompts.len() {
+        let verdict =
+            judge_agent_prompt_wake(state, &state.identity.pending_prompts[index], now_ms);
+        if verdict == rebon_tool::peer::WakeVerdict::Admitted {
+            lead_agent_messages_with(state, index);
+            return true;
+        }
+    }
+    false
+}
+
+/// The uuid of the transcript row a claimed prompt opens its turn with.
+///
+/// Its own id — except another session's message, whose row is named the way
+/// that message's row is wherever it lands. The name is what makes the turn
+/// write the row as a runtime attachment rather than as the person's words,
+/// and it is also what the durability check looks the row up by.
+pub(crate) fn pending_prompt_row_uuid(prompt: &PendingPrompt) -> String {
+    if prompt.is_agent_message() {
+        rebon_core::query::agent_message_row_uuid(&prompt.id)
+    } else {
+        prompt.id.clone()
+    }
 }
 
 pub(crate) fn claimed_pending_prompts(state: &BackgroundJobState) -> &[PendingPrompt] {
@@ -183,6 +298,13 @@ pub(crate) struct BackgroundPendingPromptPoller {
     ipc_port: u16,
     ipc_token: String,
     coordinator_report_paths: Mutex<std::collections::HashMap<String, Vec<PathBuf>>>,
+    /// The prompts already waiting, unclaimed, when this turn was claimed.
+    ///
+    /// They ride along — the turn reads them at its first poll — but the turn
+    /// was not started for them: a message another session sent that rides in
+    /// a turn somebody typed is context, not something the turn is answering,
+    /// and must not lend that turn its depth.
+    passengers: std::collections::HashSet<String>,
 }
 
 impl BackgroundPendingPromptPoller {
@@ -199,7 +321,35 @@ impl BackgroundPendingPromptPoller {
             ipc_port: ipc.port,
             ipc_token: ipc.token.clone(),
             coordinator_report_paths: Mutex::new(std::collections::HashMap::new()),
+            passengers: state
+                .identity
+                .pending_prompts
+                .iter()
+                .filter(|prompt| {
+                    prompt.claimed_turn_generation != Some(state.process.turn_generation)
+                })
+                .map(|prompt| prompt.id.clone())
+                .collect(),
         })
+    }
+
+    /// The running turn is reading `prompt`: if another session sent it while
+    /// the turn ran, the turn now answers that session, and a reply to it
+    /// carries one more hop. A prompt that was already waiting when the turn
+    /// was claimed only rides along and records nothing.
+    fn note_answered(&self, session_id: &str, prompt: &PendingPrompt) {
+        let Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
+            from_session_id,
+            hops,
+            ..
+        }) = prompt.origin.as_ref()
+        else {
+            return;
+        };
+        if self.passengers.contains(&prompt.id) {
+            return;
+        }
+        rebon_tool::peer::session_reply_ledger(session_id).note_inbound_now(from_session_id, *hops);
     }
 
     pub(crate) fn owns_turn(&self, state: &BackgroundJobState, session_id: &str) -> bool {
@@ -359,15 +509,7 @@ pub(crate) fn spawn_background_steer_pump(
                     // The running turn is now reading this message, so a reply
                     // to its sender carries one more hop — the same thing the
                     // tool round's poller does for the local engine.
-                    if let Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
-                        from_session_id,
-                        hops,
-                        ..
-                    }) = prompt.origin.as_ref()
-                    {
-                        rebon_tool::peer::session_reply_ledger(&session_id)
-                            .note_inbound_now(from_session_id, *hops);
-                    }
+                    poller.note_answered(&session_id, &prompt);
                     // The steer blocks already carry the framed message; a
                     // queued-user row would render it as something the user
                     // typed, which it is not.
@@ -444,7 +586,7 @@ pub(crate) fn pending_prompt_attachment_message(prompt: &PendingPrompt) -> rebon
     if prompt.is_agent_message() {
         let framed = prompt.text.clone();
         return rebon_core::query::visible_runtime_attachment_message(
-            &format!("u-agent-message-{}", prompt.id),
+            &rebon_core::query::agent_message_row_uuid(&prompt.id),
             framed.clone(),
             framed,
         );
@@ -505,15 +647,7 @@ impl AttachmentPoller for BackgroundPendingPromptPoller {
                     // The running turn is now reading this message, so a reply
                     // to its sender carries one more hop — the hosted half of
                     // what the local engine's mid-turn queue records.
-                    if let Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
-                        from_session_id,
-                        hops,
-                        ..
-                    }) = prompt.origin.as_ref()
-                    {
-                        rebon_tool::peer::session_reply_ledger(request.session_id)
-                            .note_inbound_now(from_session_id, *hops);
-                    }
+                    self.note_answered(request.session_id, prompt);
                     let _ = self.store.append_event(
                         &self.job_id,
                         "pending_prompt_injected",
@@ -611,9 +745,12 @@ impl PendingPromptTranscriptState {
 
 /// Whether a user row starts a new turn. Rows the runtime writes into a
 /// running turn do not: meta and context rows, rows only shown in the
-/// transcript, and runtime attachments — the group entries a plugin hands a
-/// member mid-turn, which are queued rows like a typed message but arrive
-/// inside the turn and are answered by it.
+/// transcript, and runtime attachments queued into a turn — the group entries
+/// a plugin hands a member mid-turn and the messages other sessions send,
+/// which are queued rows like a typed message but arrive inside the turn and
+/// are answered by it. A runtime attachment that was not queued is the prompt
+/// row of a turn another session's message started: not the person's words,
+/// but what that turn opened with.
 pub(crate) fn transcript_user_entry_is_turn_boundary(
     entry: &rebon_session::TranscriptEntry,
 ) -> bool {
@@ -628,7 +765,7 @@ pub(crate) fn transcript_user_entry_is_turn_boundary(
         || flag("isMeta")
         || flag("runtimeContext")
         || flag("isVisibleInTranscriptOnly")
-        || flag("runtimeAttachment")
+        || (flag("runtimeAttachment") && flag("queuedCommand"))
     {
         return false;
     }
@@ -899,14 +1036,23 @@ pub(crate) fn pending_prompt_transcript_state(
     else {
         return PendingPromptTranscriptState::Missing;
     };
+    claimed_prompts_transcript_state_in_messages(&loaded.messages, claimed)
+}
+
+/// What the transcript says about the claimed prompts `claimed`, which is
+/// never empty.
+pub(crate) fn claimed_prompts_transcript_state_in_messages(
+    messages: &[rebon_session::TranscriptEntry],
+    claimed: &[PendingPrompt],
+) -> PendingPromptTranscriptState {
     // The turn's head prompt produced a durable user row. A message another
     // agent sent mid-turn is an injected attachment with its own generated
     // uuid, so it is not expected to appear under its message id — only the
     // head is checked, which is also what keeps the durability rule about
     // "the prompt this turn started from" rather than every injection.
-    let mut prompt_ids = claimed.iter().map(|prompt| prompt.id.as_str());
-    let head = prompt_ids.next();
-    let mut ids: Vec<&str> = head.into_iter().collect();
+    let head = &claimed[0];
+    let head_row = pending_prompt_row_uuid(head);
+    let mut ids: Vec<&str> = vec![head_row.as_str()];
     ids.extend(
         claimed
             .iter()
@@ -914,5 +1060,12 @@ pub(crate) fn pending_prompt_transcript_state(
             .filter(|prompt| prompt.typed_by_user())
             .map(|prompt| prompt.id.as_str()),
     );
-    pending_prompts_transcript_state_in_messages(&loaded.messages, &ids)
+    let found = pending_prompts_transcript_state_in_messages(messages, &ids);
+    if found != PendingPromptTranscriptState::Missing || head_row == head.id {
+        return found;
+    }
+    // A turn another session's message started before its row was named for
+    // the message wrote the row under the message id itself.
+    ids[0] = head.id.as_str();
+    pending_prompts_transcript_state_in_messages(messages, &ids)
 }

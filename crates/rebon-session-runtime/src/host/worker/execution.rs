@@ -1228,7 +1228,7 @@ fn start_background_side_channels(
     update_rx: tokio::sync::mpsc::UnboundedReceiver<rebon_types::SessionUpdateParams>,
     task_bridge_state: Option<BackgroundTaskBridgeState>,
 ) -> BackgroundTurnSideChannels {
-    let pending_user_message_uuid = claimed_pending_prompt(state).map(|prompt| prompt.id.clone());
+    let pending_user_message_uuid = claimed_pending_prompt(state).map(pending_prompt_row_uuid);
     let coordinator_report_paths = background_prompt_coordinator_report_paths(state);
     let (task_bridge_stop, task_bridge) = spawn_task_store_bridge_from_cursor(
         Arc::clone(&session.engine_half.tasks),

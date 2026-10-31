@@ -1063,7 +1063,9 @@ fn session_pipeline(
             && app.resume_dialog.is_none()
             && app.expanding_command.is_none()
             && app.queued_commands.is_empty()
-            && !session.engine_half.session_loop.inbox().has_context()
+            // A message only waiting for a turn somebody else starts is not
+            // one about to start: it must not hold idle work off indefinitely.
+            && !session.engine_half.session_loop.inbox().has_waking_context()
             && app.deferred_internal_submit_payloads.is_empty()
             && session.remote_background_attachment.is_none()
             && session.pending_hosted_session.is_none();

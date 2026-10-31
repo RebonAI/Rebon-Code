@@ -510,6 +510,89 @@ async fn background_steer_pump_does_not_echo_an_agent_message_as_user_input() {
     ipc.cancel.cancel();
 }
 
+/// An agent message steered into a running external-agent turn makes that turn
+/// the one answering its sender — when it arrived during the turn. One that was
+/// already waiting when the turn was claimed is steered in too, but only rides
+/// along: it was not what the turn was started for, and lends it no depth.
+#[tokio::test]
+async fn background_steer_pump_records_the_depth_of_a_message_sent_during_the_turn() {
+    fn agent_prompt(id: &str, from: &str, hops: u8) -> PendingPrompt {
+        let mut prompt = pending_prompt(
+            id,
+            &format!("<teammate-message>{id}</teammate-message>"),
+            Vec::new(),
+        );
+        prompt.origin = Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
+            from_session_id: from.into(),
+            from_agent: "main".into(),
+            from_handle: None,
+            from_name: None,
+            hops,
+        });
+        prompt
+    }
+
+    let session_id = "sess-steer-hops";
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.process.status = BackgroundJobStatus::Running;
+    state.process.turn_generation = 3;
+    state.identity.session_id = Some(session_id.into());
+    let ipc = start_background_ipc_server(&store, &state.identity.job_id).unwrap();
+    install_ipc_owner(&mut state, &ipc);
+    // Waiting before the turn was claimed: a passenger.
+    state.identity.pending_prompts = vec![agent_prompt("m-passenger", "sess-passenger", 3)];
+    store.write_state(&state).unwrap();
+    let poller = BackgroundPendingPromptPoller::new(store.clone(), &state, &ipc);
+    // Sent while the turn runs.
+    store
+        .update_state(&state.identity.job_id, |current| {
+            current
+                .identity
+                .pending_prompts
+                .push(agent_prompt("m-during", "sess-during", 1));
+            Ok(())
+        })
+        .unwrap();
+
+    let mid_turn_queue = crate::mid_turn_queue::MidTurnQueuedSubmitPoller::new(session_id);
+    let _turn = mid_turn_queue.begin_turn();
+    let (agents, _calls, mut sent) = test_steering_agents(
+        vec![
+            Ok(rebon_agent_core::SteerOutcome::Injected),
+            Ok(rebon_agent_core::SteerOutcome::Injected),
+        ],
+        session_id,
+        None,
+    );
+    let (publisher, _update_rx) = rebon_agent_core::ChannelSessionUpdatePublisher::new();
+    let publisher: Arc<dyn rebon_agent_core::SessionUpdatePublisher> = Arc::new(publisher);
+    let pump = spawn_background_steer_pump(agents, poller, publisher, session_id.into());
+    for expected in ["m-passenger", "m-during"] {
+        let delivered = tokio::time::timeout(Duration::from_secs(2), sent.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered, expected);
+    }
+    pump.stop().await;
+
+    let ledger = rebon_tool::peer::session_reply_ledger(session_id);
+    assert_eq!(
+        ledger.reply_hops("sess-during"),
+        2,
+        "the turn read a message sent during it, so it answers that sender"
+    );
+    assert_eq!(
+        ledger.reply_hops("sess-passenger"),
+        0,
+        "a message that was only riding along is not what the turn answers"
+    );
+    ipc.cancel.cancel();
+}
+
 #[tokio::test]
 async fn background_steer_pump_releases_undelivered_claims() {
     let outcomes = [
@@ -1016,6 +1099,100 @@ fn pending_prompt_transcript_state_reads_past_mid_turn_runtime_attachments() {
         .with_parent(prompt_id),
     );
     assert!(transcript_user_entry_is_turn_boundary(&typed));
+}
+
+/// A hosted turn another session's message started opens with that message's
+/// row: named for the message and marked as a runtime attachment, so it is not
+/// read as the person's words. It still opens its turn — unlike the same
+/// message queued into a running turn — so the turn before it ends there and
+/// the durability check finds the claimed prompt by that name.
+#[test]
+fn a_turn_another_session_started_opens_with_the_message_row_and_is_found_by_it() {
+    let frame = "<teammate-message teammate_id=\"main@session:sess-sender\" from_session=\"sess-sender\">\ngo\n</teammate-message>";
+    let mut head = pending_prompt("m-opened", frame, Vec::new());
+    head.origin = Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
+        from_session_id: "sess-sender".into(),
+        from_agent: "main".into(),
+        from_handle: None,
+        from_name: None,
+        hops: 0,
+    });
+    assert_eq!(pending_prompt_row_uuid(&head), "u-agent-message-m-opened");
+    assert_eq!(
+        pending_prompt_row_uuid(&pending_prompt("pp-typed", "typed", Vec::new())),
+        "pp-typed",
+        "a prompt the person typed keeps its own id"
+    );
+
+    // The shape the executor persists: one text block, written as a string.
+    let opening = rebon_session::finalize_transcript_entry(
+        &rebon_session::TranscriptWriteEntry::new(
+            "user",
+            serde_json::json!({
+                "message": {"role": "user", "content": frame},
+                "runtimeAttachment": true
+            }),
+        )
+        .with_uuid("u-agent-message-m-opened"),
+    );
+    // The same message queued into a running turn: marker stripped, one block.
+    let queued = rebon_session::finalize_transcript_entry(
+        &rebon_session::TranscriptWriteEntry::new(
+            "user",
+            serde_json::json!({
+                "message": {"role": "user", "content": [{"type": "text", "text": frame}]},
+                "queuedCommand": true,
+                "iteration": 1,
+                "runtimeAttachment": true
+            }),
+        )
+        .with_uuid("u-agent-message-m-queued"),
+    );
+    assert!(transcript_user_entry_is_turn_boundary(&opening));
+    assert!(!transcript_user_entry_is_turn_boundary(&queued));
+
+    let terminal = rebon_session::finalize_transcript_entry(
+        &rebon_session::TranscriptWriteEntry::new(
+            "assistant",
+            serde_json::json!({
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "answered"}],
+                    "stop_reason": "end_turn"
+                }
+            }),
+        )
+        .with_uuid("a-opened-terminal")
+        .with_parent("u-agent-message-m-opened"),
+    );
+    head.claimed_turn_generation = Some(4);
+    assert_eq!(
+        claimed_prompts_transcript_state_in_messages(
+            std::slice::from_ref(&opening),
+            std::slice::from_ref(&head)
+        ),
+        PendingPromptTranscriptState::ResumeSavedUser
+    );
+    assert_eq!(
+        claimed_prompts_transcript_state_in_messages(
+            &[opening, terminal],
+            std::slice::from_ref(&head)
+        ),
+        PendingPromptTranscriptState::Completed
+    );
+
+    // A row written before it was named for the message is still found.
+    let legacy = rebon_session::finalize_transcript_entry(
+        &rebon_session::TranscriptWriteEntry::new(
+            "user",
+            serde_json::json!({"message": {"role": "user", "content": frame}}),
+        )
+        .with_uuid("m-opened"),
+    );
+    assert_eq!(
+        claimed_prompts_transcript_state_in_messages(&[legacy], &[head]),
+        PendingPromptTranscriptState::ResumeSavedUser
+    );
 }
 
 #[test]
