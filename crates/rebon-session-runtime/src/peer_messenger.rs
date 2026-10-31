@@ -107,6 +107,7 @@ fn envelope(
         from_name,
         summary: message.summary,
         text: message.text,
+        hops: message.hops,
     })
 }
 
@@ -232,6 +233,7 @@ mod tests {
                     from_name: None,
                     summary: None,
                     text: "hello".into(),
+                    hops: 0,
                 },
             )
             .await
@@ -249,6 +251,7 @@ mod tests {
             from_name: None,
             summary: None,
             text: "hello".into(),
+            hops: 0,
         };
         let root = std::path::Path::new("/nonexistent-projects");
         let first = envelope(root, message()).unwrap();

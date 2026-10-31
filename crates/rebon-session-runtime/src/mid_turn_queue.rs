@@ -29,6 +29,10 @@ pub enum QueuedSubmitWithdrawal {
 #[derive(Debug)]
 pub struct MidTurnQueuedSubmitPoller {
     session_id: String,
+    /// What this session was told this turn, and how often one peer may wake
+    /// it. Shared with the turn's `ToolContext`, so a reply to the peer whose
+    /// message started the turn carries the depth that message came with.
+    reply_ledger: Arc<rebon_tool::peer::AgentReplyLedger>,
     queue: Mutex<VecDeque<SubmitPayload>>,
     /// Framed `<teammate-message>` text from a cross-session agent, waiting for
     /// the next tool round.
@@ -81,8 +85,10 @@ impl Drop for QueuedSubmitTurnGuard {
 
 impl MidTurnQueuedSubmitPoller {
     pub fn new(session_id: impl Into<String>) -> Arc<Self> {
+        let session_id = session_id.into();
         Arc::new(Self {
-            session_id: session_id.into(),
+            reply_ledger: rebon_tool::peer::session_reply_ledger(&session_id),
+            session_id,
             queue: Mutex::new(VecDeque::new()),
             agent_messages: Mutex::new(VecDeque::new()),
             consumed_user_message_uuids: Mutex::new(HashSet::new()),
@@ -388,7 +394,17 @@ impl MidTurnQueuedSubmitPoller {
     /// attachment uuid, which is what makes the injection a transcript row a
     /// resume can draw again rather than a message that only ever existed in
     /// one request.
-    pub fn enqueue_agent_message(&self, message_id: String, framed: String) {
+    pub fn enqueue_agent_message(
+        &self,
+        message_id: String,
+        framed: String,
+        from_session_id: &str,
+        hops: u8,
+    ) {
+        // The turn now knows whose message it is reading, so a reply to that
+        // peer carries one more hop than the message did. A turn that received
+        // two answers the second, which is the one whose context is freshest.
+        self.reply_ledger.note_inbound(from_session_id, hops);
         self.agent_messages
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -396,6 +412,11 @@ impl MidTurnQueuedSubmitPoller {
                 message_id,
                 framed,
             });
+    }
+
+    /// The session's reply ledger, shared with the turn's `ToolContext`.
+    pub fn reply_ledger(&self) -> Arc<rebon_tool::peer::AgentReplyLedger> {
+        self.reply_ledger.clone()
     }
 
     /// Take back every agent message the running turn never injected.
@@ -639,6 +660,14 @@ impl AttachmentPoller for MidTurnQueuedSubmitPoller {
 
         messages
     }
+
+    /// The turn is over, so what it was answering no longer applies.
+    ///
+    /// The wake counts are deliberately not cleared: they exist to slow one
+    /// peer down across turns, and a per-turn reset would count nothing.
+    fn finish_turn_for_query(&self, _session_id: &str, _turn_id: &str, _succeeded: bool) {
+        self.reply_ledger.end_turn();
+    }
 }
 
 #[cfg(test)]
@@ -674,7 +703,7 @@ mod tests {
     fn an_agent_message_is_injected_as_a_visible_framed_attachment() {
         let poller = MidTurnQueuedSubmitPoller::new("session");
         let frame = "<teammate-message teammate_id=\"main@session:s\" from_session=\"s\">\nhello\n</teammate-message>";
-        poller.enqueue_agent_message("m-1".into(), frame.to_string());
+        poller.enqueue_agent_message("m-1".into(), frame.to_string(), "sess-sender", 0);
         assert_eq!(poller.pending_len(), 1);
 
         let eager = AttachmentPollRequest::new("session", "turn", 1, AttachmentPollPhase::Eager);
@@ -726,8 +755,8 @@ mod tests {
     #[test]
     fn an_agent_message_the_turn_never_reached_is_taken_back_for_idle() {
         let poller = MidTurnQueuedSubmitPoller::new("session");
-        poller.enqueue_agent_message("m-1".into(), "first".into());
-        poller.enqueue_agent_message("m-2".into(), "second".into());
+        poller.enqueue_agent_message("m-1".into(), "first".into(), "sess-sender", 0);
+        poller.enqueue_agent_message("m-2".into(), "second".into(), "sess-sender", 0);
         assert_eq!(poller.pending_len(), 2);
 
         assert_eq!(
@@ -737,7 +766,7 @@ mod tests {
         assert_eq!(poller.pending_len(), 0);
         assert!(poller.poll(request(1)).is_empty());
 
-        poller.enqueue_agent_message("m-3".into(), "third".into());
+        poller.enqueue_agent_message("m-3".into(), "third".into(), "sess-sender", 0);
         poller.clear_pending();
         assert_eq!(poller.pending_len(), 0);
         assert!(poller.take_pending_agent_messages().is_empty());

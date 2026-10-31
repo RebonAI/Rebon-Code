@@ -2056,6 +2056,7 @@ pub fn append_agent_message_to_background_job(
         from_agent: envelope.from_agent.clone(),
         from_handle: envelope.from_handle.clone(),
         from_name: envelope.from_name.clone(),
+        hops: envelope.hops,
     });
     append_pending_prompt_durably(
         store,

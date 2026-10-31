@@ -172,7 +172,9 @@ impl ForegroundControl {
         Self {
             mailbox: crate::background::ForegroundMailbox::new(session),
             command_handler: None,
-            agent_inbox: Arc::new(rebon_session_host::ForegroundAgentInbox::new()),
+            agent_inbox: Arc::new(rebon_session_host::ForegroundAgentInbox::for_session(
+                &session.session_id,
+            )),
             agent_endpoint: None,
             agent_endpoint_session: None,
         }
@@ -237,6 +239,9 @@ impl ForegroundControl {
         {
             return;
         }
+        // The inbox outlives a session switch but its bounds must not: what the
+        // old session had been told says nothing about the new one.
+        self.agent_inbox.set_session(&identity.2);
         self.stop_agent_endpoint();
         // Remembered even when start fails: retrying every event-loop pass
         // would bind and discard a port each time, and the mailbox capability
@@ -289,7 +294,12 @@ impl ForegroundControl {
                     .engine_half
                     .runtime
                     .mid_turn_queue
-                    .enqueue_agent_message(envelope.message_id.clone(), framed);
+                    .enqueue_agent_message(
+                        envelope.message_id.clone(),
+                        framed,
+                        &envelope.from_session_id,
+                        envelope.hops,
+                    );
             }
             return;
         }
@@ -741,6 +751,7 @@ mod tests {
             from_name: Some("worker".into()),
             summary: Some("handoff".into()),
             text: "please continue".into(),
+            hops: 0,
         };
 
         let applied = control.apply(
@@ -834,6 +845,7 @@ mod tests {
                 from_name: None,
                 summary: None,
                 text: "wake up".into(),
+                hops: 0,
             },
         );
         assert!(matches!(applied, Ok(None)), "got {applied:?}");

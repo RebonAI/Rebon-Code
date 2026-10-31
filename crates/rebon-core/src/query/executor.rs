@@ -1486,6 +1486,10 @@ impl EngineQueryExecutor {
         if let Some(messenger) = &self.peer_messenger {
             ctx = ctx.with_peer_messenger(messenger.clone());
         }
+        // The ledger is the session's, not the executor's: what this session was
+        // told is what its inbox recorded, and the inbox lives in the runtime
+        // that hosts it.
+        ctx = ctx.with_peer_reply_ledger(rebon_tool::peer::session_reply_ledger(session_id));
         if let Some(controller) = &self.queue_controller {
             ctx = ctx.with_queue_controller(controller.clone());
         }

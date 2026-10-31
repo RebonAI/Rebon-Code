@@ -691,6 +691,11 @@ pub struct PeerMessage {
     pub from_name: Option<String>,
     pub summary: Option<String>,
     pub text: String,
+    /// How many cross-session hand-offs this message has already made. A
+    /// conversation the sender started is `0`; an answer to a message carries
+    /// that message's depth plus one, which is what stops two agents replying
+    /// to each other forever.
+    pub hops: u8,
 }
 
 /// Where a cross-session message ended up, as the target's owner reported it.
@@ -916,6 +921,15 @@ pub struct AutoModeContext {
 struct PeerContext {
     messenger: Option<Arc<dyn PeerMessenger>>,
 }
+
+/// A session's [`AgentReplyLedger`](crate::peer::AgentReplyLedger), carried in
+/// the [`Extensions`] bag.
+///
+/// Named rather than a bare `Arc` so the bag's key says what it holds: the
+/// session's inbox and its turn's `ToolContext` have to be looking at the same
+/// ledger, and a type alias would make that invisible at both ends.
+#[derive(Clone)]
+pub struct PeerReplyLedger(pub Arc<crate::peer::AgentReplyLedger>);
 
 #[derive(Clone, Default)]
 pub struct ToolContext {
@@ -1365,6 +1379,25 @@ impl ToolContext {
     pub fn with_peer_messenger(mut self, messenger: Arc<dyn PeerMessenger>) -> Self {
         self.update_extension::<PeerContext>(|peer| peer.messenger = Some(messenger));
         self
+    }
+
+    /// Attach the session's [`AgentReplyLedger`](crate::peer::AgentReplyLedger),
+    /// the same one its inbox records arrivals in.
+    ///
+    /// SendMessage reads it to label a reply with the depth of the message it
+    /// answers; without it every message looks like a first one, which is what
+    /// a session that never receives a cross-session message is.
+    pub fn with_peer_reply_ledger(
+        mut self,
+        ledger: Arc<crate::peer::AgentReplyLedger>,
+    ) -> Self {
+        self.extensions.insert(PeerReplyLedger(ledger));
+        self
+    }
+
+    /// Borrow the session's reply ledger, if one is attached.
+    pub fn peer_reply_ledger(&self) -> Option<&crate::peer::AgentReplyLedger> {
+        Some(self.extension::<PeerReplyLedger>()?.0.as_ref())
     }
 
     /// Attach a [`QueueController`] so a queue coordinator session can read the

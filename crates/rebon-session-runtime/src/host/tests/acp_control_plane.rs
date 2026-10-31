@@ -818,6 +818,7 @@ fn an_agent_message_over_acp_reaches_the_jobs_queue() {
         from_name: None,
         summary: Some("handoff".into()),
         text: "look at the build".into(),
+        hops: 0,
     };
     let reloaded = store.read_state(state.job_id()).unwrap();
     assert_eq!(reloaded.identity.pending_prompts.len(), 1);
@@ -834,6 +835,7 @@ fn an_agent_message_over_acp_reaches_the_jobs_queue() {
             from_agent: "main".into(),
             from_handle: None,
             from_name: None,
+            hops: 0,
         })
     );
 

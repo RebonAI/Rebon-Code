@@ -763,6 +763,7 @@ impl OwnerHandle {
             from_name,
             summary,
             text,
+            hops,
         } = envelope;
         let response = self.send(
             BackgroundIpcRequest::AgentMessage {
@@ -774,6 +775,7 @@ impl OwnerHandle {
                 from_name,
                 summary,
                 text,
+                hops,
             },
             command_id,
         )?;

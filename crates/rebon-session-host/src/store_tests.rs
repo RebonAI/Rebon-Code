@@ -4432,6 +4432,7 @@ fn agent_message_envelope(message_id: &str, text: &str) -> crate::AgentMessageEn
         from_name: None,
         summary: Some("handoff".into()),
         text: text.into(),
+        hops: 0,
     }
 }
 
@@ -4464,6 +4465,7 @@ fn an_agent_message_is_queued_without_starting_a_worker() {
             from_agent: "main".into(),
             from_handle: None,
             from_name: None,
+            hops: 0,
         })
     );
     assert!(

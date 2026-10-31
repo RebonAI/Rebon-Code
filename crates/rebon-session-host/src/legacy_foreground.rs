@@ -143,6 +143,11 @@ pub enum ForegroundCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
         text: String,
+        /// How many cross-session hand-offs this message has already made.
+        /// Additive for the same reason the variant is, and skipped at zero so
+        /// a first message's receipt is byte-identical to what it was.
+        #[serde(default, skip_serializing_if = "crate::agent_message::hops_is_zero")]
+        hops: u8,
     },
 }
 
@@ -1609,6 +1614,7 @@ mod tests {
             from_name: None,
             summary: Some("handoff".into()),
             text: "please continue".into(),
+            hops: 0,
         };
         send_foreground_command(&root, cwd, sid, &command).unwrap();
 
@@ -1630,6 +1636,7 @@ mod tests {
                 from_name: None,
                 summary: Some("handoff".into()),
                 text: "please continue".into(),
+                hops: 0,
             })
         );
         complete_foreground_command(&drained[0]).unwrap();

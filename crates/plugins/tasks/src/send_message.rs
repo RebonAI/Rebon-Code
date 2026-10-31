@@ -811,6 +811,12 @@ impl SendMessageTool {
             from_name: None,
             summary,
             text,
+            // Answering the peer that wrote to this turn continues its chain;
+            // writing to anyone else starts a new conversation.
+            hops: context
+                .peer_reply_ledger()
+                .map(|ledger| ledger.reply_hops(target_session_id))
+                .unwrap_or(0),
         };
         let delivery = messenger
             .send(target_session_id, message)
@@ -2448,5 +2454,32 @@ mod tests {
         let sent = messenger.sent.lock().unwrap();
         assert_eq!(sent[0].1.from_agent, "alice");
         assert_eq!(sent[0].1.from_cwd.as_deref(), Some("C:/work/caller"));
+    }
+
+    /// Answering the peer whose message started this turn continues its chain;
+    /// writing to a third session starts a new one.
+    #[tokio::test]
+    async fn a_reply_to_the_inbound_peer_carries_one_more_hop() {
+        let messenger = Arc::new(ScriptedPeerMessenger::new(
+            vec![peer_info("peer-one", None), peer_info("peer-two", None)],
+            PeerDelivery::Injected,
+        ));
+        let ledger = Arc::new(rebon_tool::peer::AgentReplyLedger::new());
+        ledger.note_inbound("peer-one", 2);
+        let context = ToolContext::new()
+            .with_session_id("caller-session")
+            .with_peer_messenger(messenger.clone() as Arc<dyn PeerMessenger>)
+            .with_peer_reply_ledger(ledger);
+
+        for target in ["session:peer-one", "session:peer-two"] {
+            SendMessageTool
+                .call(json!({ "to": target, "message": "hello" }), &context)
+                .await
+                .unwrap();
+        }
+
+        let sent = messenger.sent.lock().unwrap();
+        assert_eq!(sent[0].1.hops, 3, "the reply deepens the chain it answers");
+        assert_eq!(sent[1].1.hops, 0, "a fresh conversation starts at zero");
     }
 }

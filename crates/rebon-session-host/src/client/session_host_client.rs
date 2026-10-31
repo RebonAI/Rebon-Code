@@ -557,6 +557,7 @@ fn foreground_agent_message_command(
         from_name: envelope.from_name.clone(),
         summary: envelope.summary.clone(),
         text: envelope.text.clone(),
+        hops: envelope.hops,
     }
 }
 

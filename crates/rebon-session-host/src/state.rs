@@ -94,6 +94,15 @@ pub enum PendingPromptOrigin {
         from_handle: Option<String>,
         #[serde(rename = "fromName", default, skip_serializing_if = "Option::is_none")]
         from_name: Option<String>,
+        /// How many cross-session hand-offs this message had already made when
+        /// it arrived. Defaulted so a record written before the field existed
+        /// reads as a first message, and skipped at zero so a first message's
+        /// record is unchanged.
+        #[serde(
+            default,
+            skip_serializing_if = "crate::agent_message::hops_is_zero"
+        )]
+        hops: u8,
     },
     /// The session's cron scheduler fired it. The text opens with
     /// `rebon_tool::cron::SCHEDULED_PROMPT_MARKER`.

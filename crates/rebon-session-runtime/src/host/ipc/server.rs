@@ -2128,6 +2128,7 @@ pub(crate) fn handle_background_ipc_request(
             from_name,
             summary,
             text,
+            hops,
         } => {
             let envelope = rebon_session_host::AgentMessageEnvelope {
                 message_id,
@@ -2138,6 +2139,7 @@ pub(crate) fn handle_background_ipc_request(
                 from_name,
                 summary,
                 text,
+                hops,
             };
             match queue_live_background_agent_message(store, job_id, owner, &envelope) {
                 Ok(acceptance) => {

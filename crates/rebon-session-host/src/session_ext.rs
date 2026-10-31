@@ -434,6 +434,11 @@ pub struct AgentMessageParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     pub text: String,
+    /// How many cross-session hand-offs this message has already made.
+    /// Defaulted so a peer from before the field existed reads as a first
+    /// message, and skipped at zero so a first message's bytes are unchanged.
+    #[serde(default, skip_serializing_if = "crate::agent_message::hops_is_zero")]
+    pub hops: u8,
 }
 
 /// Whether a waiter was actually let go.
@@ -629,6 +634,7 @@ pub fn method_and_params(
             from_name,
             summary,
             text,
+            hops,
         } => (
             method::AGENT_MESSAGE,
             serde_json::json!({
@@ -640,6 +646,7 @@ pub fn method_and_params(
                 "fromName": from_name,
                 "summary": summary,
                 "text": text,
+                "hops": hops,
             }),
         ),
         R::Subscribe { since } => (method::SUBSCRIBE, serde_json::json!({ "since": since })),

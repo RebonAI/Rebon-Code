@@ -468,6 +468,7 @@ async fn background_steer_pump_does_not_echo_an_agent_message_as_user_input() {
         from_name: None,
         summary: None,
         text: "take the next step".into(),
+        hops: 0,
     };
     let frame = rebon_session_host::frame_agent_message(&envelope);
     let mut prompt = pending_prompt("m-steer", &frame, Vec::new());
@@ -476,6 +477,7 @@ async fn background_steer_pump_does_not_echo_an_agent_message_as_user_input() {
         from_agent: "main".into(),
         from_handle: None,
         from_name: None,
+        hops: 0,
     });
     state.identity.pending_prompts = vec![prompt];
     store.write_state(&state).unwrap();

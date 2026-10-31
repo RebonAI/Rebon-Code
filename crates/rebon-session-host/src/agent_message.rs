@@ -37,6 +37,22 @@ pub struct AgentMessageEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     pub text: String,
+    /// How many cross-session hand-offs this message has already made.
+    ///
+    /// A conversation the sender started is `0`; an answer carries the depth of
+    /// the message it answers plus one. Past [`rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS`]
+    /// the message may still join a running turn but may not wake an idle one.
+    /// Defaulted so a record written before the field existed reads as a first
+    /// message, and skipped at zero so the bytes of a first message are what
+    /// they always were.
+    #[serde(default, skip_serializing_if = "hops_is_zero")]
+    pub hops: u8,
+}
+
+/// Whether a message made no cross-session hand-off, which is the case the wire
+/// does not have to spell out.
+pub fn hops_is_zero(hops: &u8) -> bool {
+    *hops == 0
 }
 
 /// Where a delivered message ended up.
@@ -119,6 +135,7 @@ mod tests {
             from_name: None,
             summary: Some("build finished".into()),
             text: "the build is green".into(),
+            hops: 0,
         }
     }
 

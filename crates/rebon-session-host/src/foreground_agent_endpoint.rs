@@ -93,6 +93,12 @@ struct InboxState {
 /// drains [`Self::take_pending`] on its next pass.
 pub struct ForegroundAgentInbox {
     state: Mutex<InboxState>,
+    /// The session's reply ledger, when this inbox belongs to a session.
+    ///
+    /// Waking an idle terminal from a cross-session message is what the hop and
+    /// wake bounds are for; an inbox built without one (a test, a surface with
+    /// no session) has no bounds to apply and admits every message.
+    reply_ledger: Mutex<Option<Arc<rebon_tool::peer::AgentReplyLedger>>>,
 }
 
 impl Default for ForegroundAgentInbox {
@@ -105,7 +111,27 @@ impl ForegroundAgentInbox {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(InboxState::default()),
+            reply_ledger: Mutex::new(None),
         }
+    }
+
+    /// The inbox for one session, bounded by that session's ledger.
+    pub fn for_session(session_id: &str) -> Self {
+        Self {
+            state: Mutex::new(InboxState::default()),
+            reply_ledger: Mutex::new(Some(rebon_tool::peer::session_reply_ledger(session_id))),
+        }
+    }
+
+    /// Point the bounds at another session's ledger — a session switch keeps one
+    /// inbox for the process but must not attribute the new session's depth to
+    /// the old one's.
+    pub fn set_session(&self, session_id: &str) {
+        *self
+            .reply_ledger
+            .lock()
+            .expect("foreground agent inbox poisoned") =
+            Some(rebon_tool::peer::session_reply_ledger(session_id));
     }
 
     /// Whether a turn is running, as the event loop last saw it.
@@ -131,19 +157,54 @@ impl ForegroundAgentInbox {
         state.pending.drain(..).collect()
     }
 
+    /// Whether this message may start a turn in this session.
+    ///
+    /// The bounds live in the ledger rather than here because the hosted half
+    /// applies the same two to the same session id — see
+    /// [`rebon_tool::peer::AgentReplyLedger::admit_wake`].
+    fn may_wake(&self, envelope: &AgentMessageEnvelope) -> bool {
+        let ledger = self
+            .reply_ledger
+            .lock()
+            .expect("foreground agent inbox poisoned")
+            .clone();
+        let Some(ledger) = ledger else {
+            return true;
+        };
+        let admission = ledger.admit_wake(
+            &envelope.from_session_id,
+            envelope.hops,
+            crate::now_ms(),
+        );
+        if !admission.is_allowed() {
+            tracing::info!(
+                from = %envelope.from_session_id,
+                hops = envelope.hops,
+                ?admission,
+                "rebon: a cross-session message will wait instead of starting a turn"
+            );
+        }
+        admission.is_allowed()
+    }
+
     /// Accept one message. A repeated `message_id` changes nothing and answers
     /// with the delivery the current state implies, matching the hosted owner's
     /// idempotency answer.
     pub fn accept(&self, envelope: AgentMessageEnvelope) -> AgentMessageResult {
         let mut state = self.state.lock().expect("foreground agent inbox poisoned");
         let outcome = if state.busy {
+            // A person is watching this turn, so the bounds do not apply to it.
             AgentMessageDelivery::Injected
         } else if state.blocked || !state.pending.is_empty() {
             // Blocked, or behind a message the idle trigger has not picked up
             // yet: either way this one will join a turn that is already owed.
             AgentMessageDelivery::Queued
-        } else {
+        } else if self.may_wake(&envelope) {
             AgentMessageDelivery::StartedNewTurn
+        } else {
+            // Too deep a chain, or a peer that keeps starting turns here: the
+            // message waits for a person rather than starting another round.
+            AgentMessageDelivery::Queued
         };
         if !state.seen.insert(envelope.message_id.clone()) {
             return AgentMessageResult {
@@ -370,6 +431,7 @@ fn handle_legacy_request(
             from_name,
             summary,
             text,
+            hops,
         } => BackgroundIpcResponse::with_data(&sink.deliver_agent_message(AgentMessageEnvelope {
             message_id,
             from_session_id,
@@ -379,6 +441,7 @@ fn handle_legacy_request(
             from_name,
             summary,
             text,
+            hops,
         })),
         _ => BackgroundIpcResponse::failed(NOT_SUPPORTED),
     };
@@ -454,6 +517,7 @@ fn handle_acp_request(
                     from_name: params.from_name,
                     summary: params.summary,
                     text: params.text,
+                    hops: params.hops,
                 }))
                 .unwrap_or(Value::Null)
             }),
@@ -511,6 +575,7 @@ impl ForegroundCommand {
                 from_name,
                 summary,
                 text,
+                hops,
             } => Some(AgentMessageEnvelope {
                 message_id,
                 from_session_id,
@@ -520,6 +585,7 @@ impl ForegroundCommand {
                 from_name,
                 summary,
                 text,
+                hops,
             }),
             _ => None,
         }
@@ -609,6 +675,7 @@ mod tests {
             from_name: None,
             summary: Some("greeting".to_string()),
             text: "hello".to_string(),
+            hops: 0,
         }
     }
 
@@ -840,6 +907,7 @@ mod tests {
             from_name: None,
             summary: None,
             text: "hello".to_string(),
+            hops: 0,
         });
         assert_eq!(accepted.outcome, AgentMessageDelivery::StartedNewTurn);
         assert!(!accepted.duplicate);
@@ -855,6 +923,7 @@ mod tests {
             from_name: None,
             summary: None,
             text: "hello".to_string(),
+            hops: 0,
         });
         assert!(repeated.duplicate);
         assert!(
@@ -872,6 +941,7 @@ mod tests {
             from_name: None,
             summary: None,
             text: "hello".to_string(),
+            hops: 0,
         });
         assert_eq!(accepted.outcome, AgentMessageDelivery::Injected);
 
@@ -886,6 +956,7 @@ mod tests {
             from_name: None,
             summary: None,
             text: "hello".to_string(),
+            hops: 0,
         });
         assert_eq!(accepted.outcome, AgentMessageDelivery::Queued);
     }

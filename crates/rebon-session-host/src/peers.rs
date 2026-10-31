@@ -855,6 +855,7 @@ mod tests {
                 from_name: None,
                 summary: None,
                 text: "hi".into(),
+                hops: 0,
             })
             .expect("agent messages have an ACP spelling")
             .0,

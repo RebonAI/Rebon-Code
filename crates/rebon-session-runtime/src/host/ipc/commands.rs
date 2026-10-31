@@ -346,22 +346,54 @@ pub(crate) fn queue_live_background_agent_message(
         from_agent: envelope.from_agent.clone(),
         from_handle: envelope.from_handle.clone(),
         from_name: envelope.from_name.clone(),
+        hops: envelope.hops,
     });
     let mut delivery = rebon_session_host::AgentMessageDelivery::Queued;
     let mut appended = false;
+    let mut wake = false;
     store.update_state(job_id, |state| {
         owner.ensure_matches(state)?;
         let status = state.process.status;
-        delivery = if matches!(
+        let running = matches!(
             status,
             BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput
-        ) {
-            // A running turn claims it at its next tool round.
-            rebon_session_host::AgentMessageDelivery::Injected
+        );
+        wake = if running {
+            // A running turn claims it at its next tool round. A person is
+            // watching that turn, so the hop and wake bounds do not apply to it.
+            false
         } else if matches!(
             status,
             BackgroundJobStatus::Idle | BackgroundJobStatus::Queued
         ) {
+            // Waking an idle session is what the bounds are for: a chain that has
+            // gone too deep, or one peer that keeps starting turns here, leaves
+            // the message in the inbox where a person will read it.
+            let ledger = state
+                .identity
+                .session_id
+                .as_deref()
+                .map(rebon_tool::peer::session_reply_ledger);
+            ledger.is_none_or(|ledger| {
+                let admission =
+                    ledger.admit_wake(&envelope.from_session_id, envelope.hops, queued_at);
+                if !admission.is_allowed() {
+                    tracing::info!(
+                        job_id,
+                        from = %envelope.from_session_id,
+                        hops = envelope.hops,
+                        ?admission,
+                        "rebon: a cross-session message will wait instead of starting a turn"
+                    );
+                }
+                admission.is_allowed()
+            })
+        } else {
+            false
+        };
+        delivery = if running {
+            rebon_session_host::AgentMessageDelivery::Injected
+        } else if wake {
             // A parked worker is woken by the status change this write makes.
             rebon_session_host::AgentMessageDelivery::StartedNewTurn
         } else {
@@ -372,10 +404,13 @@ pub(crate) fn queue_live_background_agent_message(
         if !acceptance.appended {
             return Ok(());
         }
-        if !matches!(
-            status,
-            BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput
-        ) {
+        if running {
+            state.identity.resume_only = false;
+            state.outcome.summary_updated_at_ms = None;
+            state.process.updated_at_ms = queued_at;
+            return Ok(());
+        }
+        if wake {
             state.process.status = BackgroundJobStatus::Queued;
             state.outcome.pending_permission = None;
             state.outcome.summary = None;

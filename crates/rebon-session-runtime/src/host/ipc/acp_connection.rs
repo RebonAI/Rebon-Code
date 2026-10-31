@@ -645,6 +645,7 @@ fn translate(
                 from_name: params.from_name,
                 summary: params.summary,
                 text: params.text,
+                hops: params.hops,
             }
         }
         method::MODS => {
@@ -971,6 +972,7 @@ mod tests {
                     from_name: Some("worker".into()),
                     summary: Some("the migration".into()),
                     text: "please take a look".into(),
+                    hops: 0,
                 },
             ),
         ]
@@ -1165,6 +1167,7 @@ mod tests {
                 from_name: Some("worker".into()),
                 summary: Some("the migration".into()),
                 text: "please take a look".into(),
+                hops: 0,
             },
         ];
         for request in requests {
