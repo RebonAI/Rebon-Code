@@ -10,6 +10,12 @@
 //! something on disk is never a recipient. That check is what keeps
 //! `@Makefile look at this` a prompt; it comes before any lookup because a file
 //! happens to be named like a teammate far more often than the other way round.
+//!
+//! Nothing answering to the name means the line was prompt text all along —
+//! `@dataclass` above a class body and `@Override` above a method are code a
+//! person pasted, not messages to anyone — so the caller hands it to the model
+//! unchanged. Only a name that really is a recipient, or one that several
+//! recipients answer to, takes the line away from the prompt.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -24,23 +30,41 @@ use crate::tui::wiring::TuiEngineSession;
 
 use super::foreground_agent_submit::send_message_to_agent_task;
 
-/// Who a typed `@name` is for, once the names in hand were checked.
+/// A teammate this session can still write to, and the name `@` reaches it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RunningTeammate {
+    pub(super) task_id: String,
+    pub(super) name: String,
+}
+
+/// The one recipient a typed `@name` turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum DirectTarget {
     /// A teammate of this session, by the id its task carries.
-    Teammate { task_id: String },
+    Teammate { task_id: String, name: String },
     /// Another session on this machine, by the id the resolver found.
     Peer { session_id: String },
 }
 
-/// Where a typed `@name` was delivered, or why it was not.
+/// What looking a typed name up came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum DirectDelivery {
-    /// A teammate of this session read it.
-    Teammate { task_id: String },
-    /// Another session read it; the string is the receipt to keep.
-    Peer(String),
-    /// Nothing was sent, and the string says why.
+pub(super) enum DirectResolution {
+    /// Exactly one recipient answers to the name.
+    Addressed(DirectTarget),
+    /// A recipient was named and cannot be written to as typed; the string says
+    /// why, and lists what to type instead where there is such a thing.
+    Refused(String),
+    /// Nothing here answers to the name, so the line was prompt text all along.
+    Unaddressed,
+}
+
+/// What happened to a message [`send_to_direct_target`] was asked to send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DirectAttempt {
+    /// A recipient read it; the string is the receipt to keep.
+    Sent(String),
+    /// A recipient was named and the line was refused, so it stays in the
+    /// prompt for the person to fix; the string says why.
     Refused(String),
 }
 
@@ -63,105 +87,197 @@ pub(super) fn parse_direct_message(
 /// and the session is still reachable as `@bob-<tail>` or `session:<id>`. A name
 /// two agents share is refused rather than resolved to whichever the registry
 /// listed first, which is the one thing a person cannot have meant.
+///
+/// `own_handle` is this session's own name, which the peer list never contains:
+/// naming it is a refusal rather than a name nothing answers to.
 pub(super) fn resolve_direct_target(
     recipient: &str,
-    teammates: &[String],
+    teammates: &[RunningTeammate],
     peers: &[rebon_tool::PeerInfo],
-) -> Result<DirectTarget, String> {
+    own_handle: Option<&str>,
+) -> DirectResolution {
     match teammates {
-        [task_id] => {
-            return Ok(DirectTarget::Teammate {
-                task_id: task_id.clone(),
+        [one] => {
+            return DirectResolution::Addressed(DirectTarget::Teammate {
+                task_id: one.task_id.clone(),
+                name: one.name.clone(),
             })
         }
         [] => {}
-        several => {
-            return Err(format!(
-            "{} agents here answer to `{recipient}`: {}. Name the one you meant by its task id.",
-            several.len(),
-            several.join(", ")
-        ))
-        }
+        several => return DirectResolution::Refused(several_teammates_answer(recipient, several)),
     }
     match rebon_tool::peer::resolve_peer(peers, recipient) {
-        Ok(peer) => Ok(DirectTarget::Peer {
+        Ok(peer) => DirectResolution::Addressed(DirectTarget::Peer {
             session_id: peer.session_id.clone(),
         }),
-        Err(error) => Err(peer_refusal(&error.to_string(), recipient)),
+        Err(rebon_tool::peer::PeerResolveError::Ambiguous { candidates, .. }) => {
+            DirectResolution::Refused(format!(
+                "`@{recipient}` matches {} sessions here: {}. Type one of those to reach exactly one.",
+                candidates.len(),
+                candidates.join(", ")
+            ))
+        }
+        Err(rebon_tool::peer::PeerResolveError::NotFound { .. }) => {
+            if own_handle.is_some_and(|own| names_own_handle(recipient, own)) {
+                DirectResolution::Refused(self_refusal())
+            } else {
+                DirectResolution::Unaddressed
+            }
+        }
     }
 }
 
-/// The teammates of this session whose name is `name`, ignoring case.
-fn teammate_ids(session: &TuiEngineSession, name: &str) -> Vec<String> {
+/// The refusal for a name several running teammates answer to.
+///
+/// A name cannot pick one of them, and a task id is not something a person can
+/// type at the prompt, so the way to reach one is the list that shows them.
+fn several_teammates_answer(recipient: &str, several: &[RunningTeammate]) -> String {
+    format!(
+        "{} running agents here are named `{recipient}`, and a name cannot tell them apart. Open one of them in `/background-agents` and type the message there.",
+        several.len()
+    )
+}
+
+/// Whether `recipient` is this session's own handle, or enough of a prefix of it
+/// to name nobody else.
+///
+/// The full handle is unambiguous — handles are unique machine-wide — and a
+/// prefix only when it is long enough to be one a caller may abbreviate to.
+fn names_own_handle(recipient: &str, own_handle: &str) -> bool {
+    let recipient = rebon_tool::peer::strip_handle_sigil(recipient).trim();
+    recipient.eq_ignore_ascii_case(own_handle)
+        || (recipient.len() >= rebon_tool::peer::MIN_SESSION_PREFIX_CHARS
+            && own_handle
+                .to_ascii_lowercase()
+                .starts_with(&recipient.to_ascii_lowercase()))
+}
+
+fn self_refusal() -> String {
+    "A session cannot send a message to itself.".to_string()
+}
+
+/// The teammates of this session that are still running and whose name is
+/// `name`, ignoring case.
+///
+/// The same rule `TeamManager::teammate_roster` applies when `SendMessage` looks
+/// a teammate up by name: an in-process teammate whose task has not reached a
+/// terminal state. A local sub-agent task is not a teammate and its `agent_type`
+/// is not a name — `@general-purpose` names nothing — and a teammate that has
+/// finished is not reachable by name either, because a message to it would
+/// resume work the person asked to end.
+fn teammates_named(session: &TuiEngineSession, name: &str) -> Vec<RunningTeammate> {
     session
         .engine_half
         .tasks
         .snapshots()
         .into_iter()
-        .filter(|task| agent_name(task).is_some_and(|agent| agent.eq_ignore_ascii_case(name)))
-        .map(|task| task.id.to_string())
+        .filter(|task| !task.status.is_terminal())
+        .filter_map(|task| match &task.data {
+            TaskData::InProcessTeammate(data) => Some(RunningTeammate {
+                task_id: task.id.to_string(),
+                name: data.identity.agent_name.clone(),
+            }),
+            _ => None,
+        })
+        .filter(|teammate| teammate.name.eq_ignore_ascii_case(name))
         .collect()
 }
 
-fn agent_name(task: &rebon_plugin_tasks::runtime::TaskSnapshot) -> Option<&str> {
-    match &task.data {
-        TaskData::InProcessTeammate(data) => Some(data.identity.agent_name.as_str()),
-        TaskData::LocalAgent(data) => Some(data.agent_type.as_str()),
-        _ => None,
-    }
-}
-
-/// Deliver one typed direct message.
-pub(super) fn deliver_direct_message(
-    app: &AppState,
+/// Look a typed name up among this session's teammates and then its peers.
+///
+/// `Unaddressed` is the answer that matters most: it means the line was prompt
+/// text after all, and the caller must send it to the model unchanged. Only a
+/// name a recipient really answers to — or several that do — takes the line out
+/// of the prompt, because only then is there a person who can be meant and a
+/// candidate list worth showing.
+pub(super) fn resolve_typed_recipient(
     session: &TuiEngineSession,
     handle: &Handle,
     recipient: &str,
-    message: &str,
-) -> DirectDelivery {
-    let messenger = peer_messenger(session);
-    let peers = match handle.block_on(messenger.list_peers(Some(&session.session_id))) {
+) -> DirectResolution {
+    let teammates = teammates_named(session, recipient);
+    if !teammates.is_empty() {
+        return resolve_direct_target(recipient, &teammates, &[], None);
+    }
+
+    // The peer list is a directory scan and a lock probe per session, so it is
+    // only paid for a line the teammate list did not already claim.
+    let own_handle = rebon_session::load_session_handle(
+        &session.projects_root,
+        &session.cwd,
+        &session.session_id,
+    );
+    let peers = match handle.block_on(peer_messenger(session).list_peers(Some(&session.session_id)))
+    {
         Ok(peers) => peers,
-        Err(error) => return DirectDelivery::Refused(error),
+        // Discovery failing says nothing about the name, so the line stays a
+        // prompt rather than being held back by an error about something else.
+        Err(error) => {
+            tracing::warn!(%error, "rebon: could not list peer sessions for a typed @name");
+            return DirectResolution::Unaddressed;
+        }
     };
-    match resolve_direct_target(recipient, &teammate_ids(session, recipient), &peers) {
-        Ok(DirectTarget::Teammate { task_id }) => {
-            match send_message_to_agent_task(app, session, handle, &task_id, message.into()) {
-                Ok(()) => DirectDelivery::Teammate { task_id },
-                Err(error) => DirectDelivery::Refused(error),
+    resolve_direct_target(recipient, &[], &peers, own_handle.as_deref())
+}
+
+/// Send one message to a recipient [`resolve_typed_recipient`] found.
+pub(super) fn send_to_direct_target(
+    app: &AppState,
+    session: &TuiEngineSession,
+    handle: &Handle,
+    target: &DirectTarget,
+    message: &str,
+) -> DirectAttempt {
+    match target {
+        DirectTarget::Teammate { task_id, name } => {
+            match send_message_to_agent_task(app, session, handle, task_id, message.into()) {
+                Ok(()) => DirectAttempt::Sent(format!("Message sent to @{name} ({task_id}).")),
+                Err(error) => DirectAttempt::Refused(error),
             }
         }
-        // Addressed as a handle, which is what `resolve_peer` just matched; the
-        // tool resolves it again against the same list, so a person and an agent
-        // cannot disagree about where a message went.
-        Ok(DirectTarget::Peer { .. }) => {
-            let context = ToolContext::new()
-                .with_session_id(session.session_id.clone())
-                .with_cwd(session.cwd.clone())
-                .with_peer_messenger(messenger);
-            let input = serde_json::json!({
-                "to": format!("@{recipient}"),
-                "message": message,
-            });
-            match handle
-                .block_on(rebon_plugin_tasks::send_message::SendMessageTool.call(input, &context))
-            {
-                Ok(output) => DirectDelivery::Peer(sent_line(&output, recipient)),
-                Err(error) => DirectDelivery::Refused(peer_refusal(&error.to_string(), recipient)),
-            }
-        }
-        Err(refusal) => DirectDelivery::Refused(refusal),
+        DirectTarget::Peer { session_id } => send_to_peer(session, handle, session_id, message),
+    }
+}
+
+/// Send through the `SendMessage` tool, so a person and an agent cannot
+/// disagree about where a message went or what a refusal says.
+fn send_to_peer(
+    session: &TuiEngineSession,
+    handle: &Handle,
+    target_session_id: &str,
+    message: &str,
+) -> DirectAttempt {
+    let mut context = ToolContext::new()
+        .with_session_id(session.session_id.clone())
+        .with_cwd(session.cwd.clone())
+        .with_peer_messenger(peer_messenger(session));
+    // Its own handle, so `@mine-1234` is refused here too rather than reported
+    // as a session that does not exist — the peer list never contains it.
+    if let Some(own_handle) = rebon_session::load_session_handle(
+        &session.projects_root,
+        &session.cwd,
+        &session.session_id,
+    ) {
+        context = context.with_peer_handle(own_handle);
+    }
+    let input = serde_json::json!({
+        "to": format!("session:{target_session_id}"),
+        "message": message,
+    });
+    match handle.block_on(rebon_plugin_tasks::send_message::SendMessageTool.call(input, &context)) {
+        Ok(output) => DirectAttempt::Sent(sent_line(&output, target_session_id)),
+        Err(error) => DirectAttempt::Refused(peer_refusal(&error.to_string())),
     }
 }
 
 /// What the transcript keeps after a send that went out.
-fn sent_line(output: &serde_json::Value, recipient: &str) -> String {
+fn sent_line(output: &serde_json::Value, target_session_id: &str) -> String {
     let fields: HashMap<String, serde_json::Value> = output
         .as_object()
         .map(|object| object.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
         .unwrap_or_default();
     rebon_render::session_message_display(&fields)
-        .unwrap_or_else(|| format!("Message sent to @{recipient}"))
+        .unwrap_or_else(|| format!("Message sent to session:{target_session_id}."))
 }
 
 /// Reaches the other sessions here the way a tool does.
@@ -177,16 +293,13 @@ fn peer_messenger(session: &TuiEngineSession) -> Arc<dyn PeerMessenger> {
 
 /// Why the peer half refused, worded for the person who typed the line.
 ///
-/// `SendMessage` already names the candidates and the tool that lists the
-/// sessions, so its words are kept and the hint is added only where it would
-/// not repeat them.
-fn peer_refusal(error: &str, recipient: &str) -> String {
-    if error.contains("agent-view") {
+/// `SendMessage` already names the candidates, so its words are kept and the
+/// hint is added only where it would not repeat them.
+fn peer_refusal(error: &str) -> String {
+    if error.contains("/background-agents") {
         return error.to_string();
     }
-    format!(
-        "{error}\n@{recipient} named no session here. `/agent-view` lists the sessions running on this machine."
-    )
+    format!("{error}\n`/background-agents` lists the sessions running on this machine.")
 }
 
 #[cfg(test)]
@@ -205,6 +318,13 @@ mod tests {
             reachable: true,
             terminal_id: None,
             activity: None,
+        }
+    }
+
+    fn teammate(task_id: &str, name: &str) -> RunningTeammate {
+        RunningTeammate {
+            task_id: task_id.into(),
+            name: name.into(),
         }
     }
 
@@ -274,14 +394,14 @@ mod tests {
     fn a_name_only_a_session_answers_to_reaches_that_session() {
         let peers = [peer("abcde-fghij-klmno-pqrst", Some("repo-qrst"), None)];
         assert_eq!(
-            resolve_direct_target("repo-qrst", &[], &peers),
-            Ok(DirectTarget::Peer {
+            resolve_direct_target("repo-qrst", &[], &peers, None),
+            DirectResolution::Addressed(DirectTarget::Peer {
                 session_id: "abcde-fghij-klmno-pqrst".into()
             })
         );
         assert_eq!(
-            resolve_direct_target("abcde-f", &[], &peers),
-            Ok(DirectTarget::Peer {
+            resolve_direct_target("abcde-f", &[], &peers, None),
+            DirectResolution::Addressed(DirectTarget::Peer {
                 session_id: "abcde-fghij-klmno-pqrst".into()
             }),
             "a typed prefix reaches it the same way the tool accepts one"
@@ -291,9 +411,10 @@ mod tests {
     #[test]
     fn a_name_only_a_teammate_answers_to_reaches_that_agent() {
         assert_eq!(
-            resolve_direct_target("bob", &["task-bob".into()], &[]),
-            Ok(DirectTarget::Teammate {
-                task_id: "task-bob".into()
+            resolve_direct_target("bob", &[teammate("task-bob", "bob")], &[], None),
+            DirectResolution::Addressed(DirectTarget::Teammate {
+                task_id: "task-bob".into(),
+                name: "bob".into(),
             })
         );
     }
@@ -304,47 +425,86 @@ mod tests {
     fn a_name_both_answer_to_goes_to_the_teammate() {
         let peers = [peer("abcde-fghij-klmno-pqrst", Some("bob"), Some("bob"))];
         assert_eq!(
-            resolve_direct_target("bob", &["task-bob".into()], &peers),
-            Ok(DirectTarget::Teammate {
-                task_id: "task-bob".into()
+            resolve_direct_target("bob", &[teammate("task-bob", "bob")], &peers, None),
+            DirectResolution::Addressed(DirectTarget::Teammate {
+                task_id: "task-bob".into(),
+                name: "bob".into(),
             })
         );
     }
 
+    /// A name nothing answers to is not a recipient, so the line was a prompt.
     #[test]
-    fn an_unknown_name_says_where_the_sessions_are_listed() {
-        let refusal = resolve_direct_target("ghost", &[], &[]).unwrap_err();
-        assert!(
-            refusal.contains("no running session matches `ghost`"),
-            "{refusal}"
+    fn an_unknown_name_leaves_the_line_to_the_model() {
+        assert_eq!(
+            resolve_direct_target("ghost", &[], &[], None),
+            DirectResolution::Unaddressed
         );
-        assert!(refusal.contains("/agent-view"), "{refusal}");
+        assert_eq!(
+            resolve_direct_target("dataclass", &[], &[], None),
+            DirectResolution::Unaddressed,
+            "pasted code is not an address"
+        );
     }
 
     #[test]
-    fn an_ambiguous_name_lists_the_handles() {
+    fn an_ambiguous_name_lists_the_candidates_a_person_can_type() {
         let peers = [
             peer("abcde-one", Some("repo-one"), None),
             peer("abcde-two", Some("repo-only"), None),
         ];
-        let refusal = resolve_direct_target("repo-o", &[], &peers).unwrap_err();
+        let DirectResolution::Refused(refusal) = resolve_direct_target("repo-o", &[], &peers, None)
+        else {
+            panic!("expected an ambiguity");
+        };
         assert!(refusal.contains("@repo-one"), "{refusal}");
         assert!(refusal.contains("@repo-only"), "{refusal}");
         assert!(refusal.contains("matches 2 sessions"), "{refusal}");
     }
 
+    /// Two teammates sharing a name cannot be told apart by name, and a task id
+    /// is not something the prompt accepts — so the refusal has to send the
+    /// person to the surface that does show them.
     #[test]
-    fn two_agents_sharing_a_name_are_refused_rather_than_guessed() {
-        let refusal =
-            resolve_direct_target("bob", &["task-one".into(), "task-two".into()], &[]).unwrap_err();
-        assert!(refusal.contains("task-one"), "{refusal}");
-        assert!(refusal.contains("task-two"), "{refusal}");
+    fn two_agents_sharing_a_name_are_refused_with_a_way_to_reach_one() {
+        let DirectResolution::Refused(refusal) = resolve_direct_target(
+            "bob",
+            &[teammate("task-one", "bob"), teammate("task-two", "bob")],
+            &[],
+            None,
+        ) else {
+            panic!("expected an ambiguity");
+        };
+        assert!(refusal.contains("/background-agents"), "{refusal}");
+        assert!(!refusal.contains("task id"), "{refusal}");
+    }
+
+    #[test]
+    fn a_session_naming_itself_is_refused_rather_than_not_found() {
+        let own = Some("repo-qrst");
+        assert_eq!(
+            resolve_direct_target("repo-qrst", &[], &[], own),
+            DirectResolution::Refused(self_refusal())
+        );
+        assert_eq!(
+            resolve_direct_target("repo-qr", &[], &[], own),
+            DirectResolution::Refused(self_refusal()),
+            "a unique handle prefix names this session too"
+        );
+        assert_eq!(
+            resolve_direct_target("rep", &[], &[], own),
+            DirectResolution::Unaddressed,
+            "too short to reach any session"
+        );
+        assert_eq!(
+            resolve_direct_target("ghost", &[], &[], own),
+            DirectResolution::Unaddressed
+        );
     }
 
     #[test]
     fn a_refusal_that_already_names_the_list_is_not_told_twice() {
-        let said =
-            "`ghost` matches nothing. `/agent-view` lists the sessions running on this machine.";
-        assert_eq!(peer_refusal(said, "ghost"), said);
+        let said = "`ghost` matches nothing. `/background-agents` lists the sessions running on this machine.";
+        assert_eq!(peer_refusal(said), said);
     }
 }

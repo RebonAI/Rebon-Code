@@ -269,7 +269,21 @@ pub(super) fn submit_or_queue_with_images_and_uuid(
         active_prompt,
         cursor_offset_before_submit,
         transcript_len_before_submit,
+        TypedLine::ByTheUser,
     )
+}
+
+/// Where the line being submitted came from.
+///
+/// A typed `@name` is an address; an expansion a command chose is text, and
+/// running an address check on it would let a plugin's output be diverted to
+/// another session by a `@` it happens to contain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypedLine {
+    /// What the person typed at the prompt.
+    ByTheUser,
+    /// What a `Prompt` command expanded to.
+    Expanded,
 }
 
 /// The submit path once the `command-registry` seat has had its look: the
@@ -291,6 +305,7 @@ fn submit_after_command_dispatch(
     active_prompt: &mut Option<ActivePrompt>,
     cursor_offset_before_submit: usize,
     transcript_len_before_submit: usize,
+    typed: TypedLine,
 ) -> bool {
     if let Some((cmd, history_text)) = parse_bang_shell_command(&app.mode, text.trim_end()) {
         if !cmd.is_empty() {
@@ -319,17 +334,6 @@ fn submit_after_command_dispatch(
         inject_system_message(app, "error", &message);
         app.follow_transcript_tail = true;
         return false;
-    }
-
-    // `@name message` names a reader rather than asking the session anything.
-    // Checked before the turn paths because a direct message starts no turn
-    // here: the recipient runs it, and this session keeps only the receipt.
-    if let Some(direct) =
-        super::direct_message::parse_direct_message(text.trim_end(), Path::new(&session.cwd))
-    {
-        if let Some(done) = deliver_typed_direct_message(app, session, handle, &direct) {
-            return done;
-        }
     }
 
     if app.foregrounded_task_id.is_some()
@@ -375,6 +379,23 @@ fn submit_after_command_dispatch(
         route_prompt_to_a_worker(app, session, &text, &injected_images, &user_message_uuid)
     {
         return done;
+    }
+
+    // `@name message` names a reader rather than asking the session anything.
+    //
+    // Below every path that already knows where the line goes — a foreground
+    // agent, a goal waiting for details, a session that lives in a worker —
+    // because those own the prompt while they are up, and an `@` typed into one
+    // is text for that reader rather than an address. Above the local turn
+    // paths, because a direct message starts no turn here: the recipient runs
+    // it, and this session keeps only the receipt.
+    //
+    // Only a line the person typed is checked: a command's expansion is the
+    // text the command chose, not an address somebody wrote.
+    if matches!(typed, TypedLine::ByTheUser)
+        && deliver_typed_direct_message(app, session, handle, &text, &injected_images)
+    {
+        return false;
     }
 
     // A goal check is the tail of the turn that just ended: what is typed
@@ -446,42 +467,91 @@ fn submit_after_command_dispatch(
 
 /// Send a typed `@name message` and put the receipt in the transcript.
 ///
-/// `None` when the line turned out to be prompt text after all (nothing could
-/// be addressed), so the caller can go on treating it as one. A refusal is a
-/// receipt too: the line is gone from the prompt either way, and leaving it
-/// there would send it to the model on the next Enter.
+/// `true` when the line was this function's to deal with: it went out, or a
+/// recipient was named and the line was refused and is still in the prompt for
+/// the person to fix. `false` when nothing here answers to the name — a pasted
+/// `@dataclass`, an `@Override`, an `@media` query — and the line is prompt text
+/// after all, to be sent to the model exactly as typed.
+///
+/// Refusing is not swallowing: the input is left alone, so the next Enter after
+/// the person fixes the name sends something rather than nothing.
 fn deliver_typed_direct_message(
     app: &mut AppState,
-    session: &mut TuiEngineSession,
+    session: &TuiEngineSession,
     handle: &Handle,
-    direct: &rebon_tui::promptinput::DirectMemberMessage,
-) -> Option<bool> {
-    let delivery = super::direct_message::deliver_direct_message(
-        app,
+    text: &str,
+    injected_images: &[rebon_types::PromptPasteContent],
+) -> bool {
+    let Some(direct) =
+        super::direct_message::parse_direct_message(text.trim_end(), Path::new(&session.cwd))
+    else {
+        return false;
+    };
+    let target = match super::direct_message::resolve_typed_recipient(
         session,
         handle,
         &direct.recipient_name,
-        &direct.message,
-    );
-    let (subtype, line) = match &delivery {
-        super::direct_message::DirectDelivery::Refused(reason) => ("error", reason.clone()),
-        super::direct_message::DirectDelivery::Teammate { task_id } => (
-            "info",
-            format!(
-                "Message sent to @{} ({task_id}).",
-                direct.recipient_name
-            ),
-        ),
-        super::direct_message::DirectDelivery::Peer(line) => ("info", line.clone()),
+    ) {
+        super::direct_message::DirectResolution::Addressed(target) => target,
+        super::direct_message::DirectResolution::Refused(reason) => {
+            inject_system_message(app, "error", &reason);
+            app.follow_transcript_tail = true;
+            return true;
+        }
+        // Nothing here answers to the name, so the line was a prompt after
+        // all and is sent to the model exactly as typed.
+        super::direct_message::DirectResolution::Unaddressed => return false,
     };
-    save_to_history_for_session_if_needed(app, session, &format!(
-        "@{} {}",
-        direct.recipient_name, direct.message
-    ));
-    clear_input(app);
-    inject_system_message(app, subtype, &line);
-    app.follow_transcript_tail = true;
-    Some(false)
+    // Checked after the name resolved: an `@media` line with a picture in it is
+    // still a prompt, and refusing it would be this check swallowing a line
+    // nobody was addressed in.
+    if !injected_images.is_empty() || pastes_an_image(app, text) {
+        inject_system_message(
+            app,
+            "error",
+            "A cross-session message can only carry text. Send the image in a prompt instead.",
+        );
+        app.follow_transcript_tail = true;
+        return true;
+    }
+    // The chip on screen is a placeholder; the recipient reads what was pasted.
+    let message =
+        crate::tui::dispatch::expand_paste_references(&direct.message, &app.pasted_contents);
+    match super::direct_message::send_to_direct_target(app, session, handle, &target, &message) {
+        super::direct_message::DirectAttempt::Sent(line) => {
+            save_to_history_for_session_if_needed(app, session, text.trim_end());
+            clear_input(app);
+            app.pasted_contents.clear();
+            app.next_paste_id = 1;
+            inject_system_message(app, "info", &line);
+            app.follow_transcript_tail = true;
+            true
+        }
+        super::direct_message::DirectAttempt::Refused(reason) => {
+            inject_system_message(app, "error", &reason);
+            app.follow_transcript_tail = true;
+            true
+        }
+    }
+}
+
+/// Whether the line refers to a pasted image rather than only text.
+fn pastes_an_image(app: &AppState, text: &str) -> bool {
+    if app
+        .pasted_contents
+        .iter()
+        .all(|paste| paste.kind != "image")
+    {
+        return false;
+    }
+    let referenced = rebon_tui::promptinput::prompt_surface::parse_references(text)
+        .into_iter()
+        .filter(|reference| reference.matched_text.starts_with("[Image"))
+        .map(|reference| reference.id)
+        .collect::<std::collections::HashSet<_>>();
+    app.pasted_contents
+        .iter()
+        .any(|paste| paste.kind == "image" && referenced.contains(&paste.id))
 }
 
 /// Run the session's `UserPromptSubmit` hook on a prompt the user just
@@ -768,6 +838,7 @@ fn submit_expanded_text(
         active_prompt,
         cursor_offset_before_submit,
         transcript_len_before_submit,
+        TypedLine::Expanded,
     );
     debug_assert!(!quit, "the submit path below the command layer cannot quit");
 }
@@ -5652,5 +5723,511 @@ mod tests {
             ),
             "{content}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // A typed `@name`: an address only when somebody answers to it.
+    // -----------------------------------------------------------------------
+
+    /// The transcript row a submitted prompt left behind, if it reached the
+    /// model at all.
+    fn submitted_prompt(recorder: &RecordingPromptExecutor) -> Option<String> {
+        recorder
+            .take_requests()
+            .into_iter()
+            .next()
+            .map(|request| prompt_request_text(&request).to_string())
+    }
+
+    /// `@dataclass` over a class body is code a person pasted, not an address:
+    /// it has to reach the model byte for byte, with the input cleared the way
+    /// any other prompt is.
+    #[test]
+    fn a_typed_at_word_nothing_answers_to_is_sent_to_the_model() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        let mut app = AppState::new();
+        let text = "@dataclass\nclass Foo:\n    x: int";
+        app.input = text.into();
+        app.cursor_offset = app.input.len();
+        let mut active_prompt = None;
+
+        assert!(!submit_or_queue(
+            &mut app,
+            text.into(),
+            &mut session,
+            &handle,
+            &mut active_prompt,
+            &mut None,
+            UiMode::Screen,
+        ));
+        runtime.block_on(tokio::task::yield_now());
+
+        assert_eq!(
+            submitted_prompt(&recorder).as_deref(),
+            Some(text),
+            "the model reads the line exactly as it was typed"
+        );
+        assert!(app.input.is_empty());
+        assert!(active_prompt.is_some());
+        assert!(
+            !app.rebon_tui.transcript.rows().iter().any(|row| matches!(
+                row,
+                rebon_tui::Message::System(system) if system.subtype == "error"
+            )),
+            "nothing was addressed, so nothing was refused"
+        );
+
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    /// The prompt is owned by whoever is being watched; an `@` typed into that
+    /// box is text for them, not an address for somebody else.
+    #[test]
+    fn an_at_word_typed_to_a_foregrounded_agent_is_not_a_direct_message() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        let mut app = AppState::new();
+        let mut session_registry = rebon_plugin_tasks::runtime::TaskRegistry::new();
+        insert_local_agent_task(
+            &mut session_registry,
+            "agent-1",
+            rebon_plugin_tasks::runtime::TaskStatus::Running,
+            false,
+        );
+        let registry = Arc::new(session_registry);
+        app.tasks = registry.clone();
+        session.engine_half.tasks = registry;
+        app.main_agent_view = Some(crate::tui::app::StoredTranscriptView::default());
+        app.foregrounded_task_id = Some("agent-1".into());
+        app.input = "@bob take the parser".into();
+        app.cursor_offset = app.input.len();
+        let mut active_prompt = None;
+
+        assert!(!submit_or_queue(
+            &mut app,
+            "@bob take the parser".into(),
+            &mut session,
+            &handle,
+            &mut active_prompt,
+            &mut None,
+            UiMode::Screen,
+        ));
+        runtime.block_on(tokio::task::yield_now());
+
+        let snapshot = app
+            .tasks
+            .snapshot(&rebon_plugin_tasks::runtime::TaskId::new("agent-1"))
+            .expect("agent task");
+        let rebon_plugin_tasks::runtime::TaskData::LocalAgent(data) = &snapshot.data else {
+            panic!("expected local agent");
+        };
+        assert_eq!(
+            data.pending_messages,
+            vec!["@bob take the parser".to_string()]
+        );
+        assert!(submitted_prompt(&recorder).is_none());
+        assert!(app.input.is_empty());
+
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    /// A goal waiting for details owns the next line; an `@` in it is the
+    /// goal's clarification.
+    #[test]
+    fn an_at_word_answering_a_goal_clarification_is_not_a_direct_message() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        let mut app = AppState::new();
+        app.pending_goal_clarification =
+            Some(crate::goal::PendingGoalClarification::new("ship it", None));
+        let text = "@bob the release gate needs cargo test";
+        app.input = text.into();
+        app.cursor_offset = app.input.len();
+        let mut active_prompt = None;
+
+        assert!(!submit_or_queue(
+            &mut app,
+            text.into(),
+            &mut session,
+            &handle,
+            &mut active_prompt,
+            &mut None,
+            UiMode::Screen,
+        ));
+        runtime.block_on(tokio::task::yield_now());
+
+        let request = submitted_prompt(&recorder).expect("the goal start reached the model");
+        assert!(
+            request.contains("@bob the release gate needs cargo test"),
+            "{request}"
+        );
+        assert!(app.pending_goal_clarification.is_none());
+
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    /// A pasted block is a chip on screen and its text on the wire.
+    #[test]
+    fn a_direct_message_expands_a_pasted_chip_before_it_is_sent() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let mut app = AppState::new();
+        let registry = Arc::new(rebon_plugin_tasks::runtime::TaskRegistry::new());
+        app.tasks = registry.clone();
+        session.engine_half.tasks = registry;
+        let teammate_id = insert_running_teammate(&app, "researcher", "teammate-1");
+        app.input = "@researcher see [Pasted text #1 +2 lines]".into();
+        app.cursor_offset = app.input.len();
+        app.pasted_contents = vec![rebon_types::PromptPasteContent {
+            id: 1,
+            kind: "text".into(),
+            content: "line one\nline two".into(),
+            media_type: None,
+            filename: None,
+            source_path: None,
+        }];
+        let mut active_prompt = None;
+
+        assert!(!submit_or_queue(
+            &mut app,
+            "@researcher see [Pasted text #1 +2 lines]".into(),
+            &mut session,
+            &handle,
+            &mut active_prompt,
+            &mut None,
+            UiMode::Screen,
+        ));
+        runtime.block_on(tokio::task::yield_now());
+
+        let snapshot = app
+            .tasks
+            .snapshot(&rebon_plugin_tasks::runtime::TaskId::new(&teammate_id))
+            .expect("teammate task");
+        let rebon_plugin_tasks::runtime::TaskData::InProcessTeammate(data) = &snapshot.data else {
+            panic!("expected teammate");
+        };
+        assert_eq!(
+            data.pending_user_messages
+                .iter()
+                .map(|request| request.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["see line one\nline two"],
+            "the recipient reads what was pasted, not the chip"
+        );
+        assert!(app.input.is_empty());
+        assert!(
+            app.pasted_contents.is_empty(),
+            "the paste state goes with the line"
+        );
+
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    /// Only text crosses sessions, so a picture in the line is a refusal — and
+    /// the line stays where the person can take the picture back out.
+    #[test]
+    fn a_direct_message_carrying_an_image_is_refused_and_kept() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        let mut app = AppState::new();
+        let registry = Arc::new(rebon_plugin_tasks::runtime::TaskRegistry::new());
+        app.tasks = registry.clone();
+        session.engine_half.tasks = registry;
+        insert_running_teammate(&app, "researcher", "teammate-1");
+        let text = "@researcher what is this? [Image #1]";
+        app.input = text.into();
+        app.cursor_offset = app.input.len();
+        app.pasted_contents = vec![rebon_types::PromptPasteContent {
+            id: 1,
+            kind: "image".into(),
+            content: "aGVsbG8=".into(),
+            media_type: Some("image/png".into()),
+            filename: None,
+            source_path: None,
+        }];
+        let mut active_prompt = None;
+
+        assert!(!submit_or_queue(
+            &mut app,
+            text.into(),
+            &mut session,
+            &handle,
+            &mut active_prompt,
+            &mut None,
+            UiMode::Screen,
+        ));
+        runtime.block_on(tokio::task::yield_now());
+
+        assert_eq!(app.input, text, "the line is kept for the person to fix");
+        assert!(app.cursor_offset == text.len());
+        assert!(submitted_prompt(&recorder).is_none());
+        assert!(system_transcript_text(&app).contains("can only carry text"));
+        assert_eq!(app.pasted_contents.len(), 1, "the picture is not dropped");
+
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    /// A name two running agents answer to cannot be resolved by name, so the
+    /// refusal lists what can be typed and the line stays put.
+    #[test]
+    fn an_ambiguous_teammate_name_is_refused_and_the_line_is_kept() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let mut app = AppState::new();
+        let registry = Arc::new(rebon_plugin_tasks::runtime::TaskRegistry::new());
+        app.tasks = registry.clone();
+        session.engine_half.tasks = registry;
+        insert_running_teammate(&app, "bob", "teammate-one");
+        insert_running_teammate(&app, "bob", "teammate-two");
+        let text = "@bob take this one";
+        app.input = text.into();
+        app.cursor_offset = app.input.len();
+        let mut active_prompt = None;
+
+        assert!(!submit_or_queue(
+            &mut app,
+            text.into(),
+            &mut session,
+            &handle,
+            &mut active_prompt,
+            &mut None,
+            UiMode::Screen,
+        ));
+        runtime.block_on(tokio::task::yield_now());
+
+        let errors = system_transcript_text(&app);
+        assert!(errors.contains("/background-agents"), "{errors}");
+        assert!(errors.contains("cannot tell them apart"), "{errors}");
+        assert_eq!(app.input, text);
+        assert!(app
+            .tasks
+            .snapshot(&rebon_plugin_tasks::runtime::TaskId::new("teammate-one"))
+            .is_some_and(|snapshot| match &snapshot.data {
+                rebon_plugin_tasks::runtime::TaskData::InProcessTeammate(data) =>
+                    data.pending_user_messages.is_empty(),
+                _ => false,
+            }));
+
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    /// A teammate that has finished is gone as a name: a message to it would
+    /// resume work the person ended, so the line is a prompt.
+    #[test]
+    fn a_finished_teammate_is_not_an_address() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        let mut app = AppState::new();
+        let registry = Arc::new(rebon_plugin_tasks::runtime::TaskRegistry::new());
+        app.tasks = registry.clone();
+        session.engine_half.tasks = registry;
+        let task_id = insert_running_teammate(&app, "researcher", "teammate-1");
+        assert!(rebon_plugin_tasks::runtime::finish_in_process_teammate(
+            &app.tasks,
+            &rebon_plugin_tasks::runtime::TaskId::new(&task_id),
+            rebon_plugin_tasks::runtime::TaskStatus::Completed,
+            Some("done".into()),
+            None,
+        ));
+        let text = "@researcher pick the review back up";
+        app.input = text.into();
+        app.cursor_offset = app.input.len();
+        let mut active_prompt = None;
+
+        assert!(!submit_or_queue(
+            &mut app,
+            text.into(),
+            &mut session,
+            &handle,
+            &mut active_prompt,
+            &mut None,
+            UiMode::Screen,
+        ));
+        runtime.block_on(tokio::task::yield_now());
+
+        assert_eq!(submitted_prompt(&recorder).as_deref(), Some(text));
+        assert!(app.input.is_empty());
+
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    /// A local sub-agent's `agent_type` is a kind of worker, not a name: a
+    /// person writing `@general-purpose` is addressing nobody.
+    #[test]
+    fn a_local_agent_type_is_not_a_teammate_name() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        let mut app = AppState::new();
+        let registry = Arc::new(rebon_plugin_tasks::runtime::TaskRegistry::new());
+        insert_local_agent_task(
+            &registry,
+            "agent-1",
+            rebon_plugin_tasks::runtime::TaskStatus::Running,
+            true,
+        );
+        app.tasks = registry.clone();
+        session.engine_half.tasks = registry;
+        let text = "@general-purpose summarise the diff";
+        app.input = text.into();
+        app.cursor_offset = app.input.len();
+        let mut active_prompt = None;
+
+        assert!(!submit_or_queue(
+            &mut app,
+            text.into(),
+            &mut session,
+            &handle,
+            &mut active_prompt,
+            &mut None,
+            UiMode::Screen,
+        ));
+        runtime.block_on(tokio::task::yield_now());
+
+        assert_eq!(submitted_prompt(&recorder).as_deref(), Some(text));
+        let snapshot = app
+            .tasks
+            .snapshot(&rebon_plugin_tasks::runtime::TaskId::new("agent-1"))
+            .expect("agent task");
+        let rebon_plugin_tasks::runtime::TaskData::LocalAgent(data) = &snapshot.data else {
+            panic!("expected local agent");
+        };
+        assert!(data.pending_messages.is_empty());
+
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    /// A name this session answers to itself is refused where it is typed, not
+    /// reported as a session that does not exist.
+    #[test]
+    fn a_direct_message_to_this_sessions_own_handle_is_refused() {
+        let (runtime, handle) = make_immediate_handle();
+        let projects = TempDir::new().unwrap();
+        let mut session = make_test_tui_session();
+        session.set_test_cwd("/repo");
+        session.projects_root = projects.path().to_path_buf();
+        let own =
+            rebon_session::ensure_session_handle(projects.path(), "/repo", &session.session_id)
+                .expect("a handle for this session");
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        let mut app = AppState::new();
+        let text = format!("@{own} note to self");
+        app.input = text.clone();
+        app.cursor_offset = app.input.len();
+        let mut active_prompt = None;
+
+        assert!(!submit_or_queue(
+            &mut app,
+            text.clone(),
+            &mut session,
+            &handle,
+            &mut active_prompt,
+            &mut None,
+            UiMode::Screen,
+        ));
+        runtime.block_on(tokio::task::yield_now());
+
+        assert!(
+            system_transcript_text(&app).contains("cannot send a message to itself"),
+            "{}",
+            system_transcript_text(&app)
+        );
+        assert_eq!(app.input, text);
+        assert!(submitted_prompt(&recorder).is_none());
+
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    /// An expansion is the text a command chose, not an address a person typed.
+    #[test]
+    fn expanded_command_text_is_not_checked_for_an_address() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        let mut app = AppState::new();
+        let registry = Arc::new(rebon_plugin_tasks::runtime::TaskRegistry::new());
+        app.tasks = registry.clone();
+        session.engine_half.tasks = registry;
+        let task_id = insert_running_teammate(&app, "researcher", "teammate-1");
+        let mut active_prompt = None;
+
+        super::submit_expanded_text(
+            &mut app,
+            "@researcher expanded by a command".into(),
+            &mut session,
+            &handle,
+            &mut active_prompt,
+        );
+        runtime.block_on(tokio::task::yield_now());
+
+        assert_eq!(
+            submitted_prompt(&recorder).as_deref(),
+            Some("@researcher expanded by a command")
+        );
+        let snapshot = app
+            .tasks
+            .snapshot(&rebon_plugin_tasks::runtime::TaskId::new(&task_id))
+            .expect("teammate task");
+        let rebon_plugin_tasks::runtime::TaskData::InProcessTeammate(data) = &snapshot.data else {
+            panic!("expected teammate");
+        };
+        assert!(data.pending_user_messages.is_empty());
+
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    /// A teammate registered under `name` and left running, returning its task
+    /// id. Its parent session is this test's, so the roster rules apply to it.
+    fn insert_running_teammate(app: &AppState, name: &str, task_id: &str) -> String {
+        use rebon_plugin_tasks::runtime::{
+            register_in_process_teammate_task, InProcessTeammateTaskSpec, TaskId, TeammateIdentity,
+        };
+
+        let id = TaskId::new(task_id);
+        register_in_process_teammate_task(
+            &app.tasks,
+            InProcessTeammateTaskSpec {
+                id: id.clone(),
+                identity: TeammateIdentity {
+                    agent_id: format!("{name}@default"),
+                    agent_name: name.into(),
+                    team_name: "default".into(),
+                    color: None,
+                    plan_mode_required: false,
+                    parent_session_id: "session-test".into(),
+                },
+                prompt: "work".into(),
+                model: None,
+                model_profile: None,
+                permission_mode: "default".into(),
+                agent_type: Some("Explore".into()),
+                description: None,
+            },
+        );
+        id.to_string()
     }
 }
