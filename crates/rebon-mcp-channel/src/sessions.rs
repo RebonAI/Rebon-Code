@@ -706,11 +706,16 @@ fn render_entry(entry: &TranscriptEntry, names: &HashMap<String, String>) -> Opt
 
 /// A prompt the harness wrote rather than the user: skill bodies, command
 /// caveats, runtime context. Both agents mark it; Rebon has used both spots.
+///
+/// A message another session or a teammate sent lands inside a turn as a
+/// `runtimeAttachment` row. It is a `user` row the person never typed, and
+/// reading it back as theirs would put somebody else's words in their mouth.
 fn is_meta(raw: &Value) -> bool {
     let flag = |value: Option<&Value>| value.and_then(Value::as_bool).unwrap_or(false);
     flag(raw.get("isMeta"))
         || flag(raw.pointer("/message/isMeta"))
         || flag(raw.get("runtimeContext"))
+        || flag(raw.get("runtimeAttachment"))
 }
 
 fn is_compact_summary(raw: &Value) -> bool {

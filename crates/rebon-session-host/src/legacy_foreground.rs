@@ -133,9 +133,21 @@ pub enum ForegroundCommand {
         from_agent: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_cwd: Option<String>,
+        /// The sender's handle and display name, when the sender has them.
+        /// Additive for the same reason the variant is: the receipt stays
+        /// readable to the sender that wrote it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_handle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
         text: String,
+        /// How many cross-session hand-offs this message has already made.
+        /// Additive for the same reason the variant is, and skipped at zero so
+        /// a first message's receipt is byte-identical to what it was.
+        #[serde(default, skip_serializing_if = "crate::agent_message::hops_is_zero")]
+        hops: u8,
     },
 }
 
@@ -442,6 +454,11 @@ pub struct ForegroundSessionStatus {
     /// before the field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// What this session is doing right now — the tool or file it is working
+    /// on. Absent while it is idle, and on every status written before the
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
 }
 
 /// Environment variable the desktop app sets in the terminals it launches.
@@ -1409,6 +1426,7 @@ mod tests {
             terminal_id: None,
             agent_endpoint: None,
             capabilities: Vec::new(),
+            activity: None,
         };
         write_foreground_status(&root, &status);
         let read = read_foreground_status(&root, &status.cwd, &status.session_id).unwrap();
@@ -1453,6 +1471,7 @@ mod tests {
             terminal_id: None,
             agent_endpoint: None,
             capabilities: Vec::new(),
+            activity: None,
         };
         let path = foreground_status_path(&root, &cwd, &status.session_id);
         assert!(
@@ -1517,6 +1536,7 @@ mod tests {
             terminal_id: Some("term-9".into()),
             agent_endpoint: None,
             capabilities: Vec::new(),
+            activity: None,
         };
         assert!(write_foreground_status(&root, &status));
         let path = foreground_status_path(&root, cwd, sid);
@@ -1557,6 +1577,7 @@ mod tests {
                 token_path: "/home/u/.rebon/projects/p/sess.agent-token".into(),
             }),
             capabilities: vec![AGENT_MESSAGE_CAPABILITY.into()],
+            activity: None,
         };
         assert!(write_foreground_status(&root, &status));
         let path = foreground_status_path(&root, cwd, sid);
@@ -1589,8 +1610,11 @@ mod tests {
             from_session_id: "sess-sender".into(),
             from_agent: "main".into(),
             from_cwd: Some("/work/sender".into()),
+            from_handle: None,
+            from_name: None,
             summary: Some("handoff".into()),
             text: "please continue".into(),
+            hops: 0,
         };
         send_foreground_command(&root, cwd, sid, &command).unwrap();
 
@@ -1608,8 +1632,11 @@ mod tests {
                 from_session_id: "sess-sender".into(),
                 from_agent: "main".into(),
                 from_cwd: Some("/work/sender".into()),
+                from_handle: None,
+                from_name: None,
                 summary: Some("handoff".into()),
                 text: "please continue".into(),
+                hops: 0,
             })
         );
         complete_foreground_command(&drained[0]).unwrap();

@@ -282,6 +282,47 @@ pub(super) fn collect_tool_block_body_lines(
     collect_tool_block_body_lines_with_width(tu, verbosity, u16::MAX)
 }
 
+/// The card for a committed assistant row whose tool call sent a message to
+/// another session.
+///
+/// The streaming overlay already draws this card from `session_message_display`;
+/// a committed row goes through this projection instead, and without it the row
+/// would show the result's raw JSON — the same send reading two different ways
+/// before and after it is committed.
+fn collect_session_message_body_lines(
+    tu: &AssistantToolUseBlock,
+    verbosity: ToolOutputVerbosity,
+    content_width: u16,
+) -> Option<Vec<String>> {
+    if tu.name != "SendMessage" {
+        return None;
+    }
+    let output = tu.raw_output.as_ref()?.as_object()?;
+    let output: HashMap<String, Value> = output
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let width = usize::from(content_width);
+    let display = rebon_render::session_message_display(&output, width)?;
+    let mut lines = vec![display];
+    if matches!(verbosity, ToolOutputVerbosity::Verbose) {
+        let input = tu.input.as_object().map(|input| {
+            input
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<HashMap<_, _>>()
+        });
+        // The detail rows are the sender's own input: the result no longer
+        // carries a copy, which is what kept the body's first line short.
+        lines.extend(rebon_render::session_message_detail_lines(
+            &output,
+            input.as_ref(),
+            width,
+        ));
+    }
+    Some(lines)
+}
+
 pub(super) fn collect_tool_block_body_lines_with_width(
     tu: &AssistantToolUseBlock,
     verbosity: ToolOutputVerbosity,
@@ -289,6 +330,9 @@ pub(super) fn collect_tool_block_body_lines_with_width(
 ) -> Vec<String> {
     if plan_ledger_input(&tu.name, &tu.input).is_some() {
         return collect_plan_ledger_body_lines(tu, verbosity);
+    }
+    if let Some(lines) = collect_session_message_body_lines(tu, verbosity, content_width) {
+        return lines;
     }
     if tu.name == rebon_render::code_mode::RUN_CODE_TOOL_NAME {
         return collect_code_mode_body_lines(tu, verbosity, content_width);

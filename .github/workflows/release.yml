@@ -52,7 +52,7 @@ env:
 
 jobs:
   verify:
-    runs-on: macos-14
+    runs-on: macos-15
     # The long pole, and nothing was bounding it.
     timeout-minutes: 90
     steps:
@@ -203,7 +203,7 @@ jobs:
 
   dsh-integration:
     name: DSH integration (macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 90
     permissions:
       contents: read
@@ -239,7 +239,7 @@ jobs:
   test:
     needs: verify
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'pull_request'
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
@@ -338,7 +338,7 @@ jobs:
     # reviewer requirement and a `v*`-only tag rule are configured, which is
     # what keeps push access from being publish access.
     environment: npm-publish
-    runs-on: macos-14
+    runs-on: macos-15
     # A cold release build of this workspace on a 3-core runner; 30 was tight.
     timeout-minutes: 60
     strategy:

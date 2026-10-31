@@ -923,6 +923,30 @@ const VISIBLE_RUNTIME_MODEL_TEXT_MARKER_PREFIX: &str = "<rebon-visible-runtime-m
 /// Transcript flag on a queued row written for a visible runtime attachment,
 /// so replay sends its model text exactly as the live request did.
 pub(super) const RUNTIME_ATTACHMENT_ENTRY_KEY: &str = "runtimeAttachment";
+/// What every transcript row another session's message is written as starts
+/// with, whether the message joined a running turn or opened one.
+const AGENT_MESSAGE_ROW_UUID_PREFIX: &str = "u-agent-message-";
+
+/// The uuid of the transcript row another session's message `message_id` is
+/// written as.
+///
+/// One spelling for both places such a message lands: queued into a running
+/// turn as a visible attachment, and as the prompt row of a turn it started.
+/// The executor reads the prefix to mark the second the way the first is
+/// marked.
+pub fn agent_message_row_uuid(message_id: &str) -> String {
+    format!("{AGENT_MESSAGE_ROW_UUID_PREFIX}{message_id}")
+}
+
+/// Whether a turn's prompt row is another session's message.
+///
+/// Such a row is not what the person typed, so it is written as a runtime
+/// attachment — readers that excerpt user text skip it — but without
+/// `queuedCommand`: it opened its turn rather than joining a running one,
+/// which is what lets a reader that looks for turn boundaries still find it.
+pub(super) fn opens_turn_with_agent_message(user_uuid: &str) -> bool {
+    user_uuid.starts_with(AGENT_MESSAGE_ROW_UUID_PREFIX)
+}
 /// Transcript field on an assistant row naming the model it was requested
 /// from, written only when the provider reported a different one; otherwise
 /// `message.model` is both.

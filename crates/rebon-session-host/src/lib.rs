@@ -203,6 +203,29 @@ const SUPERVISOR_CLIENT_TTL_MS: u64 = 15_000;
 const SUPERVISOR_CLIENT_HEARTBEAT_INTERVAL_MS: u64 = 2_000;
 pub const BACKGROUND_SUMMARY_UPDATE_INTERVAL_MS: u64 = 15_000;
 pub const MAX_PENDING_PROMPTS: usize = 32;
+/// How many of those slots messages from other sessions may hold at once.
+///
+/// A message the wake bounds refused waits in the queue for a turn somebody
+/// else starts, so a peer that keeps writing to a session it may no longer wake
+/// would otherwise fill the queue and leave no room for what a person types.
+/// They may hold half of it; past that a new agent message is refused, and its
+/// sender is told so rather than having it dropped.
+pub const MAX_PENDING_AGENT_MESSAGES: usize = MAX_PENDING_PROMPTS / 2;
+/// How many of the queue's last free slots messages from other sessions may
+/// never take, counting ones a running turn already read but has not retired.
+///
+/// The share above bounds the messages still waiting; this bounds them all,
+/// so a long turn that keeps reading what a peer sends cannot fill the queue
+/// either, and a typed prompt, a cron fire or a task's report always finds
+/// room.
+pub const PENDING_PROMPT_SLOTS_KEPT_FROM_AGENT_MESSAGES: usize = MAX_PENDING_PROMPTS / 4;
+/// How many messages one sender may have waiting with a refused wake.
+///
+/// A peer past its wake bounds keeps being accepted — its messages ride with
+/// the next turn somebody else starts — but without this it could fill the
+/// share every sender draws on. Past it, that sender's next refused message
+/// is not taken, and it is told so.
+pub const MAX_WAITING_REFUSED_MESSAGES_PER_SENDER: usize = 4;
 /// Upper bound on remembered coordinator report grants. One entry per
 /// worker report path; a long coordinator run stays bounded and drops
 /// its oldest grants first.

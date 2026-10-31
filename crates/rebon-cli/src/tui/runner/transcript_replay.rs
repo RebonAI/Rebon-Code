@@ -161,4 +161,78 @@ mod tests {
             assert_eq!(tui.transcript.len(), 1, "case: {case}");
         }
     }
+
+    /// An agent message injected into a running turn is persisted as a visible
+    /// runtime attachment. A resume reads that row back as what it was — a
+    /// teammate message naming its sender — rather than as a prompt the person
+    /// typed or as nothing at all.
+    #[test]
+    fn a_persisted_agent_message_replays_as_a_visible_teammate_row() {
+        let frame = "<teammate-message teammate_id=\"main@session:sess-sender\" \
+                     from_session=\"sess-sender\" from_handle=\"repo-qrst\">\
+                     please check the build</teammate-message>";
+        let entry = rebon_session::TranscriptEntry {
+            entry_type: "user".into(),
+            uuid: "u-agent-message-m-1".into(),
+            parent_uuid: Some("root".into()),
+            timestamp: Some("2026-04-18T00:00:00.000Z".into()),
+            raw: json!({
+                "type": "user",
+                "uuid": "u-agent-message-m-1",
+                "parentUuid": "root",
+                "timestamp": "2026-04-18T00:00:00.000Z",
+                "queuedCommand": true,
+                "runtimeAttachment": true,
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "<rebon-visible-runtime-attachment uuid=\"u-agent-message-m-1\">"},
+                        {"type": "text", "text": frame},
+                    ],
+                },
+                "modelContent": [{"type": "text", "text": frame}],
+            }),
+        };
+        let mut tui = rebon_tui::AppState::default();
+
+        replay_transcript_entries(&mut tui, vec![entry]);
+
+        let rows = tui.transcript.rows();
+        assert_eq!(rows.len(), 1, "the attachment is not dropped: {rows:?}");
+        let rebon_tui::Message::User(user) = &rows[0] else {
+            panic!("expected a user row, got {:?}", rows[0]);
+        };
+        let text = user
+            .message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                rebon_tui::UserContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            text.contains("<teammate-message"),
+            "the row keeps the frame the model read: {text}"
+        );
+        assert!(
+            text.contains("from_handle=\"repo-qrst\""),
+            "the frame names its sender, which is what the row draws: {text}"
+        );
+
+        // The row as drawn, not just as stored: the sender is named by its
+        // handle and the body is the message it sent.
+        let rendered =
+            rebon_render::teammate_messages::project_user_teammate_messages(&text, false);
+        assert_eq!(rendered.len(), 1, "{rendered:?}");
+        let rebon_render::teammate_messages::TeammateRenderable::Plain(plain) = &rendered[0] else {
+            panic!("expected a plain teammate message, got {:?}", rendered[0]);
+        };
+        assert_eq!(plain.display_name, "repo-qrst");
+        assert!(
+            plain.content.contains("please check the build"),
+            "{:?}",
+            plain.content
+        );
+    }
 }

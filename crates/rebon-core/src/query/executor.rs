@@ -1486,6 +1486,17 @@ impl EngineQueryExecutor {
         if let Some(messenger) = &self.peer_messenger {
             ctx = ctx.with_peer_messenger(messenger.clone());
         }
+        // The ledger is the session's, not the executor's: what this session was
+        // told is what its inbox recorded, and the inbox lives in the runtime
+        // that hosts it.
+        ctx = ctx.with_peer_reply_ledger(rebon_tool::peer::session_reply_ledger(session_id));
+        // Its own handle, so `@mine-1234` is refused as a message to itself
+        // rather than reported as a session that does not exist.
+        if let Some(handle) =
+            rebon_session::load_session_handle(&self.projects_root, cwd, session_id)
+        {
+            ctx = ctx.with_peer_handle(handle);
+        }
         if let Some(controller) = &self.queue_controller {
             ctx = ctx.with_queue_controller(controller.clone());
         }
@@ -3627,6 +3638,14 @@ impl EngineQueryExecutor {
                 false,
                 false,
             );
+            // A turn another session's message started opens with that
+            // message, not with anything the person typed: marked the way the
+            // same message is when it joins a running turn, so a reader that
+            // excerpts user text does not put the sender's words in the
+            // person's mouth.
+            if opens_turn_with_agent_message(&user_uuid) {
+                user_payload[RUNTIME_ATTACHMENT_ENTRY_KEY] = serde_json::Value::Bool(true);
+            }
             if replay_only {
                 user_payload.as_object_mut().unwrap().insert(
                     "permissionReplay".to_string(),

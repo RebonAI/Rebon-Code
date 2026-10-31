@@ -38,16 +38,18 @@ pub(crate) struct PersistedRemoteTurn {
 }
 
 fn entry_is_meta_user(entry: &rebon_session::TranscriptEntry) -> bool {
-    entry
-        .raw
-        .get("isMeta")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-        || entry
+    let flag = |key: &str| {
+        entry
             .raw
-            .get("runtimeContext")
+            .get(key)
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
+    };
+    // A message another agent sent is a visible attachment inside the turn it
+    // arrived in, so it is not what the person typed and not what opened a turn.
+    flag("isMeta")
+        || flag("runtimeContext")
+        || flag("runtimeAttachment")
         || entry
             .raw
             .get("message")
@@ -59,17 +61,30 @@ fn entry_is_meta_user(entry: &rebon_session::TranscriptEntry) -> bool {
 /// Whether a user entry opens a turn.
 ///
 /// Meta entries mostly ride inside a turn (attachments, runtime context) and
-/// are not boundaries. The exception is an internal prompt (`u-internal-…`):
-/// a task notification, a cron fire, a follow-up the session queued for
-/// itself. It is meta because nobody typed it, but it is what the turn was
-/// started from. Missing it left a mirror on the previous boundary, so the
-/// streamed text of every such turn piled up in one overlay that was never
-/// cleared.
+/// are not boundaries. The exceptions are rows nobody typed that a turn was
+/// started from. An internal prompt (`u-internal-…`) — a task notification, a
+/// cron fire, a follow-up the session queued for itself — is meta. Another
+/// session's message that started a turn is a runtime attachment like the same
+/// message queued into a running turn, but written as the turn's own prompt
+/// rather than queued (`queuedCommand`). Missing either left a mirror on the
+/// previous boundary, so the streamed text of every such turn piled up in one
+/// overlay that was never cleared.
 fn entry_is_user_turn(entry: &rebon_session::TranscriptEntry) -> bool {
     if entry.entry_type != "user" {
         return false;
     }
-    if entry_is_meta_user(entry) && !entry.uuid.starts_with("u-internal-") {
+    let flag = |key: &str| {
+        entry
+            .raw
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    let opened_by_another_session = flag("runtimeAttachment") && !flag("queuedCommand");
+    if entry_is_meta_user(entry)
+        && !entry.uuid.starts_with("u-internal-")
+        && !opened_by_another_session
+    {
         return false;
     }
     let Some(content) = entry
@@ -693,7 +708,9 @@ pub(crate) fn transcript_fingerprint(entries: &[rebon_session::TranscriptEntry])
 /// The one thing the record still ends is a turn the owner never announced:
 /// this terminal starts the clock on the user's Enter, and a prompt the
 /// worker refuses before its turn loop ends in the record — terminal status,
-/// nothing queued — with no `Turn` event to close what no event opened.
+/// nothing queued to run — with no `Turn` event to close what no event opened.
+/// A message from another session the wake bounds refused may still be
+/// queued then; it waits for a turn somebody else starts and runs nothing.
 pub(crate) fn sync_turn_with_record(
     remote: &mut crate::background::RemoteBackgroundAttachment,
     state: &rebon_session_host::BackgroundJobState,
@@ -712,7 +729,9 @@ pub(crate) fn sync_turn_with_record(
         } else {
             remote.end_turn();
         }
-    } else if !remote.turn_started_by_stream && !record_says_running && !state.has_pending_prompts()
+    } else if !remote.turn_started_by_stream
+        && !record_says_running
+        && !state.has_pending_prompts_to_run()
     {
         remote.end_turn();
     }
@@ -1120,6 +1139,101 @@ mod tests {
         let first = persisted_remote_turn(&entries, "u-user-1");
         assert!(first.next_user_found, "the cron fire ends the typed turn");
         assert_eq!(first.assistant_text, "hello");
+    }
+
+    /// A message another agent sent reaches the transcript as a visible
+    /// attachment, which is a user entry the person never typed. It rides inside
+    /// the turn it arrived in, so it neither opens a turn nor ends one — a
+    /// boundary it moved would take `last_remote_user_turn_uuid` with it.
+    #[test]
+    fn a_persisted_agent_message_attachment_is_not_a_user_turn() {
+        // As the executor persists it: the marker stripped, the frame in one
+        // block, queued into the running turn.
+        let mut attachment = transcript_entry(
+            "user",
+            "u-agent-message-m-1",
+            serde_json::json!([
+                {"type": "text", "text": "<teammate-message teammate_id=\"main@session:sess-sender\" from_session=\"sess-sender\">\ngo\n</teammate-message>"}
+            ]),
+        );
+        attachment.raw["runtimeAttachment"] = serde_json::json!(true);
+        attachment.raw["queuedCommand"] = serde_json::json!(true);
+        attachment.raw["iteration"] = serde_json::json!(1);
+
+        let entries = vec![
+            transcript_entry(
+                "user",
+                "u-typed",
+                serde_json::json!([{"type": "text", "text": "do the work"}]),
+            ),
+            attachment,
+            transcript_entry(
+                "assistant",
+                "a-1",
+                serde_json::json!([{"type": "text", "text": "done"}]),
+            ),
+        ];
+
+        assert_eq!(
+            last_remote_user_turn_uuid(&entries).as_deref(),
+            Some("u-typed"),
+            "the attachment is not what the conversation was last opened by"
+        );
+        let turn = persisted_remote_turn(&entries, "u-typed");
+        assert!(
+            !turn.next_user_found,
+            "the attachment did not end the turn it arrived in"
+        );
+        assert_eq!(turn.assistant_text, "done");
+    }
+
+    /// A turn another session's message started opens with that message's row,
+    /// marked as a runtime attachment so it does not read as the person's words.
+    /// It is still what the turn was started from: it ends the turn before it
+    /// and is the boundary the mirror follows.
+    #[test]
+    fn a_turn_another_session_started_opens_at_the_message_row() {
+        // As the executor persists a turn's prompt row: one text block, written
+        // as a string, and not queued into a running turn.
+        let mut opening = transcript_entry(
+            "user",
+            "u-agent-message-m-2",
+            serde_json::json!("<teammate-message teammate_id=\"main@session:sess-sender\" from_session=\"sess-sender\">\nnext\n</teammate-message>"),
+        );
+        opening.raw["runtimeAttachment"] = serde_json::json!(true);
+
+        let entries = vec![
+            transcript_entry(
+                "user",
+                "u-typed",
+                serde_json::json!([{"type": "text", "text": "do the work"}]),
+            ),
+            transcript_entry(
+                "assistant",
+                "a-1",
+                serde_json::json!([{"type": "text", "text": "done"}]),
+            ),
+            opening,
+            transcript_entry(
+                "assistant",
+                "a-2",
+                serde_json::json!([{"type": "text", "text": "on it"}]),
+            ),
+        ];
+
+        assert_eq!(
+            last_remote_user_turn_uuid(&entries).as_deref(),
+            Some("u-agent-message-m-2")
+        );
+        let typed = persisted_remote_turn(&entries, "u-typed");
+        assert!(
+            typed.next_user_found,
+            "the message's turn ends the typed one"
+        );
+        assert_eq!(typed.assistant_text, "done");
+        let opened = persisted_remote_turn(&entries, "u-agent-message-m-2");
+        assert!(opened.boundary_found);
+        assert_eq!(opened.assistant_text, "on it");
     }
 
     #[test]
@@ -1646,6 +1760,32 @@ mod tests {
             remote.running_turn_started_at().is_none(),
             "the record ends a turn the stream never announced"
         );
+
+        // The same, while a message the wake bounds refused waits in the
+        // queue: it runs nothing, so it does not keep the turn going.
+        remote.begin_turn(now, false);
+        let mut refused = rebon_session_host::PendingPrompt::new(
+            "m-refused".into(),
+            "<teammate-message teammate_id=\"main@session:sess-peer\">x</teammate-message>".into(),
+            Vec::new(),
+            1,
+        )
+        .unwrap();
+        refused.origin = Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
+            from_session_id: "sess-peer".into(),
+            from_agent: "main".into(),
+            from_handle: None,
+            from_name: None,
+            hops: 9,
+        });
+        refused.wake = rebon_tool::peer::WakeVerdict::Refused;
+        state.identity.pending_prompts = vec![refused];
+        super::sync_turn_with_record(&mut remote, &state, true, now);
+        assert!(
+            remote.running_turn_started_at().is_none(),
+            "a refused message waiting does not keep a refused prompt's turn alive"
+        );
+        state.identity.pending_prompts.clear();
 
         // Typed here, still queued there: the worker has not claimed it yet.
         remote.begin_turn(now, false);

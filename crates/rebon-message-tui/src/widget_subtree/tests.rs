@@ -62,7 +62,7 @@ fn teammate_message_uses_message_gutter_and_visible_body() {
     let mut buf = make_buf(60, 5);
     widget.render_to_buffer(Rect::new(0, 0, 60, 5), &mut buf);
 
-    assert_eq!(line_at(&buf, 0), "› Message from @fix-d1-transport");
+    assert_eq!(line_at(&buf, 0), "› Message from @fix-d1-transport: done");
     assert_eq!(line_at(&buf, 1), "");
     assert_eq!(line_at(&buf, 2), "  D1 complete");
     assert_eq!(line_at(&buf, 3), "  Handoff ready.");

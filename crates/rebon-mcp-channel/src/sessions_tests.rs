@@ -764,6 +764,79 @@ fn a_rebon_transcript_reads_the_same_way() {
     assert_eq!(read["next_cursor"], "r4");
 }
 
+/// A message another session sent arrives inside a running turn and is written
+/// as a `user` row flagged `runtimeAttachment`: the person never typed it. The
+/// reader must not hand it back as something the user said, and a title must
+/// not be made of it.
+#[test]
+fn a_message_from_another_session_is_not_the_users_words() {
+    let f = fixture();
+    let frame = "<teammate-message teammate_id=\"main@session:sess-sender\" \
+                 from_session=\"sess-sender\" from_handle=\"repo-qrst\">\
+                 please check the build</teammate-message>";
+    // The row as the executor persists an in-turn agent message: the queued-row
+    // payload, the attachment flag, and the frame as the visible content with
+    // its uuid marker stripped.
+    let attachment = |uuid: &str, parent: Option<&str>, stamp: u32| {
+        json!({"type":"user","uuid":uuid,"parentUuid":parent,
+               "timestamp":format!("2026-09-01T00:00:{stamp:02}.000Z"),
+               "queuedCommand":true,"iteration":1,"runtimeAttachment":true,
+               "message":{"role":"user","content":[{"type":"text","text":frame}]}})
+    };
+    f.rebon(
+        "agmsg-agmsg-agmsg-agmsg",
+        &jsonl(&[
+            user("r1", None, 1, json!("tidy the imports")),
+            assistant(
+                "r2",
+                Some("r1"),
+                2,
+                json!([{"type":"text","text":"On it."}]),
+            ),
+            attachment("u-agent-message-m-1", Some("r2"), 3),
+            assistant(
+                "r4",
+                Some("u-agent-message-m-1"),
+                4,
+                json!([{"type":"text","text":"Done."}]),
+            ),
+        ]),
+        1_000,
+    );
+    let read = f
+        .read(json!({ "session_id": "agmsg-agmsg-agmsg-agmsg" }))
+        .unwrap();
+    assert_eq!(
+        read["text"],
+        "### user\ntidy the imports\n\n### assistant\nOn it.\nDone."
+    );
+
+    // A session whose first user row is such a message is titled by what the
+    // person typed after it.
+    f.rebon(
+        "agttl-agttl-agttl-agttl",
+        &jsonl(&[
+            attachment("u-agent-message-m-2", None, 1),
+            user(
+                "t1",
+                Some("u-agent-message-m-2"),
+                2,
+                json!("look at the failure"),
+            ),
+        ]),
+        2_000,
+    );
+    let listed = f.list(json!({})).unwrap();
+    assert!(
+        rows(&listed).contains(&(
+            "agttl-agttl-agttl-agttl".into(),
+            "rebon".into(),
+            "look at the failure".into()
+        )),
+        "the title is the person's prompt, not the other session's frame: {listed}"
+    );
+}
+
 #[test]
 fn a_compacted_claude_conversation_opens_with_its_summary() {
     let f = fixture();

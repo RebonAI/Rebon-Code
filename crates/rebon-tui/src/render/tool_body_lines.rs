@@ -38,9 +38,13 @@ pub(super) fn collect_tool_body_lines(
     content_override: Option<&[ToolCallContent]>,
     supports_hyperlinks: bool,
     extras: TranscriptRenderExtras<'_>,
+    content_width: usize,
 ) -> Vec<String> {
     if let Some(text) = async_agent_launch_display(tool, extras) {
         return vec![text];
+    }
+    if let Some(lines) = session_message_body_lines(tool, false, content_width) {
+        return lines;
     }
     if let Some(lines) = workflow_journal_lines_for_tool(tool) {
         return lines;
@@ -154,6 +158,37 @@ pub(super) fn collect_tool_body_lines(
         }
     }
     normalize_tool_body_lines(lines, true)
+}
+
+/// The card for a message sent to another session.
+///
+/// One line says who it went to; `verbose` adds the sender's summary and the
+/// first line of what it actually wrote, which is what ctrl+o is for. A send
+/// that failed, or went to a teammate or a local task, has no such card — the
+/// tool result already says what happened.
+///
+/// `content_width` is the columns the row is painted in. A title is text the
+/// peer's owner wrote, so it can be any width at all, and a row wider than the
+/// terminal folds into a second line that reads as a second fact.
+pub(super) fn session_message_body_lines(
+    tool: &crate::streaming::StreamingToolUse,
+    verbose: bool,
+    content_width: usize,
+) -> Option<Vec<String>> {
+    if tool.tool_name != "SendMessage" {
+        return None;
+    }
+    let output = tool.raw_output.as_ref()?;
+    let display = rebon_render::session_message_display(output, content_width)?;
+    let mut lines = vec![display];
+    if verbose {
+        lines.extend(rebon_render::session_message_detail_lines(
+            output,
+            tool.raw_input.as_ref(),
+            content_width,
+        ));
+    }
+    Some(lines)
 }
 
 pub(super) fn is_web_search_tool(
@@ -1032,6 +1067,195 @@ mod tests {
         assert_eq!(
             lines[1],
             "✓ [design] Design UI — completed (9 tokens · 80ms)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_message_tests {
+    use super::*;
+    use crate::streaming::StreamingToolUse;
+    use rebon_types::{ToolCallStatus, ToolKind};
+    use serde_json::json;
+
+    fn send_tool(output: serde_json::Value) -> StreamingToolUse {
+        StreamingToolUse {
+            call_id: "call-1".into(),
+            tool_name: "SendMessage".into(),
+            kind: ToolKind::Other,
+            status: ToolCallStatus::Completed,
+            title: None,
+            content: None,
+            locations: None,
+            raw_input: None,
+            raw_output: Some(serde_json::from_value(output).expect("an object")),
+        }
+    }
+
+    fn session_output() -> serde_json::Value {
+        json!({
+            "success": true,
+            "mode": "session",
+            "target": "session:abcde-fghij-klmno-pqrst",
+            "target_handle": "repo-qrst",
+            "target_name": "worker",
+        })
+    }
+
+    /// What the sender asked to send, which is where the detail rows come from.
+    fn session_input() -> HashMap<String, Value> {
+        serde_json::from_value(json!({
+            "to": "@repo-qrst",
+            "summary": "handoff",
+            "message": "please look at the failing test\nand then the second one",
+        }))
+        .expect("an object")
+    }
+
+    const WIDE: usize = 120;
+
+    #[test]
+    fn a_session_send_gets_one_line_naming_the_peer() {
+        let lines = session_message_body_lines(&send_tool(session_output()), false, WIDE)
+            .expect("a session send has a card");
+        assert_eq!(
+            lines,
+            vec!["Message sent to @repo-qrst — worker".to_string()]
+        );
+    }
+
+    #[test]
+    fn verbose_adds_the_summary_and_the_first_body_line() {
+        let mut tool = send_tool(session_output());
+        tool.raw_input = Some(session_input());
+        let lines =
+            session_message_body_lines(&tool, true, WIDE).expect("a session send has a card");
+        assert_eq!(
+            lines,
+            vec![
+                "Message sent to @repo-qrst — worker".to_string(),
+                "handoff".to_string(),
+                "please look at the failing test".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_peer_with_only_an_id_is_named_by_its_session() {
+        let lines = session_message_body_lines(
+            &send_tool(json!({
+                "success": true,
+                "mode": "session",
+                "target": "session:abcde-fghij-klmno-pqrst",
+            })),
+            false,
+            WIDE,
+        )
+        .expect("a session send has a card");
+        assert_eq!(lines, vec!["Message sent to session:abcde-fg".to_string()]);
+    }
+
+    /// A send that failed keeps the tool's own error row; this card never
+    /// claims a delivery that did not happen.
+    #[test]
+    fn a_failed_send_has_no_card() {
+        assert!(session_message_body_lines(
+            &send_tool(json!({
+                "success": false,
+                "mode": "session",
+                "target": "session:abcde-fghij-klmno-pqrst",
+            })),
+            false,
+            WIDE,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_teammate_or_task_send_has_no_card() {
+        assert!(session_message_body_lines(
+            &send_tool(json!({ "success": true, "target": "bob" })),
+            false,
+            WIDE,
+        )
+        .is_none());
+        assert!(session_message_body_lines(
+            &send_tool(json!({ "success": true, "target": "task-1", "mode": "runtime" })),
+            false,
+            WIDE,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn another_tool_has_no_card() {
+        let mut tool = send_tool(session_output());
+        tool.tool_name = "Read".into();
+        assert!(session_message_body_lines(&tool, false, WIDE).is_none());
+    }
+
+    /// The committed row goes through `collect_tool_body_lines`, which is what
+    /// the projection uses after a send — the card is the row, not the raw JSON
+    /// of the result.
+    #[test]
+    fn the_collected_body_is_the_card_and_not_the_raw_json() {
+        let tool = send_tool(session_output());
+        let extras = crate::render::TranscriptRenderExtras::empty();
+        let lines = collect_tool_body_lines(&tool, None, false, extras, WIDE);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("Message sent to @repo-qrst"),
+            "{lines:?}"
+        );
+    }
+
+    /// A narrow terminal gets a narrow card: the title is remote text and can
+    /// be any width, and a wrapped row would read as a second line.
+    #[test]
+    fn the_card_is_truncated_to_the_columns_it_is_painted_in() {
+        let tool = send_tool(json!({
+            "success": true,
+            "mode": "session",
+            "target": "session:abcde-fghij-klmno-pqrst",
+            "target_handle": "repo-qrst",
+            "target_name": "a worker with a rather long title",
+        }));
+        let lines =
+            session_message_body_lines(&tool, false, 24).expect("a session send has a card");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(rebon_width::str_width(&lines[0]), 24, "{lines:?}");
+        assert!(lines[0].ends_with('…'), "{lines:?}");
+    }
+
+    /// The message text is the sender's input, and its first line is all the
+    /// detail row shows — a title it did not choose cannot break the row.
+    #[test]
+    fn a_verbose_body_line_stays_on_one_row() {
+        let mut tool = send_tool(session_output());
+        tool.raw_input = Some(
+            serde_json::from_value(json!({
+                "summary": "hand\r\noff",
+                "message": "first line\nsecond line",
+            }))
+            .expect("an object"),
+        );
+        let lines =
+            session_message_body_lines(&tool, true, WIDE).expect("a session send has a card");
+        assert_eq!(lines[1], "hand off");
+        assert_eq!(lines[2], "first line");
+    }
+
+    /// A queued message is still waiting; the row says so rather than reading as
+    /// delivered.
+    #[test]
+    fn a_queued_send_marks_it_on_the_same_row() {
+        let mut output = session_output();
+        output["delivery"] = json!("queued");
+        let lines = session_message_body_lines(&send_tool(output), false, WIDE)
+            .expect("a session send has a card");
+        assert_eq!(
+            lines,
+            vec!["Message sent to @repo-qrst — worker · queued".to_string()]
         );
     }
 }

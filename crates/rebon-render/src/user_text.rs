@@ -85,8 +85,6 @@ pub enum UserTextProjection {
     ResourceUpdates(Vec<ResourceUpdateDisplay>),
     /// Deferred feature-gated fork boilerplate branch.
     ForkBoilerplateDeferred,
-    /// Deferred feature-gated cross-session branch.
-    CrossSessionDeferred,
     /// Channel branch.
     Channel(UserChannelDisplay),
     /// Plain prompt fallback branch.
@@ -153,8 +151,6 @@ pub struct UserTextInput {
     pub github_webhooks_enabled: bool,
     /// Feature gate for fork boilerplate messages.
     pub fork_subagent_enabled: bool,
-    /// Feature gate for cross-session UDS messages.
-    pub uds_inbox_enabled: bool,
     /// Feature gate for channel messages (`<channel source="…">`).
     pub channels_enabled: bool,
     /// Whether teammate/swarm messages are enabled.
@@ -226,7 +222,13 @@ pub fn project_user_text(input: &UserTextInput) -> UserTextProjection {
                 .unwrap(),
         );
     }
-    if input.agent_swarms_enabled && input.text.contains("<teammate-message") {
+    // A cross-session message is a teammate message: it arrives in the same
+    // frame, and the `from_session` attribute is what says so. It renders
+    // whether or not swarms are on — turning swarms off must not make another
+    // session's message vanish from the transcript it was delivered into.
+    if input.text.contains("<teammate-message")
+        && (input.agent_swarms_enabled || input.text.contains("from_session=\""))
+    {
         return UserTextProjection::Teammate(
             crate::teammate_messages::project_user_teammate_messages(
                 &input.text,
@@ -250,9 +252,6 @@ pub fn project_user_text(input: &UserTextInput) -> UserTextProjection {
     }
     if input.fork_subagent_enabled && input.text.contains("<fork-boilerplate>") {
         return UserTextProjection::ForkBoilerplateDeferred;
-    }
-    if input.uds_inbox_enabled && input.text.contains("<cross-session-message") {
-        return UserTextProjection::CrossSessionDeferred;
     }
     if input.channels_enabled && input.text.contains("<channel source=\"") {
         return UserTextProjection::Channel(
@@ -310,6 +309,53 @@ pub fn project_user_prompt_display_lines_for_width(
             .collect();
     }
     fold_prompt_lines(rows, USER_PROMPT_FOLD_HEAD_ROWS, USER_PROMPT_FOLD_TAIL_ROWS)
+}
+
+/// Rows of a teammate message body past which the body folds.
+///
+/// A cross-session message is somebody else's turn: it can be a whole report,
+/// and pasting all of it into the transcript pushes the conversation that
+/// answered it off the screen. Folded rather than dropped — the header says
+/// what it was, and the hint says how to read the rest.
+pub const TEAMMATE_BODY_FOLD_THRESHOLD_ROWS: usize = 12;
+
+/// Rows kept above the fold in a teammate message body.
+pub const TEAMMATE_BODY_FOLD_HEAD_ROWS: usize = 6;
+
+/// Rows kept below the fold in a teammate message body.
+pub const TEAMMATE_BODY_FOLD_TAIL_ROWS: usize = 3;
+
+/// The body of a teammate message as the transcript draws it.
+///
+/// Transcript mode shows the whole thing; the live view folds it by the rows it
+/// takes at `width`, so a dozen long paragraphs fold like forty short ones.
+pub fn project_teammate_body_lines(
+    content: &str,
+    is_transcript_mode: bool,
+    width: usize,
+) -> Vec<UserPromptDisplayLine> {
+    let lines = content.lines().collect::<Vec<_>>();
+    if is_transcript_mode {
+        return lines
+            .into_iter()
+            .map(|line| UserPromptDisplayLine::Text(line.to_owned()))
+            .collect();
+    }
+    let rows = lines
+        .iter()
+        .flat_map(|line| wrap_prompt_line(line, width))
+        .collect::<Vec<_>>();
+    if rows.len() <= TEAMMATE_BODY_FOLD_THRESHOLD_ROWS {
+        return lines
+            .into_iter()
+            .map(|line| UserPromptDisplayLine::Text(line.to_owned()))
+            .collect();
+    }
+    fold_prompt_lines(
+        rows,
+        TEAMMATE_BODY_FOLD_HEAD_ROWS,
+        TEAMMATE_BODY_FOLD_TAIL_ROWS,
+    )
 }
 
 /// Word-wrap one prompt line to `width` columns; a word wider than a row,
@@ -470,7 +516,6 @@ three";
             timestamp: Some("ts".into()),
             github_webhooks_enabled: false,
             fork_subagent_enabled: false,
-            uds_inbox_enabled: false,
             channels_enabled: false,
             agent_swarms_enabled: false,
         }
@@ -533,6 +578,106 @@ three";
             project_user_text(&i),
             UserTextProjection::Channel(_)
         ));
+    }
+
+    /// A frame that names its sending session came from another session, not
+    /// from a swarm teammate — and it must still render when swarms are off.
+    /// Turning swarms off is not a reason for a delivered message to vanish
+    /// from the transcript it was delivered into.
+    #[test]
+    fn a_cross_session_message_renders_as_a_teammate_message_with_swarms_off() {
+        let i = input(
+            "<teammate-message teammate_id=\"main@session:sess-a\" from_session=\"sess-a\" from_handle=\"repo-qrst\">hello</teammate-message>",
+        );
+        assert!(!i.agent_swarms_enabled);
+        match project_user_text(&i) {
+            UserTextProjection::Teammate(renderables) => {
+                assert_eq!(renderables.len(), 1);
+                match &renderables[0] {
+                    crate::teammate_messages::TeammateRenderable::Plain(plain) => {
+                        assert_eq!(plain.display_name, "repo-qrst");
+                        assert_eq!(plain.content, "hello");
+                    }
+                    other => panic!("expected a plain message, got {other:?}"),
+                }
+            }
+            other => panic!("a cross-session message must render: {other:?}"),
+        }
+    }
+
+    /// A teammate frame with no session attribute is still gated on swarms, as
+    /// it always was.
+    #[test]
+    fn a_plain_teammate_frame_still_needs_swarms() {
+        let i = input("<teammate-message teammate_id=\"a\">plain</teammate-message>");
+        assert!(!i.agent_swarms_enabled);
+        assert!(matches!(
+            project_user_text(&i),
+            UserTextProjection::Prompt { .. }
+        ));
+    }
+
+    #[test]
+    fn a_teammate_body_folds_by_rows_at_the_given_width() {
+        let content = (0..30)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let folded = project_teammate_body_lines(&content, false, 80);
+        let hidden = folded
+            .iter()
+            .find_map(|line| match line {
+                UserPromptDisplayLine::HiddenSeparator { hidden_line_count } => {
+                    Some(*hidden_line_count)
+                }
+                _ => None,
+            })
+            .expect("a long body folds");
+        assert_eq!(hidden, 30 - TEAMMATE_BODY_FOLD_HEAD_ROWS - TEAMMATE_BODY_FOLD_TAIL_ROWS);
+        assert_eq!(folded.iter().filter(|l| matches!(l, UserPromptDisplayLine::Text(_))).count(), TEAMMATE_BODY_FOLD_HEAD_ROWS + TEAMMATE_BODY_FOLD_TAIL_ROWS + 1);
+    }
+
+    /// A dozen long paragraphs take many rows: the fold counts rows on screen,
+    /// not source lines.
+    #[test]
+    fn a_teammate_body_of_few_long_lines_still_folds() {
+        let content = (0..3)
+            .map(|_| "word ".repeat(80).trim_end().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(content.lines().count(), 3);
+        let folded = project_teammate_body_lines(&content, false, 40);
+        assert!(
+            folded
+                .iter()
+                .any(|line| matches!(line, UserPromptDisplayLine::HiddenSeparator { .. })),
+            "{folded:?}"
+        );
+    }
+
+    #[test]
+    fn transcript_mode_shows_the_whole_teammate_body() {
+        let content = (0..60)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = project_teammate_body_lines(&content, true, 80);
+        assert_eq!(lines.len(), 60);
+        assert!(!lines
+            .iter()
+            .any(|line| matches!(line, UserPromptDisplayLine::HiddenSeparator { .. })));
+    }
+
+    #[test]
+    fn a_short_teammate_body_is_left_alone() {
+        let lines = project_teammate_body_lines("one\ntwo", false, 80);
+        assert_eq!(
+            lines,
+            vec![
+                UserPromptDisplayLine::Text("one".into()),
+                UserPromptDisplayLine::Text("two".into()),
+            ]
+        );
     }
 
     #[test]

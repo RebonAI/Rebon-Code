@@ -759,8 +759,11 @@ impl OwnerHandle {
             from_session_id,
             from_agent,
             from_cwd,
+            from_handle,
+            from_name,
             summary,
             text,
+            hops,
         } = envelope;
         let response = self.send(
             BackgroundIpcRequest::AgentMessage {
@@ -768,8 +771,11 @@ impl OwnerHandle {
                 from_session_id,
                 from_agent,
                 from_cwd,
+                from_handle,
+                from_name,
                 summary,
                 text,
+                hops,
             },
             command_id,
         )?;
@@ -1162,6 +1168,9 @@ pub fn foreground_status_from_owner(
         // descriptor is how it is reached.
         agent_endpoint: None,
         capabilities: Vec::new(),
+        // What the owner is doing is published on its job record, which the
+        // peer directory reads directly; this projection is the mailbox shape.
+        activity: None,
     }
 }
 

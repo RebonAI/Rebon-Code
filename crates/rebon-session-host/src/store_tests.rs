@@ -3644,6 +3644,7 @@ fn pending_prompt_writes_and_appends_remain_strict() {
         claimed_turn_generation: None,
         completed_turn_generation: None,
         origin: None,
+        wake: rebon_tool::peer::WakeVerdict::Unjudged,
     }];
     assert!(store.write_state(&invalid_id).is_err());
     assert_eq!(store.read_state(&state.identity.job_id).unwrap(), expected);
@@ -4428,14 +4429,18 @@ fn agent_message_envelope(message_id: &str, text: &str) -> crate::AgentMessageEn
         from_session_id: "sess-sender".into(),
         from_agent: "main".into(),
         from_cwd: Some("F:/work/sender".into()),
+        from_handle: None,
+        from_name: None,
         summary: Some("handoff".into()),
         text: text.into(),
+        hops: 0,
     }
 }
 
-/// A message appended for a session whose worker is gone must wait in the
-/// durable queue: nothing here may start a worker, because a message is not a
-/// turn somebody asked for.
+/// A message appended for a session whose worker is gone is judged against
+/// the wake bounds the record keeps and, within them, queues the job. Starting
+/// a supervisor is the caller's choice (an executable); without one, nothing is
+/// spawned here.
 #[test]
 fn an_agent_message_is_queued_without_starting_a_worker() {
     let (_dir, store) = store();
@@ -4448,7 +4453,15 @@ fn an_agent_message_is_queued_without_starting_a_worker() {
     store.write_state(&state).unwrap();
 
     let envelope = agent_message_envelope("m-store", "check the build");
-    let acceptance = append_agent_message_to_background_job(&store, &job_id, &envelope).unwrap();
+    let acceptance = append_agent_message_to_background_job(
+        &store,
+        &job_id,
+        &envelope,
+        crate::AgentMessageReach::Unowned,
+        None,
+    )
+    .unwrap();
+    let acceptance = acceptance.acceptance;
     assert!(acceptance.appended);
     assert_eq!(acceptance.prompt.id, "m-store");
     assert_eq!(
@@ -4460,6 +4473,9 @@ fn an_agent_message_is_queued_without_starting_a_worker() {
         Some(crate::PendingPromptOrigin::AgentMessage {
             from_session_id: "sess-sender".into(),
             from_agent: "main".into(),
+            from_handle: None,
+            from_name: None,
+            hops: 0,
         })
     );
     assert!(
@@ -4468,6 +4484,8 @@ fn an_agent_message_is_queued_without_starting_a_worker() {
     );
 
     let reloaded = store.read_state(&job_id).unwrap();
+    // Within the wake bounds the record keeps, the message queues the job; with
+    // no executable given, nothing is spawned here.
     assert_eq!(reloaded.process.status, BackgroundJobStatus::Queued);
     assert_eq!(reloaded.identity.pending_prompts.len(), 1);
     assert_eq!(
@@ -4475,9 +4493,327 @@ fn an_agent_message_is_queued_without_starting_a_worker() {
         acceptance.prompt.origin
     );
 
-    let duplicate = append_agent_message_to_background_job(&store, &job_id, &envelope).unwrap();
+    let duplicate = append_agent_message_to_background_job(
+        &store,
+        &job_id,
+        &envelope,
+        crate::AgentMessageReach::Unowned,
+        None,
+    )
+    .unwrap()
+    .acceptance;
     assert!(!duplicate.appended, "the same message id is delivered once");
     assert_eq!(duplicate.queue_depth, 1);
+}
+
+/// Messages from other sessions may take only part of the queue. A peer that
+/// keeps writing to a session it may no longer wake fills its share and is
+/// refused past it — told so, rather than having the message dropped — and
+/// what a person types still has room.
+#[test]
+fn agent_messages_cannot_fill_the_queue_a_person_types_into() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.identity.session_id = Some("sess-agent-share".into());
+    state.process.status = BackgroundJobStatus::Running;
+    let job_id = state.identity.job_id.clone();
+    store.write_state(&state).unwrap();
+
+    for index in 0..MAX_PENDING_AGENT_MESSAGES {
+        let envelope = agent_message_envelope(&format!("m-share-{index}"), "one more");
+        assert!(
+            append_agent_message_to_background_job(
+                &store,
+                &job_id,
+                &envelope,
+                crate::AgentMessageReach::Unowned,
+                None
+            )
+            .unwrap()
+            .acceptance
+            .appended
+        );
+    }
+    let before = store.read_state(&job_id).unwrap();
+    let error = append_agent_message_to_background_job(
+        &store,
+        &job_id,
+        &agent_message_envelope("m-share-over", "one too many"),
+        crate::AgentMessageReach::Unowned,
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("messages from other sessions"), "{error}");
+    assert!(
+        error.starts_with("message refused") && error.contains("not queued"),
+        "the sender is told plainly this message was not taken: {error}"
+    );
+    assert_eq!(store.read_state(&job_id).unwrap(), before);
+
+    let typed = append_background_prompt_with_images(
+        &store,
+        &job_id,
+        "pp-typed-after-agents".into(),
+        "what the person typed".into(),
+        Vec::new(),
+        false,
+        &rebon_exe(),
+    )
+    .unwrap();
+    assert!(typed.appended, "the person's prompt still has room");
+}
+
+/// The share counts only messages still waiting to be read. Ones a running
+/// turn has already taken stay queued until that turn ends, but they take no
+/// room from what comes next; and a message past the share is told plainly it
+/// was refused, not that it will be delivered.
+#[test]
+fn agent_messages_a_running_turn_already_took_leave_room_for_more() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.identity.session_id = Some("sess-agent-share-claimed".into());
+    state.process.status = BackgroundJobStatus::Running;
+    state.process.turn_generation = 2;
+    let job_id = state.identity.job_id.clone();
+    store.write_state(&state).unwrap();
+    for index in 0..MAX_PENDING_AGENT_MESSAGES {
+        let envelope = agent_message_envelope(&format!("m-read-{index}"), "read already");
+        append_agent_message_to_background_job(
+            &store,
+            &job_id,
+            &envelope,
+            crate::AgentMessageReach::Unowned,
+            None,
+        )
+        .unwrap();
+    }
+    store
+        .update_state(&job_id, |state| {
+            for prompt in &mut state.identity.pending_prompts {
+                prompt.claimed_turn_generation = Some(2);
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(
+        append_agent_message_to_background_job(
+            &store,
+            &job_id,
+            &agent_message_envelope("m-after-reads", "one more"),
+            crate::AgentMessageReach::Unowned,
+            None,
+        )
+        .unwrap()
+        .acceptance
+        .appended,
+        "the messages the turn took leave room"
+    );
+}
+
+/// However many messages a long turn reads, they never take the queue's last
+/// free slots: past the point where only those are left, another message is
+/// refused, and a typed prompt, a cron fire or a task's report still fits.
+#[test]
+fn agent_messages_never_take_the_slots_kept_for_prompts() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.identity.session_id = Some("sess-agent-reserve".into());
+    state.process.status = BackgroundJobStatus::Running;
+    state.process.turn_generation = 2;
+    let job_id = state.identity.job_id.clone();
+    store.write_state(&state).unwrap();
+    let room_for_messages = MAX_PENDING_PROMPTS - PENDING_PROMPT_SLOTS_KEPT_FROM_AGENT_MESSAGES;
+    for index in 0..room_for_messages {
+        let envelope = agent_message_envelope(&format!("m-long-{index}"), "while you work");
+        append_agent_message_to_background_job(
+            &store,
+            &job_id,
+            &envelope,
+            crate::AgentMessageReach::Unowned,
+            None,
+        )
+        .unwrap();
+        // The running turn reads each as it comes, so none waits unread.
+        store
+            .update_state(&job_id, |state| {
+                for prompt in &mut state.identity.pending_prompts {
+                    prompt.claimed_turn_generation = Some(2);
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    let error = append_agent_message_to_background_job(
+        &store,
+        &job_id,
+        &agent_message_envelope("m-into-reserve", "one more"),
+        crate::AgentMessageReach::Unowned,
+        None,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("message refused") && error.contains("not queued"),
+        "{error}"
+    );
+    for index in 0..PENDING_PROMPT_SLOTS_KEPT_FROM_AGENT_MESSAGES {
+        assert!(
+            append_background_prompt_with_images(
+                &store,
+                &job_id,
+                format!("pp-kept-{index}"),
+                "what the person typed".into(),
+                Vec::new(),
+                false,
+                &rebon_exe(),
+            )
+            .unwrap()
+            .appended,
+            "kept slot {index} is free for a prompt"
+        );
+    }
+}
+
+/// A message from another session waiting in the queue — refused a turn, or
+/// never judged — is no follow-up owed. It does not stop `/bg`, `/hosted` or a
+/// local takeover, and none of them drops it: it is carried, unclaimed, for
+/// the next turn somebody starts.
+#[test]
+fn a_waiting_message_does_not_block_a_fresh_start_and_is_carried_through_it() {
+    let waiting = |id: &str, wake| {
+        let mut prompt =
+            pending_prompt(id, "<teammate-message>later</teammate-message>", Vec::new());
+        prompt.origin = Some(crate::PendingPromptOrigin::AgentMessage {
+            from_session_id: "sess-peer".into(),
+            from_agent: "main".into(),
+            from_handle: None,
+            from_name: None,
+            hops: 9,
+        });
+        prompt.wake = wake;
+        prompt.claimed_turn_generation = Some(1);
+        prompt
+    };
+    let job = |status| {
+        let (dir, store) = store();
+        let mut state = store
+            .create_job("prompt".into(), PathBuf::from("."), runtime())
+            .unwrap();
+        state.identity.session_id = Some("sess-fresh-start".into());
+        state.process.status = status;
+        state.process.turn_generation = 1;
+        state.identity.pending_prompts = vec![
+            waiting("m-refused", rebon_tool::peer::WakeVerdict::Refused),
+            waiting("m-unjudged", rebon_tool::peer::WakeVerdict::Unjudged),
+        ];
+        let job_id = state.identity.job_id.clone();
+        store.write_state(&state).unwrap();
+        (dir, store, job_id)
+    };
+    let carried = |store: &BackgroundStore, job_id: &str| {
+        store
+            .read_state(job_id)
+            .unwrap()
+            .identity
+            .pending_prompts
+            .iter()
+            .map(|prompt| (prompt.id.clone(), prompt.claimed_turn_generation))
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![
+        ("m-refused".to_string(), None),
+        ("m-unjudged".to_string(), None),
+    ];
+
+    let (_dir, store, job_id) = job(BackgroundJobStatus::Idle);
+    let queued = mark_existing_background_session_queued(
+        &store,
+        &job_id,
+        Some("the final prompt".into()),
+        PathBuf::from("."),
+        runtime(),
+        "sess-fresh-start".into(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(queued.process.status, BackgroundJobStatus::Queued);
+    assert_eq!(queued.identity.prompt, "the final prompt");
+    assert_eq!(carried(&store, &job_id), expected);
+
+    let (_dir, store, job_id) = job(BackgroundJobStatus::Succeeded);
+    mark_existing_background_session_idle(
+        &store,
+        &job_id,
+        None,
+        PathBuf::from("."),
+        runtime(),
+        "sess-fresh-start".into(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(carried(&store, &job_id), expected);
+
+    let (_dir, store, job_id) = job(BackgroundJobStatus::Succeeded);
+    mark_background_job_idle(&store, &job_id).unwrap();
+    assert_eq!(
+        store.read_state(&job_id).unwrap().process.status,
+        BackgroundJobStatus::Idle
+    );
+    assert_eq!(carried(&store, &job_id), expected);
+
+    // A prompt still owed blocks the fresh start, as before.
+    let (_dir, store, job_id) = job(BackgroundJobStatus::Idle);
+    store
+        .update_state(&job_id, |state| {
+            state
+                .identity
+                .pending_prompts
+                .push(pending_prompt("pp-owed", "owed", Vec::new()));
+            Ok(())
+        })
+        .unwrap();
+    let error = mark_background_job_idle(&store, &job_id).unwrap_err();
+    assert!(error.to_string().contains("follow-ups"), "{error}");
+}
+
+/// A verdict this build cannot read is read as not judged — the worker judges
+/// the message again — never as admitted, and never as dropping the message.
+#[test]
+fn an_unreadable_wake_verdict_reads_as_not_judged() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.identity.session_id = Some("sess-unreadable-wake".into());
+    let job_id = state.identity.job_id.clone();
+    state.identity.pending_prompts = vec![pending_prompt("m-odd", "message", Vec::new())];
+    store.write_state(&state).unwrap();
+    let path = store.state_path(&job_id);
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    raw["pendingPrompts"][0]["wake"] = serde_json::json!("maybe");
+    raw["pendingPrompts"][0]["origin"] = serde_json::json!({
+        "kind": "agentMessage",
+        "fromSessionId": "sess-peer",
+        "fromAgent": "main"
+    });
+    std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
+
+    let loaded = store.read_state(&job_id).unwrap();
+    assert_eq!(loaded.identity.pending_prompts.len(), 1);
+    assert_eq!(
+        loaded.identity.pending_prompts[0].wake,
+        rebon_tool::peer::WakeVerdict::Unjudged
+    );
 }
 
 /// The old atomic writer left `roster.json.<pid>-<seq>.tmp` files beside the
@@ -4541,5 +4877,150 @@ fn writing_the_roster_sweeps_only_old_roster_temp_files() {
     assert!(
         unrelated_tmp.exists(),
         "another atomic writer's temp file is not ours to delete"
+    );
+}
+
+/// The paths that queue a job to run its own prompt say so in the record, and
+/// the flag is written only when set: a new job owes its first prompt, a rerun
+/// owes it again, and a record without the flag reads as not owing it by name.
+#[test]
+fn the_record_says_when_the_jobs_own_prompt_is_owed() {
+    let (_dir, store) = store();
+    let created = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    assert!(
+        created.identity.prompt_owed,
+        "a new job owes its first prompt"
+    );
+    let raw: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(store.state_path(&created.identity.job_id)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(raw["promptOwed"], serde_json::json!(true));
+
+    store
+        .update_state(&created.identity.job_id, |state| {
+            state.identity.prompt_owed = false;
+            state.process.status = BackgroundJobStatus::Succeeded;
+            state.process.started_at_ms = Some(1);
+            Ok(())
+        })
+        .unwrap();
+    let raw: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(store.state_path(&created.identity.job_id)).unwrap(),
+    )
+    .unwrap();
+    assert!(raw.get("promptOwed").is_none(), "not written when false");
+
+    queue_background_job_in_store(&store, &created.identity.job_id, false, &rebon_exe()).unwrap();
+    let requeued = store.read_state(&created.identity.job_id).unwrap();
+    assert_eq!(requeued.process.status, BackgroundJobStatus::Queued);
+    assert!(
+        requeued.identity.prompt_owed,
+        "a rerun owes its prompt again"
+    );
+}
+
+/// A job whose parent was stopped ended with it, even one that had already
+/// finished on its own: a message from another session joins its queue but
+/// does not wake it, charge a wake, or touch its result — down the tree, too.
+/// Under a parent that was not stopped, the same message wakes the job.
+#[test]
+fn a_message_does_not_wake_a_job_whose_parent_was_stopped() {
+    let (_dir, store) = store();
+    let job = |status, parent: Option<&str>, session: &str| {
+        let mut state = store
+            .create_job("work".into(), PathBuf::from("."), runtime())
+            .unwrap();
+        state.process.status = status;
+        state.identity.prompt_owed = false;
+        state.process.started_at_ms = Some(1);
+        state.identity.parent_job_id = parent.map(str::to_string);
+        state.identity.session_id = Some(session.into());
+        state.outcome.exit_code = Some(0);
+        store.write_state(&state).unwrap();
+        state.identity.job_id
+    };
+    let stopped_root = job(BackgroundJobStatus::Stopped, None, "sess-root");
+    let child = job(
+        BackgroundJobStatus::Succeeded,
+        Some(&stopped_root),
+        "sess-child",
+    );
+    let grandchild = job(
+        BackgroundJobStatus::Succeeded,
+        Some(&child),
+        "sess-grandchild",
+    );
+    for job_id in [&child, &grandchild] {
+        let reception = append_agent_message_to_background_job(
+            &store,
+            job_id,
+            &agent_message_envelope(&format!("m-{job_id}"), "still there?"),
+            crate::AgentMessageReach::Unowned,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reception.delivery, crate::AgentMessageDelivery::Queued);
+        let state = store.read_state(job_id).unwrap();
+        assert_eq!(state.process.status, BackgroundJobStatus::Succeeded);
+        assert_eq!(state.outcome.exit_code, Some(0));
+        assert_eq!(
+            state.identity.pending_prompts[0].wake,
+            rebon_tool::peer::WakeVerdict::Unjudged
+        );
+        assert!(state.identity.agent_wakes.is_empty(), "nothing charged");
+    }
+
+    let running_root = job(BackgroundJobStatus::Succeeded, None, "sess-live-root");
+    let live_child = job(
+        BackgroundJobStatus::Succeeded,
+        Some(&running_root),
+        "sess-live-child",
+    );
+    let reception = append_agent_message_to_background_job(
+        &store,
+        &live_child,
+        &agent_message_envelope("m-live", "next item"),
+        crate::AgentMessageReach::Unowned,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        reception.delivery,
+        crate::AgentMessageDelivery::StartedNewTurn
+    );
+}
+
+/// A record that still says `Running` with nobody owning it is a worker that
+/// died mid-turn. A message written there is not injected into anything — it
+/// waits, and the sender is told so.
+#[test]
+fn a_message_to_a_record_left_running_by_a_dead_worker_is_queued_not_injected() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.identity.session_id = Some("sess-dead-worker".into());
+    state.process.status = BackgroundJobStatus::Running;
+    state.process.started_at_ms = Some(1);
+    let job_id = state.identity.job_id.clone();
+    store.write_state(&state).unwrap();
+
+    let reception = append_agent_message_to_background_job(
+        &store,
+        &job_id,
+        &agent_message_envelope("m-to-the-dead", "are you there"),
+        crate::AgentMessageReach::Unowned,
+        None,
+    )
+    .unwrap();
+    assert_eq!(reception.delivery, crate::AgentMessageDelivery::Queued);
+    let state = store.read_state(&job_id).unwrap();
+    assert_eq!(state.process.status, BackgroundJobStatus::Running);
+    assert_eq!(
+        state.identity.pending_prompts[0].wake,
+        rebon_tool::peer::WakeVerdict::Unjudged
     );
 }

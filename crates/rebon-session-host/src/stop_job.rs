@@ -397,7 +397,7 @@ fn stop_background_job_as_child(
             {
                 current.clear_recorded_owner();
                 current.outcome.pending_permission = None;
-                current.clear_pending_prompts();
+                current.cancel_pending_prompts();
                 current.process.updated_at_ms = now_ms();
             }
             Ok(Some(current.clone()))
@@ -446,13 +446,13 @@ fn stop_background_job_as_child(
         if !terminal {
             current.process.status = BackgroundJobStatus::Stopped;
             current.process.completed_at_ms = Some(completed_at);
-            current.clear_pending_prompts();
+            current.cancel_pending_prompts();
         }
         current.set_recorded_owner(fenced_owner.clone());
         current.process.spawn_admitted = false;
         current.process.updated_at_ms = completed_at;
         current.outcome.pending_permission = None;
-        current.clear_pending_prompts();
+        current.cancel_pending_prompts();
         Ok(Some(current.clone()))
     })?;
     let Some(stopped) = stopped else {

@@ -24,6 +24,12 @@ use rebon_tool::{PeerDelivery, PeerInfo, PeerMessage, PeerMessenger};
 pub struct SessionPeerMessenger {
     directory: PeerDirectory,
     client: SessionHostClient,
+    /// The cwd this session was built under — the one that keys its project
+    /// directory. Read here rather than taken from a tool's own cwd, which a
+    /// worktree or a sub-agent may have moved: the meta sidecar would then be
+    /// looked for in a directory this session was never keyed against, and the
+    /// send would quietly go out without a handle or a name.
+    session_cwd: String,
 }
 
 impl SessionPeerMessenger {
@@ -31,11 +37,13 @@ impl SessionPeerMessenger {
         store: BackgroundStore,
         projects_root: impl Into<PathBuf>,
         worker_exe: impl Into<PathBuf>,
+        session_cwd: impl Into<String>,
     ) -> Self {
         let projects_root = projects_root.into();
         Self {
             directory: PeerDirectory::new(store.clone(), projects_root.clone()),
             client: SessionHostClient::new(store, projects_root, worker_exe),
+            session_cwd: session_cwd.into(),
         }
     }
 }
@@ -61,7 +69,7 @@ impl PeerMessenger for SessionPeerMessenger {
         target_session_id: &str,
         message: PeerMessage,
     ) -> Result<PeerDelivery, String> {
-        let envelope = envelope(message)?;
+        let envelope = envelope(self.client.projects_root(), &self.session_cwd, message)?;
         let client = self.client.clone();
         let target = target_session_id.to_string();
         let result =
@@ -78,22 +86,58 @@ impl PeerMessenger for SessionPeerMessenger {
 
 /// A new id per send means a retry is a new message to the owner rather than a
 /// duplicate it silently drops.
-fn envelope(message: PeerMessage) -> Result<AgentMessageEnvelope, String> {
+///
+/// `session_cwd` is the cwd this session was keyed under, not whatever directory
+/// a tool happened to be running in: the sidecar lives beside the project
+/// directory, so a worktree's cwd would look in the wrong one and the send would
+/// go out unnamed.
+fn envelope(
+    projects_root: &std::path::Path,
+    session_cwd: &str,
+    message: PeerMessage,
+) -> Result<AgentMessageEnvelope, String> {
     let message_id = rebon_types::secure_random_hex_token()
         .map_err(|error| format!("could not mint a message id: {error}"))?;
+    // The sender's own sidecar is where its handle and title live. Read here
+    // rather than in the tool: the projects root is this adapter's fact, and a
+    // tool that guessed at it would read somebody else's config home.
+    let (from_handle, from_name) = if message.from_session_id.is_empty() {
+        (message.from_handle, message.from_name)
+    } else {
+        (
+            message.from_handle.clone().or_else(|| {
+                rebon_session::load_session_handle(
+                    projects_root,
+                    session_cwd,
+                    &message.from_session_id,
+                )
+            }),
+            message.from_name.clone().or_else(|| {
+                rebon_session::load_session_title(
+                    projects_root,
+                    session_cwd,
+                    &message.from_session_id,
+                )
+            }),
+        )
+    };
     Ok(AgentMessageEnvelope {
         message_id,
         from_session_id: message.from_session_id,
         from_agent: message.from_agent,
         from_cwd: message.from_cwd,
+        from_handle,
+        from_name,
         summary: message.summary,
         text: message.text,
+        hops: message.hops,
     })
 }
 
 fn peer_info(peer: PeerSession) -> PeerInfo {
     PeerInfo {
         session_id: peer.session_id,
+        handle: peer.handle,
         name: peer.name,
         cwd: peer.cwd,
         kind: match peer.kind {
@@ -103,6 +147,7 @@ fn peer_info(peer: PeerSession) -> PeerInfo {
         busy: peer.busy,
         reachable: peer.reachable,
         terminal_id: peer.terminal_id,
+        activity: peer.activity,
     }
 }
 
@@ -150,6 +195,7 @@ mod tests {
             terminal_id: Some("term-7".into()),
             agent_endpoint: None,
             capabilities: Vec::new(),
+            activity: None,
         }
     }
 
@@ -158,6 +204,7 @@ mod tests {
             BackgroundStore::new(dir.path().join("state")),
             dir.path().join("projects"),
             dir.path().join("rebon"),
+            "C:/work/caller",
         )
     }
 
@@ -206,8 +253,11 @@ mod tests {
                     from_session_id: "sess-caller".into(),
                     from_agent: "main".into(),
                     from_cwd: None,
+                    from_handle: None,
+                    from_name: None,
                     summary: None,
                     text: "hello".into(),
+                    hops: 0,
                 },
             )
             .await
@@ -221,13 +271,80 @@ mod tests {
             from_session_id: "sess-caller".into(),
             from_agent: "main".into(),
             from_cwd: None,
+            from_handle: None,
+            from_name: None,
             summary: None,
             text: "hello".into(),
+            hops: 0,
         };
-        let first = envelope(message()).unwrap();
-        let second = envelope(message()).unwrap();
+        let root = std::path::Path::new("/nonexistent-projects");
+        let first = envelope(root, "C:/work/caller", message()).unwrap();
+        let second = envelope(root, "C:/work/caller", message()).unwrap();
         assert_ne!(first.message_id, second.message_id);
         assert_eq!(first.text, "hello");
         assert_eq!(first.from_session_id, "sess-caller");
+    }
+
+    /// The sender's own handle and title come from its sidecar, read under the
+    /// cwd the session was keyed at. A tool running elsewhere — a worktree, a
+    /// sub-agent — must still produce a named envelope, or the receiver shows a
+    /// bare session id for a sender that has both a handle and a name.
+    #[test]
+    fn the_sender_is_named_from_its_own_sidecar_whatever_cwd_the_tool_ran_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects_root = dir.path().join("projects");
+        let session_cwd = "/repo/caller";
+        let session_id = "abcde-fghij-klmno-pqrst";
+        rebon_session::update_session_metadata(&projects_root, session_cwd, session_id, |meta| {
+            meta.insert("handle".into(), serde_json::json!("repo-qrst"));
+            meta.insert("title".into(), serde_json::json!("build handoff"));
+        })
+        .unwrap();
+
+        let envelope = envelope(
+            &projects_root,
+            session_cwd,
+            PeerMessage {
+                from_session_id: session_id.into(),
+                from_agent: "main".into(),
+                // What a tool inside a worktree would have reported.
+                from_cwd: Some("/repo/.worktrees/feature".into()),
+                from_handle: None,
+                from_name: None,
+                summary: None,
+                text: "hello".into(),
+                hops: 0,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(envelope.from_handle.as_deref(), Some("repo-qrst"));
+        assert_eq!(envelope.from_name.as_deref(), Some("build handoff"));
+    }
+
+    /// A session with no sidecar yet has no name to read, and the send still goes
+    /// out: the receiver falls back to the session id rather than losing the
+    /// message.
+    #[test]
+    fn a_sender_with_no_sidecar_still_sends_unnamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let envelope = envelope(
+            &dir.path().join("projects"),
+            "/repo/unwritten",
+            PeerMessage {
+                from_session_id: "sess-unwritten".into(),
+                from_agent: "main".into(),
+                from_cwd: None,
+                from_handle: None,
+                from_name: None,
+                summary: None,
+                text: "hello".into(),
+                hops: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(envelope.from_handle, None);
+        assert_eq!(envelope.from_name, None);
+        assert_eq!(envelope.text, "hello");
     }
 }

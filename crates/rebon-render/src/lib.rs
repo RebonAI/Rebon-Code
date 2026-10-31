@@ -48,8 +48,8 @@
 //! [`transcript_row`] is not re-exported at the crate root. Say which end
 //! you mean.
 //! * **Tool-call rendering** — [`agent`], [`content`], [`diff`], [`hidden`],
-//!   [`json_compact`], [`kind`], [`plan_ledger`], [`shell_output`],
-//!   [`streaming`], [`summary`], [`text`], [`tool_output`],
+//!   [`json_compact`], [`kind`], [`peer_message`], [`plan_ledger`],
+//!   [`shell_output`], [`streaming`], [`summary`], [`text`], [`tool_output`],
 //!   [`workflow_body`], [`auto_mode_note`], [`code_mode`]. Edit/Write diff
 //!   computation, tool-call body/title/kind formatting, the raw-output →
 //!   `ToolCallContent` / `ToolCallLocation` projection a live turn and a
@@ -180,8 +180,11 @@ pub mod metadata;
 pub mod pad_aligned;
 pub mod patch;
 #[deny(missing_docs)]
+pub mod peer_message;
+#[deny(missing_docs)]
 pub mod plan_approval;
 pub mod plan_ledger;
+pub use peer_message::{session_message_detail_lines, session_message_display};
 #[deny(missing_docs)]
 pub mod project;
 #[deny(missing_docs)]
@@ -491,10 +494,12 @@ pub use user_prompt::{
     TRUNCATE_HEAD_CHARS, TRUNCATE_TAIL_CHARS,
 };
 pub use user_text::{
-    format_user_prompt_hidden_separator, project_user_prompt_display_lines,
-    project_user_prompt_display_lines_for_width, project_user_text, UserPromptDisplayLine,
-    UserTextInput, UserTextProjection, NO_CONTENT_MESSAGE, USER_PROMPT_FOLD_DEFAULT_WIDTH,
-    USER_PROMPT_FOLD_HEAD_LINES, USER_PROMPT_FOLD_TAIL_LINES, USER_PROMPT_FOLD_THRESHOLD_LINES,
+    format_user_prompt_hidden_separator, project_teammate_body_lines,
+    project_user_prompt_display_lines, project_user_prompt_display_lines_for_width,
+    project_user_text, UserPromptDisplayLine, UserTextInput, UserTextProjection,
+    NO_CONTENT_MESSAGE, TEAMMATE_BODY_FOLD_HEAD_ROWS, TEAMMATE_BODY_FOLD_TAIL_ROWS,
+    TEAMMATE_BODY_FOLD_THRESHOLD_ROWS, USER_PROMPT_FOLD_DEFAULT_WIDTH, USER_PROMPT_FOLD_HEAD_LINES,
+    USER_PROMPT_FOLD_TAIL_LINES, USER_PROMPT_FOLD_THRESHOLD_LINES,
 };
 pub use workflow_body::{workflow_body_lines, workflow_tool_summary};
 pub use wrappers::{

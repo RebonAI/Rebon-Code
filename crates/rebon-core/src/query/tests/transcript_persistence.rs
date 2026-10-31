@@ -716,6 +716,96 @@ async fn execute_pushes_entries_to_loaded_transcript_after_turn() {
     );
 }
 
+/// A turn another session's message started opens with that message as its
+/// prompt row. Named for the message, the row is written the way the same
+/// message is when it joins a running turn — a runtime attachment — so nothing
+/// reading the transcript takes it for the person's words; it is not queued,
+/// because it opened its turn rather than joining one, and it is not meta, so
+/// it is still drawn and still sent to the model.
+#[tokio::test]
+async fn a_turn_opened_by_another_sessions_message_writes_it_as_a_runtime_attachment() {
+    let tool = Arc::new(RecordingTool::new("Bash", json!({"ok": true})));
+    let engine = build_engine_with(tool as Arc<dyn Tool>);
+    let client = MockModelClient::new();
+    client.push_turn(text_turn("msg_1", "on it"));
+    client.push_turn(text_turn("msg_2", "hi"));
+    let client: Arc<dyn ModelClient> = Arc::new(client);
+    let projects_root_dir = temp_projects_root("agent_message_opening_row");
+    let projects_root = projects_root_dir.path();
+    let state = Arc::new(rebon_session_state::ServerState::new());
+    let cwd = projects_root.to_string_lossy().to_string();
+    let session = state.create_session(cwd.clone(), Vec::new());
+    let executor = EngineQueryExecutor::new(engine, client, projects_root, "mock-model")
+        .with_server_state(state.clone());
+    let frame = "<teammate-message teammate_id=\"main@session:sess-sender\" from_session=\"sess-sender\">\nnext\n</teammate-message>";
+    let request = |text: &str, user_message_uuid: Option<String>| rebon_agent_core::PromptRequest {
+        user_prompt: None,
+        effort_is_session_default: false,
+        session_id: session.id.clone(),
+        cwd: cwd.clone(),
+        prompt: vec![rebon_types::ContentBlock::Text(rebon_types::TextContent {
+            text: text.into(),
+            annotations: None,
+        })],
+        mcp_servers: Vec::new(),
+        update_publisher: None,
+        permission_publisher: None,
+        cancel: CancelToken::new(),
+        thinking_budget: None,
+        max_tokens: None,
+        reasoning_effort_ordinal: None,
+        additional_working_directories: Vec::new(),
+        coordinator_mode: None,
+        coordinator_report_paths: Vec::new(),
+        user_message_uuid,
+        background_agent_system: None,
+        background_agent_tool_filter: None,
+        execution_policy: None,
+        replay_requests: Vec::new(),
+        skill_invocations: Vec::new(),
+    };
+
+    executor
+        .execute(request(
+            frame,
+            Some(crate::query::agent_message_row_uuid("m-opened")),
+        ))
+        .await
+        .unwrap();
+    executor.execute(request("hello", None)).await.unwrap();
+
+    let path = rebon_session::transcript_file_path(projects_root, &cwd, &session.id);
+    let raw = rebon_session::load_raw_transcript_from_file(&path)
+        .unwrap()
+        .unwrap();
+    let opening = raw
+        .entries
+        .iter()
+        .find(|entry| entry.uuid == "u-agent-message-m-opened")
+        .expect("the prompt row is named for the message");
+    assert_eq!(opening.raw["runtimeAttachment"], json!(true));
+    assert!(
+        opening.raw.get("queuedCommand").is_none(),
+        "{:?}",
+        opening.raw
+    );
+    assert!(opening.raw.get("isMeta").is_none(), "{:?}", opening.raw);
+    assert_eq!(opening.raw["message"]["content"], json!(frame));
+
+    let typed = raw
+        .entries
+        .iter()
+        .find(|entry| {
+            entry.entry_type == "user" && entry.raw["message"]["content"] == json!("hello")
+        })
+        .expect("the typed prompt row");
+    assert!(
+        typed.raw.get("runtimeAttachment").is_none(),
+        "a prompt somebody typed is still theirs: {:?}",
+        typed.raw
+    );
+}
+
 #[tokio::test]
 async fn executor_polls_with_exact_session_and_turn_context() {
     #[derive(Default)]

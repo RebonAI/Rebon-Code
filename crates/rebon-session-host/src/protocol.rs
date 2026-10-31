@@ -244,9 +244,22 @@ pub enum BackgroundIpcRequest {
         from_agent: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_cwd: Option<String>,
+        /// The sender's handle, when its owner claimed one, and its display
+        /// name when it has one. Both are additive: an owner that does not
+        /// know them still reads the message, and falls back to the id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_handle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
         text: String,
+        /// How many cross-session hand-offs this message has already made.
+        /// Defaulted for the wire so a sender from before the field existed
+        /// reads as a first message, and omitted at zero so the bytes of an
+        /// ordinary message are what they always were.
+        #[serde(default, skip_serializing_if = "crate::agent_message::hops_is_zero")]
+        hops: u8,
     },
     /// One question for the Claude Code mods this owner loaded: what they
     /// put on screen since a version, draw a pane, a press, a mod command.

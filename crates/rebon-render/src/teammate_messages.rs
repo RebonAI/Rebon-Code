@@ -18,11 +18,16 @@ use crate::plan_approval::{
 pub struct ParsedTeammateMessage {
     /// Teammate id.
     pub teammate_id: String,
-    /// Raw inner content.
+    /// The sender's session id, when the frame carries `from_session`. Only a
+    /// cross-session message does, which is what tells the two apart.
+    pub from_session: Option<String>,
+    /// The sender's handle, when the frame carries `from_handle`.
+    pub from_handle: Option<String>,
+    /// Raw inner content, unescaped.
     pub content: String,
     /// Optional color string.
     pub color: Option<String>,
-    /// Optional summary string.
+    /// Optional summary string, unescaped.
     pub summary: Option<String>,
 }
 
@@ -86,10 +91,14 @@ pub fn parse_teammate_messages(text: &str) -> Vec<ParsedTeammateMessage> {
             None => break,
         };
         let teammate_id = extract_attr_value(attrs, "teammate_id");
-        let content = text[open_end + 1..close].trim().to_string();
+        // The body was XML-escaped by whoever framed it, so it is unescaped
+        // here: a literal `<` or `&` the sender wrote comes back as itself.
+        let content = rebon_types::xml_unescape(text[open_end + 1..close].trim());
         if let Some(teammate_id) = teammate_id {
             messages.push(ParsedTeammateMessage {
                 teammate_id,
+                from_session: extract_attr_value(attrs, "from_session"),
+                from_handle: extract_attr_value(attrs, "from_handle"),
                 content,
                 color: extract_attr_value(attrs, "color"),
                 summary: extract_attr_value(attrs, "summary"),
@@ -136,7 +145,7 @@ pub fn project_user_teammate_messages(
         .into_iter()
         .filter(|msg| !is_shutdown_approved_json(&msg.content) && !is_terminated_json(&msg.content))
         .map(|msg| {
-            let display_name = teammate_display_name(&msg.teammate_id);
+            let display_name = parsed_display_name(&msg);
             if let Some(summary) = maybe_plan_approval_summary(&msg.content) {
                 return TeammateRenderable::PlanApprovalSummary(summary);
             }
@@ -175,7 +184,38 @@ fn extract_attr_value(attrs: &str, key: &str) -> Option<String> {
     let start = attrs.find(&needle)? + needle.len();
     let rest = &attrs[start..];
     let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    // Attribute values are escaped the same way the body is, so `&quot;` in a
+    // summary reads as a quote rather than as four characters.
+    Some(rebon_types::xml_unescape(&rest[..end]))
+}
+
+/// The name to show for one parsed message.
+///
+/// A handle is what a sender is addressed by, so it wins; a session with no
+/// handle yet is still better named by its id than by the internal
+/// `main@session:<id>` spelling, which is a key and not a name.
+pub fn parsed_display_name(message: &ParsedTeammateMessage) -> String {
+    if let Some(handle) = message.from_handle.as_deref().filter(|h| !h.is_empty()) {
+        return handle.to_string();
+    }
+    if let Some(session_id) = message.from_session.as_deref().filter(|s| !s.is_empty()) {
+        let short: String = session_id.chars().take(8).collect();
+        return format!("session:{short}");
+    }
+    teammate_display_name(&message.teammate_id)
+}
+
+/// [`parsed_display_name`] as a sender is written: `@handle`, or the bare
+/// `session:<id>` when there is no handle to address.
+///
+/// The sigil is what makes a handle a handle. A session id is not one, and
+/// `@session:01234567` names nothing anybody could type.
+pub fn sender_label(display_name: &str) -> String {
+    if display_name.starts_with("session:") {
+        display_name.to_string()
+    } else {
+        format!("@{display_name}")
+    }
 }
 
 fn parse_json(content: &str) -> Option<Value> {
@@ -344,6 +384,65 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].summary.as_deref(), Some("s1"));
         assert_eq!(parsed[1].teammate_id, "leader");
+    }
+
+    /// A sender is named by its handle; without one, by the first eight
+    /// characters of its session. The internal `main@session:<id>` spelling is
+    /// a key, not a name, and must not reach the screen.
+    #[test]
+    fn a_parsed_message_is_named_by_handle_then_by_session_never_by_the_key() {
+        let text = concat!(
+            "<teammate-message teammate_id=\"main@session:abcde-fghij\" from_session=\"abcde-fghij\" from_handle=\"repo-qrst\">one</teammate-message>",
+            "<teammate-message teammate_id=\"main@session:0123456789abcdef\" from_session=\"0123456789abcdef\">two</teammate-message>",
+            "<teammate-message teammate_id=\"alice\">three</teammate-message>"
+        );
+        let parsed = parse_teammate_messages(text);
+        assert_eq!(parsed_display_name(&parsed[0]), "repo-qrst");
+        assert_eq!(parsed_display_name(&parsed[1]), "session:01234567");
+        assert_eq!(parsed_display_name(&parsed[2]), "alice");
+        assert!(
+            !parsed_display_name(&parsed[1]).contains("main@session:"),
+            "the internal spelling does not go on screen"
+        );
+    }
+
+    /// The sigil belongs to a handle. A sender with none is named by its session,
+    /// and `@session:01234567` addresses nothing anybody could type.
+    #[test]
+    fn a_sender_with_a_handle_is_at_addressed_and_one_without_is_not() {
+        assert_eq!(sender_label("repo-qrst"), "@repo-qrst");
+        assert_eq!(sender_label("session:01234567"), "session:01234567");
+        assert_eq!(sender_label("alice"), "@alice");
+    }
+
+    /// An escaped frame is unescaped once, on the way in, so a sender's own
+    /// `<` and `&` read as themselves.
+    #[test]
+    fn a_frame_round_trips_through_escaping() {
+        let original = "a < b & c > d";
+        let frame = format!(
+            "<teammate-message teammate_id=\"alice\" summary=\"{}\">{}</teammate-message>",
+            rebon_types::xml_escape("s & t"),
+            rebon_types::xml_escape(original)
+        );
+        let parsed = parse_teammate_messages(&frame);
+        assert_eq!(parsed[0].content, original);
+        assert_eq!(parsed[0].summary.as_deref(), Some("s & t"));
+    }
+
+    #[test]
+    fn from_session_and_from_handle_are_read_off_the_frame() {
+        let parsed = parse_teammate_messages(
+            "<teammate-message teammate_id=\"main@session:sess-a\" from_session=\"sess-a\" from_handle=\"repo-qrst\">hi</teammate-message>",
+        );
+        assert_eq!(parsed[0].from_session.as_deref(), Some("sess-a"));
+        assert_eq!(parsed[0].from_handle.as_deref(), Some("repo-qrst"));
+
+        let teammate = parse_teammate_messages(
+            "<teammate-message teammate_id=\"alice\">hi</teammate-message>",
+        );
+        assert_eq!(teammate[0].from_session, None);
+        assert_eq!(teammate[0].from_handle, None);
     }
 
     #[test]

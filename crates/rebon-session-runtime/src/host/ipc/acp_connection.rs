@@ -641,8 +641,11 @@ fn translate(
                 from_session_id: params.from_session_id,
                 from_agent: params.from_agent,
                 from_cwd: params.from_cwd,
+                from_handle: params.from_handle,
+                from_name: params.from_name,
                 summary: params.summary,
                 text: params.text,
+                hops: params.hops,
             }
         }
         method::MODS => {
@@ -955,6 +958,8 @@ mod tests {
                     "fromSessionId": "s-1",
                     "fromAgent": "main",
                     "fromCwd": "/work",
+                    "fromHandle": "repo-qrst",
+                    "fromName": "worker",
                     "summary": "the migration",
                     "text": "please take a look",
                 }),
@@ -963,8 +968,11 @@ mod tests {
                     from_session_id: "s-1".into(),
                     from_agent: "main".into(),
                     from_cwd: Some("/work".into()),
+                    from_handle: Some("repo-qrst".into()),
+                    from_name: Some("worker".into()),
                     summary: Some("the migration".into()),
                     text: "please take a look".into(),
+                    hops: 0,
                 },
             ),
         ]
@@ -1155,8 +1163,11 @@ mod tests {
                 from_session_id: "s-1".into(),
                 from_agent: "main".into(),
                 from_cwd: Some("/work".into()),
+                from_handle: Some("repo-qrst".into()),
+                from_name: Some("worker".into()),
                 summary: Some("the migration".into()),
                 text: "please take a look".into(),
+                hops: 0,
             },
         ];
         for request in requests {
