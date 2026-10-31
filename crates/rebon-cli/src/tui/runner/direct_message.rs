@@ -88,13 +88,15 @@ pub(super) fn parse_direct_message(
 /// two agents share is refused rather than resolved to whichever the registry
 /// listed first, which is the one thing a person cannot have meant.
 ///
-/// `own_handle` is this session's own name, which the peer list never contains:
-/// naming it is a refusal rather than a name nothing answers to.
+/// `own` is this session, which the peer list never contains. It is counted
+/// by the same resolver `SendMessage` uses, so a name that is this session is
+/// refused as such, and an abbreviation this session shares with another is the
+/// same ambiguity it is for an agent rather than a send to the other one.
 pub(super) fn resolve_direct_target(
     recipient: &str,
     teammates: &[RunningTeammate],
     peers: &[rebon_tool::PeerInfo],
-    own_handle: Option<&str>,
+    own: rebon_tool::peer::OwnSession<'_>,
 ) -> DirectResolution {
     match teammates {
         [one] => {
@@ -106,24 +108,23 @@ pub(super) fn resolve_direct_target(
         [] => {}
         several => return DirectResolution::Refused(several_teammates_answer(recipient, several)),
     }
-    match rebon_tool::peer::resolve_peer(peers, recipient) {
-        Ok(peer) => DirectResolution::Addressed(DirectTarget::Peer {
-            session_id: peer.session_id.clone(),
-        }),
-        Err(rebon_tool::peer::PeerResolveError::Ambiguous { candidates, .. }) => {
-            DirectResolution::Refused(format!(
-                "`@{recipient}` matches {} sessions here: {}. Type one of those to reach exactly one.",
-                candidates.len(),
-                candidates.join(", ")
-            ))
+    match rebon_tool::peer::resolve_peer_or_self(peers, own, recipient) {
+        Ok(rebon_tool::peer::PeerTarget::Peer(peer)) => {
+            DirectResolution::Addressed(DirectTarget::Peer {
+                session_id: peer.session_id.clone(),
+            })
         }
-        Err(rebon_tool::peer::PeerResolveError::NotFound { .. }) => {
-            if own_handle.is_some_and(|own| names_own_handle(recipient, own)) {
-                DirectResolution::Refused(self_refusal())
-            } else {
-                DirectResolution::Unaddressed
-            }
-        }
+        Ok(rebon_tool::peer::PeerTarget::OwnSession) => DirectResolution::Refused(self_refusal()),
+        // `session:<id>` is how a tool names a session without a handle, and the
+        // prompt cannot read it: what a person is told to type is an `@word`.
+        Err(rebon_tool::peer::PeerResolveError::Ambiguous {
+            typed_candidates, ..
+        }) => DirectResolution::Refused(format!(
+            "`@{recipient}` matches {} sessions here: {}. Type one of those to reach exactly one.",
+            typed_candidates.len(),
+            typed_candidates.join(", ")
+        )),
+        Err(rebon_tool::peer::PeerResolveError::NotFound { .. }) => DirectResolution::Unaddressed,
     }
 }
 
@@ -136,20 +137,6 @@ fn several_teammates_answer(recipient: &str, several: &[RunningTeammate]) -> Str
         "{} running agents here are named `{recipient}`, and a name cannot tell them apart. Open one of them in `/background-agents` and type the message there.",
         several.len()
     )
-}
-
-/// Whether `recipient` is this session's own handle, or enough of a prefix of it
-/// to name nobody else.
-///
-/// The full handle is unambiguous — handles are unique machine-wide — and a
-/// prefix only when it is long enough to be one a caller may abbreviate to.
-fn names_own_handle(recipient: &str, own_handle: &str) -> bool {
-    let recipient = rebon_tool::peer::strip_handle_sigil(recipient).trim();
-    recipient.eq_ignore_ascii_case(own_handle)
-        || (recipient.len() >= rebon_tool::peer::MIN_SESSION_PREFIX_CHARS
-            && own_handle
-                .to_ascii_lowercase()
-                .starts_with(&recipient.to_ascii_lowercase()))
 }
 
 fn self_refusal() -> String {
@@ -197,7 +184,12 @@ pub(super) fn resolve_typed_recipient(
 ) -> DirectResolution {
     let teammates = teammates_named(session, recipient);
     if !teammates.is_empty() {
-        return resolve_direct_target(recipient, &teammates, &[], None);
+        return resolve_direct_target(
+            recipient,
+            &teammates,
+            &[],
+            rebon_tool::peer::OwnSession::default(),
+        );
     }
 
     // The peer list is a directory scan and a lock probe per session, so it is
@@ -217,7 +209,15 @@ pub(super) fn resolve_typed_recipient(
             return DirectResolution::Unaddressed;
         }
     };
-    resolve_direct_target(recipient, &[], &peers, own_handle.as_deref())
+    resolve_direct_target(
+        recipient,
+        &[],
+        &peers,
+        rebon_tool::peer::OwnSession {
+            session_id: Some(&session.session_id),
+            handle: own_handle.as_deref(),
+        },
+    )
 }
 
 /// Send one message to a recipient [`resolve_typed_recipient`] found.
@@ -324,6 +324,20 @@ mod tests {
         }
     }
 
+    /// A session that knows nothing about itself, for cases where it is not
+    /// the point.
+    const NO_OWN: rebon_tool::peer::OwnSession<'static> = rebon_tool::peer::OwnSession {
+        session_id: None,
+        handle: None,
+    };
+
+    fn own<'a>(session_id: &'a str, handle: &'a str) -> rebon_tool::peer::OwnSession<'a> {
+        rebon_tool::peer::OwnSession {
+            session_id: Some(session_id),
+            handle: Some(handle),
+        }
+    }
+
     fn teammate(task_id: &str, name: &str) -> RunningTeammate {
         RunningTeammate {
             task_id: task_id.into(),
@@ -397,13 +411,13 @@ mod tests {
     fn a_name_only_a_session_answers_to_reaches_that_session() {
         let peers = [peer("abcde-fghij-klmno-pqrst", Some("repo-qrst"), None)];
         assert_eq!(
-            resolve_direct_target("repo-qrst", &[], &peers, None),
+            resolve_direct_target("repo-qrst", &[], &peers, NO_OWN),
             DirectResolution::Addressed(DirectTarget::Peer {
                 session_id: "abcde-fghij-klmno-pqrst".into()
             })
         );
         assert_eq!(
-            resolve_direct_target("abcde-f", &[], &peers, None),
+            resolve_direct_target("abcde-f", &[], &peers, NO_OWN),
             DirectResolution::Addressed(DirectTarget::Peer {
                 session_id: "abcde-fghij-klmno-pqrst".into()
             }),
@@ -414,7 +428,7 @@ mod tests {
     #[test]
     fn a_name_only_a_teammate_answers_to_reaches_that_agent() {
         assert_eq!(
-            resolve_direct_target("bob", &[teammate("task-bob", "bob")], &[], None),
+            resolve_direct_target("bob", &[teammate("task-bob", "bob")], &[], NO_OWN),
             DirectResolution::Addressed(DirectTarget::Teammate {
                 task_id: "task-bob".into(),
                 name: "bob".into(),
@@ -428,7 +442,7 @@ mod tests {
     fn a_name_both_answer_to_goes_to_the_teammate() {
         let peers = [peer("abcde-fghij-klmno-pqrst", Some("bob"), Some("bob"))];
         assert_eq!(
-            resolve_direct_target("bob", &[teammate("task-bob", "bob")], &peers, None),
+            resolve_direct_target("bob", &[teammate("task-bob", "bob")], &peers, NO_OWN),
             DirectResolution::Addressed(DirectTarget::Teammate {
                 task_id: "task-bob".into(),
                 name: "bob".into(),
@@ -440,11 +454,11 @@ mod tests {
     #[test]
     fn an_unknown_name_leaves_the_line_to_the_model() {
         assert_eq!(
-            resolve_direct_target("ghost", &[], &[], None),
+            resolve_direct_target("ghost", &[], &[], NO_OWN),
             DirectResolution::Unaddressed
         );
         assert_eq!(
-            resolve_direct_target("dataclass", &[], &[], None),
+            resolve_direct_target("dataclass", &[], &[], NO_OWN),
             DirectResolution::Unaddressed,
             "pasted code is not an address"
         );
@@ -456,7 +470,8 @@ mod tests {
             peer("abcde-one", Some("repo-one"), None),
             peer("abcde-two", Some("repo-only"), None),
         ];
-        let DirectResolution::Refused(refusal) = resolve_direct_target("repo-o", &[], &peers, None)
+        let DirectResolution::Refused(refusal) =
+            resolve_direct_target("repo-o", &[], &peers, NO_OWN)
         else {
             panic!("expected an ambiguity");
         };
@@ -474,7 +489,7 @@ mod tests {
             "bob",
             &[teammate("task-one", "bob"), teammate("task-two", "bob")],
             &[],
-            None,
+            NO_OWN,
         ) else {
             panic!("expected an ambiguity");
         };
@@ -484,7 +499,7 @@ mod tests {
 
     #[test]
     fn a_session_naming_itself_is_refused_rather_than_not_found() {
-        let own = Some("repo-qrst");
+        let own = own("fedcba-self-0000", "repo-qrst");
         assert_eq!(
             resolve_direct_target("repo-qrst", &[], &[], own),
             DirectResolution::Refused(self_refusal())
@@ -503,6 +518,73 @@ mod tests {
             resolve_direct_target("ghost", &[], &[], own),
             DirectResolution::Unaddressed
         );
+        assert_eq!(
+            resolve_direct_target("fedcba-self", &[], &[], own),
+            DirectResolution::Refused(self_refusal()),
+            "its own id prefix names this session as well"
+        );
+    }
+
+    /// The prompt and `SendMessage` agree on what a name means: an abbreviation
+    /// this session and another both answer to is an ambiguity on both paths,
+    /// not a refusal as "self" and not a send to the other one.
+    #[test]
+    fn a_prefix_naming_this_session_and_another_is_ambiguous() {
+        let peers = [peer("c3d4c3d4-peer", Some("reboncode-c3d4"), None)];
+        let me = own("a1b2a1b2-self", "reboncode-a1b2");
+        let DirectResolution::Refused(refusal) =
+            resolve_direct_target("reboncode", &[], &peers, me)
+        else {
+            panic!("expected an ambiguity");
+        };
+        assert!(refusal.contains("matches 2 sessions"), "{refusal}");
+        assert!(refusal.contains("@reboncode-c3d4"), "{refusal}");
+        assert!(
+            refusal.contains("@reboncode-a1b2 (this session)"),
+            "{refusal}"
+        );
+        assert_eq!(
+            resolve_direct_target("reboncode-c3", &[], &peers, me),
+            DirectResolution::Addressed(DirectTarget::Peer {
+                session_id: "c3d4c3d4-peer".into()
+            }),
+            "only the other session answers to this one"
+        );
+    }
+
+    /// A session without a handle is `session:<id>` to a tool, which the prompt
+    /// cannot read back. What a person is told to type has to be an `@word`
+    /// that the prompt parses and that reaches that one session.
+    #[test]
+    fn an_ambiguity_hint_offers_only_what_the_prompt_can_take() {
+        let dir = tempfile::tempdir().unwrap();
+        let peers = [
+            peer("abcdef-1111-x", None, Some("worker")),
+            peer("abcdef-1112-y", None, Some("worker")),
+            peer("zzzzzz-0000-z", Some("repo-zzzz"), Some("worker")),
+        ];
+        let DirectResolution::Refused(refusal) =
+            resolve_direct_target("worker", &[], &peers, NO_OWN)
+        else {
+            panic!("expected an ambiguity");
+        };
+        assert!(!refusal.contains("session:"), "{refusal}");
+        for (typed, expected) in [
+            ("@abcdef-1111", "abcdef-1111-x"),
+            ("@abcdef-1112", "abcdef-1112-y"),
+            ("@repo-zzzz", "zzzzzz-0000-z"),
+        ] {
+            assert!(refusal.contains(typed), "{typed} in {refusal}");
+            let parsed = parse_direct_message(&format!("{typed} hello"), dir.path())
+                .unwrap_or_else(|| panic!("{typed} is not a typeable recipient"));
+            assert_eq!(
+                resolve_direct_target(&parsed.recipient_name, &[], &peers, NO_OWN),
+                DirectResolution::Addressed(DirectTarget::Peer {
+                    session_id: expected.into()
+                }),
+                "{typed}"
+            );
+        }
     }
 
     #[test]

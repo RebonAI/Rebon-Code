@@ -255,7 +255,13 @@ pub enum PeerResolveError {
     /// Several do; each candidate is spelled the way a caller should send to it.
     Ambiguous {
         requested: String,
+        /// For a tool: `@handle` where there is one and `session:<id>`
+        /// otherwise.
         candidates: Vec<String>,
+        /// For a person at the prompt, which reads `@` and a word and nothing
+        /// else: `@handle`, or `@` and as much of the id as it takes to name
+        /// that session alone. Each one resolves to its own candidate.
+        typed_candidates: Vec<String>,
     },
 }
 
@@ -279,6 +285,7 @@ impl std::fmt::Display for PeerResolveError {
             Self::Ambiguous {
                 requested,
                 candidates,
+                ..
             } => write!(
                 f,
                 "`{requested}` matches {} sessions: {}",
@@ -302,6 +309,27 @@ pub fn strip_handle_sigil(requested: &str) -> &str {
     requested.strip_prefix('@').unwrap_or(requested)
 }
 
+/// The session doing the addressing, as far as it knows itself.
+///
+/// The peer list never contains the caller, yet a caller can name itself — by
+/// its handle, its id, or an abbreviation of either — and an abbreviation can
+/// name it and another session at once. [`resolve_peer_or_self`] puts it back
+/// in the list so that such a name is judged by the same steps as any other.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OwnSession<'a> {
+    pub session_id: Option<&'a str>,
+    pub handle: Option<&'a str>,
+}
+
+/// Who a name resolved to once the caller itself is counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerTarget<'a> {
+    /// Another session.
+    Peer(&'a PeerInfo),
+    /// The caller: a refusal, not something to deliver to.
+    OwnSession,
+}
+
 /// The one session `requested` names.
 ///
 /// A leading `@` is accepted and ignored, so the same string works in a tool
@@ -310,78 +338,178 @@ pub fn resolve_peer<'a>(
     peers: &'a [PeerInfo],
     requested: &str,
 ) -> Result<&'a PeerInfo, PeerResolveError> {
-    let requested = strip_handle_sigil(requested).trim();
-    let not_found = || PeerResolveError::NotFound {
-        requested: requested.to_string(),
-    };
-    if requested.is_empty() {
-        return Err(not_found());
+    match resolve_peer_or_self(peers, OwnSession::default(), requested)? {
+        PeerTarget::Peer(peer) => Ok(peer),
+        PeerTarget::OwnSession => unreachable!("no own session was given"),
     }
-
-    let by_handle: Vec<&PeerInfo> = peers
-        .iter()
-        .filter(|peer| {
-            peer.handle
-                .as_deref()
-                .is_some_and(|handle| handle.eq_ignore_ascii_case(requested))
-        })
-        .collect();
-    if let Some(peer) = resolve_step(by_handle, requested)? {
-        return Ok(peer);
-    }
-
-    if requested.len() >= MIN_SESSION_PREFIX_CHARS {
-        let by_handle_prefix: Vec<&PeerInfo> = peers
-            .iter()
-            .filter(|peer| {
-                peer.handle.as_deref().is_some_and(|handle| {
-                    handle
-                        .to_ascii_lowercase()
-                        .starts_with(&requested.to_ascii_lowercase())
-                })
-            })
-            .collect();
-        if let Some(peer) = resolve_step(by_handle_prefix, requested)? {
-            return Ok(peer);
-        }
-
-        if let Some(peer) = peers.iter().find(|peer| peer.session_id == requested) {
-            return Ok(peer);
-        }
-        let by_id_prefix: Vec<&PeerInfo> = peers
-            .iter()
-            .filter(|peer| peer.session_id.starts_with(requested))
-            .collect();
-        if let Some(peer) = resolve_step(by_id_prefix, requested)? {
-            return Ok(peer);
-        }
-    }
-
-    let by_name: Vec<&PeerInfo> = peers
-        .iter()
-        .filter(|peer| {
-            peer.name
-                .as_deref()
-                .is_some_and(|name| name.eq_ignore_ascii_case(requested))
-        })
-        .collect();
-    resolve_step(by_name, requested)?.ok_or_else(not_found)
 }
 
-/// One step of [`resolve_peer`]: a unique hit ends the search, several are an
-/// ambiguity, none passes the decision to the next step.
-fn resolve_step<'a>(
-    matches: Vec<&'a PeerInfo>,
+/// The one session `requested` names, counting the caller as one of them.
+///
+/// This is the rule every sender applies, so one written name means one thing
+/// whoever writes it: the caller's exact handle or id is the caller; an
+/// abbreviation that only the caller answers to is the caller too; one that the
+/// caller and another session both answer to is an ambiguity listing both; and
+/// one that only others answer to is resolved among them as [`resolve_peer`]
+/// would. A peer entry carrying the caller's own id is ignored — it is the
+/// caller, already counted.
+pub fn resolve_peer_or_self<'a>(
+    peers: &'a [PeerInfo],
+    own: OwnSession<'_>,
     requested: &str,
-) -> Result<Option<&'a PeerInfo>, PeerResolveError> {
-    match matches.len() {
-        0 => Ok(None),
-        1 => Ok(Some(matches[0])),
-        _ => Err(PeerResolveError::Ambiguous {
-            requested: requested.to_string(),
-            candidates: matches.into_iter().map(peer_target_label).collect(),
-        }),
+) -> Result<PeerTarget<'a>, PeerResolveError> {
+    let own_id = own.session_id.map(str::trim).filter(|id| !id.is_empty());
+    let own_handle = own
+        .handle
+        .map(str::trim)
+        .filter(|handle| !handle.is_empty());
+    let own_entry = (own_id.is_some() || own_handle.is_some()).then(|| PeerInfo {
+        session_id: own_id.unwrap_or_default().to_string(),
+        handle: own_handle.map(str::to_string),
+        name: None,
+        cwd: String::new(),
+        kind: String::new(),
+        busy: false,
+        reachable: true,
+        terminal_id: None,
+        activity: None,
+    });
+    let mut everyone: Vec<&PeerInfo> = peers
+        .iter()
+        .filter(|peer| own_id.is_none_or(|own_id| peer.session_id != own_id))
+        .collect();
+    if let Some(own_entry) = own_entry.as_ref() {
+        everyone.push(own_entry);
     }
+    let is_own = |entry: &PeerInfo| {
+        own_entry
+            .as_ref()
+            .is_some_and(|own_entry| std::ptr::eq(entry, own_entry))
+    };
+
+    let requested = strip_handle_sigil(requested).trim();
+    match matches_for(&everyone, requested) {
+        Matches::None => Err(PeerResolveError::NotFound {
+            requested: requested.to_string(),
+        }),
+        Matches::One(index) if is_own(everyone[index]) => Ok(PeerTarget::OwnSession),
+        Matches::One(index) => {
+            // `everyone` borrows from `peers` for every entry but the caller's.
+            let found = everyone[index];
+            let peer = peers
+                .iter()
+                .find(|peer| std::ptr::eq(*peer, found))
+                .expect("a match that is not the caller is one of the peers");
+            Ok(PeerTarget::Peer(peer))
+        }
+        Matches::Several(indices) => {
+            let label = |index: usize, spelled: String| {
+                if is_own(everyone[index]) {
+                    format!("{spelled} (this session)")
+                } else {
+                    spelled
+                }
+            };
+            Err(PeerResolveError::Ambiguous {
+                requested: requested.to_string(),
+                candidates: indices
+                    .iter()
+                    .map(|&index| label(index, peer_target_label(everyone[index])))
+                    .collect(),
+                typed_candidates: indices
+                    .iter()
+                    .map(|&index| label(index, typed_label(&everyone, index)))
+                    .collect(),
+            })
+        }
+    }
+}
+
+/// `entry` spelled the way a person types it at the prompt, which accepts `@`
+/// and a word and nothing else — so not `session:<id>`.
+///
+/// The handle when it names this session alone; otherwise the shortest id
+/// prefix that does, so a session without a handle is still one word away.
+fn typed_label(everyone: &[&PeerInfo], index: usize) -> String {
+    let entry = everyone[index];
+    let names_it =
+        |spelled: &str| matches!(matches_for(everyone, spelled), Matches::One(hit) if hit == index);
+    if let Some(handle) = entry.handle.as_deref().map(str::trim) {
+        if !handle.is_empty() && names_it(handle) {
+            return format!("@{handle}");
+        }
+    }
+    let id = entry.session_id.as_str();
+    id.char_indices()
+        .map(|(at, ch)| &id[..at + ch.len_utf8()])
+        .filter(|prefix| prefix.chars().count() >= MIN_SESSION_PREFIX_CHARS)
+        .find(|prefix| names_it(prefix))
+        .map(|prefix| format!("@{prefix}"))
+        .unwrap_or_else(|| format!("@{id}"))
+}
+
+/// What one lookup matched, by position in the list it was given.
+enum Matches {
+    None,
+    One(usize),
+    Several(Vec<usize>),
+}
+
+/// The search [`resolve_peer_or_self`] runs, step by step.
+fn matches_for(everyone: &[&PeerInfo], requested: &str) -> Matches {
+    if requested.is_empty() {
+        return Matches::None;
+    }
+    let lowered = requested.to_ascii_lowercase();
+    let handle_of = |peer: &PeerInfo| {
+        peer.handle
+            .as_deref()
+            .map(str::trim)
+            .filter(|handle| !handle.is_empty())
+            .map(str::to_ascii_lowercase)
+    };
+    let step = |keep: &dyn Fn(&PeerInfo) -> bool| -> Option<Matches> {
+        let hits: Vec<usize> = everyone
+            .iter()
+            .enumerate()
+            .filter(|(_, peer)| keep(peer))
+            .map(|(index, _)| index)
+            .collect();
+        match hits.as_slice() {
+            [] => None,
+            [one] => Some(Matches::One(*one)),
+            _ => Some(Matches::Several(hits)),
+        }
+    };
+
+    if let Some(found) = step(&|peer| handle_of(peer).is_some_and(|handle| handle == lowered)) {
+        return found;
+    }
+    if requested.chars().count() >= MIN_SESSION_PREFIX_CHARS {
+        if let Some(found) =
+            step(&|peer| handle_of(peer).is_some_and(|handle| handle.starts_with(&lowered)))
+        {
+            return found;
+        }
+        // An exact id ends the search even where it is also a prefix of a
+        // longer id: it names one session in full.
+        if let Some(found) =
+            step(&|peer| !peer.session_id.is_empty() && peer.session_id == requested)
+        {
+            return found;
+        }
+        if let Some(found) =
+            step(&|peer| !peer.session_id.is_empty() && peer.session_id.starts_with(requested))
+        {
+            return found;
+        }
+    }
+    step(&|peer| {
+        peer.name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(requested))
+    })
+    .unwrap_or(Matches::None)
 }
 
 #[cfg(test)]
@@ -495,6 +623,7 @@ mod tests {
             PeerResolveError::Ambiguous {
                 requested: "repo-qrst".into(),
                 candidates: vec!["@repo-qrst".into(), "@repo-qrst".into()],
+                typed_candidates: vec!["@abcde-o".into(), "@abcde-t".into()],
             }
         );
         assert_eq!(
@@ -548,6 +677,7 @@ mod tests {
             PeerResolveError::Ambiguous {
                 requested: "repo-o".into(),
                 candidates: vec!["@repo-one".into(), "@repo-only".into()],
+                typed_candidates: vec!["@repo-one".into(), "@repo-only".into()],
             }
         );
         assert!(
@@ -598,6 +728,101 @@ mod tests {
         assert_eq!(
             peer_target_label(&peer("abcde-fghij-klmno-pqrst", None, None)),
             "session:abcde-fghij-klmno-pqrst"
+        );
+    }
+
+    /// The prompt reads `@` and a word, so `session:<id>` cannot be typed: a
+    /// session without a handle is offered as the shortest id prefix that names
+    /// it alone, and that prefix really does resolve to it.
+    #[test]
+    fn a_typed_candidate_without_a_handle_is_an_id_prefix_that_names_it_alone() {
+        let peers = vec![
+            peer("abcdef-1111-x", None, Some("worker")),
+            peer("abcdef-1112-y", None, Some("worker")),
+            peer("zzzzzz-0000-z", Some("repo-zzzz"), Some("worker")),
+        ];
+        let PeerResolveError::Ambiguous {
+            typed_candidates, ..
+        } = resolve_peer(&peers, "worker").unwrap_err()
+        else {
+            panic!("expected an ambiguity");
+        };
+        assert_eq!(
+            typed_candidates,
+            ["@abcdef-1111", "@abcdef-1112", "@repo-zzzz"]
+        );
+        for (typed, expected) in typed_candidates.iter().zip(&peers) {
+            assert_eq!(
+                resolve_peer(&peers, typed).unwrap().session_id,
+                expected.session_id,
+                "{typed}"
+            );
+        }
+    }
+
+    fn own<'a>(session_id: &'a str, handle: &'a str) -> OwnSession<'a> {
+        OwnSession {
+            session_id: Some(session_id),
+            handle: Some(handle),
+        }
+    }
+
+    /// The caller's own handle or id, written in full, is the caller.
+    #[test]
+    fn the_callers_full_handle_or_id_is_the_caller() {
+        let peers = vec![peer("c3d4c3d4-peer", Some("reboncode-c3d4"), None)];
+        let me = own("a1b2a1b2-self", "reboncode-a1b2");
+        for requested in ["reboncode-a1b2", "@REBONCODE-A1B2", "a1b2a1b2-self"] {
+            assert_eq!(
+                resolve_peer_or_self(&peers, me, requested),
+                Ok(PeerTarget::OwnSession),
+                "{requested}"
+            );
+        }
+    }
+
+    /// An abbreviation the caller and another session both answer to names
+    /// neither; one only the caller answers to is the caller; one only another
+    /// answers to is that other.
+    #[test]
+    fn an_abbreviation_of_the_callers_handle_is_judged_like_any_other() {
+        let peers = vec![peer("c3d4c3d4-peer", Some("reboncode-c3d4"), None)];
+        let me = own("a1b2a1b2-self", "reboncode-a1b2");
+
+        let error = resolve_peer_or_self(&peers, me, "@reboncode").unwrap_err();
+        assert_eq!(
+            error.candidates(),
+            ["@reboncode-c3d4", "@reboncode-a1b2 (this session)"]
+        );
+        assert_eq!(
+            resolve_peer_or_self(&peers, me, "reboncode-a1"),
+            Ok(PeerTarget::OwnSession)
+        );
+        assert_eq!(
+            resolve_peer_or_self(&peers, me, "reboncode-c3"),
+            Ok(PeerTarget::Peer(&peers[0]))
+        );
+        assert_eq!(
+            resolve_peer_or_self(&peers, me, "rebon"),
+            Err(PeerResolveError::NotFound {
+                requested: "rebon".into()
+            }),
+            "too short to abbreviate anything"
+        );
+    }
+
+    /// The peer list leaves the caller out; if it did not, the caller is still
+    /// one session, not two that share an id.
+    #[test]
+    fn a_peer_entry_for_the_caller_is_the_caller() {
+        let peers = vec![peer("a1b2a1b2-self", Some("reboncode-a1b2"), None)];
+        assert_eq!(
+            resolve_peer_or_self(
+                &peers,
+                own("a1b2a1b2-self", "reboncode-a1b2"),
+                "reboncode-a1b2"
+            ),
+            Ok(PeerTarget::OwnSession)
         );
     }
 
