@@ -20,8 +20,9 @@ pub fn warm_background_job_for_peek_in_store(
             || state.process.ipc_port.is_some()
             || state.process.ipc_token.is_some()
             || state.outcome.pending_permission.is_some()
-            // A message the wake bounds refused only waits for a turn somebody
-            // else starts; it does not make the job's next start a turn.
+            // A message from another session the wake bounds have not admitted
+            // only waits; it does not make the job's next start a turn. The
+            // warm-up judges any nobody judged yet when it ends.
             || state.has_pending_prompts_to_run()
             || !matches!(
                 state.process.status,
@@ -132,12 +133,13 @@ mod tests {
         assert!(loaded.process.completed_at_ms.is_none());
     }
 
-    /// Another session's message the wake bounds refused waits for a turn
-    /// somebody else starts; it is no follow-up to run, so it does not stop a
-    /// peek from warming the session. One nobody judged yet may still lead a
-    /// turn, and does.
+    /// Another session's message the wake bounds have not admitted — refused,
+    /// or never judged — is no follow-up to run, so it does not stop a peek
+    /// from warming the session; the warm-up judges an unjudged one when it
+    /// ends. An admitted one is owed its turn, and blocks the peek like any
+    /// prompt waiting to run.
     #[test]
-    fn warm_peek_warms_past_a_refused_message_but_not_an_unjudged_one() {
+    fn warm_peek_warms_past_messages_nobody_admitted() {
         let message = |wake| {
             let mut prompt = crate::PendingPrompt::new(
                 "m-waiting".into(),
@@ -158,7 +160,8 @@ mod tests {
         };
         for (wake, warms) in [
             (rebon_tool::peer::WakeVerdict::Refused, true),
-            (rebon_tool::peer::WakeVerdict::Unjudged, false),
+            (rebon_tool::peer::WakeVerdict::Unjudged, true),
+            (rebon_tool::peer::WakeVerdict::Admitted, false),
         ] {
             let (_dir, store) = store();
             let mut state = store

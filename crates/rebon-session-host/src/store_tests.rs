@@ -4475,7 +4475,9 @@ fn an_agent_message_is_queued_without_starting_a_worker() {
     );
 
     let reloaded = store.read_state(&job_id).unwrap();
-    assert_eq!(reloaded.process.status, BackgroundJobStatus::Queued);
+    // Nothing here can judge the message against the session's wake bounds,
+    // so it does not move the job; it waits for whoever runs the session next.
+    assert_eq!(reloaded.process.status, BackgroundJobStatus::Idle);
     assert_eq!(reloaded.identity.pending_prompts.len(), 1);
     assert_eq!(
         reloaded.identity.pending_prompts[0].origin,
@@ -4576,6 +4578,166 @@ fn agent_messages_a_running_turn_already_took_leave_room_for_more() {
         .appended,
         "the messages the turn took leave room"
     );
+}
+
+/// However many messages a long turn reads, they never take the queue's last
+/// free slots: past the point where only those are left, another message is
+/// refused, and a typed prompt, a cron fire or a task's report still fits.
+#[test]
+fn agent_messages_never_take_the_slots_kept_for_prompts() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.identity.session_id = Some("sess-agent-reserve".into());
+    state.process.status = BackgroundJobStatus::Running;
+    state.process.turn_generation = 2;
+    let job_id = state.identity.job_id.clone();
+    store.write_state(&state).unwrap();
+    let room_for_messages = MAX_PENDING_PROMPTS - PENDING_PROMPT_SLOTS_KEPT_FROM_AGENT_MESSAGES;
+    for index in 0..room_for_messages {
+        let envelope = agent_message_envelope(&format!("m-long-{index}"), "while you work");
+        append_agent_message_to_background_job(&store, &job_id, &envelope).unwrap();
+        // The running turn reads each as it comes, so none waits unread.
+        store
+            .update_state(&job_id, |state| {
+                for prompt in &mut state.identity.pending_prompts {
+                    prompt.claimed_turn_generation = Some(2);
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    let error = append_agent_message_to_background_job(
+        &store,
+        &job_id,
+        &agent_message_envelope("m-into-reserve", "one more"),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("message refused") && error.contains("not queued"),
+        "{error}"
+    );
+    for index in 0..PENDING_PROMPT_SLOTS_KEPT_FROM_AGENT_MESSAGES {
+        assert!(
+            append_background_prompt_with_images(
+                &store,
+                &job_id,
+                format!("pp-kept-{index}"),
+                "what the person typed".into(),
+                Vec::new(),
+                false,
+                &rebon_exe(),
+            )
+            .unwrap()
+            .appended,
+            "kept slot {index} is free for a prompt"
+        );
+    }
+}
+
+/// A message from another session waiting in the queue — refused a turn, or
+/// never judged — is no follow-up owed. It does not stop `/bg`, `/hosted` or a
+/// local takeover, and none of them drops it: it is carried, unclaimed, for
+/// the next turn somebody starts.
+#[test]
+fn a_waiting_message_does_not_block_a_fresh_start_and_is_carried_through_it() {
+    let waiting = |id: &str, wake| {
+        let mut prompt =
+            pending_prompt(id, "<teammate-message>later</teammate-message>", Vec::new());
+        prompt.origin = Some(crate::PendingPromptOrigin::AgentMessage {
+            from_session_id: "sess-peer".into(),
+            from_agent: "main".into(),
+            from_handle: None,
+            from_name: None,
+            hops: 9,
+        });
+        prompt.wake = wake;
+        prompt.claimed_turn_generation = Some(1);
+        prompt
+    };
+    let job = |status| {
+        let (dir, store) = store();
+        let mut state = store
+            .create_job("prompt".into(), PathBuf::from("."), runtime())
+            .unwrap();
+        state.identity.session_id = Some("sess-fresh-start".into());
+        state.process.status = status;
+        state.process.turn_generation = 1;
+        state.identity.pending_prompts = vec![
+            waiting("m-refused", rebon_tool::peer::WakeVerdict::Refused),
+            waiting("m-unjudged", rebon_tool::peer::WakeVerdict::Unjudged),
+        ];
+        let job_id = state.identity.job_id.clone();
+        store.write_state(&state).unwrap();
+        (dir, store, job_id)
+    };
+    let carried = |store: &BackgroundStore, job_id: &str| {
+        store
+            .read_state(job_id)
+            .unwrap()
+            .identity
+            .pending_prompts
+            .iter()
+            .map(|prompt| (prompt.id.clone(), prompt.claimed_turn_generation))
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![
+        ("m-refused".to_string(), None),
+        ("m-unjudged".to_string(), None),
+    ];
+
+    let (_dir, store, job_id) = job(BackgroundJobStatus::Idle);
+    let queued = mark_existing_background_session_queued(
+        &store,
+        &job_id,
+        Some("the final prompt".into()),
+        PathBuf::from("."),
+        runtime(),
+        "sess-fresh-start".into(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(queued.process.status, BackgroundJobStatus::Queued);
+    assert_eq!(queued.identity.prompt, "the final prompt");
+    assert_eq!(carried(&store, &job_id), expected);
+
+    let (_dir, store, job_id) = job(BackgroundJobStatus::Succeeded);
+    mark_existing_background_session_idle(
+        &store,
+        &job_id,
+        None,
+        PathBuf::from("."),
+        runtime(),
+        "sess-fresh-start".into(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(carried(&store, &job_id), expected);
+
+    let (_dir, store, job_id) = job(BackgroundJobStatus::Succeeded);
+    mark_background_job_idle(&store, &job_id).unwrap();
+    assert_eq!(
+        store.read_state(&job_id).unwrap().process.status,
+        BackgroundJobStatus::Idle
+    );
+    assert_eq!(carried(&store, &job_id), expected);
+
+    // A prompt still owed blocks the fresh start, as before.
+    let (_dir, store, job_id) = job(BackgroundJobStatus::Idle);
+    store
+        .update_state(&job_id, |state| {
+            state
+                .identity
+                .pending_prompts
+                .push(pending_prompt("pp-owed", "owed", Vec::new()));
+            Ok(())
+        })
+        .unwrap();
+    let error = mark_background_job_idle(&store, &job_id).unwrap_err();
+    assert!(error.to_string().contains("follow-ups"), "{error}");
 }
 
 /// A verdict this build cannot read is read as not judged — the worker judges

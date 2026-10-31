@@ -2347,7 +2347,10 @@ async fn wait_for_first_prompt_on_warm_session(
             return Ok(WarmSessionWait::Ended);
         }
         match current.process.status {
-            BackgroundJobStatus::Queued if current.has_pending_prompts() => {
+            // Only a follow-up to run brings a parked worker back: messages
+            // from other sessions that merely wait are carried by the next
+            // turn, not the reason for one.
+            BackgroundJobStatus::Queued if current.has_pending_prompts_to_run() => {
                 let (cancel, claim) = ipc.start_turn_and(|| {
                     claim_background_job(
                         store,
@@ -2387,7 +2390,7 @@ async fn wait_for_first_prompt_on_warm_session(
                         return Ok(false);
                     }
                     if current.process.status == BackgroundJobStatus::Queued
-                        && !current.has_pending_prompts()
+                        && !current.has_pending_prompts_to_run()
                     {
                         current.process.status = BackgroundJobStatus::Idle;
                         current.process.updated_at_ms = normalized_at;
@@ -2474,7 +2477,10 @@ pub(crate) async fn wait_for_terminal_worker_reuse(
             return Ok(false);
         }
         match state.process.status {
-            BackgroundJobStatus::Queued if state.has_pending_prompts() => {
+            // Only a follow-up to run brings a parked worker back: messages
+            // from other sessions that merely wait are carried by the next
+            // turn, not the reason for one.
+            BackgroundJobStatus::Queued if state.has_pending_prompts_to_run() => {
                 store.append_event(job_id, "worker_reused", serde_json::json!({}))?;
                 return Ok(true);
             }
@@ -2492,7 +2498,7 @@ pub(crate) async fn wait_for_terminal_worker_reuse(
                         return Ok(false);
                     }
                     if current.process.status == BackgroundJobStatus::Queued
-                        && !current.has_pending_prompts()
+                        && !current.has_pending_prompts_to_run()
                     {
                         current.process.status = BackgroundJobStatus::Idle;
                         current.process.updated_at_ms = normalized_at;

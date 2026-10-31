@@ -47,7 +47,7 @@ pub fn mark_existing_background_session_idle(
         state.clear_recorded_owner();
         state.process.spawn_admitted = false;
         state.outcome.pending_permission = None;
-        state.clear_pending_prompts();
+        state.keep_only_waiting_messages();
         state.outcome.summary_updated_at_ms = None;
         state.outcome.exit_code = None;
         state.outcome.error = None;

@@ -186,12 +186,6 @@ impl PendingPrompt {
         self.origin.is_none()
     }
 
-    /// Whether this prompt may be the reason a turn starts once its wake is
-    /// decided: anything but another session's message the bounds refused.
-    pub fn may_start_turn(&self) -> bool {
-        !(self.is_agent_message() && self.wake == rebon_tool::peer::WakeVerdict::Refused)
-    }
-
     /// Whether this prompt may lead a turn without being judged first:
     /// anything somebody asked for, and another session's message only once
     /// the bounds admitted it.
@@ -1371,17 +1365,36 @@ impl BackgroundJobState {
         !self.identity.pending_prompts.is_empty()
     }
 
-    /// Whether anything waiting may be the reason for a turn.
+    /// Whether anything waiting is a follow-up to run: a prompt somebody
+    /// asked for, or another session's message the wake bounds admitted.
     ///
-    /// Not merely whether something waits: another session's message the
-    /// wake bounds refused stays queued for a turn somebody else starts, and
-    /// on its own it is no follow-up to run — reviving, warming or finishing
-    /// a job must not treat it as one.
+    /// Not merely whether something waits. Another session's message the
+    /// bounds refused stays queued for a turn somebody else starts, and one
+    /// nobody judged yet runs only once whoever next runs the session judges
+    /// and admits it; on their own neither is a follow-up — reviving, warming,
+    /// handing over or finishing a job must not treat them as one, and must
+    /// carry them rather than drop them.
     pub fn has_pending_prompts_to_run(&self) -> bool {
         self.identity
             .pending_prompts
             .iter()
-            .any(PendingPrompt::may_start_turn)
+            .any(PendingPrompt::may_lead_turn)
+    }
+
+    /// Drop every prompt waiting to run and keep, unclaimed, the messages
+    /// from other sessions that only wait for a turn somebody else starts.
+    ///
+    /// For the paths that hand a job a fresh start — `/bg`, `/hosted`, a local
+    /// takeover — once [`Self::has_pending_prompts_to_run`] said there is
+    /// nothing owed: what is left is somebody else's words, still undelivered.
+    pub fn keep_only_waiting_messages(&mut self) {
+        self.identity
+            .pending_prompts
+            .retain(|prompt| !prompt.may_lead_turn());
+        for prompt in &mut self.identity.pending_prompts {
+            prompt.claimed_turn_generation = None;
+            prompt.completed_turn_generation = None;
+        }
     }
 
     /// Whether the head of the queue is a prompt a turn already took up and
@@ -1455,9 +1468,23 @@ impl BackgroundJobState {
                 MAX_PENDING_PROMPTS
             );
         }
-        // Only messages still waiting to be read count: one a running turn
-        // has already taken stays in the queue until that turn ends, but it
-        // no longer takes room from what a person types.
+        // The last free slots stay free for prompts somebody asked for, however
+        // many messages from other sessions sit in the queue — unread, or read
+        // by a running turn that has not ended to retire them.
+        if prompt.is_agent_message()
+            && self.identity.pending_prompts.len()
+                >= MAX_PENDING_PROMPTS - PENDING_PROMPT_SLOTS_KEPT_FROM_AGENT_MESSAGES
+        {
+            anyhow::bail!(
+                "message refused: background job {} keeps its last {} queue slots for prompts \
+                 somebody asked for; this one was not queued",
+                self.identity.job_id,
+                PENDING_PROMPT_SLOTS_KEPT_FROM_AGENT_MESSAGES
+            );
+        }
+        // Of the rest, only messages still waiting to be read count against
+        // their share: one a running turn has already taken stays in the queue
+        // until that turn ends, but it is no longer waiting on anybody.
         if prompt.is_agent_message()
             && self
                 .identity

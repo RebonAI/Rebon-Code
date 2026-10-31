@@ -950,103 +950,114 @@ fn the_verdict_reached_at_reception_is_kept_on_the_message() {
     );
 }
 
-/// A revive, or a message written while the session had no live owner, can
-/// queue a job whose only waiting prompts were refused a turn. The worker
-/// claiming it must not run a turn for them: it parks the job.
+/// A job queued with nothing in its queue owes its own prompt a turn — `/bg`
+/// with a final prompt, a rerun. A message that reaches it before a worker
+/// claims it does not take that turn's place, whether its sender's wakes are
+/// spent or not: the job's prompt leads, the message rides along unjudged and
+/// uncharged, and the job is not parked.
 #[test]
-fn a_job_queued_for_only_refused_messages_parks_instead_of_running_one() {
+fn a_message_does_not_take_the_place_of_the_jobs_own_prompt() {
     use rebon_tool::peer::WakeVerdict;
 
-    let hosted = hosted(BackgroundJobStatus::Queued, "sess-park-refused");
-    rewrite(&hosted, |state| {
-        state.identity.pending_prompts = vec![waiting_agent_prompt(
-            "m-refused",
-            rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1,
-            WakeVerdict::Refused,
-        )];
-    });
+    for (session_id, spent) in [
+        ("sess-own-prompt-within", false),
+        ("sess-own-prompt-over", true),
+    ] {
+        let hosted = hosted(BackgroundJobStatus::Queued, session_id);
+        if spent {
+            exhaust_wakes(session_id);
+        }
+        rebon_session_host::append_agent_message_to_background_job(
+            &hosted.store,
+            &hosted.state.identity.job_id,
+            &envelope("m-early", "before the worker came"),
+        )
+        .unwrap();
+        deliver(&hosted, &envelope("m-ipc", "and over the endpoint")).unwrap();
 
-    let claim = claim_background_job(
-        &hosted.store,
-        &hosted.state.identity.job_id,
-        std::process::id(),
-        hosted.ipc.port,
-        &hosted.ipc.token,
-        |_| Some(true),
-    )
-    .unwrap();
-    assert_eq!(claim, WorkerClaim::NoWork);
-    let parked = current(&hosted);
-    assert_eq!(parked.process.status, BackgroundJobStatus::Idle);
-    assert_eq!(
-        parked.identity.pending_prompts.len(),
-        1,
-        "still delivered later"
-    );
-    assert_eq!(
-        parked.identity.pending_prompts[0].wake,
-        WakeVerdict::Refused
-    );
+        let claimed = claim(&hosted);
+        assert_eq!(
+            claimed_pending_prompt(&claimed),
+            None,
+            "spent={spent}: the turn is the job's own prompt"
+        );
+        assert_eq!(
+            resolve_background_agent_runtime(&claimed).prompt,
+            "prompt",
+            "spent={spent}"
+        );
+        assert!(
+            claimed
+                .identity
+                .pending_prompts
+                .iter()
+                .all(|prompt| prompt.wake == WakeVerdict::Unjudged
+                    && prompt.claimed_turn_generation.is_none()),
+            "spent={spent}: the messages ride along, unjudged"
+        );
+    }
+    let ledger = rebon_tool::peer::session_reply_ledger("sess-own-prompt-within");
+    for step in 0..rebon_tool::peer::AGENT_MESSAGE_WAKES_PER_HOUR {
+        assert!(
+            ledger.admit_wake("sess-sender", 0, now_ms()).is_allowed(),
+            "wake {step}: riding along spent nothing"
+        );
+    }
 }
 
-/// A message nobody judged — it was written while the session had no live
-/// owner, or before verdicts were kept — is judged by the worker before it may
-/// lead the turn, and the verdict is written down.
+/// A message nobody judged — written while the session had no live owner, or
+/// before verdicts were kept — is judged when a turn would start only because
+/// of it: here, as a warm-up ends. Admitted, it leads that turn; refused, the
+/// session stays parked and the verdict is written down.
 #[test]
-fn the_worker_judges_a_message_nobody_judged_before_it_may_lead() {
+fn a_message_nobody_judged_is_judged_before_it_may_lead() {
     use rebon_tool::peer::WakeVerdict;
 
-    let within = hosted(BackgroundJobStatus::Queued, "sess-claim-judges");
-    rewrite(&within, |state| {
-        state.identity.pending_prompts =
-            vec![waiting_agent_prompt("m-unjudged", 1, WakeVerdict::Unjudged)];
-    });
-    let claimed = claim(&within);
-    let head = claimed_pending_prompt(&claimed).expect("the message leads");
-    assert_eq!(head.id, "m-unjudged");
-    assert_eq!(head.wake, WakeVerdict::Admitted);
-
-    let over = hosted(BackgroundJobStatus::Queued, "sess-claim-refuses");
-    exhaust_wakes("sess-claim-refuses");
-    rewrite(&over, |state| {
-        state.identity.pending_prompts =
-            vec![waiting_agent_prompt("m-unjudged", 1, WakeVerdict::Unjudged)];
-    });
-    let claim = claim_background_job(
-        &over.store,
-        &over.state.identity.job_id,
-        std::process::id(),
-        over.ipc.port,
-        &over.ipc.token,
-        |_| Some(true),
-    )
-    .unwrap();
-    assert_eq!(claim, WorkerClaim::NoWork);
-    let parked = current(&over);
-    assert_eq!(parked.process.status, BackgroundJobStatus::Idle);
-    assert_eq!(
-        parked.identity.pending_prompts[0].wake,
-        WakeVerdict::Refused
-    );
+    for (session_id, spent) in [
+        ("sess-warm-end-admits", false),
+        ("sess-warm-end-refuses", true),
+    ] {
+        let hosted = hosted(BackgroundJobStatus::Idle, session_id);
+        if spent {
+            exhaust_wakes(session_id);
+        }
+        rewrite(&hosted, |state| {
+            state.identity.pending_prompts =
+                vec![waiting_agent_prompt("m-unjudged", 1, WakeVerdict::Unjudged)];
+        });
+        let mut state = current(&hosted);
+        assert_eq!(lead_with_turn_driver(&mut state, now_ms()), !spent);
+        assert_eq!(
+            state.identity.pending_prompts[0].wake,
+            if spent {
+                WakeVerdict::Refused
+            } else {
+                WakeVerdict::Admitted
+            }
+        );
+    }
 }
 
-/// The store's fallback queues a job for a message without asking any bound.
-/// A message refused earlier is still waiting there; the turn the worker runs
-/// is for the new message once judged, never for the refused one.
+/// The store's fallback writes a message without a live owner to judge it, so
+/// it leaves the job as it is — a finished job keeps the result it finished
+/// with — and the message waits, unjudged. When the session next runs, a
+/// message refused earlier still never leads: the new one is judged, and
+/// leads only if admitted.
 #[test]
-fn a_message_written_without_a_live_owner_does_not_let_a_refused_one_lead() {
+fn a_message_written_without_a_live_owner_leaves_the_job_and_does_not_let_a_refused_one_lead() {
     use rebon_tool::peer::WakeVerdict;
 
     let hosted = hosted(BackgroundJobStatus::Succeeded, "sess-store-fallback");
+    rewrite(&hosted, |state| {
+        state.outcome.summary = Some("finished the build".into());
+        state.outcome.exit_code = Some(0);
+        state.process.completed_at_ms = Some(7);
+    });
     let mut deep = envelope("m-deep", "too deep");
     deep.hops = rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1;
     assert_eq!(
         result_of(deliver(&hosted, &deep)).outcome,
         AgentMessageDelivery::Queued
-    );
-    assert_eq!(
-        current(&hosted).process.status,
-        BackgroundJobStatus::Succeeded
     );
 
     rebon_session_host::append_agent_message_to_background_job(
@@ -1055,16 +1066,24 @@ fn a_message_written_without_a_live_owner_does_not_let_a_refused_one_lead() {
         &envelope("m-later", "a later question"),
     )
     .unwrap();
-    assert_eq!(current(&hosted).process.status, BackgroundJobStatus::Queued);
-
-    let claimed = claim(&hosted);
-    let head = claimed_pending_prompt(&claimed).expect("a prompt leads");
-    assert_eq!(head.id, "m-later");
-    assert_eq!(head.wake, WakeVerdict::Admitted);
+    let mut state = current(&hosted);
+    assert_eq!(state.process.status, BackgroundJobStatus::Succeeded);
+    assert_eq!(state.outcome.summary.as_deref(), Some("finished the build"));
+    assert_eq!(state.outcome.exit_code, Some(0));
+    assert_eq!(state.process.completed_at_ms, Some(7));
     assert_eq!(
-        claimed.identity.pending_prompts[1].wake,
-        WakeVerdict::Refused
+        state.identity.pending_prompts[1].wake,
+        WakeVerdict::Unjudged
     );
+
+    // The session runs next — a warm-up ending decides what waits.
+    assert!(lead_with_turn_driver(&mut state, now_ms()));
+    assert_eq!(state.identity.pending_prompts[0].id, "m-later");
+    assert_eq!(
+        state.identity.pending_prompts[0].wake,
+        WakeVerdict::Admitted
+    );
+    assert_eq!(state.identity.pending_prompts[1].wake, WakeVerdict::Refused);
 }
 
 /// A failed turn keeps its prompt for a retry. Another session's message must

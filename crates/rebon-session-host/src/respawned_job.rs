@@ -5,13 +5,17 @@ pub(crate) fn validate_respawned_job_materialization(
     target: &BackgroundJobState,
     target_job_id: &str,
 ) -> anyhow::Result<()> {
-    let mut expected_pending_prompts = source.identity.pending_prompts.clone();
+    let resumes_session = source.has_pending_prompts_to_run();
+    let mut expected_pending_prompts = if resumes_session {
+        source.identity.pending_prompts.clone()
+    } else {
+        Vec::new()
+    };
     for prompt in &mut expected_pending_prompts {
         prompt.claimed_turn_generation = None;
         prompt.completed_turn_generation = None;
     }
-    let expected_session_id = source
-        .has_pending_prompts()
+    let expected_session_id = resumes_session
         .then(|| source.identity.session_id.clone())
         .flatten();
     if target.identity.job_id != target_job_id
@@ -59,7 +63,12 @@ pub(crate) fn create_respawned_job_with_id(
     );
     new_job.identity.job_id = job_id;
     new_job.identity.prompt_images = source.identity.prompt_images.clone();
-    if source.has_pending_prompts() {
+    // Only a follow-up owed carries the session and its queue over. Messages
+    // from other sessions that merely wait — refused a turn, or never judged —
+    // are no reason to resume it: with only those, the respawn reruns the
+    // job's own prompt like any job with nothing queued, and the messages stay
+    // with the session they were sent to, in the source record.
+    if source.has_pending_prompts_to_run() {
         new_job.identity.session_id = source.identity.session_id.clone();
         new_job.identity.pending_prompts = source.identity.pending_prompts.clone();
         for prompt in &mut new_job.identity.pending_prompts {
@@ -236,6 +245,67 @@ mod tests {
             respawned.identity.pending_prompts[0].completed_turn_generation,
             None
         );
+    }
+
+    /// A respawn whose source holds only messages that wait — refused a turn,
+    /// or never judged — owes no follow-up: it reruns the job's own prompt
+    /// like any job with nothing queued, rather than resuming the session for
+    /// messages that may not start a turn.
+    #[test]
+    fn create_respawned_job_with_only_waiting_messages_reruns_its_own_prompt() {
+        let (_dir, store) = store();
+        let mut source = store
+            .create_job(
+                "original prompt".into(),
+                PathBuf::from("/repo/project"),
+                BackgroundRuntimeFields {
+                    provider: None,
+                    model: None,
+                    fast_mode: None,
+                    channels: Vec::new(),
+                    development_channels: Vec::new(),
+                    provider_format: None,
+                    ui_mode: None,
+                    effort_level: None,
+                    permission_mode: None,
+                    capability_mode: rebon_types::AgentCapabilityMode::Normal,
+                    settings: Vec::new(),
+                    add_dirs: Vec::new(),
+                    plugin_dirs: Vec::new(),
+                    mcp_configs: Vec::new(),
+                    strict_mcp_config: false,
+                },
+            )
+            .unwrap();
+        let mut refused = crate::PendingPrompt::new(
+            "m-refused".into(),
+            "<teammate-message>later</teammate-message>".into(),
+            Vec::new(),
+            crate::now_ms(),
+        )
+        .unwrap();
+        refused.origin = Some(crate::PendingPromptOrigin::AgentMessage {
+            from_session_id: "sess-peer".into(),
+            from_agent: "main".into(),
+            from_handle: None,
+            from_name: None,
+            hops: 9,
+        });
+        refused.wake = rebon_tool::peer::WakeVerdict::Refused;
+        source.identity.session_id = Some("sess-respawn-waiting".into());
+        source.identity.pending_prompts = vec![refused];
+        source.process.status = BackgroundJobStatus::Failed;
+        store.write_state(&source).unwrap();
+
+        let respawned = create_respawned_job(&store, &source).unwrap();
+        assert!(respawned.identity.pending_prompts.is_empty());
+        assert_eq!(respawned.identity.session_id, None);
+        assert_eq!(respawned.identity.prompt, "original prompt");
+        // Materialized again from the same source, the record still matches.
+        let again =
+            create_respawned_job_with_id(&store, &source, respawned.identity.job_id.clone())
+                .unwrap();
+        assert_eq!(again.identity.job_id, respawned.identity.job_id);
     }
 
     /// A respawn drops every claim but keeps what was decided about each

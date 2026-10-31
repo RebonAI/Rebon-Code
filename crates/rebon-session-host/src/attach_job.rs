@@ -124,8 +124,9 @@ fn revive_background_job(
         // again, the next worker resumes the session and takes up the prompt
         // it was on; with nothing claimed it parks, like a handover.
         BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput => {
-            // A message from another session the wake bounds refused is not a
-            // prompt to resume: with only those waiting, the worker warms up.
+            // A message from another session the wake bounds refused, or one
+            // nobody judged yet, is not a prompt to resume: with only those
+            // waiting, the worker warms up and judges them when it is done.
             let has_prompts = state.has_pending_prompts_to_run();
             store.update_state(job_id, |current| {
                 if current.process.process_owner_fenced {
@@ -150,10 +151,11 @@ fn revive_background_job(
             if state.has_pending_prompts_to_run() {
                 // An accepted follow-up the old worker never ran: queue the
                 // job for real, so the new worker runs it rather than parks.
-                // A message from another session the wake bounds refused is
-                // not one: opening the session must not start the turn it was
-                // refused. The worker judges one nobody judged yet before it
-                // may lead a turn.
+                // A message from another session is not one unless the wake
+                // bounds admitted it: opening the session must not start the
+                // turn one was refused. With only such messages waiting the
+                // worker warms up below, judges any nobody judged when the
+                // warm-up ends, and starts a turn only for one it admits.
                 store.update_state(job_id, |current| {
                     if current.process.process_owner_fenced {
                         anyhow::bail!(
@@ -461,15 +463,34 @@ mod tests {
         }
     }
 
-    /// A message from another session the wake bounds refused is not a
-    /// follow-up the old worker owed: opening the session must not start the
-    /// turn it was refused. The job is warmed for the person instead — parked
-    /// or mid-turn when its owner died — and the message keeps waiting.
+    /// A message from another session the wake bounds refused — or one nobody
+    /// judged yet — is not a follow-up the old worker owed: opening the
+    /// session must not start a turn for it. The job is warmed for the person
+    /// instead, parked or mid-turn when its owner died, so a worker owns it
+    /// and publishes its endpoint whatever the verdict; the message keeps
+    /// waiting and is judged when the warm-up ends.
     #[test]
-    fn attach_does_not_run_a_turn_for_a_refused_message() {
-        for (index, status) in [BackgroundJobStatus::Succeeded, BackgroundJobStatus::Running]
-            .into_iter()
-            .enumerate()
+    fn attach_does_not_run_a_turn_for_a_message_nobody_admitted() {
+        for (index, (status, wake)) in [
+            (
+                BackgroundJobStatus::Succeeded,
+                rebon_tool::peer::WakeVerdict::Refused,
+            ),
+            (
+                BackgroundJobStatus::Running,
+                rebon_tool::peer::WakeVerdict::Refused,
+            ),
+            (
+                BackgroundJobStatus::Succeeded,
+                rebon_tool::peer::WakeVerdict::Unjudged,
+            ),
+            (
+                BackgroundJobStatus::Running,
+                rebon_tool::peer::WakeVerdict::Unjudged,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let (dir, store) = store();
             let mut state = store
@@ -488,7 +509,7 @@ mod tests {
                 from_name: None,
                 hops: 9,
             });
-            refused.wake = rebon_tool::peer::WakeVerdict::Refused;
+            refused.wake = wake;
             state.identity.pending_prompts = vec![refused];
             state.identity.session_id = Some(format!("sess-refused-attach-{index}"));
             state.process.pid = None;

@@ -1488,11 +1488,16 @@ pub(crate) fn ensure_background_job_ownership_reusable(
     Ok(())
 }
 
+/// Refuse a fresh start while a follow-up is still owed.
+///
+/// Messages from other sessions that only wait for a turn somebody else
+/// starts — refused one, or never judged — owe nothing; the paths behind this
+/// guard carry them over with [`BackgroundJobState::keep_only_waiting_messages`].
 pub(crate) fn ensure_background_job_has_no_unfinished_follow_up(
     state: &BackgroundJobState,
     job_id: &str,
 ) -> anyhow::Result<()> {
-    if state.has_pending_prompts() {
+    if state.has_pending_prompts_to_run() {
         anyhow::bail!("background job {job_id} already has accepted follow-ups awaiting recovery");
     }
     Ok(())
@@ -1677,7 +1682,7 @@ pub fn mark_existing_background_session_queued_with_images(
         state.clear_recorded_owner();
         state.process.spawn_admitted = false;
         state.outcome.pending_permission = None;
-        state.clear_pending_prompts();
+        state.keep_only_waiting_messages();
         if let Some(prompt) = pending_prompt.clone() {
             state.append_pending_prompt(prompt)?;
         }
@@ -1966,7 +1971,7 @@ pub fn mark_background_job_idle(store: &BackgroundStore, job_id: &str) -> anyhow
         state.clear_recorded_owner();
         state.process.spawn_admitted = false;
         state.outcome.pending_permission = None;
-        state.clear_pending_prompts();
+        state.keep_only_waiting_messages();
         state.outcome.summary_updated_at_ms = None;
         state.process.updated_at_ms = now_ms();
         state.process.completed_at_ms = None;
@@ -2035,10 +2040,14 @@ fn append_background_pending_prompt(
 
 /// Append an agent message to a job's durable queue.
 ///
-/// The queue write is the wake signal: the status moves to `Queued`, which a
-/// live supervisor and an idle worker both poll for. Nothing is spawned here —
-/// a message is delivered to a session that is already running, never used to
-/// resurrect one whose worker is gone.
+/// Only the queue changes. Written here, without a live owner, the message
+/// cannot be judged against the session's wake bounds, and only an admitted
+/// message may be the reason for a turn — so the job's status and its result
+/// stay as they are, and the message waits, unjudged, for whoever runs the
+/// session next: a running turn reads it, a turn somebody else starts carries
+/// it, and a worker that warms up for the session judges it when the warm-up
+/// ends. Nothing is spawned here either — a message is never used to
+/// resurrect a session whose worker is gone.
 pub fn append_agent_message_to_background_job(
     store: &BackgroundStore,
     job_id: &str,
@@ -2126,12 +2135,6 @@ fn append_pending_prompt_durably(
                 "background job {job_id} is waiting for permission; answer or cancel it before sending another turn"
             );
         }
-        // Another session's message wakes a parked job only for its worker to
-        // judge against the session's wake bounds; it is never the reason a
-        // failed prompt is retried, and it does not turn a queued warm-up into
-        // a turn.
-        let agent_message_waits = prompt.is_agent_message()
-            && (state.head_awaits_retry() || state.process.status == BackgroundJobStatus::Queued);
         let acceptance = state.append_pending_prompt(prompt.clone())?;
         let active = matches!(
             state.process.status,
@@ -2143,7 +2146,12 @@ fn append_pending_prompt_durably(
         if !acceptance.appended {
             return Ok(acceptance);
         }
-        if !active && !agent_message_waits {
+        // Another session's message never moves the job: written here, with no
+        // live owner, nothing can judge it against the session's wake bounds,
+        // and only an admitted message may be the reason for a turn. It waits,
+        // unjudged, for whoever runs the session next — and a finished job
+        // keeps the result it finished with.
+        if !active && !prompt.is_agent_message() {
             state.process.status = BackgroundJobStatus::Queued;
             state.outcome.pending_permission = None;
             state.outcome.summary = None;

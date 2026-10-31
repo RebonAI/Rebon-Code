@@ -782,7 +782,9 @@ fn an_agent_message_for_a_free_session_with_a_job_is_queued() {
     );
 
     let reloaded = store.read_state(&job_id).expect("the job is still there");
-    assert_eq!(reloaded.process.status, BackgroundJobStatus::Queued);
+    // Nothing here can judge the message against the session's wake bounds,
+    // so it does not move the job; it waits for whoever runs the session next.
+    assert_eq!(reloaded.process.status, BackgroundJobStatus::Idle);
     assert_eq!(reloaded.identity.pending_prompts.len(), 1);
     let prompt = &reloaded.identity.pending_prompts[0];
     assert_eq!(prompt.id, "m-queue");

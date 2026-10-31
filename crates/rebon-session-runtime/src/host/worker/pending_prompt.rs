@@ -41,13 +41,15 @@ pub(crate) fn parent_published_this_worker(
 /// runs a full session — duplicate MCP/analyzer stacks and contention
 /// on the session file (os error 33).
 ///
-/// Being queued is not by itself a reason to run: the claim is where every
-/// path that queues a job — a turn ending, a revive, a warm-up ending, a
-/// message written without a live owner — meets the one rule for what may
-/// lead a turn (see [`lead_with_turn_driver`]). With nothing that may, the job
-/// parks and the claim answers `NoWork`. A head an earlier turn was claimed
-/// for is taken up again when it may lead, which is what lets a resumed turn
-/// find its durable row instead of writing a second one.
+/// The turn is claimed for the first waiting prompt that may lead one (see
+/// [`lead_with_ready_prompt`]). With none, it is the job's own prompt's turn:
+/// every path that queues a job without a prompt to run queues it for that —
+/// a new job, `/bg` with a final prompt, a rerun — and messages from other
+/// sessions that arrived meanwhile ride along in it. They are not judged here:
+/// judging is for a message that would be the reason for a turn, and this
+/// turn's reason is the job's prompt. A head an earlier turn was claimed for is
+/// taken up again when it may lead, which is what lets a resumed turn find its
+/// durable row instead of writing a second one.
 pub(crate) fn claim_background_job(
     store: &BackgroundStore,
     job_id: &str,
@@ -127,16 +129,7 @@ pub(crate) fn claim_background_job(
         }
         // A warm-up reads no prompt; whatever waits is decided when it ends.
         let warm_up = current.identity.resume_only;
-        if !warm_up && current.has_pending_prompts() && !lead_with_turn_driver(current, claimed_at)
-        {
-            // Everything waiting is another session's message the wake bounds
-            // refused, now or before. Whatever queued the job — a revive, a
-            // message written without a live owner — the job parks instead
-            // of running a turn for one of them.
-            current.process.status = BackgroundJobStatus::Idle;
-            current.process.updated_at_ms = claimed_at;
-            return Ok(WorkerClaim::NoWork);
-        }
+        let leads_with_pending = !warm_up && lead_with_ready_prompt(current);
         let next_generation = current_owner.turn_generation.wrapping_add(1).max(1);
         current.set_recorded_owner(RecordedOwnerSnapshot::owned(
             my_pid,
@@ -152,7 +145,7 @@ pub(crate) fn claim_background_job(
             .identity
             .pending_prompts
             .first_mut()
-            .filter(|_| !warm_up)
+            .filter(|_| leads_with_pending)
         {
             prompt.claimed_turn_generation = Some(current.process.turn_generation);
         }
@@ -167,8 +160,13 @@ pub(crate) fn claim_background_job(
     })
 }
 
-/// Put the prompt the next turn is for at the head of the queue, where the
-/// claim takes it; false when nothing waiting may start a turn.
+/// Decide whether what waits starts another turn, putting the prompt that turn
+/// is for at the head of the queue, where the claim takes it; false when
+/// nothing waiting may start one.
+///
+/// For the moments a turn would start only because of what waits — a turn
+/// ending, a warm-up ending. The claim itself judges nothing (see
+/// [`claim_background_job`]).
 ///
 /// The turn is for the first prompt that may lead one: something a person
 /// typed, a cron fire, a report, or another session's message the wake bounds
@@ -183,22 +181,40 @@ pub(crate) fn claim_background_job(
 ///
 /// Claimed prompts keep their place: the claim prefix stays the prefix.
 pub(crate) fn lead_with_turn_driver(state: &mut BackgroundJobState, now_ms: u64) -> bool {
-    let start = state
-        .identity
-        .pending_prompts
-        .iter()
-        .position(|prompt| prompt.claimed_turn_generation.is_none())
-        .unwrap_or(state.identity.pending_prompts.len());
-    let leader = state.identity.pending_prompts[start..]
-        .iter()
-        .position(PendingPrompt::may_lead_turn)
-        .map(|offset| start + offset)
-        .or_else(|| admit_a_waiting_agent_message(state, start, now_ms));
-    let Some(leader) = leader else {
+    if lead_with_ready_prompt(state) {
+        return true;
+    }
+    let start = first_unclaimed(state);
+    let Some(leader) = admit_a_waiting_agent_message(state, start, now_ms) else {
         return false;
     };
     state.identity.pending_prompts[start..=leader].rotate_right(1);
     true
+}
+
+/// Put the first waiting prompt that may lead a turn without being judged —
+/// one somebody asked for, or a message already admitted — at the head of the
+/// unclaimed queue; false when there is none. Nothing is judged and nothing
+/// is spent.
+pub(crate) fn lead_with_ready_prompt(state: &mut BackgroundJobState) -> bool {
+    let start = first_unclaimed(state);
+    let Some(offset) = state.identity.pending_prompts[start..]
+        .iter()
+        .position(PendingPrompt::may_lead_turn)
+    else {
+        return false;
+    };
+    state.identity.pending_prompts[start..=start + offset].rotate_right(1);
+    true
+}
+
+fn first_unclaimed(state: &BackgroundJobState) -> usize {
+    state
+        .identity
+        .pending_prompts
+        .iter()
+        .position(|prompt| prompt.claimed_turn_generation.is_none())
+        .unwrap_or(state.identity.pending_prompts.len())
 }
 
 /// Judge the messages from other sessions nobody judged yet, from `start` in
