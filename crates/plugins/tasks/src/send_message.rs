@@ -16,9 +16,6 @@ const TEAM_LEAD_NAME: &str = "team-lead";
 const PERMISSION_MESSAGE_PREVIEW_CHARS: usize = 200;
 /// `to: "session:<id>"` addresses another session running on this machine.
 const SESSION_TARGET_PREFIX: &str = "session:";
-/// How much of a session id a caller may abbreviate. Short enough to type,
-/// long enough that two sessions rarely share it.
-const MIN_SESSION_PREFIX_CHARS: usize = 6;
 
 fn message_delivery_error(message: impl Into<String>) -> ToolErrorPresentation {
     ToolErrorPresentation::new(
@@ -255,52 +252,37 @@ fn messenger_or_unavailable(
     })
 }
 
-fn session_target_list(peers: &[&PeerInfo]) -> String {
-    peers
-        .iter()
-        .map(|peer| format!("{SESSION_TARGET_PREFIX}{}", peer.session_id))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Resolve a full session id or a unique prefix of at least
-/// `MIN_SESSION_PREFIX_CHARS` characters against the running sessions.
-fn resolve_session_target(tool: ToolId, peers: &[PeerInfo], requested: &str) -> ToolResult<String> {
-    if let Some(peer) = peers.iter().find(|peer| peer.session_id == requested) {
-        return Ok(peer.session_id.clone());
-    }
-    if requested.len() < MIN_SESSION_PREFIX_CHARS {
-        return Err(ToolError::InvalidInput {
+/// The one running session `requested` names, or the error that says why not.
+///
+/// Matching itself lives in [`rebon_tool::peer::resolve_peer`]; this only turns
+/// its answer into the tool's own vocabulary, so a handle, an id and a name
+/// cannot come to mean three different things in three callers.
+fn resolve_peer_target<'a>(
+    tool: ToolId,
+    peers: &'a [PeerInfo],
+    requested: &str,
+) -> ToolResult<&'a PeerInfo> {
+    rebon_tool::peer::resolve_peer(peers, requested).map_err(|error| match error {
+        rebon_tool::peer::PeerResolveError::NotFound { .. } => ToolError::InvalidInput {
             tool,
             reason: format!(
-                "a session id must be at least {MIN_SESSION_PREFIX_CHARS} characters to abbreviate; \"{requested}\" is too short"
-            ),
-            error_code: Some(INVALID_INPUT_CODE),
-        });
-    }
-    let matches: Vec<&PeerInfo> = peers
-        .iter()
-        .filter(|peer| peer.session_id.starts_with(requested))
-        .collect();
-    match matches.len() {
-        1 => Ok(matches[0].session_id.clone()),
-        0 => Err(ToolError::InvalidInput {
-            tool,
-            reason: format!(
-                "\"{SESSION_TARGET_PREFIX}{requested}\" does not match a running session. {}",
+                "\"{requested}\" does not match a running session. A handle or a session id may be abbreviated to at least {} characters. {}",
+                rebon_tool::peer::MIN_SESSION_PREFIX_CHARS,
                 list_peers_hint()
             ),
             error_code: Some(INVALID_INPUT_CODE),
-        }),
-        _ => Err(ToolError::InvalidInput {
-            tool,
-            reason: format!(
-                "session prefix \"{requested}\" is ambiguous: {}. Send to the full id.",
-                session_target_list(&matches)
-            ),
-            error_code: Some(INVALID_INPUT_CODE),
-        }),
-    }
+        },
+        rebon_tool::peer::PeerResolveError::Ambiguous { candidates, .. } => {
+            ToolError::InvalidInput {
+                tool,
+                reason: format!(
+                    "\"{requested}\" is ambiguous: {}. Send to one of them by @handle, or by session:<id>.",
+                    candidates.join(", ")
+                ),
+                error_code: Some(INVALID_INPUT_CODE),
+            }
+        }
+    })
 }
 
 #[async_trait]
@@ -321,14 +303,15 @@ impl Tool for SendMessageTool {
          | `to` | |\n\
          |---|---|\n\
          | `\"researcher\"` | Teammate by name |\n\
-         | `\"session:<id>\"` | Another session running on this machine — a full id or a unique prefix of at least 6 characters. Plain text only |\n\
+         | `\"@repo-qrst\"` | Another session running on this machine, by its handle. Plain text only |\n\
+         | `\"session:<id>\"` | Another session running on this machine, by id — still accepted; a full id or a unique prefix of at least 6 characters |\n\
          | `\"*\"` | Broadcast to all teammates — expensive (linear in team size), use only when everyone genuinely needs it |\n\
          \n\
          Your plain text output is NOT visible to other agents — to communicate, you MUST call this tool. Messages from teammates are delivered automatically; you don't check an inbox. Refer to teammates by name, never by UUID. Use SendMessage to supplement or correct a running teammate; use Agent with the same name when assigning a distinct follow-up request. When relaying, don't quote the original — it's already rendered to the user.\n\
          \n\
          ## Other sessions\n\
          \n\
-         `ListPeers` lists the sessions running on this machine, with their ids, names, working directories and whether they are reachable. Address one with `session:<id>`; a unique prefix of at least 6 characters is enough. Cross-session traffic is plain text only — structured protocol payloads stay inside a team. A message to a running turn is injected at its next tool round, and an idle hosted session starts a new turn from it. Your own session is never a valid target, and `\"*\"` still broadcasts only to your team.\n\
+         `ListPeers` lists the sessions running on this machine, with their handles, ids, names, working directories, what each is doing right now, and whether they are reachable. Prefer addressing one with its handle, `@handle` — it is short, and it stays the same across restarts. `session:<id>` still works, with a full id or a unique prefix of at least 6 characters; a bare name is tried as a teammate first and then as a session, while `@handle` skips the teammate lookup. Cross-session traffic is plain text only — structured protocol payloads stay inside a team. A message to a running turn is injected at its next tool round, and an idle hosted session starts a new turn from it. Your own session is never a valid target, and `\"*\"` still broadcasts only to your team.\n\
          \n\
          ## Protocol responses (legacy)\n\
          \n\
@@ -346,7 +329,7 @@ impl Tool for SendMessageTool {
         json!({
             "type": "object",
             "properties": {
-                "to": { "type": "string", "description": "Recipient teammate name, 'session:<id>' for another running session, or '*' to broadcast." },
+                "to": { "type": "string", "description": "Recipient teammate name, '@handle' or 'session:<id>' for another running session, or '*' to broadcast." },
                 "summary": { "type": "string", "description": "Optional short preview summary for UI display." },
                 "message": {
                     "oneOf": [
@@ -424,6 +407,12 @@ impl Tool for SendMessageTool {
             return self
                 .send_to_session(parsed, &target_session_id, context)
                 .await;
+        }
+        // `@handle` names a peer session and nothing else, so it skips the
+        // teammate lookup entirely: a teammate and a session may share a name,
+        // and the sigil is how the caller says which one it meant.
+        if let Some(handle) = parsed.to.strip_prefix('@').map(str::to_string) {
+            return self.send_to_session(parsed, &handle, context).await;
         }
         let session_id = own_session_id(context);
         let current_team = context.current_team_name().and_then(|team_name| {
@@ -559,14 +548,14 @@ impl Tool for SendMessageTool {
             if !is_missing_local_recipient(&error) {
                 return Err(error);
             }
-            let Some(target_session_id) = self
+            let Some(target) = self
                 .resolve_peer_by_name(&parsed.to, session_id, context)
                 .await?
             else {
                 return Err(with_list_peers_hint(error));
             };
             return self
-                .deliver_to_session(&target_session_id, parsed.summary, parsed.payload, context)
+                .deliver_to_session(&target, parsed.summary, parsed.payload, context)
                 .await;
         }
 
@@ -657,37 +646,34 @@ impl SendMessageTool {
         match result {
             Ok(result) => Ok(result),
             Err(error) if is_missing_local_recipient(&error) => {
-                let Some(target_session_id) = self
+                let Some(target) = self
                     .resolve_peer_by_name(&parsed.to, session_id, context)
                     .await?
                 else {
                     return Err(with_list_peers_hint(error));
                 };
-                self.deliver_to_session(&target_session_id, parsed.summary, parsed.payload, context)
+                self.deliver_to_session(&target, parsed.summary, parsed.payload, context)
                     .await
             }
             Err(error) => Err(error),
         }
     }
 
-    /// Find at most one other running session whose name matches `name`.
+    /// Find at most one other running session named `name`.
+    ///
+    /// `None` means nothing local matched, and is what sends the caller on to
+    /// the peer fallback; an ambiguity is an error, because picking one of two
+    /// sessions with the same name would deliver a message nobody addressed.
     async fn resolve_peer_by_name(
         &self,
         name: &str,
         session_id: Option<&str>,
         context: &ToolContext,
-    ) -> ToolResult<Option<String>> {
-        let Some(messenger) = context.peer_messenger() else {
-            return Ok(None);
+    ) -> ToolResult<Option<PeerInfo>> {
+        let peers = match self.list_peers(session_id, context).await? {
+            Some(peers) => peers,
+            None => return Ok(None),
         };
-        let peers =
-            messenger
-                .list_peers(session_id)
-                .await
-                .map_err(|message| ToolError::Presented {
-                    tool: self.id(),
-                    presentation: message_delivery_error(message),
-                })?;
         let matches: Vec<&PeerInfo> = peers
             .iter()
             .filter(|peer| {
@@ -698,39 +684,67 @@ impl SendMessageTool {
             .collect();
         match matches.len() {
             0 => Ok(None),
-            1 => Ok(Some(matches[0].session_id.clone())),
+            1 => Ok(Some(matches[0].clone())),
             _ => Err(ToolError::InvalidInput {
                 tool: self.id(),
                 reason: format!(
-                    "{} sessions are named \"{name}\": {}. Send to one by id with `session:<id>`.",
+                    "{} sessions are named \"{name}\": {}. Send to one of them by @handle, or by session:<id>.",
                     matches.len(),
-                    session_target_list(&matches)
+                    matches
+                        .iter()
+                        .map(|peer| rebon_tool::peer::peer_target_label(peer))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
                 error_code: Some(INVALID_INPUT_CODE),
             }),
         }
     }
 
-    /// `to: "session:<id>"`: resolve the id (or a unique prefix) and send the
-    /// message to that session.
+    /// The other sessions running on this machine, or `None` when this surface
+    /// has no messenger installed.
+    async fn list_peers(
+        &self,
+        session_id: Option<&str>,
+        context: &ToolContext,
+    ) -> ToolResult<Option<Vec<PeerInfo>>> {
+        let Some(messenger) = context.peer_messenger() else {
+            return Ok(None);
+        };
+        messenger
+            .list_peers(session_id)
+            .await
+            .map(Some)
+            .map_err(|message| ToolError::Presented {
+                tool: self.id(),
+                presentation: message_delivery_error(message),
+            })
+    }
+
+    /// `to: "session:<id>"` or `to: "@handle"`: resolve the recipient and send
+    /// the message to that session.
     async fn send_to_session(
         &self,
         parsed: SendMessageInput,
         requested: &str,
         context: &ToolContext,
     ) -> ToolResult<Value> {
-        let messenger = messenger_or_unavailable(self.id(), context)?;
-        if requested.is_empty() {
+        messenger_or_unavailable(self.id(), context)?;
+        if rebon_tool::peer::strip_handle_sigil(requested)
+            .trim()
+            .is_empty()
+        {
             return Err(ToolError::InvalidInput {
                 tool: self.id(),
-                reason: "`session:` needs a session id (use ListPeers to find one)".into(),
+                reason: "`session:` needs a session id, and `@` needs a handle (use ListPeers to find one)".into(),
                 error_code: Some(INVALID_INPUT_CODE),
             });
         }
         let session_id = own_session_id(context);
         if let Some(own) = session_id {
-            let names_own_session = requested == own
-                || (requested.len() >= MIN_SESSION_PREFIX_CHARS && own.starts_with(requested));
+            let names_own_session = rebon_tool::peer::strip_handle_sigil(requested).trim() == own
+                || (requested.len() >= rebon_tool::peer::MIN_SESSION_PREFIX_CHARS
+                    && own.starts_with(requested));
             if names_own_session {
                 return Err(ToolError::InvalidInput {
                     tool: self.id(),
@@ -739,28 +753,29 @@ impl SendMessageTool {
                 });
             }
         }
-        let peers =
-            messenger
-                .list_peers(session_id)
-                .await
-                .map_err(|message| ToolError::Presented {
-                    tool: self.id(),
-                    presentation: message_delivery_error(message),
-                })?;
-        let target_session_id = resolve_session_target(self.id(), &peers, requested)?;
-        self.deliver_to_session(&target_session_id, parsed.summary, parsed.payload, context)
+        let peers = self
+            .list_peers(session_id, context)
+            .await?
+            .unwrap_or_else(|| {
+                // `messenger_or_unavailable` above proved one is installed, so a
+                // messenger that lists nothing is a machine with nobody else on it.
+                Vec::new()
+            });
+        let target = resolve_peer_target(self.id(), &peers, requested)?.clone();
+        self.deliver_to_session(&target, parsed.summary, parsed.payload, context)
             .await
     }
 
     /// Build and send the envelope once the target session is known.
     async fn deliver_to_session(
         &self,
-        target_session_id: &str,
+        target: &PeerInfo,
         summary: Option<String>,
         payload: MessagePayload,
         context: &ToolContext,
     ) -> ToolResult<Value> {
         let messenger = messenger_or_unavailable(self.id(), context)?;
+        let target_session_id = target.session_id.as_str();
         if let Some(own) = own_session_id(context) {
             if own == target_session_id {
                 return Err(ToolError::InvalidInput {
@@ -1137,6 +1152,7 @@ mod tests {
     fn peer_info(session_id: &str, name: Option<&str>) -> PeerInfo {
         PeerInfo {
             session_id: session_id.into(),
+            handle: None,
             name: name.map(str::to_string),
             cwd: "C:/work/peer".into(),
             kind: "hosted".into(),
@@ -2125,6 +2141,147 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("session:peer-one"), "{text}");
         assert!(text.contains("session:peer-two"), "{text}");
+    }
+
+    fn peer_with_handle(session_id: &str, handle: &str, name: Option<&str>) -> PeerInfo {
+        PeerInfo {
+            handle: Some(handle.into()),
+            ..peer_info(session_id, name)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_at_handle_addresses_a_peer_without_a_team() {
+        let messenger = Arc::new(ScriptedPeerMessenger::new(
+            vec![peer_with_handle(
+                "abcde-fghij-klmno-pqrst",
+                "repo-qrst",
+                None,
+            )],
+            PeerDelivery::StartedTurn,
+        ));
+        let context = context_with_messenger(messenger.clone(), "caller-session");
+        let output = SendMessageTool
+            .call(json!({ "to": "@repo-qrst", "message": "hello" }), &context)
+            .await
+            .unwrap();
+
+        assert_eq!(output["mode"], json!("session"));
+        assert_eq!(
+            output["target"],
+            json!("session:abcde-fghij-klmno-pqrst"),
+            "{output}"
+        );
+        assert_eq!(
+            messenger.sent.lock().unwrap()[0].0,
+            "abcde-fghij-klmno-pqrst"
+        );
+    }
+
+    /// A teammate and a session may share a name. `@handle` is the caller saying
+    /// which one it meant, so it must not reach the teammate path at all.
+    #[tokio::test]
+    async fn an_at_handle_never_touches_the_teammate_lookup() {
+        let _home =
+            rebon_tool::tasks::test_support::TestConfigHome::new("sm-at_handle_never_touches");
+        clear_current_team_name();
+        let manager = Arc::new(ScriptedTeamManager {
+            sent: Mutex::new(Vec::new()),
+            task_messages: Mutex::new(Vec::new()),
+            shutdowns: Mutex::new(Vec::new()),
+            roster: Vec::new(),
+        });
+        let messenger = Arc::new(ScriptedPeerMessenger::new(
+            vec![peer_with_handle(
+                "abcde-fghij-klmno-pqrst",
+                "repo-qrst",
+                Some("bob"),
+            )],
+            PeerDelivery::Injected,
+        ));
+        let context = ToolContext::new()
+            .with_session_id("caller-session")
+            .with_team_manager(manager.clone() as Arc<dyn TeamManager>)
+            .with_team_identity(rebon_tool::TeamIdentityContext {
+                agent_id: "alice@alpha".into(),
+                agent_name: "alice".into(),
+                team_name: "alpha".into(),
+                permission_mode: Some("default".into()),
+            })
+            .with_peer_messenger(messenger.clone() as Arc<dyn PeerMessenger>);
+
+        SendMessageTool
+            .call(
+                json!({ "to": "@repo-qrst", "message": "hello from the tool" }),
+                &context,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            manager.sent.lock().unwrap().is_empty(),
+            "the teammate path ran"
+        );
+        assert_eq!(messenger.sent.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_session_target_still_accepts_an_id_when_handles_exist() {
+        let messenger = Arc::new(ScriptedPeerMessenger::new(
+            vec![peer_with_handle(
+                "abcde-fghij-klmno-pqrst",
+                "repo-qrst",
+                None,
+            )],
+            PeerDelivery::Injected,
+        ));
+        let context = context_with_messenger(messenger.clone(), "caller-session");
+        let output = SendMessageTool
+            .call(
+                json!({ "to": "session:abcde-fghij-klmno-p", "message": "hello" }),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output["target"], json!("session:abcde-fghij-klmno-pqrst"));
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_handle_lists_the_handle_candidates() {
+        let messenger = Arc::new(ScriptedPeerMessenger::new(
+            vec![
+                peer_with_handle("abcde-one", "repo-one", None),
+                peer_with_handle("abcde-two", "repo-only", None),
+            ],
+            PeerDelivery::Injected,
+        ));
+        let context = context_with_messenger(messenger, "caller-session");
+        let error = SendMessageTool
+            .call(json!({ "to": "@repo-o", "message": "hello" }), &context)
+            .await
+            .unwrap_err();
+
+        let text = error.to_string();
+        assert!(text.contains("@repo-one"), "{text}");
+        assert!(text.contains("@repo-only"), "{text}");
+        assert!(text.contains("ambiguous"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_handle_says_which_tool_lists_the_sessions() {
+        let messenger = Arc::new(ScriptedPeerMessenger::new(
+            Vec::new(),
+            PeerDelivery::Injected,
+        ));
+        let context = context_with_messenger(messenger, "caller-session");
+        let error = SendMessageTool
+            .call(json!({ "to": "@ghost-qrst", "message": "hello" }), &context)
+            .await
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("does not match a running session"), "{text}");
+        assert!(text.contains("at least 6 characters"), "{text}");
+        assert!(text.contains("ListPeers"), "{text}");
     }
 
     #[tokio::test]

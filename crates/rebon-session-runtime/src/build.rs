@@ -747,6 +747,20 @@ fn bind_session_record(
         };
         (record.id, Vec::new(), None, active_lock)
     };
+    // The owner names the session, and this build holds the lock, so this is
+    // where a session made before handles existed gets one. A mirror holds no
+    // lock and writes nothing: the name belongs to whoever does.
+    if session_active_lock.is_some() {
+        if let Err(error) = rebon_session::ensure_session_handle(&projects_root(), &cwd, &session_id)
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                cwd = %cwd,
+                %error,
+                "rebon: could not claim a handle for this session"
+            );
+        }
+    }
     Ok(SessionRecordBinding {
         session_id,
         loaded_transcript,

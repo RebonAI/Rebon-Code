@@ -45,6 +45,11 @@ pub enum PeerKind {
 #[serde(rename_all = "camelCase")]
 pub struct PeerSession {
     pub session_id: String,
+    /// The short, typeable name the session's owner claimed for it, read from
+    /// its metadata sidecar. Absent until that owner has published a status
+    /// since handles existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub cwd: String,
@@ -165,6 +170,7 @@ impl PeerDirectory {
         let name = job.name().trim();
         Some(PeerSession {
             session_id: session_id.to_string(),
+            handle: rebon_session::load_session_handle(&self.projects_root, job.cwd(), session_id),
             name: (!name.is_empty()).then(|| name.to_string()),
             cwd: job.cwd().to_string(),
             kind: PeerKind::Hosted,
@@ -202,6 +208,11 @@ impl PeerDirectory {
         }
         let reachable = foreground_agent_reachable(&status);
         Some(PeerSession {
+            handle: rebon_session::load_session_handle(
+                &self.projects_root,
+                &status.cwd,
+                &status.session_id,
+            ),
             name: rebon_session::load_session_title(
                 &self.projects_root,
                 &status.cwd,
@@ -342,6 +353,33 @@ mod tests {
         assert!(peer.reachable);
         assert_eq!(peer.job_id.as_deref(), Some(job_id.as_str()));
         assert_eq!(peer.terminal_id, None);
+        // No sidecar, no handle: discovery only ever reads one.
+        assert_eq!(peer.handle, None);
+    }
+
+    /// The handle is the owner's, read from the metadata sidecar its session
+    /// writes; discovery claims nothing of its own.
+    #[test]
+    fn a_peer_reports_the_handle_its_owner_claimed() {
+        let (_dir, store, projects_root) = store_and_projects();
+        host_job(&store, "abcde-fghij-klmno-pqrst", "F:/work/hosted");
+        rebon_session::ensure_session_handle(
+            &projects_root,
+            "F:/work/hosted",
+            "abcde-fghij-klmno-pqrst",
+        )
+        .expect("the handle is claimed");
+        let _lock = rebon_session::try_acquire_session_active_lock(
+            &projects_root,
+            "F:/work/hosted",
+            "abcde-fghij-klmno-pqrst",
+        )
+        .expect("the lock probe works")
+        .expect("the session lock is free");
+
+        let peers = PeerDirectory::new(store, &projects_root).list();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].handle.as_deref(), Some("hosted-qrst"));
     }
 
     /// A job record with a status of Running but nobody holding the lock is

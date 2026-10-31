@@ -94,6 +94,7 @@ fn envelope(message: PeerMessage) -> Result<AgentMessageEnvelope, String> {
 fn peer_info(peer: PeerSession) -> PeerInfo {
     PeerInfo {
         session_id: peer.session_id,
+        handle: peer.handle,
         name: peer.name,
         cwd: peer.cwd,
         kind: match peer.kind {

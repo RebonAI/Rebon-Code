@@ -218,6 +218,8 @@ pub mod mcp;
 pub mod monitor;
 pub mod multi_edit;
 pub mod output_truncation;
+/// Naming a peer session: handles, ids and names, resolved once.
+pub mod peer;
 #[cfg(windows)]
 pub(crate) mod path_lookup;
 pub mod path_scope;
@@ -660,6 +662,10 @@ pub trait TaskRuntimeController: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInfo {
     pub session_id: String,
+    /// The short, typeable name this session goes by (`<project>-<id tail>`),
+    /// when its owner has claimed one. Absent for a session whose owner has not
+    /// published a status since handles existed.
+    pub handle: Option<String>,
     pub name: Option<String>,
     pub cwd: String,
     /// `"hosted"` or `"foreground"`.
