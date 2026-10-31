@@ -4437,9 +4437,10 @@ fn agent_message_envelope(message_id: &str, text: &str) -> crate::AgentMessageEn
     }
 }
 
-/// A message appended for a session whose worker is gone must wait in the
-/// durable queue: nothing here may start a worker, because a message is not a
-/// turn somebody asked for.
+/// A message appended for a session whose worker is gone is judged against
+/// the wake bounds the record keeps and, within them, queues the job. Starting
+/// a supervisor is the caller's choice (an executable); without one, nothing is
+/// spawned here.
 #[test]
 fn an_agent_message_is_queued_without_starting_a_worker() {
     let (_dir, store) = store();
@@ -4452,7 +4453,9 @@ fn an_agent_message_is_queued_without_starting_a_worker() {
     store.write_state(&state).unwrap();
 
     let envelope = agent_message_envelope("m-store", "check the build");
-    let acceptance = append_agent_message_to_background_job(&store, &job_id, &envelope).unwrap();
+    let acceptance =
+        append_agent_message_to_background_job(&store, &job_id, &envelope, None).unwrap();
+    let acceptance = acceptance.acceptance;
     assert!(acceptance.appended);
     assert_eq!(acceptance.prompt.id, "m-store");
     assert_eq!(
@@ -4475,16 +4478,18 @@ fn an_agent_message_is_queued_without_starting_a_worker() {
     );
 
     let reloaded = store.read_state(&job_id).unwrap();
-    // Nothing here can judge the message against the session's wake bounds,
-    // so it does not move the job; it waits for whoever runs the session next.
-    assert_eq!(reloaded.process.status, BackgroundJobStatus::Idle);
+    // Within the wake bounds the record keeps, the message queues the job; with
+    // no executable given, nothing is spawned here.
+    assert_eq!(reloaded.process.status, BackgroundJobStatus::Queued);
     assert_eq!(reloaded.identity.pending_prompts.len(), 1);
     assert_eq!(
         reloaded.identity.pending_prompts[0].origin,
         acceptance.prompt.origin
     );
 
-    let duplicate = append_agent_message_to_background_job(&store, &job_id, &envelope).unwrap();
+    let duplicate = append_agent_message_to_background_job(&store, &job_id, &envelope, None)
+        .unwrap()
+        .acceptance;
     assert!(!duplicate.appended, "the same message id is delivered once");
     assert_eq!(duplicate.queue_depth, 1);
 }
@@ -4507,8 +4512,9 @@ fn agent_messages_cannot_fill_the_queue_a_person_types_into() {
     for index in 0..MAX_PENDING_AGENT_MESSAGES {
         let envelope = agent_message_envelope(&format!("m-share-{index}"), "one more");
         assert!(
-            append_agent_message_to_background_job(&store, &job_id, &envelope)
+            append_agent_message_to_background_job(&store, &job_id, &envelope, None)
                 .unwrap()
+                .acceptance
                 .appended
         );
     }
@@ -4517,6 +4523,7 @@ fn agent_messages_cannot_fill_the_queue_a_person_types_into() {
         &store,
         &job_id,
         &agent_message_envelope("m-share-over", "one too many"),
+        None,
     )
     .unwrap_err()
     .to_string();
@@ -4557,7 +4564,7 @@ fn agent_messages_a_running_turn_already_took_leave_room_for_more() {
     store.write_state(&state).unwrap();
     for index in 0..MAX_PENDING_AGENT_MESSAGES {
         let envelope = agent_message_envelope(&format!("m-read-{index}"), "read already");
-        append_agent_message_to_background_job(&store, &job_id, &envelope).unwrap();
+        append_agent_message_to_background_job(&store, &job_id, &envelope, None).unwrap();
     }
     store
         .update_state(&job_id, |state| {
@@ -4572,9 +4579,11 @@ fn agent_messages_a_running_turn_already_took_leave_room_for_more() {
         append_agent_message_to_background_job(
             &store,
             &job_id,
-            &agent_message_envelope("m-after-reads", "one more")
+            &agent_message_envelope("m-after-reads", "one more"),
+            None
         )
         .unwrap()
+        .acceptance
         .appended,
         "the messages the turn took leave room"
     );
@@ -4597,7 +4606,7 @@ fn agent_messages_never_take_the_slots_kept_for_prompts() {
     let room_for_messages = MAX_PENDING_PROMPTS - PENDING_PROMPT_SLOTS_KEPT_FROM_AGENT_MESSAGES;
     for index in 0..room_for_messages {
         let envelope = agent_message_envelope(&format!("m-long-{index}"), "while you work");
-        append_agent_message_to_background_job(&store, &job_id, &envelope).unwrap();
+        append_agent_message_to_background_job(&store, &job_id, &envelope, None).unwrap();
         // The running turn reads each as it comes, so none waits unread.
         store
             .update_state(&job_id, |state| {
@@ -4613,6 +4622,7 @@ fn agent_messages_never_take_the_slots_kept_for_prompts() {
         &store,
         &job_id,
         &agent_message_envelope("m-into-reserve", "one more"),
+        None,
     )
     .unwrap_err()
     .to_string();
@@ -4832,5 +4842,47 @@ fn writing_the_roster_sweeps_only_old_roster_temp_files() {
     assert!(
         unrelated_tmp.exists(),
         "another atomic writer's temp file is not ours to delete"
+    );
+}
+
+/// The paths that queue a job to run its own prompt say so in the record, and
+/// the flag is written only when set: a new job owes its first prompt, a rerun
+/// owes it again, and a record without the flag reads as not owing it by name.
+#[test]
+fn the_record_says_when_the_jobs_own_prompt_is_owed() {
+    let (_dir, store) = store();
+    let created = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    assert!(
+        created.identity.prompt_owed,
+        "a new job owes its first prompt"
+    );
+    let raw: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(store.state_path(&created.identity.job_id)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(raw["promptOwed"], serde_json::json!(true));
+
+    store
+        .update_state(&created.identity.job_id, |state| {
+            state.identity.prompt_owed = false;
+            state.process.status = BackgroundJobStatus::Succeeded;
+            state.process.started_at_ms = Some(1);
+            Ok(())
+        })
+        .unwrap();
+    let raw: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(store.state_path(&created.identity.job_id)).unwrap(),
+    )
+    .unwrap();
+    assert!(raw.get("promptOwed").is_none(), "not written when false");
+
+    queue_background_job_in_store(&store, &created.identity.job_id, false, &rebon_exe()).unwrap();
+    let requeued = store.read_state(&created.identity.job_id).unwrap();
+    assert_eq!(requeued.process.status, BackgroundJobStatus::Queued);
+    assert!(
+        requeued.identity.prompt_owed,
+        "a rerun owes its prompt again"
     );
 }

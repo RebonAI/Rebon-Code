@@ -161,6 +161,8 @@ fn fully_populated_job() -> BackgroundJobState {
             queue_session: true,
             pinned: true,
             sort_order: -3,
+            prompt_owed: false,
+            agent_wakes: Default::default(),
         },
         process: ProcessOwnership {
             status: BackgroundJobStatus::NeedsInput,
@@ -306,6 +308,8 @@ fn minimal_job() -> BackgroundJobState {
             queue_session: false,
             pinned: false,
             sort_order: 0,
+            prompt_owed: false,
+            agent_wakes: Default::default(),
         },
         process: ProcessOwnership {
             status: BackgroundJobStatus::Queued,

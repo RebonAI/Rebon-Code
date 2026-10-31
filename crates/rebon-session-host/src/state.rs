@@ -169,6 +169,28 @@ impl PendingPrompt {
         })
     }
 
+    /// The queue entry for a message another session sent: its frame, keyed
+    /// by the message's own id, with who sent it and how deep it came.
+    pub fn from_agent_message(
+        envelope: &crate::AgentMessageEnvelope,
+        queued_at_ms: u64,
+    ) -> anyhow::Result<Self> {
+        let mut prompt = Self::new(
+            envelope.message_id.clone(),
+            crate::frame_agent_message(envelope),
+            Vec::new(),
+            queued_at_ms,
+        )?;
+        prompt.origin = Some(PendingPromptOrigin::AgentMessage {
+            from_session_id: envelope.from_session_id.clone(),
+            from_agent: envelope.from_agent.clone(),
+            from_handle: envelope.from_handle.clone(),
+            from_name: envelope.from_name.clone(),
+            hops: envelope.hops,
+        });
+        Ok(prompt)
+    }
+
     /// Whether this prompt is a message another agent sent.
     ///
     /// The poller and the turn builder both branch on this: agent text reaches
@@ -192,6 +214,13 @@ impl PendingPrompt {
     pub fn may_lead_turn(&self) -> bool {
         !self.is_agent_message() || self.wake == rebon_tool::peer::WakeVerdict::Admitted
     }
+}
+
+/// Where a message from another session landed in a job's queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMessageReception {
+    pub acceptance: PendingPromptAcceptance,
+    pub delivery: AgentMessageDelivery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -513,6 +542,29 @@ pub struct JobIdentityIntent {
     pub pinned: bool,
     #[serde(default)]
     pub sort_order: i64,
+    /// Whether the job's own `prompt` is owed a turn: set by every path that
+    /// queues the job to run it — creating it, `/bg` with a final prompt, a
+    /// rerun — and cleared by the claim that takes the job up, whatever that
+    /// claim runs.
+    ///
+    /// Written down rather than read off "queued with nothing to run", because
+    /// messages from other sessions can sit in the queue of a job that owes its
+    /// prompt and of one that owes nothing alike. Not written when false, so a
+    /// record from before the field reads as false and
+    /// [`BackgroundJobState::owes_its_prompt`] decides it from what such a
+    /// record can show.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub prompt_owed: bool,
+    /// When messages from other sessions started turns here, per sender,
+    /// within the wake bounds' hour (see
+    /// [`rebon_tool::peer::AGENT_MESSAGE_WAKES_PER_HOUR`]).
+    ///
+    /// Kept in the record, not in the worker's memory: a worker that exits
+    /// and the next one that starts — and a sender writing while no worker
+    /// runs at all — must count the same hour, or every new process would be
+    /// a fresh budget. Pruned as it is consulted; not written when empty.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub agent_wakes: std::collections::BTreeMap<String, Vec<u64>>,
 }
 
 /// Who is running this job right now, and how to reach them.
@@ -1115,6 +1167,9 @@ impl BackgroundJobState {
                 queue_session: false,
                 pinned: false,
                 sort_order: now as i64,
+                // A new job is created to run its prompt.
+                prompt_owed: true,
+                agent_wakes: std::collections::BTreeMap::new(),
             },
             process: ProcessOwnership {
                 status: BackgroundJobStatus::Queued,
@@ -1395,6 +1450,198 @@ impl BackgroundJobState {
             prompt.claimed_turn_generation = None;
             prompt.completed_turn_generation = None;
         }
+    }
+
+    /// Whether a claim that finds nothing in the queue that may lead a turn
+    /// runs the job's own prompt.
+    ///
+    /// The paths that queue the job for its prompt say so in `prompt_owed`.
+    /// A record from before that flag existed cannot, so it is read the way
+    /// the old record can show it: a job that never started owes its first
+    /// prompt, and a job queued with an empty queue was queued for its prompt
+    /// (what every older build ran for it). A job that did start and whose
+    /// queue holds only messages from other sessions was queued for those
+    /// messages — an older build woke a session that way — and its prompt,
+    /// long since answered, is not run again: the claim warms the session up
+    /// instead and the messages are judged when the warm-up ends.
+    pub fn owes_its_prompt(&self) -> bool {
+        self.identity.prompt_owed
+            || self.identity.pending_prompts.is_empty()
+            || self.process.started_at_ms.is_none()
+    }
+
+    /// Whether a worker parked on this job has a turn to start: a follow-up
+    /// to run, or the job's prompt, owed by name.
+    pub fn has_turn_to_run(&self) -> bool {
+        self.identity.prompt_owed || self.has_pending_prompts_to_run()
+    }
+
+    /// Judge whether the message from another session at `index` may start a
+    /// turn here, against this session's wake bounds as the record keeps
+    /// them, and write the verdict on the message.
+    ///
+    /// Spends a wake when it admits. The record's hour is pruned on the way,
+    /// so a sender that stopped writing is forgotten once its wakes age out.
+    pub fn judge_agent_message_wake(
+        &mut self,
+        index: usize,
+        now_ms: u64,
+    ) -> rebon_tool::peer::WakeVerdict {
+        let Some(PendingPromptOrigin::AgentMessage {
+            from_session_id,
+            hops,
+            ..
+        }) = self.identity.pending_prompts[index].origin.clone()
+        else {
+            return rebon_tool::peer::WakeVerdict::Admitted;
+        };
+        self.identity
+            .agent_wakes
+            .retain(|_, wakes| rebon_tool::peer::wakes_still_count(wakes, now_ms));
+        let verdict = rebon_tool::peer::judge_wake_in(
+            self.identity
+                .agent_wakes
+                .entry(from_session_id.clone())
+                .or_default(),
+            &from_session_id,
+            hops,
+            now_ms,
+        );
+        self.identity
+            .agent_wakes
+            .retain(|_, wakes| !wakes.is_empty());
+        self.identity.pending_prompts[index].wake = verdict;
+        verdict
+    }
+
+    /// Take a message another session sent into this job, deciding where it
+    /// lands and whether it starts a turn — the one decision, whichever way
+    /// the message came: over the owner's endpoint, or written into the record
+    /// with no live owner to take it.
+    ///
+    /// A message that would be the reason for a turn — the job is parked, not
+    /// warming up, and not holding a failed prompt for a retry — is judged
+    /// against the wake bounds; admitted, it queues the job, and only then is
+    /// the job's last result cleared, because a turn is about to replace it.
+    /// Anything else is appended unjudged and changes nothing: it joins a
+    /// running turn, rides into one already owed, or waits to be judged when
+    /// the session runs next. A refused message from a sender that already has
+    /// [`MAX_WAITING_REFUSED_MESSAGES_PER_SENDER`] refused messages waiting is
+    /// not taken at all, so one peer past its bounds cannot crowd out the rest.
+    pub fn receive_agent_message(
+        &mut self,
+        prompt: PendingPrompt,
+        now_ms: u64,
+    ) -> anyhow::Result<AgentMessageReception> {
+        let status = self.process.status;
+        let warming = self.identity.resume_only;
+        let running = matches!(
+            status,
+            BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput
+        ) && !warming;
+        let parked = matches!(
+            status,
+            BackgroundJobStatus::Idle
+                | BackgroundJobStatus::Succeeded
+                | BackgroundJobStatus::Failed
+        ) && !self.head_awaits_retry();
+        let sender = match prompt.origin.as_ref() {
+            Some(PendingPromptOrigin::AgentMessage {
+                from_session_id, ..
+            }) => from_session_id.clone(),
+            _ => anyhow::bail!(
+                "pending prompt {} is not another session's message",
+                prompt.id
+            ),
+        };
+        let acceptance = self.append_pending_prompt(prompt)?;
+        let unchanged = |acceptance| AgentMessageReception {
+            acceptance,
+            delivery: if running {
+                AgentMessageDelivery::Injected
+            } else {
+                AgentMessageDelivery::Queued
+            },
+        };
+        if !acceptance.appended {
+            return Ok(unchanged(acceptance));
+        }
+        let index = self.identity.pending_prompts.len() - 1;
+        let verdict = if parked {
+            self.judge_agent_message_wake(index, now_ms)
+        } else {
+            rebon_tool::peer::WakeVerdict::Unjudged
+        };
+        if verdict == rebon_tool::peer::WakeVerdict::Refused
+            && self.waiting_refused_messages_from(&sender) > MAX_WAITING_REFUSED_MESSAGES_PER_SENDER
+        {
+            self.identity.pending_prompts.pop();
+            anyhow::bail!(
+                "message refused: background job {} already holds {} messages from session {} \
+                 that may not start a turn of their own; this one was not queued",
+                self.identity.job_id,
+                MAX_WAITING_REFUSED_MESSAGES_PER_SENDER,
+                sender
+            );
+        }
+        self.outcome.summary_updated_at_ms = None;
+        self.process.updated_at_ms = now_ms;
+        if verdict != rebon_tool::peer::WakeVerdict::Admitted {
+            return Ok(unchanged(acceptance));
+        }
+        // A parked worker — or the supervisor — is woken by the status change
+        // this write makes.
+        self.process.status = BackgroundJobStatus::Queued;
+        self.outcome.pending_permission = None;
+        self.outcome.summary = None;
+        self.process.completed_at_ms = None;
+        self.outcome.exit_code = None;
+        self.outcome.error = None;
+        Ok(AgentMessageReception {
+            acceptance,
+            delivery: AgentMessageDelivery::StartedNewTurn,
+        })
+    }
+
+    /// How many of `sender`'s messages wait unread with a refused wake.
+    fn waiting_refused_messages_from(&self, sender: &str) -> usize {
+        self.identity
+            .pending_prompts
+            .iter()
+            .filter(|prompt| {
+                prompt.claimed_turn_generation.is_none()
+                    && prompt.wake == rebon_tool::peer::WakeVerdict::Refused
+                    && matches!(
+                        prompt.origin.as_ref(),
+                        Some(PendingPromptOrigin::AgentMessage { from_session_id, .. })
+                            if from_session_id == sender
+                    )
+            })
+            .count()
+    }
+
+    /// Cancel or stop the work the queue was owed: drop every prompt somebody
+    /// asked to run and every prompt the cancelled turn already took, and
+    /// return them.
+    ///
+    /// Messages from other sessions still waiting unread stay, unclaimed —
+    /// their senders were told they arrived — but none of them may start a
+    /// turn any more: the person stopped the session, and a message must not
+    /// restart it behind their back. They ride with the next turn the person
+    /// starts. One the bounds had admitted keeps the wake it was charged and is
+    /// not charged again; one nobody judged is not judged now.
+    pub fn cancel_pending_prompts(&mut self) -> Vec<PendingPrompt> {
+        let (kept, dropped): (Vec<_>, Vec<_>) = std::mem::take(&mut self.identity.pending_prompts)
+            .into_iter()
+            .partition(|prompt| {
+                prompt.is_agent_message() && prompt.claimed_turn_generation.is_none()
+            });
+        self.identity.pending_prompts = kept;
+        for prompt in &mut self.identity.pending_prompts {
+            prompt.completed_turn_generation = None;
+            prompt.wake = rebon_tool::peer::WakeVerdict::Refused;
+        }
+        dropped
     }
 
     /// Whether the head of the queue is a prompt a turn already took up and

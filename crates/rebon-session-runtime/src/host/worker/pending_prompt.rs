@@ -42,14 +42,15 @@ pub(crate) fn parent_published_this_worker(
 /// on the session file (os error 33).
 ///
 /// The turn is claimed for the first waiting prompt that may lead one (see
-/// [`lead_with_ready_prompt`]). With none, it is the job's own prompt's turn:
-/// every path that queues a job without a prompt to run queues it for that —
-/// a new job, `/bg` with a final prompt, a rerun — and messages from other
-/// sessions that arrived meanwhile ride along in it. They are not judged here:
-/// judging is for a message that would be the reason for a turn, and this
-/// turn's reason is the job's prompt. A head an earlier turn was claimed for is
-/// taken up again when it may lead, which is what lets a resumed turn find its
-/// durable row instead of writing a second one.
+/// [`lead_with_ready_prompt`]). With none, it is the job's own prompt's turn
+/// when the job owes it one ([`BackgroundJobState::owes_its_prompt`]) — a new
+/// job, `/bg` with a final prompt, a rerun — and messages from other sessions
+/// that arrived meanwhile ride along in it, unjudged: the turn's reason is the
+/// job's prompt. With neither, the claim is a warm-up: nothing is run, and what
+/// waits is decided when the warm-up ends, never by re-running a prompt that
+/// was answered long ago. A head an earlier turn was claimed for is taken up
+/// again when it may lead, which is what lets a resumed turn find its durable
+/// row instead of writing a second one.
 pub(crate) fn claim_background_job(
     store: &BackgroundStore,
     job_id: &str,
@@ -130,6 +131,14 @@ pub(crate) fn claim_background_job(
         // A warm-up reads no prompt; whatever waits is decided when it ends.
         let warm_up = current.identity.resume_only;
         let leads_with_pending = !warm_up && lead_with_ready_prompt(current);
+        if !warm_up && !leads_with_pending && !current.owes_its_prompt() {
+            // Nothing may lead and the job's prompt is not owed — a record an
+            // older build queued for messages alone: warm up instead.
+            current.identity.resume_only = true;
+        }
+        // Whatever this claim runs, the job's own prompt is no longer owed:
+        // it runs now, or a pending prompt ran in its place, or there is none.
+        current.identity.prompt_owed = false;
         let next_generation = current_owner.turn_generation.wrapping_add(1).max(1);
         current.set_recorded_owner(RecordedOwnerSnapshot::owned(
             my_pid,
@@ -219,7 +228,7 @@ fn first_unclaimed(state: &BackgroundJobState) -> usize {
 
 /// Judge the messages from other sessions nobody judged yet, from `start` in
 /// arrival order, until the bounds admit one; its index, if any. Each verdict
-/// is kept on the message.
+/// is kept on the message, and the bounds are the ones the record keeps.
 fn admit_a_waiting_agent_message(
     state: &mut BackgroundJobState,
     start: usize,
@@ -230,40 +239,12 @@ fn admit_a_waiting_agent_message(
         if !prompt.is_agent_message() || !prompt.wake.is_unjudged() {
             continue;
         }
-        let verdict = judge_agent_prompt_wake(state, prompt, now_ms);
-        state.identity.pending_prompts[index].wake = verdict;
-        if verdict == rebon_tool::peer::WakeVerdict::Admitted {
+        if state.judge_agent_message_wake(index, now_ms) == rebon_tool::peer::WakeVerdict::Admitted
+        {
             return Some(index);
         }
     }
     None
-}
-
-/// Whether another session's message may start a turn here, judged by this
-/// session's own bounds and spending a wake if it may.
-///
-/// A job with no session yet has no bounds to apply.
-pub(crate) fn judge_agent_prompt_wake(
-    state: &BackgroundJobState,
-    prompt: &PendingPrompt,
-    now_ms: u64,
-) -> rebon_tool::peer::WakeVerdict {
-    let Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
-        from_session_id,
-        hops,
-        ..
-    }) = prompt.origin.as_ref()
-    else {
-        return rebon_tool::peer::WakeVerdict::Admitted;
-    };
-    match state.identity.session_id.as_deref() {
-        Some(session_id) => rebon_tool::peer::session_reply_ledger(session_id).judge_wake(
-            from_session_id,
-            *hops,
-            now_ms,
-        ),
-        None => rebon_tool::peer::WakeVerdict::Admitted,
-    }
 }
 
 /// The uuid of the transcript row a claimed prompt opens its turn with.

@@ -2567,13 +2567,15 @@ fn handle_cancel_request(
                 );
                 let had_pending_permission = state.outcome.pending_permission.take().is_some();
                 if cancelled_turn {
-                    cancelled_prompts = state.identity.pending_prompts.clone();
                     running_generation = matches!(
                         state.process.status,
                         BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput
                     )
                     .then_some(state.process.turn_generation);
-                    state.clear_pending_prompts();
+                    // Messages from other sessions still waiting unread stay
+                    // queued — their senders were told they arrived — but may
+                    // not start a turn after the person stopped this one.
+                    cancelled_prompts = state.cancel_pending_prompts();
                     state.process.status = BackgroundJobStatus::Idle;
                     state.outcome.summary = Some("turn cancelled".to_string());
                     state.outcome.summary_updated_at_ms = None;

@@ -240,38 +240,24 @@ impl AgentReplyLedger {
     /// Records the wake when it is allowed, so the caller does not have to
     /// remember to.
     pub fn admit_wake(&self, from_session_id: &str, hops: u8, now_ms: u64) -> WakeAdmission {
-        if hops > MAX_AGENT_MESSAGE_HOPS {
-            return WakeAdmission::TooManyHops { hops };
-        }
         let mut state = self.state.lock().expect("agent reply ledger poisoned");
-        let wakes = state.wakes.entry(from_session_id.to_string()).or_default();
-        wakes.retain(|started| now_ms.saturating_sub(*started) < WAKE_WINDOW_MS);
-        if wakes.len() >= AGENT_MESSAGE_WAKES_PER_HOUR {
-            return WakeAdmission::RateLimited {
-                window_ms: WAKE_WINDOW_MS,
-            };
-        }
-        wakes.push(now_ms);
-        WakeAdmission::Allowed
+        admit_wake_in(
+            state.wakes.entry(from_session_id.to_string()).or_default(),
+            hops,
+            now_ms,
+        )
     }
 
     /// Judge whether a received message may start a turn, spending a wake if
     /// it may.
-    ///
-    /// The one place a refusal is reported, so both halves of a session log the
-    /// same sentence for it.
     pub fn judge_wake(&self, from_session_id: &str, hops: u8, now_ms: u64) -> WakeVerdict {
-        let admission = self.admit_wake(from_session_id, hops, now_ms);
-        if admission.is_allowed() {
-            return WakeVerdict::Admitted;
-        }
-        tracing::info!(
-            from = %from_session_id,
+        let mut state = self.state.lock().expect("agent reply ledger poisoned");
+        judge_wake_in(
+            state.wakes.entry(from_session_id.to_string()).or_default(),
+            from_session_id,
             hops,
-            ?admission,
-            "rebon: a cross-session message will wait instead of starting a turn"
-        );
-        WakeVerdict::Refused
+            now_ms,
+        )
     }
 
     /// Turn `generation` is over; what it was answering no longer applies.
@@ -287,6 +273,59 @@ impl AgentReplyLedger {
         state.open = None;
         state.inbound = None;
     }
+}
+
+/// The wake bounds applied to one peer's record of the turns it started here,
+/// oldest first: the hop bound, then the sliding hour. Records the wake when it
+/// is allowed.
+///
+/// The one rule, whoever keeps the record: the ledger keeps it in memory for a
+/// session hosted in this process, and a hosted session keeps it in its job
+/// record, so a worker that exits and a new one that starts — or a sender
+/// writing to a session with no worker at all — count the same hour.
+pub fn admit_wake_in(wakes: &mut Vec<u64>, hops: u8, now_ms: u64) -> WakeAdmission {
+    if hops > MAX_AGENT_MESSAGE_HOPS {
+        return WakeAdmission::TooManyHops { hops };
+    }
+    wakes.retain(|started| now_ms.saturating_sub(*started) < WAKE_WINDOW_MS);
+    if wakes.len() >= AGENT_MESSAGE_WAKES_PER_HOUR {
+        return WakeAdmission::RateLimited {
+            window_ms: WAKE_WINDOW_MS,
+        };
+    }
+    wakes.push(now_ms);
+    WakeAdmission::Allowed
+}
+
+/// [`admit_wake_in`] as a verdict, reporting a refusal.
+///
+/// The one place a refusal is reported, so every half of a session logs the
+/// same sentence for it.
+pub fn judge_wake_in(
+    wakes: &mut Vec<u64>,
+    from_session_id: &str,
+    hops: u8,
+    now_ms: u64,
+) -> WakeVerdict {
+    let admission = admit_wake_in(wakes, hops, now_ms);
+    if admission.is_allowed() {
+        return WakeVerdict::Admitted;
+    }
+    tracing::info!(
+        from = %from_session_id,
+        hops,
+        ?admission,
+        "rebon: a cross-session message will wait instead of starting a turn"
+    );
+    WakeVerdict::Refused
+}
+
+/// Whether a peer's record of turn starts still counts against the hour at
+/// `now_ms`; a record with nothing left in the window can be forgotten.
+pub fn wakes_still_count(wakes: &[u64], now_ms: u64) -> bool {
+    wakes
+        .iter()
+        .any(|started| now_ms.saturating_sub(*started) < WAKE_WINDOW_MS)
 }
 
 /// The ledger one session records arrivals in, for the process that hosts it.
@@ -1060,6 +1099,30 @@ mod tests {
             );
         }
         assert_eq!(ledger.judge_wake("sess-a", 0, 1_000), WakeVerdict::Refused);
+    }
+
+    /// The bounds are the same rule wherever the record of turn starts is
+    /// kept — here a plain list, as a hosted session's job record keeps it —
+    /// and a record whose wakes have all left the hour no longer counts.
+    #[test]
+    fn a_kept_record_of_wakes_is_bounded_like_the_ledger() {
+        let mut wakes = Vec::new();
+        for _ in 0..AGENT_MESSAGE_WAKES_PER_HOUR {
+            assert_eq!(
+                judge_wake_in(&mut wakes, "sess-a", 0, 1_000),
+                WakeVerdict::Admitted
+            );
+        }
+        assert_eq!(
+            judge_wake_in(&mut wakes, "sess-a", 0, 1_000),
+            WakeVerdict::Refused
+        );
+        assert_eq!(
+            judge_wake_in(&mut Vec::new(), "sess-a", MAX_AGENT_MESSAGE_HOPS + 1, 1_000),
+            WakeVerdict::Refused
+        );
+        assert!(wakes_still_count(&wakes, 1_000 + WAKE_WINDOW_MS - 1));
+        assert!(!wakes_still_count(&wakes, 1_000 + WAKE_WINDOW_MS));
     }
 
     /// A ledger is per session: one session's depth is not another's.

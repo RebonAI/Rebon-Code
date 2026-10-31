@@ -219,6 +219,13 @@ pub const MAX_PENDING_AGENT_MESSAGES: usize = MAX_PENDING_PROMPTS / 2;
 /// either, and a typed prompt, a cron fire or a task's report always finds
 /// room.
 pub const PENDING_PROMPT_SLOTS_KEPT_FROM_AGENT_MESSAGES: usize = MAX_PENDING_PROMPTS / 4;
+/// How many messages one sender may have waiting with a refused wake.
+///
+/// A peer past its wake bounds keeps being accepted — its messages ride with
+/// the next turn somebody else starts — but without this it could fill the
+/// share every sender draws on. Past it, that sender's next refused message
+/// is not taken, and it is told so.
+pub const MAX_WAITING_REFUSED_MESSAGES_PER_SENDER: usize = 4;
 /// Upper bound on remembered coordinator report grants. One entry per
 /// worker report path; a long coordinator run stays bounded and drops
 /// its oldest grants first.

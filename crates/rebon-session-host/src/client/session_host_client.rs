@@ -535,12 +535,16 @@ impl SessionHostClient {
         job: &crate::BackgroundJobState,
         envelope: &crate::AgentMessageEnvelope,
     ) -> Result<crate::AgentMessageResult, HostCallError> {
-        let acceptance =
-            crate::append_agent_message_to_background_job(&self.store, job.job_id(), envelope)
-                .map_err(|err| HostCallError::Refused(err.to_string()))?;
+        let reception = crate::append_agent_message_to_background_job(
+            &self.store,
+            job.job_id(),
+            envelope,
+            Some(&self.worker_exe),
+        )
+        .map_err(|err| HostCallError::Refused(err.to_string()))?;
         Ok(crate::AgentMessageResult {
-            outcome: crate::AgentMessageDelivery::Queued,
-            duplicate: !acceptance.appended,
+            outcome: reception.delivery,
+            duplicate: !reception.acceptance.appended,
         })
     }
 }

@@ -752,11 +752,13 @@ fn message_job(
     job_id
 }
 
-/// A free session with a job record has no worker to hand the message to, so
-/// the message waits in the durable queue. It must not start a worker: a
-/// message is not a turn somebody asked for.
+/// A free session with a job record has no worker to hand the message to. The
+/// message is judged against the wake bounds the record keeps, as the owner
+/// would judge it: within them it queues the job and makes sure of a
+/// supervisor, so a worker comes up to answer — a hosted session can be woken
+/// by another session's message even after its worker left.
 #[test]
-fn an_agent_message_for_a_free_session_with_a_job_is_queued() {
+fn an_agent_message_for_a_free_session_with_a_job_wakes_it_within_the_bounds() {
     let dir = tempfile::Builder::new()
         .prefix("rebon-client-message-")
         .tempdir()
@@ -764,6 +766,7 @@ fn an_agent_message_for_a_free_session_with_a_job_is_queued() {
     let store = BackgroundStore::new(dir.path().join("store"));
     let projects = dir.path().join("projects");
     std::fs::create_dir_all(&projects).expect("projects root");
+    seed_live_supervisor(&store);
     let job_id = message_job(
         &store,
         "sess-message",
@@ -776,19 +779,18 @@ fn an_agent_message_for_a_free_session_with_a_job_is_queued() {
     assert_eq!(
         client.send_agent_message("sess-message", envelope.clone()),
         Ok(crate::AgentMessageResult {
-            outcome: crate::AgentMessageDelivery::Queued,
+            outcome: crate::AgentMessageDelivery::StartedNewTurn,
             duplicate: false,
         })
     );
 
     let reloaded = store.read_state(&job_id).expect("the job is still there");
-    // Nothing here can judge the message against the session's wake bounds,
-    // so it does not move the job; it waits for whoever runs the session next.
-    assert_eq!(reloaded.process.status, BackgroundJobStatus::Idle);
+    assert_eq!(reloaded.process.status, BackgroundJobStatus::Queued);
     assert_eq!(reloaded.identity.pending_prompts.len(), 1);
     let prompt = &reloaded.identity.pending_prompts[0];
     assert_eq!(prompt.id, "m-queue");
     assert_eq!(prompt.text, crate::frame_agent_message(&envelope));
+    assert_eq!(prompt.wake, rebon_tool::peer::WakeVerdict::Admitted);
     assert_eq!(
         prompt.origin,
         Some(crate::PendingPromptOrigin::AgentMessage {
@@ -799,10 +801,6 @@ fn an_agent_message_for_a_free_session_with_a_job_is_queued() {
             hops: 0,
         })
     );
-    assert!(
-        !store.roster_path().exists(),
-        "queueing a message must not publish a supervisor roster"
-    );
 
     assert_eq!(
         client.send_agent_message("sess-message", envelope),
@@ -811,6 +809,46 @@ fn an_agent_message_for_a_free_session_with_a_job_is_queued() {
             duplicate: true,
         }),
         "a retry is answered without a second delivery"
+    );
+}
+
+/// Past the bounds the message only joins the queue: the free session is not
+/// woken, no supervisor is asked for, and the job keeps its status.
+#[test]
+fn an_agent_message_for_a_free_session_past_the_bounds_waits() {
+    let dir = tempfile::Builder::new()
+        .prefix("rebon-client-message-")
+        .tempdir()
+        .expect("tempdir");
+    let store = BackgroundStore::new(dir.path().join("store"));
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects root");
+    let job_id = message_job(
+        &store,
+        "sess-message-deep",
+        "/work/message",
+        BackgroundJobStatus::Idle,
+    );
+    let client = SessionHostClient::new(store.clone(), &projects, rebon_exe());
+    let mut envelope = message_envelope("m-deep", "the fifth hand-off");
+    envelope.hops = rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1;
+
+    assert_eq!(
+        client.send_agent_message("sess-message-deep", envelope),
+        Ok(crate::AgentMessageResult {
+            outcome: crate::AgentMessageDelivery::Queued,
+            duplicate: false,
+        })
+    );
+    let reloaded = store.read_state(&job_id).expect("the job is still there");
+    assert_eq!(reloaded.process.status, BackgroundJobStatus::Idle);
+    assert_eq!(
+        reloaded.identity.pending_prompts[0].wake,
+        rebon_tool::peer::WakeVerdict::Refused
+    );
+    assert!(
+        !store.roster_path().exists(),
+        "a refused message asks for no supervisor"
     );
 }
 

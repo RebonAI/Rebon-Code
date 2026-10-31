@@ -1683,6 +1683,8 @@ pub fn mark_existing_background_session_queued_with_images(
         state.process.spawn_admitted = false;
         state.outcome.pending_permission = None;
         state.keep_only_waiting_messages();
+        // Without an identified prompt to queue, what runs is the job's own.
+        state.identity.prompt_owed = pending_prompt.is_none();
         if let Some(prompt) = pending_prompt.clone() {
             state.append_pending_prompt(prompt)?;
         }
@@ -1769,6 +1771,8 @@ pub fn adopt_existing_background_session(
         } else {
             BackgroundJobStatus::Idle
         };
+        // Queued, the adopted session runs the prompt it was handed with.
+        state.identity.prompt_owed = start_supervisor;
         state.process.updated_at_ms = now_ms();
         Ok(state.clone())
     })?;
@@ -1972,6 +1976,7 @@ pub fn mark_background_job_idle(store: &BackgroundStore, job_id: &str) -> anyhow
         state.process.spawn_admitted = false;
         state.outcome.pending_permission = None;
         state.keep_only_waiting_messages();
+        state.identity.prompt_owed = false;
         state.outcome.summary_updated_at_ms = None;
         state.process.updated_at_ms = now_ms();
         state.process.completed_at_ms = None;
@@ -2038,48 +2043,61 @@ fn append_background_pending_prompt(
     )
 }
 
-/// Append an agent message to a job's durable queue.
+/// Append an agent message to a job's durable queue, for a session with no
+/// live owner to hand it to.
 ///
-/// Only the queue changes. Written here, without a live owner, the message
-/// cannot be judged against the session's wake bounds, and only an admitted
-/// message may be the reason for a turn — so the job's status and its result
-/// stay as they are, and the message waits, unjudged, for whoever runs the
-/// session next: a running turn reads it, a turn somebody else starts carries
-/// it, and a worker that warms up for the session judges it when the warm-up
-/// ends. Nothing is spawned here either — a message is never used to
-/// resurrect a session whose worker is gone.
+/// The same decision the owner makes over its endpoint
+/// ([`BackgroundJobState::receive_agent_message`]), against the same wake
+/// bounds the record keeps: a parked session is woken only by a message the
+/// bounds admit — then the job is queued and, given an executable, a
+/// supervisor is made sure of, so a worker comes up to run the turn. A
+/// message refused, or one that joins a turn already running or owed, only
+/// changes the queue: the job keeps its status and its result, and the
+/// message waits for whoever runs the session next.
 pub fn append_agent_message_to_background_job(
     store: &BackgroundStore,
     job_id: &str,
     envelope: &crate::AgentMessageEnvelope,
-) -> anyhow::Result<PendingPromptAcceptance> {
+    start_supervisor: Option<&Path>,
+) -> anyhow::Result<AgentMessageReception> {
     let queued_at = now_ms();
-    let mut prompt = PendingPrompt::new(
-        envelope.message_id.clone(),
-        crate::frame_agent_message(envelope),
-        Vec::new(),
-        queued_at,
-    )?;
-    prompt.origin = Some(crate::PendingPromptOrigin::AgentMessage {
-        from_session_id: envelope.from_session_id.clone(),
-        from_agent: envelope.from_agent.clone(),
-        from_handle: envelope.from_handle.clone(),
-        from_name: envelope.from_name.clone(),
-        hops: envelope.hops,
-    });
-    append_pending_prompt_durably(
-        store,
-        job_id,
-        prompt,
-        None,
-        "agent_message_queued",
-        serde_json::json!({
-            "fromSessionId": envelope.from_session_id,
-            "fromAgent": envelope.from_agent,
-            "fromHandle": envelope.from_handle,
-            "fromName": envelope.from_name,
-        }),
-    )
+    let prompt = PendingPrompt::from_agent_message(envelope, queued_at)?;
+    let mut observed = store.read_state(job_id)?;
+    store.reconcile_stale_pid(&mut observed)?;
+    let reception = store.update_state(job_id, |state| {
+        ensure_background_job_ownership_reusable(state, job_id)?;
+        if state.identity.session_id.is_none() {
+            anyhow::bail!("background job {job_id} has no session to reply to yet");
+        }
+        if state.outcome.pending_permission.is_some()
+            && state.process.status != BackgroundJobStatus::NeedsInput
+        {
+            anyhow::bail!(
+                "background job {job_id} is waiting for permission; answer or cancel it before sending another turn"
+            );
+        }
+        state.receive_agent_message(prompt.clone(), queued_at)
+    })?;
+    let woke = reception.delivery == crate::AgentMessageDelivery::StartedNewTurn;
+    if let Some(rebon_exe_path) = start_supervisor.filter(|_| woke) {
+        ensure_supervisor_running(store, rebon_exe_path)?;
+    }
+    if reception.acceptance.appended {
+        store.append_event(
+            job_id,
+            "agent_message_queued",
+            serde_json::json!({
+                "fromSessionId": envelope.from_session_id,
+                "fromAgent": envelope.from_agent,
+                "fromHandle": envelope.from_handle,
+                "fromName": envelope.from_name,
+                "resumed": woke,
+                "promptId": reception.acceptance.prompt.id,
+                "queueDepth": reception.acceptance.queue_depth,
+            }),
+        )?;
+    }
+    Ok(reception)
 }
 
 /// Queue a prompt the session's cron scheduler fired, for a running worker to
@@ -2146,12 +2164,7 @@ fn append_pending_prompt_durably(
         if !acceptance.appended {
             return Ok(acceptance);
         }
-        // Another session's message never moves the job: written here, with no
-        // live owner, nothing can judge it against the session's wake bounds,
-        // and only an admitted message may be the reason for a turn. It waits,
-        // unjudged, for whoever runs the session next — and a finished job
-        // keeps the result it finished with.
-        if !active && !prompt.is_agent_message() {
+        if !active {
             state.process.status = BackgroundJobStatus::Queued;
             state.outcome.pending_permission = None;
             state.outcome.summary = None;
@@ -2160,9 +2173,7 @@ fn append_pending_prompt_durably(
             state.outcome.exit_code = None;
             state.outcome.error = None;
         }
-        if !prompt.is_agent_message() {
-            state.identity.resume_only = false;
-        }
+        state.identity.resume_only = false;
         state.process.updated_at_ms = queued_at;
         Ok(acceptance)
     })?;
@@ -2315,6 +2326,8 @@ fn queue_background_job_in_store(
         ensure_background_job_ownership_reusable(state, job_id)?;
         state.process.status = BackgroundJobStatus::Queued;
         state.identity.resume_only = false;
+        // Queued to run its prompt again.
+        state.identity.prompt_owed = true;
         state.outcome.pending_permission = None;
         state.process.updated_at_ms = now_ms();
         state.process.completed_at_ms = None;

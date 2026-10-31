@@ -69,6 +69,11 @@ fn hosted(status: BackgroundJobStatus, session_id: &str) -> Hosted {
 }
 
 fn deliver(hosted: &Hosted, envelope: &AgentMessageEnvelope) -> RequestResult {
+    handle(hosted, request(envelope))
+}
+
+/// One request to the owner, the way its endpoint hands it over.
+fn handle(hosted: &Hosted, request: BackgroundIpcRequest) -> RequestResult {
     let turn_cancel = Arc::new(Mutex::new(rebon_types::PromptCancel::new()));
     let task_registry_resolver = Arc::new(Mutex::new(None));
     let teammate_runtimes = Arc::new(Mutex::new(Vec::new()));
@@ -79,7 +84,7 @@ fn deliver(hosted: &Hosted, envelope: &AgentMessageEnvelope) -> RequestResult {
     let live_mcp_status = Arc::new(Mutex::new(None));
     let live_agent = Arc::new(Mutex::new(None));
     handle_background_ipc_request(
-        request(envelope),
+        request,
         &hosted.store,
         &hosted.state.identity.job_id,
         &hosted.ipc.owner(),
@@ -693,12 +698,8 @@ fn a_message_read_by_the_running_hosted_turn_makes_it_reply_one_hop_deeper() {
 /// else starts.
 #[test]
 fn a_message_the_turn_never_read_is_judged_before_it_starts_the_next_turn() {
-    let wake_budget = rebon_tool::peer::AGENT_MESSAGE_WAKES_PER_HOUR;
-    let ledger = rebon_tool::peer::session_reply_ledger("sess-unread-over");
-    for _ in 0..wake_budget {
-        assert!(ledger.admit_wake("sess-sender", 0, now_ms()).is_allowed());
-    }
     let over = hosted(BackgroundJobStatus::Running, "sess-unread-over");
+    exhaust_wakes(&over);
     assert_eq!(
         result_of(deliver(&over, &envelope("m-unread", "while you worked"))).outcome,
         AgentMessageDelivery::Injected,
@@ -741,10 +742,7 @@ fn a_message_the_turn_never_read_is_judged_before_it_starts_the_next_turn() {
 #[test]
 fn an_unread_message_rides_into_the_turn_a_waiting_prompt_starts() {
     let hosted = hosted(BackgroundJobStatus::Running, "sess-unread-typed");
-    let ledger = rebon_tool::peer::session_reply_ledger("sess-unread-typed");
-    for _ in 0..rebon_tool::peer::AGENT_MESSAGE_WAKES_PER_HOUR {
-        assert!(ledger.admit_wake("sess-sender", 0, now_ms()).is_allowed());
-    }
+    exhaust_wakes(&hosted);
     deliver(&hosted, &envelope("m-unread", "while you worked")).unwrap();
     queue_live_background_reply(
         &hosted.store,
@@ -912,10 +910,25 @@ fn current(hosted: &Hosted) -> BackgroundJobState {
         .unwrap()
 }
 
-/// Spend every wake `sess-sender` has left on this session this hour.
-fn exhaust_wakes(session_id: &str) {
-    let ledger = rebon_tool::peer::session_reply_ledger(session_id);
-    while ledger.admit_wake("sess-sender", 0, now_ms()).is_allowed() {}
+/// Spend every wake `sess-sender` has left on this session this hour, in the
+/// record that keeps the hour across worker restarts.
+fn exhaust_wakes(hosted: &Hosted) {
+    let now = now_ms();
+    rewrite(hosted, |state| {
+        state.identity.agent_wakes.insert(
+            "sess-sender".into(),
+            vec![now; rebon_tool::peer::AGENT_MESSAGE_WAKES_PER_HOUR],
+        );
+    });
+}
+
+/// How many wakes `sess-sender` has spent on this session this hour.
+fn wakes_spent(hosted: &Hosted) -> usize {
+    current(hosted)
+        .identity
+        .agent_wakes
+        .get("sess-sender")
+        .map_or(0, Vec::len)
 }
 
 /// What reception decided is written on the message, so no later path asks
@@ -965,12 +978,14 @@ fn a_message_does_not_take_the_place_of_the_jobs_own_prompt() {
     ] {
         let hosted = hosted(BackgroundJobStatus::Queued, session_id);
         if spent {
-            exhaust_wakes(session_id);
+            exhaust_wakes(&hosted);
         }
+        let spent_before = wakes_spent(&hosted);
         rebon_session_host::append_agent_message_to_background_job(
             &hosted.store,
             &hosted.state.identity.job_id,
             &envelope("m-early", "before the worker came"),
+            None,
         )
         .unwrap();
         deliver(&hosted, &envelope("m-ipc", "and over the endpoint")).unwrap();
@@ -995,12 +1010,10 @@ fn a_message_does_not_take_the_place_of_the_jobs_own_prompt() {
                     && prompt.claimed_turn_generation.is_none()),
             "spent={spent}: the messages ride along, unjudged"
         );
-    }
-    let ledger = rebon_tool::peer::session_reply_ledger("sess-own-prompt-within");
-    for step in 0..rebon_tool::peer::AGENT_MESSAGE_WAKES_PER_HOUR {
-        assert!(
-            ledger.admit_wake("sess-sender", 0, now_ms()).is_allowed(),
-            "wake {step}: riding along spent nothing"
+        assert_eq!(
+            wakes_spent(&hosted),
+            spent_before,
+            "spent={spent}: riding along spent nothing"
         );
     }
 }
@@ -1019,7 +1032,7 @@ fn a_message_nobody_judged_is_judged_before_it_may_lead() {
     ] {
         let hosted = hosted(BackgroundJobStatus::Idle, session_id);
         if spent {
-            exhaust_wakes(session_id);
+            exhaust_wakes(&hosted);
         }
         rewrite(&hosted, |state| {
             state.identity.pending_prompts =
@@ -1038,13 +1051,13 @@ fn a_message_nobody_judged_is_judged_before_it_may_lead() {
     }
 }
 
-/// The store's fallback writes a message without a live owner to judge it, so
-/// it leaves the job as it is — a finished job keeps the result it finished
-/// with — and the message waits, unjudged. When the session next runs, a
-/// message refused earlier still never leads: the new one is judged, and
-/// leads only if admitted.
+/// The store's fallback, for a session with no live owner, makes the owner's
+/// decision against the bounds the record keeps. Refused, the message only
+/// joins the queue: the finished job keeps its status and its result. Admitted,
+/// it queues the job — a turn is about to replace that result — and leads the
+/// turn ahead of the message refused before it.
 #[test]
-fn a_message_written_without_a_live_owner_leaves_the_job_and_does_not_let_a_refused_one_lead() {
+fn a_message_written_without_a_live_owner_is_judged_against_the_record() {
     use rebon_tool::peer::WakeVerdict;
 
     let hosted = hosted(BackgroundJobStatus::Succeeded, "sess-store-fallback");
@@ -1055,35 +1068,65 @@ fn a_message_written_without_a_live_owner_leaves_the_job_and_does_not_let_a_refu
     });
     let mut deep = envelope("m-deep", "too deep");
     deep.hops = rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1;
-    assert_eq!(
-        result_of(deliver(&hosted, &deep)).outcome,
-        AgentMessageDelivery::Queued
-    );
-
-    rebon_session_host::append_agent_message_to_background_job(
+    let refused = rebon_session_host::append_agent_message_to_background_job(
         &hosted.store,
         &hosted.state.identity.job_id,
-        &envelope("m-later", "a later question"),
+        &deep,
+        None,
     )
     .unwrap();
-    let mut state = current(&hosted);
+    assert_eq!(refused.delivery, AgentMessageDelivery::Queued);
+    let state = current(&hosted);
     assert_eq!(state.process.status, BackgroundJobStatus::Succeeded);
     assert_eq!(state.outcome.summary.as_deref(), Some("finished the build"));
     assert_eq!(state.outcome.exit_code, Some(0));
     assert_eq!(state.process.completed_at_ms, Some(7));
-    assert_eq!(
-        state.identity.pending_prompts[1].wake,
-        WakeVerdict::Unjudged
-    );
+    assert_eq!(state.identity.pending_prompts[0].wake, WakeVerdict::Refused);
 
-    // The session runs next — a warm-up ending decides what waits.
-    assert!(lead_with_turn_driver(&mut state, now_ms()));
-    assert_eq!(state.identity.pending_prompts[0].id, "m-later");
-    assert_eq!(
-        state.identity.pending_prompts[0].wake,
-        WakeVerdict::Admitted
-    );
-    assert_eq!(state.identity.pending_prompts[1].wake, WakeVerdict::Refused);
+    let admitted = rebon_session_host::append_agent_message_to_background_job(
+        &hosted.store,
+        &hosted.state.identity.job_id,
+        &envelope("m-later", "a later question"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(admitted.delivery, AgentMessageDelivery::StartedNewTurn);
+    let state = current(&hosted);
+    assert_eq!(state.process.status, BackgroundJobStatus::Queued);
+    assert_eq!(state.outcome.exit_code, None, "a turn replaces the result");
+    assert_eq!(wakes_spent(&hosted), 1, "the wake is counted in the record");
+
+    let claimed = claim(&hosted);
+    let head = claimed_pending_prompt(&claimed).expect("a prompt leads");
+    assert_eq!(head.id, "m-later");
+    assert_eq!(claimed.identity.pending_prompts[1].id, "m-deep");
+}
+
+/// The wake budget is the record's, so it is the same hour whichever process
+/// reads it: wakes the owner admitted over its endpoint count against a message
+/// later written with no live owner, and a worker that restarts — a process with
+/// a fresh memory — does not get a fresh budget.
+#[test]
+fn the_wake_budget_survives_the_worker_that_counted_it() {
+    let hosted = hosted(BackgroundJobStatus::Idle, "sess-budget-kept");
+    for step in 0..rebon_tool::peer::AGENT_MESSAGE_WAKES_PER_HOUR {
+        assert_eq!(
+            result_of(deliver(&hosted, &envelope(&format!("m-{step}"), "next"))).outcome,
+            AgentMessageDelivery::StartedNewTurn,
+            "wake {step}"
+        );
+        park_after_its_turn(&hosted);
+    }
+    // No owner now: the message is written into the record directly.
+    let reception = rebon_session_host::append_agent_message_to_background_job(
+        &hosted.store,
+        &hosted.state.identity.job_id,
+        &envelope("m-ownerless", "one more"),
+        None,
+    )
+    .unwrap();
+    assert_eq!(reception.delivery, AgentMessageDelivery::Queued);
+    assert_eq!(current(&hosted).process.status, BackgroundJobStatus::Idle);
 }
 
 /// A failed turn keeps its prompt for a retry. Another session's message must
@@ -1114,6 +1157,7 @@ fn a_message_to_a_job_holding_a_failed_prompt_for_retry_does_not_retry_it() {
         &hosted.store,
         &hosted.state.identity.job_id,
         &envelope("m-fallback", "still there?"),
+        None,
     )
     .unwrap();
 
@@ -1126,14 +1170,11 @@ fn a_message_to_a_job_holding_a_failed_prompt_for_retry_does_not_retry_it() {
     assert!(state.identity.pending_prompts[1..]
         .iter()
         .all(|prompt| prompt.wake == WakeVerdict::Unjudged));
-    for step in 0..rebon_tool::peer::AGENT_MESSAGE_WAKES_PER_HOUR {
-        assert!(
-            rebon_tool::peer::session_reply_ledger("sess-retained-claim")
-                .admit_wake("sess-sender", 0, now_ms())
-                .is_allowed(),
-            "wake {step}: waiting behind the retry spent nothing"
-        );
-    }
+    assert_eq!(
+        wakes_spent(&hosted),
+        0,
+        "waiting behind the retry spent nothing"
+    );
 }
 
 /// A respawned job keeps its queue but loses every claim. An admitted message
@@ -1175,7 +1216,7 @@ fn an_admitted_message_left_unread_is_not_charged_again() {
             waiting_agent_prompt("m-admitted", 1, WakeVerdict::Admitted),
         ];
     });
-    exhaust_wakes(session_id);
+    exhaust_wakes(&hosted);
 
     let claimed = current(&hosted);
     assert_eq!(
@@ -1282,5 +1323,219 @@ fn a_warmed_sessions_poller_serves_the_turn_claimed_after_the_warm_up() {
         rebon_tool::peer::session_reply_ledger(session_id).reply_hops("sess-sender"),
         2,
         "and the turn answers it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Whether the job's own prompt is owed, read off old records too.
+// ---------------------------------------------------------------------------
+
+/// A record an older build left: queued, never flagged, its queue holding only
+/// a message from another session — an older build woke a finished session
+/// that way. Its prompt was answered long ago and is not run again: the claim
+/// is a warm-up, and the message is judged when the warm-up ends.
+#[test]
+fn a_legacy_record_queued_only_for_messages_warms_up_instead_of_rerunning_its_prompt() {
+    use rebon_tool::peer::WakeVerdict;
+
+    let hosted = hosted(BackgroundJobStatus::Queued, "sess-legacy-stale");
+    rewrite(&hosted, |state| {
+        state.identity.prompt_owed = false;
+        state.process.started_at_ms = Some(1);
+        state.identity.pending_prompts =
+            vec![waiting_agent_prompt("m-old", 0, WakeVerdict::Unjudged)];
+    });
+    assert!(!current(&hosted).owes_its_prompt());
+
+    let claimed = claim(&hosted);
+    assert!(claimed.identity.resume_only, "a warm-up, not a turn");
+    assert_eq!(claimed_pending_prompt(&claimed), None);
+
+    // The warm-up ends: the message is judged, and admitted it leads.
+    let mut state = current(&hosted);
+    crate::host::worker::execution::end_warm_up(&mut state, now_ms());
+    assert_eq!(state.process.status, BackgroundJobStatus::Queued);
+    assert!(!state.identity.resume_only);
+    assert_eq!(
+        state.identity.pending_prompts[0].wake,
+        WakeVerdict::Admitted
+    );
+    hosted.store.write_state(&state).unwrap();
+    let next = claim(&hosted);
+    assert_eq!(
+        claimed_pending_prompt(&next).map(|prompt| prompt.id.as_str()),
+        Some("m-old")
+    );
+}
+
+/// The same old record, but for a job that never started — queued for its
+/// first prompt when the message came — still runs that prompt, with the
+/// message riding along. So does an old record queued with nothing waiting,
+/// which every older build ran its prompt for.
+#[test]
+fn a_legacy_record_that_owes_its_prompt_still_runs_it() {
+    use rebon_tool::peer::WakeVerdict;
+
+    let never_started = hosted(BackgroundJobStatus::Queued, "sess-legacy-fresh");
+    rewrite(&never_started, |state| {
+        state.identity.prompt_owed = false;
+        state.process.started_at_ms = None;
+        state.identity.pending_prompts =
+            vec![waiting_agent_prompt("m-early", 0, WakeVerdict::Unjudged)];
+    });
+    let claimed = claim(&never_started);
+    assert!(!claimed.identity.resume_only);
+    assert_eq!(claimed_pending_prompt(&claimed), None);
+    assert_eq!(resolve_background_agent_runtime(&claimed).prompt, "prompt");
+
+    let nothing_waiting = hosted(BackgroundJobStatus::Queued, "sess-legacy-empty");
+    rewrite(&nothing_waiting, |state| {
+        state.identity.prompt_owed = false;
+        state.process.started_at_ms = Some(1);
+        state.identity.pending_prompts.clear();
+    });
+    let claimed = claim(&nothing_waiting);
+    assert!(!claimed.identity.resume_only);
+    assert_eq!(resolve_background_agent_runtime(&claimed).prompt, "prompt");
+}
+
+/// `/bg` with a final prompt on a session that already ran says so in the
+/// record. A message that reaches the job before a worker claims it rides
+/// along; the final prompt runs, and once claimed it is owed no more — a later
+/// claim does not run it again.
+#[test]
+fn a_final_prompt_queued_on_a_started_session_runs_with_messages_waiting() {
+    let hosted = hosted(BackgroundJobStatus::Succeeded, "sess-final-prompt");
+    rewrite(&hosted, |state| {
+        state.process.started_at_ms = Some(1);
+        state.identity.prompt_owed = false;
+        state.process.pid = None;
+        state.process.pid_identity = None;
+        state.process.ipc_port = None;
+        state.process.ipc_token = None;
+    });
+    rebon_session_host::mark_existing_background_session_queued(
+        &hosted.store,
+        &hosted.state.identity.job_id,
+        Some("the final prompt".into()),
+        PathBuf::from("."),
+        runtime(),
+        "sess-final-prompt".into(),
+        None,
+    )
+    .unwrap();
+    rebon_session_host::append_agent_message_to_background_job(
+        &hosted.store,
+        &hosted.state.identity.job_id,
+        &envelope("m-meanwhile", "while you were queued"),
+        None,
+    )
+    .unwrap();
+
+    let claimed = claim(&hosted);
+    assert!(!claimed.identity.resume_only);
+    assert_eq!(claimed_pending_prompt(&claimed), None);
+    assert_eq!(
+        resolve_background_agent_runtime(&claimed).prompt,
+        "the final prompt"
+    );
+    assert!(!current(&hosted).identity.prompt_owed, "owed no more");
+}
+
+// ---------------------------------------------------------------------------
+// A cancel keeps what other sessions sent.
+// ---------------------------------------------------------------------------
+
+/// Cancelling a turn drops the prompts somebody asked to run and the ones the
+/// cancelled turn already took. Messages from other sessions still waiting
+/// unread stay — their senders were told they arrived — but none may restart
+/// the session the person just stopped: they ride with the next turn, and an
+/// admitted one is not charged again.
+#[test]
+fn a_cancel_keeps_waiting_messages_as_riders() {
+    use rebon_tool::peer::WakeVerdict;
+
+    let hosted = hosted(BackgroundJobStatus::Running, "sess-cancel-keeps");
+    rewrite(&hosted, |state| {
+        let generation = state.process.turn_generation;
+        let mut led = pending_prompt("u-led", "the cancelled prompt", Vec::new());
+        led.claimed_turn_generation = Some(generation);
+        let mut read = waiting_agent_prompt("m-read", 0, WakeVerdict::Unjudged);
+        read.claimed_turn_generation = Some(generation);
+        state.identity.pending_prompts = vec![
+            led,
+            read,
+            waiting_agent_prompt("m-admitted", 0, WakeVerdict::Admitted),
+            waiting_agent_prompt("m-unjudged", 0, WakeVerdict::Unjudged),
+            pending_prompt("u-queued", "typed while it ran", Vec::new()),
+        ];
+        state
+            .identity
+            .agent_wakes
+            .insert("sess-sender".into(), vec![now_ms()]);
+    });
+    let fence = rebon_session_host::BackgroundIpcCancelFence::from_state(&current(&hosted));
+    handle(&hosted, BackgroundIpcRequest::Cancel { fence }).unwrap();
+
+    let state = current(&hosted);
+    assert_eq!(state.process.status, BackgroundJobStatus::Idle);
+    assert_eq!(
+        state
+            .identity
+            .pending_prompts
+            .iter()
+            .map(|prompt| (
+                prompt.id.as_str(),
+                prompt.wake,
+                prompt.claimed_turn_generation
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("m-admitted", WakeVerdict::Refused, None),
+            ("m-unjudged", WakeVerdict::Refused, None)
+        ]
+    );
+    assert_eq!(wakes_spent(&hosted), 1, "nothing charged again");
+    assert!(!state.has_pending_prompts_to_run());
+}
+
+// ---------------------------------------------------------------------------
+// One sender past its bounds does not crowd out the others.
+// ---------------------------------------------------------------------------
+
+/// A sender may have only so many messages waiting with a refused wake. Past
+/// that its next refused message is not taken — it is told so — while another
+/// sender's message still is.
+#[test]
+fn one_sender_past_its_bounds_cannot_fill_the_queue() {
+    let hosted = hosted(BackgroundJobStatus::Idle, "sess-per-sender");
+    let deep = |id: &str, from: &str| {
+        let mut message = envelope(id, "past the bound");
+        message.hops = rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1;
+        message.from_session_id = from.into();
+        message
+    };
+    for index in 0..rebon_session_host::MAX_WAITING_REFUSED_MESSAGES_PER_SENDER {
+        assert_eq!(
+            result_of(deliver(
+                &hosted,
+                &deep(&format!("m-noisy-{index}"), "sess-noisy")
+            ))
+            .outcome,
+            AgentMessageDelivery::Queued
+        );
+    }
+    let (_, message) = deliver(&hosted, &deep("m-noisy-over", "sess-noisy"))
+        .expect_err("past the per-sender bound the message is refused");
+    assert!(message.contains("message refused"), "{message}");
+    assert_eq!(
+        stored_prompts(&hosted).len(),
+        rebon_session_host::MAX_WAITING_REFUSED_MESSAGES_PER_SENDER,
+        "the refused one was not queued"
+    );
+    assert_eq!(
+        result_of(deliver(&hosted, &deep("m-quiet", "sess-quiet"))).outcome,
+        AgentMessageDelivery::Queued,
+        "another sender is still heard"
     );
 }

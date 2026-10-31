@@ -335,90 +335,18 @@ pub(crate) fn queue_live_background_agent_message(
     envelope: &rebon_session_host::AgentMessageEnvelope,
 ) -> anyhow::Result<AgentMessageAcceptance> {
     let queued_at = now_ms();
-    let mut prompt = PendingPrompt::new(
-        envelope.message_id.clone(),
-        rebon_session_host::frame_agent_message(envelope),
-        Vec::new(),
-        queued_at,
-    )?;
-    prompt.origin = Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
-        from_session_id: envelope.from_session_id.clone(),
-        from_agent: envelope.from_agent.clone(),
-        from_handle: envelope.from_handle.clone(),
-        from_name: envelope.from_name.clone(),
-        hops: envelope.hops,
-    });
-    let mut delivery = rebon_session_host::AgentMessageDelivery::Queued;
-    let mut appended = false;
-    let mut wake = false;
-    store.update_state(job_id, |state| {
+    let prompt = PendingPrompt::from_agent_message(envelope, queued_at)?;
+    // Where it lands, and whether the wake bounds — kept in the job record, so
+    // they count the same hour across worker restarts — let it start a turn,
+    // is the one decision the record makes for every way a message arrives.
+    let reception = store.update_state(job_id, |state| {
         owner.ensure_matches(state)?;
-        let status = state.process.status;
-        // A warm-up reads no prompts: a message that reaches a warming worker
-        // is decided when the warm-up ends, not injected into a turn.
-        let warming = state.identity.resume_only;
-        let running = matches!(
-            status,
-            BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput
-        ) && !warming;
-        // Parked: no turn is running and none is owed, so a turn would start
-        // only because of this message. A job whose last turn succeeded or
-        // failed is parked the same as one whose turn was cancelled — unless
-        // that failed turn's prompt is kept for a retry, which a message from
-        // another session must not be what sets off.
-        let parked = matches!(
-            status,
-            BackgroundJobStatus::Idle
-                | BackgroundJobStatus::Succeeded
-                | BackgroundJobStatus::Failed
-        ) && !state.head_awaits_retry();
-        // `append_pending_prompt` answers a repeat (`appended: false`) and
-        // refuses the same id with different words or a queue already holding
-        // its share of agent messages, so it runs before any bound is
-        // consulted: a retry, or a message that is not taken, spends no wake.
-        let acceptance = state.append_pending_prompt(prompt.clone())?;
-        appended = acceptance.appended;
-        // Only a message that would be the reason for a turn is judged, because
-        // judging spends a wake. One that joins a running turn, rides into a
-        // turn already queued, or waits behind a warm-up or a retry is left
-        // unjudged: if it outlives that unread, the worker judges it before it
-        // may lead a turn. The verdict is kept on the message so no later path
-        // asks again.
-        if parked && appended {
-            let verdict = judge_agent_prompt_wake(state, &prompt, queued_at);
-            wake = verdict == rebon_tool::peer::WakeVerdict::Admitted;
-            if let Some(stored) = state.identity.pending_prompts.last_mut() {
-                stored.wake = verdict;
-            }
-        }
-        delivery = if running {
-            rebon_session_host::AgentMessageDelivery::Injected
-        } else if wake {
-            // A parked worker is woken by the status change this write makes.
-            rebon_session_host::AgentMessageDelivery::StartedNewTurn
-        } else {
-            rebon_session_host::AgentMessageDelivery::Queued
-        };
-        if !acceptance.appended {
-            return Ok(());
-        }
-        if wake {
-            // The claim takes the first prompt that may lead a turn, which is
-            // this one: messages refused before it stay behind it.
-            state.process.status = BackgroundJobStatus::Queued;
-            state.outcome.pending_permission = None;
-            state.outcome.summary = None;
-            state.process.completed_at_ms = None;
-            state.outcome.exit_code = None;
-            state.outcome.error = None;
-        }
-        // `resume_only` is left alone: unlike a prompt somebody asked the job
-        // to run, a message does not turn a warm-up into a turn.
-        state.outcome.summary_updated_at_ms = None;
-        state.process.updated_at_ms = queued_at;
-        Ok(())
+        state.receive_agent_message(prompt.clone(), queued_at)
     })?;
-    Ok(AgentMessageAcceptance { delivery, appended })
+    Ok(AgentMessageAcceptance {
+        delivery: reception.delivery,
+        appended: reception.acceptance.appended,
+    })
 }
 
 /// The queue mutation is shared by delivery acknowledgements and ACP turns.

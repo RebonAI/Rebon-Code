@@ -982,6 +982,28 @@ pub(crate) fn stage_inbound_for_claimed_prompt(
     ledger.stage_inbound(from_session_id, hops);
 }
 
+/// A warm-up is over: the session waits for its first prompt, or — when what
+/// waited meanwhile starts a turn — is queued for it.
+///
+/// What waited decides as anything waiting does (see
+/// [`lead_with_turn_driver`]): a message from another session nobody judged is
+/// judged now, against the bounds the record keeps, and leads only if
+/// admitted; a refused one never does. Nothing here runs the job's own prompt.
+pub(crate) fn end_warm_up(current: &mut BackgroundJobState, at_ms: u64) {
+    current.identity.resume_only = false;
+    current.process.status = if lead_with_turn_driver(current, at_ms) {
+        BackgroundJobStatus::Queued
+    } else {
+        BackgroundJobStatus::Idle
+    };
+    current.outcome.pending_permission = None;
+    current.outcome.summary_updated_at_ms = None;
+    current.process.completed_at_ms = None;
+    current.outcome.exit_code = None;
+    current.outcome.error = None;
+    current.process.updated_at_ms = at_ms;
+}
+
 /// Run the turn, publishing progress while it runs.
 ///
 /// The MCP stack has to be up before the turn lists its tools, and the turn
@@ -1341,21 +1363,7 @@ async fn resolve_resume_only_turn(
     if state.identity.resume_only {
         let idle_at = now_ms();
         store.update_state(&state.identity.job_id, |current| {
-            current.identity.resume_only = false;
-            // What waited for the warm-up to end decides as anything waiting
-            // does: a message from another session only once the bounds admit
-            // it, a refused one never.
-            current.process.status = if lead_with_turn_driver(current, idle_at) {
-                BackgroundJobStatus::Queued
-            } else {
-                BackgroundJobStatus::Idle
-            };
-            current.outcome.pending_permission = None;
-            current.outcome.summary_updated_at_ms = None;
-            current.process.completed_at_ms = None;
-            current.outcome.exit_code = None;
-            current.outcome.error = None;
-            current.process.updated_at_ms = idle_at;
+            end_warm_up(current, idle_at);
             Ok(())
         })?;
         store.append_event(
@@ -2347,10 +2355,10 @@ async fn wait_for_first_prompt_on_warm_session(
             return Ok(WarmSessionWait::Ended);
         }
         match current.process.status {
-            // Only a follow-up to run brings a parked worker back: messages
-            // from other sessions that merely wait are carried by the next
-            // turn, not the reason for one.
-            BackgroundJobStatus::Queued if current.has_pending_prompts_to_run() => {
+            // Only a turn to run brings a parked worker back — a follow-up, or
+            // the job's prompt owed by name: messages from other sessions that
+            // merely wait are carried by the next turn, not the reason for one.
+            BackgroundJobStatus::Queued if current.has_turn_to_run() => {
                 let (cancel, claim) = ipc.start_turn_and(|| {
                     claim_background_job(
                         store,
@@ -2362,6 +2370,18 @@ async fn wait_for_first_prompt_on_warm_session(
                     )
                 });
                 match claim? {
+                    // The record changed between the read and the claim, and
+                    // the claim found nothing to run: it is a warm-up, and this
+                    // session is already warm — end it here and keep waiting.
+                    WorkerClaim::Claimed(claimed) if claimed.identity.resume_only => {
+                        let ended_at = now_ms();
+                        store.update_state(job_id, |current| {
+                            if owner.matches(current) {
+                                end_warm_up(current, ended_at);
+                            }
+                            Ok(())
+                        })?;
+                    }
                     WorkerClaim::Claimed(claimed) => {
                         store.append_event(
                             job_id,
@@ -2390,7 +2410,7 @@ async fn wait_for_first_prompt_on_warm_session(
                         return Ok(false);
                     }
                     if current.process.status == BackgroundJobStatus::Queued
-                        && !current.has_pending_prompts_to_run()
+                        && !current.has_turn_to_run()
                     {
                         current.process.status = BackgroundJobStatus::Idle;
                         current.process.updated_at_ms = normalized_at;
@@ -2477,10 +2497,10 @@ pub(crate) async fn wait_for_terminal_worker_reuse(
             return Ok(false);
         }
         match state.process.status {
-            // Only a follow-up to run brings a parked worker back: messages
-            // from other sessions that merely wait are carried by the next
-            // turn, not the reason for one.
-            BackgroundJobStatus::Queued if state.has_pending_prompts_to_run() => {
+            // Only a turn to run brings a parked worker back — a follow-up, or
+            // the job's prompt owed by name: messages from other sessions that
+            // merely wait are carried by the next turn, not the reason for one.
+            BackgroundJobStatus::Queued if state.has_turn_to_run() => {
                 store.append_event(job_id, "worker_reused", serde_json::json!({}))?;
                 return Ok(true);
             }
@@ -2498,7 +2518,7 @@ pub(crate) async fn wait_for_terminal_worker_reuse(
                         return Ok(false);
                     }
                     if current.process.status == BackgroundJobStatus::Queued
-                        && !current.has_pending_prompts_to_run()
+                        && !current.has_turn_to_run()
                     {
                         current.process.status = BackgroundJobStatus::Idle;
                         current.process.updated_at_ms = normalized_at;
