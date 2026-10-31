@@ -19,9 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::BackgroundStore;
 use crate::{
-    background_task_event_summary, BackgroundJobEvent, BackgroundJobState, BackgroundJobStatus,
-    BackgroundTaskEventBatch, BackgroundTaskEventKind, ForegroundSessionStatus, OwnerHandle,
-    BACKGROUND_SUMMARY_UPDATE_INTERVAL_MS,
+    BackgroundJobEvent, BackgroundJobState, BackgroundJobStatus, ForegroundSessionStatus,
+    OwnerHandle, BACKGROUND_SUMMARY_UPDATE_INTERVAL_MS,
 };
 
 /// How stale a foreground heartbeat may be and still count as running.
@@ -202,9 +201,9 @@ impl PeerDirectory {
     /// The owner's own summary is the best answer and the only one written for
     /// this purpose, but the owner refreshes it on an interval, so a summary
     /// older than two intervals describes a turn that may already be over. Past
-    /// that the event log is the fallback: the last tool the session started is
-    /// still what a caller wants to know, and it costs one bounded tail read of
-    /// a file the owner is already writing.
+    /// that the event log is the fallback: the tool the session itself is
+    /// running right now is what a caller wants to know, and it costs one
+    /// bounded tail read of a file the owner is already writing.
     fn hosted_activity(&self, job: &BackgroundJobState) -> Option<String> {
         if !matches!(job.status(), BackgroundJobStatus::Running) {
             return None;
@@ -212,15 +211,15 @@ impl PeerDirectory {
         let fresh_window = BACKGROUND_SUMMARY_UPDATE_INTERVAL_MS.saturating_mul(2);
         let now = crate::now_ms();
         if let Some(summary) = job.summary().map(str::trim).filter(|s| !s.is_empty()) {
-            let fresh = job
+            if job
                 .outcome
                 .summary_updated_at_ms
-                .is_some_and(|updated| now.saturating_sub(updated) <= fresh_window);
-            if fresh {
+                .is_some_and(|updated| summary_is_fresh(updated, now, fresh_window))
+            {
                 return Some(summary.to_string());
             }
         }
-        latest_tool_start_activity(&self.store, job.job_id())
+        latest_running_tool_activity(&self.store, job.job_id())
     }
 
     /// Every `.live.json` under the projects root that is fresh.
@@ -267,22 +266,41 @@ impl PeerDirectory {
     }
 }
 
+/// Whether an owner summary written at `updated` still describes the turn that
+/// is running at `now`.
+///
+/// The owner refreshes its summary once per interval, so a summary that has
+/// missed two refreshes may describe a turn that already ended. The comparison
+/// lives here, with the numbers passed in, because the boundary is exactly the
+/// fact a test has to be able to state without racing a clock.
+fn summary_is_fresh(updated_ms: u64, now_ms: u64, fresh_window_ms: u64) -> bool {
+    now_ms.saturating_sub(updated_ms) <= fresh_window_ms
+}
+
 /// How much of a job's event log the fallback activity read looks at.
 ///
-/// A turn can write thousands of lines; the tool that started most recently is
-/// what a peer card shows, and the last 64 KiB of the log holds it unless the
-/// turn has written that much since its last tool call — in which case the tool
-/// is genuinely not what the session is doing any more.
+/// A turn can write thousands of lines; the tool the session is running right
+/// now is what a peer card shows, and the last 64 KiB of the log holds it unless
+/// the turn has written that much since its last tool call — in which case the
+/// tool is genuinely not what the session is doing any more.
 const ACTIVITY_EVENT_TAIL_BYTES: usize = 64 * 1024;
 
 /// Lines of the event-log tail this fallback parses.
 const ACTIVITY_EVENT_TAIL_LINES: usize = 256;
 
-/// The activity the session's most recent started tool was doing.
+/// The tool the session itself is running right now, described the way its
+/// summary describes one.
 ///
-/// Reads the tail of the job's event file rather than the whole thing: this runs
-/// once per peer for every `ListPeers`, and the answer is always at the end.
-fn latest_tool_start_activity(store: &BackgroundStore, job_id: &str) -> Option<String> {
+/// The session's own tool calls are recorded as `session_update` events — the
+/// same stream `summarize_session_update` reads — and not as the
+/// `task_live_batch` events, which belong to the sub-agents and teammates a turn
+/// spawned. Reading those instead answered with whatever a *child* had done last,
+/// which is not what the session is doing.
+///
+/// The tail is walked newest first and the answer is the most recent tool call
+/// that has not finished. A completed or failed tool is history: past it the
+/// session is thinking or answering, and `None` is the honest answer.
+fn latest_running_tool_activity(store: &BackgroundStore, job_id: &str) -> Option<String> {
     let path = store.events_path(job_id);
     let lines = crate::store::read_tail_lines_bounded(
         &path,
@@ -290,32 +308,53 @@ fn latest_tool_start_activity(store: &BackgroundStore, job_id: &str) -> Option<S
         ACTIVITY_EVENT_TAIL_BYTES,
     )
     .ok()?;
-    lines
-        .iter()
-        .rev()
-        .filter_map(|line| serde_json::from_str::<BackgroundJobEvent>(line).ok())
-        .find_map(|event| last_tool_start_in_batch(&event))
-}
-
-/// The activity carried by the last `ToolStart` in a `task_live_batch` event.
-///
-/// The batch is written into `data` with its own camelCase shape, so this reads
-/// it back as a [`BackgroundTaskEventBatch`] rather than reaching for keys. The
-/// line is that summary because that is exactly what the Agent View row shows
-/// for a started tool.
-fn last_tool_start_in_batch(event: &BackgroundJobEvent) -> Option<String> {
-    if event.kind != "task_live_batch" {
-        return None;
+    let mut settled = HashSet::new();
+    for line in lines.iter().rev() {
+        let Ok(event) = serde_json::from_str::<BackgroundJobEvent>(line) else {
+            continue;
+        };
+        if event.kind != "session_update" {
+            continue;
+        }
+        let Ok(update) = serde_json::from_value::<rebon_types::SessionUpdateParams>(event.data)
+        else {
+            continue;
+        };
+        let Some(state) = crate::summary::tool_call_state(&update.update) else {
+            continue;
+        };
+        match state.status {
+            // Newest first: a finished call means every earlier event about it
+            // is older news, so it can no longer be the running tool.
+            Some(rebon_types::ToolCallStatus::Completed | rebon_types::ToolCallStatus::Failed) => {
+                settled.insert(state.tool_call_id.to_string());
+            }
+            Some(
+                rebon_types::ToolCallStatus::Pending | rebon_types::ToolCallStatus::InProgress,
+            ) => {
+                // Newest first: a newer event can already have finished this
+                // call, and a running-looking event that old is not running.
+                if settled.contains(state.tool_call_id) {
+                    continue;
+                }
+                return state
+                    .description
+                    .map(|activity| activity.trim().to_string())
+                    .filter(|activity| !activity.is_empty());
+            }
+            // An update that says nothing about status: the call is running
+            // unless a newer event already finished it.
+            None => {
+                if !settled.contains(state.tool_call_id) {
+                    return state
+                        .description
+                        .map(|activity| activity.trim().to_string())
+                        .filter(|activity| !activity.is_empty());
+                }
+            }
+        }
     }
-    let batch = serde_json::from_value::<BackgroundTaskEventBatch>(event.data.clone()).ok()?;
-    batch
-        .events
-        .iter()
-        .rev()
-        .find(|entry| matches!(entry.event, BackgroundTaskEventKind::ToolStart { .. }))
-        .map(|entry| background_task_event_summary(&entry.event))
-        .map(|activity| activity.trim().to_string())
-        .filter(|activity| !activity.is_empty())
+    None
 }
 
 /// Whether a foreground status names a way to take an agent message.
@@ -352,7 +391,10 @@ fn foreground_agent_reachable(status: &ForegroundSessionStatus) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BackgroundIpcRequest, BackgroundRuntimeFields, ForegroundSessionStatus};
+    use crate::{
+        BackgroundIpcRequest, BackgroundRuntimeFields, BackgroundTaskEventBatch,
+        BackgroundTaskEventKind, ForegroundSessionStatus,
+    };
     use tempfile::TempDir;
 
     fn runtime() -> BackgroundRuntimeFields {
@@ -690,23 +732,34 @@ mod tests {
         assert_eq!(peers[0].activity.as_deref(), Some("Bash cargo test"));
     }
 
-    /// A summary older than two publish intervals may describe a turn that is
-    /// already over, so the event log answers instead.
+    /// A stale summary falls back to the tool the session itself is running.
+    ///
+    /// The session's own tool calls are `session_update` events; a
+    /// `task_live_batch` is a child's, and reading that instead would answer with
+    /// what a sub-agent did rather than what this session is doing.
     #[test]
-    fn a_stale_summary_falls_back_to_the_last_started_tool() {
+    fn a_stale_summary_falls_back_to_the_tool_the_session_is_running() {
         let (_dir, store, projects_root) = store_and_projects();
         let job_id = host_job(&store, "sess-stale-summary", "F:/work/stale-summary");
         store
             .update_state(&job_id, |state| {
                 state.outcome.summary = Some("an older turn".into());
-                state.outcome.summary_updated_at_ms = Some(
-                    crate::now_ms()
-                        - BACKGROUND_SUMMARY_UPDATE_INTERVAL_MS * 3,
-                );
+                state.outcome.summary_updated_at_ms =
+                    Some(crate::now_ms() - BACKGROUND_SUMMARY_UPDATE_INTERVAL_MS * 3);
                 Ok(())
             })
             .unwrap();
+        // A child's finished tool, which is not what this session is doing.
         append_tool_start_batch(&store, &job_id, "Read crates/rebon-core/src/lib.rs");
+        // The session's own running tool.
+        append_tool_call(
+            &store,
+            &job_id,
+            "tool-own",
+            "Read crates/rebon-session/src/lib.rs",
+            rebon_types::ToolKind::Read,
+            Some(rebon_types::ToolCallStatus::InProgress),
+        );
         let _lock = rebon_session::try_acquire_session_active_lock(
             &projects_root,
             "F:/work/stale-summary",
@@ -719,7 +772,163 @@ mod tests {
         assert_eq!(peers.len(), 1);
         assert_eq!(
             peers[0].activity.as_deref(),
-            Some("Read crates/rebon-core/src/lib.rs")
+            Some("reading: Read crates/rebon-session/src/lib.rs"),
+            "the session's own running tool, not a child's"
+        );
+    }
+
+    /// Once the session's tool finishes, nothing is running any more: it is
+    /// thinking or answering, and an old tool is not what it is doing.
+    #[test]
+    fn a_finished_tool_is_no_longer_the_activity() {
+        let (_dir, store, projects_root) = store_and_projects();
+        let job_id = host_job(&store, "sess-finished", "F:/work/finished");
+        append_tool_call(
+            &store,
+            &job_id,
+            "tool-done",
+            "Read crates/rebon-core/src/lib.rs",
+            rebon_types::ToolKind::Read,
+            Some(rebon_types::ToolCallStatus::InProgress),
+        );
+        append_tool_call(
+            &store,
+            &job_id,
+            "tool-done",
+            "Read crates/rebon-core/src/lib.rs",
+            rebon_types::ToolKind::Read,
+            Some(rebon_types::ToolCallStatus::Completed),
+        );
+        // Writing the calls also refreshed the summary; make it stale so the
+        // question this test asks is answered by the log and not by the owner.
+        store
+            .update_state(&job_id, |state| {
+                state.outcome.summary = None;
+                state.outcome.summary_updated_at_ms = None;
+                Ok(())
+            })
+            .unwrap();
+        let _lock = rebon_session::try_acquire_session_active_lock(
+            &projects_root,
+            "F:/work/finished",
+            "sess-finished",
+        )
+        .expect("the lock probe works")
+        .expect("the session lock is free");
+
+        let peers = PeerDirectory::new(store, &projects_root).list();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].activity, None);
+    }
+
+    /// A log past the tail window still answers from what the window holds, and
+    /// a line the window cut in half is skipped rather than guessed at.
+    #[test]
+    fn a_long_event_log_answers_from_the_tail_window_it_reads() {
+        let (_dir, store, projects_root) = store_and_projects();
+        let job_id = host_job(&store, "sess-long-log", "F:/work/long-log");
+        // Push the log past the 64 KiB window with a line long enough that the
+        // window's first line is a fragment of it.
+        for index in 0..600 {
+            store
+                .append_event(
+                    &job_id,
+                    "chatter",
+                    serde_json::json!({ "index": index, "pad": "x".repeat(200) }),
+                )
+                .unwrap();
+        }
+        append_tool_call(
+            &store,
+            &job_id,
+            "tool-recent",
+            "crates/rebon-session-host/src/peers.rs",
+            rebon_types::ToolKind::Edit,
+            Some(rebon_types::ToolCallStatus::InProgress),
+        );
+        // The premise, asserted rather than assumed: the file is past the window
+        // and the window begins in the middle of a line.
+        let path = store.events_path(&job_id);
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            raw.len() > ACTIVITY_EVENT_TAIL_BYTES,
+            "the log is past the {} byte window",
+            ACTIVITY_EVENT_TAIL_BYTES
+        );
+        let window_start = raw.len() - ACTIVITY_EVENT_TAIL_BYTES;
+        assert_ne!(
+            raw[window_start - 1],
+            b'\n',
+            "the window starts mid-line, so its first line is a fragment"
+        );
+        let _lock = rebon_session::try_acquire_session_active_lock(
+            &projects_root,
+            "F:/work/long-log",
+            "sess-long-log",
+        )
+        .expect("the lock probe works")
+        .expect("the session lock is free");
+
+        let peers = PeerDirectory::new(store, &projects_root).list();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0].activity.as_deref(),
+            Some("editing: crates/rebon-session-host/src/peers.rs"),
+            "the answer is at the end of the log, which is what the window holds"
+        );
+    }
+
+    /// The freshness boundary is exactly two intervals: at it the summary still
+    /// describes this turn, one millisecond past it does not.
+    ///
+    /// The comparison is asserted on numbers rather than a wall clock, because a
+    /// test that measures "now" twice straddles the boundary it is testing.
+    #[test]
+    fn the_summary_freshness_boundary_is_two_intervals() {
+        let window = BACKGROUND_SUMMARY_UPDATE_INTERVAL_MS * 2;
+        let updated = 1_000_000;
+        assert!(summary_is_fresh(updated, updated + window, window));
+        assert!(!summary_is_fresh(updated, updated + window + 1, window));
+        // A record from the future still counts as fresh rather than wrapping.
+        assert!(summary_is_fresh(updated, updated - 1, window));
+    }
+
+    /// End to end: a summary past two intervals is not the activity, and the
+    /// fallback answers instead.
+    #[test]
+    fn a_summary_past_the_freshness_window_gives_way_to_the_fallback() {
+        let (_dir, store, projects_root) = store_and_projects();
+        let job_id = host_job(&store, "sess-stale-e2e", "F:/work/stale-e2e");
+        store
+            .update_state(&job_id, |state| {
+                state.outcome.summary = Some("an older turn".into());
+                state.outcome.summary_updated_at_ms =
+                    Some(crate::now_ms() - BACKGROUND_SUMMARY_UPDATE_INTERVAL_MS * 3);
+                Ok(())
+            })
+            .unwrap();
+        append_tool_call(
+            &store,
+            &job_id,
+            "tool-own",
+            "Read crates/rebon-core/src/lib.rs",
+            rebon_types::ToolKind::Read,
+            Some(rebon_types::ToolCallStatus::InProgress),
+        );
+        let _lock = rebon_session::try_acquire_session_active_lock(
+            &projects_root,
+            "F:/work/stale-e2e",
+            "sess-stale-e2e",
+        )
+        .expect("the lock probe works")
+        .expect("the session lock is free");
+
+        let peers = PeerDirectory::new(store, &projects_root).list();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0].activity.as_deref(),
+            Some("reading: Read crates/rebon-core/src/lib.rs"),
+            "a summary past the window is history; the running tool answers"
         );
     }
 
@@ -797,26 +1006,60 @@ mod tests {
         let (_dir, store, projects_root) = store_and_projects();
         let cwd = "F:/work/old-heartbeat";
         let session_id = "sess-old-heartbeat";
-        let path = crate::legacy_foreground::foreground_status_path(&projects_root, cwd, session_id);
-        std::fs::create_dir_all(
-            path.parent().expect("the status file has a parent"),
-        )
-        .unwrap();
+        let path =
+            crate::legacy_foreground::foreground_status_path(&projects_root, cwd, session_id);
+        std::fs::create_dir_all(path.parent().expect("the status file has a parent")).unwrap();
         let body = format!(
             r#"{{"pid":{},"sessionId":"{session_id}","cwd":"{cwd}","heartbeatMs":{},"busy":true,"lastCommandAtMs":0}}"#,
             std::process::id(),
             crate::now_ms()
         );
         std::fs::write(&path, body).unwrap();
-        let _lock =
-            rebon_session::try_acquire_session_active_lock(&projects_root, cwd, session_id)
-                .expect("the lock probe works")
-                .expect("the session lock is free");
+        let _lock = rebon_session::try_acquire_session_active_lock(&projects_root, cwd, session_id)
+            .expect("the lock probe works")
+            .expect("the session lock is free");
 
         let peers = PeerDirectory::new(store, &projects_root).list();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].session_id, session_id);
         assert_eq!(peers[0].activity, None);
+    }
+
+    /// One of the session's own tool-call updates, as the owner logs it.
+    fn append_tool_call(
+        store: &BackgroundStore,
+        job_id: &str,
+        tool_call_id: &str,
+        title: &str,
+        kind: rebon_types::ToolKind,
+        status: Option<rebon_types::ToolCallStatus>,
+    ) {
+        let update = rebon_types::SessionUpdateParams {
+            session_id: "sess-tool".into(),
+            update: match status {
+                Some(status) => rebon_types::SessionUpdate::ToolCall {
+                    tool_call_id: tool_call_id.into(),
+                    title: title.into(),
+                    kind,
+                    status,
+                    content: None,
+                    locations: None,
+                    raw_input: None,
+                    raw_output: None,
+                },
+                None => rebon_types::SessionUpdate::ToolCallUpdate {
+                    tool_call_id: tool_call_id.into(),
+                    status: None,
+                    title: Some(title.into()),
+                    content: None,
+                    locations: None,
+                    raw_output: None,
+                },
+            },
+        };
+        store
+            .append_session_update_for_turn(job_id, 1, &update)
+            .unwrap();
     }
 
     fn append_tool_start_batch(store: &BackgroundStore, job_id: &str, summary: &str) {
