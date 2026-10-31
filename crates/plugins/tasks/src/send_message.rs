@@ -795,6 +795,9 @@ impl SendMessageTool {
                 });
             }
         };
+        let result_summary = summary.clone();
+        let result_body_first_line = text.lines().map(str::trim).find(|line| !line.is_empty())
+            .map(str::to_string);
         let message = PeerMessage {
             from_session_id: own_session_id(context).unwrap_or_default().to_string(),
             from_agent: context
@@ -816,12 +819,29 @@ impl SendMessageTool {
                 tool: self.id(),
                 presentation: message_delivery_error(message),
             })?;
-        Ok(json!({
+        // The target's own name, taken from the entry the resolver already
+        // read: the sender's card says who it wrote to, not just an id.
+        let mut result = json!({
             "success": true,
             "target": format!("{SESSION_TARGET_PREFIX}{target_session_id}"),
             "mode": "session",
             "message": session_delivery_note(delivery, target_session_id),
-        }))
+        });
+        if let Some(handle) = target.handle.as_deref().filter(|handle| !handle.is_empty()) {
+            result["target_handle"] = json!(handle);
+        }
+        if let Some(name) = target.name.as_deref().filter(|name| !name.is_empty()) {
+            result["target_name"] = json!(name);
+        }
+        // The card names the target in one line; what was sent is one ctrl+o
+        // away, so the summary and the body's first line ride along for that.
+        if let Some(summary) = result_summary.as_deref().filter(|s| !s.is_empty()) {
+            result["summary"] = json!(summary);
+        }
+        if let Some(line) = result_body_first_line.as_deref().filter(|line| !line.is_empty()) {
+            result["body_first_line"] = json!(line);
+        }
+        Ok(result)
     }
 
     async fn deliver_message(

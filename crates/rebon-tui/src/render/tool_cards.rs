@@ -1142,6 +1142,15 @@ fn append_verbose_streaming_tool_body(
                 context.theme.streaming,
             );
         }
+    } else if let Some(lines) = session_message_body_lines(tool, true) {
+        for line in lines {
+            push_tool_body_line(
+                &mut body.lines,
+                &mut body.text,
+                line,
+                context.theme.streaming,
+            );
+        }
     } else if let Some(raw_output) = agent_final_raw_output {
         for line in agent_final_text_lines(raw_output) {
             push_tool_body_line(

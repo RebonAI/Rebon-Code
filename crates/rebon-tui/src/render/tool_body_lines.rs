@@ -42,6 +42,9 @@ pub(super) fn collect_tool_body_lines(
     if let Some(text) = async_agent_launch_display(tool, extras) {
         return vec![text];
     }
+    if let Some(lines) = session_message_body_lines(tool, false) {
+        return lines;
+    }
     if let Some(lines) = workflow_journal_lines_for_tool(tool) {
         return lines;
     }
@@ -154,6 +157,28 @@ pub(super) fn collect_tool_body_lines(
         }
     }
     normalize_tool_body_lines(lines, true)
+}
+
+/// The card for a message sent to another session.
+///
+/// One line says who it went to; `verbose` adds the sender's summary and the
+/// first line of what it actually wrote, which is what ctrl+o is for. A send
+/// that failed, or went to a teammate or a local task, has no such card — the
+/// tool result already says what happened.
+pub(super) fn session_message_body_lines(
+    tool: &crate::streaming::StreamingToolUse,
+    verbose: bool,
+) -> Option<Vec<String>> {
+    if tool.tool_name != "SendMessage" {
+        return None;
+    }
+    let output = tool.raw_output.as_ref()?;
+    let display = rebon_render::session_message_display(output)?;
+    let mut lines = vec![display];
+    if verbose {
+        lines.extend(rebon_render::session_message_detail_lines(output));
+    }
+    Some(lines)
 }
 
 pub(super) fn is_web_search_tool(
@@ -1033,5 +1058,119 @@ mod tests {
             lines[1],
             "✓ [design] Design UI — completed (9 tokens · 80ms)"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_message_tests {
+    use super::*;
+    use crate::streaming::StreamingToolUse;
+    use rebon_types::{ToolCallStatus, ToolKind};
+    use serde_json::json;
+
+    fn send_tool(output: serde_json::Value) -> StreamingToolUse {
+        StreamingToolUse {
+            call_id: "call-1".into(),
+            tool_name: "SendMessage".into(),
+            kind: ToolKind::Other,
+            status: ToolCallStatus::Completed,
+            title: None,
+            content: None,
+            locations: None,
+            raw_input: None,
+            raw_output: Some(serde_json::from_value(output).expect("an object")),
+        }
+    }
+
+    fn session_output() -> serde_json::Value {
+        json!({
+            "success": true,
+            "mode": "session",
+            "target": "session:abcde-fghij-klmno-pqrst",
+            "target_handle": "repo-qrst",
+            "target_name": "worker",
+            "summary": "handoff",
+            "body_first_line": "please look at the failing test",
+        })
+    }
+
+    #[test]
+    fn a_session_send_gets_one_line_naming_the_peer() {
+        let lines = session_message_body_lines(&send_tool(session_output()), false)
+            .expect("a session send has a card");
+        assert_eq!(lines, vec!["Message sent to @repo-qrst — worker".to_string()]);
+    }
+
+    #[test]
+    fn verbose_adds_the_summary_and_the_first_body_line() {
+        let lines = session_message_body_lines(&send_tool(session_output()), true)
+            .expect("a session send has a card");
+        assert_eq!(
+            lines,
+            vec![
+                "Message sent to @repo-qrst — worker".to_string(),
+                "handoff".to_string(),
+                "please look at the failing test".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_peer_with_only_an_id_is_named_by_its_session() {
+        let lines = session_message_body_lines(
+            &send_tool(json!({
+                "success": true,
+                "mode": "session",
+                "target": "session:abcde-fghij-klmno-pqrst",
+            })),
+            false,
+        )
+        .expect("a session send has a card");
+        assert_eq!(lines, vec!["Message sent to session:abcde-fg".to_string()]);
+    }
+
+    /// A send that failed keeps the tool's own error row; this card never
+    /// claims a delivery that did not happen.
+    #[test]
+    fn a_failed_send_has_no_card() {
+        assert!(session_message_body_lines(
+            &send_tool(json!({
+                "success": false,
+                "mode": "session",
+                "target": "session:abcde-fghij-klmno-pqrst",
+            })),
+            false
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_teammate_or_task_send_has_no_card() {
+        assert!(session_message_body_lines(
+            &send_tool(json!({ "success": true, "target": "bob" })),
+            false
+        )
+        .is_none());
+        assert!(session_message_body_lines(
+            &send_tool(json!({ "success": true, "target": "task-1", "mode": "runtime" })),
+            false
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn another_tool_has_no_card() {
+        let mut tool = send_tool(session_output());
+        tool.tool_name = "Read".into();
+        assert!(session_message_body_lines(&tool, false).is_none());
+    }
+
+    #[test]
+    fn the_collected_body_is_the_card_and_not_the_raw_json() {
+        let tool = send_tool(session_output());
+        let extras = crate::render::TranscriptRenderExtras::empty();
+        let lines = collect_tool_body_lines(&tool, None, false, extras);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("Message sent to @repo-qrst"), "{lines:?}");
     }
 }

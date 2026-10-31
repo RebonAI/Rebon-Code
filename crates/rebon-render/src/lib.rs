@@ -48,8 +48,8 @@
 //! [`transcript_row`] is not re-exported at the crate root. Say which end
 //! you mean.
 //! * **Tool-call rendering** — [`agent`], [`content`], [`diff`], [`hidden`],
-//!   [`json_compact`], [`kind`], [`plan_ledger`], [`shell_output`],
-//!   [`streaming`], [`summary`], [`text`], [`tool_output`],
+//!   [`json_compact`], [`kind`], [`peer_message`], [`plan_ledger`],
+//!   [`shell_output`], [`streaming`], [`summary`], [`text`], [`tool_output`],
 //!   [`workflow_body`], [`auto_mode_note`], [`code_mode`]. Edit/Write diff
 //!   computation, tool-call body/title/kind formatting, the raw-output →
 //!   `ToolCallContent` / `ToolCallLocation` projection a live turn and a
@@ -180,8 +180,11 @@ pub mod metadata;
 pub mod pad_aligned;
 pub mod patch;
 #[deny(missing_docs)]
+pub mod peer_message;
+#[deny(missing_docs)]
 pub mod plan_approval;
 pub mod plan_ledger;
+pub use peer_message::{session_message_detail_lines, session_message_display};
 #[deny(missing_docs)]
 pub mod project;
 #[deny(missing_docs)]

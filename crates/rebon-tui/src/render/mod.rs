@@ -95,7 +95,7 @@ use rebon_render::plan_ledger::{
 use text_util::last_non_empty_line;
 use tool_body_lines::{
     agent_description, agent_full_detail_lines, collect_shell_tool_body_lines,
-    collect_tool_body_lines, render_tool_call_content,
+    collect_tool_body_lines, render_tool_call_content, session_message_body_lines,
 };
 use tool_format::{
     compact_json_map, deferred_tool_verbose_summary, streaming_tool_display_name,
