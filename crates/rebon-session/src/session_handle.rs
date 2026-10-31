@@ -208,7 +208,12 @@ pub fn ensure_session_handle(
 /// the sidecar write after it must have failed — rather than a conflict.
 fn claim_handle(projects_root: &Path, handle: &str, session_id: &str) -> std::io::Result<bool> {
     let dir = projects_root.join(SESSION_HANDLE_INDEX_DIR);
-    std::fs::create_dir_all(&dir)?;
+    if !dir.is_dir() {
+        std::fs::create_dir_all(&dir)?;
+        // The first claim on a machine creates the index; its entry in the
+        // projects root has to outlive a power loss as much as the claim does.
+        crate::session_storage::sync_parent_directory(&dir);
+    }
     let path = handle_index_path(&dir, handle);
     if let Ok(owner) = std::fs::read_to_string(&path) {
         let ours = owner.trim() == session_id;
@@ -216,7 +221,7 @@ fn claim_handle(projects_root: &Path, handle: &str, session_id: &str) -> std::io
             // An earlier claim of ours that the sidecar never recorded may not
             // have reached the disk either; make it durable before the sidecar
             // names it.
-            sync_claim(&path)?;
+            sync_claim(&path);
         }
         return Ok(ours);
     }
@@ -250,7 +255,7 @@ fn claim_handle(projects_root: &Path, handle: &str, session_id: &str) -> std::io
             let owner = std::fs::read_to_string(&path)?;
             let ours = owner.trim() == session_id;
             if ours {
-                sync_claim(&path)?;
+                sync_claim(&path);
             }
             Ok(ours)
         }
@@ -268,14 +273,19 @@ fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 /// Flush an existing claim and the index directory that names it.
-fn sync_claim(path: &Path) -> std::io::Result<()> {
+///
+/// Best effort: the claim is already on disk and names this session, so a file
+/// that cannot be reopened for writing is no reason to refuse the handle.
+fn sync_claim(path: &Path) {
     // Write access, because Windows refuses to flush a handle opened read-only.
-    std::fs::OpenOptions::new()
+    let flushed = std::fs::OpenOptions::new()
         .write(true)
-        .open(path)?
-        .sync_all()?;
+        .open(path)
+        .and_then(|file| file.sync_all());
+    if let Err(error) = flushed {
+        tracing::debug!(%error, path = %path.display(), "rebon: could not flush an existing handle claim");
+    }
     crate::session_storage::sync_parent_directory(path);
-    Ok(())
 }
 
 /// A per-call suffix that keeps two claims in one process from staging under the
