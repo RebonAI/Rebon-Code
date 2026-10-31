@@ -448,6 +448,32 @@ mod tests {
         assert!(transcript_entry_is_meta(&raw));
     }
 
+    /// A message another agent sent is written into the turn it arrived in as a
+    /// visible attachment, so it is a `user` row the person never typed. Excerpting
+    /// it would show somebody else's words as this conversation's user text.
+    #[test]
+    fn transcript_entry_is_meta_detects_a_visible_agent_message_attachment() {
+        let raw = serde_json::json!({
+            "type": "user",
+            "runtimeAttachment": true,
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "<teammate-message teammate_id=\"main@session:sess-sender\">go</teammate-message>"
+                }]
+            },
+        });
+        assert!(transcript_entry_is_meta(&raw));
+        assert!(
+            !transcript_entry_is_meta(&serde_json::json!({
+                "type": "user",
+                "message": { "role": "user", "content": "typed by the person" },
+            })),
+            "a line the person typed is still user text"
+        );
+    }
+
     #[test]
     fn shorten_excerpt_collapses_whitespace_and_truncates() {
         let collapsed = shorten_excerpt("hello\n\nworld\t  foo", 100);
