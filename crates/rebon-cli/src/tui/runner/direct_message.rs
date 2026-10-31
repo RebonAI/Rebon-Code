@@ -77,10 +77,10 @@ pub(super) fn resolve_direct_target(
         [] => {}
         several => {
             return Err(format!(
-                "{} agents here answer to `{recipient}`: {}. Name the one you meant by its task id.",
-                several.len(),
-                several.join(", ")
-            ))
+            "{} agents here answer to `{recipient}`: {}. Name the one you meant by its task id.",
+            several.len(),
+            several.join(", ")
+        ))
         }
     }
     match rebon_tool::peer::resolve_peer(peers, recipient) {
@@ -143,7 +143,8 @@ pub(super) fn deliver_direct_message(
                 "to": format!("@{recipient}"),
                 "message": message,
             });
-            match handle.block_on(rebon_plugin_tasks::send_message::SendMessageTool.call(input, &context))
+            match handle
+                .block_on(rebon_plugin_tasks::send_message::SendMessageTool.call(input, &context))
             {
                 Ok(output) => DirectDelivery::Peer(sent_line(&output, recipient)),
                 Err(error) => DirectDelivery::Refused(peer_refusal(&error.to_string(), recipient)),
@@ -226,7 +227,47 @@ mod tests {
     fn a_line_without_a_leading_name_is_a_prompt() {
         let dir = tempfile::tempdir().unwrap();
         assert!(parse_direct_message("read @Makefile for me", dir.path()).is_none());
-        assert!(parse_direct_message("@bob", dir.path()).is_none(), "nothing to say");
+        assert!(
+            parse_direct_message("@bob", dir.path()).is_none(),
+            "nothing to say"
+        );
+    }
+
+    /// A handle is only usable if a person can type it as a recipient. The
+    /// generator and the `@name` parser live in different crates, so this is the
+    /// one place the two rules are checked against each other: every handle an
+    /// owner could actually claim has to parse back as a recipient.
+    #[test]
+    fn a_claimed_handle_is_a_recipient_a_person_can_type() {
+        let projects = tempfile::tempdir().unwrap();
+        let mentions = tempfile::tempdir().unwrap();
+        let session_id = "0123456-789ab-cdef0-12345";
+
+        for cwd in [
+            "/repo",
+            "/tmp/My Project!!",
+            "F:\\dev\\Work",
+            "/Users/bon/Dev/reboncode/.worktrees/cross-session",
+            "/",
+        ] {
+            let handle = rebon_session::ensure_session_handle(projects.path(), cwd, session_id)
+                .unwrap_or_else(|error| panic!("{cwd}: {error}"));
+            assert_eq!(
+                rebon_session::load_session_handle(projects.path(), cwd, session_id).as_deref(),
+                Some(handle.as_str()),
+                "{cwd}"
+            );
+
+            let line = format!("@{handle} take the next item");
+            let parsed = rebon_tui::promptinput::parse_direct_member_message(&line)
+                .unwrap_or_else(|| panic!("{handle} from {cwd} is not a typeable recipient"));
+            assert_eq!(parsed.recipient_name, handle, "{cwd}");
+            assert_eq!(parsed.message, "take the next item");
+            assert!(
+                parse_direct_message(&line, mentions.path()).is_some(),
+                "nothing on disk is named {handle}"
+            );
+        }
     }
 
     #[test]
@@ -261,11 +302,7 @@ mod tests {
     /// names the teammate, and the session stays reachable by its handle.
     #[test]
     fn a_name_both_answer_to_goes_to_the_teammate() {
-        let peers = [peer(
-            "abcde-fghij-klmno-pqrst",
-            Some("bob"),
-            Some("bob"),
-        )];
+        let peers = [peer("abcde-fghij-klmno-pqrst", Some("bob"), Some("bob"))];
         assert_eq!(
             resolve_direct_target("bob", &["task-bob".into()], &peers),
             Ok(DirectTarget::Teammate {
@@ -277,7 +314,10 @@ mod tests {
     #[test]
     fn an_unknown_name_says_where_the_sessions_are_listed() {
         let refusal = resolve_direct_target("ghost", &[], &[]).unwrap_err();
-        assert!(refusal.contains("no running session matches `ghost`"), "{refusal}");
+        assert!(
+            refusal.contains("no running session matches `ghost`"),
+            "{refusal}"
+        );
         assert!(refusal.contains("/agent-view"), "{refusal}");
     }
 
@@ -303,7 +343,8 @@ mod tests {
 
     #[test]
     fn a_refusal_that_already_names_the_list_is_not_told_twice() {
-        let said = "`ghost` matches nothing. `/agent-view` lists the sessions running on this machine.";
+        let said =
+            "`ghost` matches nothing. `/agent-view` lists the sessions running on this machine.";
         assert_eq!(peer_refusal(said, "ghost"), said);
     }
 }

@@ -753,6 +753,18 @@ impl SendMessageTool {
                 });
             }
         }
+        // A handle names one session, and this one's is not a target either. The
+        // peer list cannot say so — it leaves the caller out — so the check reads
+        // the handle the context carries.
+        if context.peer_handle().is_some_and(|handle| {
+            handle.eq_ignore_ascii_case(rebon_tool::peer::strip_handle_sigil(requested).trim())
+        }) {
+            return Err(ToolError::InvalidInput {
+                tool: self.id(),
+                reason: "a session cannot send a message to itself".into(),
+                error_code: Some(INVALID_INPUT_CODE),
+            });
+        }
         let peers = self
             .list_peers(session_id, context)
             .await?
@@ -796,7 +808,10 @@ impl SendMessageTool {
             }
         };
         let result_summary = summary.clone();
-        let result_body_first_line = text.lines().map(str::trim).find(|line| !line.is_empty())
+        let result_body_first_line = text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
             .map(str::to_string);
         let message = PeerMessage {
             from_session_id: own_session_id(context).unwrap_or_default().to_string(),
@@ -844,7 +859,10 @@ impl SendMessageTool {
         if let Some(summary) = result_summary.as_deref().filter(|s| !s.is_empty()) {
             result["summary"] = json!(summary);
         }
-        if let Some(line) = result_body_first_line.as_deref().filter(|line| !line.is_empty()) {
+        if let Some(line) = result_body_first_line
+            .as_deref()
+            .filter(|line| !line.is_empty())
+        {
             result["body_first_line"] = json!(line);
         }
         Ok(result)
@@ -2351,6 +2369,54 @@ mod tests {
             );
         }
         assert!(messenger.sent.lock().unwrap().is_empty());
+    }
+
+    /// The handle is a name for the same session, and the peer list cannot say
+    /// so — it leaves the caller out — so the refusal reads the context.
+    #[tokio::test]
+    async fn the_sender_cannot_address_itself_by_its_own_handle() {
+        let messenger = Arc::new(ScriptedPeerMessenger::new(
+            vec![peer_info("abcdef-caller", None)],
+            PeerDelivery::Injected,
+        ));
+        let context = context_with_messenger(messenger.clone(), "abcdef-caller")
+            .with_peer_handle("repo-call");
+
+        for target in ["@repo-call", "@REPO-CALL"] {
+            let error = SendMessageTool
+                .call(json!({ "to": target, "message": "hello" }), &context)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("a session cannot send a message to itself"),
+                "{target}: {error}"
+            );
+        }
+        assert!(messenger.sent.lock().unwrap().is_empty());
+    }
+
+    /// The handle refusal is about one string, not about the shape of a handle:
+    /// another session's handle still resolves.
+    #[tokio::test]
+    async fn another_sessions_handle_is_still_a_target() {
+        let messenger = Arc::new(ScriptedPeerMessenger::new(
+            vec![peer_with_handle(
+                "abcde-fghij-klmno-pqrst",
+                "repo-qrst",
+                None,
+            )],
+            PeerDelivery::Injected,
+        ));
+        let context = context_with_messenger(messenger.clone(), "caller-session")
+            .with_peer_handle("call-qrst");
+        let output = SendMessageTool
+            .call(json!({ "to": "@repo-qrst", "message": "hello" }), &context)
+            .await
+            .unwrap();
+        assert_eq!(output["mode"], json!("session"));
+        assert_eq!(messenger.sent.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

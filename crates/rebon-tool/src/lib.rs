@@ -218,11 +218,11 @@ pub mod mcp;
 pub mod monitor;
 pub mod multi_edit;
 pub mod output_truncation;
-/// Naming a peer session: handles, ids and names, resolved once.
-pub mod peer;
 #[cfg(windows)]
 pub(crate) mod path_lookup;
 pub mod path_scope;
+/// Naming a peer session: handles, ids and names, resolved once.
+pub mod peer;
 pub mod plan_mode;
 pub mod powershell;
 pub mod queue;
@@ -920,6 +920,8 @@ pub struct AutoModeContext {
 #[derive(Clone, Default)]
 struct PeerContext {
     messenger: Option<Arc<dyn PeerMessenger>>,
+    /// The handle this session's owner claimed for itself.
+    handle: Option<String>,
 }
 
 /// A session's [`AgentReplyLedger`](crate::peer::AgentReplyLedger), carried in
@@ -1387,10 +1389,7 @@ impl ToolContext {
     /// SendMessage reads it to label a reply with the depth of the message it
     /// answers; without it every message looks like a first one, which is what
     /// a session that never receives a cross-session message is.
-    pub fn with_peer_reply_ledger(
-        mut self,
-        ledger: Arc<crate::peer::AgentReplyLedger>,
-    ) -> Self {
+    pub fn with_peer_reply_ledger(mut self, ledger: Arc<crate::peer::AgentReplyLedger>) -> Self {
         self.extensions.insert(PeerReplyLedger(ledger));
         self
     }
@@ -1398,6 +1397,22 @@ impl ToolContext {
     /// Borrow the session's reply ledger, if one is attached.
     pub fn peer_reply_ledger(&self) -> Option<&crate::peer::AgentReplyLedger> {
         Some(self.extension::<PeerReplyLedger>()?.0.as_ref())
+    }
+
+    /// Attach the handle this session's owner claimed for itself.
+    ///
+    /// A sender refuses its own session for the same reason it refuses its own
+    /// id: `@repo-qrst` names the one target that can never work. The peer list
+    /// cannot answer this — it leaves the caller out — so the handle has to
+    /// travel with the context.
+    pub fn with_peer_handle(mut self, handle: impl Into<String>) -> Self {
+        self.update_extension::<PeerContext>(|peer| peer.handle = Some(handle.into()));
+        self
+    }
+
+    /// This session's own handle, when its owner published one.
+    pub fn peer_handle(&self) -> Option<&str> {
+        self.extension::<PeerContext>()?.handle.as_deref()
     }
 
     /// Attach a [`QueueController`] so a queue coordinator session can read the

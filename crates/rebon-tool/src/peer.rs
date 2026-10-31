@@ -565,6 +565,9 @@ mod tests {
         first.note_inbound("sess-peer", 1);
         let second = session_reply_ledger("sess-ledger-b");
         assert_eq!(second.reply_hops("sess-peer"), 0);
-        assert_eq!(session_reply_ledger("sess-ledger-a").reply_hops("sess-peer"), 2);
+        assert_eq!(
+            session_reply_ledger("sess-ledger-a").reply_hops("sess-peer"),
+            2
+        );
     }
 }

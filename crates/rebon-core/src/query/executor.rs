@@ -1490,6 +1490,13 @@ impl EngineQueryExecutor {
         // told is what its inbox recorded, and the inbox lives in the runtime
         // that hosts it.
         ctx = ctx.with_peer_reply_ledger(rebon_tool::peer::session_reply_ledger(session_id));
+        // Its own handle, so `@mine-1234` is refused as a message to itself
+        // rather than reported as a session that does not exist.
+        if let Some(handle) =
+            rebon_session::load_session_handle(&self.projects_root, cwd, session_id)
+        {
+            ctx = ctx.with_peer_handle(handle);
+        }
         if let Some(controller) = &self.queue_controller {
             ctx = ctx.with_queue_controller(controller.clone());
         }
