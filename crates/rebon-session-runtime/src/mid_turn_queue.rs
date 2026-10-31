@@ -486,6 +486,24 @@ impl MidTurnQueuedSubmitPoller {
             .collect()
     }
 
+    /// A copy of every agent message the running turn has not injected yet,
+    /// leaving them queued. For recording what is still waiting, not for
+    /// delivering it.
+    pub fn pending_agent_messages(&self) -> Vec<DeferredAgentMessage> {
+        self.agent_messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|message| DeferredAgentMessage {
+                message_id: message.message_id.clone(),
+                text: message.framed.clone(),
+                from_session_id: message.from_session_id.clone(),
+                hops: message.hops,
+                verdict: message.verdict,
+            })
+            .collect()
+    }
+
     pub fn remove_submit(&self, submit: &SubmitPayload) {
         let Some(uuid) = submit.user_message_uuid.as_deref() else {
             return;
