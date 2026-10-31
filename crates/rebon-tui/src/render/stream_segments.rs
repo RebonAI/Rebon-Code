@@ -302,7 +302,7 @@ pub(super) fn single_tool_needs_trailing_expand_hint(
         }
     }
 
-    let body_lines = collect_tool_body_lines(tool, None, false, extras);
+    let body_lines = collect_tool_body_lines(tool, None, false, extras, content_width as usize);
     let body_line_count = visual_preview_lines(&tool.tool_name, &body_lines, content_width).len();
     body_line_count > 0 && body_line_count <= TOOL_PREVIEW_MAX_LINES
 }

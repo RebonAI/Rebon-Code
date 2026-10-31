@@ -199,6 +199,18 @@ fn session_delivery_note(delivery: PeerDelivery, session_id: &str) -> String {
     }
 }
 
+/// The same outcome as one word, for a card that has no room for a sentence.
+///
+/// `queued` is the one a reader has to be able to tell apart: the message has
+/// not been read yet, so the card says so instead of reading as delivered.
+fn delivery_name(delivery: PeerDelivery) -> &'static str {
+    match delivery {
+        PeerDelivery::Injected => "injected",
+        PeerDelivery::StartedTurn => "started_turn",
+        PeerDelivery::Queued => "queued",
+    }
+}
+
 fn list_peers_hint() -> &'static str {
     "ListPeers lists the sessions running on this machine."
 }
@@ -823,12 +835,6 @@ impl SendMessageTool {
                 });
             }
         };
-        let result_summary = summary.clone();
-        let result_body_first_line = text
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .map(str::to_string);
         let message = PeerMessage {
             from_session_id: own_session_id(context).unwrap_or_default().to_string(),
             from_agent: context
@@ -862,6 +868,7 @@ impl SendMessageTool {
             "success": true,
             "target": format!("{SESSION_TARGET_PREFIX}{target_session_id}"),
             "mode": "session",
+            "delivery": delivery_name(delivery),
             "message": session_delivery_note(delivery, target_session_id),
         });
         if let Some(handle) = target.handle.as_deref().filter(|handle| !handle.is_empty()) {
@@ -869,17 +876,6 @@ impl SendMessageTool {
         }
         if let Some(name) = target.name.as_deref().filter(|name| !name.is_empty()) {
             result["target_name"] = json!(name);
-        }
-        // The card names the target in one line; what was sent is one ctrl+o
-        // away, so the summary and the body's first line ride along for that.
-        if let Some(summary) = result_summary.as_deref().filter(|s| !s.is_empty()) {
-            result["summary"] = json!(summary);
-        }
-        if let Some(line) = result_body_first_line
-            .as_deref()
-            .filter(|line| !line.is_empty())
-        {
-            result["body_first_line"] = json!(line);
         }
         Ok(result)
     }
@@ -2100,6 +2096,80 @@ mod tests {
         assert_eq!(sent[0].1.from_agent, "main");
         assert_eq!(sent[0].1.summary.as_deref(), Some("handoff"));
         assert_eq!(sent[0].1.text, "hello from the other side");
+    }
+
+    /// The sender's card says who it wrote to, so the entry the resolver read
+    /// rides back on the result: the handle and the name, not just an id.
+    #[tokio::test]
+    async fn a_session_send_reports_the_target_handle_and_name() {
+        let messenger = Arc::new(ScriptedPeerMessenger::new(
+            vec![peer_with_handle(
+                "abcde-fghij-klmno-pqrst",
+                "repo-qrst",
+                Some("worker"),
+            )],
+            PeerDelivery::Injected,
+        ));
+        let context = context_with_messenger(messenger, "caller-session");
+        let output = SendMessageTool
+            .call(json!({ "to": "@repo-qrst", "message": "hello" }), &context)
+            .await
+            .unwrap();
+
+        assert_eq!(output["target_handle"], json!("repo-qrst"), "{output}");
+        assert_eq!(output["target_name"], json!("worker"), "{output}");
+        assert_eq!(output["delivery"], json!("injected"), "{output}");
+    }
+
+    /// Only a queued message is still waiting, and the card has to be able to
+    /// say so; each outcome gets its own word rather than one for all three.
+    #[tokio::test]
+    async fn a_session_send_reports_how_it_was_delivered() {
+        for (delivery, expected) in [
+            (PeerDelivery::Injected, "injected"),
+            (PeerDelivery::StartedTurn, "started_turn"),
+            (PeerDelivery::Queued, "queued"),
+        ] {
+            let messenger = Arc::new(ScriptedPeerMessenger::new(
+                vec![peer_info("target-session", None)],
+                delivery,
+            ));
+            let context = context_with_messenger(messenger, "caller-session");
+            let output = SendMessageTool
+                .call(
+                    json!({ "to": "session:target-session", "message": "hello" }),
+                    &context,
+                )
+                .await
+                .unwrap();
+            assert_eq!(output["delivery"], json!(expected), "{delivery:?}");
+        }
+    }
+
+    /// Neither the summary nor the body's first line goes back to the model:
+    /// both are already its own, and the first line is unbounded. The card reads
+    /// them off the tool's input instead.
+    #[tokio::test]
+    async fn a_session_send_result_carries_no_copy_of_what_was_sent() {
+        let messenger = Arc::new(ScriptedPeerMessenger::new(
+            vec![peer_info("target-session", None)],
+            PeerDelivery::Injected,
+        ));
+        let context = context_with_messenger(messenger, "caller-session");
+        let output = SendMessageTool
+            .call(
+                json!({
+                    "to": "session:target-session",
+                    "summary": "handoff",
+                    "message": "hello from the other side",
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.get("summary"), None, "{output}");
+        assert_eq!(output.get("body_first_line"), None, "{output}");
     }
 
     #[tokio::test]

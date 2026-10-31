@@ -276,7 +276,7 @@ fn sent_line(output: &serde_json::Value, target_session_id: &str) -> String {
         .as_object()
         .map(|object| object.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
         .unwrap_or_default();
-    rebon_render::session_message_display(&fields)
+    rebon_render::session_message_display(&fields, usize::MAX)
         .unwrap_or_else(|| format!("Message sent to session:{target_session_id}."))
 }
 

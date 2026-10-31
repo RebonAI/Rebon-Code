@@ -1887,3 +1887,101 @@ fn committed_run_code_failure_prefers_the_reported_error_over_the_last_block() {
     );
     assert_no_progress_leak(&fallback, ToolOutputVerbosity::Normal);
 }
+
+/// A committed assistant row that carries prose *and* a `SendMessage` call goes
+/// through the message projection, not the streaming card. The projection has
+/// to draw the same one-line card the overlay does: the result's raw JSON is
+/// what the model reads, not what the user is meant to see.
+fn committed_session_message(send_output: Value, send_input: Value) -> Message {
+    Message::Assistant(AssistantMessage {
+        uuid: "a-mixed-send".into(),
+        timestamp: "t".into(),
+        message: AssistantMessageInner {
+            role: AssistantRole::Assistant,
+            content: vec![
+                AssistantContentBlock::Text(AssistantTextBlock {
+                    text: "Handing this off".into(),
+                }),
+                AssistantContentBlock::ToolUse(AssistantToolUseBlock {
+                    id: "send-1".into(),
+                    name: "SendMessage".into(),
+                    input: send_input,
+                    tool_call_content: None,
+                    raw_output: Some(send_output),
+                    title: None,
+                    locations: None,
+                    status: Some(ToolCallStatus::Completed),
+                }),
+            ],
+        },
+        is_api_error_message: None,
+        advisor_model: None,
+        is_stream_continuation: None,
+    })
+}
+
+fn render_committed_send(verbosity: ToolOutputVerbosity) -> String {
+    let message = committed_session_message(
+        json!({
+            "success": true,
+            "mode": "session",
+            "target": "session:abcde-fghij-klmno-pqrst",
+            "target_handle": "repo-qrst",
+            "target_name": "worker",
+            "message": "Message sent to session:abcde-fghij-klmno-pqrst.",
+        }),
+        json!({
+            "to": "@repo-qrst",
+            "summary": "handoff",
+            "message": "please look at the failing test",
+        }),
+    );
+    let mut buf = new_buf(80, 12);
+    render_message(
+        &message,
+        Rect::new(0, 0, 80, 12),
+        &mut buf,
+        &RenderTheme::plain(),
+        verbosity,
+    );
+    all_text(&buf)
+}
+
+#[test]
+fn committed_session_send_renders_the_card_and_not_the_raw_json() {
+    for verbosity in [
+        ToolOutputVerbosity::Compact,
+        ToolOutputVerbosity::Normal,
+        ToolOutputVerbosity::Verbose,
+    ] {
+        let snap = render_committed_send(verbosity);
+        assert!(
+            snap.contains("Message sent to @repo-qrst — worker"),
+            "{verbosity:?}: the card is missing\n{snap}"
+        );
+        for raw in ["\"mode\":", "\"target_handle\":", "\"success\": true"] {
+            assert!(
+                !snap.contains(raw),
+                "{verbosity:?}: the result's JSON leaked into the committed row: {raw}\n{snap}"
+            );
+        }
+    }
+}
+
+/// What ctrl+o reveals comes from the tool's input, since the result no longer
+/// carries a copy of it.
+#[test]
+fn committed_session_send_detail_rows_come_from_the_tool_input() {
+    let verbose = render_committed_send(ToolOutputVerbosity::Verbose);
+    assert!(verbose.contains("handoff"), "{verbose}");
+    assert!(
+        verbose.contains("please look at the failing test"),
+        "{verbose}"
+    );
+
+    let compact = render_committed_send(ToolOutputVerbosity::Compact);
+    assert!(
+        !compact.contains("please look at the failing test"),
+        "the detail rows are ctrl+o's, not the card's\n{compact}"
+    );
+}

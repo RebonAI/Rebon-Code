@@ -68,6 +68,11 @@ fn push_tool_body_line(
     body_text.push(line);
 }
 
+/// The columns a streaming tool body row is painted in.
+fn streaming_body_width(context: &StreamingToolBodyContext<'_>) -> usize {
+    context.area.width.saturating_sub(GUTTER).max(1) as usize
+}
+
 fn plan_ledger_streaming_body_lines(
     tool: &crate::streaming::StreamingToolUse,
     verbosity: ToolOutputVerbosity,
@@ -889,6 +894,7 @@ fn append_compact_streaming_tool_body(
                 None,
                 context.theme.supports_hyperlinks,
                 context.extras,
+                streaming_body_width(context),
             ),
             false,
         )
@@ -979,6 +985,7 @@ fn append_normal_streaming_tool_body(
             None,
             context.theme.supports_hyperlinks,
             context.extras,
+            streaming_body_width(context),
         )
     } else if context.is_web_search {
         tool.raw_output
@@ -993,6 +1000,7 @@ fn append_normal_streaming_tool_body(
             None,
             context.theme.supports_hyperlinks,
             context.extras,
+            streaming_body_width(context),
         )
     } else {
         tool.content
@@ -1134,6 +1142,7 @@ fn append_verbose_streaming_tool_body(
             None,
             context.theme.supports_hyperlinks,
             context.extras,
+            streaming_body_width(context),
         ) {
             push_tool_body_line(
                 &mut body.lines,
@@ -1142,7 +1151,9 @@ fn append_verbose_streaming_tool_body(
                 context.theme.streaming,
             );
         }
-    } else if let Some(lines) = session_message_body_lines(tool, true) {
+    } else if let Some(lines) =
+        session_message_body_lines(tool, true, streaming_body_width(context))
+    {
         for line in lines {
             push_tool_body_line(
                 &mut body.lines,
@@ -1166,6 +1177,7 @@ fn append_verbose_streaming_tool_body(
             context.full_live_shell_content,
             context.theme.supports_hyperlinks,
             context.extras,
+            streaming_body_width(context),
         ) {
             push_tool_body_line(
                 &mut body.lines,
