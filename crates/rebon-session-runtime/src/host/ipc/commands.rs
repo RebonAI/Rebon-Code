@@ -341,7 +341,11 @@ pub(crate) fn queue_live_background_agent_message(
     // is the one decision the record makes for every way a message arrives.
     let reception = store.update_state(job_id, |state| {
         owner.ensure_matches(state)?;
-        state.receive_agent_message(prompt.clone(), queued_at)
+        state.receive_agent_message(
+            prompt.clone(),
+            rebon_session_host::AgentMessageReach::Owner,
+            queued_at,
+        )
     })?;
     Ok(AgentMessageAcceptance {
         delivery: reception.delivery,

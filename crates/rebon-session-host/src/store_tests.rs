@@ -4453,8 +4453,14 @@ fn an_agent_message_is_queued_without_starting_a_worker() {
     store.write_state(&state).unwrap();
 
     let envelope = agent_message_envelope("m-store", "check the build");
-    let acceptance =
-        append_agent_message_to_background_job(&store, &job_id, &envelope, None).unwrap();
+    let acceptance = append_agent_message_to_background_job(
+        &store,
+        &job_id,
+        &envelope,
+        crate::AgentMessageReach::Unowned,
+        None,
+    )
+    .unwrap();
     let acceptance = acceptance.acceptance;
     assert!(acceptance.appended);
     assert_eq!(acceptance.prompt.id, "m-store");
@@ -4487,9 +4493,15 @@ fn an_agent_message_is_queued_without_starting_a_worker() {
         acceptance.prompt.origin
     );
 
-    let duplicate = append_agent_message_to_background_job(&store, &job_id, &envelope, None)
-        .unwrap()
-        .acceptance;
+    let duplicate = append_agent_message_to_background_job(
+        &store,
+        &job_id,
+        &envelope,
+        crate::AgentMessageReach::Unowned,
+        None,
+    )
+    .unwrap()
+    .acceptance;
     assert!(!duplicate.appended, "the same message id is delivered once");
     assert_eq!(duplicate.queue_depth, 1);
 }
@@ -4512,10 +4524,16 @@ fn agent_messages_cannot_fill_the_queue_a_person_types_into() {
     for index in 0..MAX_PENDING_AGENT_MESSAGES {
         let envelope = agent_message_envelope(&format!("m-share-{index}"), "one more");
         assert!(
-            append_agent_message_to_background_job(&store, &job_id, &envelope, None)
-                .unwrap()
-                .acceptance
-                .appended
+            append_agent_message_to_background_job(
+                &store,
+                &job_id,
+                &envelope,
+                crate::AgentMessageReach::Unowned,
+                None
+            )
+            .unwrap()
+            .acceptance
+            .appended
         );
     }
     let before = store.read_state(&job_id).unwrap();
@@ -4523,6 +4541,7 @@ fn agent_messages_cannot_fill_the_queue_a_person_types_into() {
         &store,
         &job_id,
         &agent_message_envelope("m-share-over", "one too many"),
+        crate::AgentMessageReach::Unowned,
         None,
     )
     .unwrap_err()
@@ -4564,7 +4583,14 @@ fn agent_messages_a_running_turn_already_took_leave_room_for_more() {
     store.write_state(&state).unwrap();
     for index in 0..MAX_PENDING_AGENT_MESSAGES {
         let envelope = agent_message_envelope(&format!("m-read-{index}"), "read already");
-        append_agent_message_to_background_job(&store, &job_id, &envelope, None).unwrap();
+        append_agent_message_to_background_job(
+            &store,
+            &job_id,
+            &envelope,
+            crate::AgentMessageReach::Unowned,
+            None,
+        )
+        .unwrap();
     }
     store
         .update_state(&job_id, |state| {
@@ -4580,7 +4606,8 @@ fn agent_messages_a_running_turn_already_took_leave_room_for_more() {
             &store,
             &job_id,
             &agent_message_envelope("m-after-reads", "one more"),
-            None
+            crate::AgentMessageReach::Unowned,
+            None,
         )
         .unwrap()
         .acceptance
@@ -4606,7 +4633,14 @@ fn agent_messages_never_take_the_slots_kept_for_prompts() {
     let room_for_messages = MAX_PENDING_PROMPTS - PENDING_PROMPT_SLOTS_KEPT_FROM_AGENT_MESSAGES;
     for index in 0..room_for_messages {
         let envelope = agent_message_envelope(&format!("m-long-{index}"), "while you work");
-        append_agent_message_to_background_job(&store, &job_id, &envelope, None).unwrap();
+        append_agent_message_to_background_job(
+            &store,
+            &job_id,
+            &envelope,
+            crate::AgentMessageReach::Unowned,
+            None,
+        )
+        .unwrap();
         // The running turn reads each as it comes, so none waits unread.
         store
             .update_state(&job_id, |state| {
@@ -4622,6 +4656,7 @@ fn agent_messages_never_take_the_slots_kept_for_prompts() {
         &store,
         &job_id,
         &agent_message_envelope("m-into-reserve", "one more"),
+        crate::AgentMessageReach::Unowned,
         None,
     )
     .unwrap_err()
@@ -4884,5 +4919,108 @@ fn the_record_says_when_the_jobs_own_prompt_is_owed() {
     assert!(
         requeued.identity.prompt_owed,
         "a rerun owes its prompt again"
+    );
+}
+
+/// A job whose parent was stopped ended with it, even one that had already
+/// finished on its own: a message from another session joins its queue but
+/// does not wake it, charge a wake, or touch its result — down the tree, too.
+/// Under a parent that was not stopped, the same message wakes the job.
+#[test]
+fn a_message_does_not_wake_a_job_whose_parent_was_stopped() {
+    let (_dir, store) = store();
+    let job = |status, parent: Option<&str>, session: &str| {
+        let mut state = store
+            .create_job("work".into(), PathBuf::from("."), runtime())
+            .unwrap();
+        state.process.status = status;
+        state.identity.prompt_owed = false;
+        state.process.started_at_ms = Some(1);
+        state.identity.parent_job_id = parent.map(str::to_string);
+        state.identity.session_id = Some(session.into());
+        state.outcome.exit_code = Some(0);
+        store.write_state(&state).unwrap();
+        state.identity.job_id
+    };
+    let stopped_root = job(BackgroundJobStatus::Stopped, None, "sess-root");
+    let child = job(
+        BackgroundJobStatus::Succeeded,
+        Some(&stopped_root),
+        "sess-child",
+    );
+    let grandchild = job(
+        BackgroundJobStatus::Succeeded,
+        Some(&child),
+        "sess-grandchild",
+    );
+    for job_id in [&child, &grandchild] {
+        let reception = append_agent_message_to_background_job(
+            &store,
+            job_id,
+            &agent_message_envelope(&format!("m-{job_id}"), "still there?"),
+            crate::AgentMessageReach::Unowned,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reception.delivery, crate::AgentMessageDelivery::Queued);
+        let state = store.read_state(job_id).unwrap();
+        assert_eq!(state.process.status, BackgroundJobStatus::Succeeded);
+        assert_eq!(state.outcome.exit_code, Some(0));
+        assert_eq!(
+            state.identity.pending_prompts[0].wake,
+            rebon_tool::peer::WakeVerdict::Unjudged
+        );
+        assert!(state.identity.agent_wakes.is_empty(), "nothing charged");
+    }
+
+    let running_root = job(BackgroundJobStatus::Succeeded, None, "sess-live-root");
+    let live_child = job(
+        BackgroundJobStatus::Succeeded,
+        Some(&running_root),
+        "sess-live-child",
+    );
+    let reception = append_agent_message_to_background_job(
+        &store,
+        &live_child,
+        &agent_message_envelope("m-live", "next item"),
+        crate::AgentMessageReach::Unowned,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        reception.delivery,
+        crate::AgentMessageDelivery::StartedNewTurn
+    );
+}
+
+/// A record that still says `Running` with nobody owning it is a worker that
+/// died mid-turn. A message written there is not injected into anything — it
+/// waits, and the sender is told so.
+#[test]
+fn a_message_to_a_record_left_running_by_a_dead_worker_is_queued_not_injected() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.identity.session_id = Some("sess-dead-worker".into());
+    state.process.status = BackgroundJobStatus::Running;
+    state.process.started_at_ms = Some(1);
+    let job_id = state.identity.job_id.clone();
+    store.write_state(&state).unwrap();
+
+    let reception = append_agent_message_to_background_job(
+        &store,
+        &job_id,
+        &agent_message_envelope("m-to-the-dead", "are you there"),
+        crate::AgentMessageReach::Unowned,
+        None,
+    )
+    .unwrap();
+    assert_eq!(reception.delivery, crate::AgentMessageDelivery::Queued);
+    let state = store.read_state(&job_id).unwrap();
+    assert_eq!(state.process.status, BackgroundJobStatus::Running);
+    assert_eq!(
+        state.identity.pending_prompts[0].wake,
+        rebon_tool::peer::WakeVerdict::Unjudged
     );
 }

@@ -57,6 +57,9 @@ fn hosted(status: BackgroundJobStatus, session_id: &str) -> Hosted {
     state.process.status = status;
     state.process.turn_generation = 3;
     state.identity.session_id = Some(session_id.into());
+    // A hosted session that has run: its first prompt was claimed long ago.
+    state.identity.prompt_owed = false;
+    state.process.started_at_ms = Some(1);
     let ipc = start_background_ipc_server(&store, &state.identity.job_id).unwrap();
     install_ipc_owner(&mut state, &ipc);
     store.write_state(&state).unwrap();
@@ -977,6 +980,8 @@ fn a_message_does_not_take_the_place_of_the_jobs_own_prompt() {
         ("sess-own-prompt-over", true),
     ] {
         let hosted = hosted(BackgroundJobStatus::Queued, session_id);
+        // Queued to run its own prompt — `/bg` with a final prompt, a rerun.
+        rewrite(&hosted, |state| state.identity.prompt_owed = true);
         if spent {
             exhaust_wakes(&hosted);
         }
@@ -985,6 +990,7 @@ fn a_message_does_not_take_the_place_of_the_jobs_own_prompt() {
             &hosted.store,
             &hosted.state.identity.job_id,
             &envelope("m-early", "before the worker came"),
+            rebon_session_host::AgentMessageReach::Unowned,
             None,
         )
         .unwrap();
@@ -1072,6 +1078,7 @@ fn a_message_written_without_a_live_owner_is_judged_against_the_record() {
         &hosted.store,
         &hosted.state.identity.job_id,
         &deep,
+        rebon_session_host::AgentMessageReach::Unowned,
         None,
     )
     .unwrap();
@@ -1087,6 +1094,7 @@ fn a_message_written_without_a_live_owner_is_judged_against_the_record() {
         &hosted.store,
         &hosted.state.identity.job_id,
         &envelope("m-later", "a later question"),
+        rebon_session_host::AgentMessageReach::Unowned,
         None,
     )
     .unwrap();
@@ -1122,6 +1130,7 @@ fn the_wake_budget_survives_the_worker_that_counted_it() {
         &hosted.store,
         &hosted.state.identity.job_id,
         &envelope("m-ownerless", "one more"),
+        rebon_session_host::AgentMessageReach::Unowned,
         None,
     )
     .unwrap();
@@ -1157,6 +1166,7 @@ fn a_message_to_a_job_holding_a_failed_prompt_for_retry_does_not_retry_it() {
         &hosted.store,
         &hosted.state.identity.job_id,
         &envelope("m-fallback", "still there?"),
+        rebon_session_host::AgentMessageReach::Unowned,
         None,
     )
     .unwrap();
@@ -1428,6 +1438,7 @@ fn a_final_prompt_queued_on_a_started_session_runs_with_messages_waiting() {
         &hosted.store,
         &hosted.state.identity.job_id,
         &envelope("m-meanwhile", "while you were queued"),
+        rebon_session_host::AgentMessageReach::Unowned,
         None,
     )
     .unwrap();
@@ -1538,4 +1549,59 @@ fn one_sender_past_its_bounds_cannot_fill_the_queue() {
         AgentMessageDelivery::Queued,
         "another sender is still heard"
     );
+}
+
+/// A handover with a final prompt parks the job, releases the session and then
+/// queues the job to run that prompt. A message admitted in between queued the
+/// job first — it was charged for a turn — but the turn that runs is the final
+/// prompt's: the message rides along in it, admitted and not charged again,
+/// instead of taking the prompt's place.
+#[test]
+fn an_admitted_message_rides_in_the_turn_an_owed_prompt_leads() {
+    use rebon_tool::peer::WakeVerdict;
+
+    let hosted = hosted(BackgroundJobStatus::Idle, "sess-owed-vs-admitted");
+    rewrite(&hosted, |state| {
+        state.identity.prompt = "the final prompt".into();
+        state.identity.prompt_owed = false;
+        state.process.started_at_ms = Some(1);
+    });
+    let reception = rebon_session_host::append_agent_message_to_background_job(
+        &hosted.store,
+        &hosted.state.identity.job_id,
+        &envelope("m-in-between", "while you were handed over"),
+        rebon_session_host::AgentMessageReach::Unowned,
+        None,
+    )
+    .unwrap();
+    assert_eq!(reception.delivery, AgentMessageDelivery::StartedNewTurn);
+    hosted
+        .store
+        .write_roster(&rebon_session_host::BackgroundRoster {
+            supervisor_pid: std::process::id(),
+            supervisor_pid_identity: rebon_session_host::process_identity(std::process::id()),
+            updated_at_ms: now_ms(),
+            jobs: Vec::new(),
+        })
+        .unwrap();
+    rebon_session_host::queue_background_job(
+        &hosted.store,
+        &hosted.state.identity.job_id,
+        std::path::Path::new("./__rebon-test-supervisor-must-not-spawn__"),
+    )
+    .unwrap();
+    assert!(current(&hosted).identity.prompt_owed);
+
+    let claimed = claim(&hosted);
+    assert_eq!(claimed_pending_prompt(&claimed), None);
+    assert_eq!(
+        resolve_background_agent_runtime(&claimed).prompt,
+        "the final prompt"
+    );
+    assert_eq!(claimed.identity.pending_prompts[0].id, "m-in-between");
+    assert_eq!(
+        claimed.identity.pending_prompts[0].wake,
+        WakeVerdict::Admitted
+    );
+    assert_eq!(wakes_spent(&hosted), 1, "charged once");
 }

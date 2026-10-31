@@ -455,13 +455,23 @@ impl SessionHostClient {
                 if let Some(result) = self.deliver_to_foreground(&cwd, session_id, &envelope) {
                     return result;
                 }
+                // Into the record, but only that: a worker woken for it could
+                // not take the session the terminal holds.
                 match job {
-                    Some(job) => self.queue_agent_message_in_job(&job, &envelope),
+                    Some(job) => self.queue_agent_message_in_job(
+                        &job,
+                        &envelope,
+                        crate::AgentMessageReach::QueueOnly,
+                    ),
                     None => Err(HostCallError::ForegroundTerminal),
                 }
             }
             OwnerState::Free => match job {
-                Some(job) => self.queue_agent_message_in_job(&job, &envelope),
+                Some(job) => self.queue_agent_message_in_job(
+                    &job,
+                    &envelope,
+                    crate::AgentMessageReach::Unowned,
+                ),
                 None => Err(HostCallError::OwnerFence(format!(
                     "no running session `{session_id}`"
                 ))),
@@ -534,11 +544,13 @@ impl SessionHostClient {
         &self,
         job: &crate::BackgroundJobState,
         envelope: &crate::AgentMessageEnvelope,
+        reach: crate::AgentMessageReach,
     ) -> Result<crate::AgentMessageResult, HostCallError> {
         let reception = crate::append_agent_message_to_background_job(
             &self.store,
             job.job_id(),
             envelope,
+            reach,
             Some(&self.worker_exe),
         )
         .map_err(|err| HostCallError::Refused(err.to_string()))?;

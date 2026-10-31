@@ -2054,16 +2054,32 @@ fn append_background_pending_prompt(
 /// message refused, or one that joins a turn already running or owed, only
 /// changes the queue: the job keeps its status and its result, and the
 /// message waits for whoever runs the session next.
+///
+/// `reach` says who holds the session: nobody
+/// ([`AgentMessageReach::Unowned`]), or a process that is not the job's owner
+/// ([`AgentMessageReach::QueueOnly`]) — then the job is never woken, since its
+/// worker could not take the session. A job that ended with a parent that was
+/// stopped is not woken either: stopping the parent stopped its work.
 pub fn append_agent_message_to_background_job(
     store: &BackgroundStore,
     job_id: &str,
     envelope: &crate::AgentMessageEnvelope,
+    reach: AgentMessageReach,
     start_supervisor: Option<&Path>,
 ) -> anyhow::Result<AgentMessageReception> {
+    if reach == AgentMessageReach::Owner {
+        anyhow::bail!("a message for a live owner goes over its endpoint, not into its record");
+    }
     let queued_at = now_ms();
     let prompt = PendingPrompt::from_agent_message(envelope, queued_at)?;
     let mut observed = store.read_state(job_id)?;
     store.reconcile_stale_pid(&mut observed)?;
+    let reach =
+        if reach == AgentMessageReach::Unowned && ended_with_a_stopped_parent(store, &observed) {
+            AgentMessageReach::QueueOnly
+        } else {
+            reach
+        };
     let reception = store.update_state(job_id, |state| {
         ensure_background_job_ownership_reusable(state, job_id)?;
         if state.identity.session_id.is_none() {
@@ -2076,7 +2092,7 @@ pub fn append_agent_message_to_background_job(
                 "background job {job_id} is waiting for permission; answer or cancel it before sending another turn"
             );
         }
-        state.receive_agent_message(prompt.clone(), queued_at)
+        state.receive_agent_message(prompt.clone(), reach, queued_at)
     })?;
     let woke = reception.delivery == crate::AgentMessageDelivery::StartedNewTurn;
     if let Some(rebon_exe_path) = start_supervisor.filter(|_| woke) {
@@ -2098,6 +2114,30 @@ pub fn append_agent_message_to_background_job(
         )?;
     }
     Ok(reception)
+}
+
+/// Whether a job sits under a parent that was stopped.
+///
+/// Stopping a parent stops its tree, but a child that had already finished
+/// keeps its own status; what keeps it ended is that its parent is stopped.
+/// Walked up the chain — a grandchild ended with its grandparent too — and
+/// bounded, so a hand-edited cycle cannot spin.
+fn ended_with_a_stopped_parent(store: &BackgroundStore, state: &BackgroundJobState) -> bool {
+    const MAX_DEPTH: usize = 32;
+    let mut parent_id = state.identity.parent_job_id.clone();
+    for _ in 0..MAX_DEPTH {
+        let Some(id) = parent_id else {
+            return false;
+        };
+        let Ok(parent) = store.read_state(&id) else {
+            return false;
+        };
+        if parent.process.status == BackgroundJobStatus::Stopped {
+            return true;
+        }
+        parent_id = parent.identity.parent_job_id;
+    }
+    false
 }
 
 /// Queue a prompt the session's cron scheduler fired, for a running worker to

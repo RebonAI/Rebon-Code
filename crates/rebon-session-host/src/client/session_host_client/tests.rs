@@ -898,6 +898,78 @@ fn an_agent_message_for_a_foreground_terminal_without_a_channel_is_refused() {
     );
 }
 
+/// A live foreground terminal holds the session and offers no channel, but a
+/// job record exists for the session — one a worker ran before the terminal
+/// took it back. The message goes into that record and nowhere else: waking
+/// the job would start a worker that cannot take the session the terminal
+/// holds, wiping the job's result and spending a wake for nothing.
+#[test]
+fn an_agent_message_for_a_foreground_terminal_with_a_job_record_only_joins_its_queue() {
+    let dir = tempfile::Builder::new()
+        .prefix("rebon-client-foreground-job-")
+        .tempdir()
+        .expect("tempdir");
+    let store = BackgroundStore::new(dir.path().join("store"));
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects root");
+    let cwd = "/work/foreground-job";
+    let session_id = "sess-foreground-job";
+    let _lock = rebon_session::try_acquire_session_active_lock(&projects, cwd, session_id)
+        .expect("probe")
+        .expect("free");
+    assert!(crate::write_foreground_status(
+        &projects,
+        &crate::ForegroundSessionStatus {
+            pid: std::process::id(),
+            session_id: session_id.into(),
+            cwd: cwd.into(),
+            heartbeat_ms: crate::now_ms(),
+            busy: false,
+            pending_permission: None,
+            ask_user_questions: None,
+            last_command_id: None,
+            last_command_at_ms: 0,
+            last_command_error: None,
+            recent_command_results: Vec::new(),
+            terminal_id: None,
+            agent_endpoint: None,
+            capabilities: Vec::new(),
+            activity: None,
+        }
+    ));
+    let job_id = message_job(&store, session_id, cwd, BackgroundJobStatus::Succeeded);
+    store
+        .update_state(&job_id, |state| {
+            state.outcome.summary = Some("finished".into());
+            state.outcome.exit_code = Some(0);
+            Ok(())
+        })
+        .expect("the result is recorded");
+
+    let client = SessionHostClient::new(store.clone(), &projects, rebon_exe());
+    assert_eq!(
+        client.send_agent_message(session_id, message_envelope("m-fg-job", "hello")),
+        Ok(crate::AgentMessageResult {
+            outcome: crate::AgentMessageDelivery::Queued,
+            duplicate: false,
+        })
+    );
+    let state = store.read_state(&job_id).expect("the job is still there");
+    assert_eq!(state.process.status, BackgroundJobStatus::Succeeded);
+    assert_eq!(state.outcome.summary.as_deref(), Some("finished"));
+    assert_eq!(state.outcome.exit_code, Some(0));
+    assert_eq!(state.identity.pending_prompts.len(), 1);
+    assert_eq!(
+        state.identity.pending_prompts[0].wake,
+        rebon_tool::peer::WakeVerdict::Unjudged
+    );
+    assert!(state.identity.agent_wakes.is_empty(), "no wake was spent");
+    assert!(
+        !store.roster_path().exists(),
+        "no supervisor is asked for a session a terminal holds"
+    );
+}
+
 /// The rung that exists for exactly this: a live foreground status names a
 /// loopback endpoint, and its answer says where the message landed.
 #[test]

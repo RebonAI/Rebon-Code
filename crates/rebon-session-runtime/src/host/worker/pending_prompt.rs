@@ -130,7 +130,16 @@ pub(crate) fn claim_background_job(
         }
         // A warm-up reads no prompt; whatever waits is decided when it ends.
         let warm_up = current.identity.resume_only;
-        let leads_with_pending = !warm_up && lead_with_ready_prompt(current);
+        // A job queued to run its own prompt runs it: only something a person
+        // (or the scheduler) asked for goes ahead of it. Another session's
+        // message — even one admitted, and charged for a turn that does run —
+        // rides along in that turn instead of taking its place.
+        let leads_with_pending = !warm_up
+            && if current.identity.prompt_owed {
+                lead_with(current, |prompt| !prompt.is_agent_message())
+            } else {
+                lead_with_ready_prompt(current)
+            };
         if !warm_up && !leads_with_pending && !current.owes_its_prompt() {
             // Nothing may lead and the job's prompt is not owed — a record an
             // older build queued for messages alone: warm up instead.
@@ -206,10 +215,16 @@ pub(crate) fn lead_with_turn_driver(state: &mut BackgroundJobState, now_ms: u64)
 /// unclaimed queue; false when there is none. Nothing is judged and nothing
 /// is spent.
 pub(crate) fn lead_with_ready_prompt(state: &mut BackgroundJobState) -> bool {
+    lead_with(state, PendingPrompt::may_lead_turn)
+}
+
+/// Put the first unclaimed prompt `leads` accepts at the head of the unclaimed
+/// queue, the prompts it passes staying in order behind it; false when none.
+fn lead_with(state: &mut BackgroundJobState, leads: impl Fn(&PendingPrompt) -> bool) -> bool {
     let start = first_unclaimed(state);
     let Some(offset) = state.identity.pending_prompts[start..]
         .iter()
-        .position(PendingPrompt::may_lead_turn)
+        .position(leads)
     else {
         return false;
     };

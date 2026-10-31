@@ -216,6 +216,23 @@ impl PendingPrompt {
     }
 }
 
+/// How a message from another session reaches a job, which bounds what it may
+/// do there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentMessageReach {
+    /// Over the endpoint of the job's live owner: a running turn reads it, and
+    /// a parked session may be woken.
+    Owner,
+    /// Written into the record while nobody holds the session: nothing runs
+    /// until a worker comes up, and a parked session may be woken for one.
+    Unowned,
+    /// Written into the record where waking the job would be wrong: another
+    /// process holds the session (a foreground terminal — a worker could not
+    /// take it), or the job ended with the parent that stopped it. The message
+    /// joins the queue, unjudged and uncharged, and nothing else changes.
+    QueueOnly,
+}
+
 /// Where a message from another session landed in a job's queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentMessageReception {
@@ -1516,35 +1533,43 @@ impl BackgroundJobState {
 
     /// Take a message another session sent into this job, deciding where it
     /// lands and whether it starts a turn — the one decision, whichever way
-    /// the message came: over the owner's endpoint, or written into the record
-    /// with no live owner to take it.
+    /// the message came (see [`AgentMessageReach`]).
     ///
     /// A message that would be the reason for a turn — the job is parked, not
-    /// warming up, and not holding a failed prompt for a retry — is judged
-    /// against the wake bounds; admitted, it queues the job, and only then is
-    /// the job's last result cleared, because a turn is about to replace it.
-    /// Anything else is appended unjudged and changes nothing: it joins a
-    /// running turn, rides into one already owed, or waits to be judged when
-    /// the session runs next. A refused message from a sender that already has
+    /// warming up, not holding a failed prompt for a retry, and may be woken
+    /// from where the message came — is judged against the wake bounds;
+    /// admitted, it queues the job, and only then is the job's last result
+    /// cleared, because a turn is about to replace it. Anything else is
+    /// appended unjudged and changes nothing: it joins a running turn, rides
+    /// into one already owed, or waits to be judged when the session runs next.
+    /// A refused message from a sender that already has
     /// [`MAX_WAITING_REFUSED_MESSAGES_PER_SENDER`] refused messages waiting is
     /// not taken at all, so one peer past its bounds cannot crowd out the rest.
     pub fn receive_agent_message(
         &mut self,
         prompt: PendingPrompt,
+        reach: AgentMessageReach,
         now_ms: u64,
     ) -> anyhow::Result<AgentMessageReception> {
         let status = self.process.status;
         let warming = self.identity.resume_only;
-        let running = matches!(
-            status,
-            BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput
-        ) && !warming;
-        let parked = matches!(
-            status,
-            BackgroundJobStatus::Idle
-                | BackgroundJobStatus::Succeeded
-                | BackgroundJobStatus::Failed
-        ) && !self.head_awaits_retry();
+        // Only the live owner has a turn running to read the message: a record
+        // that still says `Running` with no owner behind it is a worker that
+        // died mid-turn, and the message waits like any other.
+        let running = reach == AgentMessageReach::Owner
+            && matches!(
+                status,
+                BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput
+            )
+            && !warming;
+        let parked = reach != AgentMessageReach::QueueOnly
+            && matches!(
+                status,
+                BackgroundJobStatus::Idle
+                    | BackgroundJobStatus::Succeeded
+                    | BackgroundJobStatus::Failed
+            )
+            && !self.head_awaits_retry();
         let sender = match prompt.origin.as_ref() {
             Some(PendingPromptOrigin::AgentMessage {
                 from_session_id, ..
