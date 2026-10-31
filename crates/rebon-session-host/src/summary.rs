@@ -139,7 +139,7 @@ fn tool_status_verb(
     }
 }
 
-fn tool_update_status_label(status: rebon_types::ToolCallStatus) -> &'static str {
+pub(crate) fn tool_update_status_label(status: rebon_types::ToolCallStatus) -> &'static str {
     match status {
         rebon_types::ToolCallStatus::Pending => "tool pending",
         rebon_types::ToolCallStatus::InProgress => "tool running",
@@ -157,10 +157,35 @@ fn tool_update_status_label(status: rebon_types::ToolCallStatus) -> &'static str
 ///
 /// `status` is `None` when the update says nothing about it — a tool call's title
 /// can change without its state changing, which is not the same as finishing.
+///
+/// `title` and `kind` are what the update itself says about which tool this is.
+/// The engine titles a call once, in its announcement, and every later update
+/// about it — running, progress, finished — carries only a status; a caller that
+/// wants the running tool's name keeps them from the announcement and describes
+/// it with [`describe_tool_call`].
 pub(crate) struct ToolCallState<'a> {
     pub(crate) tool_call_id: &'a str,
     pub(crate) status: Option<rebon_types::ToolCallStatus>,
+    pub(crate) title: Option<&'a str>,
+    pub(crate) kind: Option<rebon_types::ToolKind>,
     pub(crate) description: Option<String>,
+}
+
+/// The line a titled tool call is described with.
+///
+/// An announcement carries the tool's kind, which picks a verb ("reading",
+/// "running"); a later update that renames the call does not, and says only
+/// what its status is.
+pub(crate) fn describe_tool_call(
+    status: Option<rebon_types::ToolCallStatus>,
+    kind: Option<rebon_types::ToolKind>,
+    title: &str,
+) -> String {
+    let verb = match (status, kind) {
+        (Some(status), Some(kind)) => tool_status_verb(status, kind),
+        (status, _) => status.map(tool_update_status_label).unwrap_or("tool"),
+    };
+    format!("{verb}: {}", truncate_chars(title.trim(), 96))
 }
 
 pub(crate) fn tool_call_state(update: &rebon_types::SessionUpdate) -> Option<ToolCallState<'_>> {
@@ -174,11 +199,9 @@ pub(crate) fn tool_call_state(update: &rebon_types::SessionUpdate) -> Option<Too
         } => Some(ToolCallState {
             tool_call_id,
             status: Some(*status),
-            description: Some(format!(
-                "{}: {}",
-                tool_status_verb(*status, *kind),
-                truncate_chars(title.trim(), 96)
-            )),
+            title: Some(title.trim()).filter(|title| !title.is_empty()),
+            kind: Some(*kind),
+            description: Some(describe_tool_call(Some(*status), Some(*kind), title)),
         }),
         rebon_types::SessionUpdate::ToolCallUpdate {
             tool_call_id,
@@ -187,12 +210,12 @@ pub(crate) fn tool_call_state(update: &rebon_types::SessionUpdate) -> Option<Too
             raw_output,
             ..
         } => {
-            let description = if let Some(title) = title.as_deref().and_then(non_empty_trimmed) {
-                Some(format!(
-                    "{}: {}",
-                    status.map(tool_update_status_label).unwrap_or("tool"),
-                    truncate_chars(&title, 96)
-                ))
+            let title = title
+                .as_deref()
+                .map(str::trim)
+                .filter(|title| !title.is_empty());
+            let description = if let Some(title) = title {
+                Some(describe_tool_call(*status, None, title))
             } else if let Some(status) = status {
                 Some(tool_update_status_label(*status).to_string())
             } else {
@@ -203,6 +226,8 @@ pub(crate) fn tool_call_state(update: &rebon_types::SessionUpdate) -> Option<Too
             Some(ToolCallState {
                 tool_call_id,
                 status: *status,
+                title,
+                kind: None,
                 description,
             })
         }

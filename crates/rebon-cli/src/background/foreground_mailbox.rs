@@ -593,7 +593,8 @@ mod tests {
     #[test]
     fn status_fingerprint_tracks_the_activity() {
         let idle = foreground_status_fingerprint(true, None, None, None, None);
-        let working = foreground_status_fingerprint(true, None, None, None, Some("Bash cargo test"));
+        let working =
+            foreground_status_fingerprint(true, None, None, None, Some("Bash cargo test"));
         assert_ne!(idle, working);
     }
 
@@ -628,26 +629,71 @@ mod tests {
         // Only the activity moved. The claim is still acknowledged — a caller
         // waits on `true` — but the file keeps the older activity until the
         // rewrite interval has passed.
-        assert!(mailbox.publish(
-            true,
-            None,
-            None,
-            Some("Read crates/rebon-core/src/lib.rs")
-        ));
+        assert!(mailbox.publish(true, None, None, Some("Read crates/rebon-core/src/lib.rs")));
         assert_eq!(read().activity.as_deref(), Some("Bash cargo test"));
 
         // The turn ending is not an activity change, so it writes at once.
-        assert!(mailbox.publish(
-            false,
-            None,
-            None,
-            Some("Read crates/rebon-core/src/lib.rs")
-        ));
+        assert!(mailbox.publish(false, None, None, Some("Read crates/rebon-core/src/lib.rs")));
         let settled = read();
         assert!(!settled.busy);
         assert_eq!(
             settled.activity.as_deref(),
             Some("Read crates/rebon-core/src/lib.rs")
         );
+    }
+
+    /// A held-back activity is a delay, not a loss: with nothing else moving,
+    /// the next publish once the rewrite interval has passed writes it.
+    ///
+    /// The last write is moved into the past rather than waited out, so the test
+    /// states the interval without racing a wall clock.
+    #[test]
+    fn a_held_back_activity_is_written_once_the_rewrite_interval_has_passed() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects_root = dir.path().to_path_buf();
+        std::fs::create_dir_all(&projects_root).unwrap();
+        let cwd = "F:/work/publish-later";
+        let session_id = "sess-publish-later";
+        let mut session = crate::tui::runner::test_support::make_test_tui_session();
+        session.projects_root = projects_root.clone();
+        session.cwd = cwd.into();
+        session.session_id = session_id.into();
+        session.session_active_lock = Some(
+            rebon_session::try_acquire_session_active_lock(&projects_root, cwd, session_id)
+                .expect("the lock probe works")
+                .expect("the session lock is free"),
+        );
+        let mut mailbox = ForegroundMailbox::new(&session);
+        let read = || {
+            rebon_session_host::read_foreground_status(&projects_root, cwd, session_id)
+                .expect("the status was written")
+        };
+        let last_write_ago = |mailbox: &mut ForegroundMailbox, elapsed: Duration| {
+            mailbox.last_status_publish = Some(
+                Instant::now()
+                    .checked_sub(elapsed)
+                    .expect("the clock is past one rewrite interval"),
+            );
+        };
+        let newer = "Read crates/rebon-core/src/lib.rs";
+
+        assert!(mailbox.publish(true, None, None, Some("Bash cargo test")));
+        assert!(mailbox.publish(true, None, None, Some(newer)));
+        assert_eq!(read().activity.as_deref(), Some("Bash cargo test"));
+
+        // Short of the interval, the same activity is still held back.
+        last_write_ago(
+            &mut mailbox,
+            ACTIVITY_REWRITE_INTERVAL - Duration::from_millis(200),
+        );
+        assert!(mailbox.publish(true, None, None, Some(newer)));
+        assert_eq!(read().activity.as_deref(), Some("Bash cargo test"));
+
+        // Past it, with busy unchanged, the held activity is written.
+        last_write_ago(&mut mailbox, ACTIVITY_REWRITE_INTERVAL);
+        assert!(mailbox.publish(true, None, None, Some(newer)));
+        let written = read();
+        assert!(written.busy);
+        assert_eq!(written.activity.as_deref(), Some(newer));
     }
 }

@@ -297,9 +297,17 @@ const ACTIVITY_EVENT_TAIL_LINES: usize = 256;
 /// spawned. Reading those instead answered with whatever a *child* had done last,
 /// which is not what the session is doing.
 ///
-/// The tail is walked newest first and the answer is the most recent tool call
+/// The tail is walked newest first and the running tool is the most recent call
 /// that has not finished. A completed or failed tool is history: past it the
 /// session is thinking or answering, and `None` is the honest answer.
+///
+/// The running call's status is the newest one reported for it, but its name is
+/// further back. The engine titles a call only in its announcement and follows
+/// that at once with an untitled `InProgress` update, which is also the shape of
+/// every progress report, so the newest event about a running tool is almost
+/// never the one that says which tool it is. Once the running call is found the
+/// walk goes on to the event that titled it. An announcement the window no longer
+/// holds leaves the bare status line, which still says a tool is running.
 fn latest_running_tool_activity(store: &BackgroundStore, job_id: &str) -> Option<String> {
     let path = store.events_path(job_id);
     let lines = crate::store::read_tail_lines_bounded(
@@ -309,6 +317,8 @@ fn latest_running_tool_activity(store: &BackgroundStore, job_id: &str) -> Option
     )
     .ok()?;
     let mut settled = HashSet::new();
+    // The running call once found: its id and the newest status reported for it.
+    let mut running: Option<(String, Option<rebon_types::ToolCallStatus>)> = None;
     for line in lines.iter().rev() {
         let Ok(event) = serde_json::from_str::<BackgroundJobEvent>(line) else {
             continue;
@@ -323,38 +333,59 @@ fn latest_running_tool_activity(store: &BackgroundStore, job_id: &str) -> Option
         let Some(state) = crate::summary::tool_call_state(&update.update) else {
             continue;
         };
-        match state.status {
-            // Newest first: a finished call means every earlier event about it
-            // is older news, so it can no longer be the running tool.
-            Some(rebon_types::ToolCallStatus::Completed | rebon_types::ToolCallStatus::Failed) => {
-                settled.insert(state.tool_call_id.to_string());
+        match running.as_mut() {
+            Some((running_id, status)) => {
+                if state.tool_call_id != running_id.as_str() {
+                    continue;
+                }
+                // An update that said nothing about status leaves the call in
+                // the state the one before it reported.
+                if status.is_none() {
+                    *status = state.status;
+                }
+                if let Some(title) = state.title {
+                    return Some(crate::summary::describe_tool_call(
+                        *status, state.kind, title,
+                    ));
+                }
             }
-            Some(
-                rebon_types::ToolCallStatus::Pending | rebon_types::ToolCallStatus::InProgress,
-            ) => {
+            None => {
                 // Newest first: a newer event can already have finished this
                 // call, and a running-looking event that old is not running.
                 if settled.contains(state.tool_call_id) {
                     continue;
                 }
-                return state
-                    .description
-                    .map(|activity| activity.trim().to_string())
-                    .filter(|activity| !activity.is_empty());
-            }
-            // An update that says nothing about status: the call is running
-            // unless a newer event already finished it.
-            None => {
-                if !settled.contains(state.tool_call_id) {
-                    return state
-                        .description
-                        .map(|activity| activity.trim().to_string())
-                        .filter(|activity| !activity.is_empty());
+                // A finished call means every earlier event about it is older
+                // news, so it can no longer be the running tool.
+                if matches!(
+                    state.status,
+                    Some(
+                        rebon_types::ToolCallStatus::Completed
+                            | rebon_types::ToolCallStatus::Failed
+                    )
+                ) {
+                    settled.insert(state.tool_call_id.to_string());
+                    continue;
                 }
+                // Pending, in progress, or silent about status: the call is
+                // running, since no newer event finished it.
+                if let Some(title) = state.title {
+                    return Some(crate::summary::describe_tool_call(
+                        state.status,
+                        state.kind,
+                        title,
+                    ));
+                }
+                running = Some((state.tool_call_id.to_string(), state.status));
             }
         }
     }
-    None
+    running.map(|(_, status)| {
+        crate::summary::tool_update_status_label(
+            status.unwrap_or(rebon_types::ToolCallStatus::InProgress),
+        )
+        .to_string()
+    })
 }
 
 /// Whether a foreground status names a way to take an agent message.
@@ -741,25 +772,18 @@ mod tests {
     fn a_stale_summary_falls_back_to_the_tool_the_session_is_running() {
         let (_dir, store, projects_root) = store_and_projects();
         let job_id = host_job(&store, "sess-stale-summary", "F:/work/stale-summary");
-        store
-            .update_state(&job_id, |state| {
-                state.outcome.summary = Some("an older turn".into());
-                state.outcome.summary_updated_at_ms =
-                    Some(crate::now_ms() - BACKGROUND_SUMMARY_UPDATE_INTERVAL_MS * 3);
-                Ok(())
-            })
-            .unwrap();
-        // A child's finished tool, which is not what this session is doing.
-        append_tool_start_batch(&store, &job_id, "Read crates/rebon-core/src/lib.rs");
         // The session's own running tool.
-        append_tool_call(
+        start_tool(
             &store,
             &job_id,
             "tool-own",
             "Read crates/rebon-session/src/lib.rs",
             rebon_types::ToolKind::Read,
-            Some(rebon_types::ToolCallStatus::InProgress),
         );
+        // A child's tool, logged after it, which is not what this session is
+        // doing.
+        append_tool_start_batch(&store, &job_id, "Read crates/rebon-core/src/lib.rs");
+        age_summary(&store, &job_id);
         let _lock = rebon_session::try_acquire_session_active_lock(
             &projects_root,
             "F:/work/stale-summary",
@@ -783,21 +807,32 @@ mod tests {
     fn a_finished_tool_is_no_longer_the_activity() {
         let (_dir, store, projects_root) = store_and_projects();
         let job_id = host_job(&store, "sess-finished", "F:/work/finished");
-        append_tool_call(
+        start_tool(
             &store,
             &job_id,
             "tool-done",
             "Read crates/rebon-core/src/lib.rs",
             rebon_types::ToolKind::Read,
-            Some(rebon_types::ToolCallStatus::InProgress),
         );
-        append_tool_call(
+        report_tool_progress(&store, &job_id, "tool-done");
+        append_tool_update(
             &store,
             &job_id,
             "tool-done",
-            "Read crates/rebon-core/src/lib.rs",
-            rebon_types::ToolKind::Read,
-            Some(rebon_types::ToolCallStatus::Completed),
+            rebon_types::ToolCallStatus::Completed,
+        );
+        start_tool(
+            &store,
+            &job_id,
+            "tool-failed",
+            "Bash cargo test",
+            rebon_types::ToolKind::Execute,
+        );
+        append_tool_update(
+            &store,
+            &job_id,
+            "tool-failed",
+            rebon_types::ToolCallStatus::Failed,
         );
         // Writing the calls also refreshed the summary; make it stale so the
         // question this test asks is answered by the log and not by the owner.
@@ -838,14 +873,15 @@ mod tests {
                 )
                 .unwrap();
         }
-        append_tool_call(
+        start_tool(
             &store,
             &job_id,
             "tool-recent",
             "crates/rebon-session-host/src/peers.rs",
             rebon_types::ToolKind::Edit,
-            Some(rebon_types::ToolCallStatus::InProgress),
         );
+        report_tool_progress(&store, &job_id, "tool-recent");
+        age_summary(&store, &job_id);
         // The premise, asserted rather than assumed: the file is past the window
         // and the window begins in the middle of a line.
         let path = store.events_path(&job_id);
@@ -899,22 +935,14 @@ mod tests {
     fn a_summary_past_the_freshness_window_gives_way_to_the_fallback() {
         let (_dir, store, projects_root) = store_and_projects();
         let job_id = host_job(&store, "sess-stale-e2e", "F:/work/stale-e2e");
-        store
-            .update_state(&job_id, |state| {
-                state.outcome.summary = Some("an older turn".into());
-                state.outcome.summary_updated_at_ms =
-                    Some(crate::now_ms() - BACKGROUND_SUMMARY_UPDATE_INTERVAL_MS * 3);
-                Ok(())
-            })
-            .unwrap();
-        append_tool_call(
+        start_tool(
             &store,
             &job_id,
             "tool-own",
             "Read crates/rebon-core/src/lib.rs",
             rebon_types::ToolKind::Read,
-            Some(rebon_types::ToolCallStatus::InProgress),
         );
+        age_summary(&store, &job_id);
         let _lock = rebon_session::try_acquire_session_active_lock(
             &projects_root,
             "F:/work/stale-e2e",
@@ -930,6 +958,88 @@ mod tests {
             Some("reading: Read crates/rebon-core/src/lib.rs"),
             "a summary past the window is history; the running tool answers"
         );
+    }
+
+    /// A running tool is named by the announcement that titled it, not by the
+    /// newest event about it.
+    ///
+    /// The engine follows a tool's announcement with an untitled `InProgress`
+    /// update and reports progress the same way, so the newest event about a
+    /// running tool almost never carries its title. Its status says the tool is
+    /// running; the announcement says which tool.
+    #[test]
+    fn a_running_tool_keeps_the_title_its_announcement_gave_it() {
+        let (_dir, store, projects_root) = store_and_projects();
+        let job_id = host_job(&store, "sess-running-tool", "F:/work/running-tool");
+        start_tool(
+            &store,
+            &job_id,
+            "tool-earlier",
+            "Read crates/rebon-core/src/lib.rs",
+            rebon_types::ToolKind::Read,
+        );
+        append_tool_update(
+            &store,
+            &job_id,
+            "tool-earlier",
+            rebon_types::ToolCallStatus::Completed,
+        );
+        start_tool(
+            &store,
+            &job_id,
+            "tool-bash",
+            "Bash cargo test",
+            rebon_types::ToolKind::Execute,
+        );
+        for _ in 0..3 {
+            report_tool_progress(&store, &job_id, "tool-bash");
+        }
+        age_summary(&store, &job_id);
+        let _lock = rebon_session::try_acquire_session_active_lock(
+            &projects_root,
+            "F:/work/running-tool",
+            "sess-running-tool",
+        )
+        .expect("the lock probe works")
+        .expect("the session lock is free");
+
+        let peers = PeerDirectory::new(store, &projects_root).list();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0].activity.as_deref(),
+            Some("running: Bash cargo test"),
+            "the newest status, with the title its announcement carried"
+        );
+    }
+
+    /// A tool whose announcement the tail window no longer holds is still
+    /// running, and says so without a name rather than not at all.
+    #[test]
+    fn a_running_tool_past_the_window_is_reported_without_its_title() {
+        let (_dir, store, projects_root) = store_and_projects();
+        let job_id = host_job(&store, "sess-long-tool", "F:/work/long-tool");
+        start_tool(
+            &store,
+            &job_id,
+            "tool-long",
+            "Bash cargo build",
+            rebon_types::ToolKind::Execute,
+        );
+        for _ in 0..ACTIVITY_EVENT_TAIL_LINES {
+            report_tool_progress(&store, &job_id, "tool-long");
+        }
+        age_summary(&store, &job_id);
+        let _lock = rebon_session::try_acquire_session_active_lock(
+            &projects_root,
+            "F:/work/long-tool",
+            "sess-long-tool",
+        )
+        .expect("the lock probe works")
+        .expect("the session lock is free");
+
+        let peers = PeerDirectory::new(store, &projects_root).list();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].activity.as_deref(), Some("tool running"));
     }
 
     /// Nothing fresh and nothing started: the session is running but has no
@@ -1025,40 +1135,109 @@ mod tests {
         assert_eq!(peers[0].activity, None);
     }
 
-    /// One of the session's own tool-call updates, as the owner logs it.
-    fn append_tool_call(
+    /// One of the session's own updates, logged the way the owner logs it.
+    fn append_session_update(
+        store: &BackgroundStore,
+        job_id: &str,
+        update: rebon_types::SessionUpdate,
+    ) {
+        let session_id = store
+            .read_state(job_id)
+            .unwrap()
+            .identity
+            .session_id
+            .expect("a hosted job names its session");
+        let update = rebon_types::SessionUpdateParams { session_id, update };
+        store
+            .append_session_update_for_turn(job_id, 1, &update)
+            .unwrap();
+    }
+
+    /// A tool starting, in the two events the engine logs for it: the
+    /// announcement, which is `Pending` and carries the title, and straight
+    /// after it an `InProgress` update that carries no title.
+    fn start_tool(
         store: &BackgroundStore,
         job_id: &str,
         tool_call_id: &str,
         title: &str,
         kind: rebon_types::ToolKind,
-        status: Option<rebon_types::ToolCallStatus>,
     ) {
-        let update = rebon_types::SessionUpdateParams {
-            session_id: "sess-tool".into(),
-            update: match status {
-                Some(status) => rebon_types::SessionUpdate::ToolCall {
-                    tool_call_id: tool_call_id.into(),
-                    title: title.into(),
-                    kind,
-                    status,
-                    content: None,
-                    locations: None,
-                    raw_input: None,
-                    raw_output: None,
-                },
-                None => rebon_types::SessionUpdate::ToolCallUpdate {
-                    tool_call_id: tool_call_id.into(),
-                    status: None,
-                    title: Some(title.into()),
-                    content: None,
-                    locations: None,
-                    raw_output: None,
-                },
+        append_session_update(
+            store,
+            job_id,
+            rebon_types::SessionUpdate::ToolCall {
+                tool_call_id: tool_call_id.into(),
+                title: title.into(),
+                kind,
+                status: rebon_types::ToolCallStatus::Pending,
+                content: None,
+                locations: None,
+                raw_input: None,
+                raw_output: None,
             },
-        };
+        );
+        append_tool_update(
+            store,
+            job_id,
+            tool_call_id,
+            rebon_types::ToolCallStatus::InProgress,
+        );
+    }
+
+    /// A running tool's progress report: `InProgress` again, with output and
+    /// no title.
+    fn report_tool_progress(store: &BackgroundStore, job_id: &str, tool_call_id: &str) {
+        append_session_update(
+            store,
+            job_id,
+            rebon_types::SessionUpdate::ToolCallUpdate {
+                tool_call_id: tool_call_id.into(),
+                status: Some(rebon_types::ToolCallStatus::InProgress),
+                title: None,
+                content: None,
+                locations: None,
+                raw_output: Some(
+                    [("elapsedMs".to_string(), serde_json::json!(1_000))]
+                        .into_iter()
+                        .collect(),
+                ),
+            },
+        );
+    }
+
+    /// A status-only update, which is how the engine both marks a call running
+    /// and settles it.
+    fn append_tool_update(
+        store: &BackgroundStore,
+        job_id: &str,
+        tool_call_id: &str,
+        status: rebon_types::ToolCallStatus,
+    ) {
+        append_session_update(
+            store,
+            job_id,
+            rebon_types::SessionUpdate::ToolCallUpdate {
+                tool_call_id: tool_call_id.into(),
+                status: Some(status),
+                title: None,
+                content: None,
+                locations: None,
+                raw_output: None,
+            },
+        );
+    }
+
+    /// Logging the updates refreshed the owner's summary; push it past the
+    /// freshness window so the question a test asks is answered by the log.
+    fn age_summary(store: &BackgroundStore, job_id: &str) {
         store
-            .append_session_update_for_turn(job_id, 1, &update)
+            .update_state(job_id, |state| {
+                state.outcome.summary = Some("an older turn".into());
+                state.outcome.summary_updated_at_ms =
+                    Some(crate::now_ms() - BACKGROUND_SUMMARY_UPDATE_INTERVAL_MS * 3);
+                Ok(())
+            })
             .unwrap();
     }
 
