@@ -5803,6 +5803,9 @@ mod tests {
         let registry = Arc::new(session_registry);
         app.tasks = registry.clone();
         session.engine_half.tasks = registry;
+        // A teammate really answers to `@bob`, so the line would be a direct
+        // message if that check ran first: only the order keeps it here.
+        let bob = insert_running_teammate(&app, "bob", "teammate-bob");
         app.main_agent_view = Some(crate::tui::app::StoredTranscriptView::default());
         app.foregrounded_task_id = Some("agent-1".into());
         app.input = "@bob take the parser".into();
@@ -5831,6 +5834,10 @@ mod tests {
             data.pending_messages,
             vec!["@bob take the parser".to_string()]
         );
+        assert!(
+            teammate_pending_messages(&app, &bob).is_empty(),
+            "the teammate named in the line was not written to"
+        );
         assert!(submitted_prompt(&recorder).is_none());
         assert!(app.input.is_empty());
 
@@ -5847,6 +5854,12 @@ mod tests {
         let recorder = Arc::new(RecordingPromptExecutor::default());
         session.set_test_executor(recorder.clone());
         let mut app = AppState::new();
+        let registry = Arc::new(rebon_plugin_tasks::runtime::TaskRegistry::new());
+        app.tasks = registry.clone();
+        session.engine_half.tasks = registry;
+        // A teammate really answers to `@bob`, so the line would be a direct
+        // message if that check ran first: only the order keeps it here.
+        let bob = insert_running_teammate(&app, "bob", "teammate-bob");
         app.pending_goal_clarification =
             Some(crate::goal::PendingGoalClarification::new("ship it", None));
         let text = "@bob the release gate needs cargo test";
@@ -5869,6 +5882,10 @@ mod tests {
         assert!(
             request.contains("@bob the release gate needs cargo test"),
             "{request}"
+        );
+        assert!(
+            teammate_pending_messages(&app, &bob).is_empty(),
+            "the teammate named in the line was not written to"
         );
         assert!(app.pending_goal_clarification.is_none());
 
@@ -6198,6 +6215,21 @@ mod tests {
 
         drop(active_prompt.take());
         runtime.shutdown_background();
+    }
+
+    /// What a running teammate has been sent and not yet read.
+    fn teammate_pending_messages(app: &AppState, task_id: &str) -> Vec<String> {
+        let snapshot = app
+            .tasks
+            .snapshot(&rebon_plugin_tasks::runtime::TaskId::new(task_id))
+            .expect("teammate task");
+        let rebon_plugin_tasks::runtime::TaskData::InProcessTeammate(data) = &snapshot.data else {
+            panic!("expected teammate");
+        };
+        data.pending_user_messages
+            .iter()
+            .map(|request| request.message.clone())
+            .collect()
     }
 
     /// A teammate registered under `name` and left running, returning its task
