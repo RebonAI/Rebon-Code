@@ -211,7 +211,14 @@ fn claim_handle(projects_root: &Path, handle: &str, session_id: &str) -> std::io
     std::fs::create_dir_all(&dir)?;
     let path = handle_index_path(&dir, handle);
     if let Ok(owner) = std::fs::read_to_string(&path) {
-        return Ok(owner.trim() == session_id);
+        let ours = owner.trim() == session_id;
+        if ours {
+            // An earlier claim of ours that the sidecar never recorded may not
+            // have reached the disk either; make it durable before the sidecar
+            // names it.
+            sync_claim(&path)?;
+        }
+        return Ok(ours);
     }
     // Written beside the index rather than inside it, so a crash between the
     // write and the link cannot leave a partial entry a reader would mistake for
@@ -221,7 +228,7 @@ fn claim_handle(projects_root: &Path, handle: &str, session_id: &str) -> std::io
         std::process::id(),
         monotonic_suffix()
     ));
-    let written = std::fs::write(&staged, session_id.as_bytes());
+    let written = write_durably(&staged, session_id.as_bytes());
     if let Err(error) = written {
         let _ = std::fs::remove_file(&staged);
         return Err(error);
@@ -231,13 +238,44 @@ fn claim_handle(projects_root: &Path, handle: &str, session_id: &str) -> std::io
     // must not survive as a second entry.
     let _ = std::fs::remove_file(&staged);
     match linked {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            // The sidecar is written durably right after this returns. If the
+            // link were still only in the page cache, a power loss could keep
+            // the sidecar and drop the claim, and another session would then
+            // mint the same handle.
+            crate::session_storage::sync_parent_directory(&path);
+            Ok(true)
+        }
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
             let owner = std::fs::read_to_string(&path)?;
-            Ok(owner.trim() == session_id)
+            let ours = owner.trim() == session_id;
+            if ours {
+                sync_claim(&path)?;
+            }
+            Ok(ours)
         }
         Err(error) => Err(error),
     }
+}
+
+/// Write `bytes` to a new file and flush it to disk before returning, so the
+/// name linked to it never publishes an empty or partial claim.
+fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Flush an existing claim and the index directory that names it.
+fn sync_claim(path: &Path) -> std::io::Result<()> {
+    // Write access, because Windows refuses to flush a handle opened read-only.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()?;
+    crate::session_storage::sync_parent_directory(path);
+    Ok(())
 }
 
 /// A per-call suffix that keeps two claims in one process from staging under the
