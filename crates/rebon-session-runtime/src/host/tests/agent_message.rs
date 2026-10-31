@@ -138,6 +138,10 @@ fn a_running_turn_injects_an_agent_message_at_the_next_tool_round() {
     let prompt = &state.identity.pending_prompts[0];
     assert_eq!(prompt.id, "m-running");
     assert_eq!(prompt.text, frame_agent_message(&envelope));
+    assert!(
+        !prompt.typed_by_user(),
+        "another agent's message is not something a person typed"
+    );
     assert_eq!(
         prompt.origin,
         Some(PendingPromptOrigin::AgentMessage {
@@ -276,8 +280,13 @@ fn the_poller_delivers_only_the_teammate_frame_for_an_agent_message() {
         "{blocks:?}"
     );
     assert_eq!(blocks[1], frame_agent_message(&envelope));
-    assert!(blocks[2].ends_with(&frame_agent_message(&envelope)), "{blocks:?}");
-    assert!(!blocks.iter().any(|block| block.contains("<rebon-queued-user-input")));
+    assert!(
+        blocks[2].ends_with(&frame_agent_message(&envelope)),
+        "{blocks:?}"
+    );
+    assert!(!blocks
+        .iter()
+        .any(|block| block.contains("<rebon-queued-user-input")));
     assert_eq!(
         messages[1].content.len(),
         2,
@@ -368,7 +377,11 @@ fn a_message_past_the_hop_bound_waits_in_the_inbox_instead_of_starting_a_turn() 
         BackgroundJobStatus::Idle,
         "the idle job was not woken"
     );
-    assert_eq!(state.identity.pending_prompts.len(), 1, "it is in the inbox");
+    assert_eq!(
+        state.identity.pending_prompts.len(),
+        1,
+        "it is in the inbox"
+    );
 
     state.identity.pending_prompts[0].claimed_turn_generation = Some(state.process.turn_generation);
     assert!(claimed_pending_prompt(&state).is_some_and(PendingPrompt::is_agent_message));
