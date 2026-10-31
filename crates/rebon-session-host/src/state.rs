@@ -128,6 +128,20 @@ pub struct PendingPrompt {
     /// existed stays byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<PendingPromptOrigin>,
+    /// For another session's message: whether this session's wake bounds let
+    /// it start a turn of its own.
+    ///
+    /// Written once it is decided, so every path that may wake the job — the
+    /// worker claiming a turn, a turn ending, a revive, a warm-up — reads the
+    /// same answer: only an admitted message may lead a turn, a refused one
+    /// is never asked again, and an admitted one is never charged twice. Not
+    /// judged yet is the default and is not written, so a record from before
+    /// the field existed is judged by the worker that next claims it.
+    #[serde(
+        default,
+        skip_serializing_if = "rebon_tool::peer::WakeVerdict::is_unjudged"
+    )]
+    pub wake: rebon_tool::peer::WakeVerdict,
 }
 
 impl PendingPrompt {
@@ -151,6 +165,7 @@ impl PendingPrompt {
             claimed_turn_generation: None,
             completed_turn_generation: None,
             origin: None,
+            wake: rebon_tool::peer::WakeVerdict::Unjudged,
         })
     }
 
@@ -169,6 +184,19 @@ impl PendingPrompt {
     /// shown as a queued user message.
     pub fn typed_by_user(&self) -> bool {
         self.origin.is_none()
+    }
+
+    /// Whether this prompt may be the reason a turn starts once its wake is
+    /// decided: anything but another session's message the bounds refused.
+    pub fn may_start_turn(&self) -> bool {
+        !(self.is_agent_message() && self.wake == rebon_tool::peer::WakeVerdict::Refused)
+    }
+
+    /// Whether this prompt may lead a turn without being judged first:
+    /// anything somebody asked for, and another session's message only once
+    /// the bounds admitted it.
+    pub fn may_lead_turn(&self) -> bool {
+        !self.is_agent_message() || self.wake == rebon_tool::peer::WakeVerdict::Admitted
     }
 }
 
@@ -339,6 +367,20 @@ fn recover_pending_prompt_item(value: serde_json::Value, index: usize) -> Option
             None
         }
     };
+    // A verdict this build cannot read is treated as not judged: the worker
+    // judges it again, which may cost a wake but never lets a refused message
+    // start a turn.
+    let wake = match object.remove("wake") {
+        Some(serde_json::Value::Null) | None => rebon_tool::peer::WakeVerdict::Unjudged,
+        Some(value) => serde_json::from_value(value).unwrap_or_else(|error| {
+            tracing::warn!(
+                pending_prompt_index = index,
+                %error,
+                "pending prompt wake verdict is unreadable; it will be judged again"
+            );
+            rebon_tool::peer::WakeVerdict::Unjudged
+        }),
+    };
     // An origin this build cannot read is not treated as "no origin": that
     // would turn another agent's message into user input, which is the one
     // misreading the field exists to prevent. The prompt is dropped instead.
@@ -366,6 +408,7 @@ fn recover_pending_prompt_item(value: serde_json::Value, index: usize) -> Option
         claimed_turn_generation,
         completed_turn_generation,
         origin,
+        wake,
     })
 }
 
@@ -386,6 +429,7 @@ fn recover_pending_prompt_text(text: String, index: usize) -> Option<PendingProm
         claimed_turn_generation: None,
         completed_turn_generation: None,
         origin: None,
+        wake: rebon_tool::peer::WakeVerdict::Unjudged,
     })
 }
 
@@ -1327,6 +1371,36 @@ impl BackgroundJobState {
         !self.identity.pending_prompts.is_empty()
     }
 
+    /// Whether anything waiting may be the reason for a turn.
+    ///
+    /// Not merely whether something waits: another session's message the
+    /// wake bounds refused stays queued for a turn somebody else starts, and
+    /// on its own it is no follow-up to run — reviving, warming or finishing
+    /// a job must not treat it as one.
+    pub fn has_pending_prompts_to_run(&self) -> bool {
+        self.identity
+            .pending_prompts
+            .iter()
+            .any(PendingPrompt::may_start_turn)
+    }
+
+    /// Whether the head of the queue is a prompt a turn already took up and
+    /// did not finish, kept so the next turn retries it.
+    ///
+    /// Another session's message must not be the reason that retry happens: a
+    /// failure that repeats would repeat on every message, while the sender
+    /// was told it had started a turn of its own.
+    pub fn head_awaits_retry(&self) -> bool {
+        !matches!(
+            self.process.status,
+            BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput
+        ) && self
+            .identity
+            .pending_prompts
+            .first()
+            .is_some_and(|prompt| prompt.claimed_turn_generation.is_some())
+    }
+
     pub fn append_pending_prompt(
         &mut self,
         prompt: PendingPrompt,
@@ -1381,18 +1455,23 @@ impl BackgroundJobState {
                 MAX_PENDING_PROMPTS
             );
         }
+        // Only messages still waiting to be read count: one a running turn
+        // has already taken stays in the queue until that turn ends, but it
+        // no longer takes room from what a person types.
         if prompt.is_agent_message()
             && self
                 .identity
                 .pending_prompts
                 .iter()
-                .filter(|waiting| waiting.is_agent_message())
+                .filter(|waiting| {
+                    waiting.is_agent_message() && waiting.claimed_turn_generation.is_none()
+                })
                 .count()
                 >= MAX_PENDING_AGENT_MESSAGES
         {
             anyhow::bail!(
-                "background job {} already holds the maximum of {} messages from other sessions; \
-                 they are delivered with its next turn",
+                "message refused: background job {} already has {} unread messages from other \
+                 sessions waiting, the most it holds; this one was not queued",
                 self.identity.job_id,
                 MAX_PENDING_AGENT_MESSAGES
             );

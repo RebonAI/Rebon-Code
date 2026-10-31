@@ -1342,7 +1342,10 @@ async fn resolve_resume_only_turn(
         let idle_at = now_ms();
         store.update_state(&state.identity.job_id, |current| {
             current.identity.resume_only = false;
-            current.process.status = if current.has_pending_prompts() {
+            // What waited for the warm-up to end decides as anything waiting
+            // does: a message from another session only once the bounds admit
+            // it, a refused one never.
+            current.process.status = if lead_with_turn_driver(current, idle_at) {
                 BackgroundJobStatus::Queued
             } else {
                 BackgroundJobStatus::Idle
@@ -1870,6 +1873,10 @@ async fn execute_background_job_inner(
     {
         return Ok(outcome);
     }
+    // A warmed session goes on to run the prompt claimed after the warm-up,
+    // under that claim's generation; the poller it was built with has to serve
+    // that turn, not the warm-up's.
+    background_pending_prompt_poller.retarget(state);
 
     if turn_cancel.is_cancelled() {
         release_session_keeping_lock(&mut session, handed_back).await;

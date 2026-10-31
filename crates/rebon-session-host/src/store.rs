@@ -2126,6 +2126,12 @@ fn append_pending_prompt_durably(
                 "background job {job_id} is waiting for permission; answer or cancel it before sending another turn"
             );
         }
+        // Another session's message wakes a parked job only for its worker to
+        // judge against the session's wake bounds; it is never the reason a
+        // failed prompt is retried, and it does not turn a queued warm-up into
+        // a turn.
+        let agent_message_waits = prompt.is_agent_message()
+            && (state.head_awaits_retry() || state.process.status == BackgroundJobStatus::Queued);
         let acceptance = state.append_pending_prompt(prompt.clone())?;
         let active = matches!(
             state.process.status,
@@ -2137,7 +2143,7 @@ fn append_pending_prompt_durably(
         if !acceptance.appended {
             return Ok(acceptance);
         }
-        if !active {
+        if !active && !agent_message_waits {
             state.process.status = BackgroundJobStatus::Queued;
             state.outcome.pending_permission = None;
             state.outcome.summary = None;
@@ -2146,7 +2152,9 @@ fn append_pending_prompt_durably(
             state.outcome.exit_code = None;
             state.outcome.error = None;
         }
-        state.identity.resume_only = false;
+        if !prompt.is_agent_message() {
+            state.identity.resume_only = false;
+        }
         state.process.updated_at_ms = queued_at;
         Ok(acceptance)
     })?;

@@ -20,7 +20,9 @@ pub fn warm_background_job_for_peek_in_store(
             || state.process.ipc_port.is_some()
             || state.process.ipc_token.is_some()
             || state.outcome.pending_permission.is_some()
-            || state.has_pending_prompts()
+            // A message the wake bounds refused only waits for a turn somebody
+            // else starts; it does not make the job's next start a turn.
+            || state.has_pending_prompts_to_run()
             || !matches!(
                 state.process.status,
                 BackgroundJobStatus::Idle
@@ -128,6 +130,60 @@ mod tests {
         assert!(loaded.identity.resume_only);
         assert!(loaded.identity.pending_prompts.is_empty());
         assert!(loaded.process.completed_at_ms.is_none());
+    }
+
+    /// Another session's message the wake bounds refused waits for a turn
+    /// somebody else starts; it is no follow-up to run, so it does not stop a
+    /// peek from warming the session. One nobody judged yet may still lead a
+    /// turn, and does.
+    #[test]
+    fn warm_peek_warms_past_a_refused_message_but_not_an_unjudged_one() {
+        let message = |wake| {
+            let mut prompt = crate::PendingPrompt::new(
+                "m-waiting".into(),
+                "<teammate-message>later</teammate-message>".into(),
+                Vec::new(),
+                now_ms(),
+            )
+            .unwrap();
+            prompt.origin = Some(crate::PendingPromptOrigin::AgentMessage {
+                from_session_id: "sess-peer".into(),
+                from_agent: "main".into(),
+                from_handle: None,
+                from_name: None,
+                hops: 9,
+            });
+            prompt.wake = wake;
+            prompt
+        };
+        for (wake, warms) in [
+            (rebon_tool::peer::WakeVerdict::Refused, true),
+            (rebon_tool::peer::WakeVerdict::Unjudged, false),
+        ] {
+            let (_dir, store) = store();
+            let mut state = store
+                .create_job("inspect".into(), PathBuf::from("."), runtime())
+                .unwrap();
+            state.process.status = BackgroundJobStatus::Succeeded;
+            state.identity.session_id = Some("sess-warm-refused".into());
+            state.identity.pending_prompts = vec![message(wake)];
+            store.write_state(&state).unwrap();
+
+            assert_eq!(
+                warm_background_job_for_peek_in_store(
+                    &store,
+                    &state.identity.job_id,
+                    false,
+                    Path::new("rebon")
+                )
+                .unwrap(),
+                warms,
+                "{wake:?}"
+            );
+            let loaded = store.read_state(&state.identity.job_id).unwrap();
+            assert_eq!(loaded.identity.resume_only, warms, "{wake:?}");
+            assert_eq!(loaded.identity.pending_prompts.len(), 1, "{wake:?}");
+        }
     }
 
     #[test]

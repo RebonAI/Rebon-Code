@@ -109,7 +109,14 @@ impl WakeAdmission {
 /// turn already owed, was never going to start anything and is left
 /// [`Self::Unjudged`]; if it outlives that turn unread it is judged before it
 /// may start one, so arriving mid-turn is not a way around the bounds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// A verdict, once reached, is kept: a hosted session writes it into the
+/// message's queue entry, so an admitted message is never charged twice and a
+/// refused one is never asked again. Unjudged is the default and is not
+/// written, so an entry from before the verdict existed reads as not yet
+/// judged — never as admitted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum WakeVerdict {
     /// The bounds admitted it and the wake is already counted: it may start a
     /// turn.
@@ -118,7 +125,15 @@ pub enum WakeVerdict {
     /// else starts — but it may not start one.
     Refused,
     /// Not judged yet: it was going to ride in a turn that existed anyway.
+    #[default]
     Unjudged,
+}
+
+impl WakeVerdict {
+    /// Whether nothing has been decided yet, which is what is left unwritten.
+    pub fn is_unjudged(&self) -> bool {
+        matches!(self, Self::Unjudged)
+    }
 }
 
 impl AgentReplyLedger {

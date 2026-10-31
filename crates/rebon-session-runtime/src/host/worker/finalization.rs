@@ -249,8 +249,9 @@ pub(crate) fn finalize_background_turn_with_completion_evidence(
         // Not merely "something is waiting": a message another session sent
         // while this turn ran, and that the turn never read, was never judged
         // against the wake bounds, and must be before it may start the next
-        // turn. Unadmitted, it waits for a turn somebody else starts.
-        if !retained_incomplete_claim && waiting_prompts_start_a_turn(current, completed_at) {
+        // turn; one refused before stays refused. Unadmitted, it waits for a
+        // turn somebody else starts.
+        if !retained_incomplete_claim && lead_with_turn_driver(current, completed_at) {
             current.process.status = BackgroundJobStatus::Queued;
             current.outcome.summary = Some(outcome.queued_summary().to_string());
             current.process.completed_at_ms = None;

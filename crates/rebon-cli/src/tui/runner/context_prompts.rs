@@ -37,35 +37,55 @@ pub(super) fn drain_model_context_prompts(session: &TuiEngineSession) -> Vec<Str
         .collect()
 }
 
+/// The message from another session an idle turn exists because of, if any:
+/// the last one among `items` that is a reason for the turn. One riding along
+/// (refused a turn of its own, or behind one already owed) is not.
+fn agent_message_turn_reason(items: &[ContextItem]) -> Option<&ContextItem> {
+    items
+        .iter()
+        .rfind(|item| item.may_wake && item.inbound.is_some())
+}
+
 /// Tell the session's ledger whose message the turn about to start is
-/// answering, and say which message that is.
+/// answering.
 ///
 /// A turn started by the prompt the person typed answers nobody, however much
 /// context rides in with it: the reply is the person's, not a link in some other
 /// conversation's chain. Only a turn that exists *because* of an agent message
 /// inherits that message's depth, which is why only the idle-context path calls
 /// this — and why the depth comes from a message that is a reason for the turn.
-/// One riding along (refused a turn of its own, or behind one already owed) is
-/// context here too, and lends the turn nothing.
-///
-/// Returns the id of the message the turn was started for, if it was another
-/// session's: the turn's prompt row is named after it, which is what keeps that
-/// row from reading as something the person typed.
-pub(super) fn stage_inbound_for_context(
-    session: &TuiEngineSession,
-    items: &[ContextItem],
-) -> Option<String> {
-    let reason = items
-        .iter()
-        .rfind(|item| item.may_wake && item.inbound.is_some())?;
-    let (from, hops) = reason.inbound.as_ref()?;
+/// One riding along is context here too, and lends the turn nothing.
+pub(super) fn stage_inbound_for_context(session: &TuiEngineSession, items: &[ContextItem]) {
+    let Some((from, hops)) =
+        agent_message_turn_reason(items).and_then(|reason| reason.inbound.as_ref())
+    else {
+        return;
+    };
     session
         .engine_half
         .runtime
         .mid_turn_queue
         .reply_ledger()
         .stage_inbound(from, *hops);
-    reason.agent_message_id.clone()
+}
+
+/// The uuid an idle turn's prompt row is written under, when that row is
+/// nothing but messages other sessions sent.
+///
+/// Named for the message the turn exists because of, which marks the row as a
+/// runtime attachment rather than the person's words. Only when every piece
+/// of it is another session's message, though: a teammate's message or a
+/// channel notification drained into the same row is no more the person's
+/// words, but it is not another session's either, and hiding it with the
+/// message would take it out of every reader that excerpts the conversation.
+/// Such a row keeps the name an ordinary prompt row gets.
+pub(super) fn agent_message_opening_row_uuid(items: &[ContextItem]) -> Option<String> {
+    if !items.iter().all(|item| item.agent_message_id.is_some()) {
+        return None;
+    }
+    agent_message_turn_reason(items)
+        .and_then(|reason| reason.agent_message_id.as_deref())
+        .map(rebon_core::query::agent_message_row_uuid)
 }
 #[cfg(test)]
 mod tests {
@@ -117,10 +137,11 @@ mod tests {
             )
             .deferred(),
         ];
+        stage_inbound_for_context(&session, &items);
         assert_eq!(
-            stage_inbound_for_context(&session, &items).as_deref(),
-            Some("m-reason"),
-            "the turn is named for the message it was started for"
+            agent_message_opening_row_uuid(&items).as_deref(),
+            Some("u-agent-message-m-reason"),
+            "the turn's row is named for the message it was started for"
         );
         let queue = session.engine_half.runtime.mid_turn_queue.clone();
         let _turn = queue.begin_turn();
@@ -131,5 +152,35 @@ mod tests {
             0,
             "a message that only rode along is not what the turn answers"
         );
+    }
+
+    /// A row that carries anything besides other sessions' messages — here a
+    /// teammate's — is not named for the agent message, so the teammate's text
+    /// stays where readers excerpt the conversation. The turn still answers
+    /// the message it was started for.
+    #[test]
+    fn a_row_shared_with_other_context_is_not_named_for_the_agent_message() {
+        let session = super::super::test_support::make_test_tui_session();
+        let items = [
+            ContextItem::waking(
+                "<teammate-message teammate_id=\"t1\">hi</teammate-message>".into(),
+            ),
+            ContextItem::agent(
+                "m-reason".into(),
+                "started it".into(),
+                "sess-mixed-reason".into(),
+                1,
+            ),
+        ];
+        assert_eq!(agent_message_opening_row_uuid(&items), None);
+        assert_eq!(
+            agent_message_opening_row_uuid(&items[1..]).as_deref(),
+            Some("u-agent-message-m-reason")
+        );
+
+        stage_inbound_for_context(&session, &items);
+        let queue = session.engine_half.runtime.mid_turn_queue.clone();
+        let _turn = queue.begin_turn();
+        assert_eq!(queue.reply_ledger().reply_hops("sess-mixed-reason"), 2);
     }
 }

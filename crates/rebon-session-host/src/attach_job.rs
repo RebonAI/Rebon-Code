@@ -124,7 +124,9 @@ fn revive_background_job(
         // again, the next worker resumes the session and takes up the prompt
         // it was on; with nothing claimed it parks, like a handover.
         BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput => {
-            let has_prompts = state.has_pending_prompts();
+            // A message from another session the wake bounds refused is not a
+            // prompt to resume: with only those waiting, the worker warms up.
+            let has_prompts = state.has_pending_prompts_to_run();
             store.update_state(job_id, |current| {
                 if current.process.process_owner_fenced {
                     anyhow::bail!(
@@ -145,9 +147,13 @@ fn revive_background_job(
         | BackgroundJobStatus::Succeeded
         | BackgroundJobStatus::Failed
         | BackgroundJobStatus::Stopped => {
-            if state.has_pending_prompts() {
+            if state.has_pending_prompts_to_run() {
                 // An accepted follow-up the old worker never ran: queue the
                 // job for real, so the new worker runs it rather than parks.
+                // A message from another session the wake bounds refused is
+                // not one: opening the session must not start the turn it was
+                // refused. The worker judges one nobody judged yet before it
+                // may lead a turn.
                 store.update_state(job_id, |current| {
                     if current.process.process_owner_fenced {
                         anyhow::bail!(
@@ -452,6 +458,63 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|event| event.kind == "worker_revived_for_attach"));
+        }
+    }
+
+    /// A message from another session the wake bounds refused is not a
+    /// follow-up the old worker owed: opening the session must not start the
+    /// turn it was refused. The job is warmed for the person instead — parked
+    /// or mid-turn when its owner died — and the message keeps waiting.
+    #[test]
+    fn attach_does_not_run_a_turn_for_a_refused_message() {
+        for (index, status) in [BackgroundJobStatus::Succeeded, BackgroundJobStatus::Running]
+            .into_iter()
+            .enumerate()
+        {
+            let (dir, store) = store();
+            let mut state = store
+                .create_job("prompt".into(), PathBuf::from("."), runtime())
+                .unwrap();
+            state.process.status = status;
+            let mut refused = pending_prompt(
+                &format!("m-refused-{index}"),
+                "<teammate-message>later</teammate-message>",
+                Vec::new(),
+            );
+            refused.origin = Some(crate::PendingPromptOrigin::AgentMessage {
+                from_session_id: "sess-peer".into(),
+                from_agent: "main".into(),
+                from_handle: None,
+                from_name: None,
+                hops: 9,
+            });
+            refused.wake = rebon_tool::peer::WakeVerdict::Refused;
+            state.identity.pending_prompts = vec![refused];
+            state.identity.session_id = Some(format!("sess-refused-attach-{index}"));
+            state.process.pid = None;
+            state.process.ipc_port = None;
+            state.process.ipc_token = None;
+            store.write_state(&state).unwrap();
+
+            attach_background_job_in_store(
+                &store,
+                &state.identity.job_id,
+                false,
+                &unspawnable_exe(&dir),
+            )
+            .unwrap();
+
+            let loaded = store.read_state(&state.identity.job_id).unwrap();
+            assert_eq!(
+                loaded.process.status,
+                BackgroundJobStatus::Queued,
+                "{status:?}"
+            );
+            assert!(
+                loaded.identity.resume_only,
+                "{status:?}: the worker warms up rather than runs the refused message"
+            );
+            assert_eq!(loaded.identity.pending_prompts.len(), 1, "{status:?}");
         }
     }
 

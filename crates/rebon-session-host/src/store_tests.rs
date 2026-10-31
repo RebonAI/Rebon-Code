@@ -3644,6 +3644,7 @@ fn pending_prompt_writes_and_appends_remain_strict() {
         claimed_turn_generation: None,
         completed_turn_generation: None,
         origin: None,
+        wake: rebon_tool::peer::WakeVerdict::Unjudged,
     }];
     assert!(store.write_state(&invalid_id).is_err());
     assert_eq!(store.read_state(&state.identity.job_id).unwrap(), expected);
@@ -4515,10 +4516,12 @@ fn agent_messages_cannot_fill_the_queue_a_person_types_into() {
         &job_id,
         &agent_message_envelope("m-share-over", "one too many"),
     )
-    .unwrap_err();
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("messages from other sessions"), "{error}");
     assert!(
-        error.to_string().contains("messages from other sessions"),
-        "{error}"
+        error.starts_with("message refused") && error.contains("not queued"),
+        "the sender is told plainly this message was not taken: {error}"
     );
     assert_eq!(store.read_state(&job_id).unwrap(), before);
 
@@ -4533,6 +4536,77 @@ fn agent_messages_cannot_fill_the_queue_a_person_types_into() {
     )
     .unwrap();
     assert!(typed.appended, "the person's prompt still has room");
+}
+
+/// The share counts only messages still waiting to be read. Ones a running
+/// turn has already taken stay queued until that turn ends, but they take no
+/// room from what comes next; and a message past the share is told plainly it
+/// was refused, not that it will be delivered.
+#[test]
+fn agent_messages_a_running_turn_already_took_leave_room_for_more() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.identity.session_id = Some("sess-agent-share-claimed".into());
+    state.process.status = BackgroundJobStatus::Running;
+    state.process.turn_generation = 2;
+    let job_id = state.identity.job_id.clone();
+    store.write_state(&state).unwrap();
+    for index in 0..MAX_PENDING_AGENT_MESSAGES {
+        let envelope = agent_message_envelope(&format!("m-read-{index}"), "read already");
+        append_agent_message_to_background_job(&store, &job_id, &envelope).unwrap();
+    }
+    store
+        .update_state(&job_id, |state| {
+            for prompt in &mut state.identity.pending_prompts {
+                prompt.claimed_turn_generation = Some(2);
+            }
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(
+        append_agent_message_to_background_job(
+            &store,
+            &job_id,
+            &agent_message_envelope("m-after-reads", "one more")
+        )
+        .unwrap()
+        .appended,
+        "the messages the turn took leave room"
+    );
+}
+
+/// A verdict this build cannot read is read as not judged — the worker judges
+/// the message again — never as admitted, and never as dropping the message.
+#[test]
+fn an_unreadable_wake_verdict_reads_as_not_judged() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.identity.session_id = Some("sess-unreadable-wake".into());
+    let job_id = state.identity.job_id.clone();
+    state.identity.pending_prompts = vec![pending_prompt("m-odd", "message", Vec::new())];
+    store.write_state(&state).unwrap();
+    let path = store.state_path(&job_id);
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    raw["pendingPrompts"][0]["wake"] = serde_json::json!("maybe");
+    raw["pendingPrompts"][0]["origin"] = serde_json::json!({
+        "kind": "agentMessage",
+        "fromSessionId": "sess-peer",
+        "fromAgent": "main"
+    });
+    std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
+
+    let loaded = store.read_state(&job_id).unwrap();
+    assert_eq!(loaded.identity.pending_prompts.len(), 1);
+    assert_eq!(
+        loaded.identity.pending_prompts[0].wake,
+        rebon_tool::peer::WakeVerdict::Unjudged
+    );
 }
 
 /// The old atomic writer left `roster.json.<pid>-<seq>.tmp` files beside the

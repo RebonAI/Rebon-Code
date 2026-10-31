@@ -708,7 +708,9 @@ pub(crate) fn transcript_fingerprint(entries: &[rebon_session::TranscriptEntry])
 /// The one thing the record still ends is a turn the owner never announced:
 /// this terminal starts the clock on the user's Enter, and a prompt the
 /// worker refuses before its turn loop ends in the record — terminal status,
-/// nothing queued — with no `Turn` event to close what no event opened.
+/// nothing queued to run — with no `Turn` event to close what no event opened.
+/// A message from another session the wake bounds refused may still be
+/// queued then; it waits for a turn somebody else starts and runs nothing.
 pub(crate) fn sync_turn_with_record(
     remote: &mut crate::background::RemoteBackgroundAttachment,
     state: &rebon_session_host::BackgroundJobState,
@@ -727,7 +729,9 @@ pub(crate) fn sync_turn_with_record(
         } else {
             remote.end_turn();
         }
-    } else if !remote.turn_started_by_stream && !record_says_running && !state.has_pending_prompts()
+    } else if !remote.turn_started_by_stream
+        && !record_says_running
+        && !state.has_pending_prompts_to_run()
     {
         remote.end_turn();
     }
@@ -1756,6 +1760,32 @@ mod tests {
             remote.running_turn_started_at().is_none(),
             "the record ends a turn the stream never announced"
         );
+
+        // The same, while a message the wake bounds refused waits in the
+        // queue: it runs nothing, so it does not keep the turn going.
+        remote.begin_turn(now, false);
+        let mut refused = rebon_session_host::PendingPrompt::new(
+            "m-refused".into(),
+            "<teammate-message teammate_id=\"main@session:sess-peer\">x</teammate-message>".into(),
+            Vec::new(),
+            1,
+        )
+        .unwrap();
+        refused.origin = Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
+            from_session_id: "sess-peer".into(),
+            from_agent: "main".into(),
+            from_handle: None,
+            from_name: None,
+            hops: 9,
+        });
+        refused.wake = rebon_tool::peer::WakeVerdict::Refused;
+        state.identity.pending_prompts = vec![refused];
+        super::sync_turn_with_record(&mut remote, &state, true, now);
+        assert!(
+            remote.running_turn_started_at().is_none(),
+            "a refused message waiting does not keep a refused prompt's turn alive"
+        );
+        state.identity.pending_prompts.clear();
 
         // Typed here, still queued there: the worker has not claimed it yet.
         remote.begin_turn(now, false);

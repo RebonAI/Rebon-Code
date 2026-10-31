@@ -1053,15 +1053,13 @@ fn admit_local_turn(
             // that sender and its reply carries one more hop. Staged before the
             // turn starts, which is what binds it to this turn rather than to
             // whatever runs next.
-            let opened_by =
-                super::context_prompts::stage_inbound_for_context(session, &injected_context);
+            super::context_prompts::stage_inbound_for_context(session, &injected_context);
             // A turn another session's message started writes its prompt row
             // under that message's name, which marks the row as not the
             // person's words. The screen commits no row for this turn, so the
             // prompt it tracks (the `None` beside the request) stays empty.
-            let opening_row_uuid = opened_by
-                .as_deref()
-                .map(rebon_core::query::agent_message_row_uuid);
+            let opening_row_uuid =
+                super::context_prompts::agent_message_opening_row_uuid(&injected_context);
             let injected_context = injected_context
                 .into_iter()
                 .map(|item| item.text)

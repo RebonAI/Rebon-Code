@@ -237,4 +237,79 @@ mod tests {
             None
         );
     }
+
+    /// A respawn drops every claim but keeps what was decided about each
+    /// message from another session: the admitted one that may already have
+    /// led a turn still leads, and a refused one stays refused, in the new job
+    /// and through its round trip on disk.
+    #[test]
+    fn create_respawned_job_keeps_each_messages_wake_verdict() {
+        let (_dir, store) = store();
+        let mut source = store
+            .create_job(
+                "original prompt".into(),
+                PathBuf::from("/repo/project"),
+                BackgroundRuntimeFields {
+                    provider: None,
+                    model: None,
+                    fast_mode: None,
+                    channels: Vec::new(),
+                    development_channels: Vec::new(),
+                    provider_format: None,
+                    ui_mode: None,
+                    effort_level: None,
+                    permission_mode: None,
+                    capability_mode: rebon_types::AgentCapabilityMode::Normal,
+                    settings: Vec::new(),
+                    add_dirs: Vec::new(),
+                    plugin_dirs: Vec::new(),
+                    mcp_configs: Vec::new(),
+                    strict_mcp_config: false,
+                },
+            )
+            .unwrap();
+        let message = |id: &str, wake| {
+            let mut prompt = crate::PendingPrompt::new(
+                id.into(),
+                format!("<teammate-message>{id}</teammate-message>"),
+                Vec::new(),
+                crate::now_ms(),
+            )
+            .unwrap();
+            prompt.origin = Some(crate::PendingPromptOrigin::AgentMessage {
+                from_session_id: "sess-peer".into(),
+                from_agent: "main".into(),
+                from_handle: None,
+                from_name: None,
+                hops: 1,
+            });
+            prompt.wake = wake;
+            prompt
+        };
+        source.identity.session_id = Some("sess-respawn-verdicts".into());
+        source.process.turn_generation = 3;
+        source.identity.pending_prompts = vec![
+            message("m-admitted", rebon_tool::peer::WakeVerdict::Admitted),
+            message("m-refused", rebon_tool::peer::WakeVerdict::Refused),
+        ];
+        source.identity.pending_prompts[0].claimed_turn_generation = Some(3);
+        source.process.status = BackgroundJobStatus::Failed;
+        store.write_state(&source).unwrap();
+
+        let respawned = create_respawned_job(&store, &source).unwrap();
+        let reloaded = store.read_state(&respawned.identity.job_id).unwrap();
+        for job in [&respawned, &reloaded] {
+            assert_eq!(
+                job.identity
+                    .pending_prompts
+                    .iter()
+                    .map(|prompt| (prompt.wake, prompt.claimed_turn_generation))
+                    .collect::<Vec<_>>(),
+                [
+                    (rebon_tool::peer::WakeVerdict::Admitted, None),
+                    (rebon_tool::peer::WakeVerdict::Refused, None)
+                ]
+            );
+        }
+    }
 }

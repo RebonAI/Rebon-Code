@@ -869,3 +869,399 @@ fn a_head_an_earlier_turn_was_claimed_for_is_resumed_before_a_typed_prompt() {
         Some("m-started")
     );
 }
+
+// ---------------------------------------------------------------------------
+// The verdict a message's wake reached is kept on its queue entry, and only an
+// admitted message — or something somebody asked for — may lead a turn,
+// whichever path queued the job.
+// ---------------------------------------------------------------------------
+
+/// Another session's message as it sits in the queue, with a verdict.
+fn waiting_agent_prompt(id: &str, hops: u8, wake: rebon_tool::peer::WakeVerdict) -> PendingPrompt {
+    let mut prompt = pending_prompt(
+        id,
+        &format!("<teammate-message>{id}</teammate-message>"),
+        Vec::new(),
+    );
+    prompt.origin = Some(PendingPromptOrigin::AgentMessage {
+        from_session_id: "sess-sender".into(),
+        from_agent: "main".into(),
+        from_handle: None,
+        from_name: None,
+        hops,
+    });
+    prompt.wake = wake;
+    prompt
+}
+
+/// Rewrite the job record the way a path outside the owner would.
+fn rewrite(hosted: &Hosted, change: impl FnOnce(&mut BackgroundJobState)) {
+    hosted
+        .store
+        .update_state(&hosted.state.identity.job_id, |state| {
+            change(state);
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn current(hosted: &Hosted) -> BackgroundJobState {
+    hosted
+        .store
+        .read_state(&hosted.state.identity.job_id)
+        .unwrap()
+}
+
+/// Spend every wake `sess-sender` has left on this session this hour.
+fn exhaust_wakes(session_id: &str) {
+    let ledger = rebon_tool::peer::session_reply_ledger(session_id);
+    while ledger.admit_wake("sess-sender", 0, now_ms()).is_allowed() {}
+}
+
+/// What reception decided is written on the message, so no later path asks
+/// again: an admitted message is not charged twice, a refused one stays
+/// refused.
+#[test]
+fn the_verdict_reached_at_reception_is_kept_on_the_message() {
+    use rebon_tool::peer::WakeVerdict;
+
+    let idle = hosted(BackgroundJobStatus::Idle, "sess-verdict-kept");
+    let mut deep = envelope("m-deep", "too deep");
+    deep.hops = rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1;
+    deliver(&idle, &deep).unwrap();
+    deliver(&idle, &envelope("m-fresh", "a fresh question")).unwrap();
+    assert_eq!(
+        stored_prompts(&idle)
+            .iter()
+            .map(|prompt| (prompt.id.as_str(), prompt.wake))
+            .collect::<Vec<_>>(),
+        [
+            ("m-deep", WakeVerdict::Refused),
+            ("m-fresh", WakeVerdict::Admitted)
+        ]
+    );
+
+    let running = hosted(BackgroundJobStatus::Running, "sess-verdict-running");
+    deliver(&running, &envelope("m-joined", "while you work")).unwrap();
+    assert_eq!(
+        stored_prompts(&running)[0].wake,
+        WakeVerdict::Unjudged,
+        "joining a running turn decides nothing"
+    );
+}
+
+/// A revive, or a message written while the session had no live owner, can
+/// queue a job whose only waiting prompts were refused a turn. The worker
+/// claiming it must not run a turn for them: it parks the job.
+#[test]
+fn a_job_queued_for_only_refused_messages_parks_instead_of_running_one() {
+    use rebon_tool::peer::WakeVerdict;
+
+    let hosted = hosted(BackgroundJobStatus::Queued, "sess-park-refused");
+    rewrite(&hosted, |state| {
+        state.identity.pending_prompts = vec![waiting_agent_prompt(
+            "m-refused",
+            rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1,
+            WakeVerdict::Refused,
+        )];
+    });
+
+    let claim = claim_background_job(
+        &hosted.store,
+        &hosted.state.identity.job_id,
+        std::process::id(),
+        hosted.ipc.port,
+        &hosted.ipc.token,
+        |_| Some(true),
+    )
+    .unwrap();
+    assert_eq!(claim, WorkerClaim::NoWork);
+    let parked = current(&hosted);
+    assert_eq!(parked.process.status, BackgroundJobStatus::Idle);
+    assert_eq!(
+        parked.identity.pending_prompts.len(),
+        1,
+        "still delivered later"
+    );
+    assert_eq!(
+        parked.identity.pending_prompts[0].wake,
+        WakeVerdict::Refused
+    );
+}
+
+/// A message nobody judged — it was written while the session had no live
+/// owner, or before verdicts were kept — is judged by the worker before it may
+/// lead the turn, and the verdict is written down.
+#[test]
+fn the_worker_judges_a_message_nobody_judged_before_it_may_lead() {
+    use rebon_tool::peer::WakeVerdict;
+
+    let within = hosted(BackgroundJobStatus::Queued, "sess-claim-judges");
+    rewrite(&within, |state| {
+        state.identity.pending_prompts =
+            vec![waiting_agent_prompt("m-unjudged", 1, WakeVerdict::Unjudged)];
+    });
+    let claimed = claim(&within);
+    let head = claimed_pending_prompt(&claimed).expect("the message leads");
+    assert_eq!(head.id, "m-unjudged");
+    assert_eq!(head.wake, WakeVerdict::Admitted);
+
+    let over = hosted(BackgroundJobStatus::Queued, "sess-claim-refuses");
+    exhaust_wakes("sess-claim-refuses");
+    rewrite(&over, |state| {
+        state.identity.pending_prompts =
+            vec![waiting_agent_prompt("m-unjudged", 1, WakeVerdict::Unjudged)];
+    });
+    let claim = claim_background_job(
+        &over.store,
+        &over.state.identity.job_id,
+        std::process::id(),
+        over.ipc.port,
+        &over.ipc.token,
+        |_| Some(true),
+    )
+    .unwrap();
+    assert_eq!(claim, WorkerClaim::NoWork);
+    let parked = current(&over);
+    assert_eq!(parked.process.status, BackgroundJobStatus::Idle);
+    assert_eq!(
+        parked.identity.pending_prompts[0].wake,
+        WakeVerdict::Refused
+    );
+}
+
+/// The store's fallback queues a job for a message without asking any bound.
+/// A message refused earlier is still waiting there; the turn the worker runs
+/// is for the new message once judged, never for the refused one.
+#[test]
+fn a_message_written_without_a_live_owner_does_not_let_a_refused_one_lead() {
+    use rebon_tool::peer::WakeVerdict;
+
+    let hosted = hosted(BackgroundJobStatus::Succeeded, "sess-store-fallback");
+    let mut deep = envelope("m-deep", "too deep");
+    deep.hops = rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1;
+    assert_eq!(
+        result_of(deliver(&hosted, &deep)).outcome,
+        AgentMessageDelivery::Queued
+    );
+    assert_eq!(
+        current(&hosted).process.status,
+        BackgroundJobStatus::Succeeded
+    );
+
+    rebon_session_host::append_agent_message_to_background_job(
+        &hosted.store,
+        &hosted.state.identity.job_id,
+        &envelope("m-later", "a later question"),
+    )
+    .unwrap();
+    assert_eq!(current(&hosted).process.status, BackgroundJobStatus::Queued);
+
+    let claimed = claim(&hosted);
+    let head = claimed_pending_prompt(&claimed).expect("a prompt leads");
+    assert_eq!(head.id, "m-later");
+    assert_eq!(head.wake, WakeVerdict::Admitted);
+    assert_eq!(
+        claimed.identity.pending_prompts[1].wake,
+        WakeVerdict::Refused
+    );
+}
+
+/// A failed turn keeps its prompt for a retry. Another session's message must
+/// not be what retries it — a failure that repeats would repeat on every
+/// message, while the sender was told it started a turn — so the message waits,
+/// unjudged and uncharged, for the turn somebody else starts. That holds for
+/// the store's fallback too.
+#[test]
+fn a_message_to_a_job_holding_a_failed_prompt_for_retry_does_not_retry_it() {
+    use rebon_tool::peer::WakeVerdict;
+
+    let hosted = hosted(BackgroundJobStatus::Failed, "sess-retained-claim");
+    rewrite(&hosted, |state| {
+        let mut failed = pending_prompt("u-failed", "what the person asked", Vec::new());
+        failed.claimed_turn_generation = Some(state.process.turn_generation);
+        state.identity.pending_prompts = vec![failed];
+    });
+
+    assert_eq!(
+        result_of(deliver(
+            &hosted,
+            &envelope("m-during-failure", "are you there")
+        ))
+        .outcome,
+        AgentMessageDelivery::Queued
+    );
+    rebon_session_host::append_agent_message_to_background_job(
+        &hosted.store,
+        &hosted.state.identity.job_id,
+        &envelope("m-fallback", "still there?"),
+    )
+    .unwrap();
+
+    let state = current(&hosted);
+    assert_eq!(
+        state.process.status,
+        BackgroundJobStatus::Failed,
+        "no message re-runs the failed prompt"
+    );
+    assert!(state.identity.pending_prompts[1..]
+        .iter()
+        .all(|prompt| prompt.wake == WakeVerdict::Unjudged));
+    for step in 0..rebon_tool::peer::AGENT_MESSAGE_WAKES_PER_HOUR {
+        assert!(
+            rebon_tool::peer::session_reply_ledger("sess-retained-claim")
+                .admit_wake("sess-sender", 0, now_ms())
+                .is_allowed(),
+            "wake {step}: waiting behind the retry spent nothing"
+        );
+    }
+}
+
+/// A respawned job keeps its queue but loses every claim. An admitted message
+/// at its head — one whose turn may already have written its row — still leads
+/// over a prompt queued after it, so it is resumed rather than injected again
+/// as a passenger under the same row name.
+#[test]
+fn an_admitted_message_at_the_head_leads_over_a_prompt_queued_after_it() {
+    use rebon_tool::peer::WakeVerdict;
+
+    let hosted = hosted(BackgroundJobStatus::Queued, "sess-respawned-head");
+    rewrite(&hosted, |state| {
+        state.identity.pending_prompts = vec![
+            waiting_agent_prompt("m-admitted", 1, WakeVerdict::Admitted),
+            pending_prompt("u-typed-after", "and this", Vec::new()),
+        ];
+    });
+    let claimed = claim(&hosted);
+    assert_eq!(
+        claimed_pending_prompt(&claimed).map(|prompt| prompt.id.as_str()),
+        Some("m-admitted")
+    );
+}
+
+/// An admitted message that rode in a turn another prompt led, and that the
+/// turn ended before reading, leads the next turn on the wake it was already
+/// charged — it is not judged, or charged, again.
+#[test]
+fn an_admitted_message_left_unread_is_not_charged_again() {
+    use rebon_tool::peer::WakeVerdict;
+
+    let session_id = "sess-admitted-unread";
+    let hosted = hosted(BackgroundJobStatus::Running, session_id);
+    rewrite(&hosted, |state| {
+        let mut led = pending_prompt("u-led", "the prompt the turn ran", Vec::new());
+        led.claimed_turn_generation = Some(state.process.turn_generation);
+        state.identity.pending_prompts = vec![
+            led,
+            waiting_agent_prompt("m-admitted", 1, WakeVerdict::Admitted),
+        ];
+    });
+    exhaust_wakes(session_id);
+
+    let claimed = current(&hosted);
+    assert_eq!(
+        finalize_cancelled_background_turn(&hosted.store, &claimed, &hosted.ipc, now_ms()).unwrap(),
+        BackgroundTurnFinalization::Queued,
+        "the message already holds its wake"
+    );
+    let next = current(&hosted);
+    assert_eq!(next.identity.pending_prompts.len(), 1);
+    assert_eq!(next.identity.pending_prompts[0].id, "m-admitted");
+    assert_eq!(next.identity.pending_prompts[0].wake, WakeVerdict::Admitted);
+}
+
+/// A message refused a turn stays refused: a later turn ending with it still
+/// unread does not ask the bounds again, even when they would now admit it.
+#[test]
+fn a_refused_message_is_never_asked_again() {
+    use rebon_tool::peer::WakeVerdict;
+
+    let hosted = hosted(BackgroundJobStatus::Running, "sess-refused-stays");
+    rewrite(&hosted, |state| {
+        state.identity.pending_prompts =
+            vec![waiting_agent_prompt("m-refused", 0, WakeVerdict::Refused)];
+    });
+    let state = current(&hosted);
+    assert_eq!(
+        finalize_completed_background_turn(&hosted.store, &state, &hosted.ipc, "done", now_ms())
+            .unwrap(),
+        BackgroundTurnFinalization::Applied
+    );
+    let finalized = current(&hosted);
+    assert_eq!(finalized.process.status, BackgroundJobStatus::Succeeded);
+    assert_eq!(
+        finalized.identity.pending_prompts[0].wake,
+        WakeVerdict::Refused
+    );
+}
+
+/// A warm-up reads no prompt. A message reaching a warming worker is neither
+/// reported as injected into a turn nor allowed to turn the warm-up into one;
+/// it waits, unjudged, for the warm-up to end.
+#[test]
+fn a_message_reaching_a_warming_worker_leaves_the_warm_up_alone() {
+    use rebon_tool::peer::WakeVerdict;
+
+    for status in [BackgroundJobStatus::Running, BackgroundJobStatus::Queued] {
+        let hosted = hosted(status, &format!("sess-warming-{}", status.as_str()));
+        rewrite(&hosted, |state| state.identity.resume_only = true);
+        assert_eq!(
+            result_of(deliver(&hosted, &envelope("m-warming", "hello"))).outcome,
+            AgentMessageDelivery::Queued,
+            "{status:?}"
+        );
+        let state = current(&hosted);
+        assert!(state.identity.resume_only, "{status:?}: still a warm-up");
+        assert_eq!(
+            state.identity.pending_prompts[0].wake,
+            WakeVerdict::Unjudged
+        );
+    }
+}
+
+/// A warmed session runs its first prompt under the claim after the warm-up.
+/// Its poller, built for the warm-up, must follow: otherwise it owns no turn
+/// and a message sent while that prompt runs is never read by it.
+#[test]
+fn a_warmed_sessions_poller_serves_the_turn_claimed_after_the_warm_up() {
+    let session_id = "sess-warm-poller";
+    let hosted = hosted(BackgroundJobStatus::Queued, session_id);
+    rewrite(&hosted, |state| state.identity.resume_only = true);
+    let warm = claim(&hosted);
+    let poller = BackgroundPendingPromptPoller::new(hosted.store.clone(), &warm, &hosted.ipc);
+
+    // The warm-up ends and the person's prompt is claimed under a new turn.
+    rewrite(&hosted, |state| {
+        state.identity.resume_only = false;
+        state.process.status = BackgroundJobStatus::Queued;
+        state.identity.pending_prompts.push(pending_prompt(
+            "u-first",
+            "the first prompt",
+            Vec::new(),
+        ));
+    });
+    let first = claim(&hosted);
+    assert!(first.process.turn_generation > warm.process.turn_generation);
+    let mid_turn_queue = crate::mid_turn_queue::MidTurnQueuedSubmitPoller::new(session_id);
+    let _turn = mid_turn_queue.begin_turn();
+    let mut during = envelope("m-during", "while the first prompt runs");
+    during.hops = 1;
+    deliver(&hosted, &during).unwrap();
+
+    let poll = || {
+        poller.poll(AttachmentPollRequest::new(
+            session_id,
+            "turn-first",
+            1,
+            AttachmentPollPhase::Regular,
+        ))
+    };
+    assert!(poll().is_empty(), "built for the warm-up, it owns no turn");
+    poller.retarget(&first);
+    assert_eq!(poll().len(), 1, "retargeted, it reads the message");
+    assert_eq!(
+        rebon_tool::peer::session_reply_ledger(session_id).reply_hops("sess-sender"),
+        2,
+        "and the turn answers it"
+    );
+}

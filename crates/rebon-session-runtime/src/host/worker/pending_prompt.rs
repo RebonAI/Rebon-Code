@@ -40,6 +40,14 @@ pub(crate) fn parent_published_this_worker(
 /// Queued job within one poll interval; without this gate each of them
 /// runs a full session — duplicate MCP/analyzer stacks and contention
 /// on the session file (os error 33).
+///
+/// Being queued is not by itself a reason to run: the claim is where every
+/// path that queues a job — a turn ending, a revive, a warm-up ending, a
+/// message written without a live owner — meets the one rule for what may
+/// lead a turn (see [`lead_with_turn_driver`]). With nothing that may, the job
+/// parks and the claim answers `NoWork`. A head an earlier turn was claimed
+/// for is taken up again when it may lead, which is what lets a resumed turn
+/// find its durable row instead of writing a second one.
 pub(crate) fn claim_background_job(
     store: &BackgroundStore,
     job_id: &str,
@@ -112,6 +120,23 @@ pub(crate) fn claim_background_job(
         if current.process.status != BackgroundJobStatus::Queued {
             return Ok(WorkerClaim::NoWork);
         }
+        let claimed_at = now_ms();
+        for prompt in &mut current.identity.pending_prompts {
+            prompt.claimed_turn_generation = None;
+            prompt.completed_turn_generation = None;
+        }
+        // A warm-up reads no prompt; whatever waits is decided when it ends.
+        let warm_up = current.identity.resume_only;
+        if !warm_up && current.has_pending_prompts() && !lead_with_turn_driver(current, claimed_at)
+        {
+            // Everything waiting is another session's message the wake bounds
+            // refused, now or before. Whatever queued the job — a revive, a
+            // message written without a live owner — the job parks instead
+            // of running a turn for one of them.
+            current.process.status = BackgroundJobStatus::Idle;
+            current.process.updated_at_ms = claimed_at;
+            return Ok(WorkerClaim::NoWork);
+        }
         let next_generation = current_owner.turn_generation.wrapping_add(1).max(1);
         current.set_recorded_owner(RecordedOwnerSnapshot::owned(
             my_pid,
@@ -123,27 +148,18 @@ pub(crate) fn claim_background_job(
             next_generation,
         ));
         current.process.status = BackgroundJobStatus::Running;
-        // A head an earlier turn was already claimed for may have a durable
-        // row; it is taken up again rather than passed over.
-        let resumes_head = current
+        if let Some(prompt) = current
             .identity
             .pending_prompts
-            .first()
-            .is_some_and(|prompt| prompt.claimed_turn_generation.is_some());
-        for prompt in &mut current.identity.pending_prompts {
-            prompt.claimed_turn_generation = None;
-            prompt.completed_turn_generation = None;
-        }
-        if !resumes_head {
-            lead_with_turn_driver(&mut current.identity.pending_prompts);
-        }
-        if let Some(prompt) = current.identity.pending_prompts.first_mut() {
+            .first_mut()
+            .filter(|_| !warm_up)
+        {
             prompt.claimed_turn_generation = Some(current.process.turn_generation);
         }
         if current.process.started_at_ms.is_none() {
-            current.process.started_at_ms = Some(now_ms());
+            current.process.started_at_ms = Some(claimed_at);
         }
-        current.process.updated_at_ms = now_ms();
+        current.process.updated_at_ms = claimed_at;
         // A claimed queue head remains durable until finalization. If the
         // worker exits, the next generation can reclaim the same ID and use
         // the transcript UUID to resume without duplicating the user row.
@@ -151,39 +167,60 @@ pub(crate) fn claim_background_job(
     })
 }
 
-/// Move the prompt a turn starting now is for to the head of the queue, where
-/// the claim takes it.
+/// Put the prompt the next turn is for at the head of the queue, where the
+/// claim takes it; false when nothing waiting may start a turn.
 ///
-/// That is the first prompt that is not another session's message — something
-/// a person typed, a cron fire, a report — moved ahead of any such message
-/// waiting before it. That message was either refused a turn of its own or is
-/// riding along with one; either way the turn must not be claimed for it, or a
-/// person's prompt would run as the rider while the message spoke for the turn
-/// (its depth, its origin, no `user_prompt`). The messages it passes stay in
-/// order behind it and reach the turn at its first poll. When every waiting
-/// prompt is another session's message, the head stays the head: that is
-/// where the one admitted to start this turn was put (see
-/// [`lead_agent_messages_with`]).
-fn lead_with_turn_driver(prompts: &mut [PendingPrompt]) {
-    if let Some(driver) = prompts.iter().position(|prompt| !prompt.is_agent_message()) {
-        prompts[..=driver].rotate_right(1);
-    }
+/// The turn is for the first prompt that may lead one: something a person
+/// typed, a cron fire, a report, or another session's message the wake bounds
+/// admitted. Messages from other sessions ahead of it — refused, or never
+/// judged because they arrived while a turn ran or was owed — stay in order
+/// behind it and reach the turn at its first poll as passengers, lending it
+/// neither their origin nor their depth. Only when nothing may lead are the
+/// unjudged ones judged against this session's bounds, in arrival order, and
+/// the first admitted leads. Every verdict reached is written into the
+/// message's entry: an admitted message is never charged again and a refused
+/// one is never asked again, which is how the foreground holds them too.
+///
+/// Claimed prompts keep their place: the claim prefix stays the prefix.
+pub(crate) fn lead_with_turn_driver(state: &mut BackgroundJobState, now_ms: u64) -> bool {
+    let start = state
+        .identity
+        .pending_prompts
+        .iter()
+        .position(|prompt| prompt.claimed_turn_generation.is_none())
+        .unwrap_or(state.identity.pending_prompts.len());
+    let leader = state.identity.pending_prompts[start..]
+        .iter()
+        .position(PendingPrompt::may_lead_turn)
+        .map(|offset| start + offset)
+        .or_else(|| admit_a_waiting_agent_message(state, start, now_ms));
+    let Some(leader) = leader else {
+        return false;
+    };
+    state.identity.pending_prompts[start..=leader].rotate_right(1);
+    true
 }
 
-/// Put the agent message at `index` ahead of every other waiting agent
-/// message, because the bounds admitted it to start a turn and the claim takes
-/// the head. Prompts already claimed keep their place.
-pub(crate) fn lead_agent_messages_with(state: &mut BackgroundJobState, index: usize) {
-    let prompts = &mut state.identity.pending_prompts;
-    let Some(first_waiting) = prompts
-        .iter()
-        .position(|prompt| prompt.is_agent_message() && prompt.claimed_turn_generation.is_none())
-    else {
-        return;
-    };
-    if first_waiting < index {
-        prompts[first_waiting..=index].rotate_right(1);
+/// Judge the messages from other sessions nobody judged yet, from `start` in
+/// arrival order, until the bounds admit one; its index, if any. Each verdict
+/// is kept on the message.
+fn admit_a_waiting_agent_message(
+    state: &mut BackgroundJobState,
+    start: usize,
+    now_ms: u64,
+) -> Option<usize> {
+    for index in start..state.identity.pending_prompts.len() {
+        let prompt = &state.identity.pending_prompts[index];
+        if !prompt.is_agent_message() || !prompt.wake.is_unjudged() {
+            continue;
+        }
+        let verdict = judge_agent_prompt_wake(state, prompt, now_ms);
+        state.identity.pending_prompts[index].wake = verdict;
+        if verdict == rebon_tool::peer::WakeVerdict::Admitted {
+            return Some(index);
+        }
     }
+    None
 }
 
 /// Whether another session's message may start a turn here, judged by this
@@ -211,35 +248,6 @@ pub(crate) fn judge_agent_prompt_wake(
         ),
         None => rebon_tool::peer::WakeVerdict::Admitted,
     }
-}
-
-/// Whether what is still waiting once a turn is over starts another turn.
-///
-/// Anything but another session's message does: somebody asked for it. A
-/// message from another session left waiting was never read by the turn — it
-/// arrived while the turn ran, or rode in one that ended before reaching it —
-/// and joining a turn was never judged against the wake bounds. So it starts a
-/// turn only if the bounds admit it now; the first one they admit leads the
-/// queue so the turn is claimed for it, and the rest ride along. None admitted:
-/// they wait for a turn somebody else starts.
-pub(crate) fn waiting_prompts_start_a_turn(state: &mut BackgroundJobState, now_ms: u64) -> bool {
-    if state
-        .identity
-        .pending_prompts
-        .iter()
-        .any(|prompt| !prompt.is_agent_message())
-    {
-        return true;
-    }
-    for index in 0..state.identity.pending_prompts.len() {
-        let verdict =
-            judge_agent_prompt_wake(state, &state.identity.pending_prompts[index], now_ms);
-        if verdict == rebon_tool::peer::WakeVerdict::Admitted {
-            lead_agent_messages_with(state, index);
-            return true;
-        }
-    }
-    false
 }
 
 /// The uuid of the transcript row a claimed prompt opens its turn with.
@@ -293,7 +301,10 @@ pub(crate) fn background_user_prompt(
 pub(crate) struct BackgroundPendingPromptPoller {
     store: BackgroundStore,
     job_id: String,
-    turn_generation: u64,
+    /// The turn this poller claims for. Moved on by [`Self::retarget`] when a
+    /// warmed session's first prompt is claimed under a later generation than
+    /// the warm-up the session was built for.
+    turn_generation: std::sync::atomic::AtomicU64,
     pid_identity: Option<String>,
     ipc_port: u16,
     ipc_token: String,
@@ -304,7 +315,18 @@ pub(crate) struct BackgroundPendingPromptPoller {
     /// was not started for them: a message another session sent that rides in
     /// a turn somebody typed is context, not something the turn is answering,
     /// and must not lend that turn its depth.
-    passengers: std::collections::HashSet<String>,
+    passengers: Mutex<std::collections::HashSet<String>>,
+}
+
+/// The prompts waiting, unclaimed by its turn, when `state`'s turn was claimed.
+fn turn_passengers(state: &BackgroundJobState) -> std::collections::HashSet<String> {
+    state
+        .identity
+        .pending_prompts
+        .iter()
+        .filter(|prompt| prompt.claimed_turn_generation != Some(state.process.turn_generation))
+        .map(|prompt| prompt.id.clone())
+        .collect()
 }
 
 impl BackgroundPendingPromptPoller {
@@ -316,21 +338,36 @@ impl BackgroundPendingPromptPoller {
         Arc::new(Self {
             store,
             job_id: state.identity.job_id.clone(),
-            turn_generation: state.process.turn_generation,
+            turn_generation: std::sync::atomic::AtomicU64::new(state.process.turn_generation),
             pid_identity: ipc.pid_identity.clone(),
             ipc_port: ipc.port,
             ipc_token: ipc.token.clone(),
             coordinator_report_paths: Mutex::new(std::collections::HashMap::new()),
-            passengers: state
-                .identity
-                .pending_prompts
-                .iter()
-                .filter(|prompt| {
-                    prompt.claimed_turn_generation != Some(state.process.turn_generation)
-                })
-                .map(|prompt| prompt.id.clone())
-                .collect(),
+            passengers: Mutex::new(turn_passengers(state)),
         })
+    }
+
+    fn turn_generation(&self) -> u64 {
+        self.turn_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Serve the turn `state` was claimed for.
+    ///
+    /// A warmed session is built for the warm-up's claim and then runs the
+    /// first prompt under the claim after it. Left on the warm-up's
+    /// generation, the poller would no longer own the turn it runs in — it
+    /// would claim nothing at a tool round — and would take what waited at the
+    /// warm-up for passengers of a turn that had not been claimed yet.
+    pub(crate) fn retarget(&self, state: &BackgroundJobState) {
+        *self
+            .passengers
+            .lock()
+            .expect("background pending prompt passengers poisoned") = turn_passengers(state);
+        self.turn_generation.store(
+            state.process.turn_generation,
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     /// The running turn is reading `prompt`: if another session sent it while
@@ -346,7 +383,12 @@ impl BackgroundPendingPromptPoller {
         else {
             return;
         };
-        if self.passengers.contains(&prompt.id) {
+        if self
+            .passengers
+            .lock()
+            .expect("background pending prompt passengers poisoned")
+            .contains(&prompt.id)
+        {
             return;
         }
         rebon_tool::peer::session_reply_ledger(session_id).note_inbound_now(from_session_id, *hops);
@@ -360,7 +402,7 @@ impl BackgroundPendingPromptPoller {
             false,
             Some(self.ipc_port),
             Some(self.ipc_token.clone()),
-            self.turn_generation,
+            self.turn_generation(),
         );
         state.recorded_owner() == expected_owner
             && state.identity.session_id.as_deref() == Some(session_id)
@@ -391,7 +433,7 @@ impl BackgroundPendingPromptPoller {
             let claimed = state.identity.pending_prompts[first_unclaimed..]
                 .iter_mut()
                 .map(|prompt| {
-                    prompt.claimed_turn_generation = Some(self.turn_generation);
+                    prompt.claimed_turn_generation = Some(self.turn_generation());
                     prompt.clone()
                 })
                 .collect();
@@ -417,7 +459,7 @@ impl BackgroundPendingPromptPoller {
             else {
                 return Ok(None);
             };
-            prompt.claimed_turn_generation = Some(self.turn_generation);
+            prompt.claimed_turn_generation = Some(self.turn_generation());
             let claimed = prompt.clone();
             state.process.updated_at_ms = claimed_at;
             Ok(Some(claimed))
@@ -442,7 +484,7 @@ impl BackgroundPendingPromptPoller {
             else {
                 return Ok(());
             };
-            if prompt.claimed_turn_generation == Some(self.turn_generation) {
+            if prompt.claimed_turn_generation == Some(self.turn_generation()) {
                 prompt.claimed_turn_generation = None;
                 prompt.completed_turn_generation = None;
                 state.process.updated_at_ms = released_at;
@@ -486,7 +528,7 @@ pub(crate) fn spawn_background_steer_pump(
                 Err(error) => {
                     tracing::warn!(
                         job_id = %poller.job_id,
-                        turn_generation = poller.turn_generation,
+                        turn_generation = poller.turn_generation(),
                         %error,
                         "background worker could not claim a pending prompt for steering"
                     );
@@ -653,7 +695,7 @@ impl AttachmentPoller for BackgroundPendingPromptPoller {
                         "pending_prompt_injected",
                         serde_json::json!({
                             "promptId": &prompt.id,
-                            "turnGeneration": self.turn_generation,
+                            "turnGeneration": self.turn_generation(),
                             "iteration": request.next_iteration,
                         }),
                     );
@@ -666,7 +708,7 @@ impl AttachmentPoller for BackgroundPendingPromptPoller {
             Err(error) => {
                 tracing::warn!(
                     job_id = %self.job_id,
-                    turn_generation = self.turn_generation,
+                    turn_generation = self.turn_generation(),
                     %error,
                     "background worker could not claim a pending prompt for mid-turn injection"
                 );

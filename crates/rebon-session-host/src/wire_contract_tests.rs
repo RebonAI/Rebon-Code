@@ -137,6 +137,7 @@ fn fully_populated_job() -> BackgroundJobState {
                 claimed_turn_generation: Some(3),
                 completed_turn_generation: Some(4),
                 origin: None,
+                wake: rebon_tool::peer::WakeVerdict::Unjudged,
             }],
             coordinator_report_grants: vec!["/reports/one.md".to_string()],
             runtime: BackgroundRuntimeFields {

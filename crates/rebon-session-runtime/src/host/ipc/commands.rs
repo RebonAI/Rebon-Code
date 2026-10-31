@@ -354,19 +354,24 @@ pub(crate) fn queue_live_background_agent_message(
     store.update_state(job_id, |state| {
         owner.ensure_matches(state)?;
         let status = state.process.status;
+        // A warm-up reads no prompts: a message that reaches a warming worker
+        // is decided when the warm-up ends, not injected into a turn.
+        let warming = state.identity.resume_only;
         let running = matches!(
             status,
             BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput
-        );
+        ) && !warming;
         // Parked: no turn is running and none is owed, so a turn would start
         // only because of this message. A job whose last turn succeeded or
-        // failed is parked the same as one whose turn was cancelled.
+        // failed is parked the same as one whose turn was cancelled — unless
+        // that failed turn's prompt is kept for a retry, which a message from
+        // another session must not be what sets off.
         let parked = matches!(
             status,
             BackgroundJobStatus::Idle
                 | BackgroundJobStatus::Succeeded
                 | BackgroundJobStatus::Failed
-        );
+        ) && !state.head_awaits_retry();
         // `append_pending_prompt` answers a repeat (`appended: false`) and
         // refuses the same id with different words or a queue already holding
         // its share of agent messages, so it runs before any bound is
@@ -374,14 +379,18 @@ pub(crate) fn queue_live_background_agent_message(
         let acceptance = state.append_pending_prompt(prompt.clone())?;
         appended = acceptance.appended;
         // Only a message that would be the reason for a turn is judged, because
-        // judging spends a wake. A running turn claims it at its next tool
-        // round — a person is watching that turn, and if it ends without
-        // reading the message, finalization judges it then. A `Queued` job
-        // already owes a turn, which this message rides into.
-        wake = parked
-            && appended
-            && judge_agent_prompt_wake(state, &prompt, queued_at)
-                == rebon_tool::peer::WakeVerdict::Admitted;
+        // judging spends a wake. One that joins a running turn, rides into a
+        // turn already queued, or waits behind a warm-up or a retry is left
+        // unjudged: if it outlives that unread, the worker judges it before it
+        // may lead a turn. The verdict is kept on the message so no later path
+        // asks again.
+        if parked && appended {
+            let verdict = judge_agent_prompt_wake(state, &prompt, queued_at);
+            wake = verdict == rebon_tool::peer::WakeVerdict::Admitted;
+            if let Some(stored) = state.identity.pending_prompts.last_mut() {
+                stored.wake = verdict;
+            }
+        }
         delivery = if running {
             rebon_session_host::AgentMessageDelivery::Injected
         } else if wake {
@@ -393,17 +402,9 @@ pub(crate) fn queue_live_background_agent_message(
         if !acceptance.appended {
             return Ok(());
         }
-        if running {
-            state.identity.resume_only = false;
-            state.outcome.summary_updated_at_ms = None;
-            state.process.updated_at_ms = queued_at;
-            return Ok(());
-        }
         if wake {
-            // The turn is claimed for its head; a message refused earlier must
-            // not be what that turn answers.
-            let index = state.identity.pending_prompts.len() - 1;
-            lead_agent_messages_with(state, index);
+            // The claim takes the first prompt that may lead a turn, which is
+            // this one: messages refused before it stay behind it.
             state.process.status = BackgroundJobStatus::Queued;
             state.outcome.pending_permission = None;
             state.outcome.summary = None;
@@ -411,7 +412,8 @@ pub(crate) fn queue_live_background_agent_message(
             state.outcome.exit_code = None;
             state.outcome.error = None;
         }
-        state.identity.resume_only = false;
+        // `resume_only` is left alone: unlike a prompt somebody asked the job
+        // to run, a message does not turn a warm-up into a turn.
         state.outcome.summary_updated_at_ms = None;
         state.process.updated_at_ms = queued_at;
         Ok(())
