@@ -321,6 +321,17 @@ fn submit_after_command_dispatch(
         return false;
     }
 
+    // `@name message` names a reader rather than asking the session anything.
+    // Checked before the turn paths because a direct message starts no turn
+    // here: the recipient runs it, and this session keeps only the receipt.
+    if let Some(direct) =
+        super::direct_message::parse_direct_message(text.trim_end(), Path::new(&session.cwd))
+    {
+        if let Some(done) = deliver_typed_direct_message(app, session, handle, &direct) {
+            return done;
+        }
+    }
+
     if app.foregrounded_task_id.is_some()
         && release_terminal_foreground_agent(app, session.engine_half.tasks.as_ref())
     {
@@ -431,6 +442,46 @@ fn submit_after_command_dispatch(
         app.is_loading = true;
     }
     false
+}
+
+/// Send a typed `@name message` and put the receipt in the transcript.
+///
+/// `None` when the line turned out to be prompt text after all (nothing could
+/// be addressed), so the caller can go on treating it as one. A refusal is a
+/// receipt too: the line is gone from the prompt either way, and leaving it
+/// there would send it to the model on the next Enter.
+fn deliver_typed_direct_message(
+    app: &mut AppState,
+    session: &mut TuiEngineSession,
+    handle: &Handle,
+    direct: &rebon_tui::promptinput::DirectMemberMessage,
+) -> Option<bool> {
+    let delivery = super::direct_message::deliver_direct_message(
+        app,
+        session,
+        handle,
+        &direct.recipient_name,
+        &direct.message,
+    );
+    let (subtype, line) = match &delivery {
+        super::direct_message::DirectDelivery::Refused(reason) => ("error", reason.clone()),
+        super::direct_message::DirectDelivery::Teammate { task_id } => (
+            "info",
+            format!(
+                "Message sent to @{} ({task_id}).",
+                direct.recipient_name
+            ),
+        ),
+        super::direct_message::DirectDelivery::Peer(line) => ("info", line.clone()),
+    };
+    save_to_history_for_session_if_needed(app, session, &format!(
+        "@{} {}",
+        direct.recipient_name, direct.message
+    ));
+    clear_input(app);
+    inject_system_message(app, subtype, &line);
+    app.follow_transcript_tail = true;
+    Some(false)
 }
 
 /// Run the session's `UserPromptSubmit` hook on a prompt the user just

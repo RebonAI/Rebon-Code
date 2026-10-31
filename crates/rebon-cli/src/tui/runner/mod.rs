@@ -27,6 +27,7 @@ mod console_input_batch;
 mod context_prompts;
 pub(crate) mod custom_status_line;
 mod dialog_keys;
+mod direct_message;
 mod event_loop_entry;
 mod footer_navigation;
 mod foreground_agent_submit;
