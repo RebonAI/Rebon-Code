@@ -5793,9 +5793,9 @@ mod tests {
         let recorder = Arc::new(RecordingPromptExecutor::default());
         session.set_test_executor(recorder.clone());
         let mut app = AppState::new();
-        let mut session_registry = rebon_plugin_tasks::runtime::TaskRegistry::new();
+        let session_registry = rebon_plugin_tasks::runtime::TaskRegistry::new();
         insert_local_agent_task(
-            &mut session_registry,
+            &session_registry,
             "agent-1",
             rebon_plugin_tasks::runtime::TaskStatus::Running,
             false,
