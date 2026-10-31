@@ -24,16 +24,35 @@ const SESSION_ID_SHORT_CHARS: usize = 8;
 /// What the card says about a message that is only waiting in a queue.
 const QUEUED_MARKER: &str = " · queued";
 
+/// Fewer columns than this left for a title and the card leaves the title out:
+/// a stub of one letter and an ellipsis names nothing.
+const MIN_TITLE_COLUMNS: usize = 4;
+
+/// What separates the peer from its title.
+const TITLE_SEPARATOR: &str = " — ";
+
 /// Replace everything that would break a single-row card: a newline splits the
 /// row, a `\r` rewinds it, and any other control character is not text at all.
+/// A terminal escape sequence (`ESC [ … m`) goes whole — blanking only its
+/// `ESC` would leave `[31m` on the row as if it were part of the title.
 fn one_line(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| if ch.is_control() { ' ' } else { ch })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut text = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            // Parameter and intermediate bytes, then the one final byte.
+            for next in chars.by_ref() {
+                if !('\u{20}'..='\u{3f}').contains(&next) {
+                    break;
+                }
+            }
+            text.push(' ');
+            continue;
+        }
+        text.push(if ch.is_control() { ' ' } else { ch });
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// How the card names the peer.
@@ -74,14 +93,54 @@ pub fn session_message_display(output: &HashMap<String, Value>, width: usize) ->
         return None;
     }
     let label = peer_label(output)?;
-    let mut line = match non_empty(output, "target_name") {
-        Some(name) => format!("Message sent to {label} — {}", one_line(name)),
-        None => format!("Message sent to {label}"),
+    // A title that was nothing but control characters is no title: it would
+    // leave the separator dangling at the end of the row.
+    let title = non_empty(output, "target_name")
+        .map(one_line)
+        .filter(|title| !title.is_empty());
+    let marker = if non_empty(output, "delivery") == Some(QUEUED_DELIVERY) {
+        QUEUED_MARKER
+    } else {
+        ""
     };
-    if non_empty(output, "delivery") == Some(QUEUED_DELIVERY) {
-        line.push_str(QUEUED_MARKER);
+    Some(fit_card(
+        &format!("Message sent to {label}"),
+        title.as_deref(),
+        marker,
+        width,
+    ))
+}
+
+/// Lay the card out in `width` columns, giving way in order of importance.
+///
+/// The title is remote text of any length and goes first; then the peer is
+/// cut short. The queued marker goes last, because it is the one part that says
+/// the message has not been read yet — a long title must never be what hides it.
+fn fit_card(head: &str, title: Option<&str>, marker: &str, width: usize) -> String {
+    let marker_width = rebon_width::str_width(marker);
+    let fixed_width = rebon_width::str_width(head) + marker_width;
+    if fixed_width > width {
+        if marker_width >= width {
+            return rebon_width::truncate_to_ellipsis(&format!("{head}{marker}"), width);
+        }
+        let head = rebon_width::truncate_to_ellipsis(head, width - marker_width);
+        return format!("{head}{marker}");
     }
-    Some(rebon_width::truncate_to_ellipsis(&line, width))
+    let room = width - fixed_width;
+    let title = title.and_then(|title| {
+        let room = room.checked_sub(rebon_width::str_width(TITLE_SEPARATOR))?;
+        if rebon_width::str_width(title) <= room {
+            Some(title.to_string())
+        } else if room >= MIN_TITLE_COLUMNS {
+            Some(rebon_width::truncate_to_ellipsis(title, room))
+        } else {
+            None
+        }
+    });
+    match title {
+        Some(title) => format!("{head}{TITLE_SEPARATOR}{title}{marker}"),
+        None => format!("{head}{marker}"),
+    }
 }
 
 /// What ctrl+o adds below that line: the sender's own summary, then the first
@@ -290,6 +349,68 @@ mod tests {
         )
         .expect("a session send has a line");
         assert_eq!(line, "Message sent to @repo-qrst — worker · queued");
+    }
+
+    /// The marker is the part that says the message is not read yet, so a long
+    /// title gives way to it rather than the other way round.
+    #[test]
+    fn a_long_title_never_hides_the_queued_marker() {
+        let result = output(json!({
+            "success": true,
+            "mode": "session",
+            "target": "session:abcde-fghij-klmno-pqrst",
+            "target_handle": "repo-qrst",
+            "target_name": "a worker with a title much longer than the terminal row is wide",
+            "delivery": "queued",
+        }));
+        let line = session_message_display(&result, 50).expect("a session send has a line");
+        assert!(
+            line.starts_with("Message sent to @repo-qrst — a worker"),
+            "{line:?}"
+        );
+        assert!(line.ends_with("… · queued"), "{line:?}");
+        assert_eq!(rebon_width::str_width(&line), 50, "{line:?}");
+
+        // Too narrow for any of the title: the label and the marker stay.
+        let line = session_message_display(&result, 38).expect("a session send has a line");
+        assert_eq!(line, "Message sent to @repo-qrst · queued");
+
+        // Too narrow even for the label: the marker outlasts it.
+        let line = session_message_display(&result, 20).expect("a session send has a line");
+        assert!(line.ends_with("… · queued"), "{line:?}");
+        assert_eq!(rebon_width::str_width(&line), 20, "{line:?}");
+    }
+
+    /// A title that is only control characters is no title, not an em dash
+    /// followed by nothing; an escape sequence goes whole, not as `[31m`.
+    #[test]
+    fn a_title_left_empty_by_sanitising_is_no_title() {
+        for name in ["\u{1b}", "\u{7}\r\n", "\u{1b}[31m"] {
+            let line = session_message_display(
+                &output(json!({
+                    "success": true,
+                    "mode": "session",
+                    "target": "session:abcde-fghij-klmno-pqrst",
+                    "target_handle": "repo-qrst",
+                    "target_name": name,
+                })),
+                WIDE,
+            )
+            .expect("a session send has a line");
+            assert_eq!(line, "Message sent to @repo-qrst", "{name:?}");
+        }
+        let line = session_message_display(
+            &output(json!({
+                "success": true,
+                "mode": "session",
+                "target": "session:abcde-fghij-klmno-pqrst",
+                "target_handle": "repo-qrst",
+                "target_name": "\u{1b}[1;31mred\u{1b}[0m title",
+            })),
+            WIDE,
+        )
+        .expect("a session send has a line");
+        assert_eq!(line, "Message sent to @repo-qrst — red title");
     }
 
     /// Every other outcome happened already; only `queued` is still pending.
