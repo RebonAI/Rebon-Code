@@ -17,6 +17,8 @@ pub struct ListPeersTool;
 struct PeerEntry {
     session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     cwd: String,
     kind: String,
@@ -24,18 +26,22 @@ struct PeerEntry {
     reachable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activity: Option<String>,
 }
 
 impl From<PeerInfo> for PeerEntry {
     fn from(peer: PeerInfo) -> Self {
         Self {
             session_id: peer.session_id,
+            handle: peer.handle,
             name: peer.name,
             cwd: peer.cwd,
             kind: peer.kind,
             busy: peer.busy,
             reachable: peer.reachable,
             terminal_id: peer.terminal_id,
+            activity: peer.activity,
         }
     }
 }
@@ -72,8 +78,8 @@ impl Tool for ListPeersTool {
          addressed to one of them with SendMessage `to: \"session:<id>\"`.\n\
          \n\
          ## When to Use This Tool\n\
-         - Before sending to another session when its id is unknown\n\
-         - To find the session id behind a bare name\n\
+         - Before sending to another session when its handle or id is unknown\n\
+         - To find the session behind a bare name, or the handle to send to\n\
          - To see whether a session is busy or cannot accept a message\n\
          \n\
          ## Output\n\
@@ -198,12 +204,14 @@ mod tests {
     fn peer(session_id: &str, reachable: bool) -> PeerInfo {
         PeerInfo {
             session_id: session_id.into(),
+            handle: Some(format!("repo-{session_id}")),
             name: Some(format!("peer-{session_id}")),
             cwd: "C:/work".into(),
             kind: "hosted".into(),
             busy: false,
             reachable,
             terminal_id: Some("term-1".into()),
+            activity: None,
         }
     }
 
@@ -222,6 +230,7 @@ mod tests {
         let peers = output["peers"].as_array().unwrap();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0]["session_id"], json!("other-session"));
+        assert_eq!(peers[0]["handle"], json!("repo-other-session"));
         assert_eq!(peers[0]["kind"], json!("hosted"));
         assert_eq!(peers[0]["terminal_id"], json!("term-1"));
         assert_eq!(

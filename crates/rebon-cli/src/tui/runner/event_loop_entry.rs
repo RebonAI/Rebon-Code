@@ -1063,7 +1063,9 @@ fn session_pipeline(
             && app.resume_dialog.is_none()
             && app.expanding_command.is_none()
             && app.queued_commands.is_empty()
-            && !session.engine_half.session_loop.inbox().has_context()
+            // A message only waiting for a turn somebody else starts is not
+            // one about to start: it must not hold idle work off indefinitely.
+            && !session.engine_half.session_loop.inbox().has_waking_context()
             && app.deferred_internal_submit_payloads.is_empty()
             && session.remote_background_attachment.is_none()
             && session.pending_hosted_session.is_none();
@@ -1090,12 +1092,15 @@ fn session_pipeline(
             suggestion_idle && !session.engine_half.compact_runtime.is_running(),
         );
         sync_permission_view(app, &state.pending_permission);
-        // Publish this session's live status (busy + pending permission) so
-        // the desktop app can render controls for it. Throttled internally.
+        // Publish this session's live status (busy + pending permission + what
+        // the running turn is working on) so the desktop app can render controls
+        // for it. Throttled internally.
+        let activity = super::foreground_mailbox::current_streaming_activity(app);
         foreground_control.publish(
             &state.active_prompt,
             &state.pending_permission,
             app.resume_dialog.is_some(),
+            activity.as_deref(),
         );
         app.sync_task_snapshots(session.engine_half.tasks.snapshots());
         refresh_teams_dialog(app);

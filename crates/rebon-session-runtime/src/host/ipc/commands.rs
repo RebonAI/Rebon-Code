@@ -335,58 +335,22 @@ pub(crate) fn queue_live_background_agent_message(
     envelope: &rebon_session_host::AgentMessageEnvelope,
 ) -> anyhow::Result<AgentMessageAcceptance> {
     let queued_at = now_ms();
-    let mut prompt = PendingPrompt::new(
-        envelope.message_id.clone(),
-        rebon_session_host::frame_agent_message(envelope),
-        Vec::new(),
-        queued_at,
-    )?;
-    prompt.origin = Some(rebon_session_host::PendingPromptOrigin::AgentMessage {
-        from_session_id: envelope.from_session_id.clone(),
-        from_agent: envelope.from_agent.clone(),
-    });
-    let mut delivery = rebon_session_host::AgentMessageDelivery::Queued;
-    let mut appended = false;
-    store.update_state(job_id, |state| {
+    let prompt = PendingPrompt::from_agent_message(envelope, queued_at)?;
+    // Where it lands, and whether the wake bounds — kept in the job record, so
+    // they count the same hour across worker restarts — let it start a turn,
+    // is the one decision the record makes for every way a message arrives.
+    let reception = store.update_state(job_id, |state| {
         owner.ensure_matches(state)?;
-        let status = state.process.status;
-        delivery = if matches!(
-            status,
-            BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput
-        ) {
-            // A running turn claims it at its next tool round.
-            rebon_session_host::AgentMessageDelivery::Injected
-        } else if matches!(
-            status,
-            BackgroundJobStatus::Idle | BackgroundJobStatus::Queued
-        ) {
-            // A parked worker is woken by the status change this write makes.
-            rebon_session_host::AgentMessageDelivery::StartedNewTurn
-        } else {
-            rebon_session_host::AgentMessageDelivery::Queued
-        };
-        let acceptance = state.append_pending_prompt(prompt.clone())?;
-        appended = acceptance.appended;
-        if !acceptance.appended {
-            return Ok(());
-        }
-        if !matches!(
-            status,
-            BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput
-        ) {
-            state.process.status = BackgroundJobStatus::Queued;
-            state.outcome.pending_permission = None;
-            state.outcome.summary = None;
-            state.process.completed_at_ms = None;
-            state.outcome.exit_code = None;
-            state.outcome.error = None;
-        }
-        state.identity.resume_only = false;
-        state.outcome.summary_updated_at_ms = None;
-        state.process.updated_at_ms = queued_at;
-        Ok(())
+        state.receive_agent_message(
+            prompt.clone(),
+            rebon_session_host::AgentMessageReach::Owner,
+            queued_at,
+        )
     })?;
-    Ok(AgentMessageAcceptance { delivery, appended })
+    Ok(AgentMessageAcceptance {
+        delivery: reception.delivery,
+        appended: reception.acceptance.appended,
+    })
 }
 
 /// The queue mutation is shared by delivery acknowledgements and ACP turns.

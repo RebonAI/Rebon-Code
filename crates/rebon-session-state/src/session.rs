@@ -817,6 +817,18 @@ impl ServerState {
         match try_acquire_session_active_lock(projects_root, cwd, sid) {
             Ok(Some(lock)) => {
                 locks.insert(sid.to_string(), lock);
+                drop(locks);
+                // The process that holds the lock is the session's owner, and
+                // an owner is the only thing allowed to name it. A session made
+                // before handles existed gets one here, on the first resume.
+                if let Err(error) = rebon_session::ensure_session_handle(projects_root, cwd, sid) {
+                    tracing::warn!(
+                        session_id = %sid,
+                        cwd = %cwd,
+                        %error,
+                        "rebon: could not claim a handle for this session"
+                    );
+                }
                 Ok(())
             }
             Ok(None) => Err(SessionOwner {

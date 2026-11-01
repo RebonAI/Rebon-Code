@@ -425,9 +425,20 @@ pub struct AgentMessageParams {
     pub from_agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_cwd: Option<String>,
+    /// The sender's handle, when its owner claimed one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_handle: Option<String>,
+    /// The sender's display name, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     pub text: String,
+    /// How many cross-session hand-offs this message has already made.
+    /// Defaulted so a peer from before the field existed reads as a first
+    /// message, and skipped at zero so a first message's bytes are unchanged.
+    #[serde(default, skip_serializing_if = "crate::agent_message::hops_is_zero")]
+    pub hops: u8,
 }
 
 /// Whether a waiter was actually let go.
@@ -619,8 +630,11 @@ pub fn method_and_params(
             from_session_id,
             from_agent,
             from_cwd,
+            from_handle,
+            from_name,
             summary,
             text,
+            hops,
         } => (
             method::AGENT_MESSAGE,
             serde_json::json!({
@@ -628,8 +642,11 @@ pub fn method_and_params(
                 "fromSessionId": from_session_id,
                 "fromAgent": from_agent,
                 "fromCwd": from_cwd,
+                "fromHandle": from_handle,
+                "fromName": from_name,
                 "summary": summary,
                 "text": text,
+                "hops": hops,
             }),
         ),
         R::Subscribe { since } => (method::SUBSCRIBE, serde_json::json!({ "since": since })),

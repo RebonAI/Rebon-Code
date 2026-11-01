@@ -374,7 +374,6 @@ fn render_user_block(
                 timestamp: timestamp.clone(),
                 github_webhooks_enabled: false,
                 fork_subagent_enabled: false,
-                uds_inbox_enabled: false,
                 channels_enabled: false,
                 agent_swarms_enabled: true,
             });

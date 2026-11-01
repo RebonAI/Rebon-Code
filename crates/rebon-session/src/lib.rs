@@ -29,9 +29,15 @@ pub mod held_lock;
 pub mod memory_paths;
 pub mod model_selection;
 pub mod scratchpad;
+pub mod session_handle;
 pub mod session_storage;
 
 pub use scratchpad::{remove_scratchpad_for, scratchpad_dir_for};
+
+pub use session_handle::{
+    ensure_session_handle, handle_project_slug, load_session_handle, session_handle_candidate,
+    SESSION_HANDLE_INDEX_DIR, SESSION_HANDLE_SLUG_CHARS, SESSION_HANDLE_TAIL_CHARS,
+};
 
 pub use config_home::{config_home_with_env, platform_home_dir, platform_home_with_env};
 

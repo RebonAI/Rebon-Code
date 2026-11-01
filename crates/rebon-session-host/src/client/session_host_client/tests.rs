@@ -723,8 +723,11 @@ fn message_envelope(message_id: &str, text: &str) -> crate::AgentMessageEnvelope
         from_session_id: "sess-sender".into(),
         from_agent: "main".into(),
         from_cwd: Some("F:/work/sender".into()),
+        from_handle: None,
+        from_name: None,
         summary: Some("handoff".into()),
         text: text.into(),
+        hops: 0,
     }
 }
 
@@ -749,11 +752,13 @@ fn message_job(
     job_id
 }
 
-/// A free session with a job record has no worker to hand the message to, so
-/// the message waits in the durable queue. It must not start a worker: a
-/// message is not a turn somebody asked for.
+/// A free session with a job record has no worker to hand the message to. The
+/// message is judged against the wake bounds the record keeps, as the owner
+/// would judge it: within them it queues the job and makes sure of a
+/// supervisor, so a worker comes up to answer — a hosted session can be woken
+/// by another session's message even after its worker left.
 #[test]
-fn an_agent_message_for_a_free_session_with_a_job_is_queued() {
+fn an_agent_message_for_a_free_session_with_a_job_wakes_it_within_the_bounds() {
     let dir = tempfile::Builder::new()
         .prefix("rebon-client-message-")
         .tempdir()
@@ -761,6 +766,7 @@ fn an_agent_message_for_a_free_session_with_a_job_is_queued() {
     let store = BackgroundStore::new(dir.path().join("store"));
     let projects = dir.path().join("projects");
     std::fs::create_dir_all(&projects).expect("projects root");
+    seed_live_supervisor(&store);
     let job_id = message_job(
         &store,
         "sess-message",
@@ -773,7 +779,7 @@ fn an_agent_message_for_a_free_session_with_a_job_is_queued() {
     assert_eq!(
         client.send_agent_message("sess-message", envelope.clone()),
         Ok(crate::AgentMessageResult {
-            outcome: crate::AgentMessageDelivery::Queued,
+            outcome: crate::AgentMessageDelivery::StartedNewTurn,
             duplicate: false,
         })
     );
@@ -784,16 +790,16 @@ fn an_agent_message_for_a_free_session_with_a_job_is_queued() {
     let prompt = &reloaded.identity.pending_prompts[0];
     assert_eq!(prompt.id, "m-queue");
     assert_eq!(prompt.text, crate::frame_agent_message(&envelope));
+    assert_eq!(prompt.wake, rebon_tool::peer::WakeVerdict::Admitted);
     assert_eq!(
         prompt.origin,
         Some(crate::PendingPromptOrigin::AgentMessage {
             from_session_id: "sess-sender".into(),
             from_agent: "main".into(),
+            from_handle: None,
+            from_name: None,
+            hops: 0,
         })
-    );
-    assert!(
-        !store.roster_path().exists(),
-        "queueing a message must not publish a supervisor roster"
     );
 
     assert_eq!(
@@ -803,6 +809,46 @@ fn an_agent_message_for_a_free_session_with_a_job_is_queued() {
             duplicate: true,
         }),
         "a retry is answered without a second delivery"
+    );
+}
+
+/// Past the bounds the message only joins the queue: the free session is not
+/// woken, no supervisor is asked for, and the job keeps its status.
+#[test]
+fn an_agent_message_for_a_free_session_past_the_bounds_waits() {
+    let dir = tempfile::Builder::new()
+        .prefix("rebon-client-message-")
+        .tempdir()
+        .expect("tempdir");
+    let store = BackgroundStore::new(dir.path().join("store"));
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects root");
+    let job_id = message_job(
+        &store,
+        "sess-message-deep",
+        "/work/message",
+        BackgroundJobStatus::Idle,
+    );
+    let client = SessionHostClient::new(store.clone(), &projects, rebon_exe());
+    let mut envelope = message_envelope("m-deep", "the fifth hand-off");
+    envelope.hops = rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1;
+
+    assert_eq!(
+        client.send_agent_message("sess-message-deep", envelope),
+        Ok(crate::AgentMessageResult {
+            outcome: crate::AgentMessageDelivery::Queued,
+            duplicate: false,
+        })
+    );
+    let reloaded = store.read_state(&job_id).expect("the job is still there");
+    assert_eq!(reloaded.process.status, BackgroundJobStatus::Idle);
+    assert_eq!(
+        reloaded.identity.pending_prompts[0].wake,
+        rebon_tool::peer::WakeVerdict::Refused
+    );
+    assert!(
+        !store.roster_path().exists(),
+        "a refused message asks for no supervisor"
     );
 }
 
@@ -841,6 +887,7 @@ fn an_agent_message_for_a_foreground_terminal_without_a_channel_is_refused() {
             terminal_id: None,
             agent_endpoint: None,
             capabilities: Vec::new(),
+            activity: None,
         }
     ));
 
@@ -848,6 +895,78 @@ fn an_agent_message_for_a_foreground_terminal_without_a_channel_is_refused() {
     assert_eq!(
         client.send_agent_message(session_id, message_envelope("m-fg", "hello")),
         Err(HostCallError::ForegroundTerminal)
+    );
+}
+
+/// A live foreground terminal holds the session and offers no channel, but a
+/// job record exists for the session — one a worker ran before the terminal
+/// took it back. The message goes into that record and nowhere else: waking
+/// the job would start a worker that cannot take the session the terminal
+/// holds, wiping the job's result and spending a wake for nothing.
+#[test]
+fn an_agent_message_for_a_foreground_terminal_with_a_job_record_only_joins_its_queue() {
+    let dir = tempfile::Builder::new()
+        .prefix("rebon-client-foreground-job-")
+        .tempdir()
+        .expect("tempdir");
+    let store = BackgroundStore::new(dir.path().join("store"));
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(&projects).expect("projects root");
+    let cwd = "/work/foreground-job";
+    let session_id = "sess-foreground-job";
+    let _lock = rebon_session::try_acquire_session_active_lock(&projects, cwd, session_id)
+        .expect("probe")
+        .expect("free");
+    assert!(crate::write_foreground_status(
+        &projects,
+        &crate::ForegroundSessionStatus {
+            pid: std::process::id(),
+            session_id: session_id.into(),
+            cwd: cwd.into(),
+            heartbeat_ms: crate::now_ms(),
+            busy: false,
+            pending_permission: None,
+            ask_user_questions: None,
+            last_command_id: None,
+            last_command_at_ms: 0,
+            last_command_error: None,
+            recent_command_results: Vec::new(),
+            terminal_id: None,
+            agent_endpoint: None,
+            capabilities: Vec::new(),
+            activity: None,
+        }
+    ));
+    let job_id = message_job(&store, session_id, cwd, BackgroundJobStatus::Succeeded);
+    store
+        .update_state(&job_id, |state| {
+            state.outcome.summary = Some("finished".into());
+            state.outcome.exit_code = Some(0);
+            Ok(())
+        })
+        .expect("the result is recorded");
+
+    let client = SessionHostClient::new(store.clone(), &projects, rebon_exe());
+    assert_eq!(
+        client.send_agent_message(session_id, message_envelope("m-fg-job", "hello")),
+        Ok(crate::AgentMessageResult {
+            outcome: crate::AgentMessageDelivery::Queued,
+            duplicate: false,
+        })
+    );
+    let state = store.read_state(&job_id).expect("the job is still there");
+    assert_eq!(state.process.status, BackgroundJobStatus::Succeeded);
+    assert_eq!(state.outcome.summary.as_deref(), Some("finished"));
+    assert_eq!(state.outcome.exit_code, Some(0));
+    assert_eq!(state.identity.pending_prompts.len(), 1);
+    assert_eq!(
+        state.identity.pending_prompts[0].wake,
+        rebon_tool::peer::WakeVerdict::Unjudged
+    );
+    assert!(state.identity.agent_wakes.is_empty(), "no wake was spent");
+    assert!(
+        !store.roster_path().exists(),
+        "no supervisor is asked for a session a terminal holds"
     );
 }
 
@@ -889,6 +1008,7 @@ fn an_agent_message_reaches_a_foreground_agent_endpoint() {
             // Deliberately no capability: the endpoint rung must work on its
             // own, not because the mailbox happens to be advertised too.
             capabilities: Vec::new(),
+            activity: None,
         }
     ));
 
@@ -943,6 +1063,7 @@ fn an_agent_message_uses_the_capability_mailbox_rung() {
             terminal_id: None,
             agent_endpoint: None,
             capabilities: vec![crate::AGENT_MESSAGE_CAPABILITY.to_string()],
+            activity: None,
         }
     ));
 

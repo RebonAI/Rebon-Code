@@ -44,7 +44,7 @@ use rebon_session_host::{
 use crate::background::{
     command_was_already_resolved, is_compact_command, validate_question_answer,
 };
-use crate::session::session_inbox::ContextSource;
+use crate::session::mid_turn_queue::DeferredAgentMessage;
 use crate::session_shell::session_command_inputs_from_app;
 use crate::tui::app::AppState;
 use crate::tui::permission_modal::{PendingPermission, PermissionKind, PermissionModalAction};
@@ -172,7 +172,9 @@ impl ForegroundControl {
         Self {
             mailbox: crate::background::ForegroundMailbox::new(session),
             command_handler: None,
-            agent_inbox: Arc::new(rebon_session_host::ForegroundAgentInbox::new()),
+            agent_inbox: Arc::new(rebon_session_host::ForegroundAgentInbox::for_session(
+                &session.session_id,
+            )),
             agent_endpoint: None,
             agent_endpoint_session: None,
         }
@@ -184,15 +186,17 @@ impl ForegroundControl {
 
     /// Publish the status sidecar for what is on screen right now.
     ///
-    /// The mailbox is told three facts rather than shown the screen: whether a
-    /// turn is running, the pending permission as a background snapshot, and the
-    /// questions an interactive prompt is asking. Reading those off the screen is
-    /// the terminal's job; writing the file is not.
+    /// The mailbox is told four facts rather than shown the screen: whether a
+    /// turn is running, the pending permission as a background snapshot, the
+    /// questions an interactive prompt is asking, and what the running turn is
+    /// working on. Reading those off the screen is the terminal's job; writing
+    /// the file is not.
     pub(super) fn publish(
         &mut self,
         active_prompt: &Option<ActivePrompt>,
         pending_permission: &Option<PendingPermission>,
         paused: bool,
+        activity: Option<&str>,
     ) -> bool {
         let busy = active_prompt.is_some();
         // The listener answers a sender before the event loop can act, so it
@@ -212,6 +216,7 @@ impl ForegroundControl {
             busy,
             pending_snapshot.as_ref(),
             ask_user_questions.as_deref(),
+            activity,
         )
     }
 
@@ -234,6 +239,9 @@ impl ForegroundControl {
         {
             return;
         }
+        // The inbox outlives a session switch but its bounds must not: what the
+        // old session had been told says nothing about the new one.
+        self.agent_inbox.set_session(&identity.2);
         self.stop_agent_endpoint();
         // Remembered even when start fails: retrying every event-loop pass
         // would bind and discard a port each time, and the mailbox capability
@@ -273,38 +281,51 @@ impl ForegroundControl {
     /// running turn never reached — it ended first, or it is an external agent
     /// with no tool rounds at all — comes back out through
     /// `take_pending_agent_messages` and joins the same idle path.
+    ///
+    /// A message the listener accepted but refused a turn of its own goes into
+    /// the inbox without being a reason to start one: it rides into the next
+    /// turn somebody else starts. Dropping it instead would lose a message the
+    /// sender was told had been accepted. One that only joined a running turn
+    /// was never judged; if it comes back unread, the inbox judges it before it
+    /// may start a turn, so writing while a turn runs is no way past the bounds.
     fn apply_pending_agent_messages(
         &self,
         session: &TuiEngineSession,
         active_prompt: &Option<ActivePrompt>,
     ) {
-        let pending = self.agent_inbox.take_pending();
+        let pending = self.agent_inbox.take_pending_messages();
+        let mid_turn_queue = &session.engine_half.runtime.mid_turn_queue;
         if active_prompt.is_some() {
-            for envelope in pending {
-                let framed = rebon_session_host::frame_agent_message(&envelope);
-                session
-                    .engine_half
-                    .runtime
-                    .mid_turn_queue
-                    .enqueue_agent_message(framed);
+            for accepted in pending {
+                let framed = rebon_session_host::frame_agent_message(&accepted.envelope);
+                mid_turn_queue.enqueue_agent_message(
+                    accepted.envelope.message_id.clone(),
+                    framed,
+                    &accepted.envelope.from_session_id,
+                    accepted.envelope.hops,
+                    accepted.verdict,
+                );
             }
             return;
         }
-        let inbox = session.engine_half.session_loop.inbox();
-        inbox.push_context(
-            ContextSource::Agent,
-            session
-                .engine_half
-                .runtime
-                .mid_turn_queue
-                .take_pending_agent_messages(),
-        );
-        inbox.push_context(
-            ContextSource::Agent,
-            pending
-                .into_iter()
-                .map(|envelope| rebon_session_host::frame_agent_message(&envelope)),
-        );
+        let accepted = pending.into_iter().map(|accepted| DeferredAgentMessage {
+            text: rebon_session_host::frame_agent_message(&accepted.envelope),
+            message_id: accepted.envelope.message_id,
+            from_session_id: accepted.envelope.from_session_id,
+            hops: accepted.envelope.hops,
+            verdict: accepted.verdict,
+        });
+        session
+            .engine_half
+            .session_loop
+            .inbox()
+            .push_agent_messages(
+                mid_turn_queue
+                    .take_pending_agent_messages()
+                    .into_iter()
+                    .chain(accepted),
+                &mid_turn_queue.reply_ledger(),
+            );
     }
 
     /// Drain and apply every command queued for this session. Runs on the idle
@@ -325,6 +346,7 @@ impl ForegroundControl {
             return;
         }
         self.apply_pending_agent_messages(session, active_prompt);
+        let activity = current_streaming_activity(app);
         for claim in self.mailbox.claims() {
             let command_id = claim.envelope.command_id.clone();
             let is_run_command = matches!(
@@ -356,6 +378,7 @@ impl ForegroundControl {
                     active_prompt,
                     pending_permission,
                     app.resume_dialog.is_some(),
+                    activity.as_deref(),
                 ) {
                     self.mailbox.complete(&claim);
                 }
@@ -404,6 +427,7 @@ impl ForegroundControl {
                 active_prompt,
                 pending_permission,
                 app.resume_dialog.is_some(),
+                current_streaming_activity(app).as_deref(),
             ) {
                 self.mailbox.complete(&claim);
             }
@@ -512,6 +536,45 @@ impl ForegroundControl {
             }
         }
     }
+}
+
+/// What the running turn is working on, for the status sidecar.
+///
+/// The peer list shows this next to a session's name, so it has to be the same
+/// sentence the transcript row carries: the newest tool still in flight, named
+/// and summarised the way the tool card names it. A turn that has only produced
+/// text has nothing to report — "thinking" tells a reader less than nothing
+/// does, and the busy flag already says a turn is running.
+pub(super) fn current_streaming_activity(app: &AppState) -> Option<String> {
+    app.rebon_tui
+        .overlay
+        .blocks
+        .iter()
+        .rev()
+        .find_map(|block| match block {
+            rebon_tui::StreamingContentBlock::ToolUse(tool)
+                if matches!(
+                    tool.status,
+                    rebon_types::ToolCallStatus::Pending | rebon_types::ToolCallStatus::InProgress
+                ) =>
+            {
+                let name = rebon_render::streaming_tool_display_name(
+                    &tool.tool_name,
+                    tool.raw_input.as_ref(),
+                );
+                let summary = tool
+                    .raw_input
+                    .as_ref()
+                    .map(|input| rebon_render::streaming_tool_summary(&tool.tool_name, input))
+                    .unwrap_or_default();
+                Some(if summary.trim().is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{name} {summary}")
+                })
+            }
+            _ => None,
+        })
 }
 
 /// Resolve a remote permission answer against the currently-pending prompt.
@@ -674,11 +737,17 @@ fn answer_ask_user_questions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::session_inbox::ContextSource;
 
-    /// A running turn takes an agent message at its next tool round, as the
-    /// framed text another agent wrote — never as a queued user submit.
+    /// A running turn takes an agent message at its next tool round, as a
+    /// visible runtime attachment carrying the frame another agent wrote — never
+    /// as a queued user submit.
+    ///
+    /// The attachment marker is what makes the injection a transcript row a
+    /// resume can draw again; the frame's `from_handle` is what lets that row name
+    /// its sender instead of a session id.
     #[tokio::test]
-    async fn an_agent_message_joins_a_running_turn_as_plain_framed_text() {
+    async fn an_agent_message_joins_a_running_turn_as_a_visible_attachment() {
         use rebon_core::query::{AttachmentPollPhase, AttachmentPollRequest, AttachmentPoller};
 
         let mut session = super::super::test_support::make_test_tui_session();
@@ -692,8 +761,11 @@ mod tests {
             from_session_id: "sess-sender".into(),
             from_agent: "main".into(),
             from_cwd: None,
+            from_handle: Some("repo-qrst".into()),
+            from_name: Some("worker".into()),
             summary: Some("handoff".into()),
             text: "please continue".into(),
+            hops: 0,
         };
 
         let applied = control.apply(
@@ -726,7 +798,17 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, rebon_api::Role::User);
         let text = serde_json::to_string(&messages[0]).unwrap();
+        assert!(
+            text.contains(
+                "<rebon-visible-runtime-attachment uuid=\\\"u-agent-message-m-running\\\">"
+            ),
+            "the injection is a visible attachment, not a bare user message: {text}"
+        );
         assert!(text.contains("<teammate-message"), "{text}");
+        assert!(
+            text.contains("from_handle=\\\"repo-qrst\\\""),
+            "the frame names its sender by handle, which is what the row shows: {text}"
+        );
         assert!(text.contains("please continue"), "{text}");
         assert!(
             !text.contains("rebon-queued-user-input"),
@@ -758,13 +840,62 @@ mod tests {
         );
     }
 
+    /// The requests a turn hands its executor, so a test can read what the
+    /// turn was started with.
+    #[derive(Default)]
+    struct RecordingExecutor {
+        requests: std::sync::Mutex<Vec<rebon_agent_core::PromptRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl rebon_agent_core::PromptExecutor for RecordingExecutor {
+        async fn execute(
+            &self,
+            request: rebon_agent_core::PromptRequest,
+        ) -> Result<rebon_agent_core::PromptOutcome, rebon_agent_core::PromptExecutorError>
+        {
+            self.requests.lock().expect("requests lock").push(request);
+            Ok(rebon_agent_core::PromptOutcome::end_turn())
+        }
+    }
+
+    impl RecordingExecutor {
+        async fn first_request(&self) -> rebon_agent_core::PromptRequest {
+            for _ in 0..200 {
+                if let Some(request) = self.requests.lock().expect("requests lock").first() {
+                    return request.clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the turn never reached its executor");
+        }
+    }
+
+    fn agent_message(message_id: &str, from: &str, text: &str, hops: u8) -> ForegroundCommand {
+        ForegroundCommand::AgentMessage {
+            message_id: message_id.into(),
+            from_session_id: from.into(),
+            from_agent: "main".into(),
+            from_cwd: None,
+            from_handle: None,
+            from_name: None,
+            summary: None,
+            text: text.into(),
+            hops,
+        }
+    }
+
     /// An idle session hands the message to the idle-context turn rather than
     /// the prompt input: it waits in the model-context queue, which
-    /// `admit_idle_context_prompt` drains into the turn it starts. That path
-    /// admits the turn with `user_prompt: None` and commits no transcript row.
+    /// `admit_idle_context_prompt` drains into the turn it starts. The turn it
+    /// starts carries the frame and offers nothing as user intent: another
+    /// agent's message is not what a person typed, and its prompt row is named
+    /// for the message so the transcript does not say so either.
     #[tokio::test]
     async fn an_agent_message_at_an_idle_prompt_starts_a_context_turn() {
         let mut session = super::super::test_support::make_test_tui_session();
+        let recorder = Arc::new(RecordingExecutor::default());
+        session.set_test_executor(recorder.clone());
         let control = ForegroundControl::new(&session);
         let mut app = AppState::new();
         let handle = tokio::runtime::Handle::current();
@@ -783,8 +914,11 @@ mod tests {
                 from_session_id: "sess-sender".into(),
                 from_agent: "main".into(),
                 from_cwd: None,
+                from_handle: None,
+                from_name: None,
                 summary: None,
                 text: "wake up".into(),
+                hops: 0,
             },
         );
         assert!(matches!(applied, Ok(None)), "got {applied:?}");
@@ -802,10 +936,309 @@ mod tests {
         assert!(pending[0].contains("wake up"));
         assert!(app.input.is_empty());
 
-        let context = super::super::context_prompts::drain_model_context_prompts(&session);
-        assert_eq!(context, pending);
+        super::super::prompt_lifecycle::maybe_spawn_ready_idle_turn(
+            &mut app,
+            &session,
+            &handle,
+            &mut active,
+        );
+        assert!(active.is_some(), "the message starts the turn it came for");
         assert!(!session.engine_half.session_loop.inbox().has_context());
-        assert!(context[0].contains("wake up"));
+        let request = recorder.first_request().await;
+        assert_eq!(
+            request.user_prompt, None,
+            "another agent's message must not reach the classifier as user intent"
+        );
+        assert_eq!(
+            request.user_message_uuid.as_deref(),
+            Some("u-agent-message-m-idle"),
+            "the prompt row is named for the message, which marks it as not the person's words"
+        );
+        let prompt = serde_json::to_string(&request.prompt).unwrap();
+        assert!(prompt.contains("wake up"), "{prompt}");
+        assert!(prompt.contains("teammate-message"), "{prompt}");
+    }
+
+    /// A message whose chain has gone too deep is still delivered — but not by
+    /// starting a turn of its own. The idle trigger must not see it as a reason
+    /// to run, and the next turn somebody else starts must carry it.
+    #[tokio::test]
+    async fn an_agent_message_past_the_hop_bound_waits_for_the_next_turn() {
+        let mut session = super::super::test_support::make_test_tui_session();
+        let control = ForegroundControl::new(&session);
+        let mut app = AppState::new();
+        let handle = tokio::runtime::Handle::current();
+        let mut active = None;
+
+        let applied = control.apply(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active,
+            &mut None,
+            UiMode::Screen,
+            "cmd-agent-deep",
+            ForegroundCommand::AgentMessage {
+                message_id: "m-deep".into(),
+                from_session_id: "sess-sender".into(),
+                from_agent: "main".into(),
+                from_cwd: None,
+                from_handle: None,
+                from_name: None,
+                summary: None,
+                text: "the fifth hand-off".into(),
+                hops: rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1,
+            },
+        );
+        assert!(matches!(applied, Ok(None)), "got {applied:?}");
+
+        assert!(
+            session.engine_half.session_loop.inbox().has_context(),
+            "an accepted message is never dropped"
+        );
+        assert!(
+            !session
+                .engine_half
+                .session_loop
+                .inbox()
+                .has_waking_context(),
+            "a chain past the bound may not start a turn"
+        );
+
+        // A later message the bounds do allow is a reason to run; the waiting
+        // one rides into that turn instead of being lost.
+        let allowed = control.apply(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active,
+            &mut None,
+            UiMode::Screen,
+            "cmd-agent-allowed",
+            ForegroundCommand::AgentMessage {
+                message_id: "m-allowed".into(),
+                from_session_id: "sess-other".into(),
+                from_agent: "main".into(),
+                from_cwd: None,
+                from_handle: None,
+                from_name: None,
+                summary: None,
+                text: "a fresh question".into(),
+                hops: 0,
+            },
+        );
+        assert!(matches!(allowed, Ok(None)), "got {allowed:?}");
+        assert!(session
+            .engine_half
+            .session_loop
+            .inbox()
+            .has_waking_context());
+
+        let items = super::super::context_prompts::drain_model_context_items(&session);
+        assert_eq!(items.len(), 2, "both messages are delivered");
+        assert!(
+            items[0].text.contains("the fifth hand-off"),
+            "{:?}",
+            items[0].text
+        );
+        assert!(!items[0].may_wake);
+        assert!(
+            items[1].text.contains("a fresh question"),
+            "{:?}",
+            items[1].text
+        );
+        assert!(items[1].may_wake);
+        assert_eq!(
+            items[0].inbound,
+            Some((
+                "sess-sender".to_string(),
+                rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1
+            )),
+            "the depth travels with the message, not with the turn"
+        );
+    }
+
+    /// A message that arrived over the reception path and then started an idle
+    /// turn makes that turn the one answering its sender: the reply it writes
+    /// carries one hop more than the message did.
+    #[tokio::test]
+    async fn an_idle_turn_started_by_a_received_message_replies_one_hop_deeper() {
+        let mut session = super::super::test_support::make_test_tui_session();
+        let control = ForegroundControl::new(&session);
+        let mut app = AppState::new();
+        let handle = tokio::runtime::Handle::current();
+        let mut active = None;
+        let peer = "sess-hops-received";
+
+        let applied = control.apply(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active,
+            &mut None,
+            UiMode::Screen,
+            "cmd-agent-hops",
+            ForegroundCommand::AgentMessage {
+                message_id: "m-hops".into(),
+                from_session_id: peer.into(),
+                from_agent: "main".into(),
+                from_cwd: None,
+                from_handle: None,
+                from_name: None,
+                summary: None,
+                text: "two of us have spoken already".into(),
+                hops: 2,
+            },
+        );
+        assert!(matches!(applied, Ok(None)), "got {applied:?}");
+
+        super::super::prompt_lifecycle::maybe_spawn_ready_idle_turn(
+            &mut app,
+            &session,
+            &handle,
+            &mut active,
+        );
+        assert!(active.is_some(), "the message starts the turn it came for");
+
+        assert_eq!(
+            session
+                .engine_half
+                .runtime
+                .mid_turn_queue
+                .reply_ledger()
+                .reply_hops(peer),
+            3,
+            "the turn answers a message that had already made two hand-offs"
+        );
+        assert_eq!(
+            session
+                .engine_half
+                .runtime
+                .mid_turn_queue
+                .reply_ledger()
+                .reply_hops("sess-unrelated"),
+            0,
+            "a conversation this turn was not answering starts at zero"
+        );
+        drop(active);
+    }
+
+    /// A message delivered while a turn runs and handed back unread when that
+    /// turn ends — it ended before its next tool round — goes back through the
+    /// wake bounds before it may start a turn. Two sessions answering each
+    /// other while one is mid-turn must not get past the hop and rate bounds
+    /// that way.
+    #[tokio::test]
+    async fn an_unread_message_from_a_finished_turn_is_judged_before_it_starts_one() {
+        let mut session = super::super::test_support::make_test_tui_session();
+        let control = ForegroundControl::new(&session);
+        let mut app = AppState::new();
+        let handle = tokio::runtime::Handle::current();
+        let peer = "sess-unread-peer";
+        let ledger = session.engine_half.runtime.mid_turn_queue.reply_ledger();
+        for _ in 0..rebon_tool::peer::AGENT_MESSAGE_WAKES_PER_HOUR {
+            assert!(ledger
+                .admit_wake(peer, 0, rebon_types::wall_clock_ms())
+                .is_allowed());
+        }
+
+        // The listener sees the turn running, so the message joins it.
+        control.agent_inbox.set_busy(true);
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let mut active = Some(ActivePrompt::new(rx, rebon_types::PromptCancel::new()));
+        let applied = control.apply(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active,
+            &mut None,
+            UiMode::Screen,
+            "cmd-agent-unread",
+            agent_message("m-unread", peer, "while you were busy", 0),
+        );
+        assert!(matches!(applied, Ok(None)), "got {applied:?}");
+        assert_eq!(session.engine_half.runtime.mid_turn_queue.pending_len(), 1);
+
+        // The turn ends before it reads the message.
+        drop(active.take());
+        control.agent_inbox.set_busy(false);
+        control.apply_pending_agent_messages(&session, &active);
+
+        let inbox = session.engine_half.session_loop.inbox();
+        assert!(inbox.has_context(), "the message is still delivered later");
+        assert!(
+            !inbox.has_waking_context(),
+            "a peer whose wakes are spent does not get a turn by writing during one"
+        );
+        super::super::prompt_lifecycle::maybe_spawn_ready_idle_turn(
+            &mut app,
+            &session,
+            &handle,
+            &mut active,
+        );
+        assert!(active.is_none(), "no turn starts for it");
+    }
+
+    /// Within the bounds, the same unread message is judged, admitted, and
+    /// starts the turn — which then answers its sender.
+    #[tokio::test]
+    async fn an_unread_message_within_the_bounds_starts_the_next_turn() {
+        let mut session = super::super::test_support::make_test_tui_session();
+        let control = ForegroundControl::new(&session);
+        let mut app = AppState::new();
+        let handle = tokio::runtime::Handle::current();
+        let peer = "sess-unread-within";
+
+        control.agent_inbox.set_busy(true);
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let mut active = Some(ActivePrompt::new(rx, rebon_types::PromptCancel::new()));
+        let applied = control.apply(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active,
+            &mut None,
+            UiMode::Screen,
+            "cmd-agent-unread-within",
+            agent_message("m-unread", peer, "while you were busy", 1),
+        );
+        assert!(matches!(applied, Ok(None)), "got {applied:?}");
+        assert_eq!(
+            session
+                .engine_half
+                .runtime
+                .mid_turn_queue
+                .reply_ledger()
+                .reply_hops(peer),
+            0,
+            "queued for the running turn is not read by it"
+        );
+
+        drop(active.take());
+        control.agent_inbox.set_busy(false);
+        control.apply_pending_agent_messages(&session, &active);
+        assert!(session
+            .engine_half
+            .session_loop
+            .inbox()
+            .has_waking_context());
+        super::super::prompt_lifecycle::maybe_spawn_ready_idle_turn(
+            &mut app,
+            &session,
+            &handle,
+            &mut active,
+        );
+        assert!(active.is_some());
+        assert_eq!(
+            session
+                .engine_half
+                .runtime
+                .mid_turn_queue
+                .reply_ledger()
+                .reply_hops(peer),
+            2
+        );
+        drop(active);
     }
 
     /// `/compact` from the desktop app runs a ~30s provider call. Answering
