@@ -27,7 +27,7 @@ use rebon_render::{
     },
     tool_results::{UserToolErrorProjection, UserToolResultProjection},
     user_text::{
-        format_user_prompt_hidden_separator, project_user_prompt_display_lines,
+        format_user_prompt_hidden_separator, project_user_prompt_display_lines_for_width,
         UserPromptDisplayLine, UserTextProjection, USER_PROMPT_FOLD_DEFAULT_WIDTH,
     },
 };
@@ -150,10 +150,20 @@ pub fn render_compact_summary_display(
     Text::from(lines)
 }
 
-/// Render `UserTextProjection`.
+/// Render `UserTextProjection` at the fallback width, for a caller with no
+/// terminal to ask.
 pub fn render_user_text_projection(
     projection: &UserTextProjection,
     theme: &MessagesRenderTheme,
+) -> Text<'static> {
+    render_user_text_projection_for_width(projection, theme, USER_PROMPT_FOLD_DEFAULT_WIDTH as u16)
+}
+
+/// [`render_user_text_projection`] for a row painted `width` columns wide.
+pub fn render_user_text_projection_for_width(
+    projection: &UserTextProjection,
+    theme: &MessagesRenderTheme,
+    width: u16,
 ) -> Text<'static> {
     match projection {
         UserTextProjection::HiddenNoContent
@@ -178,24 +188,26 @@ pub fn render_user_text_projection(
             is_transcript_mode,
             ..
         } => Text::from(
-            project_user_prompt_display_lines(text, *verbose, *is_transcript_mode)
-                .into_iter()
-                .map(|line| match line {
-                    UserPromptDisplayLine::Text(line) => Line::from(Span::styled(line, theme.text)),
-                    UserPromptDisplayLine::HiddenSeparator { hidden_line_count } => {
-                        Line::from(Span::styled(
-                            format_user_prompt_hidden_separator(
-                                hidden_line_count,
-                                USER_PROMPT_FOLD_DEFAULT_WIDTH,
-                            ),
-                            fold_separator_style(),
-                        ))
-                    }
-                })
-                .collect::<Vec<_>>(),
+            project_user_prompt_display_lines_for_width(
+                text,
+                *verbose,
+                *is_transcript_mode,
+                width as usize,
+            )
+            .into_iter()
+            .map(|line| match line {
+                UserPromptDisplayLine::Text(line) => Line::from(Span::styled(line, theme.text)),
+                UserPromptDisplayLine::HiddenSeparator { hidden_line_count } => {
+                    Line::from(Span::styled(
+                        format_user_prompt_hidden_separator(hidden_line_count, width as usize),
+                        fold_separator_style(),
+                    ))
+                }
+            })
+            .collect::<Vec<_>>(),
         ),
         UserTextProjection::Teammate(renderables) => {
-            render_teammate_renderables(renderables, theme)
+            render_teammate_renderables(renderables, theme, width as usize)
         }
         UserTextProjection::TaskNotification(notification) => {
             let style = match notification.color {
@@ -624,27 +636,58 @@ fn render_teammate_plain_content(
         .collect()
 }
 
+/// One plain teammate message: a header naming the sender, then the body.
+///
+/// The header is `Message from @handle`, and a summary — the sender's own one
+/// line about what it sent — rides on it. The body is what the sender wrote;
+/// it folds at `width` when it would otherwise push the conversation answering
+/// it off screen, and the fold says how to see the rest.
 fn render_user_teammate_plain_content(
     plain: &TeammateMessageContentDisplay,
     theme: &MessagesRenderTheme,
+    width: usize,
 ) -> Vec<Line<'static>> {
     let name_style = if plain.color.is_some() {
         theme.accent
     } else {
         theme.text
     };
-    let header = Line::from(vec![
+    let mut header = vec![
         Span::styled("Message from ", theme.dim),
-        Span::styled(format!("@{}", plain.display_name), name_style),
-    ]);
-    std::iter::once(header)
+        Span::styled(
+            rebon_render::teammate_messages::sender_label(&plain.display_name),
+            name_style,
+        ),
+    ];
+    if let Some(summary) = plain
+        .summary
+        .as_deref()
+        .filter(|summary| !summary.is_empty())
+    {
+        header.push(Span::styled(format!(": {summary}"), theme.text));
+    }
+    let body =
+        rebon_render::project_teammate_body_lines(&plain.content, plain.is_transcript_mode, width);
+    let folded = body
+        .iter()
+        .any(|line| matches!(line, UserPromptDisplayLine::HiddenSeparator { .. }));
+    std::iter::once(Line::from(header))
         .chain(std::iter::once(Line::default()))
-        .chain(
-            plain
-                .content
-                .lines()
-                .map(|line| Line::from(Span::styled(line.to_owned(), theme.text))),
-        )
+        .chain(body.into_iter().map(|line| match line {
+            UserPromptDisplayLine::Text(line) => Line::from(Span::styled(line, theme.text)),
+            UserPromptDisplayLine::HiddenSeparator { hidden_line_count } => {
+                Line::from(Span::styled(
+                    format_user_prompt_hidden_separator(hidden_line_count, width),
+                    fold_separator_style(),
+                ))
+            }
+        }))
+        .chain(folded.then(|| {
+            Line::from(Span::styled(
+                format_shortcut_hint("ctrl+o", "expand", false, false).plain_text,
+                theme.dim,
+            ))
+        }))
         .collect()
 }
 
@@ -655,6 +698,7 @@ fn render_user_teammate_plain_content(
 fn render_teammate_renderables(
     renderables: &[TeammateRenderable],
     theme: &MessagesRenderTheme,
+    width: usize,
 ) -> Text<'static> {
     let lines: Vec<Line<'static>> = renderables
         .iter()
@@ -667,7 +711,9 @@ fn render_teammate_renderables(
                 Span::styled(format!("@{display_name}"), theme.accent),
                 Span::styled(format!(" {status_text}"), theme.dim),
             ])],
-            TeammateRenderable::Plain(plain) => render_user_teammate_plain_content(plain, theme),
+            TeammateRenderable::Plain(plain) => {
+                render_user_teammate_plain_content(plain, theme, width)
+            }
             TeammateRenderable::PlanApprovalSummary(summary) => {
                 vec![Line::from(Span::styled(summary.clone(), theme.accent))]
             }
@@ -1249,12 +1295,138 @@ mod tests {
         assert_eq!(
             lines(rendered),
             vec![
-                "Message from @fix-d1-transport",
+                "Message from @fix-d1-transport: ignored summary",
                 "",
                 "D1 complete",
                 "Handoff ready.",
             ]
         );
+    }
+
+    fn long_teammate_plain(is_transcript_mode: bool) -> UserTextProjection {
+        let content = (0..40)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        UserTextProjection::Teammate(vec![TeammateRenderable::Plain(
+            TeammateMessageContentDisplay {
+                display_name: "repo-qrst".into(),
+                color: None,
+                content,
+                summary: Some("a report".into()),
+                is_transcript_mode,
+            },
+        )])
+    }
+
+    /// The live view folds a long body and says how to see the rest; transcript
+    /// mode shows all of it and needs no hint.
+    #[test]
+    fn a_long_teammate_body_folds_in_the_live_view_and_not_in_the_transcript() {
+        let live = lines(render_user_text_projection(
+            &long_teammate_plain(false),
+            &MessagesRenderTheme::plain(),
+        ));
+        assert_eq!(live[0], "Message from @repo-qrst: a report");
+        assert!(
+            live.iter()
+                .any(|line| line.contains("hidden)") || line.contains("hidden) ─")),
+            "the fold separator is on screen: {live:?}"
+        );
+        assert!(
+            live.iter().any(|line| line.contains("expand")),
+            "the fold says how to expand: {live:?}"
+        );
+        assert!(live.len() < 40, "the body was folded: {live:?}");
+
+        let transcript = lines(render_user_text_projection(
+            &long_teammate_plain(true),
+            &MessagesRenderTheme::plain(),
+        ));
+        assert_eq!(transcript[0], "Message from @repo-qrst: a report");
+        assert!(
+            !transcript.iter().any(|line| line.contains("hidden)")),
+            "a transcript shows the whole body: {transcript:?}"
+        );
+        assert!(transcript.len() > 40, "every line survives: {transcript:?}");
+    }
+
+    /// A teammate body folds at the width it is actually painted at. The live
+    /// view is the one with a terminal to ask; a fixed fallback width would make
+    /// a narrow terminal count the wrong number of hidden lines and draw a
+    /// separator wider than the row.
+    #[test]
+    fn a_teammate_body_folds_at_the_width_it_is_painted_at() {
+        let narrow = 70u16;
+        let wide = 120u16;
+
+        let narrow_lines = lines(render_user_text_projection_for_width(
+            &long_teammate_plain(false),
+            &MessagesRenderTheme::plain(),
+            narrow,
+        ));
+        let wide_lines = lines(render_user_text_projection_for_width(
+            &long_teammate_plain(false),
+            &MessagesRenderTheme::plain(),
+            wide,
+        ));
+
+        let separator = |rendered: &[String]| {
+            rendered
+                .iter()
+                .find(|line| line.contains("hidden)"))
+                .cloned()
+                .unwrap_or_else(|| panic!("no fold separator in {rendered:?}"))
+        };
+        let narrow_separator = separator(&narrow_lines);
+        let wide_separator = separator(&wide_lines);
+        assert_ne!(
+            narrow_separator, wide_separator,
+            "the separator names how many lines are hidden, which depends on the width"
+        );
+        for line in narrow_lines.iter().chain(wide_lines.iter()) {
+            assert!(
+                line.chars().count() <= wide as usize,
+                "a row may not be painted wider than the row it is drawn in: {line:?}"
+            );
+        }
+        assert!(
+            narrow_separator.chars().count() <= narrow as usize,
+            "the separator has to fit the narrow row it is drawn in: {narrow_separator:?}"
+        );
+    }
+
+    /// A summary rides on the header; without one the header is just the
+    /// sender.
+    #[test]
+    fn a_teammate_summary_joins_the_header_and_a_missing_one_leaves_it_alone() {
+        let with_summary = lines(render_user_text_projection(
+            &UserTextProjection::Teammate(vec![TeammateRenderable::Plain(
+                TeammateMessageContentDisplay {
+                    display_name: "repo-qrst".into(),
+                    color: None,
+                    content: "body".into(),
+                    summary: Some("build is green".into()),
+                    is_transcript_mode: false,
+                },
+            )]),
+            &MessagesRenderTheme::plain(),
+        ));
+        assert_eq!(with_summary[0], "Message from @repo-qrst: build is green");
+
+        let without = lines(render_user_text_projection(
+            &UserTextProjection::Teammate(vec![TeammateRenderable::Plain(
+                TeammateMessageContentDisplay {
+                    display_name: "repo-qrst".into(),
+                    color: None,
+                    content: "body".into(),
+                    summary: None,
+                    is_transcript_mode: false,
+                },
+            )]),
+            &MessagesRenderTheme::plain(),
+        ));
+        assert_eq!(without[0], "Message from @repo-qrst");
     }
 
     #[test]

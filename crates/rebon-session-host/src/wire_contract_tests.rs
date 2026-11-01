@@ -137,6 +137,7 @@ fn fully_populated_job() -> BackgroundJobState {
                 claimed_turn_generation: Some(3),
                 completed_turn_generation: Some(4),
                 origin: None,
+                wake: rebon_tool::peer::WakeVerdict::Unjudged,
             }],
             coordinator_report_grants: vec!["/reports/one.md".to_string()],
             runtime: BackgroundRuntimeFields {
@@ -160,6 +161,8 @@ fn fully_populated_job() -> BackgroundJobState {
             queue_session: true,
             pinned: true,
             sort_order: -3,
+            prompt_owed: false,
+            agent_wakes: Default::default(),
         },
         process: ProcessOwnership {
             status: BackgroundJobStatus::NeedsInput,
@@ -305,6 +308,8 @@ fn minimal_job() -> BackgroundJobState {
             queue_session: false,
             pinned: false,
             sort_order: 0,
+            prompt_owed: false,
+            agent_wakes: Default::default(),
         },
         process: ProcessOwnership {
             status: BackgroundJobStatus::Queued,
@@ -663,8 +668,11 @@ fn every_request_variant_has_the_encoding_it_has_today() {
                 from_session_id: "s1".to_string(),
                 from_agent: "main".to_string(),
                 from_cwd: None,
+                from_handle: None,
+                from_name: None,
                 summary: None,
                 text: "hi".to_string(),
+                hops: 0,
             },
             r#"{"agentMessage":{"from_agent":"main","from_session_id":"s1","message_id":"m1","text":"hi"}}"#,
         ),

@@ -948,6 +948,62 @@ pub(crate) async fn execute_claimed_prompt(
     execution
 }
 
+/// What the turn this worker is about to run is answering, if anything.
+///
+/// Only a claimed prompt that another agent sent makes the turn an answer: a
+/// prompt the person typed and a cron fire both leave the depth at zero however
+/// much context rode in with them.
+pub(crate) fn claimed_prompt_inbound(state: &BackgroundJobState) -> Option<(&str, u8)> {
+    let prompt = claimed_pending_prompt(state)?;
+    let rebon_session_host::PendingPromptOrigin::AgentMessage {
+        from_session_id,
+        hops,
+        ..
+    } = prompt.origin.as_ref()?
+    else {
+        return None;
+    };
+    Some((from_session_id.as_str(), *hops))
+}
+
+/// Tell this turn's ledger whose message it is answering.
+///
+/// A hosted turn that exists because another agent's message was claimed
+/// answers that sender, so its reply carries one more hop. Staged before the
+/// turn is submitted, which is what binds the depth to this turn rather than to
+/// whatever runs next.
+pub(crate) fn stage_inbound_for_claimed_prompt(
+    ledger: &rebon_tool::peer::AgentReplyLedger,
+    state: &BackgroundJobState,
+) {
+    let Some((from_session_id, hops)) = claimed_prompt_inbound(state) else {
+        return;
+    };
+    ledger.stage_inbound(from_session_id, hops);
+}
+
+/// A warm-up is over: the session waits for its first prompt, or — when what
+/// waited meanwhile starts a turn — is queued for it.
+///
+/// What waited decides as anything waiting does (see
+/// [`lead_with_turn_driver`]): a message from another session nobody judged is
+/// judged now, against the bounds the record keeps, and leads only if
+/// admitted; a refused one never does. Nothing here runs the job's own prompt.
+pub(crate) fn end_warm_up(current: &mut BackgroundJobState, at_ms: u64) {
+    current.identity.resume_only = false;
+    current.process.status = if lead_with_turn_driver(current, at_ms) {
+        BackgroundJobStatus::Queued
+    } else {
+        BackgroundJobStatus::Idle
+    };
+    current.outcome.pending_permission = None;
+    current.outcome.summary_updated_at_ms = None;
+    current.process.completed_at_ms = None;
+    current.outcome.exit_code = None;
+    current.outcome.error = None;
+    current.process.updated_at_ms = at_ms;
+}
+
 /// Run the turn, publishing progress while it runs.
 ///
 /// The MCP stack has to be up before the turn lists its tools, and the turn
@@ -998,6 +1054,10 @@ async fn run_background_turn(
     // effort this turn runs under, above all, which the top of the turn may
     // just have re-read from a `/model` another client sent.
     ipc.publish_status_now(store, &state.identity.job_id);
+    stage_inbound_for_claimed_prompt(
+        &session.engine_half.runtime.mid_turn_queue.reply_ledger(),
+        state,
+    );
     let turn = run_through_session_loop(session, request, worker_turn_origin(state));
     let mut execution_future = Box::pin(execute_claimed_prompt(
         store,
@@ -1190,7 +1250,7 @@ fn start_background_side_channels(
     update_rx: tokio::sync::mpsc::UnboundedReceiver<rebon_types::SessionUpdateParams>,
     task_bridge_state: Option<BackgroundTaskBridgeState>,
 ) -> BackgroundTurnSideChannels {
-    let pending_user_message_uuid = claimed_pending_prompt(state).map(|prompt| prompt.id.clone());
+    let pending_user_message_uuid = claimed_pending_prompt(state).map(pending_prompt_row_uuid);
     let coordinator_report_paths = background_prompt_coordinator_report_paths(state);
     let (task_bridge_stop, task_bridge) = spawn_task_store_bridge_from_cursor(
         Arc::clone(&session.engine_half.tasks),
@@ -1303,18 +1363,7 @@ async fn resolve_resume_only_turn(
     if state.identity.resume_only {
         let idle_at = now_ms();
         store.update_state(&state.identity.job_id, |current| {
-            current.identity.resume_only = false;
-            current.process.status = if current.has_pending_prompts() {
-                BackgroundJobStatus::Queued
-            } else {
-                BackgroundJobStatus::Idle
-            };
-            current.outcome.pending_permission = None;
-            current.outcome.summary_updated_at_ms = None;
-            current.process.completed_at_ms = None;
-            current.outcome.exit_code = None;
-            current.outcome.error = None;
-            current.process.updated_at_ms = idle_at;
+            end_warm_up(current, idle_at);
             Ok(())
         })?;
         store.append_event(
@@ -1832,6 +1881,10 @@ async fn execute_background_job_inner(
     {
         return Ok(outcome);
     }
+    // A warmed session goes on to run the prompt claimed after the warm-up,
+    // under that claim's generation; the poller it was built with has to serve
+    // that turn, not the warm-up's.
+    background_pending_prompt_poller.retarget(state);
 
     if turn_cancel.is_cancelled() {
         release_session_keeping_lock(&mut session, handed_back).await;
@@ -2302,7 +2355,10 @@ async fn wait_for_first_prompt_on_warm_session(
             return Ok(WarmSessionWait::Ended);
         }
         match current.process.status {
-            BackgroundJobStatus::Queued if current.has_pending_prompts() => {
+            // Only a turn to run brings a parked worker back — a follow-up, or
+            // the job's prompt owed by name: messages from other sessions that
+            // merely wait are carried by the next turn, not the reason for one.
+            BackgroundJobStatus::Queued if current.has_turn_to_run() => {
                 let (cancel, claim) = ipc.start_turn_and(|| {
                     claim_background_job(
                         store,
@@ -2314,6 +2370,18 @@ async fn wait_for_first_prompt_on_warm_session(
                     )
                 });
                 match claim? {
+                    // The record changed between the read and the claim, and
+                    // the claim found nothing to run: it is a warm-up, and this
+                    // session is already warm — end it here and keep waiting.
+                    WorkerClaim::Claimed(claimed) if claimed.identity.resume_only => {
+                        let ended_at = now_ms();
+                        store.update_state(job_id, |current| {
+                            if owner.matches(current) {
+                                end_warm_up(current, ended_at);
+                            }
+                            Ok(())
+                        })?;
+                    }
                     WorkerClaim::Claimed(claimed) => {
                         store.append_event(
                             job_id,
@@ -2342,7 +2410,7 @@ async fn wait_for_first_prompt_on_warm_session(
                         return Ok(false);
                     }
                     if current.process.status == BackgroundJobStatus::Queued
-                        && !current.has_pending_prompts()
+                        && !current.has_turn_to_run()
                     {
                         current.process.status = BackgroundJobStatus::Idle;
                         current.process.updated_at_ms = normalized_at;
@@ -2429,7 +2497,10 @@ pub(crate) async fn wait_for_terminal_worker_reuse(
             return Ok(false);
         }
         match state.process.status {
-            BackgroundJobStatus::Queued if state.has_pending_prompts() => {
+            // Only a turn to run brings a parked worker back — a follow-up, or
+            // the job's prompt owed by name: messages from other sessions that
+            // merely wait are carried by the next turn, not the reason for one.
+            BackgroundJobStatus::Queued if state.has_turn_to_run() => {
                 store.append_event(job_id, "worker_reused", serde_json::json!({}))?;
                 return Ok(true);
             }
@@ -2447,7 +2518,7 @@ pub(crate) async fn wait_for_terminal_worker_reuse(
                         return Ok(false);
                     }
                     if current.process.status == BackgroundJobStatus::Queued
-                        && !current.has_pending_prompts()
+                        && !current.has_turn_to_run()
                     {
                         current.process.status = BackgroundJobStatus::Idle;
                         current.process.updated_at_ms = normalized_at;

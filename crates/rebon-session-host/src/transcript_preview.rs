@@ -106,20 +106,21 @@ pub fn read_transcript_preview(state: &BackgroundJobState, max_entries: usize) -
 }
 
 fn transcript_entry_is_meta(raw: &serde_json::Value) -> bool {
-    let top = raw
-        .get("isMeta")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let flag = |key: &str| {
+        raw.get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
     let nested = raw
         .get("message")
         .and_then(|m| m.get("isMeta"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let runtime_context = raw
-        .get("runtimeContext")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    top || nested || runtime_context
+    // A message another agent sent is written into the turn it arrived in as a
+    // visible attachment, which is a row the person never typed. Calling it user
+    // text would put somebody else's words in the preview as an excerpt of this
+    // conversation.
+    flag("isMeta") || nested || flag("runtimeContext") || flag("runtimeAttachment")
 }
 
 fn extract_transcript_entry_text(raw: &serde_json::Value) -> Option<String> {
@@ -445,6 +446,60 @@ mod tests {
             "message": { "role": "user", "content": "ctx" },
         });
         assert!(transcript_entry_is_meta(&raw));
+    }
+
+    /// A message another agent sent is written into the turn it arrived in as a
+    /// visible attachment, so it is a `user` row the person never typed. Excerpting
+    /// it would show somebody else's words as this conversation's user text.
+    #[test]
+    fn transcript_entry_is_meta_detects_a_visible_agent_message_attachment() {
+        // As the executor persists it: the marker stripped, the frame in one
+        // block, queued into the running turn.
+        let raw = serde_json::json!({
+            "type": "user",
+            "uuid": "u-agent-message-m-1",
+            "queuedCommand": true,
+            "iteration": 1,
+            "runtimeAttachment": true,
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "<teammate-message teammate_id=\"main@session:sess-sender\" from_session=\"sess-sender\">\ngo\n</teammate-message>"
+                }]
+            },
+        });
+        assert!(transcript_entry_is_meta(&raw));
+        assert!(
+            !transcript_entry_is_meta(&serde_json::json!({
+                "type": "user",
+                "message": { "role": "user", "content": "typed by the person" },
+            })),
+            "a line the person typed is still user text"
+        );
+    }
+
+    /// A turn another session's message started opens with that message as its
+    /// prompt row. It is no more the person's words than the same message
+    /// queued into a running turn, and is marked the same way.
+    #[test]
+    fn transcript_entry_is_meta_detects_a_turn_another_session_started() {
+        // As the executor persists a turn's prompt row: one text block, written
+        // as a string.
+        let raw = serde_json::json!({
+            "type": "user",
+            "uuid": "u-agent-message-m-2",
+            "runtimeAttachment": true,
+            "message": {
+                "role": "user",
+                "content": "<teammate-message teammate_id=\"main@session:sess-sender\" from_session=\"sess-sender\">\nnext\n</teammate-message>"
+            },
+        });
+        assert!(transcript_entry_is_meta(&raw));
+        assert!(
+            extract_transcript_entry_text(&raw).is_some(),
+            "the row has text; only its marking keeps it out of the preview"
+        );
     }
 
     #[test]

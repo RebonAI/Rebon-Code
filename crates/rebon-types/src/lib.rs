@@ -45,7 +45,7 @@ pub use session_id::new_session_id;
 pub use sub_agent_model::{SubAgentModelConfig, SubAgentModelSelection};
 pub use summary_envelope::{display_text_for_summary_envelope, summary_envelope_text};
 pub use task_status::{ListTask, TaskListStatus, TaskStatus};
-pub use text::{truncate_chars, xml_escape};
+pub use text::{truncate_chars, xml_escape, xml_unescape};
 pub use time_fmt::{format_system_time_iso_ms, wall_clock_ms, wall_clock_ms_u128};
 pub use types::*;
 pub use ultraplan_manifest::*;
