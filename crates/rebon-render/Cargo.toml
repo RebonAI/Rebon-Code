@@ -24,6 +24,11 @@ serde = { workspace = true, features = ["derive"] }
 rebon-tools-core = { workspace = true }
 # The shared ACP content-block / tool-kind values.
 rebon-types = { workspace = true }
+# The workspace's only shell tokenisers, shared with the auto-mode classifier.
+# Collapse grouping has to split a `Bash` command the same way a permission
+# decision does; a second splitter here was a second set of quoting rules, and
+# the two disagreed about which link of a chain was the one being run.
+rebon-shell-policy = { workspace = true }
 # The workspace's one display-width policy, a leaf over unicode-width, so what
 # this crate lays out and what a front-end paints agree about East Asian
 # ambiguous characters. Left a separate crate on purpose: the rendering

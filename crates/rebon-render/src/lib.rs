@@ -275,8 +275,8 @@ pub use auto_mode_note::{
 };
 pub use brief::{drop_text_in_brief_turns, filter_for_brief_tool};
 pub use collapse_grouping::{
-    classify_tool_use, command_as_hint, is_collapsible_tool_result, Aggregator, ClassifyOptions,
-    FinalizeParams, MemoryPathPolicy, ResultStatus, RowDecision, ToolClass, MAX_HINT_CHARS,
+    classify_tool_use, command_as_hint, is_collapsible_tool_result, Aggregator, FinalizeParams,
+    MemoryPathPolicy, ResultStatus, RowDecision, ToolClass, MAX_HINT_CHARS,
 };
 pub use collapsed_read_search::{
     file_name_from_path, format_duration_compact, format_seconds_one_decimal,
@@ -524,6 +524,7 @@ mod compatibility {
     /// the whole point of this crate is that every front-end can consume it.
     const ALLOWED: &[&str] = &[
         "rebon-design-system",
+        "rebon-shell-policy",
         "rebon-width",
         "rebon-tools-core",
         "rebon-types",

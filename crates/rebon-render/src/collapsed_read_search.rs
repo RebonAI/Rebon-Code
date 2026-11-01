@@ -211,8 +211,6 @@ pub struct CollapsedReadSearchInput {
     pub verbose: bool,
     /// Active group flag.
     pub is_active_group: bool,
-    /// Fullscreen env flag.
-    pub fullscreen_enabled: bool,
     /// Selected-message background.
     pub background: Option<String>,
 }
@@ -382,13 +380,9 @@ pub fn project_collapsed_read_search(
     let search_count = next_counts.search_count;
     let list_count = next_counts.list_count;
     let mcp_call_count = next_counts.mcp_call_count;
-    let bash_count = if input.fullscreen_enabled {
-        next_counts
-            .bash_count
-            .saturating_sub(input.git_op_bash_count)
-    } else {
-        0
-    };
+    let bash_count = next_counts
+        .bash_count
+        .saturating_sub(input.git_op_bash_count);
 
     let has_memory_ops = input.memory_search_count > 0
         || input.memory_read_count > 0
@@ -534,7 +528,7 @@ fn build_summary_text(
 ) -> String {
     let mut parts = Vec::new();
 
-    if input.fullscreen_enabled && !input.commits.is_empty() {
+    if !input.commits.is_empty() {
         for kind in ["committed", "amended", "cherry-picked"] {
             let shas = input
                 .commits
@@ -555,14 +549,14 @@ fn build_summary_text(
             }
         }
     }
-    if input.fullscreen_enabled && !input.pushes.is_empty() {
+    if !input.pushes.is_empty() {
         push_summary_part(
             &mut parts,
             "pushed to",
             dedup_preserving_order(&input.pushes).join(", "),
         );
     }
-    if input.fullscreen_enabled && !input.branches.is_empty() {
+    if !input.branches.is_empty() {
         for branch in &input.branches {
             push_summary_part(
                 &mut parts,
@@ -575,7 +569,7 @@ fn build_summary_text(
             );
         }
     }
-    if input.fullscreen_enabled && !input.prs.is_empty() {
+    if !input.prs.is_empty() {
         for pr in &input.prs {
             push_summary_part(
                 &mut parts,
@@ -673,7 +667,7 @@ fn build_summary_text(
             suffix
         ));
     }
-    if input.fullscreen_enabled && bash_count > 0 {
+    if bash_count > 0 {
         parts.push(format!(
             "{} {} bash {}",
             pick_verb(
@@ -779,7 +773,7 @@ fn non_blank_string(value: String) -> Option<String> {
 }
 
 fn compute_shell_progress_suffix(input: &CollapsedReadSearchInput) -> String {
-    if !(input.fullscreen_enabled && input.is_active_group) {
+    if !input.is_active_group {
         return String::new();
     }
 
@@ -1003,7 +997,6 @@ mod tests {
             should_animate: true,
             verbose: false,
             is_active_group: false,
-            fullscreen_enabled: false,
             background: Some("messageActionsBackground".into()),
         }
     }
@@ -1049,9 +1042,8 @@ mod tests {
     }
 
     #[test]
-    fn summary_prioritizes_git_and_fullscreen_parts() {
+    fn summary_prioritizes_git_and_shell_parts() {
         let mut input = base_input();
-        input.fullscreen_enabled = true;
         input.is_active_group = true;
         input.raw_bash_count = 5;
         input.git_op_bash_count = 2;
@@ -1094,7 +1086,6 @@ mod tests {
     fn active_hint_uses_repl_progress_and_shell_suffix() {
         let mut input = base_input();
         input.is_active_group = true;
-        input.fullscreen_enabled = true;
         input.raw_read_count = 1;
         input.tool_use_ids = vec!["u1".into(), "u2".into()];
         input.in_progress_tool_use_ids = HashSet::from(["u1".into(), "u2".into()]);

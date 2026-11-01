@@ -132,6 +132,25 @@ pub const READ_ONLY_ARGV: Grammar = Grammar {
     ..STATIC_ARGV
 };
 
+/// Splitting a command into the programs a reader would name — for display,
+/// not for a permission decision.
+///
+/// The grammars above refuse anything that could expand, because a word that
+/// can become another word can become a flag. A projection that only has to
+/// *name* the program resolves nothing, so a glob stays an ordinary argument
+/// here while redirection, substitution and backgrounding still stop the
+/// scan: those hide which program runs rather than spell it, and a caller that
+/// named a program it could not see would be guessing.
+///
+/// Double quotes follow POSIX here rather than [`RULE_ARGV`]'s literal reading,
+/// because the answer is shown back to the user: `grep -E "^\+[^+]"` must keep
+/// the backslash the user typed, not the word a shell would have produced.
+pub const DISPLAY_ARGV: Grammar = Grammar {
+    list_operators_separate: true,
+    double_quote_escape: DoubleQuoteEscape::Posix,
+    ..RULE_ARGV
+};
+
 /// What a permission rule gets to match against.
 ///
 /// The name is historical — [`crate::powershell_shape::parse_powershell_shape`]

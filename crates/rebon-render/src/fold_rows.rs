@@ -14,7 +14,7 @@
 
 use serde_json::Value;
 
-use crate::collapse_grouping::{classify_tool_use, ClassifyOptions, ToolClass};
+use crate::collapse_grouping::{classify_tool_use, ToolClass};
 use crate::transcript_row::{AssistantContentBlock, Message, UserContentBlock};
 use crate::user_text_kind::{detect_user_text_kind, UserTextKind};
 use crate::{MemoryPathPolicy, TRANSCRIPT_HIDDEN_TOOLS};
@@ -149,10 +149,9 @@ pub fn classify_message_tool_uses(
     tools: &[&crate::transcript_row::AssistantToolUseBlock],
 ) -> Option<Vec<ToolClass>> {
     let policy = MemoryPathPolicy::default();
-    let options = ClassifyOptions::default();
     let mut out = Vec::with_capacity(tools.len());
     for t in tools {
-        let class = classify_tool_use(&t.name, &t.input, &policy, options);
+        let class = classify_tool_use(&t.name, &t.input, &policy);
         if !class.is_collapsible() {
             return None;
         }

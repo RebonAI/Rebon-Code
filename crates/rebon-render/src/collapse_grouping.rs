@@ -25,6 +25,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use rebon_shell_policy::lexer::{simple_command_segments, DISPLAY_ARGV};
 use serde_json::Value as JsonValue;
 
 use crate::collapsed_read_search::{
@@ -137,15 +138,6 @@ impl ToolClass {
     }
 }
 
-/// Options controlling [`classify_tool_use`] behaviour that can't be
-/// derived from the tool name and input alone.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ClassifyOptions {
-    /// Controls whether `Bash` falls into `Bash { .. }` or is rejected as
-    /// non-collapsible.
-    pub fullscreen: bool,
-}
-
 /// Classify a single tool invocation.
 ///
 /// Recognised tool names:
@@ -153,7 +145,8 @@ pub struct ClassifyOptions {
 /// * `Read` / `Write` / `Edit`
 /// * `Grep` / `Glob`
 /// * `LS`
-/// * `Bash` / `PowerShell`
+/// * `Bash` / `PowerShell` — always collapsible; the command decides how the
+///   summary words it, never whether it joins the group
 /// * `mcp__*` → MCP call
 /// * `ToolSearch` / `Snip` → absorbed silently
 /// * `repl` / `REPL` → counted in the summary, no verbose row
@@ -161,7 +154,6 @@ pub fn classify_tool_use(
     tool_name: &str,
     input: &JsonValue,
     policy: &MemoryPathPolicy,
-    options: ClassifyOptions,
 ) -> ToolClass {
     // MCP tool: `mcp__<server>__<method>`.
     if let Some(rest) = tool_name.strip_prefix("mcp__") {
@@ -229,108 +221,102 @@ pub fn classify_tool_use(
         }
         "ToolSearch" | "Snip" => ToolClass::AbsorbedSilently,
         "repl" | "REPL" => ToolClass::Repl,
-        "Bash" | "PowerShell" => classify_shell_command(input, policy, options),
+        "Bash" | "PowerShell" => classify_shell_command(input, policy),
         _ => ToolClass::NotCollapsible,
     }
 }
 
-fn classify_shell_command(
-    input: &JsonValue,
-    policy: &MemoryPathPolicy,
-    options: ClassifyOptions,
-) -> ToolClass {
+/// Classify a `Bash` / `PowerShell` command.
+///
+/// A shell call is always collapsible: the command decides how the summary
+/// words it, never whether it joins the group. It used to answer
+/// `NotCollapsible` for anything that was not a recognisable search/read/list,
+/// which meant one `sed` or `cargo check` chopped every read/search chain in
+/// the turn into single-tool fragments — and, because a message's tool uses are
+/// classified together, dragged the `grep` issued beside it out of the group
+/// too.
+fn classify_shell_command(input: &JsonValue, policy: &MemoryPathPolicy) -> ToolClass {
     let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-    let analysis_command = strip_leading_cd_prefix(command);
     let memory = (policy.is_shell_cmd_targeting_memory)(command);
-    let hint = if command.is_empty() {
-        None
-    } else {
-        Some(command_as_hint(command))
-    };
-    let normalized_hint = if analysis_command.is_empty() {
-        None
-    } else {
-        Some(command_as_hint(analysis_command))
-    };
+    let hint = (!command.is_empty()).then(|| command_as_hint(command));
 
-    if let Some(segment) = find_shell_segment(analysis_command, is_shell_search_command) {
-        let pattern = extract_shell_search_pattern(&segment);
-        return ToolClass::Search {
-            pattern: pattern.clone(),
-            memory,
-            hint: pattern
-                .as_ref()
-                .map(|pattern| format!("\"{pattern}\""))
-                .or_else(|| normalized_hint.clone())
-                .or_else(|| hint.clone()),
-        };
-    }
+    // The one workspace tokeniser. It refuses redirection, substitution and
+    // backgrounding, and those all answer `Bash` below — a command whose word
+    // structure cannot be spelled out plainly is counted, not named.
+    let segments = simple_command_segments(command.trim(), &DISPLAY_ARGV).ok();
+    if let Some(segments) = segments {
+        if let Some(argv) = segments
+            .iter()
+            .find(|argv| program_is(argv, is_shell_search_command))
+        {
+            let pattern = extract_shell_search_pattern(argv);
+            return ToolClass::Search {
+                hint: pattern
+                    .as_ref()
+                    .map(|pattern| format!("\"{pattern}\""))
+                    .or_else(|| hint.clone()),
+                pattern,
+                memory,
+            };
+        }
 
-    if let Some(segment) = find_shell_segment(analysis_command, is_shell_read_command) {
-        let file_path = extract_shell_read_hint(&segment);
-        let read_memory = file_path
-            .as_deref()
-            .map(|path| (policy.is_memory_file)(path))
-            .unwrap_or(false);
-        return ToolClass::Read {
-            file_path: file_path.clone(),
-            memory: read_memory,
-            hint: file_path
-                .or_else(|| normalized_hint.clone())
-                .or_else(|| hint.clone()),
-        };
-    }
+        if let Some(argv) = segments
+            .iter()
+            .find(|argv| program_is(argv, is_shell_read_command) || stream_editor_only_reads(argv))
+        {
+            let file_path = extract_shell_read_hint(argv);
+            let read_memory = file_path
+                .as_deref()
+                .map(|path| (policy.is_memory_file)(path))
+                .unwrap_or(false);
+            return ToolClass::Read {
+                hint: file_path.clone().or_else(|| hint.clone()),
+                file_path,
+                memory: read_memory,
+            };
+        }
 
-    let first = shell_segment_base_command(analysis_command).unwrap_or_default();
-    match first.as_str() {
-        "ls" | "tree" | "dir" | "du" => ToolClass::List {
-            hint: normalized_hint.or_else(|| hint),
-        },
-        _ if options.fullscreen => ToolClass::Bash {
-            command: command.to_string(),
-            hint,
-        },
-        _ => ToolClass::NotCollapsible,
-    }
-}
-
-fn strip_leading_cd_prefix(command: &str) -> &str {
-    let trimmed = command.trim();
-    let after_cd = trimmed
-        .strip_prefix("cd ")
-        .or_else(|| trimmed.strip_prefix("CD "));
-    if let Some(after_cd) = after_cd {
-        if let Some(sep_pos) = after_cd.find(" && ") {
-            return after_cd[sep_pos + 4..].trim_start();
+        // The first command that is not a directory change: `cd repo && ls`
+        // lists a directory as plainly as `ls` does.
+        if let Some(program) = segments
+            .iter()
+            .map(|argv| argv_program(argv))
+            .find(|program| program.as_deref().is_some_and(|p| !is_directory_change(p)))
+            .flatten()
+        {
+            if is_shell_list_command(&program) {
+                return ToolClass::List { hint };
+            }
         }
     }
-    trimmed
+
+    ToolClass::Bash {
+        command: command.to_string(),
+        hint,
+    }
 }
 
-fn find_shell_segment(command: &str, predicate: fn(&str) -> bool) -> Option<String> {
-    split_shell_segments(command).into_iter().find(|segment| {
-        shell_segment_base_command(segment)
-            .as_deref()
-            .map(predicate)
-            .unwrap_or(false)
-    })
-}
-
-fn shell_segment_base_command(segment: &str) -> Option<String> {
-    for token in first_shell_segment_tokens(segment) {
+/// The program an argv runs, by the base name a reader would recognise:
+/// `/usr/bin/rg` and `rg.exe` both answer `rg`.
+fn argv_program(argv: &[String]) -> Option<String> {
+    for token in argv {
         let token = token.trim_start_matches('!');
         if token.eq_ignore_ascii_case("sudo") {
             continue;
         }
-        let base = token
-            .rsplit(|c| c == '/' || c == '\\')
-            .next()
-            .unwrap_or(token);
+        let base = token.rsplit(['/', '\\']).next().unwrap_or(token);
         let lower = base.to_ascii_lowercase();
-        let lower = lower.strip_suffix(".exe").unwrap_or(lower.as_str());
-        return Some(lower.to_string());
+        return Some(lower.strip_suffix(".exe").unwrap_or(&lower).to_string());
     }
     None
+}
+
+fn program_is(argv: &[String], predicate: fn(&str) -> bool) -> bool {
+    argv_program(argv).is_some_and(|program| predicate(&program))
+}
+
+fn is_directory_change(program: &str) -> bool {
+    matches!(program, "cd" | "pushd" | "popd")
 }
 
 fn is_shell_search_command(command: &str) -> bool {
@@ -350,72 +336,17 @@ fn is_shell_search_command(command: &str) -> bool {
     )
 }
 
-fn is_shell_read_command(command: &str) -> bool {
-    matches!(command, "cat" | "head" | "tail" | "less" | "more" | "type")
-}
-
-fn split_shell_segments(command: &str) -> Vec<String> {
-    let mut segments = Vec::new();
-    let mut current = String::new();
-    let mut chars = command.chars().peekable();
-    let mut in_single = false;
-    let mut in_double = false;
-
-    while let Some(ch) = chars.next() {
-        if ch == '\\' && !in_single {
-            current.push(ch);
-            if let Some(next) = chars.next() {
-                current.push(next);
-            }
-            continue;
-        }
-
-        match ch {
-            '\'' if !in_double => {
-                in_single = !in_single;
-                current.push(ch);
-            }
-            '"' if !in_single => {
-                in_double = !in_double;
-                current.push(ch);
-            }
-            '|' | ';' if !in_single && !in_double => {
-                push_shell_segment(&mut segments, &mut current);
-            }
-            '&' if !in_single && !in_double => {
-                if chars.peek() == Some(&'&') {
-                    chars.next();
-                }
-                push_shell_segment(&mut segments, &mut current);
-            }
-            _ => current.push(ch),
-        }
-    }
-
-    push_shell_segment(&mut segments, &mut current);
-    segments
-}
-
-fn push_shell_segment(segments: &mut Vec<String>, current: &mut String) {
-    let segment = current.trim();
-    if !segment.is_empty() {
-        segments.push(segment.to_string());
-    }
-    current.clear();
-}
-
-fn extract_shell_read_hint(command: &str) -> Option<String> {
-    let tokens = first_shell_segment_tokens(command);
-    if tokens.len() < 2 {
+fn extract_shell_read_hint(argv: &[String]) -> Option<String> {
+    if argv.len() < 2 {
         return None;
     }
 
-    for idx in (1..tokens.len()).rev() {
-        let token = &tokens[idx];
+    for idx in (1..argv.len()).rev() {
+        let token = &argv[idx];
         if token.starts_with('-') {
             continue;
         }
-        if idx > 1 && shell_option_expects_value(&tokens[idx - 1]) {
+        if idx > 1 && shell_option_expects_value(&argv[idx - 1]) {
             continue;
         }
         return Some(token.clone());
@@ -424,20 +355,19 @@ fn extract_shell_read_hint(command: &str) -> Option<String> {
     None
 }
 
-fn extract_shell_search_pattern(command: &str) -> Option<String> {
-    let tokens = first_shell_segment_tokens(command);
-    if tokens.len() < 2 {
+fn extract_shell_search_pattern(argv: &[String]) -> Option<String> {
+    if argv.len() < 2 {
         return None;
     }
 
-    for idx in 1..tokens.len() {
-        if idx > 1 && shell_pattern_option(&tokens[idx - 1]) {
-            return Some(tokens[idx].clone());
+    for idx in 1..argv.len() {
+        if idx > 1 && shell_pattern_option(&argv[idx - 1]) {
+            return Some(argv[idx].clone());
         }
     }
 
     let mut skip_next = false;
-    for token in tokens.iter().skip(1) {
+    for token in argv.iter().skip(1) {
         if skip_next {
             skip_next = false;
             continue;
@@ -452,58 +382,36 @@ fn extract_shell_search_pattern(command: &str) -> Option<String> {
     None
 }
 
-fn first_shell_segment_tokens(command: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut chars = command.chars().peekable();
-    let mut in_single = false;
-    let mut in_double = false;
+fn is_shell_read_command(command: &str) -> bool {
+    matches!(
+        command,
+        "cat" | "head" | "tail" | "less" | "more" | "type" | "bat" | "nl"
+    )
+}
 
-    while let Some(ch) = chars.next() {
-        if ch == '\\' && !in_single {
-            let escaped = chars.peek().copied();
-            let should_escape = if in_double {
-                matches!(escaped, Some('"' | '\\' | '$' | '`'))
-            } else {
-                matches!(escaped, Some(next) if next.is_whitespace() || matches!(next, '"' | '\'' | '|' | ';' | '&' | '\\'))
-            };
-            if should_escape {
-                if let Some(next) = chars.next() {
-                    current.push(next);
-                }
-                continue;
-            }
-            current.push(ch);
-            continue;
-        }
+fn is_shell_list_command(command: &str) -> bool {
+    matches!(command, "ls" | "tree" | "dir" | "du")
+}
 
-        match ch {
-            '\'' if !in_double => {
-                in_single = !in_single;
-            }
-            '"' if !in_single => {
-                in_double = !in_double;
-            }
-            '|' | ';' | '&' if !in_single && !in_double => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-                break;
-            }
-            _ if ch.is_whitespace() && !in_single && !in_double => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            _ => current.push(ch),
-        }
+/// A stream editor that prints its input rather than rewriting it.
+///
+/// `sed -n 1,80p f` and `awk '{print}' f` read a file and print it, which is
+/// the same act as the `Read` tool — agents reach for them constantly where
+/// they would otherwise read a slice. `sed -i` edits in place, so it is not
+/// one of these.
+fn stream_editor_only_reads(argv: &[String]) -> bool {
+    let Some(program) = argv_program(argv) else {
+        return false;
+    };
+    match program.as_str() {
+        "sed" => !argv.iter().skip(1).any(|arg| {
+            arg == "--in-place"
+                || arg.starts_with("--in-place=")
+                || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('i'))
+        }),
+        "awk" | "gawk" | "nawk" => true,
+        _ => false,
     }
-
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-
-    tokens
 }
 
 fn shell_option_expects_value(token: &str) -> bool {
@@ -933,7 +841,6 @@ impl Aggregator {
             should_animate: params.should_animate,
             verbose: params.verbose,
             is_active_group: params.is_active_group,
-            fullscreen_enabled: params.fullscreen_enabled,
             background: params.background,
         }
     }
@@ -950,8 +857,6 @@ pub struct FinalizeParams {
     pub verbose: bool,
     /// Animate loaders.
     pub should_animate: bool,
-    /// Fullscreen flag.
-    pub fullscreen_enabled: bool,
     /// Selected-message background color.
     pub background: Option<String>,
 }
@@ -1020,7 +925,6 @@ mod tests {
             "Read",
             &json!({"file_path": "/home/u/project/file.rs"}),
             &policy(),
-            ClassifyOptions::default(),
         );
         match class {
             ToolClass::Read {
@@ -1039,7 +943,6 @@ mod tests {
             "Read",
             &json!({"file_path": "/home/u/.rebon/memory/x.md"}),
             &policy(),
-            ClassifyOptions::default(),
         );
         assert!(matches!(class, ToolClass::Read { memory: true, .. }));
     }
@@ -1050,7 +953,6 @@ mod tests {
             "Grep",
             &json!({"pattern": "TODO", "path": "/home/u/project"}),
             &policy(),
-            ClassifyOptions::default(),
         );
         assert!(matches!(
             class,
@@ -1065,19 +967,13 @@ mod tests {
             "Grep",
             &json!({"pattern": "TODO", "path": "/home/u/.rebon/memory"}),
             &policy(),
-            ClassifyOptions::default(),
         );
         assert!(matches!(class, ToolClass::Search { memory: true, .. }));
     }
 
     #[test]
     fn glob_uses_search_classification() {
-        let class = classify_tool_use(
-            "Glob",
-            &json!({"pattern": "**/*.rs"}),
-            &policy(),
-            ClassifyOptions::default(),
-        );
+        let class = classify_tool_use("Glob", &json!({"pattern": "**/*.rs"}), &policy());
         assert!(matches!(class, ToolClass::Search { memory: false, .. }));
     }
 
@@ -1087,12 +983,7 @@ mod tests {
         // `ToolKind::Search` label — the classifier must still recognise
         // the normalized name so streaming + committed Grep runs fold
         // into a single "Searching for N patterns" summary.
-        let class = classify_tool_use(
-            "Search",
-            &json!({"pattern": "TODO"}),
-            &policy(),
-            ClassifyOptions::default(),
-        );
+        let class = classify_tool_use("Search", &json!({"pattern": "TODO"}), &policy());
         assert!(matches!(
             class,
             ToolClass::Search {
@@ -1105,12 +996,7 @@ mod tests {
 
     #[test]
     fn ls_tool_is_list() {
-        let class = classify_tool_use(
-            "LS",
-            &json!({"path": "/tmp"}),
-            &policy(),
-            ClassifyOptions::default(),
-        );
+        let class = classify_tool_use("LS", &json!({"path": "/tmp"}), &policy());
         assert!(matches!(class, ToolClass::List { .. }));
     }
 
@@ -1120,7 +1006,6 @@ mod tests {
             "Write",
             &json!({"file_path": "/home/u/.rebon/memory/mood.md"}),
             &policy(),
-            ClassifyOptions::default(),
         );
         assert!(matches!(class, ToolClass::MemoryWrite));
     }
@@ -1131,7 +1016,6 @@ mod tests {
             "Write",
             &json!({"file_path": "/home/u/project/src/lib.rs"}),
             &policy(),
-            ClassifyOptions::default(),
         );
         assert_eq!(class, ToolClass::NotCollapsible);
     }
@@ -1142,7 +1026,6 @@ mod tests {
             "mcp__slack__read_messages",
             &json!({"query": "hello"}),
             &policy(),
-            ClassifyOptions::default(),
         );
         match class {
             ToolClass::Mcp { server_name, hint } => {
@@ -1155,23 +1038,13 @@ mod tests {
 
     #[test]
     fn bash_ls_becomes_list() {
-        let class = classify_tool_use(
-            "Bash",
-            &json!({"command": "ls -la"}),
-            &policy(),
-            ClassifyOptions::default(),
-        );
+        let class = classify_tool_use("Bash", &json!({"command": "ls -la"}), &policy());
         assert!(matches!(class, ToolClass::List { .. }));
     }
 
     #[test]
     fn bash_cat_becomes_read_with_path() {
-        let class = classify_tool_use(
-            "Bash",
-            &json!({"command": "cat /tmp/foo.txt"}),
-            &policy(),
-            ClassifyOptions::default(),
-        );
+        let class = classify_tool_use("Bash", &json!({"command": "cat /tmp/foo.txt"}), &policy());
         assert!(matches!(
             class,
             ToolClass::Read {
@@ -1184,12 +1057,7 @@ mod tests {
 
     #[test]
     fn bash_grep_becomes_search_with_pattern() {
-        let class = classify_tool_use(
-            "Bash",
-            &json!({"command": "rg foo /tmp"}),
-            &policy(),
-            ClassifyOptions::default(),
-        );
+        let class = classify_tool_use("Bash", &json!({"command": "rg foo /tmp"}), &policy());
         assert!(matches!(
             class,
             ToolClass::Search {
@@ -1201,14 +1069,11 @@ mod tests {
     }
 
     #[test]
-    fn bash_cd_prefixed_diff_pipeline_extracts_grep_pattern() {
+    fn bash_pipeline_extracts_the_grep_pattern() {
         let class = classify_tool_use(
             "Bash",
-            &json!({
-                "command": r#"cd "/repo" && git diff -- crates/rebon-hooks/src/output_protocol.rs crates/rebon-hooks/src/lib.rs 2>&1 | grep -E "^\+[^+]" | grep output"#
-            }),
+            &json!({"command": r#"cd "/repo" && git diff -- src/lib.rs | grep -E "^\+[^+]" | grep output"#}),
             &policy(),
-            ClassifyOptions::default(),
         );
         assert!(matches!(
             class,
@@ -1221,31 +1086,67 @@ mod tests {
     }
 
     #[test]
-    fn bash_other_is_non_collapsible_outside_fullscreen() {
+    fn bash_redirection_stops_the_scan_so_the_command_is_counted() {
+        // `2>&1` makes the shared tokeniser refuse the command, so the
+        // projection cannot name the `grep` inside it and counts the call
+        // instead. The group still folds; only the wording differs.
         let class = classify_tool_use(
             "Bash",
-            &json!({"command": "git status"}),
+            &json!({"command": r#"cd "/repo" && git diff -- src/lib.rs 2>&1 | grep -E "^\+[^+]""#}),
             &policy(),
-            ClassifyOptions::default(),
         );
-        assert_eq!(class, ToolClass::NotCollapsible);
+        assert!(matches!(class, ToolClass::Bash { .. }), "got {class:?}");
+        assert!(class.is_collapsible());
     }
 
     #[test]
-    fn bash_other_is_bash_in_fullscreen_mode() {
+    fn bash_other_is_bash_and_stays_collapsible() {
+        // A command the projection cannot name is still counted: one `git
+        // status` in the middle of a read/search chain must not split it.
+        let class = classify_tool_use("Bash", &json!({"command": "git status"}), &policy());
+        assert!(matches!(class, ToolClass::Bash { .. }));
+        assert!(class.is_collapsible());
+    }
+
+    #[test]
+    fn bash_stream_editor_that_prints_is_a_read() {
+        // `sed -n 1,80p f` is how an agent reads a slice without the Read
+        // tool. Treating it as an unnamed command chopped every chain it
+        // appeared in.
         let class = classify_tool_use(
             "Bash",
-            &json!({"command": "git status"}),
+            &json!({"command": "cd /repo && sed -n 1,80p src/lib.rs"}),
             &policy(),
-            ClassifyOptions { fullscreen: true },
         );
-        assert!(matches!(class, ToolClass::Bash { .. }));
+        assert!(
+            matches!(class, ToolClass::Read { file_path: Some(ref path), .. } if path == "src/lib.rs"),
+            "expected Read, got {class:?}"
+        );
+
+        let in_place = classify_tool_use(
+            "Bash",
+            &json!({"command": "sed -i s/a/b/ src/lib.rs"}),
+            &policy(),
+        );
+        assert!(matches!(in_place, ToolClass::Bash { .. }), "sed -i edits");
+    }
+
+    #[test]
+    fn bash_redirection_is_counted_rather_than_named() {
+        // The tokeniser refuses redirection, so the command cannot be split
+        // into named programs. It still folds — it is just counted.
+        let class = classify_tool_use(
+            "Bash",
+            &json!({"command": "grep -rn TODO crates > /tmp/out.txt"}),
+            &policy(),
+        );
+        assert!(matches!(class, ToolClass::Bash { .. }), "got {class:?}");
     }
 
     #[test]
     fn repl_tool_is_absorbed_silently() {
         assert!(matches!(
-            classify_tool_use("repl", &json!({}), &policy(), ClassifyOptions::default()),
+            classify_tool_use("repl", &json!({}), &policy()),
             ToolClass::Repl
         ));
     }
@@ -1253,12 +1154,7 @@ mod tests {
     #[test]
     fn unknown_tool_is_not_collapsible() {
         assert_eq!(
-            classify_tool_use(
-                "CustomTool",
-                &json!({}),
-                &policy(),
-                ClassifyOptions::default()
-            ),
+            classify_tool_use("CustomTool", &json!({}), &policy(),),
             ToolClass::NotCollapsible
         );
     }

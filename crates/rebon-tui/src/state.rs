@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 
-use rebon_render::{classify_tool_use, ClassifyOptions, MemoryPathPolicy, ToolClass};
+use rebon_render::{classify_tool_use, MemoryPathPolicy, ToolClass};
 use rebon_types::{
     ContentBlock, RegularContent, TextContent, ToolCallContent, ToolCallLocation, ToolCallStatus,
     ToolKind,
@@ -190,12 +190,7 @@ fn streaming_tool_class(tool: &StreamingToolUse) -> ToolClass {
             Value::Object(object)
         })
         .unwrap_or(Value::Null);
-    classify_tool_use(
-        &tool.tool_name,
-        &input,
-        &MemoryPathPolicy::default(),
-        ClassifyOptions::default(),
-    )
+    classify_tool_use(&tool.tool_name, &input, &MemoryPathPolicy::default())
 }
 
 fn trailing_groupable_tool_cluster(

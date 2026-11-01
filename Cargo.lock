@@ -5639,6 +5639,7 @@ name = "rebon-render"
 version = "1.24.0"
 dependencies = [
  "rebon-design-system",
+ "rebon-shell-policy",
  "rebon-tools-core",
  "rebon-types",
  "rebon-width",

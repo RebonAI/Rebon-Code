@@ -1240,9 +1240,11 @@ fn trailing_collapsible_tool_run_stops_at_non_collapsible_tail() {
     let rows = vec![
         assistant_tool_uses("a1", vec![("t1", "Grep", json!({ "pattern": "first" }))]),
         user_tool_results("u1", vec![("t1", "matches", None)]),
+        // A write is the group breaker: it renders a diff, so absorbing it
+        // into a "searched / read" summary would hide the change.
         assistant_tool_uses(
             "a2",
-            vec![("t2", "Bash", json!({ "command": "cargo test" }))],
+            vec![("t2", "Write", json!({ "file_path": "src/lib.rs" }))],
         ),
     ];
 
@@ -2328,8 +2330,11 @@ fn long_transcript_scroll_reuses_layout_and_clipped_segment_cache() {
 }
 
 fn thinking_tool_step(thinking: &str, tool_first: bool) -> Message {
+    // A `Write` on a non-memory path is the non-collapsible stand-in here: it
+    // renders its own card with a diff, so the reasoning margin around it is
+    // decided by the per-message path rather than by a collapsed run.
     let Message::Assistant(mut step) =
-        assistant_tool("margin-step", "tool-margin", "Bash", "cargo test")
+        assistant_tool("margin-step", "tool-margin", "Write", "src/lib.rs")
     else {
         unreachable!()
     };
@@ -2363,7 +2368,7 @@ fn committed_thinking_margin_follows_first_and_later_block_contract() {
                 .unwrap();
                 let rows = all_rows(&buf);
                 let thinking_y = row_y_containing(&rows, "Planning verification");
-                let tool_y = row_y_containing(&rows, "Bash");
+                let tool_y = row_y_containing(&rows, "Write");
                 let (first, second) = if tool_first {
                     (tool_y, thinking_y)
                 } else {
@@ -2564,7 +2569,7 @@ fn committed_thinking_margin_keeps_gap_after_collapsed_group() {
         .position(|row| row.to_lowercase().contains("read 2 files"))
         .unwrap_or_else(|| panic!("collapsed Read summary missing: {rows:?}"));
     let thinking_y = row_y_containing(&rows, "Planning verification");
-    let tool_y = row_y_containing(&rows, "Bash");
+    let tool_y = row_y_containing(&rows, "Write");
     assert!(
         thinking_y > group_y + 1 && tool_y > thinking_y + 1,
         "{rows:?}"
