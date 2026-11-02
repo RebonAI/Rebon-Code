@@ -1094,6 +1094,14 @@ impl EngineQueryExecutor {
         self
     }
 
+    /// Whether the session is the router, which gets the router contract in
+    /// place of the base prompt.
+    fn is_router_session(&self) -> bool {
+        self.coordinator_mode
+            .as_ref()
+            .is_some_and(|mode| mode.mode() == rebon_tool::SessionMode::Router)
+    }
+
     pub fn with_coordinator_use_worktree(mut self, enabled: bool) -> Self {
         self.coordinator_use_worktree = enabled;
         self
@@ -3067,6 +3075,7 @@ impl EngineQueryExecutor {
                                         self.coordinator_use_worktree,
                                         request_config.language.clone(),
                                     );
+                                dynamic_ctx.router_mode = self.is_router_session();
                                 dynamic_ctx.plugin_prompt_sections = seat_prompt_sections(
                                     kernel_turn_lease.as_ref(),
                                     &request_config,
@@ -3142,6 +3151,7 @@ impl EngineQueryExecutor {
                                 self.coordinator_use_worktree,
                                 request_config.language.clone(),
                             );
+                        dynamic_ctx.router_mode = self.is_router_session();
                         dynamic_ctx.plugin_prompt_sections = seat_prompt_sections(
                             kernel_turn_lease.as_ref(),
                             &request_config,

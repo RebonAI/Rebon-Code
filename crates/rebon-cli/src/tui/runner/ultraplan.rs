@@ -61,6 +61,11 @@ pub(super) fn match_runtime_resume_session_mode(
     session: &TuiEngineSession,
     mode: Option<&str>,
 ) -> Option<String> {
+    if mode == Some("router") {
+        app.coordinator_mode = false;
+        session.apply_session_mode(rebon_tool::SessionMode::Router);
+        return Some("Resumed the router session.".to_string());
+    }
     let mode = mode.filter(|mode| matches!(*mode, "coordinator" | "normal"))?;
     let (enabled, warning) = rebon_core::coordinator_mode::match_session_mode(
         session.engine_half.coordinator_mode_handle.get(),

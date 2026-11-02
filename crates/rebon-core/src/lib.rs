@@ -29,6 +29,7 @@ pub(crate) mod context_manager;
 /// engine's history keeps only the newest few of them.
 pub use context_manager::LIVE_CAPTURE_RESULT_TEXT_PREFIX;
 pub mod coordinator_mode;
+pub mod router_mode;
 pub mod cron;
 mod deferred_question;
 pub mod hooks;

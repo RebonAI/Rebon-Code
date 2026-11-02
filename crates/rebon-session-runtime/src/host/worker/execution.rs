@@ -2833,8 +2833,22 @@ mod retry_progress_tests {
     }
 }
 
-/// Apply a `/ceo` command carried by this turn's prompt.
+/// Apply a `/ceo` or `/router` command carried by this turn's prompt.
 fn apply_background_ceo_command(session: &mut crate::EngineSession, prompt: &mut String) {
+    // `/router` makes this session the router, for good: a router job is
+    // launched with it, and every later turn resumes the mode from disk.
+    if let Some(rest) = strip_router_command(prompt.trim()) {
+        session.apply_session_mode(rebon_tool::SessionMode::Router);
+        // The literal text stays, after the reminder, as with `/ceo`: the
+        // app matches its echo of the sent message against it.
+        let reminder = if rest.is_empty() {
+            "You are now online as the router. Say so in one short line and wait for the person; do nothing else this turn."
+        } else {
+            "You are now online as the router. Handle the request after /router."
+        };
+        *prompt = format!("<system-reminder>\n{reminder}\n</system-reminder>\n\n{prompt}");
+        return;
+    }
     // `/ceo` toggles coordinator (CEO) mode for this session, mirroring the
     // interactive TUI. `/ceo <task>` enters coordinator mode and runs the task;
     // bare `/ceo on` / `/ceo off` flip the mode. The mode is applied + persisted
@@ -2868,10 +2882,24 @@ fn apply_background_ceo_command(session: &mut crate::EngineSession, prompt: &mut
     }
 }
 
+/// The text after a leading `/router` command, if the prompt is one.
+fn strip_router_command(prompt: &str) -> Option<&str> {
+    let rest = prompt.strip_prefix("/router")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::host::BackgroundRuntimeFields;
+
+    #[test]
+    fn only_a_leading_router_command_is_one() {
+        assert_eq!(strip_router_command("/router"), Some(""));
+        assert_eq!(strip_router_command("/router  fix CI"), Some("fix CI"));
+        assert_eq!(strip_router_command("/routers"), None);
+        assert_eq!(strip_router_command("use /router"), None);
+    }
 
     #[test]
     fn an_idle_worker_leaves_at_its_linger_deadline_with_nothing_scheduled() {

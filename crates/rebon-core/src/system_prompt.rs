@@ -97,6 +97,10 @@ pub struct DynamicPromptContext {
     pub session_date: Option<String>,
     /// Whether we're in coordinator mode.
     pub coordinator_mode: bool,
+    /// Whether this is the router session. Set by the executor from the
+    /// session's mode after the context is resolved; it wins over
+    /// `coordinator_mode`.
+    pub router_mode: bool,
     /// Whether coordinator implementation workers should be isolated in git worktrees.
     pub coordinator_use_worktree: bool,
     /// Worker tools context (injected when coordinator mode is on).
@@ -729,6 +733,7 @@ pub fn resolve_dynamic_context_with_language(
         mcp_instructions: None,
         session_date,
         coordinator_mode,
+        router_mode: false,
         coordinator_use_worktree,
         worker_tools_context,
         scratchpad_dir,
@@ -878,6 +883,7 @@ mod tests {
             mcp_instructions: None,
             session_date: Some("2026-04-10".to_string()),
             coordinator_mode: false,
+            router_mode: false,
             coordinator_use_worktree: false,
             worker_tools_context: None,
             scratchpad_dir: None,

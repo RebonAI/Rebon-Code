@@ -1188,12 +1188,12 @@ fn iso8601_to_epoch_ms(input: &str) -> Option<u64> {
     u64::try_from(millis).ok().filter(|millis| *millis > 0)
 }
 
-/// Read the stored session mode (`"coordinator"` / `"normal"`) from the
-/// sidecar metadata file.
+/// Read the stored session mode (`"coordinator"` / `"router"` / `"normal"`)
+/// from the sidecar metadata file.
 pub fn load_session_mode(projects_root: &Path, cwd: &str, session_id: &str) -> Option<String> {
     let meta = load_session_meta(projects_root, cwd, session_id)?;
     meta.mode
-        .filter(|s| matches!(s.as_str(), "coordinator" | "normal"))
+        .filter(|s| matches!(s.as_str(), "coordinator" | "router" | "normal"))
 }
 
 /// Whether this internal session should be omitted from ordinary chat lists.
@@ -1227,11 +1227,11 @@ pub fn save_session_mode(
     mode: &str,
 ) -> std::io::Result<()> {
     let mode = match mode {
-        "coordinator" | "normal" => mode,
+        "coordinator" | "router" | "normal" => mode,
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "session mode must be coordinator or normal",
+                "session mode must be coordinator, router or normal",
             ));
         }
     };

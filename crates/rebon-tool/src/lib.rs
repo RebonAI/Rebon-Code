@@ -20,7 +20,7 @@ use serde_json::Value;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::sync::{mpsc, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
@@ -725,24 +725,101 @@ pub trait PeerMessenger: Send + Sync {
     ) -> Result<PeerDelivery, String>;
 }
 
+/// What a session is for, which decides its prompt and its tools.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SessionMode {
+    /// An ordinary session that does the work itself.
+    #[default]
+    Normal,
+    /// `/ceo`: plans and delegates to in-process workers, for the length of
+    /// the session.
+    Coordinator,
+    /// The resident router: talks with the person and dispatches background
+    /// worker jobs, which it never does the work of itself.
+    Router,
+}
+
+impl SessionMode {
+    /// The value stored in the session's metadata sidecar.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Coordinator => "coordinator",
+            Self::Router => "router",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "normal" => Some(Self::Normal),
+            "coordinator" => Some(Self::Coordinator),
+            "router" => Some(Self::Router),
+            _ => None,
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::Coordinator => 1,
+            Self::Router => 2,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Coordinator,
+            2 => Self::Router,
+            _ => Self::Normal,
+        }
+    }
+}
+
+/// The session's mode, shared by everything that reads it each turn.
+///
+/// Named for the mode it started as: [`Self::get`] and [`Self::set`] still
+/// answer and switch "is this a coordinator", which is all most readers ask.
+/// [`Self::mode`] is the whole answer.
 #[derive(Clone, Default)]
 pub struct SharedCoordinatorMode {
-    inner: Arc<AtomicBool>,
+    inner: Arc<AtomicU8>,
 }
 
 impl SharedCoordinatorMode {
     pub fn new(enabled: bool) -> Self {
+        Self::with_mode(if enabled {
+            SessionMode::Coordinator
+        } else {
+            SessionMode::Normal
+        })
+    }
+
+    pub fn with_mode(mode: SessionMode) -> Self {
         Self {
-            inner: Arc::new(AtomicBool::new(enabled)),
+            inner: Arc::new(AtomicU8::new(mode.to_u8())),
         }
     }
 
+    /// Whether the session is a coordinator.
     pub fn get(&self) -> bool {
-        self.inner.load(Ordering::Relaxed)
+        self.mode() == SessionMode::Coordinator
     }
 
+    /// Make the session a coordinator, or an ordinary session.
     pub fn set(&self, enabled: bool) {
-        self.inner.store(enabled, Ordering::Relaxed);
+        self.set_mode(if enabled {
+            SessionMode::Coordinator
+        } else {
+            SessionMode::Normal
+        });
+    }
+
+    pub fn mode(&self) -> SessionMode {
+        SessionMode::from_u8(self.inner.load(Ordering::Relaxed))
+    }
+
+    pub fn set_mode(&self, mode: SessionMode) {
+        self.inner.store(mode.to_u8(), Ordering::Relaxed);
     }
 }
 

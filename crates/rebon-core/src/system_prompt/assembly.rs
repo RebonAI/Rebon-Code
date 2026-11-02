@@ -63,6 +63,9 @@ pub enum PromptVariant {
     /// The coordinator contract replaces the base plane; runtime context
     /// planes are shared with the standard variant.
     Coordinator { simple: bool, use_worktree: bool },
+    /// The router contract replaces the base plane, as the coordinator's
+    /// does; runtime context planes are shared.
+    Router,
 }
 
 impl PromptVariant {
@@ -70,7 +73,9 @@ impl PromptVariant {
     /// `build_split_system_prompt` used to hardcode, including the
     /// `REBON_SIMPLE` read at this point.
     pub fn from_context(ctx: &DynamicPromptContext) -> Self {
-        if ctx.coordinator_mode {
+        if ctx.router_mode {
+            PromptVariant::Router
+        } else if ctx.coordinator_mode {
             PromptVariant::Coordinator {
                 simple: coordinator_simple_mode_enabled(),
                 use_worktree: ctx.coordinator_use_worktree,
@@ -117,6 +122,14 @@ impl PromptAssembly {
                 use_worktree,
             } => Self {
                 base: coordinator_base_sections(*simple, *use_worktree),
+                stable: stable_context_sections(),
+                transient: transient_context_sections(),
+                base_accepts_plugin_sections: false,
+            },
+            PromptVariant::Router => Self {
+                base: vec![section("router-contract", 10, |_, _| {
+                    Some(crate::router_mode::router_system_prompt())
+                })],
                 stable: stable_context_sections(),
                 transient: transient_context_sections(),
                 base_accepts_plugin_sections: false,
@@ -497,6 +510,7 @@ mod tests {
             mcp_instructions: Some("## some-mcp\nUse it sparingly.".into()),
             session_date: Some("2026-08-14".into()),
             coordinator_mode: false,
+            router_mode: false,
             coordinator_use_worktree: false,
             worker_tools_context: Some("Worker tools: Read, Edit".into()),
             scratchpad_dir: Some("/tmp/scratch".into()),

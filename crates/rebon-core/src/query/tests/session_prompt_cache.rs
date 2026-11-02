@@ -90,6 +90,15 @@ fn session_prompt_cache_key_ignores_dynamic_tool_lists_but_covers_base_prompt_in
         SessionPromptCacheKey::from_config(&config, &coordinator_ctx)
     );
 
+    let router_ctx = DynamicPromptContext {
+        router_mode: true,
+        ..Default::default()
+    };
+    assert_ne!(
+        key,
+        SessionPromptCacheKey::from_config(&config, &router_ctx)
+    );
+
     let worktree_ctx = DynamicPromptContext {
         coordinator_mode: false,
         coordinator_use_worktree: true,

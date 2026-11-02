@@ -469,8 +469,22 @@ impl EngineSession {
     /// `enter/exit_coordinator_mode` and the headless background worker so both
     /// surfaces flip identical state.
     pub fn apply_coordinator_mode(&self, on: bool) {
-        self.engine_half.coordinator_mode_handle.set(on);
-        let mode = if on { "coordinator" } else { "normal" };
+        self.apply_session_mode(if on {
+            rebon_tool::SessionMode::Coordinator
+        } else {
+            rebon_tool::SessionMode::Normal
+        });
+    }
+
+    /// Put the session in `mode`: the shared mode handle, the session and
+    /// sub-agent tool filters, and the persisted mode, all at once. See
+    /// [`Self::apply_coordinator_mode`].
+    pub fn apply_session_mode(&self, session_mode: rebon_tool::SessionMode) {
+        use rebon_tool::SessionMode;
+        self.engine_half
+            .coordinator_mode_handle
+            .set_mode(session_mode);
+        let mode = session_mode.as_str();
         let _ = self.server_state.set_session_mode(&self.session_id, mode);
         if let Err(err) =
             rebon_session::save_session_mode(&self.projects_root, &self.cwd, &self.session_id, mode)
@@ -482,25 +496,38 @@ impl EngineSession {
                 "failed to persist session mode"
             );
         }
-        if on {
-            self.engine_half.session_filter_handle.set(
-                rebon_core::coordinator_mode::coordinator_session_filter_for_queue(
-                    self.startup.queue_session,
-                ),
-            );
-            self.engine_half
-                .subagent_filter_handle
-                .set(rebon_core::coordinator_mode::async_agent_filter());
-        } else {
-            self.engine_half.session_filter_handle.set(
-                rebon_harness::build_default_tool_filter_for_context(
-                    false,
-                    self.startup.queue_session,
-                ),
-            );
-            self.engine_half
-                .subagent_filter_handle
-                .set(rebon_core::coordinator_mode::default_subagent_filter(false));
+        match session_mode {
+            SessionMode::Coordinator => {
+                self.engine_half.session_filter_handle.set(
+                    rebon_core::coordinator_mode::coordinator_session_filter_for_queue(
+                        self.startup.queue_session,
+                    ),
+                );
+                self.engine_half
+                    .subagent_filter_handle
+                    .set(rebon_core::coordinator_mode::async_agent_filter());
+            }
+            // The router spawns no in-process sub-agents; its workers are
+            // background jobs with their own sessions.
+            SessionMode::Router => {
+                self.engine_half
+                    .session_filter_handle
+                    .set(rebon_core::router_mode::router_session_filter());
+                self.engine_half
+                    .subagent_filter_handle
+                    .set(rebon_core::coordinator_mode::default_subagent_filter(false));
+            }
+            SessionMode::Normal => {
+                self.engine_half.session_filter_handle.set(
+                    rebon_harness::build_default_tool_filter_for_context(
+                        false,
+                        self.startup.queue_session,
+                    ),
+                );
+                self.engine_half
+                    .subagent_filter_handle
+                    .set(rebon_core::coordinator_mode::default_subagent_filter(false));
+            }
         }
     }
 }

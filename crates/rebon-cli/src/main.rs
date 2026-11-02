@@ -33,6 +33,7 @@ pub(crate) use rebon_session_runtime::{
     acp_subagent_pool, mcp_config, mcp_status, plugin, project_settings, rebon_config, ripgrep,
     task_notification_poller, ui_config,
 };
+mod router;
 mod serve;
 mod session_agent_router;
 #[cfg(test)]
@@ -330,6 +331,12 @@ enum Command {
     Bg {
         #[command(subcommand)]
         command: AgentServiceCommand,
+    },
+    /// The router: the one resident session you talk to, which sends work to
+    /// background worker jobs and keeps track of them.
+    Router {
+        #[command(subcommand)]
+        command: RouterCommand,
     },
     /// Hidden supervisor entrypoint for background jobs.
     #[command(name = "__background-supervisor", hide = true)]
@@ -665,6 +672,16 @@ enum AgentsCommand {
         #[command(subcommand)]
         command: AgentServiceCommand,
     },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+enum RouterCommand {
+    /// Start the router, or say which one is running.
+    Start,
+    /// Print the router's job, model and worker count.
+    Status,
+    /// Stop the router. Its workers keep running.
+    Stop,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -1077,6 +1094,7 @@ async fn run_headless_command(command: Command) -> anyhow::Result<()> {
                 }),
         } => run_agent_service_command(service_command).await,
         Command::Bg { command } => run_agent_service_command(command).await,
+        Command::Router { command } => run_router_command(command),
         Command::Attach { job_id } => {
             agent_view_enabled()?;
             let target = background::attach_background_job(&job_id)?;
@@ -1501,6 +1519,26 @@ fn print_plugin_records(records: Vec<(plugin::PluginScope, plugin::InstalledPlug
             source
         );
     }
+}
+
+fn run_router_command(command: RouterCommand) -> anyhow::Result<()> {
+    let store = background::cli_default_store();
+    match command {
+        RouterCommand::Start => {
+            let (job, started) = router::ensure_router(&store)?;
+            if started {
+                println!("Started the router: {}", job.identity.job_id);
+            } else {
+                println!("The router is already running: {}", job.identity.job_id);
+            }
+        }
+        RouterCommand::Status => println!("{}", router::describe_router(&store)),
+        RouterCommand::Stop => match router::stop_router(&store)? {
+            Some(job_id) => println!("Stopped the router {job_id}. Its workers keep running."),
+            None => println!("No router is running."),
+        },
+    }
+    Ok(())
 }
 
 async fn run_agent_service_command(command: AgentServiceCommand) -> anyhow::Result<()> {
