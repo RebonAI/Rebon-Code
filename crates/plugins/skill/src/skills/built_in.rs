@@ -361,6 +361,13 @@ mod tests {
             "do not schedule a wakeup; its completion wakes you",
             "Continue the self-paced /loop: <the parsed prompt>",
             "Immediately execute the parsed prompt once",
+            // The budget is named once and inherited, so it can run out.
+            "becomes `budgetSeconds`",
+            "becomes `maxWakeups`",
+            "Pass them on the **first** `ScheduleWakeup` of this loop only",
+            "refuses because the loop's budget is spent, the loop is over",
+            // A condition a command can test belongs to Monitor, not a timer.
+            "start a `Monitor` for it",
         ] {
             assert!(body.contains(expected), "missing {expected:?}");
         }

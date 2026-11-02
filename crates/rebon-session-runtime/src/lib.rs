@@ -278,6 +278,14 @@ impl EngineSession {
         if self.engine_half.cron_scheduler.is_some() {
             return;
         }
+        // Becoming the session's owner: what its last owner scheduled for
+        // it session-only is this process's to fire now.
+        crate::session_handoff::take_handed_off_schedule(
+            &self.projects_root,
+            &self.engine_half.session_cron_store,
+            &self.cwd,
+            &self.session_id,
+        );
         // The scheduler is a tokio task: it needs a runtime to be spawned
         // on, and the UI thread is not one. A test session may have none.
         let handle = self
@@ -305,6 +313,19 @@ impl EngineSession {
     /// the lock with it; there is nothing to wait for.
     pub fn stop_cron_scheduler(&mut self) {
         drop(self.engine_half.cron_scheduler.take());
+    }
+
+    /// Leave this session's session-only schedule for the process that owns
+    /// it next. Only an owner may: a mirror's store is empty, and handing
+    /// that off would remove what the real owner left. Call it before the
+    /// lock goes.
+    pub fn hand_off_cron_schedule(&self) {
+        crate::session_handoff::hand_off_schedule(
+            &self.projects_root,
+            &self.engine_half.session_cron_store,
+            &self.cwd,
+            &self.session_id,
+        );
     }
 
     /// Make sure this session exists on disk before another process is asked

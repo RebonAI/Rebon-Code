@@ -256,8 +256,30 @@ pub async fn run_background_worker(job_id: String) -> anyhow::Result<()> {
         outcome = ?result.as_ref().map(|_| "done").map_err(|err| err.to_string()),
         "rebon: background worker exiting"
     );
+    hand_off_held_cron(handed_back.cron.take());
     close_host_resources(&ipc, handed_back.mcp.take(), &store, &job_id).await;
     result
+}
+
+/// Stop a leaving worker's scheduler and leave the session-only schedule it
+/// ran for the session's next owner — a terminal taking the session back, or
+/// the next worker. `handed_back` still holds the session's lock here, and the
+/// next owner reads only after taking it. The scheduler stops first, so
+/// nothing fires here after the snapshot that would fire again there.
+fn hand_off_held_cron(cron: Option<crate::session_handoff::HeldCron>) {
+    let Some(cron) = cron else {
+        return;
+    };
+    let crate::session_handoff::HeldCron {
+        session_id,
+        cwd,
+        session_store,
+        scheduler,
+        projects_root,
+        ..
+    } = cron;
+    drop(scheduler);
+    crate::session_handoff::hand_off_schedule(&projects_root, &session_store, &cwd, &session_id);
 }
 
 /// Close what this host holds, in the order a client can observe.
@@ -2111,6 +2133,7 @@ async fn release_session_keeping_lock(
             poller: Arc::clone(&session.engine_half.cron_poller),
             session_store: Arc::clone(&session.engine_half.session_cron_store),
             scheduler,
+            projects_root: session.projects_root.clone(),
         });
     }
 }
@@ -2747,12 +2770,88 @@ mod tests {
         let poller = rebon_core::cron::CronPoller::new();
         let store = rebon_tool::SessionCronStore::new();
         let schedule = Some((poller.as_ref(), store.as_ref()));
-        store.set_wakeup("next iteration", "CI", 0, 600_000);
+        store
+            .arm_wakeup("next iteration", "CI", 0, 600_000, None)
+            .unwrap();
         assert!(idle_worker_stays(5_000, 1_000, schedule));
 
         // Disarmed (`stop`), the worker goes at its deadline again.
         store.clear_wakeup();
         assert!(!idle_worker_stays(5_000, 1_000, schedule));
+    }
+
+    fn leaving_worker_cron(dir: &std::path::Path) -> crate::session_handoff::HeldCron {
+        let poller = rebon_core::cron::CronPoller::new();
+        let session_store = rebon_tool::SessionCronStore::new();
+        let scheduler = rebon_core::cron::start_scheduler_with_session_store(
+            rebon_core::cron::SchedulerConfig::new(dir.join("repo")),
+            poller.clone(),
+            Some(session_store.clone()),
+        );
+        let held = crate::session_handoff::HeldCron {
+            session_id: "sess-leaving".into(),
+            cwd: dir.join("repo").to_string_lossy().into_owned(),
+            poller,
+            session_store,
+            scheduler,
+            projects_root: dir.join("projects"),
+        };
+        std::fs::create_dir_all(rebon_session::project_dir_path(
+            &held.projects_root,
+            &held.cwd,
+        ))
+        .unwrap();
+        held
+    }
+
+    fn handoff_path_of(held: &crate::session_handoff::HeldCron) -> std::path::PathBuf {
+        rebon_tool::cron::session_schedule_handoff_path(
+            &held.projects_root,
+            &held.cwd,
+            &held.session_id,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_leaving_worker_hands_its_schedule_to_the_sessions_next_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = leaving_worker_cron(dir.path());
+        let path = handoff_path_of(&held);
+        let (projects_root, cwd) = (held.projects_root.clone(), held.cwd.clone());
+        let wakeup = held
+            .session_store
+            .arm_wakeup(
+                "Continue the self-paced /loop: check CI",
+                "CI",
+                rebon_tool::cron::now_ms(),
+                600_000,
+                None,
+            )
+            .unwrap();
+
+        hand_off_held_cron(Some(held));
+        assert!(path.exists());
+
+        // The terminal taking the session back.
+        let next = rebon_tool::SessionCronStore::new();
+        crate::session_handoff::take_handed_off_schedule(
+            &projects_root,
+            &next,
+            &cwd,
+            "sess-leaving",
+        );
+        assert_eq!(next.wakeup(), Some(wakeup));
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_leaving_worker_with_nothing_scheduled_leaves_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = leaving_worker_cron(dir.path());
+        let path = handoff_path_of(&held);
+        hand_off_held_cron(Some(held));
+        assert!(!path.exists());
+        hand_off_held_cron(None);
     }
 
     #[test]
@@ -2761,7 +2860,9 @@ mod tests {
         // poller after this pass queued fires: leaving now would drop it.
         let poller = rebon_core::cron::CronPoller::new();
         let store = rebon_tool::SessionCronStore::new();
-        store.set_wakeup("next iteration", "CI", 0, 1);
+        store
+            .arm_wakeup("next iteration", "CI", 0, 1, None)
+            .unwrap();
         let wakeup = store.take_due_wakeup(10).expect("due");
         poller.enqueue(wakeup.prompt);
         let schedule = Some((poller.as_ref(), store.as_ref()));

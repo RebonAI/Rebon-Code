@@ -52,6 +52,9 @@ pub struct HeldCron {
     pub poller: Arc<rebon_core::cron::CronPoller>,
     pub session_store: Arc<rebon_tool::SessionCronStore>,
     pub scheduler: rebon_core::cron::SchedulerHandle,
+    /// Where the session's lock lives, and so where its schedule is handed
+    /// off when the worker holding this leaves.
+    pub projects_root: std::path::PathBuf,
 }
 
 impl HeldCron {
@@ -64,6 +67,54 @@ impl HeldCron {
     ) -> Option<Self> {
         let held = held?;
         (session_id == Some(held.session_id.as_str()) && held.cwd == cwd).then_some(held)
+    }
+}
+
+/// Leave `store`'s session-only schedule — its cron tasks and its wakeup — for
+/// the next process to own `session_id`, which takes it with
+/// [`take_handed_off_schedule`]. Both directions of a handoff call this: the
+/// terminal releasing to a worker, and a worker leaving.
+///
+/// Call it while this process still holds the session's lock, with the
+/// `projects_root` that lock lives under. The next owner reads only after
+/// taking the lock, so it can never look before this wrote. A failure is
+/// logged and loses the schedule, as every handoff did before.
+pub fn hand_off_schedule(
+    projects_root: &std::path::Path,
+    store: &rebon_tool::SessionCronStore,
+    cwd: &str,
+    session_id: &str,
+) {
+    let path = rebon_tool::cron::session_schedule_handoff_path(projects_root, cwd, session_id);
+    if let Err(error) = store.hand_off(&path, rebon_tool::cron::now_ms()) {
+        tracing::warn!(
+            %session_id,
+            error = %format!("{error:#}"),
+            "rebon: could not hand off the session's schedule; its session-only tasks end here"
+        );
+    }
+}
+
+/// Take what the previous owner of `session_id` left with
+/// [`hand_off_schedule`] into `store`. Call it after taking the session's
+/// lock and before starting its scheduler.
+pub fn take_handed_off_schedule(
+    projects_root: &std::path::Path,
+    store: &rebon_tool::SessionCronStore,
+    cwd: &str,
+    session_id: &str,
+) {
+    let path = rebon_tool::cron::session_schedule_handoff_path(projects_root, cwd, session_id);
+    match store.take_handed_off(&path, rebon_tool::cron::now_ms()) {
+        Ok(rebon_tool::cron::HandedOff::Taken { tasks, wakeup }) => {
+            tracing::info!(%session_id, tasks, wakeup, "rebon: took the schedule the session's last owner left");
+        }
+        Ok(rebon_tool::cron::HandedOff::Nothing | rebon_tool::cron::HandedOff::Discarded) => {}
+        Err(error) => tracing::warn!(
+            %session_id,
+            error = %format!("{error:#}"),
+            "rebon: could not read the schedule the session's last owner left"
+        ),
     }
 }
 
@@ -118,6 +169,7 @@ mod tests {
                 rebon_core::cron::SchedulerConfig::new(std::env::temp_dir()),
                 rebon_core::cron::CronPoller::new(),
             ),
+            projects_root: std::env::temp_dir(),
         };
         assert!(HeldCron::take_for(Some(held("s1")), Some("s1"), "/work").is_some());
         assert!(HeldCron::take_for(Some(held("s1")), Some("s2"), "/work").is_none());

@@ -49,14 +49,23 @@ After `CronCreate` succeeds, immediately execute the parsed prompt once in this 
 
 Immediately execute the parsed prompt once in this same turn.
 
+### Budget
+
+Take the loop's limits from the request: a duration (`for 2 hours`, `until tonight`) becomes `budgetSeconds`, a count (`at most 5 times`) becomes `maxWakeups`. Without a duration, use `budgetSeconds: 86400`. Pass them on the **first** `ScheduleWakeup` of this loop only — later iterations leave them out and inherit the budget, which is what lets it run out.
+
+### Each iteration
+
 At the end of every iteration, decide whether the loop goes on:
 - **Done** — the task is finished, the thing being watched settled, or the user asked to stop: call `ScheduleWakeup` with `stop: true` and tell the user the loop ended and why.
 - **Waiting on work you started** — a background agent or shell is still running: do not schedule a wakeup; its completion wakes you, and you continue the loop then.
+- **Waiting on a condition a command can test** — a port answering, a file appearing, a CI status changing: start a `Monitor` for it instead of checking on a timer; its event wakes you.
 - **Otherwise** — call `ScheduleWakeup` with:
   - `delaySeconds`: matched to what you are waiting on (a CI run of ~8 minutes deserves one check at ~480, not eight at 60). With nothing specific to watch, use 1200–1800.
   - `prompt`: `Continue the self-paced /loop: <the parsed prompt>` — the same text every iteration.
   - `reason`: one short sentence on why this delay, such as `watching the CI run`.
 
 If `ScheduleWakeup` is not loaded, first call `ToolSearch` with query `select:ScheduleWakeup`.
+
+If `ScheduleWakeup` refuses because the loop's budget is spent, the loop is over: say so, with what the last iteration found. Do not start a new budget unless the user asks to keep going.
 
 A turn that starts with `Continue the self-paced /loop:` is the next iteration: run the prompt, then decide again as above. Keep each iteration's report short; say only what changed.

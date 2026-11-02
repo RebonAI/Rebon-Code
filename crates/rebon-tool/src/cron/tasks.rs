@@ -103,7 +103,7 @@ impl From<&CronTask> for SessionCronTask {
 /// A turn the agent scheduled for itself (`ScheduleWakeup`): one prompt at
 /// one exact time, to the second. A session holds at most one — a self-paced
 /// loop re-arms it every turn, and arming again replaces it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionWakeup {
     pub id: String,
     pub prompt: String,
@@ -113,10 +113,51 @@ pub struct SessionWakeup {
     pub fire_at: i64,
 }
 
+/// What a self-paced loop may still spend. It belongs to the loop, not to one
+/// wakeup: each fire counts against it, a re-arm inherits it, and only `stop`
+/// or a re-arm that names a new budget ends it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeupBudget {
+    pub started_at: i64,
+    /// No wakeup fires after this; the last one is moved up to it.
+    pub deadline: i64,
+    pub max_wakeups: Option<u32>,
+    /// Wakeups of this loop that have fired.
+    pub fired: u32,
+}
+
+/// The budget a re-arm starts a new loop with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewWakeupBudget {
+    pub duration_ms: i64,
+    pub max_wakeups: Option<u32>,
+}
+
+/// How long a loop that names no budget may run: a day. A loop nobody bounded
+/// should end on its own rather than spend a turn an hour indefinitely.
+pub const DEFAULT_WAKEUP_BUDGET_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Why a wakeup was not armed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeupRefused {
+    /// The loop has fired every wakeup it was allowed.
+    WakeupsSpent { fired: u32, max: u32 },
+    /// The loop's time is up.
+    DeadlinePassed { deadline: i64 },
+}
+
+/// The session's wakeup and the loop budget it is counted against, under one
+/// lock so the two never disagree.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct WakeupSlot {
+    armed: Option<SessionWakeup>,
+    budget: Option<WakeupBudget>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionCronStore {
     tasks: Arc<Mutex<Vec<SessionCronTask>>>,
-    wakeup: Arc<Mutex<Option<SessionWakeup>>>,
+    wakeup: Arc<Mutex<WakeupSlot>>,
 }
 
 impl SessionCronStore {
@@ -169,23 +210,58 @@ impl SessionCronStore {
     }
 
     /// Arm the session's wakeup to fire `delay_ms` after `now_ms`, replacing
-    /// any wakeup already armed. Returns the new one.
-    pub fn set_wakeup(
+    /// any wakeup already armed, and counted against the loop's budget.
+    ///
+    /// `new_budget` starts a new loop with that budget. Without it the
+    /// running loop's budget carries on, or — when there is none — a new
+    /// loop starts with [`DEFAULT_WAKEUP_BUDGET_MS`]. A wakeup that would land
+    /// past the deadline is moved up to it, so the loop gets one last turn to
+    /// report in.
+    pub fn arm_wakeup(
         &self,
         prompt: &str,
         reason: &str,
         now_ms: i64,
         delay_ms: i64,
-    ) -> SessionWakeup {
+        new_budget: Option<NewWakeupBudget>,
+    ) -> Result<SessionWakeup, WakeupRefused> {
+        let mut slot = self.wakeup.lock().expect("session wakeup slot poisoned");
+        let budget = match (new_budget, slot.budget.clone()) {
+            (Some(new), _) => WakeupBudget {
+                started_at: now_ms,
+                deadline: now_ms.saturating_add(new.duration_ms),
+                max_wakeups: new.max_wakeups,
+                fired: 0,
+            },
+            (None, Some(running)) => running,
+            (None, None) => WakeupBudget {
+                started_at: now_ms,
+                deadline: now_ms.saturating_add(DEFAULT_WAKEUP_BUDGET_MS),
+                max_wakeups: None,
+                fired: 0,
+            },
+        };
+        if let Some(max) = budget.max_wakeups.filter(|max| budget.fired >= *max) {
+            return Err(WakeupRefused::WakeupsSpent {
+                fired: budget.fired,
+                max,
+            });
+        }
+        if now_ms >= budget.deadline {
+            return Err(WakeupRefused::DeadlinePassed {
+                deadline: budget.deadline,
+            });
+        }
         let wakeup = SessionWakeup {
             id: generate_task_id(),
             prompt: prompt.to_string(),
             reason: reason.to_string(),
             created_at: now_ms,
-            fire_at: now_ms.saturating_add(delay_ms),
+            fire_at: now_ms.saturating_add(delay_ms).min(budget.deadline),
         };
-        *self.wakeup.lock().expect("session wakeup slot poisoned") = Some(wakeup.clone());
-        wakeup
+        slot.armed = Some(wakeup.clone());
+        slot.budget = Some(budget);
+        Ok(wakeup)
     }
 
     /// The armed wakeup, if any.
@@ -193,26 +269,40 @@ impl SessionCronStore {
         self.wakeup
             .lock()
             .expect("session wakeup slot poisoned")
+            .armed
             .clone()
     }
 
-    /// Disarm the wakeup; returns the one that was armed.
-    pub fn clear_wakeup(&self) -> Option<SessionWakeup> {
+    /// The running loop's budget, if a loop is running.
+    pub fn wakeup_budget(&self) -> Option<WakeupBudget> {
         self.wakeup
             .lock()
             .expect("session wakeup slot poisoned")
-            .take()
+            .budget
+            .clone()
     }
 
-    /// Take the wakeup if it is due at `now_ms`, disarming it, so it fires
-    /// exactly once.
+    /// End the loop: disarm the wakeup and drop its budget. Returns the
+    /// wakeup that was armed.
+    pub fn clear_wakeup(&self) -> Option<SessionWakeup> {
+        std::mem::take(&mut *self.wakeup.lock().expect("session wakeup slot poisoned")).armed
+    }
+
+    /// Take the wakeup if it is due at `now_ms`, disarming it so it fires
+    /// exactly once, and count it against the loop's budget.
     pub fn take_due_wakeup(&self, now_ms: i64) -> Option<SessionWakeup> {
         let mut slot = self.wakeup.lock().expect("session wakeup slot poisoned");
-        if slot.as_ref().is_some_and(|wakeup| now_ms >= wakeup.fire_at) {
-            slot.take()
-        } else {
-            None
+        if !slot
+            .armed
+            .as_ref()
+            .is_some_and(|wakeup| now_ms >= wakeup.fire_at)
+        {
+            return None;
         }
+        if let Some(budget) = slot.budget.as_mut() {
+            budget.fired = budget.fired.saturating_add(1);
+        }
+        slot.armed.take()
     }
 
     pub fn mark_fired(&self, ids: &[String], fired_at_ms: i64) {
@@ -225,6 +315,119 @@ impl SessionCronStore {
                 task.last_fired_at = Some(fired_at_ms);
             }
         }
+    }
+}
+
+// --- Session schedule handoff ----------------------------------------------
+
+/// Suffix of the file a session's session-only schedule crosses a handoff in,
+/// beside its transcript: `<session id>.schedule-handoff.json`.
+pub const SESSION_SCHEDULE_HANDOFF_SUFFIX: &str = ".schedule-handoff.json";
+
+/// How long a handed-off schedule waits for the session's next owner. The
+/// file only bridges one release and the adopt after it, seconds apart; one
+/// nobody took in this long was left by a handoff that never completed, and
+/// its tasks were only ever meant to live as long as a process.
+pub const SESSION_SCHEDULE_HANDOFF_TTL_MS: i64 = 10 * 60 * 1000;
+
+/// Where `session_id`'s schedule waits between two owners.
+pub fn session_schedule_handoff_path(projects_root: &Path, cwd: &str, session_id: &str) -> PathBuf {
+    let mut path = rebon_session::project_dir_path(projects_root, cwd);
+    path.push(format!("{session_id}{SESSION_SCHEDULE_HANDOFF_SUFFIX}"));
+    path
+}
+
+/// The handoff file's shape. Written by [`SessionCronStore::hand_off`] and
+/// read only by [`SessionCronStore::take_handed_off`].
+#[derive(Debug, Serialize, Deserialize)]
+struct HandedOffSchedule {
+    written_at: i64,
+    tasks: Vec<SessionCronTask>,
+    /// The armed wakeup and the running loop's budget, together.
+    wakeup: WakeupSlot,
+}
+
+/// What [`SessionCronStore::take_handed_off`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandedOff {
+    /// No file: nothing was handed off.
+    Nothing,
+    /// The file was older than [`SESSION_SCHEDULE_HANDOFF_TTL_MS`], or did
+    /// not parse; it was removed and nothing was taken.
+    Discarded,
+    /// Taken into the store: how many cron tasks, and whether a wakeup.
+    Taken { tasks: usize, wakeup: bool },
+}
+
+impl SessionCronStore {
+    /// Leave this store's session-only schedule at `path` for whichever
+    /// process owns the session next. Call it while this process still holds
+    /// the session's lock, so the next owner — who reads only after taking
+    /// the lock — always finds it. An empty schedule removes any file there
+    /// instead, so a stale one cannot outlive this handoff.
+    pub fn hand_off(&self, path: &Path, now_ms: i64) -> Result<()> {
+        let schedule = HandedOffSchedule {
+            written_at: now_ms,
+            tasks: self.list(),
+            wakeup: self
+                .wakeup
+                .lock()
+                .expect("session wakeup slot poisoned")
+                .clone(),
+        };
+        if schedule.tasks.is_empty() && schedule.wakeup == WakeupSlot::default() {
+            return remove_if_present(path);
+        }
+        let body = serde_json::to_vec(&schedule).context("serialize handed-off schedule")?;
+        rebon_session::write_private_file_atomically(path, &body)
+            .with_context(|| format!("write handed-off schedule {}", path.display()))
+    }
+
+    /// Take the schedule a previous owner left at `path` into this store,
+    /// removing the file so it is taken once. Tasks are appended; the wakeup
+    /// and its loop's budget are taken only if this store runs no loop of
+    /// its own, which a store that is only now becoming the session's never
+    /// does.
+    pub fn take_handed_off(&self, path: &Path, now_ms: i64) -> Result<HandedOff> {
+        let raw = match fs::read(path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(HandedOff::Nothing)
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("read handed-off schedule {}", path.display()))
+            }
+        };
+        remove_if_present(path)?;
+        let Ok(schedule) = serde_json::from_slice::<HandedOffSchedule>(&raw) else {
+            tracing::warn!(path = %path.display(), "[Cron] discarding an unreadable handed-off schedule");
+            return Ok(HandedOff::Discarded);
+        };
+        if now_ms.saturating_sub(schedule.written_at) > SESSION_SCHEDULE_HANDOFF_TTL_MS {
+            tracing::info!(path = %path.display(), "[Cron] discarding a handed-off schedule nobody took in time");
+            return Ok(HandedOff::Discarded);
+        }
+        let tasks = schedule.tasks.len();
+        self.tasks
+            .lock()
+            .expect("session cron store poisoned")
+            .extend(schedule.tasks);
+        let mut slot = self.wakeup.lock().expect("session wakeup slot poisoned");
+        let take_loop = *slot == WakeupSlot::default();
+        let wakeup = take_loop && schedule.wakeup.armed.is_some();
+        if take_loop {
+            *slot = schedule.wakeup;
+        }
+        Ok(HandedOff::Taken { tasks, wakeup })
+    }
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("remove {}", path.display())),
     }
 }
 
@@ -594,11 +797,137 @@ mod tests {
         dir
     }
 
+    fn budget(duration_ms: i64, max_wakeups: Option<u32>) -> Option<NewWakeupBudget> {
+        Some(NewWakeupBudget {
+            duration_ms,
+            max_wakeups,
+        })
+    }
+
+    #[test]
+    fn a_loop_with_no_budget_named_runs_for_a_day() {
+        let store = SessionCronStore::new();
+        store.arm_wakeup("x", "y", 1_000, 60_000, None).unwrap();
+        assert_eq!(
+            store.wakeup_budget(),
+            Some(WakeupBudget {
+                started_at: 1_000,
+                deadline: 1_000 + DEFAULT_WAKEUP_BUDGET_MS,
+                max_wakeups: None,
+                fired: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn rearms_inherit_the_loop_budget_and_each_fire_counts_against_it() {
+        let store = SessionCronStore::new();
+        store
+            .arm_wakeup("x", "y", 0, 60_000, budget(3_600_000, Some(3)))
+            .unwrap();
+        for fired in 1..=3 {
+            store.take_due_wakeup(i64::MAX - 1).expect("fires");
+            assert_eq!(store.wakeup_budget().unwrap().fired, fired);
+            let rearm = store.arm_wakeup("x", "y", 1_000, 60_000, None);
+            if fired < 3 {
+                rearm.expect("budget left");
+                assert_eq!(
+                    store.wakeup_budget().unwrap().deadline,
+                    3_600_000,
+                    "inherited"
+                );
+            } else {
+                assert_eq!(rearm, Err(WakeupRefused::WakeupsSpent { fired: 3, max: 3 }));
+            }
+        }
+        assert!(
+            store.wakeup().is_none(),
+            "a refused arm leaves nothing armed"
+        );
+    }
+
+    #[test]
+    fn a_wakeup_past_the_deadline_moves_up_to_it_and_the_next_is_refused() {
+        let store = SessionCronStore::new();
+        let last = store
+            .arm_wakeup("x", "y", 0, 3_600_000, budget(600_000, None))
+            .unwrap();
+        assert_eq!(last.fire_at, 600_000);
+        store
+            .take_due_wakeup(600_000)
+            .expect("fires at the deadline");
+        assert_eq!(
+            store.arm_wakeup("x", "y", 600_000, 60_000, None),
+            Err(WakeupRefused::DeadlinePassed { deadline: 600_000 })
+        );
+    }
+
+    #[test]
+    fn naming_a_new_budget_starts_a_new_loop() {
+        let store = SessionCronStore::new();
+        store
+            .arm_wakeup("x", "y", 0, 60_000, budget(60_000, Some(1)))
+            .unwrap();
+        store.take_due_wakeup(i64::MAX).unwrap();
+        assert!(store.arm_wakeup("x", "y", 70_000, 60_000, None).is_err());
+        store
+            .arm_wakeup("x", "y", 70_000, 60_000, budget(600_000, Some(2)))
+            .expect("a new budget, a new loop");
+        let fresh = store.wakeup_budget().unwrap();
+        assert_eq!(
+            (fresh.started_at, fresh.fired, fresh.max_wakeups),
+            (70_000, 0, Some(2))
+        );
+    }
+
+    #[test]
+    fn a_handoff_carries_the_loops_budget_with_its_spent_wakeups() {
+        let dir = tmp_project();
+        let path = handoff_path(&dir);
+        let old = SessionCronStore::new();
+        old.arm_wakeup("x", "y", 0, 60_000, budget(3_600_000, Some(5)))
+            .unwrap();
+        old.take_due_wakeup(i64::MAX).unwrap();
+        old.arm_wakeup("x", "y", 1, 60_000, None).unwrap();
+        old.hand_off(&path, 2).unwrap();
+
+        let new = SessionCronStore::new();
+        new.take_handed_off(&path, 3).unwrap();
+        assert_eq!(new.wakeup_budget(), old.wakeup_budget());
+        assert_eq!(new.wakeup_budget().unwrap().fired, 1);
+    }
+
+    #[test]
+    fn a_spent_loop_with_nothing_armed_is_still_handed_off() {
+        // The budget is the loop's: a new owner must not let a spent loop
+        // start over just because no wakeup happened to be armed.
+        let dir = tmp_project();
+        let path = handoff_path(&dir);
+        let old = SessionCronStore::new();
+        old.arm_wakeup("x", "y", 0, 60_000, budget(3_600_000, Some(1)))
+            .unwrap();
+        old.take_due_wakeup(i64::MAX).unwrap();
+        old.hand_off(&path, 1).unwrap();
+        assert!(path.exists());
+
+        let new = SessionCronStore::new();
+        assert_eq!(
+            new.take_handed_off(&path, 2).unwrap(),
+            HandedOff::Taken {
+                tasks: 0,
+                wakeup: false
+            }
+        );
+        assert!(new.arm_wakeup("x", "y", 3, 60_000, None).is_err());
+    }
+
     #[test]
     fn a_wakeup_fires_once_at_its_second_and_not_before() {
         let store = SessionCronStore::new();
         assert!(store.wakeup().is_none());
-        let armed = store.set_wakeup("check CI", "CI takes ~5m", 1_000, 90_000);
+        let armed = store
+            .arm_wakeup("check CI", "CI takes ~5m", 1_000, 90_000, None)
+            .unwrap();
         assert_eq!(armed.fire_at, 91_000);
         assert_eq!(store.wakeup(), Some(armed.clone()));
 
@@ -618,8 +947,10 @@ mod tests {
     #[test]
     fn arming_a_wakeup_again_replaces_the_one_armed() {
         let store = SessionCronStore::new();
-        let first = store.set_wakeup("first", "a", 0, 60_000);
-        let second = store.set_wakeup("second", "b", 10_000, 120_000);
+        let first = store.arm_wakeup("first", "a", 0, 60_000, None).unwrap();
+        let second = store
+            .arm_wakeup("second", "b", 10_000, 120_000, None)
+            .unwrap();
         assert_ne!(first.id, second.id);
         assert_eq!(store.wakeup(), Some(second.clone()));
         assert!(store.take_due_wakeup(60_000).is_none(), "the first is gone");
@@ -630,7 +961,7 @@ mod tests {
     fn clearing_a_wakeup_disarms_it_and_leaves_cron_tasks_alone() {
         let store = SessionCronStore::new();
         let task = store.add("*/5 * * * *", "poll", true, 0, None);
-        let armed = store.set_wakeup("later", "why", 0, 60_000);
+        let armed = store.arm_wakeup("later", "why", 0, 60_000, None).unwrap();
         assert_eq!(store.clear_wakeup(), Some(armed));
         assert!(store.clear_wakeup().is_none());
         assert!(store.take_due_wakeup(i64::MAX).is_none());
@@ -641,7 +972,9 @@ mod tests {
     #[test]
     fn a_wakeup_far_in_the_future_does_not_overflow() {
         let store = SessionCronStore::new();
-        let armed = store.set_wakeup("x", "y", i64::MAX - 5, 60_000);
+        let armed = store
+            .arm_wakeup("x", "y", i64::MAX - 5, 60_000, None)
+            .unwrap();
         assert_eq!(armed.fire_at, i64::MAX);
     }
 
@@ -651,8 +984,142 @@ mod tests {
         // held cron hands out clones: they must all see one slot.
         let store = SessionCronStore::new();
         let clone = (*store).clone();
-        let armed = clone.set_wakeup("x", "y", 0, 1);
+        let armed = clone.arm_wakeup("x", "y", 0, 1, None).unwrap();
         assert_eq!(store.wakeup(), Some(armed));
+    }
+
+    fn handoff_path(dir: &TempDir) -> PathBuf {
+        let path = session_schedule_handoff_path(dir.path(), "/repo", "sess-1");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_handed_off_schedule_is_taken_whole_by_the_next_owner_once() {
+        let dir = tmp_project();
+        let path = handoff_path(&dir);
+        let old = SessionCronStore::new();
+        let task = old.add("*/5 * * * *", "poll", true, 1_000, None);
+        let wakeup = old
+            .arm_wakeup("next iteration", "CI", 1_000, 600_000, None)
+            .unwrap();
+        old.hand_off(&path, 2_000).unwrap();
+        assert!(path.exists());
+
+        let new = SessionCronStore::new();
+        assert_eq!(
+            new.take_handed_off(&path, 3_000).unwrap(),
+            HandedOff::Taken {
+                tasks: 1,
+                wakeup: true
+            }
+        );
+        assert_eq!(new.list(), old.list());
+        assert_eq!(new.list()[0].id, task);
+        assert_eq!(new.wakeup(), Some(wakeup), "same id and fire time");
+        assert!(!path.exists(), "taken once");
+        assert_eq!(
+            new.take_handed_off(&path, 3_000).unwrap(),
+            HandedOff::Nothing
+        );
+    }
+
+    #[test]
+    fn handing_off_an_empty_schedule_clears_a_stale_file() {
+        let dir = tmp_project();
+        let path = handoff_path(&dir);
+        let full = SessionCronStore::new();
+        full.arm_wakeup("x", "y", 0, 60_000, None).unwrap();
+        full.hand_off(&path, 0).unwrap();
+        SessionCronStore::new().hand_off(&path, 1).unwrap();
+        assert!(!path.exists());
+        // And with no file at all it is a no-op, not an error.
+        SessionCronStore::new().hand_off(&path, 2).unwrap();
+    }
+
+    #[test]
+    fn a_handed_off_schedule_nobody_took_in_time_is_discarded() {
+        let dir = tmp_project();
+        let path = handoff_path(&dir);
+        let old = SessionCronStore::new();
+        old.arm_wakeup("x", "y", 0, 60_000, None).unwrap();
+        old.hand_off(&path, 0).unwrap();
+
+        let new = SessionCronStore::new();
+        let late = SESSION_SCHEDULE_HANDOFF_TTL_MS + 1;
+        assert_eq!(
+            new.take_handed_off(&path, late).unwrap(),
+            HandedOff::Discarded
+        );
+        assert!(new.wakeup().is_none());
+        assert!(!path.exists(), "debris is removed");
+    }
+
+    #[test]
+    fn a_handed_off_schedule_at_exactly_the_ttl_is_still_taken() {
+        let dir = tmp_project();
+        let path = handoff_path(&dir);
+        let old = SessionCronStore::new();
+        old.add("0 9 * * *", "daily", true, 0, None);
+        old.hand_off(&path, 0).unwrap();
+        let taken = SessionCronStore::new()
+            .take_handed_off(&path, SESSION_SCHEDULE_HANDOFF_TTL_MS)
+            .unwrap();
+        assert_eq!(
+            taken,
+            HandedOff::Taken {
+                tasks: 1,
+                wakeup: false
+            }
+        );
+    }
+
+    #[test]
+    fn an_unreadable_handoff_file_is_discarded_not_an_error() {
+        let dir = tmp_project();
+        let path = handoff_path(&dir);
+        fs::write(&path, b"{not json").unwrap();
+        let new = SessionCronStore::new();
+        assert_eq!(new.take_handed_off(&path, 0).unwrap(), HandedOff::Discarded);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn taking_a_handoff_keeps_a_wakeup_already_armed_and_appends_tasks() {
+        let dir = tmp_project();
+        let path = handoff_path(&dir);
+        let old = SessionCronStore::new();
+        old.add("*/5 * * * *", "old task", true, 0, None);
+        old.arm_wakeup("old wakeup", "a", 0, 60_000, None).unwrap();
+        old.hand_off(&path, 0).unwrap();
+
+        let new = SessionCronStore::new();
+        new.add("*/10 * * * *", "own task", true, 0, None);
+        let own = new.arm_wakeup("own wakeup", "b", 0, 120_000, None).unwrap();
+        assert_eq!(
+            new.take_handed_off(&path, 1).unwrap(),
+            HandedOff::Taken {
+                tasks: 1,
+                wakeup: false
+            }
+        );
+        assert_eq!(new.wakeup(), Some(own));
+        let prompts: Vec<_> = new.list().into_iter().map(|t| t.prompt).collect();
+        assert_eq!(prompts, ["own task", "old task"]);
+    }
+
+    #[test]
+    fn handoff_paths_sit_beside_the_sessions_transcript() {
+        let root = Path::new("/projects");
+        let path = session_schedule_handoff_path(root, "/repo", "sess-1");
+        assert_eq!(
+            path.parent(),
+            Some(rebon_session::project_dir_path(root, "/repo").as_path())
+        );
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            "sess-1.schedule-handoff.json"
+        );
     }
 
     #[test]

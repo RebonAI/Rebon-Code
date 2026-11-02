@@ -287,13 +287,22 @@ pub(crate) enum SessionHandedOff {
 /// Let go of a session that another process now owns.
 ///
 /// See [`SessionHandedOff`] for why the three releases travel together. The
-/// lock goes first: while it is still held, `is_session_active` says this
-/// process owns a session it has already stopped hosting servers for.
+/// lock goes before the MCP servers: while it is still held,
+/// `is_session_active` says this process owns a session it has already
+/// stopped hosting servers for.
+///
+/// The schedule goes before the lock. An owner leaves its session-only tasks
+/// and wakeup for the next one, which reads them only once it holds the lock;
+/// the scheduler stops first, so nothing fires here after the snapshot that
+/// would fire again there.
 pub(crate) fn release_session_to_owner(session: &mut EngineSession) -> SessionHandedOff {
     let held = session.session_active_lock.is_some();
+    session.stop_cron_scheduler();
+    if held {
+        session.hand_off_cron_schedule();
+    }
     session.session_active_lock = None;
     session.release_mcp();
-    session.stop_cron_scheduler();
     if held {
         SessionHandedOff::Released
     } else {
@@ -482,5 +491,120 @@ mod tests {
             release_session_to_owner(&mut session),
             SessionHandedOff::NeverHeld
         ));
+    }
+
+    /// An owner's session in its own temp directory, holding the lock and
+    /// running the scheduler.
+    fn owned_session(dir: &std::path::Path) -> crate::tui::wiring::TuiEngineSession {
+        let mut session = crate::tui::runner::test_support::make_test_tui_session();
+        session.cwd = dir.join("repo").to_string_lossy().into_owned();
+        session.projects_root = dir.join("projects");
+        std::fs::create_dir_all(rebon_session::project_dir_path(
+            &session.projects_root,
+            &session.cwd,
+        ))
+        .unwrap();
+        session.session_active_lock = rebon_session::try_acquire_session_active_lock(
+            &session.projects_root,
+            &session.cwd,
+            &session.session_id,
+        )
+        .expect("the lock is free in a fresh temp dir");
+        session.start_cron_scheduler();
+        session
+    }
+
+    fn handoff_path(session: &EngineSession) -> std::path::PathBuf {
+        rebon_tool::cron::session_schedule_handoff_path(
+            &session.projects_root,
+            &session.cwd,
+            &session.session_id,
+        )
+    }
+
+    /// The terminal handing a session over leaves its session-only tasks and
+    /// wakeup for the worker, and the next owner to adopt it takes them: a
+    /// self-paced loop survives `/hosted` and coming back.
+    #[test]
+    fn a_handover_carries_the_session_only_schedule_to_the_next_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut old = owned_session(dir.path());
+        let store = &old.engine_half.session_cron_store;
+        store.add("*/5 * * * *", "poll the deploy", true, 0, None);
+        let wakeup = store
+            .arm_wakeup(
+                "Continue the self-paced /loop: check CI",
+                "CI takes ~8m",
+                rebon_tool::cron::now_ms(),
+                480_000,
+                None,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            release_session_to_owner(&mut old),
+            SessionHandedOff::Released
+        ));
+        assert!(handoff_path(&old).exists(), "left for the next owner");
+
+        let mut new = crate::tui::runner::test_support::make_test_tui_session();
+        new.cwd = old.cwd.clone();
+        new.projects_root = old.projects_root.clone();
+        new.session_id = old.session_id.clone();
+        let lock = rebon_session::try_acquire_session_active_lock(
+            &new.projects_root,
+            &new.cwd,
+            &new.session_id,
+        )
+        .expect("the old owner let the lock go");
+        assert!(adopt_session_as_owner(&mut new, lock));
+
+        let taken = &new.engine_half.session_cron_store;
+        assert_eq!(taken.wakeup(), Some(wakeup), "the same wakeup, same second");
+        let prompts: Vec<_> = taken.list().into_iter().map(|t| t.prompt).collect();
+        assert_eq!(prompts, ["poll the deploy"]);
+        assert!(!handoff_path(&new).exists(), "taken once");
+    }
+
+    /// A mirror releasing a session it never held has nothing to hand off,
+    /// and must not clear what the real owner left on its way out.
+    #[test]
+    fn a_mirror_releasing_leaves_the_owners_handoff_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut owner = owned_session(dir.path());
+        owner
+            .engine_half
+            .session_cron_store
+            .arm_wakeup("x", "y", rebon_tool::cron::now_ms(), 60_000, None)
+            .unwrap();
+        release_session_to_owner(&mut owner);
+        let path = handoff_path(&owner);
+        assert!(path.exists());
+
+        let mut mirror = crate::tui::runner::test_support::make_test_tui_session();
+        mirror.cwd = owner.cwd.clone();
+        mirror.projects_root = owner.projects_root.clone();
+        mirror.session_id = owner.session_id.clone();
+        mirror.session_active_lock = None;
+        assert!(matches!(
+            release_session_to_owner(&mut mirror),
+            SessionHandedOff::NeverHeld
+        ));
+        assert!(path.exists(), "the owner's schedule is still waiting");
+    }
+
+    /// Releasing an owner with nothing scheduled leaves no file behind.
+    #[test]
+    fn a_handover_with_nothing_scheduled_leaves_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let mut session = owned_session(dir.path());
+        release_session_to_owner(&mut session);
+        assert!(!handoff_path(&session).exists());
     }
 }

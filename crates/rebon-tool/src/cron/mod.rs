@@ -23,7 +23,8 @@ pub use tasks::{
     add_cron_task, cron_dir, cron_file_path, find_missed_tasks, is_recurring_task_aged,
     jittered_next_cron_run_ms, list_all_cron_tasks, mark_cron_tasks_fired, next_cron_run_ms,
     now_ms, one_shot_jittered_next_cron_run_ms, read_cron_tasks, remove_cron_tasks,
-    write_cron_tasks, CronJitterConfig, CronTask, SessionWakeup, DEFAULT_CRON_JITTER_CONFIG,
+    session_schedule_handoff_path, write_cron_tasks, CronJitterConfig, CronTask, HandedOff,
+    SessionWakeup, DEFAULT_CRON_JITTER_CONFIG,
 };
 
 /// Opening line of every user turn the scheduler injects instead of the user

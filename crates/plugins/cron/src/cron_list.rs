@@ -195,7 +195,9 @@ mod tests {
     async fn an_armed_wakeup_is_listed_beside_the_jobs_and_is_not_one() {
         let dir = tmp_project();
         let store = rebon_tool::SessionCronStore::new();
-        let wakeup = store.set_wakeup("check CI", "CI takes ~8m", now_ms(), 480_000);
+        let wakeup = store
+            .arm_wakeup("check CI", "CI takes ~8m", now_ms(), 480_000, None)
+            .unwrap();
         let context = ctx(&dir).with_session_cron_store(store.clone());
 
         let out = CronListTool.call(json!({}), &context).await.unwrap();

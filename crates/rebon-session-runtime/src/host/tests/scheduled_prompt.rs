@@ -17,6 +17,7 @@ fn held_cron(session_id: &str, cwd: &std::path::Path) -> crate::session_handoff:
         poller,
         session_store: rebon_tool::SessionCronStore::new(),
         scheduler,
+        projects_root: cwd.join("projects"),
     }
 }
 
@@ -87,6 +88,7 @@ fn held_session_cron(session_id: &str, cwd: &std::path::Path) -> crate::session_
         poller,
         session_store,
         scheduler,
+        projects_root: cwd.join("projects"),
     }
 }
 
@@ -118,12 +120,19 @@ async fn an_armed_wakeup_keeps_a_lingering_worker_and_becomes_its_next_turn() {
         ..Default::default()
     };
     // Due in two seconds: the linger is long gone by then.
-    handed_back.cron.as_ref().unwrap().session_store.set_wakeup(
-        "Continue the self-paced /loop: check CI",
-        "CI takes a while",
-        rebon_tool::cron::tasks::now_ms(),
-        2_000,
-    );
+    handed_back
+        .cron
+        .as_ref()
+        .unwrap()
+        .session_store
+        .arm_wakeup(
+            "Continue the self-paced /loop: check CI",
+            "CI takes a while",
+            rebon_tool::cron::tasks::now_ms(),
+            2_000,
+            None,
+        )
+        .unwrap();
 
     let reused = tokio::time::timeout(
         Duration::from_secs(10),
@@ -164,7 +173,9 @@ async fn a_lingering_worker_with_no_wakeup_leaves_at_its_deadline() {
     };
     // A stopped loop: armed, then disarmed.
     let held = handed_back.cron.as_ref().unwrap();
-    held.session_store.set_wakeup("x", "y", 0, 3_600_000);
+    held.session_store
+        .arm_wakeup("x", "y", 0, 3_600_000, None)
+        .unwrap();
     held.session_store.clear_wakeup();
 
     let reused = tokio::time::timeout(

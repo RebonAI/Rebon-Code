@@ -657,7 +657,9 @@ mod tests {
         let cfg = test_config(&dir);
         let poller = CronPoller::new();
         let store = SessionCronStore::new();
-        store.set_wakeup("look at CI again", "CI takes ~5m", 1_000, 60_000);
+        store
+            .arm_wakeup("look at CI again", "CI takes ~5m", 1_000, 60_000, None)
+            .unwrap();
 
         run_session_tick(&cfg, &poller, &store, 60_999);
         assert_eq!(poller.pending_len(), 0, "not due yet");
@@ -679,7 +681,9 @@ mod tests {
         let store = SessionCronStore::new();
         // A one-shot pinned to the top of the hour after `created_at`.
         store.add("0 * * * *", "cron prompt", false, 0, None);
-        store.set_wakeup("wakeup prompt", "why", 0, 1_000);
+        store
+            .arm_wakeup("wakeup prompt", "why", 0, 1_000, None)
+            .unwrap();
 
         run_session_tick(&cfg, &poller, &store, 24 * 60 * 60 * 1000);
         assert_eq!(poller.pending_len(), 2);

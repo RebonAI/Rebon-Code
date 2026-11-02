@@ -1537,6 +1537,14 @@ fn finish_session_build(records: SessionRecords) -> anyhow::Result<SessionBuild>
     } else if mirror {
         None
     } else {
+        // This process owns the session now: take the session-only schedule
+        // its last owner left — a terminal handing over to this worker, say.
+        crate::session_handoff::take_handed_off_schedule(
+            &projects_root(),
+            &session_cron_store,
+            &cwd,
+            &session_id,
+        );
         let config = rebon_core::cron::SchedulerConfig::new(std::path::PathBuf::from(&cwd));
         Some(rebon_core::cron::start_scheduler_with_session_store(
             config,
