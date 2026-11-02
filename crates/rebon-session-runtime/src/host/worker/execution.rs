@@ -2837,6 +2837,16 @@ mod retry_progress_tests {
 fn apply_background_ceo_command(session: &mut crate::EngineSession, prompt: &mut String) {
     // `/router` makes this session the router, for good: a router job is
     // launched with it, and every later turn resumes the mode from disk.
+    if let Some(rest) = strip_command(prompt.trim(), "/watchdog") {
+        session.apply_session_mode(rebon_tool::SessionMode::Watchdog);
+        let reminder = if rest.is_empty() {
+            "You are now online as the watchdog. Say so in one short line and wait; do nothing else this turn."
+        } else {
+            "You are now online as the watchdog. Handle what follows /watchdog."
+        };
+        *prompt = format!("<system-reminder>\n{reminder}\n</system-reminder>\n\n{prompt}");
+        return;
+    }
     if let Some(rest) = strip_router_command(prompt.trim()) {
         session.apply_session_mode(rebon_tool::SessionMode::Router);
         // The literal text stays, after the reminder, as with `/ceo`: the
@@ -2884,7 +2894,13 @@ fn apply_background_ceo_command(session: &mut crate::EngineSession, prompt: &mut
 
 /// The text after a leading `/router` command, if the prompt is one.
 fn strip_router_command(prompt: &str) -> Option<&str> {
-    let rest = prompt.strip_prefix("/router")?;
+    strip_command(prompt, "/router")
+}
+
+/// The text after a leading `command`, if the prompt starts with it as a
+/// word of its own.
+fn strip_command<'a>(prompt: &'a str, command: &str) -> Option<&'a str> {
+    let rest = prompt.strip_prefix(command)?;
     (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
 }
 

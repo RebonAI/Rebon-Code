@@ -1107,6 +1107,13 @@ impl EngineQueryExecutor {
             .is_some_and(|mode| mode.mode() == rebon_tool::SessionMode::Router)
     }
 
+    /// Whether the session is the watchdog, which gets the watchdog contract.
+    fn is_watchdog_session(&self) -> bool {
+        self.coordinator_mode
+            .as_ref()
+            .is_some_and(|mode| mode.mode() == rebon_tool::SessionMode::Watchdog)
+    }
+
     pub fn with_coordinator_use_worktree(mut self, enabled: bool) -> Self {
         self.coordinator_use_worktree = enabled;
         self
@@ -3090,6 +3097,7 @@ impl EngineQueryExecutor {
                                         request_config.language.clone(),
                                     );
                                 dynamic_ctx.router_mode = self.is_router_session();
+                                dynamic_ctx.watchdog_mode = self.is_watchdog_session();
                                 dynamic_ctx.plugin_prompt_sections = seat_prompt_sections(
                                     kernel_turn_lease.as_ref(),
                                     &request_config,
@@ -3166,6 +3174,7 @@ impl EngineQueryExecutor {
                                 request_config.language.clone(),
                             );
                         dynamic_ctx.router_mode = self.is_router_session();
+                        dynamic_ctx.watchdog_mode = self.is_watchdog_session();
                         dynamic_ctx.plugin_prompt_sections = seat_prompt_sections(
                             kernel_turn_lease.as_ref(),
                             &request_config,

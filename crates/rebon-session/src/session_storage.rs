@@ -1193,7 +1193,7 @@ fn iso8601_to_epoch_ms(input: &str) -> Option<u64> {
 pub fn load_session_mode(projects_root: &Path, cwd: &str, session_id: &str) -> Option<String> {
     let meta = load_session_meta(projects_root, cwd, session_id)?;
     meta.mode
-        .filter(|s| matches!(s.as_str(), "coordinator" | "router" | "normal"))
+        .filter(|s| matches!(s.as_str(), "coordinator" | "router" | "watchdog" | "normal"))
 }
 
 /// Whether this internal session should be omitted from ordinary chat lists.
@@ -1227,11 +1227,11 @@ pub fn save_session_mode(
     mode: &str,
 ) -> std::io::Result<()> {
     let mode = match mode {
-        "coordinator" | "router" | "normal" => mode,
+        "coordinator" | "router" | "watchdog" | "normal" => mode,
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "session mode must be coordinator, router or normal",
+                "session mode must be coordinator, router, watchdog or normal",
             ));
         }
     };

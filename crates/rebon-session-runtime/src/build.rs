@@ -1014,7 +1014,9 @@ struct SessionWiring {
     startup_cwd: PathBuf,
     plugin_runtime: crate::plugin::runtime::PluginRuntimeContributions,
     startup_coordinator_mode: bool,
-    startup_router_mode: bool,
+    /// A resumed router or watchdog stays one; applied once the session is
+    /// built.
+    startup_resident_mode: Option<rebon_tool::SessionMode>,
     coordinator_use_worktree: bool,
     engine: Arc<Engine>,
     /// The session's model and the handles `/model` and `/provider` write
@@ -1066,8 +1068,9 @@ async fn resolve_session_wiring(
         tracing::warn!(warning = %warning, "rebon startup: plugin warning");
     }
     let mut startup_coordinator_mode = coordinator_mode_from_env_default();
-    // A resumed router stays one; it is applied once the session is built.
-    let mut startup_router_mode = false;
+    // A resumed router or watchdog stays one; it is applied once the session
+    // is built.
+    let mut startup_resident_mode = None;
     let coordinator_use_worktree = crate::rebon_config::saved_coordinator_use_worktree();
     if let Some(resume_id) = overrides.resume.as_deref() {
         if let Some(mode) = rebon_session::load_session_mode(
@@ -1075,7 +1078,12 @@ async fn resolve_session_wiring(
             &startup_cwd.to_string_lossy(),
             resume_id,
         ) {
-            startup_router_mode = mode == rebon_tool::SessionMode::Router.as_str();
+            startup_resident_mode = rebon_tool::SessionMode::parse(&mode).filter(|mode| {
+                matches!(
+                    mode,
+                    rebon_tool::SessionMode::Router | rebon_tool::SessionMode::Watchdog
+                )
+            });
             let (matched_mode, warning) = match_session_mode(startup_coordinator_mode, Some(&mode));
             startup_coordinator_mode = matched_mode;
             if let Some(warning) = warning {
@@ -1187,7 +1195,7 @@ async fn resolve_session_wiring(
             startup_cwd,
             plugin_runtime,
             startup_coordinator_mode,
-            startup_router_mode,
+            startup_resident_mode,
             coordinator_use_worktree,
             engine,
             model,
@@ -2158,14 +2166,14 @@ pub async fn build_session_with_runtime_controller(
         transcript_entries = record.loaded_transcript.len(),
         "rebon startup: session record ready"
     );
-    let current_session_mode = if wiring.startup_router_mode {
-        "router"
+    let current_session_mode = if let Some(mode) = wiring.startup_resident_mode {
+        mode.as_str()
     } else if wiring.startup_coordinator_mode {
         "coordinator"
     } else {
         "normal"
     };
-    let startup_router_mode = wiring.startup_router_mode;
+    let startup_resident_mode = wiring.startup_resident_mode;
     let _ = tui_server_state.set_session_mode(&record.session_id, current_session_mode);
     if let Err(err) = rebon_session::save_session_mode(
         &projects_root(),
@@ -2260,10 +2268,8 @@ pub async fn build_session_with_runtime_controller(
     if let Some(held) = HeldSessionLoop::take_for(held_session_loop, &build.session.session_id) {
         build.session.engine_half.session_loop = held;
     }
-    if startup_router_mode {
-        build
-            .session
-            .apply_session_mode(rebon_tool::SessionMode::Router);
+    if let Some(mode) = startup_resident_mode {
+        build.session.apply_session_mode(mode);
     }
     Ok(build)
 }

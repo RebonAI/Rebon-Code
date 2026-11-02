@@ -30,6 +30,7 @@ pub(crate) mod context_manager;
 pub use context_manager::LIVE_CAPTURE_RESULT_TEXT_PREFIX;
 pub mod coordinator_mode;
 pub mod router_mode;
+pub mod watchdog_mode;
 pub mod cron;
 mod deferred_question;
 pub mod hooks;

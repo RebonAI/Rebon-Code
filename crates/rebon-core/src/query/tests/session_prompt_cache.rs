@@ -94,6 +94,14 @@ fn session_prompt_cache_key_ignores_dynamic_tool_lists_but_covers_base_prompt_in
         router_mode: true,
         ..Default::default()
     };
+    let watchdog_ctx = DynamicPromptContext {
+        watchdog_mode: true,
+        ..Default::default()
+    };
+    assert_ne!(
+        key,
+        SessionPromptCacheKey::from_config(&config, &watchdog_ctx)
+    );
     assert_ne!(
         key,
         SessionPromptCacheKey::from_config(&config, &router_ctx)

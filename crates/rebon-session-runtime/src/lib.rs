@@ -82,6 +82,8 @@ pub mod workflow_review;
 
 /// What a router session is called until the person names it.
 pub const ROUTER_SESSION_TITLE: &str = "Rebon Router";
+/// What the watchdog session is called until the person names it.
+pub const WATCHDOG_SESSION_TITLE: &str = "Rebon Watchdog";
 
 use std::sync::Arc;
 
@@ -480,6 +482,25 @@ impl EngineSession {
         });
     }
 
+    /// A router or watchdog is named for what it is, not for the first thing
+    /// asked of it; a title the person gave it stays.
+    fn name_resident_session(&self, title: &str) {
+        let untitled =
+            rebon_session::load_session_title(&self.projects_root, &self.cwd, &self.session_id)
+                .is_none_or(|title| title.trim().is_empty());
+        if untitled {
+            let _ = rebon_session::save_session_title(
+                &self.projects_root,
+                &self.cwd,
+                &self.session_id,
+                title,
+            );
+            let _ = self
+                .server_state
+                .set_session_title(&self.session_id, title.to_string());
+        }
+    }
+
     /// Put the session in `mode`: the shared mode handle, the session and
     /// sub-agent tool filters, and the persisted mode, all at once. See
     /// [`Self::apply_coordinator_mode`].
@@ -520,25 +541,16 @@ impl EngineSession {
                 self.engine_half
                     .subagent_filter_handle
                     .set(rebon_core::coordinator_mode::default_subagent_filter(false));
-                // The router is named for what it is, not for the first thing
-                // asked of it; a title the person gave it stays.
-                let untitled = rebon_session::load_session_title(
-                    &self.projects_root,
-                    &self.cwd,
-                    &self.session_id,
-                )
-                .is_none_or(|title| title.trim().is_empty());
-                if untitled {
-                    let _ = rebon_session::save_session_title(
-                        &self.projects_root,
-                        &self.cwd,
-                        &self.session_id,
-                        ROUTER_SESSION_TITLE,
-                    );
-                    let _ = self
-                        .server_state
-                        .set_session_title(&self.session_id, ROUTER_SESSION_TITLE.to_string());
-                }
+                self.name_resident_session(ROUTER_SESSION_TITLE);
+            }
+            SessionMode::Watchdog => {
+                self.engine_half
+                    .session_filter_handle
+                    .set(rebon_core::watchdog_mode::watchdog_session_filter());
+                self.engine_half
+                    .subagent_filter_handle
+                    .set(rebon_core::coordinator_mode::default_subagent_filter(false));
+                self.name_resident_session(WATCHDOG_SESSION_TITLE);
             }
             SessionMode::Normal => {
                 self.engine_half.session_filter_handle.set(

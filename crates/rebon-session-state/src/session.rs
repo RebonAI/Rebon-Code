@@ -2198,7 +2198,7 @@ impl ServerState {
 
     /// Update the collaboration mode stored on the session record.
     pub fn set_session_mode(&self, sid: &str, mode: &str) -> bool {
-        if !matches!(mode, "coordinator" | "router" | "normal") {
+        if !matches!(mode, "coordinator" | "router" | "watchdog" | "normal") {
             return false;
         }
         let mut sessions = self.sessions.lock().expect("session map mutex poisoned");

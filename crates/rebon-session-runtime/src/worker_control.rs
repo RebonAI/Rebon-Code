@@ -25,6 +25,17 @@ use rebon_session_host::{
 };
 use rebon_tool::{DispatchedWorker, PlannedTask, WorkerControl, WorkerDispatch};
 
+/// Where `rebon router start` records the router's job, and the watchdog's.
+pub const ROUTER_RECORD_FILE: &str = "router.json";
+pub const WATCHDOG_RECORD_FILE: &str = "watchdog.json";
+
+/// The job a record file under the store names.
+pub fn recorded_job(store_root: &Path, file: &str) -> Option<String> {
+    let bytes = std::fs::read(store_root.join(file)).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("jobId")?.as_str().map(str::to_string)
+}
+
 /// The permission mode every worker runs in.
 const WORKER_PERMISSION_MODE: &str = "auto";
 /// How much of a worker's last reply a recall shows. The rest stays in its
@@ -51,16 +62,28 @@ impl HostWorkerControl {
         self.store.root()
     }
 
-    /// The router job whose session is `session_id`.
+    /// The router job whose session is `session_id`. The watchdog's session
+    /// acts for the router it watches: the one recorded in `router.json`.
     fn router(&self, session_id: &str) -> Result<BackgroundJobState, String> {
-        self.store
+        let job = self
+            .store
             .list_jobs()
             .map_err(|error| format!("{error:#}"))?
             .into_iter()
             .find(|job| job.identity.session_id.as_deref() == Some(session_id))
             .ok_or_else(|| {
                 "this session is not a background router job, so it has no workers".to_string()
-            })
+            })?;
+        if recorded_job(self.store.root(), WATCHDOG_RECORD_FILE).as_deref()
+            != Some(job.identity.job_id.as_str())
+        {
+            return Ok(job);
+        }
+        let router = recorded_job(self.store.root(), ROUTER_RECORD_FILE)
+            .ok_or("no router is running, so there are no workers to watch")?;
+        self.store
+            .read_state(&router)
+            .map_err(|_| format!("the router {router} is gone"))
     }
 
     /// One of `router`'s workers.

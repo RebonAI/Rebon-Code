@@ -101,6 +101,8 @@ pub struct DynamicPromptContext {
     /// session's mode after the context is resolved; it wins over
     /// `coordinator_mode`.
     pub router_mode: bool,
+    /// Whether this is the watchdog session. Set like `router_mode`.
+    pub watchdog_mode: bool,
     /// Whether coordinator implementation workers should be isolated in git worktrees.
     pub coordinator_use_worktree: bool,
     /// Worker tools context (injected when coordinator mode is on).
@@ -734,6 +736,7 @@ pub fn resolve_dynamic_context_with_language(
         session_date,
         coordinator_mode,
         router_mode: false,
+        watchdog_mode: false,
         coordinator_use_worktree,
         worker_tools_context,
         scratchpad_dir,
@@ -884,6 +887,7 @@ mod tests {
             session_date: Some("2026-04-10".to_string()),
             coordinator_mode: false,
             router_mode: false,
+            watchdog_mode: false,
             coordinator_use_worktree: false,
             worker_tools_context: None,
             scratchpad_dir: None,

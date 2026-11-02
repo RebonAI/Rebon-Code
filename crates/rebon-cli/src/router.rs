@@ -1,11 +1,15 @@
-//! The router: the one resident session the person talks to, which sends
-//! work to background worker jobs (`rebon_core::router_mode`).
+//! The router and its watchdog: the two resident sessions of the
+//! super-agent (`rebon_core::router_mode`, `rebon_core::watchdog_mode`).
 //!
-//! There is one per user, not one per project. It is an ordinary background
-//! job that starts with `/router`, which puts its session in router mode for
-//! good. It lives in its own directory under the store, because it never
-//! works in a project itself. `<store>/router.json` names its job. Stopping
-//! the router leaves its workers running: they are tasks in their own right.
+//! There is one router per user, not one per project: the session the person
+//! talks to, which sends work to background worker jobs. Beside it runs one
+//! watchdog, outside its loop, which the supervisor wakes when something in
+//! that loop looks wrong (`crate::watchdog`). Each is an ordinary background
+//! job whose first prompt (`/router`, `/watchdog`) puts its session in its
+//! mode for good. Each lives in its own directory under the store, because
+//! neither works in a project, and a record file names its job. They start and
+//! stop together; stopping them leaves the router's workers running, because
+//! those are tasks in their own right.
 
 use std::path::{Path, PathBuf};
 
@@ -14,33 +18,61 @@ use serde::{Deserialize, Serialize};
 
 use crate::background::{BackgroundLaunchOptions, BackgroundRuntimeFields};
 
-const RECORD_FILE_NAME: &str = "router.json";
 /// Where the supervisor publishes the router and its workers for the
 /// desktop app; see `crate::router_digest`.
 pub(crate) const ROSTER_FILE_NAME: &str = "router-roster.json";
-const ROUTER_NAME: &str = "Rebon Router";
-/// The permission mode the router and its workers run in: they act on their
-/// own, with the auto-mode classifier as the check instead of a person.
+/// The permission mode the router, the watchdog and the workers run in: they
+/// act on their own, with the auto-mode classifier as the check instead of a
+/// person.
 pub(crate) const ROUTER_PERMISSION_MODE: &str = "auto";
+
+/// One of the two resident sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Resident {
+    record_file: &'static str,
+    name: &'static str,
+    command: &'static str,
+    workspace: &'static str,
+}
+
+pub(crate) const ROUTER: Resident = Resident {
+    record_file: crate::session::worker_control::ROUTER_RECORD_FILE,
+    name: "Rebon Router",
+    command: "/router",
+    workspace: "router",
+};
+
+pub(crate) const WATCHDOG: Resident = Resident {
+    record_file: crate::session::worker_control::WATCHDOG_RECORD_FILE,
+    name: "Rebon Watchdog",
+    command: "/watchdog",
+    workspace: "watchdog",
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RouterRecord {
+struct Record {
     job_id: String,
 }
 
-fn record_path(store: &BackgroundStore) -> PathBuf {
-    store.root().join(RECORD_FILE_NAME)
+fn record_path(store: &BackgroundStore, resident: Resident) -> PathBuf {
+    store.root().join(resident.record_file)
 }
 
-/// Where the router's session lives. It is not a project.
+/// Where a resident session lives. It is not a project.
+pub(crate) fn workspace(store: &BackgroundStore, resident: Resident) -> PathBuf {
+    store.root().join(resident.workspace)
+}
+
+/// Where the router's session lives.
 pub(crate) fn router_workspace(store: &BackgroundStore) -> PathBuf {
-    store.root().join("router")
+    workspace(store, ROUTER)
 }
 
-/// The router's job, if one is recorded and has not been stopped or removed.
-pub(crate) fn current_router(store: &BackgroundStore) -> Option<BackgroundJobState> {
-    let record: RouterRecord = std::fs::read(record_path(store))
+/// The resident's job, if one is recorded and has not been stopped or
+/// removed.
+pub(crate) fn current(store: &BackgroundStore, resident: Resident) -> Option<BackgroundJobState> {
+    let record: Record = std::fs::read(record_path(store, resident))
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())?;
     let job = store.read_state(&record.job_id).ok()?;
@@ -48,9 +80,14 @@ pub(crate) fn current_router(store: &BackgroundStore) -> Option<BackgroundJobSta
         .then_some(job)
 }
 
-/// The light model the router runs: the active provider's `fast` profile,
-/// else its `small` one. `None` leaves the router on the default model.
-fn router_model() -> Option<String> {
+/// The router's job, if one runs.
+pub(crate) fn current_router(store: &BackgroundStore) -> Option<BackgroundJobState> {
+    current(store, ROUTER)
+}
+
+/// The light model both run: the active provider's `fast` profile, else its
+/// `small` one. `None` leaves them on the default model.
+fn light_model() -> Option<String> {
     [
         rebon_types::MODEL_PROFILE_FAST,
         rebon_types::MODEL_PROFILE_SMALL,
@@ -59,9 +96,13 @@ fn router_model() -> Option<String> {
     .find_map(rebon_config::active_provider_profile_model)
 }
 
-fn launch_options(workspace: &Path, model: Option<String>) -> BackgroundLaunchOptions {
+fn launch_options(
+    resident: Resident,
+    workspace: &Path,
+    model: Option<String>,
+) -> BackgroundLaunchOptions {
     BackgroundLaunchOptions {
-        prompt: "/router".to_string(),
+        prompt: resident.command.to_string(),
         images: Vec::new(),
         cwd: workspace.to_path_buf(),
         isolate_in_worktree: false,
@@ -85,52 +126,71 @@ fn launch_options(workspace: &Path, model: Option<String>) -> BackgroundLaunchOp
             mcp_configs: Vec::new(),
             strict_mcp_config: false,
         },
-        name: Some(ROUTER_NAME.to_string()),
+        name: Some(resident.name.to_string()),
         agent_type: None,
         parent_job_id: None,
     }
 }
 
-/// The router, started if there is none. `true` when this call started it.
-pub(crate) fn ensure_router(store: &BackgroundStore) -> anyhow::Result<(BackgroundJobState, bool)> {
-    if let Some(job) = current_router(store) {
+/// The resident, started if there is none. `true` when this call started it.
+fn ensure(
+    store: &BackgroundStore,
+    resident: Resident,
+) -> anyhow::Result<(BackgroundJobState, bool)> {
+    if let Some(job) = current(store, resident) {
         return Ok((job, false));
     }
-    let workspace = router_workspace(store);
+    let workspace = workspace(store, resident);
     std::fs::create_dir_all(&workspace)?;
     let job = crate::background::launch_background_prompt(
         store,
-        launch_options(&workspace, router_model()),
+        launch_options(resident, &workspace, light_model()),
     )?;
-    let record = RouterRecord {
+    let record = Record {
         job_id: job.identity.job_id.clone(),
     };
     rebon_session::write_file_atomically(
-        &record_path(store),
+        &record_path(store, resident),
         &serde_json::to_vec_pretty(&record)?,
     )?;
     Ok((job, true))
 }
 
-/// Stop the router, leaving its workers running. The stopped job's id, if
-/// there was a router.
-///
-/// Stopping ends a turn in progress, but a router between turns is a job
-/// that already finished, and a stop leaves that as it is. So the record
-/// goes too, and that is what makes it no router. The roster goes with it,
-/// in case no supervisor is up to remove it.
-pub(crate) fn stop_router(store: &BackgroundStore) -> anyhow::Result<Option<String>> {
-    let Some(mut job) = current_router(store) else {
+/// The router and its watchdog, each started if there is none. The router,
+/// and `true` when this call started it.
+pub(crate) fn ensure_router(store: &BackgroundStore) -> anyhow::Result<(BackgroundJobState, bool)> {
+    let router = ensure(store, ROUTER)?;
+    ensure(store, WATCHDOG)?;
+    Ok(router)
+}
+
+/// Stop one resident. Stopping ends a turn in progress, but a session
+/// between turns is a job that already finished, and a stop leaves that as
+/// it is. So the record goes too, and that is what makes it gone.
+fn stop(store: &BackgroundStore, resident: Resident) -> anyhow::Result<Option<String>> {
+    let Some(mut job) = current(store, resident) else {
         return Ok(None);
     };
     rebon_session_host::stop_background_job_in_store(store, &mut job)?;
-    for path in [record_path(store), store.root().join(ROSTER_FILE_NAME)] {
-        match std::fs::remove_file(&path) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
-            _ => {}
-        }
-    }
+    remove_if_there(&record_path(store, resident))?;
     Ok(Some(job.identity.job_id))
+}
+
+fn remove_if_there(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Stop the router and its watchdog, leaving the router's workers running.
+/// The router's job id, if there was a router. The roster goes too, in case
+/// no supervisor is up to remove it.
+pub(crate) fn stop_router(store: &BackgroundStore) -> anyhow::Result<Option<String>> {
+    stop(store, WATCHDOG)?;
+    let router = stop(store, ROUTER)?;
+    remove_if_there(&store.root().join(ROSTER_FILE_NAME))?;
+    Ok(router)
 }
 
 /// What `rebon router status` prints.
@@ -154,8 +214,15 @@ pub(crate) fn describe_router(store: &BackgroundStore) -> String {
                 .count()
         })
         .unwrap_or(0);
+    let watchdog = match current(store, WATCHDOG) {
+        Some(watchdog) => format!(
+            "watchdog {} — {:?}",
+            watchdog.identity.job_id, watchdog.process.status
+        ),
+        None => "no watchdog".to_string(),
+    };
     format!(
-        "Router {} — {:?}, model {model}, {workers} worker(s)",
+        "Router {} — {:?}, model {model}, {workers} worker(s); {watchdog}",
         job.identity.job_id, job.process.status
     )
 }
@@ -163,10 +230,19 @@ pub(crate) fn describe_router(store: &BackgroundStore) -> String {
 /// Record `job_id` as the router, for tests elsewhere that need one.
 #[cfg(test)]
 pub(crate) fn record_router_for_test(store: &BackgroundStore, job_id: &str) {
-    let record = RouterRecord {
+    record_for_test(store, ROUTER, job_id);
+}
+
+#[cfg(test)]
+pub(crate) fn record_for_test(store: &BackgroundStore, resident: Resident, job_id: &str) {
+    let record = Record {
         job_id: job_id.to_string(),
     };
-    std::fs::write(record_path(store), serde_json::to_vec(&record).unwrap()).unwrap();
+    std::fs::write(
+        record_path(store, resident),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
 }
 
 #[cfg(test)]
@@ -174,16 +250,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_router_runs_in_its_own_directory_in_auto_mode_and_starts_as_one() {
+    fn each_resident_runs_in_its_own_directory_in_auto_mode_and_starts_as_itself() {
         let dir = tempfile::tempdir().unwrap();
         let store = BackgroundStore::new(dir.path());
-        let options = launch_options(&router_workspace(&store), Some("light-model".into()));
+        let options = launch_options(
+            ROUTER,
+            &router_workspace(&store),
+            Some("light-model".into()),
+        );
         assert_eq!(options.prompt, "/router");
         assert_eq!(options.cwd, dir.path().join("router"));
         assert_eq!(options.runtime.permission_mode.as_deref(), Some("auto"));
         assert_eq!(options.runtime.model.as_deref(), Some("light-model"));
         assert!(!options.isolate_in_worktree);
         assert_eq!(options.parent_job_id, None);
+        let watchdog = launch_options(WATCHDOG, &workspace(&store, WATCHDOG), None);
+        assert_eq!(watchdog.prompt, "/watchdog");
+        assert_eq!(watchdog.cwd, dir.path().join("watchdog"));
+        assert_eq!(watchdog.name.as_deref(), Some("Rebon Watchdog"));
+    }
+
+    fn resident_job(store: &BackgroundStore, resident: Resident) -> BackgroundJobState {
+        let mut job = store
+            .create_job(
+                resident.command.into(),
+                workspace(store, resident),
+                launch_options(resident, &workspace(store, resident), None).runtime,
+            )
+            .unwrap();
+        job.process.status = BackgroundJobStatus::Succeeded;
+        store.write_state(&job).unwrap();
+        record_for_test(store, resident, &job.identity.job_id);
+        job
     }
 
     #[test]
@@ -191,46 +289,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BackgroundStore::new(dir.path());
         assert!(current_router(&store).is_none());
-
-        let mut job = store
-            .create_job(
-                "/router".into(),
-                router_workspace(&store),
-                launch_options(&router_workspace(&store), None).runtime,
-            )
-            .unwrap();
-        let record = RouterRecord {
-            job_id: job.identity.job_id.clone(),
-        };
-        std::fs::write(record_path(&store), serde_json::to_vec(&record).unwrap()).unwrap();
+        let mut job = resident_job(&store, ROUTER);
         assert_eq!(
             current_router(&store).map(|router| router.identity.job_id),
             Some(job.identity.job_id.clone())
         );
-
         job.process.status = BackgroundJobStatus::Stopped;
         store.write_state(&job).unwrap();
         assert!(current_router(&store).is_none());
     }
 
     #[test]
-    fn stopping_a_router_between_turns_leaves_no_router() {
+    fn stopping_the_router_between_turns_takes_its_watchdog_and_roster_with_it() {
         let dir = tempfile::tempdir().unwrap();
         let store = BackgroundStore::new(dir.path());
-        let mut job = store
-            .create_job(
-                "/router".into(),
-                router_workspace(&store),
-                launch_options(&router_workspace(&store), None).runtime,
-            )
-            .unwrap();
-        job.process.status = BackgroundJobStatus::Succeeded;
-        store.write_state(&job).unwrap();
-        record_router_for_test(&store, &job.identity.job_id);
+        let router = resident_job(&store, ROUTER);
+        resident_job(&store, WATCHDOG);
         std::fs::write(store.root().join(ROSTER_FILE_NAME), "{}").unwrap();
 
-        assert_eq!(stop_router(&store).unwrap(), Some(job.identity.job_id));
+        assert_eq!(stop_router(&store).unwrap(), Some(router.identity.job_id));
         assert!(current_router(&store).is_none());
+        assert!(current(&store, WATCHDOG).is_none());
         assert!(!store.root().join(ROSTER_FILE_NAME).exists());
         assert_eq!(stop_router(&store).unwrap(), None);
     }

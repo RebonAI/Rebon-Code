@@ -741,6 +741,9 @@ pub enum SessionMode {
     /// The resident router: talks with the person and dispatches background
     /// worker jobs, which it never does the work of itself.
     Router,
+    /// The watchdog: outside the router's loop, it looks into what the
+    /// supervisor flags as stuck, looping or overspending, and steps in.
+    Watchdog,
 }
 
 impl SessionMode {
@@ -750,6 +753,7 @@ impl SessionMode {
             Self::Normal => "normal",
             Self::Coordinator => "coordinator",
             Self::Router => "router",
+            Self::Watchdog => "watchdog",
         }
     }
 
@@ -758,6 +762,7 @@ impl SessionMode {
             "normal" => Some(Self::Normal),
             "coordinator" => Some(Self::Coordinator),
             "router" => Some(Self::Router),
+            "watchdog" => Some(Self::Watchdog),
             _ => None,
         }
     }
@@ -767,6 +772,7 @@ impl SessionMode {
             Self::Normal => 0,
             Self::Coordinator => 1,
             Self::Router => 2,
+            Self::Watchdog => 3,
         }
     }
 
@@ -774,6 +780,7 @@ impl SessionMode {
         match value {
             1 => Self::Coordinator,
             2 => Self::Router,
+            3 => Self::Watchdog,
             _ => Self::Normal,
         }
     }
