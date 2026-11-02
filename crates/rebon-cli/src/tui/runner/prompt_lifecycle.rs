@@ -176,7 +176,13 @@ pub(super) fn maybe_update_loading_state(
     app.prompt_suggestion_turn = app.prompt_suggestion_turn.wrapping_add(1);
     app.prompt_suggestion_session = Some(turn_runtime.session_id.clone());
     app.prompt_suggestion_text = None;
-    if let Some(elapsed) = completed_elapsed {
+    let awaiting_user_answer = app.pending_permission_view.as_ref().is_some_and(|view| {
+        matches!(
+            view.kind,
+            crate::tui::permission_modal::PermissionKind::AskUserQuestion { .. }
+        )
+    });
+    if let Some(elapsed) = completed_elapsed.filter(|_| !awaiting_user_answer) {
         super::transcript_messages::inject_worked_message(app, elapsed);
     }
     turn_runtime.file_history_tracker.clear_current_message_id();
@@ -1444,6 +1450,7 @@ pub(super) fn drain_ui_channels(
         }
     }
     drain_pending_permissions(app, session, pending_permission);
+    super::permission_flow::sync_permission_view(app, pending_permission);
     drain_pending_profile_runtime_refresh(app, session);
     sync_follow_tail_after_updates(app);
 }
@@ -2218,6 +2225,69 @@ mod tests {
     }
 
     #[test]
+    fn user_turn_waiting_for_an_answer_does_not_append_worked_row() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("worked-pending-question");
+        for answered in [false, true] {
+            let mut app = AppState::new();
+            app.rebon_tui.overlay.set_streaming_text("等待用户确认");
+            let mut session = make_test_tui_session();
+            let (permission_tx, permission_rx) = unbounded_channel();
+            session.engine_half.permission_rx = permission_rx;
+            let (response_tx, _response_rx) = oneshot::channel();
+            permission_tx
+                .send(rebon_core::permission::OutboundPermissionQuery {
+                    id: 1,
+                    tool_name: "AskUserQuestion".into(),
+                    tool_call_id: "ask-pending".into(),
+                    session_id: session.session_id.clone(),
+                    title: "确认".into(),
+                    message: "请选择方案".into(),
+                    tool_input: Some(json!({"questions": []})),
+                    metadata: None,
+                    options: Vec::new(),
+                    response_tx,
+                })
+                .unwrap();
+            let (tx, rx) = oneshot::channel();
+            tx.send(Ok(PromptOutcome::end_turn())).unwrap();
+            let mut active = Some(
+                ActivePrompt::new(rx, PromptCancel::new())
+                    .with_user_message_uuid(Some("u-question".into())),
+            );
+            let mut pending = None;
+            let (runtime, handle) = make_immediate_handle();
+            drain_ui_channels(&mut app, &mut session, &mut pending, &mut active);
+            assert!(pending.is_some());
+            if answered {
+                pending
+                    .take()
+                    .unwrap()
+                    .outbound
+                    .response_tx
+                    .send(rebon_core::permission::PermissionAnswer::Selected {
+                        option_id: "allow_once".into(),
+                        updated_input: None,
+                        extra_text: None,
+                    })
+                    .unwrap();
+                super::super::permission_flow::sync_permission_view(&mut app, &pending);
+            }
+
+            maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
+
+            assert!(active.is_none());
+            let has_worked_row = app.rebon_tui.transcript.rows().iter().any(|row| {
+                matches!(
+                    row,
+                    rebon_tui::Message::System(system) if system.subtype == "turn_duration"
+                )
+            });
+            assert_eq!(has_worked_row, answered);
+            runtime.shutdown_background();
+        }
+    }
+
+    #[test]
     fn failed_user_turn_does_not_append_worked_row() {
         let mut app = AppState::new();
         let (tx, rx) = oneshot::channel();
@@ -2341,7 +2411,9 @@ mod tests {
     #[test]
     fn prompt_failure_display_text_strips_known_wrapper_prefixes() {
         assert_eq!(
-            prompt_failure_display_text("Prompt turn failed: prompt executor failed: model stream error: model client bad request: 400: ws error (websocket_connection_limit_reached): Responses websocket connection limit reached (60 minutes)."),
+            prompt_failure_display_text(
+                "Prompt turn failed: prompt executor failed: model stream error: model client bad request: 400: ws error (websocket_connection_limit_reached): Responses websocket connection limit reached (60 minutes)."
+            ),
             "Responses websocket connection limit reached (60 minutes)."
         );
     }
