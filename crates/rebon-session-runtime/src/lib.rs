@@ -80,6 +80,9 @@ pub mod usage;
 pub mod worker_control;
 pub mod workflow_review;
 
+/// What a router session is called until the person names it.
+pub const ROUTER_SESSION_TITLE: &str = "Rebon Router";
+
 use std::sync::Arc;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -517,6 +520,25 @@ impl EngineSession {
                 self.engine_half
                     .subagent_filter_handle
                     .set(rebon_core::coordinator_mode::default_subagent_filter(false));
+                // The router is named for what it is, not for the first thing
+                // asked of it; a title the person gave it stays.
+                let untitled = rebon_session::load_session_title(
+                    &self.projects_root,
+                    &self.cwd,
+                    &self.session_id,
+                )
+                .is_none_or(|title| title.trim().is_empty());
+                if untitled {
+                    let _ = rebon_session::save_session_title(
+                        &self.projects_root,
+                        &self.cwd,
+                        &self.session_id,
+                        ROUTER_SESSION_TITLE,
+                    );
+                    let _ = self
+                        .server_state
+                        .set_session_title(&self.session_id, ROUTER_SESSION_TITLE.to_string());
+                }
             }
             SessionMode::Normal => {
                 self.engine_half.session_filter_handle.set(
