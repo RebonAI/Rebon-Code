@@ -645,12 +645,9 @@ pub fn publish_turn_usage(
             session.model.name.clone(),
             *turn_usage,
         );
+    let day = rebon_session_host::local_day_number(now_ms());
     if let Err(error) = store.update_state(job_id, |current| {
-        current
-            .outcome
-            .usage
-            .get_or_insert_with(Default::default)
-            .add_turn(turn_usage);
+        current.outcome.record_turn_usage(turn_usage, day);
         Ok(())
     }) {
         tracing::debug!(%job_id, %error, "could not publish session usage");
@@ -2389,6 +2386,9 @@ async fn wait_for_first_prompt_on_warm_session(
             // the job's prompt owed by name: messages from other sessions that
             // merely wait are carried by the next turn, not the reason for one.
             BackgroundJobStatus::Queued if current.has_turn_to_run() => {
+                if automated_turn_left_to_supervisor(store, &current) {
+                    return Ok(WarmSessionWait::Ended);
+                }
                 let (cancel, claim) = ipc.start_turn_and(|| {
                     claim_background_job(
                         store,
@@ -2472,6 +2472,47 @@ async fn wait_for_first_prompt_on_warm_session(
     }
 }
 
+/// Whether a parked worker leaves the automatic turn it was about to take up
+/// to the supervisor, because the user's limits hold it back: too many turns
+/// running, or the session's daily token budget spent. The supervisor, started
+/// here if it is not running, starts the turn once the limits allow. A worker
+/// that took the turn up itself would be the one way around them.
+///
+/// A supervisor that cannot be started would leave the turn stranded, so in
+/// that case the worker runs it after all.
+fn automated_turn_left_to_supervisor(store: &BackgroundStore, job: &BackgroundJobState) -> bool {
+    if !job.next_turn_is_automated() {
+        return false;
+    }
+    let settings = rebon_config::saved_autonomy_settings();
+    let limits = rebon_session_host::AutomatedTurnLimits {
+        max_running_turns: settings.max_automated_turns,
+        daily_token_budget: settings.daily_token_budget,
+    };
+    let running = store
+        .list_jobs()
+        .map(|jobs| rebon_session_host::running_turns(&jobs))
+        .unwrap_or(0);
+    let Some(hold) = rebon_session_host::automated_turn_hold(job, running, limits, now_ms()) else {
+        return false;
+    };
+    let job_id = job.identity.job_id.as_str();
+    let supervisor = std::env::current_exe()
+        .map_err(anyhow::Error::from)
+        .and_then(|exe| rebon_session_host::ensure_supervisor_running(store, &exe));
+    if let Err(error) = supervisor {
+        tracing::warn!(%job_id, error = %format!("{error:#}"), "rebon: no supervisor to hold an automatic turn for; running it");
+        return false;
+    }
+    tracing::info!(%job_id, reason = hold.reason(), "rebon: worker leaving an automatic turn to the supervisor");
+    let _ = store.append_event(
+        job_id,
+        "automated_turn_held",
+        serde_json::json!({ "reason": hold.reason(), "runningTurns": running }),
+    );
+    true
+}
+
 /// Whether an idle worker stays at `now`. Its linger is one reason; the
 /// session's own schedule is the other: an armed wakeup, which only a living
 /// worker can deliver, or a fired prompt the next pass has yet to queue — the
@@ -2552,6 +2593,9 @@ pub(crate) async fn wait_for_terminal_worker_reuse(
             // the job's prompt owed by name: messages from other sessions that
             // merely wait are carried by the next turn, not the reason for one.
             BackgroundJobStatus::Queued if state.has_turn_to_run() => {
+                if automated_turn_left_to_supervisor(store, &state) {
+                    return Ok(false);
+                }
                 store.append_event(job_id, "worker_reused", serde_json::json!({}))?;
                 return Ok(true);
             }

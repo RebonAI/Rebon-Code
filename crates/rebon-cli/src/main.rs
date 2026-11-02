@@ -13,6 +13,7 @@
 
 mod acp;
 mod automation_host;
+mod autonomy;
 mod background;
 mod exec;
 use background::RuntimeFieldsExt;

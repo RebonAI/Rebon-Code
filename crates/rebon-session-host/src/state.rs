@@ -738,6 +738,48 @@ pub struct OutcomeUsage {
     /// would be re-implementing the accounting and getting cache reads wrong.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<SessionUsageSnapshot>,
+    /// The tokens a daily budget counts, for the local day of the last turn.
+    /// Kept beside the running total, in the same write, so a budget can be
+    /// checked without anyone having watched the day begin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_today: Option<DailyUsage>,
+}
+
+/// One local day's budgeted tokens. See [`OutcomeUsage::tokens_on_day`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyUsage {
+    /// Days since the Unix epoch on the local clock (`local_day_number`).
+    pub day: i64,
+    pub tokens: u64,
+}
+
+impl OutcomeUsage {
+    /// Fold one turn's usage into the total, and count it toward `day`.
+    pub fn record_turn_usage(&mut self, usage: &rebon_types::Usage, day: i64) {
+        self.usage
+            .get_or_insert_with(Default::default)
+            .add_turn(usage);
+        let tokens = self
+            .tokens_on_day(day)
+            .saturating_add(budgeted_tokens(usage));
+        self.usage_today = Some(DailyUsage { day, tokens });
+    }
+
+    /// The tokens a daily budget counts on `day`: input, output and cache
+    /// writes. Cache reads are left out, or a loop re-reading its cached
+    /// context would spend its budget on reads that cost a tenth as much.
+    pub fn tokens_on_day(&self, day: i64) -> u64 {
+        self.usage_today
+            .filter(|today| today.day == day)
+            .map_or(0, |today| today.tokens)
+    }
+}
+
+fn budgeted_tokens(usage: &rebon_types::Usage) -> u64 {
+    u64::from(usage.input_tokens)
+        .saturating_add(u64::from(usage.output_tokens))
+        .saturating_add(u64::from(usage.cache_creation_input_tokens))
 }
 
 /// One job's whole record.
@@ -1227,6 +1269,7 @@ impl BackgroundJobState {
                 pending_permission: None,
                 event_count: 0,
                 usage: None,
+                usage_today: None,
             },
         }
     }
@@ -1491,6 +1534,26 @@ impl BackgroundJobState {
     /// to run, or the job's prompt, owed by name.
     pub fn has_turn_to_run(&self) -> bool {
         self.identity.prompt_owed || self.has_pending_prompts_to_run()
+    }
+
+    /// Whether the turn this job waits to run is one nobody asked for: every
+    /// prompt that may lead it was scheduled (a wakeup, a schedule, an event,
+    /// a recovery), or, with none queued, the job's own prompt was — an
+    /// automation rule's launch. One prompt from a person makes it theirs.
+    pub fn next_turn_is_automated(&self) -> bool {
+        let mut leading = self
+            .identity
+            .pending_prompts
+            .iter()
+            .filter(|prompt| prompt.may_lead_turn())
+            .peekable();
+        if leading.peek().is_none() {
+            return self
+                .identity
+                .prompt
+                .starts_with(rebon_tool::cron::SCHEDULED_PROMPT_MARKER);
+        }
+        leading.all(|prompt| prompt.origin == Some(PendingPromptOrigin::Scheduled))
     }
 
     /// Judge whether the message from another session at `index` may start a

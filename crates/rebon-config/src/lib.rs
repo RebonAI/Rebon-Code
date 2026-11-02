@@ -5407,6 +5407,98 @@ pub fn save_idle_auto_compact_enabled_in_dir(
     write_settings_json_object(&target, &settings)
 }
 
+/// How far the background supervisor runs sessions on its own: the
+/// `autonomy` object in the user's settings. Every key has a default, so a
+/// missing, partial or unreadable object reads as the defaults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutonomySettings {
+    /// `recoverCrashedTurns`: queue a background turn again when its worker
+    /// died in the middle of it.
+    pub recover_crashed_turns: bool,
+    /// `maxAutomatedTurns`: an automatic turn (a wakeup, a schedule, a
+    /// pull-request event, a crash recovery) starts only while fewer turns
+    /// than this are running. A turn the person asked for always starts.
+    pub max_automated_turns: usize,
+    /// `dailyTokenBudget`: tokens a session may use in a day before nothing
+    /// starts a turn in it automatically. Cache reads do not count. `None`
+    /// sets no budget.
+    pub daily_token_budget: Option<u64>,
+}
+
+impl Default for AutonomySettings {
+    fn default() -> Self {
+        Self {
+            recover_crashed_turns: true,
+            max_automated_turns: 3,
+            daily_token_budget: None,
+        }
+    }
+}
+
+pub fn saved_autonomy_settings() -> AutonomySettings {
+    saved_autonomy_settings_in_dir(&config_home_dir())
+}
+
+pub fn saved_autonomy_settings_in_dir(config_dir: &Path) -> AutonomySettings {
+    let defaults = AutonomySettings::default();
+    let Some(autonomy) = read_settings_json_object(&user_settings_file(config_dir))
+        .ok()
+        .and_then(|mut settings| settings.remove("autonomy"))
+    else {
+        return defaults;
+    };
+    AutonomySettings {
+        recover_crashed_turns: autonomy
+            .get("recoverCrashedTurns")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(defaults.recover_crashed_turns),
+        max_automated_turns: autonomy
+            .get("maxAutomatedTurns")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(defaults.max_automated_turns, |max| max as usize),
+        daily_token_budget: autonomy
+            .get("dailyTokenBudget")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|budget| *budget > 0),
+    }
+}
+
+#[cfg(test)]
+mod autonomy_settings_tests {
+    use super::{saved_autonomy_settings_in_dir, AutonomySettings};
+
+    #[test]
+    fn missing_and_partial_settings_read_as_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            saved_autonomy_settings_in_dir(dir.path()),
+            AutonomySettings::default()
+        );
+        let path = super::user_settings_file(dir.path());
+        std::fs::write(
+            &path,
+            r#"{"autonomy":{"maxAutomatedTurns":1,"dailyTokenBudget":2000000}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            saved_autonomy_settings_in_dir(dir.path()),
+            AutonomySettings {
+                recover_crashed_turns: true,
+                max_automated_turns: 1,
+                daily_token_budget: Some(2_000_000),
+            }
+        );
+        std::fs::write(
+            &path,
+            r#"{"autonomy":{"recoverCrashedTurns":false,"dailyTokenBudget":0}}"#,
+        )
+        .unwrap();
+        let settings = saved_autonomy_settings_in_dir(dir.path());
+        assert!(!settings.recover_crashed_turns);
+        assert_eq!(settings.daily_token_budget, None);
+    }
+}
+
 #[cfg(test)]
 mod idle_auto_compact_settings_tests {
     use super::{save_idle_auto_compact_enabled_in_dir, saved_idle_auto_compact_enabled_in_dir};

@@ -34,6 +34,11 @@ pub struct SupervisorHooks<'a> {
     /// process to fire. An error is logged and keeps nothing running.
     pub scheduled_work:
         Option<&'a dyn Fn(&BackgroundStore, &[BackgroundJobState], u64) -> anyhow::Result<bool>>,
+    /// Whether a queued job with no worker may have one started now, given
+    /// how many turns are running. `false` leaves it queued for a later tick.
+    /// How many automatic turns may run, and on what budget, is the binary's
+    /// policy; without the hook every queued job starts.
+    pub admit_spawn: Option<&'a dyn Fn(&BackgroundJobState, usize, u64) -> bool>,
 }
 
 /// Run the supervisor loop against `store`.
@@ -114,6 +119,7 @@ pub fn supervisor_tick(
     let mut jobs = store.list_jobs()?;
     recover_orphaned_spawn_admissions(store, &mut jobs)?;
     supervise_terminal_worker_processes(store, &mut jobs, now)?;
+    let mut running_turns = crate::running_turns(&jobs);
     for state in &mut jobs {
         if state.process.status != BackgroundJobStatus::Queued {
             continue;
@@ -163,6 +169,12 @@ pub fn supervisor_tick(
                 }
             }
             QueuedSpawnDecision::Spawn => {
+                if hooks
+                    .admit_spawn
+                    .is_some_and(|admit| !admit(state, running_turns, now))
+                {
+                    continue;
+                }
                 if state.process.process_owner_fenced {
                     match fenced_stuck_worker_has_exited(state) {
                         Ok(true) => {
@@ -184,7 +196,9 @@ pub fn supervisor_tick(
                         }
                     }
                 }
-                let _ = spawn_worker_process(store, state);
+                if spawn_worker_process(store, state).is_ok() {
+                    running_turns += 1;
+                }
             }
         }
     }
@@ -663,6 +677,39 @@ mod scheduled_work_tests {
             Ok(false)
         });
         assert_eq!(*seen.borrow(), [job.identity.job_id]);
+    }
+
+    /// A queued job the admission hook turns down gets no worker this tick and
+    /// stays queued, which keeps the supervisor up to ask again.
+    #[test]
+    fn a_queued_job_the_admission_hook_refuses_stays_queued_without_a_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BackgroundStore::new(dir.path());
+        let job = store
+            .create_job("p".into(), std::path::PathBuf::from("."), runtime())
+            .unwrap();
+        assert_eq!(job.process.status, BackgroundJobStatus::Queued);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let admit = |state: &BackgroundJobState, running: usize, _now: u64| {
+            asked
+                .borrow_mut()
+                .push((state.identity.job_id.clone(), running));
+            false
+        };
+        let resident = supervisor_tick(
+            &store,
+            &SupervisorHooks {
+                admit_spawn: Some(&admit),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(resident);
+        assert_eq!(*asked.borrow(), [(job.identity.job_id.clone(), 0)]);
+        let after = store.read_state(&job.identity.job_id).unwrap();
+        assert_eq!(after.process.status, BackgroundJobStatus::Queued);
+        assert_eq!(after.process.pid, None);
+        assert!(!after.process.spawn_admitted);
     }
 
     #[test]

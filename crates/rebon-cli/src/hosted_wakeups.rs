@@ -55,7 +55,7 @@ fn job_may_be_woken(job: &BackgroundJobState) -> bool {
 
 /// A worker still runs for the job, and fires the wakeup itself. A pid that
 /// cannot be checked counts as alive: two deliveries are worse than a late one.
-fn worker_alive(job: &BackgroundJobState) -> bool {
+pub(crate) fn worker_alive(job: &BackgroundJobState) -> bool {
     job.process.pid.is_some_and(|pid| {
         recorded_process_is_running(pid, job.process.pid_identity.as_deref()).unwrap_or(true)
     })
@@ -134,7 +134,7 @@ mod tests {
         let job = reaped_job_with_wakeup(&store, BackgroundJobStatus::Succeeded, 60_000);
 
         assert!(
-            deliver_hosted_wakeups(&store, &[job.clone()], 59_000).unwrap(),
+            deliver_hosted_wakeups(&store, std::slice::from_ref(&job), 59_000).unwrap(),
             "armed: stay up"
         );
         assert!(store
@@ -145,7 +145,7 @@ mod tests {
             .is_empty());
 
         assert!(
-            !deliver_hosted_wakeups(&store, &[job.clone()], 60_000).unwrap(),
+            !deliver_hosted_wakeups(&store, std::slice::from_ref(&job), 60_000).unwrap(),
             "delivered"
         );
         let loaded = store.read_state(&job.identity.job_id).unwrap();
@@ -182,7 +182,7 @@ mod tests {
         let mut job = reaped_job_with_wakeup(&store, BackgroundJobStatus::Idle, 1_000);
         job.process.pid = Some(std::process::id());
         job.process.pid_identity = rebon_session_host::process_identity(std::process::id());
-        assert!(deliver_hosted_wakeups(&store, &[job.clone()], 10_000).unwrap());
+        assert!(deliver_hosted_wakeups(&store, std::slice::from_ref(&job), 10_000).unwrap());
         assert!(store
             .read_state(&job.identity.job_id)
             .unwrap()
@@ -203,7 +203,7 @@ mod tests {
         ] {
             let job = reaped_job_with_wakeup(&store, status, 1_000);
             assert!(
-                !deliver_hosted_wakeups(&store, &[job.clone()], 10_000).unwrap(),
+                !deliver_hosted_wakeups(&store, std::slice::from_ref(&job), 10_000).unwrap(),
                 "{status:?}"
             );
             assert!(

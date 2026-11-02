@@ -228,6 +228,7 @@ fn fully_populated_job() -> BackgroundJobState {
                 cache_read_tokens: 33,
                 cache_creation_tokens: 44,
             }),
+            usage_today: None,
         },
     }
 }
@@ -350,6 +351,7 @@ fn minimal_job() -> BackgroundJobState {
             pending_permission: None,
             event_count: 0,
             usage: None,
+            usage_today: None,
         },
     }
 }

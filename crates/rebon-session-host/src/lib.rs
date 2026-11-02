@@ -42,6 +42,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// `<teammate-message>` frame it is delivered under.
 pub mod agent_message;
 mod attach_job;
+pub mod autonomy;
 pub mod client;
 mod day;
 mod dispatch_prompt;
@@ -87,6 +88,7 @@ mod warm_peek;
 mod wire_contract_tests;
 mod worktree_path;
 
+pub use autonomy::{automated_turn_hold, running_turns, AutomatedTurnHold, AutomatedTurnLimits};
 pub use attach_job::{
     attach_background_job_in_store, mirrorable_background_job_in_store, AttachedJob,
     BackgroundAttachMode,

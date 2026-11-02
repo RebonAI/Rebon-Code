@@ -60,9 +60,10 @@ pub(crate) use client::*;
 /// All this does is resolve what only the binary knows — its own store, its own
 /// executable — and lend the loop the three things that are the CLI's rather
 /// than the host's: the updater plugin's one-time Windows scheduler migration,
-/// the `gh`-backed pull-request status refresh, and the work scheduled for
+/// the `gh`-backed pull-request status refresh, the work scheduled for
 /// later — automation rules, and the wakeups of hosted sessions whose worker
-/// is gone. The loop itself lives in
+/// is gone — and the autonomy policy: crash recovery, and which automatic
+/// turns may start (`crate::autonomy`). The loop itself lives in
 /// `rebon-session-host`, and this is the shape design §11 asks the
 /// hidden subcommands to end up in.
 pub(crate) fn run_background_supervisor() -> anyhow::Result<()> {
@@ -77,10 +78,15 @@ pub(crate) fn run_background_supervisor() -> anyhow::Result<()> {
         refresh_stale_pull_request_statuses(store, jobs, now)
     };
     let automation = crate::automation_host::AutomationHost::new(store.root().to_path_buf());
+    let autonomy = crate::autonomy::Autonomy::new(rebon_config::config_home_dir());
     let automations = |store: &BackgroundStore, jobs: &[BackgroundJobState], now: u64| {
-        // Both run every tick, whatever the other answered.
+        // All run every tick, whatever the others answered.
+        let recovering = autonomy.tick(store, jobs, now);
         let wakeups = crate::hosted_wakeups::deliver_hosted_wakeups(store, jobs, now)?;
-        Ok(automation.tick(store, jobs, now)? || wakeups)
+        Ok(automation.tick(store, jobs, now)? || wakeups || recovering)
+    };
+    let admit = |job: &BackgroundJobState, running_turns: usize, now: u64| {
+        autonomy.admit(&store, job, running_turns, now)
     };
     rebon_session_host::run_background_supervisor_with_store(
         &store,
@@ -88,6 +94,7 @@ pub(crate) fn run_background_supervisor() -> anyhow::Result<()> {
             migration: Some(&migrate),
             refresh_pull_requests: Some(&refresh),
             scheduled_work: Some(&automations),
+            admit_spawn: Some(&admit),
         },
     )
 }

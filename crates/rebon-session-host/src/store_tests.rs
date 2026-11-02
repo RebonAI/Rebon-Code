@@ -5024,3 +5024,30 @@ fn a_message_to_a_record_left_running_by_a_dead_worker_is_queued_not_injected() 
         rebon_tool::peer::WakeVerdict::Unjudged
     );
 }
+
+#[test]
+fn a_turn_is_automated_only_when_nothing_a_person_sent_may_lead_it() {
+    let scheduled = |id: &str| {
+        let mut prompt = PendingPrompt::new(
+            id.into(),
+            rebon_tool::cron::mark_scheduled_prompt("check CI"),
+            Vec::new(),
+            1,
+        )
+        .unwrap();
+        prompt.origin = Some(PendingPromptOrigin::Scheduled);
+        prompt
+    };
+    let mut job = BackgroundJobState::new("fix the bug".into(), ".".into(), runtime(), None);
+    assert!(!job.next_turn_is_automated(), "a person's own launch");
+    job.identity.prompt = rebon_tool::cron::mark_scheduled_prompt("nightly review");
+    assert!(job.next_turn_is_automated(), "a rule's launch");
+
+    job.identity.prompt = "fix the bug".into();
+    job.identity.pending_prompts = vec![scheduled("u-internal-scheduled-1")];
+    assert!(job.next_turn_is_automated(), "only a wakeup waits");
+    job.identity
+        .pending_prompts
+        .push(PendingPrompt::new("u-reply".into(), "also this".into(), Vec::new(), 2).unwrap());
+    assert!(!job.next_turn_is_automated(), "a reply rides along");
+}
