@@ -112,6 +112,9 @@ pub struct AutomationState {
     /// a fresh supervisor does not answer history.
     #[serde(default)]
     pub events_seen_until_ms: Option<u64>,
+    /// Threads sessions are subscribed to, per thread key.
+    #[serde(default)]
+    pub threads: BTreeMap<String, crate::threads::PrThread>,
 }
 
 #[derive(Serialize)]
@@ -194,7 +197,7 @@ impl AutomationState {
             .collect();
         Ok(Self {
             rules,
-            events_seen_until_ms: None,
+            ..Self::default()
         })
     }
 

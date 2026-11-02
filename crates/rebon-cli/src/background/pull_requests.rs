@@ -387,6 +387,109 @@ fn json_upper_str(value: &serde_json::Value, key: &str) -> Option<String> {
         .map(|value| value.to_ascii_uppercase())
 }
 
+// ---------------------------------------------------------------------------
+// Pull requests as threads (`rebon_automation::threads`)
+// ---------------------------------------------------------------------------
+
+/// The pull requests a session's summary names, as threads see them.
+pub(crate) fn pull_requests_named_in(text: &str) -> Vec<rebon_automation::threads::PrRef> {
+    github_pull_request_references(text)
+        .into_iter()
+        .map(|reference| rebon_automation::threads::PrRef {
+            owner: reference.owner,
+            repo: reference.repo,
+            number: reference.number,
+            url: reference.url,
+        })
+        .collect()
+}
+
+/// Look at a subscribed pull request with `gh`, from `cwd`.
+pub(crate) fn observe_pull_request(
+    cwd: &Path,
+    pr: &rebon_automation::threads::PrRef,
+) -> anyhow::Result<rebon_automation::threads::PrSnapshot> {
+    let reference = GithubPullRequestReference {
+        owner: pr.owner.clone(),
+        repo: pr.repo.clone(),
+        number: pr.number,
+        url: pr.url.clone(),
+    };
+    pull_request_snapshot_from_json(&run_gh_pr_view(cwd, &reference)?)
+}
+
+/// A `gh pr view --json` answer as a thread snapshot: the same check rollup
+/// the status dot is drawn from, kept as counts.
+fn pull_request_snapshot_from_json(
+    data: &str,
+) -> anyhow::Result<rebon_automation::threads::PrSnapshot> {
+    use rebon_automation::threads::{PrSnapshot, PrState};
+    let value: serde_json::Value =
+        serde_json::from_str(data).context("failed to parse `gh pr view` JSON")?;
+    let state = match json_upper_str(&value, "state").as_deref() {
+        Some("MERGED") => PrState::Merged,
+        Some("CLOSED") => PrState::Closed,
+        _ => PrState::Open,
+    };
+    let checks = GithubCheckRollup::from_json(value.get("statusCheckRollup"));
+    Ok(PrSnapshot {
+        state,
+        checks_failed: u32::try_from(checks.failed).unwrap_or(u32::MAX),
+        checks_pending: u32::try_from(checks.pending).unwrap_or(u32::MAX),
+        changes_requested: json_upper_str(&value, "reviewDecision").as_deref()
+            == Some("CHANGES_REQUESTED"),
+        checks_summary: checks.summary(),
+    })
+}
+
+#[cfg(test)]
+mod thread_tests {
+    use super::*;
+    use rebon_automation::threads::PrState;
+
+    #[test]
+    fn a_summary_names_its_pull_requests_once_each() {
+        let prs = pull_requests_named_in(
+            "Opened https://github.com/RebonAI/Rebon-Code/pull/42, see \
+             (https://github.com/RebonAI/Rebon-Code/pull/42) and github.com/a/b/pull/7.",
+        );
+        let numbers: Vec<_> = prs.iter().map(|pr| pr.number).collect();
+        assert_eq!(numbers, [42, 7]);
+        assert_eq!(prs[0].owner, "RebonAI");
+        assert!(pull_requests_named_in("no links here").is_empty());
+    }
+
+    #[test]
+    fn a_gh_answer_becomes_a_snapshot_with_counts() {
+        let failing = pull_request_snapshot_from_json(
+            &serde_json::json!({
+                "state": "OPEN",
+                "reviewDecision": "CHANGES_REQUESTED",
+                "statusCheckRollup": [
+                    {"status": "COMPLETED", "conclusion": "FAILURE"},
+                    {"status": "COMPLETED", "conclusion": "SUCCESS"},
+                    {"status": "IN_PROGRESS"}
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(failing.state, PrState::Open);
+        assert_eq!((failing.checks_failed, failing.checks_pending), (1, 1));
+        assert!(failing.changes_requested);
+        assert_eq!(failing.checks_summary.as_deref(), Some("1 check(s) failed"));
+
+        for (state, expected) in [("MERGED", PrState::Merged), ("CLOSED", PrState::Closed)] {
+            let snapshot =
+                pull_request_snapshot_from_json(&serde_json::json!({ "state": state }).to_string())
+                    .unwrap();
+            assert_eq!(snapshot.state, expected);
+            assert_eq!(snapshot.checks_summary, None);
+        }
+        assert!(pull_request_snapshot_from_json("not json").is_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

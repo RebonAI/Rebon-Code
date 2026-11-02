@@ -7,6 +7,9 @@
 //! which nothing else writes. A rule on a clock keeps the supervisor running
 //! with no job to supervise; that is the whole reason the rules moved here
 //! from the app, which stopped firing them when its window closed.
+//!
+//! The same pass routes pull-request threads to the sessions that opened
+//! them (`crate::thread_routing`), against the same state file.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -61,15 +64,31 @@ impl AutomationHost {
                 .map(|job| job.identity.job_id)
                 .map_err(|error| format!("{error:#}"))
         };
-        self.tick_with(jobs, now_ms, &mut launch)
+        let mut observe = |thread: &rebon_automation::threads::PrThread| {
+            crate::background::observe_pull_request(std::path::Path::new(&thread.cwd), &thread.pr)
+        };
+        // Queued as a scheduled turn; this supervisor starts its worker.
+        let mut deliver = |job_id: &str, prompt: String| {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = format!(
+                "u-internal-scheduled-thread-{now_ms}-{}",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
+            let text = rebon_tool::cron::mark_scheduled_prompt(&prompt);
+            rebon_session_host::append_background_scheduled_prompt(store, job_id, id, text)
+                .map(|_| ())
+        };
+        self.tick_with(jobs, now_ms, &mut launch, &mut observe, &mut deliver)
     }
 
-    /// [`Self::tick`] with the launch injected.
+    /// [`Self::tick`] with what it does to the world injected.
     pub(crate) fn tick_with(
         &self,
         jobs: &[BackgroundJobState],
         now_ms: u64,
         launch: &mut Launch<'_>,
+        observe_pr: &mut crate::thread_routing::ObservePr<'_>,
+        deliver: &mut crate::thread_routing::DeliverToJob<'_>,
     ) -> anyhow::Result<bool> {
         let requests_dir = requests_dir(&self.config_home);
         let pass_due = self
@@ -97,7 +116,7 @@ impl AutomationHost {
             )?),
         };
         let views: Vec<JobView> = jobs.iter().map(job_view).collect();
-        let changed = run_pass(
+        let mut changed = run_pass(
             &rules,
             state,
             &views,
@@ -106,10 +125,18 @@ impl AutomationHost {
             &local_stamp(now_ms),
             launch,
         );
+        if rules.pr_follow_up {
+            changed |=
+                crate::thread_routing::route_pr_threads(state, jobs, now_ms, observe_pr, deliver);
+        }
         if changed {
             state.save(&state_path(&self.config_home))?;
         }
-        self.resident.set(rules.has_armed_time_rule());
+        // An open thread needs a living supervisor to be looked at: its
+        // checks may finish hours after the session that opened it.
+        let watching_threads = rules.pr_follow_up && !state.threads.is_empty();
+        self.resident
+            .set(rules.has_armed_time_rule() || watching_threads);
         Ok(self.resident.get())
     }
 }
@@ -201,6 +228,16 @@ mod tests {
         }
     }
 
+    fn no_prs(
+        _: &rebon_automation::threads::PrThread,
+    ) -> anyhow::Result<rebon_automation::threads::PrSnapshot> {
+        anyhow::bail!("no gh in tests")
+    }
+
+    fn no_delivery(_: &str, _: String) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn recording(
         launched: &mut Vec<LaunchRequest>,
     ) -> impl FnMut(&LaunchRequest) -> Result<String, String> + '_ {
@@ -218,7 +255,13 @@ mod tests {
         let mut launched = Vec::new();
 
         assert!(host
-            .tick_with(&[], 1_000, &mut recording(&mut launched))
+            .tick_with(
+                &[],
+                1_000,
+                &mut recording(&mut launched),
+                &mut no_prs,
+                &mut no_delivery
+            )
             .unwrap());
         assert!(launched.is_empty(), "armed, not fired");
         let state = AutomationState::load(&state_path(home.path())).unwrap();
@@ -228,7 +271,13 @@ mod tests {
         );
 
         assert!(host
-            .tick_with(&[], 61_000, &mut recording(&mut launched))
+            .tick_with(
+                &[],
+                61_000,
+                &mut recording(&mut launched),
+                &mut no_prs,
+                &mut no_delivery
+            )
             .unwrap());
         assert_eq!(launched.len(), 1);
         assert_eq!(launched[0].cwd, "/work/repo");
@@ -245,20 +294,38 @@ mod tests {
         write_rules(home.path(), vec![interval_rule("r")]);
         let host = AutomationHost::new(home.path().to_path_buf());
         let mut launched = Vec::new();
-        host.tick_with(&[], 10_000, &mut recording(&mut launched))
-            .unwrap();
+        host.tick_with(
+            &[],
+            10_000,
+            &mut recording(&mut launched),
+            &mut no_prs,
+            &mut no_delivery,
+        )
+        .unwrap();
 
         // Unreadable rules a second later go unnoticed: no pass is due.
         std::fs::write(rules_path(home.path()), b"{nope").unwrap();
         assert!(host
-            .tick_with(&[], 11_000, &mut recording(&mut launched))
+            .tick_with(
+                &[],
+                11_000,
+                &mut recording(&mut launched),
+                &mut no_prs,
+                &mut no_delivery
+            )
             .unwrap());
 
         // A Run now is answered on the next tick, not the next pass.
         write_rules(home.path(), vec![interval_rule("r")]);
         rebon_automation::request_run(&requests_dir(home.path()), "r", 11_500).unwrap();
-        host.tick_with(&[], 12_000, &mut recording(&mut launched))
-            .unwrap();
+        host.tick_with(
+            &[],
+            12_000,
+            &mut recording(&mut launched),
+            &mut no_prs,
+            &mut no_delivery,
+        )
+        .unwrap();
         assert_eq!(launched.len(), 1);
         assert_eq!(
             launched[0].prompt, "check repo",
@@ -272,13 +339,25 @@ mod tests {
         let host = AutomationHost::new(home.path().to_path_buf());
         let mut launched = Vec::new();
         assert!(!host
-            .tick_with(&[], 0, &mut recording(&mut launched))
+            .tick_with(
+                &[],
+                0,
+                &mut recording(&mut launched),
+                &mut no_prs,
+                &mut no_delivery
+            )
             .unwrap());
         let mut rule = interval_rule("e");
         rule.trigger = AutomationTrigger::JobFailed;
         write_rules(home.path(), vec![rule]);
         assert!(!host
-            .tick_with(&[], PASS_INTERVAL_MS, &mut recording(&mut launched))
+            .tick_with(
+                &[],
+                PASS_INTERVAL_MS,
+                &mut recording(&mut launched),
+                &mut no_prs,
+                &mut no_delivery
+            )
             .unwrap());
     }
 
@@ -295,10 +374,22 @@ mod tests {
         let host = AutomationHost::new(home.path().to_path_buf());
         let mut launched = Vec::new();
         assert!(!host
-            .tick_with(&[], 0, &mut recording(&mut launched))
+            .tick_with(
+                &[],
+                0,
+                &mut recording(&mut launched),
+                &mut no_prs,
+                &mut no_delivery
+            )
             .unwrap());
         assert!(!host
-            .tick_with(&[], 120_000, &mut recording(&mut launched))
+            .tick_with(
+                &[],
+                120_000,
+                &mut recording(&mut launched),
+                &mut no_prs,
+                &mut no_delivery
+            )
             .unwrap());
         assert!(
             launched.is_empty(),
@@ -311,6 +402,76 @@ mod tests {
         );
     }
 
+    /// A job whose summary names a pull request it opened.
+    fn job_with_pr(home: &std::path::Path) -> BackgroundJobState {
+        let store = BackgroundStore::new(home);
+        let mut job = store
+            .create_job(
+                "p".into(),
+                PathBuf::from("/work/repo"),
+                launch_options(&LaunchRequest {
+                    rule_id: "r".into(),
+                    prompt: "p".into(),
+                    cwd: "/work/repo".into(),
+                    permission_mode: "default".into(),
+                })
+                .runtime,
+            )
+            .unwrap();
+        job.process.status = BackgroundJobStatus::Succeeded;
+        job.outcome.summary = Some("Opened https://github.com/RebonAI/Rebon-Code/pull/42".into());
+        job
+    }
+
+    #[test]
+    fn pr_follow_up_subscribes_and_keeps_the_supervisor_watching() {
+        let home = tempfile::tempdir().unwrap();
+        write_rules(home.path(), Vec::new());
+        let job = job_with_pr(home.path());
+        let host = AutomationHost::new(home.path().to_path_buf());
+        let mut launched = Vec::new();
+        assert!(
+            host.tick_with(
+                &[job],
+                0,
+                &mut recording(&mut launched),
+                &mut no_prs,
+                &mut no_delivery
+            )
+            .unwrap(),
+            "an open thread needs a living supervisor"
+        );
+        let state = AutomationState::load(&state_path(home.path())).unwrap();
+        assert!(state.threads.contains_key("pr:rebonai/rebon-code#42"));
+    }
+
+    #[test]
+    fn with_pr_follow_up_off_no_thread_is_kept() {
+        let home = tempfile::tempdir().unwrap();
+        AutomationRules {
+            pr_follow_up: false,
+            ..Default::default()
+        }
+        .save(&rules_path(home.path()))
+        .unwrap();
+        let job = job_with_pr(home.path());
+        let host = AutomationHost::new(home.path().to_path_buf());
+        let mut launched = Vec::new();
+        assert!(!host
+            .tick_with(
+                &[job],
+                0,
+                &mut recording(&mut launched),
+                &mut no_prs,
+                &mut no_delivery
+            )
+            .unwrap());
+        assert!(AutomationState::load(&state_path(home.path()))
+            .unwrap()
+            .threads
+            .is_empty());
+    }
+
     #[test]
     fn an_unreadable_rules_file_is_an_error_for_the_supervisor_to_log() {
         let home = tempfile::tempdir().unwrap();
@@ -318,7 +479,13 @@ mod tests {
         let host = AutomationHost::new(home.path().to_path_buf());
         let mut launched = Vec::new();
         assert!(host
-            .tick_with(&[], 0, &mut recording(&mut launched))
+            .tick_with(
+                &[],
+                0,
+                &mut recording(&mut launched),
+                &mut no_prs,
+                &mut no_delivery
+            )
             .is_err());
     }
 

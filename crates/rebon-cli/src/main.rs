@@ -39,6 +39,7 @@ mod session_command_tests;
 mod session_shell;
 mod sibling_command;
 mod steering_poller;
+mod thread_routing;
 mod tui;
 
 use std::ffi::OsString;

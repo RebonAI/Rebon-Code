@@ -43,6 +43,7 @@ pub(crate) use mirror_turn::{
     OwnerWord, PersistedRemoteTurn,
 };
 use pull_requests::refresh_stale_pull_request_statuses;
+pub(crate) use pull_requests::{observe_pull_request, pull_requests_named_in};
 // The runtime-field conversions live with the session runtime; re-exported so
 // the module's own callers and tests reach them by the name they always used.
 pub use crate::session::host::runtime_fields::RuntimeFieldsExt;

@@ -22,6 +22,7 @@ mod requests;
 mod rules;
 pub mod schedule;
 mod state;
+pub mod threads;
 mod trigger;
 
 pub use engine::{run_pass, JobPhase, JobView, Launch, LaunchRequest};

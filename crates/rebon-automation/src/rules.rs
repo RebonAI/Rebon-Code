@@ -71,6 +71,10 @@ pub struct AutomationRules {
     /// started by the system so rules run after a restart.
     #[serde(default)]
     pub autostart_asked: bool,
+    /// Tell a session what happens to the pull requests it opened — checks
+    /// failing, changes requested, merged or closed — so it can follow up.
+    #[serde(default = "default_true")]
+    pub pr_follow_up: bool,
     #[serde(default)]
     pub rules: Vec<AutomationRule>,
 }
@@ -82,6 +86,7 @@ impl Default for AutomationRules {
             master_enabled: true,
             provider_cost_acknowledged: false,
             autostart_asked: false,
+            pr_follow_up: true,
             rules: Vec::new(),
         }
     }
@@ -172,6 +177,7 @@ mod tests {
             master_enabled: false,
             provider_cost_acknowledged: true,
             autostart_asked: true,
+            pr_follow_up: false,
             rules: vec![rule("a", AutomationTrigger::Interval { minutes: 5 })],
         };
         rules.save(&path).unwrap();
