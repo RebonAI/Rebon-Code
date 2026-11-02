@@ -3839,22 +3839,33 @@ mod tests {
     }
 
     #[test]
-    fn remote_live_prefix_does_not_hold_non_collapsible_shell_tools() {
-        for name in ["Bash", "PowerShell"] {
-            let rows = vec![
+    fn remote_live_prefix_does_not_hold_non_collapsible_tools() {
+        let remote = pin_remote_attachment(
+            crate::background::BackgroundJobStatus::Running,
+            &["u1", "a1", "r1"],
+        );
+        let rows_with = |name: &str| {
+            vec![
                 pin_user_row("u1"),
                 pin_tool_row("a1", "t1", name),
                 pin_tool_result_row("r1", "t1"),
                 pin_system_row("s-local", "attached supervisor recap"),
-            ];
-            let remote = pin_remote_attachment(
-                crate::background::BackgroundJobStatus::Running,
-                &["u1", "a1", "r1"],
-            );
+            ]
+        };
+        for name in ["Edit", "Write"] {
             assert_eq!(
-                remote_attachment_live_prefix(Some(&remote), &rows),
+                remote_attachment_live_prefix(Some(&remote), &rows_with(name)),
                 Some(3),
                 "{name} must commit normally while only the movable recap stays live"
+            );
+        }
+        // Shell calls always join the read/search group, so they stay live
+        // with it like a Grep would.
+        for name in ["Bash", "PowerShell"] {
+            assert_eq!(
+                remote_attachment_live_prefix(Some(&remote), &rows_with(name)),
+                Some(1),
+                "{name} joins the collapsed group and stays repaintable"
             );
         }
     }

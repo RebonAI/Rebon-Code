@@ -1903,12 +1903,12 @@ mod tests {
             &mut app,
             params(SessionUpdate::ToolCall {
                 tool_call_id: "tool-1".into(),
-                title: "Bash ls".into(),
-                kind: ToolKind::Execute,
+                title: "Edit src/lib.rs".into(),
+                kind: ToolKind::Edit,
                 status: ToolCallStatus::Pending,
                 content: None,
                 locations: None,
-                raw_input: None,
+                raw_input: Some(raw_input("src/lib.rs")),
                 raw_output: None,
             }),
         );
@@ -1917,7 +1917,7 @@ mod tests {
             params(SessionUpdate::ToolCallUpdate {
                 tool_call_id: "tool-1".into(),
                 status: Some(ToolCallStatus::Completed),
-                title: Some("Bash ls - completed".into()),
+                title: Some("Edit src/lib.rs - completed".into()),
                 content: None,
                 locations: None,
                 raw_output: None,

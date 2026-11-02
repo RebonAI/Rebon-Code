@@ -3260,6 +3260,63 @@ fn collapsed_inline_hint_suppresses_trailing_single_tool_hint() {
         ToolCallStatus::Completed,
         vec![("file_path", json!("src/lib.rs"))],
     ));
+    // A non-collapsible tool after the run: it keeps its own card, so the
+    // collapsed summary's inline hint and that card's trailing hint are two
+    // hints competing for the screen. A shell call would not do any more —
+    // it folds into the summary now.
+    overlay.upsert_streaming_tool_use(streaming_tool(
+        "t3",
+        "Write",
+        ToolKind::Edit,
+        ToolCallStatus::Completed,
+        vec![("file_path", json!("src/lib.rs"))],
+    ));
+
+    let mut buf = new_buf(120, 12);
+    render_streaming_overlay(
+        &overlay,
+        Rect::new(0, 0, 120, 12),
+        &mut buf,
+        &RenderTheme::plain(),
+        ToolOutputVerbosity::Compact,
+    );
+    let snap = (0..12)
+        .map(|y| row_text(&buf, y))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        snap.contains("Searched for 1 pattern, read 1 file"),
+        "collapsed summary missing: {snap:?}"
+    );
+    assert!(snap.contains("Write"), "single tool missing: {snap:?}");
+    assert_eq!(
+        snap.matches("Ctrl+O to expand").count(),
+        1,
+        "collapsed inline hint and trailing tool hint must not stack: {snap:?}"
+    );
+}
+
+#[test]
+fn a_shell_call_folds_into_the_summary_instead_of_breaking_the_run() {
+    // The turn shape that used to fragment: read, search, then a `sed` or a
+    // build. Every link folds, and the shell call is counted rather than
+    // rendered as its own card.
+    let mut overlay = StreamingOverlay::new();
+    overlay.upsert_streaming_tool_use(streaming_tool(
+        "t1",
+        "Grep",
+        ToolKind::Search,
+        ToolCallStatus::Completed,
+        vec![("pattern", json!("foo"))],
+    ));
+    overlay.upsert_streaming_tool_use(streaming_tool(
+        "t2",
+        "Read",
+        ToolKind::Read,
+        ToolCallStatus::Completed,
+        vec![("file_path", json!("src/lib.rs"))],
+    ));
     overlay.upsert_streaming_tool_use(streaming_tool(
         "t3",
         "Bash",
@@ -3282,14 +3339,12 @@ fn collapsed_inline_hint_suppresses_trailing_single_tool_hint() {
         .join("\n");
 
     assert!(
-        snap.contains("Searched for 1 pattern, read 1 file"),
-        "collapsed summary missing: {snap:?}"
+        snap.contains("ran 1 bash command"),
+        "the shell call should be counted in the summary: {snap:?}"
     );
-    assert!(snap.contains("Bash"), "single tool missing: {snap:?}");
-    assert_eq!(
-        snap.matches("Ctrl+O to expand").count(),
-        1,
-        "collapsed inline hint and trailing tool hint must not stack: {snap:?}"
+    assert!(
+        !snap.contains("● Bash"),
+        "the shell call must not render its own card: {snap:?}"
     );
 }
 

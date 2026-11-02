@@ -124,7 +124,7 @@ use rebon_message_tui::{MessageRenderTheme, RenderedMessageWidget};
 use rebon_render::{
     classify_tool_use, project_collapsed_read_search, Aggregator,
     AssistantContentBlock as RmAssistantContentBlock, AssistantMessage as RmAssistantMessage,
-    AttachmentInput, AttachmentMessage as RmAttachmentMessage, ClassifyOptions,
+    AttachmentInput, AttachmentMessage as RmAttachmentMessage,
     CollapsedReadSearchDisplay, CollapsedReadSearchProjection, FinalizeParams, MemoryPathPolicy,
     MessageRow as RmMessageRow, RenderMessageInput, ResultStatus, SystemMessage as RmSystemMessage,
     SystemSubtype as RmSystemSubtype, ToolClass, UserContentBlock as RmUserContentBlock,

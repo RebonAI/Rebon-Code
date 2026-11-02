@@ -714,13 +714,12 @@ fn committed_collapsed_group_display(
     // tool_result is treated as resolved — this is the committed path,
     // so every call we see has already left the wire.
     let policy = MemoryPathPolicy::default();
-    let options = ClassifyOptions::default();
     let mut agg = Aggregator::new();
     let mut any_failed = false;
     for &i in indices {
         if let Some(tools) = tool_only_assistant(&rows[i]) {
             for t in tools {
-                let class = classify_tool_use(&t.name, &t.input, &policy, options);
+                let class = classify_tool_use(&t.name, &t.input, &policy);
                 agg.push_tool_use(&t.id, &class, 1);
                 if errored_ids.contains(&t.id) {
                     agg.record_result(&t.id, ResultStatus::Errored);
@@ -739,7 +738,6 @@ fn committed_collapsed_group_display(
         is_active_group: false,
         verbose: false,
         should_animate: false,
-        fullscreen_enabled: options.fullscreen,
         background: None,
     });
     let output = project_collapsed_read_search(&input);

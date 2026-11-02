@@ -610,7 +610,7 @@ pub(super) fn streaming_tool_input_json(tool: &crate::streaming::StreamingToolUs
 pub(super) fn classify_streaming_tool(tool: &crate::streaming::StreamingToolUse) -> ToolClass {
     let policy = MemoryPathPolicy::default();
     let input = streaming_tool_input_json(tool);
-    classify_tool_use(&tool.tool_name, &input, &policy, ClassifyOptions::default())
+    classify_tool_use(&tool.tool_name, &input, &policy)
 }
 
 pub(super) fn render_collapsed_read_search_display(
@@ -774,14 +774,13 @@ pub(super) fn render_collapsed_streaming_group(
     }
 
     let policy = MemoryPathPolicy::default();
-    let options = ClassifyOptions::default();
     let mut agg = Aggregator::new();
     let mut any_in_progress = false;
     let mut any_failed = false;
 
     for tool in tools {
         let input = streaming_tool_input_json(tool);
-        let class = classify_tool_use(&tool.tool_name, &input, &policy, options);
+        let class = classify_tool_use(&tool.tool_name, &input, &policy);
         agg.push_tool_use(&tool.call_id, &class, 1);
         match tool.status {
             ToolCallStatus::Completed => {
@@ -802,7 +801,6 @@ pub(super) fn render_collapsed_streaming_group(
         is_active_group: any_in_progress,
         verbose: false,
         should_animate: true,
-        fullscreen_enabled: options.fullscreen,
         background: None,
     });
 
