@@ -22,7 +22,6 @@ use rebon_session_host::{BackgroundJobState, BackgroundJobStatus, BackgroundStor
 use serde::{Deserialize, Serialize};
 
 const STATE_FILE_NAME: &str = "router-digest.json";
-const ROSTER_FILE_NAME: &str = "router-roster.json";
 /// How long the first line waits for others before the digest goes out.
 const BATCH_MS: u64 = 15_000;
 const MAX_LINE_CHARS: usize = 300;
@@ -89,7 +88,7 @@ impl RouterDigest {
     pub(crate) fn new(store: &BackgroundStore) -> Self {
         Self {
             path: store.root().join(STATE_FILE_NAME),
-            roster_path: store.root().join(ROSTER_FILE_NAME),
+            roster_path: store.root().join(crate::router::ROSTER_FILE_NAME),
             state: RefCell::new(None),
             published: RefCell::new(None),
         }
@@ -143,7 +142,18 @@ impl RouterDigest {
         });
         let before = state.clone();
         let router_id = router.identity.job_id.as_str();
-        collect(state, router_id, jobs, now_ms);
+        let last_reply = |job: &BackgroundJobState| {
+            rebon_session_host::background_job_transcript_path_in(
+                &rebon_harness::projects_root(),
+                job,
+            )
+            .and_then(|transcript| {
+                rebon_session::last_turn_assistant_text(&transcript)
+                    .ok()
+                    .flatten()
+            })
+        };
+        collect(state, router_id, jobs, now_ms, &last_reply);
         let due = state
             .pending_since_ms
             .is_some_and(|since| now_ms.saturating_sub(since) >= BATCH_MS);
@@ -176,8 +186,17 @@ impl RouterDigest {
     }
 }
 
+/// A worker's last reply, read only for a worker that just finished a turn.
+type LastReply<'a> = dyn Fn(&BackgroundJobState) -> Option<String> + 'a;
+
 /// Note every worker of `router_id` whose state moved to one worth a line.
-fn collect(state: &mut DigestState, router_id: &str, jobs: &[BackgroundJobState], now_ms: u64) {
+fn collect(
+    state: &mut DigestState,
+    router_id: &str,
+    jobs: &[BackgroundJobState],
+    now_ms: u64,
+    last_reply: &LastReply<'_>,
+) {
     if state.router_job_id.as_deref() != Some(router_id) {
         *state = DigestState {
             router_job_id: Some(router_id.to_string()),
@@ -195,7 +214,7 @@ fn collect(state: &mut DigestState, router_id: &str, jobs: &[BackgroundJobState]
         );
         let changed = state.seen.get(&job.identity.job_id) != Some(&now);
         if changed {
-            if let Some(line) = line(job) {
+            if let Some(line) = line(job, last_reply) {
                 state.pending.push(line);
                 state.pending_since_ms.get_or_insert(now_ms);
             }
@@ -220,19 +239,27 @@ fn status_key(status: BackgroundJobStatus) -> &'static str {
 }
 
 /// The line for a worker's new state, if the state is worth one.
-fn line(job: &BackgroundJobState) -> Option<String> {
+fn line(job: &BackgroundJobState, last_reply: &LastReply<'_>) -> Option<String> {
     let id = &job.identity.job_id;
     let name = &job.identity.name;
     let what = match job.process.status {
         BackgroundJobStatus::Queued | BackgroundJobStatus::Running => return None,
+        // What the worker said leads: its summary is often only a status
+        // line, which would send the router to Recall for every worker.
         BackgroundJobStatus::Idle | BackgroundJobStatus::Succeeded => {
-            let summary = job
-                .outcome
-                .summary
+            let reply = last_reply(job);
+            let first_line = |text: &str| {
+                text.lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(str::to_string)
+            };
+            let said = reply
                 .as_deref()
-                .and_then(|summary| summary.lines().find(|line| !line.trim().is_empty()))
-                .unwrap_or("no summary yet");
-            format!("finished a turn: {}", clip(summary.trim()))
+                .and_then(first_line)
+                .or_else(|| job.outcome.summary.as_deref().and_then(first_line))
+                .unwrap_or_else(|| "no reply yet".to_string());
+            format!("finished a turn: {}", clip(&said))
         }
         BackgroundJobStatus::Failed => format!(
             "failed: {}",
@@ -315,13 +342,13 @@ mod tests {
     fn a_worker_is_reported_once_per_settled_turn() {
         let mut state = DigestState::default();
         let mut job = worker("w1", "r", BackgroundJobStatus::Running, 1);
-        collect(&mut state, "r", std::slice::from_ref(&job), 0);
+        collect(&mut state, "r", std::slice::from_ref(&job), 0, &|_| None);
         assert!(state.pending.is_empty(), "running is not news");
 
         job.process.status = BackgroundJobStatus::Idle;
         job.outcome.summary = Some("\nOpened a pull request\nmore".into());
-        collect(&mut state, "r", std::slice::from_ref(&job), 10);
-        collect(&mut state, "r", std::slice::from_ref(&job), 20);
+        collect(&mut state, "r", std::slice::from_ref(&job), 10, &|_| None);
+        collect(&mut state, "r", std::slice::from_ref(&job), 20, &|_| None);
         assert_eq!(
             state.pending,
             ["- w1 \"task w1\" finished a turn: Opened a pull request"]
@@ -331,9 +358,23 @@ mod tests {
         job.process.turn_generation = 2;
         job.process.status = BackgroundJobStatus::Failed;
         job.outcome.error = Some("quota".into());
-        collect(&mut state, "r", std::slice::from_ref(&job), 30);
+        collect(&mut state, "r", std::slice::from_ref(&job), 30, &|_| None);
         assert_eq!(state.pending.len(), 2);
         assert!(state.pending[1].ends_with("failed: quota"));
+    }
+
+    #[test]
+    fn a_finished_turn_is_told_by_the_workers_own_words() {
+        let mut state = DigestState::default();
+        let mut job = worker("w1", "r", BackgroundJobStatus::Idle, 1);
+        job.outcome.summary = Some("responding: done".into());
+        let reply =
+            |_: &BackgroundJobState| Some("\n  Fixed add(); 6 tests pass.\nDetails…".to_string());
+        collect(&mut state, "r", std::slice::from_ref(&job), 0, &reply);
+        assert_eq!(
+            state.pending,
+            ["- w1 \"task w1\" finished a turn: Fixed add(); 6 tests pass."]
+        );
     }
 
     #[test]
@@ -341,9 +382,9 @@ mod tests {
         let mut state = DigestState::default();
         let mine = worker("w1", "r", BackgroundJobStatus::Idle, 1);
         let other = worker("w2", "someone", BackgroundJobStatus::Idle, 1);
-        collect(&mut state, "r", &[mine.clone(), other], 0);
+        collect(&mut state, "r", &[mine.clone(), other], 0, &|_| None);
         assert_eq!(state.pending.len(), 1);
-        collect(&mut state, "r2", &[mine], 5);
+        collect(&mut state, "r2", &[mine], 5, &|_| None);
         assert!(state.pending.is_empty(), "w1 is not r2's");
         assert_eq!(state.router_job_id.as_deref(), Some("r2"));
     }
