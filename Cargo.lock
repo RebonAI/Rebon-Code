@@ -5036,6 +5036,7 @@ dependencies = [
  "rebon-kernel",
  "rebon-tool",
  "rebon-tools-core",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

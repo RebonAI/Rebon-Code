@@ -941,6 +941,7 @@ impl UltraplanContext {
                         "Skill",
                         "CronCreate",
                         "CronDelete",
+                        "ScheduleWakeup",
                     ]
                     .into_iter()
                     .map(str::to_string),
@@ -996,6 +997,7 @@ impl UltraplanContext {
                         "Skill",
                         "CronCreate",
                         "CronDelete",
+                        "ScheduleWakeup",
                         "Sleep",
                         "ToolSearch",
                         "InvokeDeferredTool",
@@ -1055,6 +1057,7 @@ impl UltraplanContext {
                 "Skill".into(),
                 "CronCreate".into(),
                 "CronDelete".into(),
+                "ScheduleWakeup".into(),
                 "ToolSearch".into(),
                 "InvokeDeferredTool".into(),
                 "WebSearch".into(),
@@ -1108,6 +1111,7 @@ impl UltraplanContext {
                 "Skill".into(),
                 "CronCreate".into(),
                 "CronDelete".into(),
+                "ScheduleWakeup".into(),
                 "ToolSearch".into(),
                 "InvokeDeferredTool".into(),
                 "WebSearch".into(),

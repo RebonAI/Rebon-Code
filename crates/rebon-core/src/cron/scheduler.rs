@@ -458,6 +458,11 @@ fn run_session_tick(
     let mut tasks = store.list();
     let mut next_fire = compute_session_next_fire_table(&tasks, now, &config.jitter);
     run_session_tick_inner(config, poller, store, &mut tasks, &mut next_fire, now);
+    // The agent's own wakeup: an exact second, no jitter — it chose the
+    // delay for what it is waiting on.
+    if let Some(wakeup) = store.take_due_wakeup(now) {
+        poller.enqueue(wakeup.prompt);
+    }
 }
 
 fn compute_session_next_fire_table(
@@ -644,6 +649,42 @@ mod tests {
                 recurring_max_age_ms: 0,
             },
         }
+    }
+
+    #[test]
+    fn a_session_tick_delivers_a_due_wakeup_once() {
+        let dir = tmp_project();
+        let cfg = test_config(&dir);
+        let poller = CronPoller::new();
+        let store = SessionCronStore::new();
+        store.set_wakeup("look at CI again", "CI takes ~5m", 1_000, 60_000);
+
+        run_session_tick(&cfg, &poller, &store, 60_999);
+        assert_eq!(poller.pending_len(), 0, "not due yet");
+        assert!(store.wakeup().is_some());
+
+        run_session_tick(&cfg, &poller, &store, 61_000);
+        assert_eq!(poller.pending_len(), 1, "due on its second");
+        assert!(store.wakeup().is_none(), "delivered wakeups disarm");
+
+        run_session_tick(&cfg, &poller, &store, 120_000);
+        assert_eq!(poller.pending_len(), 1, "and are delivered once");
+    }
+
+    #[test]
+    fn a_wakeup_and_a_due_cron_task_both_fire_on_one_tick() {
+        let dir = tmp_project();
+        let cfg = test_config(&dir);
+        let poller = CronPoller::new();
+        let store = SessionCronStore::new();
+        // A one-shot pinned to the top of the hour after `created_at`.
+        store.add("0 * * * *", "cron prompt", false, 0, None);
+        store.set_wakeup("wakeup prompt", "why", 0, 1_000);
+
+        run_session_tick(&cfg, &poller, &store, 24 * 60 * 60 * 1000);
+        assert_eq!(poller.pending_len(), 2);
+        assert!(store.list().is_empty());
+        assert!(store.wakeup().is_none());
     }
 
     #[test]

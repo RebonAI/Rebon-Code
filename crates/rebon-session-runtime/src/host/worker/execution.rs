@@ -2431,11 +2431,32 @@ async fn wait_for_first_prompt_on_warm_session(
             .process
             .completed_at_ms
             .unwrap_or(current.process.updated_at_ms);
-        if now_ms() >= current.linger_deadline_ms(idle_since) {
+        let schedule = Some((
+            session.engine_half.cron_poller.as_ref(),
+            session.engine_half.session_cron_store.as_ref(),
+        ));
+        if !idle_worker_stays(now_ms(), current.linger_deadline_ms(idle_since), schedule) {
             tracing::info!(%job_id, "rebon: worker leaving linger — nobody asked for it in time");
             return Ok(WarmSessionWait::Ended);
         }
     }
+}
+
+/// Whether an idle worker stays at `now`. Its linger is one reason; the
+/// session's own schedule is the other: an armed wakeup, which only a living
+/// worker can deliver, or a fired prompt the next pass has yet to queue — the
+/// scheduler moves a due wakeup into the poller on its own tick.
+///
+/// A wakeup is armed at most `MAX_WAKEUP_DELAY_SECONDS` ahead and fires once,
+/// so it holds the worker for a bounded time: a loop that stops re-arming
+/// lets it go.
+fn idle_worker_stays(
+    now_ms: u64,
+    linger_deadline_ms: u64,
+    schedule: Option<(&rebon_core::cron::CronPoller, &rebon_tool::SessionCronStore)>,
+) -> bool {
+    now_ms < linger_deadline_ms
+        || schedule.is_some_and(|(poller, store)| poller.has_pending() || store.wakeup().is_some())
 }
 
 /// Queue what the session's cron fired while no turn was running, as scheduled
@@ -2540,7 +2561,11 @@ pub(crate) async fn wait_for_terminal_worker_reuse(
         // A client holding a lease is watching this session, so the worker is
         // not idle in the sense that matters — it is standing by for someone.
         // The clock only starts once the last lease stops being renewed.
-        if now_ms() >= state.linger_deadline_ms(idle_since) {
+        let schedule = handed_back
+            .cron
+            .as_ref()
+            .map(|cron| (cron.poller.as_ref(), cron.session_store.as_ref()));
+        if !idle_worker_stays(now_ms(), state.linger_deadline_ms(idle_since), schedule) {
             tracing::info!(%job_id, "rebon: worker leaving linger — nobody asked for it in time");
             return Ok(false);
         }
@@ -2702,6 +2727,48 @@ fn apply_background_ceo_command(session: &mut crate::EngineSession, prompt: &mut
 mod tests {
     use super::*;
     use crate::host::BackgroundRuntimeFields;
+
+    #[test]
+    fn an_idle_worker_leaves_at_its_linger_deadline_with_nothing_scheduled() {
+        let poller = rebon_core::cron::CronPoller::new();
+        let store = rebon_tool::SessionCronStore::new();
+        let schedule = Some((poller.as_ref(), store.as_ref()));
+        assert!(idle_worker_stays(999, 1_000, schedule));
+        assert!(!idle_worker_stays(1_000, 1_000, schedule));
+        assert!(!idle_worker_stays(1_000, 1_000, None));
+        // A cron task alone does not hold it: those are minutes-to-days
+        // away, and the worker's linger is the policy for them.
+        store.add("*/5 * * * *", "poll", true, 0, None);
+        assert!(!idle_worker_stays(1_000, 1_000, schedule));
+    }
+
+    #[test]
+    fn an_armed_wakeup_holds_an_idle_worker_past_its_linger() {
+        let poller = rebon_core::cron::CronPoller::new();
+        let store = rebon_tool::SessionCronStore::new();
+        let schedule = Some((poller.as_ref(), store.as_ref()));
+        store.set_wakeup("next iteration", "CI", 0, 600_000);
+        assert!(idle_worker_stays(5_000, 1_000, schedule));
+
+        // Disarmed (`stop`), the worker goes at its deadline again.
+        store.clear_wakeup();
+        assert!(!idle_worker_stays(5_000, 1_000, schedule));
+    }
+
+    #[test]
+    fn a_fired_wakeup_not_yet_queued_holds_an_idle_worker() {
+        // The scheduler's tick took the wakeup out of its slot and into the
+        // poller after this pass queued fires: leaving now would drop it.
+        let poller = rebon_core::cron::CronPoller::new();
+        let store = rebon_tool::SessionCronStore::new();
+        store.set_wakeup("next iteration", "CI", 0, 1);
+        let wakeup = store.take_due_wakeup(10).expect("due");
+        poller.enqueue(wakeup.prompt);
+        let schedule = Some((poller.as_ref(), store.as_ref()));
+        assert!(idle_worker_stays(5_000, 1_000, schedule));
+        poller.take_prompts();
+        assert!(!idle_worker_stays(5_000, 1_000, schedule));
+    }
 
     fn runtime() -> BackgroundRuntimeFields {
         BackgroundRuntimeFields {

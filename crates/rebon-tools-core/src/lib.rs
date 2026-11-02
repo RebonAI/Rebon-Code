@@ -764,6 +764,7 @@ pub fn primary_display_params(tool_name: &str) -> Option<&'static [&'static str]
         "TodoWrite" => Some(&[]),
         "SendMessage" => Some(&["to", "summary"]),
         "Sleep" => Some(&["duration_ms"]),
+        "ScheduleWakeup" => Some(&["delaySeconds", "reason"]),
         "EscalateQuestion" => Some(&["question"]),
         "ResolveEscalation" => Some(&["agent_id", "answer"]),
         _ => None,

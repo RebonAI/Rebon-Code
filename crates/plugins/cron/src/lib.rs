@@ -1,14 +1,14 @@
-//! `cron`: the feature plugin that puts the three scheduled-prompt tools on
+//! `cron`: the feature plugin that puts the four scheduled-prompt tools on
 //! the process tool seat.
 //!
-//! `CronCreate` / `CronList` / `CronDelete` are the model's face on the
-//! scheduler. The arithmetic and the on-disk task list they operate over
+//! `CronCreate` / `CronList` / `CronDelete` / `ScheduleWakeup` are the
+//! model's face on the scheduler. The arithmetic and the on-disk task list they operate over
 //! (`rebon_tool::cron`) live in `rebon-tool`, because `rebon-core`'s tick
 //! loop and the desktop app read the same store. Only the tools are this
 //! plugin's.
 //!
 //! Turning the plugin off (`plugins.cron.enabled = false`, or the legacy
-//! `REBON_DISABLE_CRON`) disposes this context, which takes the three tools
+//! `REBON_DISABLE_CRON`) disposes this context, which takes the four tools
 //! off the seat: the model stops seeing them at the next turn. Nothing else
 //! about the scheduler changes — an already-scheduled task still fires.
 
@@ -20,19 +20,21 @@ use rebon_kernel::{Context, KernelError, Plugin, PluginDef, PluginHost, PluginKi
 pub mod cron_create;
 pub mod cron_delete;
 pub mod cron_list;
+pub mod schedule_wakeup;
 
 pub use cron_create::{CronCreateTool, CRON_CREATE_TOOL_NAME};
 pub use cron_delete::{CronDeleteTool, CRON_DELETE_TOOL_NAME};
 pub use cron_list::{CronListTool, CRON_LIST_TOOL_NAME};
+pub use schedule_wakeup::{ScheduleWakeupTool, SCHEDULE_WAKEUP_TOOL_NAME};
 
 /// Stable id: the config key `plugins.cron.enabled` and the name in
 /// `/kernel plugins`.
 pub const PLUGIN_ID: &str = "cron";
 
-/// The provider id the three tools sit under on the seat.
+/// The provider id the four tools sit under on the seat.
 const PROVIDER_ID: &str = "cron";
 
-/// The three tools, in registration order.
+/// The four tools, in registration order.
 ///
 /// Public so a test that needs the whole builtin catalogue on a bare
 /// [`rebon_core::Engine`] can register them without standing up a kernel.
@@ -41,6 +43,7 @@ pub fn tools() -> Vec<Arc<dyn rebon_tool::Tool>> {
         Arc::new(CronCreateTool) as Arc<dyn rebon_tool::Tool>,
         Arc::new(CronListTool),
         Arc::new(CronDeleteTool),
+        Arc::new(ScheduleWakeupTool),
     ]
 }
 
@@ -64,7 +67,7 @@ fn make(_: &PluginHost) -> Result<Box<dyn Plugin>, KernelError> {
 /// This crate's one export to the binary's plugin table.
 pub static PLUGIN: PluginDef = PluginDef {
     id: PLUGIN_ID,
-    title: "Scheduled prompts (CronCreate, CronList, CronDelete)",
+    title: "Scheduled prompts (CronCreate, CronList, CronDelete, ScheduleWakeup)",
     kind: PluginKind::Feature,
     default_enabled: true,
     factory: make,
@@ -136,6 +139,7 @@ mod tests {
             CRON_CREATE_TOOL_NAME,
             CRON_LIST_TOOL_NAME,
             CRON_DELETE_TOOL_NAME,
+            SCHEDULE_WAKEUP_TOOL_NAME,
         ] {
             assert!(
                 seat.resolve(name, None).unwrap().is_some(),

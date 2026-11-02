@@ -343,6 +343,33 @@ mod tests {
         assert!(loop_skill.prompt_body.contains("immediately execute"));
     }
 
+    /// Without an interval the loop paces itself: it re-arms `ScheduleWakeup`
+    /// each iteration, stops it when done, and leaves waiting on its own
+    /// background work to the completion wake.
+    #[test]
+    fn loop_skill_self_paces_without_an_interval() {
+        let skills = built_in_skills();
+        let body = &skills
+            .iter()
+            .find(|s| s.name == "loop")
+            .unwrap()
+            .prompt_body;
+        for expected in [
+            "Without one, follow **Self-paced**",
+            "`ScheduleWakeup` with `stop: true`",
+            "ToolSearch` with query `select:ScheduleWakeup",
+            "do not schedule a wakeup; its completion wakes you",
+            "Continue the self-paced /loop: <the parsed prompt>",
+            "Immediately execute the parsed prompt once",
+        ] {
+            assert!(body.contains(expected), "missing {expected:?}");
+        }
+        assert!(
+            !body.contains("Default interval"),
+            "no interval no longer means 10 minutes"
+        );
+    }
+
     #[test]
     fn split_frontmatter_works() {
         let (yaml, body) = split_frontmatter("---\nname: test\n---\n# Body\n");

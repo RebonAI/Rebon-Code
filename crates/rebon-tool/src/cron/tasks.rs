@@ -100,9 +100,23 @@ impl From<&CronTask> for SessionCronTask {
     }
 }
 
+/// A turn the agent scheduled for itself (`ScheduleWakeup`): one prompt at
+/// one exact time, to the second. A session holds at most one — a self-paced
+/// loop re-arms it every turn, and arming again replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionWakeup {
+    pub id: String,
+    pub prompt: String,
+    /// Why this delay was chosen, in the agent's words; shown to the user.
+    pub reason: String,
+    pub created_at: i64,
+    pub fire_at: i64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionCronStore {
     tasks: Arc<Mutex<Vec<SessionCronTask>>>,
+    wakeup: Arc<Mutex<Option<SessionWakeup>>>,
 }
 
 impl SessionCronStore {
@@ -152,6 +166,53 @@ impl SessionCronStore {
         let before = tasks.len();
         tasks.retain(|task| !ids.iter().any(|id| id == &task.id));
         before - tasks.len()
+    }
+
+    /// Arm the session's wakeup to fire `delay_ms` after `now_ms`, replacing
+    /// any wakeup already armed. Returns the new one.
+    pub fn set_wakeup(
+        &self,
+        prompt: &str,
+        reason: &str,
+        now_ms: i64,
+        delay_ms: i64,
+    ) -> SessionWakeup {
+        let wakeup = SessionWakeup {
+            id: generate_task_id(),
+            prompt: prompt.to_string(),
+            reason: reason.to_string(),
+            created_at: now_ms,
+            fire_at: now_ms.saturating_add(delay_ms),
+        };
+        *self.wakeup.lock().expect("session wakeup slot poisoned") = Some(wakeup.clone());
+        wakeup
+    }
+
+    /// The armed wakeup, if any.
+    pub fn wakeup(&self) -> Option<SessionWakeup> {
+        self.wakeup
+            .lock()
+            .expect("session wakeup slot poisoned")
+            .clone()
+    }
+
+    /// Disarm the wakeup; returns the one that was armed.
+    pub fn clear_wakeup(&self) -> Option<SessionWakeup> {
+        self.wakeup
+            .lock()
+            .expect("session wakeup slot poisoned")
+            .take()
+    }
+
+    /// Take the wakeup if it is due at `now_ms`, disarming it, so it fires
+    /// exactly once.
+    pub fn take_due_wakeup(&self, now_ms: i64) -> Option<SessionWakeup> {
+        let mut slot = self.wakeup.lock().expect("session wakeup slot poisoned");
+        if slot.as_ref().is_some_and(|wakeup| now_ms >= wakeup.fire_at) {
+            slot.take()
+        } else {
+            None
+        }
     }
 
     pub fn mark_fired(&self, ids: &[String], fired_at_ms: i64) {
@@ -531,6 +592,67 @@ mod tests {
             .tempdir()
             .unwrap();
         dir
+    }
+
+    #[test]
+    fn a_wakeup_fires_once_at_its_second_and_not_before() {
+        let store = SessionCronStore::new();
+        assert!(store.wakeup().is_none());
+        let armed = store.set_wakeup("check CI", "CI takes ~5m", 1_000, 90_000);
+        assert_eq!(armed.fire_at, 91_000);
+        assert_eq!(store.wakeup(), Some(armed.clone()));
+
+        assert!(
+            store.take_due_wakeup(90_999).is_none(),
+            "a millisecond early"
+        );
+        assert_eq!(store.wakeup(), Some(armed.clone()), "not due stays armed");
+        assert_eq!(store.take_due_wakeup(91_000), Some(armed));
+        assert!(store.wakeup().is_none(), "firing disarms it");
+        assert!(
+            store.take_due_wakeup(200_000).is_none(),
+            "and it fires once"
+        );
+    }
+
+    #[test]
+    fn arming_a_wakeup_again_replaces_the_one_armed() {
+        let store = SessionCronStore::new();
+        let first = store.set_wakeup("first", "a", 0, 60_000);
+        let second = store.set_wakeup("second", "b", 10_000, 120_000);
+        assert_ne!(first.id, second.id);
+        assert_eq!(store.wakeup(), Some(second.clone()));
+        assert!(store.take_due_wakeup(60_000).is_none(), "the first is gone");
+        assert_eq!(store.take_due_wakeup(130_000), Some(second));
+    }
+
+    #[test]
+    fn clearing_a_wakeup_disarms_it_and_leaves_cron_tasks_alone() {
+        let store = SessionCronStore::new();
+        let task = store.add("*/5 * * * *", "poll", true, 0, None);
+        let armed = store.set_wakeup("later", "why", 0, 60_000);
+        assert_eq!(store.clear_wakeup(), Some(armed));
+        assert!(store.clear_wakeup().is_none());
+        assert!(store.take_due_wakeup(i64::MAX).is_none());
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(store.list()[0].id, task);
+    }
+
+    #[test]
+    fn a_wakeup_far_in_the_future_does_not_overflow() {
+        let store = SessionCronStore::new();
+        let armed = store.set_wakeup("x", "y", i64::MAX - 5, 60_000);
+        assert_eq!(armed.fire_at, i64::MAX);
+    }
+
+    #[test]
+    fn clones_of_a_store_share_one_wakeup_slot() {
+        // The scheduler and the tools hold the same `Arc`, and a worker's
+        // held cron hands out clones: they must all see one slot.
+        let store = SessionCronStore::new();
+        let clone = (*store).clone();
+        let armed = clone.set_wakeup("x", "y", 0, 1);
+        assert_eq!(store.wakeup(), Some(armed));
     }
 
     #[test]

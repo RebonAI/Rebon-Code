@@ -1,17 +1,17 @@
 //! Scheduled-prompt support — cron-driven runtime-state → model injection.
 //!
 //! Cron scheduling utilities for the `CronCreate` / `CronList` /
-//! `CronDelete` tools. This module holds everything that can live
-//! inside `rebon-tool` (i.e. doesn't need the attachment-poller contract):
+//! `CronDelete` / `ScheduleWakeup` tools. This module holds everything that
+//! can live inside `rebon-tool` (i.e. doesn't need the attachment-poller
+//! contract):
 //!
 //! - [`expr`] — 5-field cron parser and next-fire arithmetic.
-//! - [`tasks`] — data model, JSON IO under `<project>/.rebon/`, jitter, and
-//!   missed-task detection.
+//! - [`tasks`] — data model, JSON IO under `<project>/.rebon/`, jitter,
+//!   missed-task detection, and the session's one wakeup slot.
 //!
 //! The tick loop / owner lock / poller impl live with the attachment poller
-//! because they integrate with its contract. The three model-facing tools
-//! (`CronCreate`, `CronList`, `CronDelete`) live in `rebon-tool` alongside
-//! the other tool implementations.
+//! because they integrate with its contract. The four model-facing tools
+//! live in the `cron` feature plugin (`crates/plugins/cron`).
 
 pub mod expr;
 pub mod tasks;
@@ -23,7 +23,7 @@ pub use tasks::{
     add_cron_task, cron_dir, cron_file_path, find_missed_tasks, is_recurring_task_aged,
     jittered_next_cron_run_ms, list_all_cron_tasks, mark_cron_tasks_fired, next_cron_run_ms,
     now_ms, one_shot_jittered_next_cron_run_ms, read_cron_tasks, remove_cron_tasks,
-    write_cron_tasks, CronJitterConfig, CronTask, DEFAULT_CRON_JITTER_CONFIG,
+    write_cron_tasks, CronJitterConfig, CronTask, SessionWakeup, DEFAULT_CRON_JITTER_CONFIG,
 };
 
 /// Opening line of every user turn the scheduler injects instead of the user

@@ -234,6 +234,7 @@ fn stable_builtin_exposure_policy_projects_expected_eager_and_deferred_sets() {
         "CronCreate",
         "CronList",
         "CronDelete",
+        "ScheduleWakeup",
         "Sleep",
         "TeamCreate",
         "TeamDelete",

@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use rebon_tool::cron::expr::cron_to_human;
-use rebon_tool::cron::tasks::{cron_disabled, list_all_cron_tasks, SessionCronTask};
+use rebon_tool::cron::tasks::{cron_disabled, list_all_cron_tasks, now_ms, SessionCronTask};
 use rebon_tool::{Tool, ToolContext};
 use rebon_tools_core::{ToolError, ToolId, ToolInputSchema, ToolResult};
 use serde_json::{json, Value};
@@ -85,27 +85,45 @@ impl Tool for CronListTool {
             })
             .collect();
 
-        let content = if tasks.is_empty() {
+        let wakeup = context
+            .session_cron_store()
+            .and_then(|store| store.wakeup());
+        let mut lines: Vec<String> = tasks
+            .iter()
+            .map(|t| {
+                let human = cron_to_human(&t.cron);
+                let kind = if t.recurring { "recurring" } else { "one-shot" };
+                let durability = if t.durable { "durable" } else { "session-only" };
+                let prompt_preview = truncate(&t.prompt, 80);
+                format!(
+                    "{} — {} ({}, {}): {}",
+                    t.id, human, kind, durability, prompt_preview
+                )
+            })
+            .collect();
+        if let Some(wakeup) = &wakeup {
+            let in_seconds = (wakeup.fire_at - now_ms()).max(0) / 1000;
+            lines.push(format!(
+                "{} — wakeup in {in_seconds}s (ScheduleWakeup, session-only; {}): {}",
+                wakeup.id,
+                wakeup.reason,
+                truncate(&wakeup.prompt, 80)
+            ));
+        }
+        let content = if lines.is_empty() {
             "No scheduled jobs.".to_string()
         } else {
-            tasks
-                .iter()
-                .map(|t| {
-                    let human = cron_to_human(&t.cron);
-                    let kind = if t.recurring { "recurring" } else { "one-shot" };
-                    let durability = if t.durable { "durable" } else { "session-only" };
-                    let prompt_preview = truncate(&t.prompt, 80);
-                    format!(
-                        "{} — {} ({}, {}): {}",
-                        t.id, human, kind, durability, prompt_preview
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            lines.join("\n")
         };
 
         Ok(json!({
             "jobs": jobs,
+            "wakeup": wakeup.map(|wakeup| json!({
+                "id": wakeup.id,
+                "fireAt": wakeup.fire_at,
+                "prompt": wakeup.prompt,
+                "reason": wakeup.reason,
+            })),
             "content": content,
         }))
     }
@@ -169,6 +187,28 @@ mod tests {
         let dir = tmp_project();
         let out = CronListTool.call(json!({}), &ctx(&dir)).await.unwrap();
         assert_eq!(out["jobs"].as_array().unwrap().len(), 0);
+        assert_eq!(out["content"], json!("No scheduled jobs."));
+        assert!(out["wakeup"].is_null());
+    }
+
+    #[tokio::test]
+    async fn an_armed_wakeup_is_listed_beside_the_jobs_and_is_not_one() {
+        let dir = tmp_project();
+        let store = rebon_tool::SessionCronStore::new();
+        let wakeup = store.set_wakeup("check CI", "CI takes ~8m", now_ms(), 480_000);
+        let context = ctx(&dir).with_session_cron_store(store.clone());
+
+        let out = CronListTool.call(json!({}), &context).await.unwrap();
+        assert_eq!(out["jobs"].as_array().unwrap().len(), 0);
+        assert_eq!(out["wakeup"]["id"], json!(wakeup.id));
+        assert_eq!(out["wakeup"]["fireAt"], json!(wakeup.fire_at));
+        let content = out["content"].as_str().unwrap();
+        assert!(content.starts_with(&wakeup.id), "{content}");
+        assert!(content.contains("ScheduleWakeup"), "{content}");
+        assert!(content.contains("CI takes ~8m"), "{content}");
+
+        store.clear_wakeup();
+        let out = CronListTool.call(json!({}), &context).await.unwrap();
         assert_eq!(out["content"], json!("No scheduled jobs."));
     }
 
