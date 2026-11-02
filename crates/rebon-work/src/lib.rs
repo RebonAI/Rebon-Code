@@ -26,6 +26,12 @@
 //! decides. The router hears about a task once it is done, stuck or
 //! blocked; not each time a worker finishes a turn.
 //!
+//! Work done in a worktree of its own is kept: when such a task passes its
+//! check, the worktree is committed, and a task that depends on it alone
+//! continues in the same worktree, on top of that commit. One that depends
+//! on several checkouts, or on one another task is still using, starts from
+//! the project instead.
+//!
 //! Launching workers and reading jobs are the caller's ([`Hands`]). This
 //! crate names no session host.
 
@@ -152,6 +158,16 @@ pub struct Task {
     pub rework_rounds: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verdicts: Vec<TaskVerdict>,
+    /// The worktree its work is in, when it has one of its own or carries
+    /// on in another task's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// The commit its work was frozen at once it passed its check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_commit: Option<String>,
+    /// The task whose worktree it carries on in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_from: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     /// Why it stands where it does, when that needs saying: what it waits
@@ -269,6 +285,9 @@ impl NewTask {
             verifier_attempts: 0,
             rework_rounds: 0,
             verdicts: Vec::new(),
+            worktree: None,
+            worktree_commit: None,
+            inherited_from: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             note: None,
@@ -448,13 +467,20 @@ pub enum WorkerPhase {
 pub struct WorkerView {
     pub job_id: String,
     pub phase: WorkerPhase,
+    /// The worktree the job works in, when it has one.
+    pub worktree: Option<String>,
 }
 
 /// What a pass does to the world, injected so the rules can be tested
 /// without a session host.
 pub trait Hands {
-    /// Start a worker on a task; its job id, or why it could not start.
-    fn launch_worker(&mut self, task: &Task) -> Result<String, String>;
+    /// Start a worker on a task; its job id, or why it could not start. With
+    /// `worktree` the worker carries on in that worktree instead of the
+    /// project.
+    fn launch_worker(&mut self, task: &Task, worktree: Option<&str>) -> Result<String, String>;
+    /// Commit everything in `worktree` as the task's work. The commit, or
+    /// `None` when there was nothing to commit.
+    fn freeze(&mut self, task: &Task, worktree: &str) -> Result<Option<String>, String>;
     /// Start the acceptance check of a task whose worker says it finished.
     fn launch_verifier(&mut self, task: &Task) -> Result<String, String>;
     /// What a finished job last said.
@@ -573,6 +599,16 @@ fn follow(
     let Some(worker_id) = task.worker_job_id.clone() else {
         return;
     };
+    if let Some(worktree) = workers
+        .iter()
+        .find(|view| view.job_id == worker_id)
+        .and_then(|view| view.worktree.clone())
+    {
+        if task.worktree.as_deref() != Some(worktree.as_str()) {
+            task.worktree = Some(worktree);
+            outcome.changed = true;
+        }
+    }
     let worker = phase_of(workers, &worker_id);
     if worker == Some(WorkerPhase::Active) {
         if task.status != TaskStatus::Running {
@@ -678,7 +714,25 @@ fn follow_check(
     });
     task.verifier_job_id = None;
     if verdict.passed {
-        task.set(TaskStatus::Done, None, now_ms);
+        // Work in a worktree is kept as a commit, which the tasks after it
+        // carry on from.
+        let mut kept = String::new();
+        let mut note = None;
+        if let Some(worktree) = task.worktree.clone() {
+            match hands.freeze(task, &worktree) {
+                Ok(Some(commit)) => {
+                    kept = format!(" (committed {commit} in {worktree})");
+                    task.worktree_commit = Some(commit);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let why = format!("its work could not be committed: {error}");
+                    kept = format!(" ({why})");
+                    note = Some(why);
+                }
+            }
+        }
+        task.set(TaskStatus::Done, note, now_ms);
         outcome.changed = true;
         let evidence = if verdict.reason.is_empty() {
             String::new()
@@ -688,7 +742,7 @@ fn follow_check(
         notice(
             outcome,
             task,
-            format!("is done and passed its acceptance check{evidence}"),
+            format!("is done and passed its acceptance check{evidence}{kept}"),
         );
         return;
     }
@@ -738,6 +792,19 @@ fn dispatch_ready(
         .iter()
         .map(|(id, task)| (id.clone(), task.status))
         .collect();
+    let worktrees: BTreeMap<String, String> = ledger
+        .tasks
+        .iter()
+        .filter_map(|(id, task)| Some((id.clone(), task.worktree.clone()?)))
+        .collect();
+    // Worktrees a task is working in or being checked in: nobody else may
+    // carry on there meanwhile.
+    let mut busy: std::collections::BTreeSet<String> = ledger
+        .tasks
+        .values()
+        .filter(|task| matches!(task.status, TaskStatus::Running | TaskStatus::Verifying))
+        .filter_map(|task| task.worktree.clone())
+        .collect();
     let mut running = statuses
         .values()
         .filter(|status| matches!(status, TaskStatus::Running | TaskStatus::Verifying))
@@ -783,12 +850,34 @@ fn dispatch_ready(
         if running >= max_running {
             continue;
         }
-        match hands.launch_worker(task) {
+        // Carry on in the one worktree it depends on, when there is exactly
+        // one and nobody is using it.
+        let inherited: Vec<(&String, &String)> = task
+            .depends_on
+            .iter()
+            .filter_map(|dep| worktrees.get(dep).map(|worktree| (dep, worktree)))
+            .collect();
+        let carry_on = match inherited.as_slice() {
+            [(dep, worktree)] if !busy.contains(*worktree) => {
+                Some(((*dep).clone(), (*worktree).clone()))
+            }
+            _ => None,
+        };
+        match hands.launch_worker(
+            task,
+            carry_on.as_ref().map(|(_, worktree)| worktree.as_str()),
+        ) {
             Ok(job_id) => {
                 task.worker_job_id = Some(job_id.clone());
                 task.attempts += 1;
                 task.set(TaskStatus::Running, None, now_ms);
                 task.record(now_ms, format!("dispatched to {job_id}"));
+                if let Some((dep, worktree)) = carry_on {
+                    task.record(now_ms, format!("carries on in {dep}'s worktree {worktree}"));
+                    busy.insert(worktree.clone());
+                    task.worktree = Some(worktree);
+                    task.inherited_from = Some(dep);
+                }
                 running += 1;
                 outcome.changed = true;
             }
@@ -884,6 +973,7 @@ mod tests {
         WorkerView {
             job_id: id.into(),
             phase,
+            worktree: None,
         }
     }
 
@@ -896,15 +986,24 @@ mod tests {
         replies: BTreeMap<String, String>,
         reworked: Vec<(String, u32, String)>,
         fail_launch: Option<String>,
+        /// Where each worker was started to carry on, if anywhere.
+        carried_on: Vec<(String, Option<String>)>,
+        frozen: Vec<String>,
     }
 
     impl Hands for Fake {
-        fn launch_worker(&mut self, task: &Task) -> Result<String, String> {
+        fn launch_worker(&mut self, task: &Task, worktree: Option<&str>) -> Result<String, String> {
             if let Some(error) = &self.fail_launch {
                 return Err(error.clone());
             }
             self.launched.push(task.id.clone());
+            self.carried_on
+                .push((task.id.clone(), worktree.map(str::to_string)));
             Ok(format!("w-{}", task.id))
+        }
+        fn freeze(&mut self, task: &Task, worktree: &str) -> Result<Option<String>, String> {
+            self.frozen.push(format!("{}@{worktree}", task.id));
+            Ok(Some(format!("c0ffee{}", self.frozen.len())))
         }
         fn launch_verifier(&mut self, task: &Task) -> Result<String, String> {
             let id = format!("c-{}-{}", task.id, self.checks.len() + 1);
@@ -989,6 +1088,97 @@ mod tests {
             "is done and passed its acceptance check: tests pass"
         );
         assert!(has_open_tasks(&ledger));
+    }
+
+    /// Pass `task`'s check: its worker (in `worktree`) finished, then its
+    /// check said PASS.
+    fn pass_check(
+        ledger: &mut Ledger,
+        hands: &mut Fake,
+        task: &str,
+        worktree: Option<&str>,
+        now: u64,
+    ) {
+        let worker_id = format!("w-{task}");
+        let mut view = worker(&worker_id, WorkerPhase::Finished);
+        view.worktree = worktree.map(str::to_string);
+        // Every other task's worker is still at it.
+        let others = |ledger: &Ledger| -> Vec<WorkerView> {
+            ledger
+                .tasks
+                .values()
+                .filter(|other| other.status == TaskStatus::Running)
+                .filter_map(|other| other.worker_job_id.clone())
+                .filter(|id| *id != worker_id)
+                .map(|id| worker(&id, WorkerPhase::Active))
+                .collect()
+        };
+        let mut views = others(ledger);
+        views.push(view.clone());
+        run_pass(ledger, &views, now, 3, hands);
+        let check = hands.checks.last().unwrap().clone();
+        hands.replies.insert(check.clone(), "VERDICT: PASS".into());
+        let mut views = others(ledger);
+        views.extend([view, worker(&check, WorkerPhase::Finished)]);
+        run_pass(ledger, &views, now + 1, 3, hands);
+    }
+
+    #[test]
+    fn work_in_a_worktree_is_committed_and_carried_on_by_the_one_task_after_it() {
+        let mut ledger = Ledger::default();
+        plan(
+            &mut ledger,
+            vec![
+                new("a", &[]),
+                new("b", &["a"]),
+                new("c", &[]),
+                new("d", &["b", "c"]),
+            ],
+            1,
+        );
+        let mut hands = Fake::default();
+        run_pass(&mut ledger, &[], 2, 3, &mut hands);
+        assert_eq!(hands.launched, ["a", "c"]);
+        pass_check(&mut ledger, &mut hands, "a", Some("/wt/a"), 3);
+        assert_eq!(ledger.tasks["a"].status, TaskStatus::Done);
+        assert_eq!(
+            ledger.tasks["a"].worktree_commit.as_deref(),
+            Some("c0ffee1")
+        );
+        assert_eq!(hands.frozen, ["a@/wt/a"]);
+        // b depends on a alone: it carries on in a's worktree.
+        assert_eq!(
+            hands.carried_on.last().unwrap(),
+            &("b".to_string(), Some("/wt/a".to_string()))
+        );
+        assert_eq!(ledger.tasks["b"].inherited_from.as_deref(), Some("a"));
+
+        pass_check(&mut ledger, &mut hands, "b", Some("/wt/a"), 10);
+        pass_check(&mut ledger, &mut hands, "c", Some("/wt/c"), 20);
+        // d depends on two checkouts: it starts from the project.
+        assert_eq!(hands.carried_on.last().unwrap(), &("d".to_string(), None));
+        assert_eq!(hands.frozen, ["a@/wt/a", "b@/wt/a", "c@/wt/c"]);
+    }
+
+    #[test]
+    fn a_worktree_in_use_is_not_carried_on_in_by_a_second_task() {
+        let mut ledger = Ledger::default();
+        plan(
+            &mut ledger,
+            vec![new("a", &[]), new("b", &["a"]), new("c", &["a"])],
+            1,
+        );
+        let mut hands = Fake::default();
+        run_pass(&mut ledger, &[], 2, 3, &mut hands);
+        pass_check(&mut ledger, &mut hands, "a", Some("/wt/a"), 3);
+        let carried: Vec<_> = hands.carried_on[1..].to_vec();
+        assert_eq!(
+            carried,
+            [
+                ("b".to_string(), Some("/wt/a".to_string())),
+                ("c".to_string(), None)
+            ]
+        );
     }
 
     #[test]

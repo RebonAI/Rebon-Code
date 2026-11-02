@@ -91,6 +91,45 @@ impl WorkHost {
     }
 }
 
+/// Commit everything in `worktree` with `message`. The short commit, or
+/// `None` when nothing had changed. A repository without an identity of its
+/// own commits as Rebon.
+fn freeze_worktree(worktree: &std::path::Path, message: &str) -> Result<Option<String>, String> {
+    let git = |args: &[&str]| -> Result<std::process::Output, String> {
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(worktree).args(args);
+        command.stdin(std::process::Stdio::null());
+        command
+            .output()
+            .map_err(|error| format!("git {}: {error}", args.join(" ")))
+    };
+    let succeed = |output: std::process::Output, what: &str| -> Result<String, String> {
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            Err(format!(
+                "git {what} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    };
+    succeed(git(&["add", "-A"])?, "add")?;
+    let status = succeed(git(&["status", "--porcelain"])?, "status")?;
+    if status.is_empty() {
+        return Ok(None);
+    }
+    let has_identity = git(&["config", "user.email"])
+        .map(|output| output.status.success() && !output.stdout.trim_ascii().is_empty())
+        .unwrap_or(false);
+    let mut args = Vec::new();
+    if !has_identity {
+        args.extend(["-c", "user.name=Rebon", "-c", "user.email=rebon@localhost"]);
+    }
+    args.extend(["commit", "--no-verify", "-q", "-m", message]);
+    succeed(git(&args)?, "commit")?;
+    succeed(git(&["rev-parse", "--short", "HEAD"])?, "rev-parse").map(Some)
+}
+
 fn worker_view(job: &BackgroundJobState) -> WorkerView {
     let phase = match job.process.status {
         BackgroundJobStatus::Queued
@@ -116,6 +155,7 @@ fn worker_view(job: &BackgroundJobState) -> WorkerView {
     WorkerView {
         job_id: job.identity.job_id.clone(),
         phase,
+        worktree: job.workspace.worktree_path.clone(),
     }
 }
 
@@ -143,14 +183,28 @@ impl HostHands<'_> {
 }
 
 impl Hands for HostHands<'_> {
-    fn launch_worker(&mut self, task: &Task) -> Result<String, String> {
+    fn launch_worker(&mut self, task: &Task, worktree: Option<&str>) -> Result<String, String> {
         let router = self.router(task)?;
+        // Carrying on in a worktree means working there as it is, with the
+        // work before it committed; the worker is told whose it is.
+        let (project, isolate, brief) = match worktree {
+            Some(worktree) => (
+                worktree.to_string(),
+                false,
+                format!(
+                    "You carry on in the worktree {worktree}, where the work this task depends on \
+                     is already committed. Build on it; do not start over.\n\n{}",
+                    task.goal
+                ),
+            ),
+            None => (task.project.clone(), task.isolate, task.goal.clone()),
+        };
         let request = rebon_tool::WorkerDispatch {
-            project: task.project.clone(),
+            project,
             title: task.title.clone(),
-            brief: task.goal.clone(),
+            brief,
             done_when: task.done_when.clone(),
-            isolate: task.isolate,
+            isolate,
             model_profile: task.model_profile.clone(),
         };
         crate::session::worker_control::launch_worker(self.store, router, &request, Some(&task.id))
@@ -168,6 +222,13 @@ impl Hands for HostHands<'_> {
             .and_then(|worker| worker.workspace.worktree_path.clone())
             .unwrap_or_else(|| task.project.clone());
         crate::session::worker_control::launch_verifier(self.store, router, task, &cwd)
+    }
+
+    fn freeze(&mut self, task: &Task, worktree: &str) -> Result<Option<String>, String> {
+        freeze_worktree(
+            std::path::Path::new(worktree),
+            &format!("{}: {}", task.id, task.title),
+        )
     }
 
     fn last_reply(&mut self, job_id: &str) -> Option<String> {
@@ -234,6 +295,29 @@ mod tests {
         assert_eq!(notices[0].title, "Fix it");
         let saved = Ledger::load(&rebon_work::ledger_path(dir.path())).unwrap();
         assert_eq!(saved.tasks["t-1"].status, rebon_work::TaskStatus::Stuck);
+    }
+
+    #[test]
+    fn a_worktree_is_frozen_once_and_an_unchanged_one_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "{args:?}: {status:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "one").unwrap();
+        let first = freeze_worktree(repo, "t-1: first").unwrap();
+        assert!(first.is_some());
+        assert_eq!(freeze_worktree(repo, "t-1: again").unwrap(), None);
+        std::fs::write(repo.join("a.txt"), "two").unwrap();
+        let second = freeze_worktree(repo, "t-2: second").unwrap();
+        assert!(second.is_some() && second != first);
     }
 
     #[test]

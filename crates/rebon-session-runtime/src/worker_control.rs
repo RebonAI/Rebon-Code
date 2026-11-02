@@ -195,6 +195,27 @@ impl HostWorkerControl {
         if !task.depends_on.is_empty() {
             lines.push(format!("depends on: {}", task.depends_on.join(", ")));
         }
+        if let Some(worktree) = task.worktree.as_deref() {
+            let from = task
+                .inherited_from
+                .as_deref()
+                .map(|dep| format!(", carried on from {dep}"))
+                .unwrap_or_default();
+            let commit = task
+                .worktree_commit
+                .as_deref()
+                .map(|commit| format!(", committed as {commit}"))
+                .unwrap_or_default();
+            lines.push(format!("worktree: {worktree}{from}{commit}"));
+        }
+        if let Some(verdict) = task.verdicts.last() {
+            lines.push(format!(
+                "last acceptance check: {} — {} (round {} of rework)",
+                if verdict.passed { "PASS" } else { "FAIL" },
+                verdict.reason,
+                task.rework_rounds
+            ));
+        }
         if let Some(worker) = task.worker_job_id.as_deref() {
             lines.push(format!(
                 "worker: {worker} (Recall it for its last reply), attempts: {}",
