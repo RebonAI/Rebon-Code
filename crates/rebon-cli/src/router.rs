@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 use crate::background::{BackgroundLaunchOptions, BackgroundRuntimeFields};
 
 const RECORD_FILE_NAME: &str = "router.json";
+/// Where the supervisor publishes the router and its workers for the
+/// desktop app; see `crate::router_digest`.
+pub(crate) const ROSTER_FILE_NAME: &str = "router-roster.json";
 const ROUTER_NAME: &str = "Rebon Router";
 /// The permission mode the router and its workers run in: they act on their
 /// own, with the auto-mode classifier as the check instead of a person.
@@ -111,11 +114,22 @@ pub(crate) fn ensure_router(store: &BackgroundStore) -> anyhow::Result<(Backgrou
 
 /// Stop the router, leaving its workers running. The stopped job's id, if
 /// there was a router.
+///
+/// Stopping ends a turn in progress, but a router between turns is a job
+/// that already finished, and a stop leaves that as it is. So the record
+/// goes too, and that is what makes it no router. The roster goes with it,
+/// in case no supervisor is up to remove it.
 pub(crate) fn stop_router(store: &BackgroundStore) -> anyhow::Result<Option<String>> {
     let Some(mut job) = current_router(store) else {
         return Ok(None);
     };
     rebon_session_host::stop_background_job_in_store(store, &mut job)?;
+    for path in [record_path(store), store.root().join(ROSTER_FILE_NAME)] {
+        match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+    }
     Ok(Some(job.identity.job_id))
 }
 
@@ -197,5 +211,27 @@ mod tests {
         job.process.status = BackgroundJobStatus::Stopped;
         store.write_state(&job).unwrap();
         assert!(current_router(&store).is_none());
+    }
+
+    #[test]
+    fn stopping_a_router_between_turns_leaves_no_router() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BackgroundStore::new(dir.path());
+        let mut job = store
+            .create_job(
+                "/router".into(),
+                router_workspace(&store),
+                launch_options(&router_workspace(&store), None).runtime,
+            )
+            .unwrap();
+        job.process.status = BackgroundJobStatus::Succeeded;
+        store.write_state(&job).unwrap();
+        record_router_for_test(&store, &job.identity.job_id);
+        std::fs::write(store.root().join(ROSTER_FILE_NAME), "{}").unwrap();
+
+        assert_eq!(stop_router(&store).unwrap(), Some(job.identity.job_id));
+        assert!(current_router(&store).is_none());
+        assert!(!store.root().join(ROSTER_FILE_NAME).exists());
+        assert_eq!(stop_router(&store).unwrap(), None);
     }
 }
