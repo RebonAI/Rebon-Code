@@ -217,6 +217,7 @@ pub struct AppState {
     /// Inline-mode user-created sessions reuse the startup banner as the visible scrollback boundary.
     pub pending_inline_startup_banner: bool,
     pub pending_inline_banner_refresh: bool,
+    pub show_startup_release_notes: bool,
     /// Page transition requested after switching between Main and live agent views.
     /// Screen mode clears the viewport once; inline mode appends a page banner and
     /// the selected transcript after the existing terminal scrollback.
@@ -799,6 +800,7 @@ impl AppState {
             pending_inline_viewport_reset: false,
             pending_inline_startup_banner: false,
             pending_inline_banner_refresh: false,
+            show_startup_release_notes: false,
             pending_page_hard_refresh: None,
             pending_permission_view: None,
             command_expansion_tx: None,

@@ -445,6 +445,7 @@ pub fn run_blocking(
         session_ready = slot.is_ready(),
         "rebon startup: entering event loop"
     );
+    app.show_startup_release_notes = super::inline_banner::startup_release_notes_due();
     let mut inline_startup_banner_emitted = false;
     let startup_onboarding_present = app.onboarding_dialog.is_some();
     let mut result = (|| -> anyhow::Result<EventLoopOutcome> {

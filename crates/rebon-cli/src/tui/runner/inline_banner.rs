@@ -12,13 +12,43 @@ use crate::tui::app::AppState;
 use crate::tui::runner::inline_commit_cursor::insert_before_cjk_safe;
 use crate::tui::wiring::TuiEngineSession;
 
+const RELEASE_NOTES_VERSION_FILE: &str = "cli-release-notes-version";
+const RELEASE_NOTES: [&str; 4] = [
+    "DeepSeek 原生 Responses API",
+    "推理与工具调用兼容性改进",
+    "插件长对话自动精简旧图片",
+    "并行图片读取结果顺序修复",
+];
+
+pub(super) fn startup_release_notes_due() -> bool {
+    let path =
+        rebon_session::config_home::default_config_home_dir().join(RELEASE_NOTES_VERSION_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(version) => version.trim() != env!("CARGO_PKG_VERSION"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            tracing::warn!(%error, "无法读取 CLI Release Notes 展示记录");
+            true
+        }
+    }
+}
+
+fn record_startup_release_notes_shown() -> std::io::Result<()> {
+    let home = rebon_session::config_home::default_config_home_dir();
+    std::fs::create_dir_all(&home)?;
+    rebon_session::write_file_atomically(
+        &home.join(RELEASE_NOTES_VERSION_FILE),
+        env!("CARGO_PKG_VERSION").as_bytes(),
+    )
+}
+
 /// The startup banner for whatever the slot holds: the session's own once
 /// it is in, the preview's until then.
 pub(super) fn startup_banner_for_slot(
     slot: &super::SessionSlot,
     app: &AppState,
 ) -> InlineStartupBanner {
-    match slot.session() {
+    let mut banner = match slot.session() {
         Some(session) => InlineStartupBanner::from_session(
             session,
             app.coordinator_mode,
@@ -30,7 +60,9 @@ pub(super) fn startup_banner_for_slot(
             app.coordinator_mode,
             inline_banner_effort_display(app),
         ),
-    }
+    };
+    banner.show_release_notes = app.show_startup_release_notes;
+    banner
 }
 
 pub(super) fn inline_banner_effort_display(app: &AppState) -> String {
@@ -76,6 +108,7 @@ pub(super) struct InlineStartupBanner {
     pub(super) directory: String,
     pub(super) mode: String,
     pub(super) effort_display: String,
+    pub(super) show_release_notes: bool,
 }
 
 impl InlineStartupBanner {
@@ -100,6 +133,7 @@ impl InlineStartupBanner {
             directory: session.cwd.trim().to_string(),
             mode: inline_banner_mode_display(session_permission_mode(session), coordinator_mode),
             effort_display,
+            show_release_notes: false,
         }
     }
 
@@ -119,6 +153,7 @@ impl InlineStartupBanner {
             directory: preview.cwd.trim().to_string(),
             mode: inline_banner_mode_display(permission_mode, coordinator_mode),
             effort_display,
+            show_release_notes: false,
         }
     }
 
@@ -342,24 +377,30 @@ impl InlineStartupBanner {
         )
         .render(chunks[1], buf);
 
-        Paragraph::new(vec![
-            Line::from(Span::styled("Quick actions", heading_style)),
-            action_line("/ceo", "manager-lead agents", command_style, title_muted),
-            action_line(
-                "/ultrawork",
-                "workflow orchestration",
-                command_style,
-                title_muted,
-            ),
-            action_line(
-                "/ultraplan",
-                "parallel read+plan",
-                command_style,
-                title_muted,
-            ),
-            action_line("/goal", "loop until done", command_style, title_muted),
-        ])
-        .render(chunks[2], buf);
+        let actions = if self.show_release_notes {
+            std::iter::once(Line::from(Span::styled("Release Notes", heading_style)))
+                .chain(RELEASE_NOTES.map(|note| Line::from(Span::styled(note, readable_style))))
+                .collect()
+        } else {
+            vec![
+                Line::from(Span::styled("Quick actions", heading_style)),
+                action_line("/ceo", "manager-lead agents", command_style, title_muted),
+                action_line(
+                    "/ultrawork",
+                    "workflow orchestration",
+                    command_style,
+                    title_muted,
+                ),
+                action_line(
+                    "/ultraplan",
+                    "parallel read+plan",
+                    command_style,
+                    title_muted,
+                ),
+                action_line("/goal", "loop until done", command_style, title_muted),
+            ]
+        };
+        Paragraph::new(actions).render(chunks[2], buf);
     }
 }
 
@@ -666,6 +707,14 @@ pub(super) fn emit_inline_startup_banner_from<B: ratatui::backend::Backend>(
         };
         banner.render(area, buf);
     })?;
+    if banner.show_release_notes
+        && width >= InlineStartupBanner::MIN_FULL_WIDTH
+        && banner_height >= InlineStartupBanner::FULL_HEIGHT
+    {
+        if let Err(error) = record_startup_release_notes_shown() {
+            tracing::warn!(%error, "无法保存 CLI Release Notes 展示记录");
+        }
+    }
     Ok(())
 }
 pub(super) fn refresh_inline_startup_banner<B: ratatui::backend::Backend>(
@@ -687,10 +736,11 @@ mod tests {
         let area = buf.area;
         let mut out = String::new();
         for y in area.y..area.y.saturating_add(area.height) {
-            for x in area.x..area.x.saturating_add(area.width) {
-                if let Some(cell) = buf.cell((x, y)) {
-                    out.push_str(cell.symbol());
-                }
+            let mut x = area.x;
+            while x < area.x.saturating_add(area.width) {
+                let cell = &buf[(x, y)];
+                out.push_str(cell.symbol());
+                x += rebon_width::str_width(cell.symbol()).max(1) as u16;
             }
             out.push('\n');
         }
@@ -783,6 +833,7 @@ mod tests {
                 provider: "old-provider".into(),
                 model: "old-model".into(),
                 fast_mode: false,
+                show_release_notes: false,
                 directory: "project".into(),
                 mode: "normal".into(),
                 effort_display: String::new(),
@@ -845,6 +896,7 @@ mod tests {
             provider: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             fast_mode: false,
+            show_release_notes: false,
             directory: "D:\\own\\MyVault".to_string(),
             mode: "normal".to_string(),
             effort_display: "thinking xhigh".to_string(),
@@ -873,11 +925,117 @@ mod tests {
     }
 
     #[test]
+    fn startup_release_notes_are_shown_once_per_version_and_survive_refresh() {
+        let home = rebon_tool::tasks::test_support::TestConfigHome::new("startup-release-notes");
+        let slot = super::super::SessionSlot::ready(
+            crate::tui::runner::test_support::make_test_tui_session(),
+        );
+        for (previous_version, expected_notes) in [
+            (None, true),
+            (Some(env!("CARGO_PKG_VERSION")), false),
+            (Some("0.0.0"), true),
+        ] {
+            if let Some(version) = previous_version {
+                rebon_session::write_file_atomically(
+                    &home.path().join(RELEASE_NOTES_VERSION_FILE),
+                    version.as_bytes(),
+                )
+                .unwrap();
+            }
+            let mut app = AppState::new();
+            app.show_startup_release_notes = startup_release_notes_due();
+            assert_eq!(app.show_startup_release_notes, expected_notes);
+            let banner = startup_banner_for_slot(&slot, &app);
+            let mut terminal = ratatui::Terminal::with_options(
+                ratatui::backend::TestBackend::new(120, 24),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Inline(4),
+                },
+            )
+            .unwrap();
+            prepare_inline_viewport_for_startup_banner(&mut terminal).unwrap();
+            emit_inline_startup_banner_from(&mut terminal, &banner).unwrap();
+            let rendered = buffer_text(terminal.backend().buffer());
+            assert_eq!(
+                rendered.contains("Release Notes"),
+                expected_notes,
+                "{rendered}"
+            );
+            assert_eq!(
+                rendered.contains("Quick actions"),
+                !expected_notes,
+                "{rendered}"
+            );
+            if expected_notes {
+                for note in RELEASE_NOTES {
+                    assert!(rendered.contains(note), "{rendered}");
+                }
+                refresh_inline_startup_banner(&mut terminal, &startup_banner_for_slot(&slot, &app))
+                    .unwrap();
+                assert!(buffer_text(terminal.backend().buffer()).contains("Release Notes"));
+            }
+            assert!(!startup_release_notes_due());
+            assert_eq!(
+                std::fs::read_to_string(home.path().join(RELEASE_NOTES_VERSION_FILE)).unwrap(),
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+    }
+
+    #[test]
+    fn hidden_release_notes_are_not_marked_as_shown() {
+        let home = rebon_tool::tasks::test_support::TestConfigHome::new("hidden-release-notes");
+        let mut banner = InlineStartupBanner::from_session(
+            &crate::tui::runner::test_support::make_test_tui_session(),
+            false,
+            String::new(),
+        );
+        banner.show_release_notes = startup_release_notes_due();
+        for (width, height) in [(20, 24), (45, 24), (120, 6)] {
+            let mut terminal = ratatui::Terminal::with_options(
+                ratatui::backend::TestBackend::new(width, height),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Inline(1),
+                },
+            )
+            .unwrap();
+            emit_inline_startup_banner_from(&mut terminal, &banner).unwrap();
+            assert!(!buffer_text(terminal.backend().buffer()).contains("Release Notes"));
+            assert!(!home.path().join(RELEASE_NOTES_VERSION_FILE).exists());
+            assert!(startup_release_notes_due());
+        }
+    }
+
+    #[test]
+    fn release_notes_storage_failure_does_not_fail_banner_rendering() {
+        let home = rebon_tool::tasks::test_support::TestConfigHome::new("release-notes-storage");
+        std::fs::create_dir(home.path().join(RELEASE_NOTES_VERSION_FILE)).unwrap();
+        assert!(startup_release_notes_due());
+        let mut banner = InlineStartupBanner::from_session(
+            &crate::tui::runner::test_support::make_test_tui_session(),
+            false,
+            String::new(),
+        );
+        banner.show_release_notes = true;
+        let mut terminal = ratatui::Terminal::with_options(
+            ratatui::backend::TestBackend::new(120, 24),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Inline(4),
+            },
+        )
+        .unwrap();
+        emit_inline_startup_banner_from(&mut terminal, &banner).unwrap();
+        assert!(buffer_text(terminal.backend().buffer()).contains("Release Notes"));
+        assert!(startup_release_notes_due());
+    }
+
+    #[test]
     fn inline_startup_banner_full_layout_stays_left_aligned_when_limited() {
         let banner = InlineStartupBanner {
             provider: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             fast_mode: false,
+            show_release_notes: false,
             directory: "D:\\own\\MyVault".to_string(),
             mode: "normal".to_string(),
             effort_display: "thinking xhigh".to_string(),
@@ -908,6 +1066,7 @@ mod tests {
             provider: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             fast_mode: true,
+            show_release_notes: false,
             directory: "D:\\own\\MyVault".to_string(),
             mode: "normal".to_string(),
             effort_display: String::new(),
@@ -931,6 +1090,7 @@ mod tests {
             provider: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             fast_mode: false,
+            show_release_notes: false,
             directory: "D:\\own\\MyVault".to_string(),
             mode: "normal".to_string(),
             effort_display: String::new(),
@@ -978,6 +1138,7 @@ mod tests {
             provider: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             fast_mode: true,
+            show_release_notes: false,
             directory: "D:\\own\\MyVault".to_string(),
             mode: "normal".to_string(),
             effort_display: "thinking high".to_string(),
@@ -1050,12 +1211,14 @@ mod tests {
             provider: "openai".to_string(),
             model: "gpt-5.5".to_string(),
             fast_mode: false,
+            show_release_notes: false,
             directory: "D:\\own\\MyVault".to_string(),
             mode: "normal".to_string(),
             effort_display: String::new(),
         };
         let fast_on = InlineStartupBanner {
             fast_mode: true,
+            show_release_notes: false,
             ..fast_off.clone()
         };
         let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 45, 5));
