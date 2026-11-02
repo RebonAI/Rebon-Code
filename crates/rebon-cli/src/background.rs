@@ -79,11 +79,13 @@ pub(crate) fn run_background_supervisor() -> anyhow::Result<()> {
     };
     let automation = crate::automation_host::AutomationHost::new(store.root().to_path_buf());
     let autonomy = crate::autonomy::Autonomy::new(rebon_config::config_home_dir());
+    let digest = crate::router_digest::RouterDigest::new(&store);
     let automations = |store: &BackgroundStore, jobs: &[BackgroundJobState], now: u64| {
         // All run every tick, whatever the others answered.
         let recovering = autonomy.tick(store, jobs, now);
+        let digesting = digest.tick(store, jobs, now);
         let wakeups = crate::hosted_wakeups::deliver_hosted_wakeups(store, jobs, now)?;
-        Ok(automation.tick(store, jobs, now)? || wakeups || recovering)
+        Ok(automation.tick(store, jobs, now)? || wakeups || recovering || digesting)
     };
     let admit = |job: &BackgroundJobState, running_turns: usize, now: u64| {
         autonomy.admit(&store, job, running_turns, now)

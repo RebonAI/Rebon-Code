@@ -7,7 +7,11 @@
 //! of state worth hearing about — checks failed, changes requested, merged,
 //! closed — is queued into the subscribed job as a scheduled turn, which
 //! starts its worker if it has none. Only program-level filtering: no model
-//! decides here (that is the router's slow path, not built yet).
+//! decides here.
+//!
+//! A thread whose job is gone or was stopped has nobody to tell. With a
+//! router running it goes to the router instead, which decides who should
+//! own it now: that is the slow path. Without one it is dropped, as before.
 
 use rebon_automation::threads::{
     event_prompt, expire_threads, next_thread_to_check, observe_pr, subscribe_prs, take_delivery,
@@ -22,10 +26,12 @@ pub(crate) type ObservePr<'a> = dyn FnMut(&PrThread) -> anyhow::Result<PrSnapsho
 /// Queue `prompt` as `job_id`'s next turn.
 pub(crate) type DeliverToJob<'a> = dyn FnMut(&str, String) -> anyhow::Result<()> + 'a;
 
-/// One routing pass. `true` when `state` changed.
+/// One routing pass. `router` is the router's job, if one runs. `true` when
+/// `state` changed.
 pub(crate) fn route_pr_threads(
     state: &mut AutomationState,
     jobs: &[BackgroundJobState],
+    router: Option<&str>,
     now_ms: u64,
     observe: &mut ObservePr<'_>,
     deliver: &mut DeliverToJob<'_>,
@@ -42,11 +48,25 @@ pub(crate) fn route_pr_threads(
         return changed;
     };
     let thread = state.threads.get_mut(&key).expect("just picked");
-    let Some(job) = jobs.iter().find(|job| job.identity.job_id == thread.job_id) else {
-        // The job is gone: nobody is left to tell, so nothing is worth a look.
-        state.threads.remove(&key);
-        return true;
+    let owner = jobs.iter().find(|job| job.identity.job_id == thread.job_id);
+    let owner_stopped = owner.is_some_and(|job| job.process.status == BackgroundJobStatus::Stopped);
+    // A thread whose job is gone or stopped goes to the router, if one runs
+    // and it is not the router's own. It keeps its last look, so only what
+    // happens next is news.
+    let router = router.filter(|router| thread.job_id != *router);
+    let orphaned_from = match (owner, router) {
+        (Some(_), _) if !owner_stopped => None,
+        (_, Some(router)) => Some(std::mem::replace(&mut thread.job_id, router.to_string())),
+        // Gone, with nobody to decide: nothing is worth a look.
+        (None, None) => {
+            state.threads.remove(&key);
+            return true;
+        }
+        // Stopped, with nobody to decide: still subscribed, but it hears
+        // nothing, since the user stopped it.
+        (Some(_), None) => None,
     };
+    let deliverable = orphaned_from.is_some() || !owner_stopped;
     let snapshot = match observe(thread) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -59,9 +79,13 @@ pub(crate) fn route_pr_threads(
     let Some(event) = observe_pr(thread, snapshot, now_ms) else {
         return true;
     };
-    // A job the user stopped stays stopped, and hears nothing.
-    if job.process.status != BackgroundJobStatus::Stopped && take_delivery(thread, &event, now_ms) {
-        let prompt = event_prompt(thread, &event);
+    if deliverable && take_delivery(thread, &event, now_ms) {
+        let mut prompt = event_prompt(thread, &event);
+        if let Some(previous) = orphaned_from {
+            prompt = format!(
+                "[Its worker {previous} is gone or was stopped, so the thread is yours now. Hand it to a worker with SubscribeThread, or let it be.]\n{prompt}"
+            );
+        }
         if let Err(error) = deliver(&thread.job_id, prompt) {
             tracing::warn!(thread = %key, error = %format!("{error:#}"), "rebon: could not deliver a thread event");
         }
@@ -134,7 +158,7 @@ mod tests {
             delivered.push((job_id.to_string(), prompt));
             Ok(())
         };
-        route_pr_threads(state, jobs, now_ms, &mut observe, &mut deliver)
+        route_pr_threads(state, jobs, None, now_ms, &mut observe, &mut deliver)
     }
 
     #[test]
@@ -185,10 +209,11 @@ mod tests {
             Ok(snapshot(PrState::Open, 0))
         };
         let mut deliver = |_: &str, _: String| Ok(());
-        route_pr_threads(&mut state, &jobs, 0, &mut observe, &mut deliver);
+        route_pr_threads(&mut state, &jobs, None, 0, &mut observe, &mut deliver);
         route_pr_threads(
             &mut state,
             &jobs,
+            None,
             PR_CHECK_INTERVAL_MS - 1,
             &mut observe,
             &mut deliver,
@@ -196,6 +221,7 @@ mod tests {
         route_pr_threads(
             &mut state,
             &jobs,
+            None,
             PR_CHECK_INTERVAL_MS,
             &mut observe,
             &mut deliver,
@@ -297,6 +323,44 @@ mod tests {
     }
 
     #[test]
+    fn a_thread_whose_worker_is_gone_goes_to_the_router() {
+        let mut state = AutomationState::default();
+        let opener = [job("job-1", BackgroundJobStatus::Idle, Some(PR_URL))];
+        let mut delivered = Vec::new();
+        pass(
+            &mut state,
+            &opener,
+            0,
+            snapshot(PrState::Open, 0),
+            &mut delivered,
+        );
+        let mut stopped = opener.clone();
+        stopped[0].process.status = BackgroundJobStatus::Stopped;
+        let mut observe = |_: &PrThread| Ok(snapshot(PrState::Merged, 0));
+        let mut deliver = |job_id: &str, prompt: String| {
+            delivered.push((job_id.to_string(), prompt));
+            Ok(())
+        };
+        route_pr_threads(
+            &mut state,
+            &stopped,
+            Some("router-job"),
+            PR_CHECK_INTERVAL_MS,
+            &mut observe,
+            &mut deliver,
+        );
+        let [(job_id, prompt)] = delivered.as_slice() else {
+            panic!("one delivery: {delivered:?}")
+        };
+        assert_eq!(job_id, "router-job");
+        assert!(
+            prompt.contains("Its worker job-1 is gone or was stopped"),
+            "{prompt}"
+        );
+        assert!(state.threads.is_empty(), "merged ends it");
+    }
+
+    #[test]
     fn gh_failing_is_retried_next_interval_without_an_event() {
         let mut state = AutomationState::default();
         let jobs = [job("job-1", BackgroundJobStatus::Idle, Some(PR_URL))];
@@ -309,6 +373,7 @@ mod tests {
         assert!(route_pr_threads(
             &mut state,
             &jobs,
+            None,
             0,
             &mut observe,
             &mut deliver

@@ -34,6 +34,7 @@ pub(crate) use rebon_session_runtime::{
     task_notification_poller, ui_config,
 };
 mod router;
+mod router_digest;
 mod serve;
 mod session_agent_router;
 #[cfg(test)]

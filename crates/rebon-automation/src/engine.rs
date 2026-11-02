@@ -36,8 +36,11 @@ pub struct JobView {
 pub struct LaunchRequest {
     pub rule_id: String,
     pub prompt: String,
+    /// Empty for a router rule with no project.
     pub cwd: String,
     pub permission_mode: String,
+    /// Hand the prompt to the router instead of launching a session.
+    pub to_router: bool,
 }
 
 /// Start a session; the launched job's id, or why it could not start.
@@ -246,6 +249,12 @@ impl Pass<'_, '_> {
                     .map(|job| job.cwd.clone())
                     .filter(|cwd| !cwd.is_empty())
             });
+        let to_router = rule.target == crate::RuleTarget::Router;
+        let cwd = if to_router {
+            Some(cwd.unwrap_or_default())
+        } else {
+            cwd
+        };
         let Some(cwd) = cwd else {
             run.detail = "no project to run in".into();
             rule_state.stats.launch_failures += 1;
@@ -285,6 +294,7 @@ impl Pass<'_, '_> {
             prompt,
             cwd,
             permission_mode: rule.permission_mode.clone(),
+            to_router,
         };
         match (self.launch)(&request) {
             Ok(job_id) => {
@@ -300,16 +310,19 @@ impl Pass<'_, '_> {
         rule_state.record_run(run);
     }
 
-    /// The rule's last launch is still going.
+    /// The rule's last launch is still going. A router rule is never busy:
+    /// the router is always running something, and decides for itself.
     fn rule_busy(&self, rule: &AutomationRule) -> bool {
-        self.state
-            .rule(&rule.id)
-            .and_then(|state| state.latest_job_id())
-            .is_some_and(|job_id| {
-                self.jobs
-                    .iter()
-                    .any(|job| job.job_id == job_id && job.phase == JobPhase::Active)
-            })
+        rule.target == crate::RuleTarget::NewSession
+            && self
+                .state
+                .rule(&rule.id)
+                .and_then(|state| state.latest_job_id())
+                .is_some_and(|job_id| {
+                    self.jobs
+                        .iter()
+                        .any(|job| job.job_id == job_id && job.phase == JobPhase::Active)
+                })
     }
 }
 
@@ -367,6 +380,7 @@ mod tests {
             project_cwd: Some("/work/repo".into()),
             permission_mode: "auto".into(),
             enabled: true,
+            target: crate::RuleTarget::NewSession,
         }
     }
 

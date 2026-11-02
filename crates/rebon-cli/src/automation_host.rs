@@ -38,6 +38,8 @@ pub(crate) struct AutomationHost {
     state: RefCell<Option<AutomationState>>,
     /// Whether the last pass found a rule that needs the supervisor kept up.
     resident: Cell<bool>,
+    /// The router's job, looked up each tick: threads nobody owns go to it.
+    router_job: RefCell<Option<String>>,
 }
 
 impl AutomationHost {
@@ -47,6 +49,7 @@ impl AutomationHost {
             last_pass_ms: Cell::new(None),
             state: RefCell::new(None),
             resident: Cell::new(false),
+            router_job: RefCell::new(None),
         }
     }
 
@@ -60,6 +63,9 @@ impl AutomationHost {
         now_ms: u64,
     ) -> anyhow::Result<bool> {
         let mut launch = |request: &LaunchRequest| {
+            if request.to_router {
+                return hand_to_router(store, request, now_ms);
+            }
             crate::background::launch_background_prompt(store, launch_options(request))
                 .map(|job| job.identity.job_id)
                 .map_err(|error| format!("{error:#}"))
@@ -78,6 +84,8 @@ impl AutomationHost {
             rebon_session_host::append_background_scheduled_prompt(store, job_id, id, text)
                 .map(|_| ())
         };
+        *self.router_job.borrow_mut() =
+            crate::router::current_router(store).map(|router| router.identity.job_id);
         self.tick_with(jobs, now_ms, &mut launch, &mut observe, &mut deliver)
     }
 
@@ -134,8 +142,14 @@ impl AutomationHost {
             launch,
         );
         if rules.pr_follow_up {
-            changed |=
-                crate::thread_routing::route_pr_threads(state, jobs, now_ms, observe_pr, deliver);
+            changed |= crate::thread_routing::route_pr_threads(
+                state,
+                jobs,
+                self.router_job.borrow().as_deref(),
+                now_ms,
+                observe_pr,
+                deliver,
+            );
         }
         if changed {
             state.save(&state_path(&self.config_home))?;
@@ -147,6 +161,45 @@ impl AutomationHost {
             .set(rules.has_armed_time_rule() || watching_threads);
         Ok(self.resident.get())
     }
+}
+
+/// A router rule's firing: its prompt becomes the router's next turn, marked
+/// as the rule's. The run records the router's job.
+fn hand_to_router(
+    store: &BackgroundStore,
+    request: &LaunchRequest,
+    now_ms: u64,
+) -> Result<String, String> {
+    let router = crate::router::current_router(store)
+        .ok_or("no router is running; start one with `rebon router start`")?;
+    let rule: String = request
+        .rule_id
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect();
+    let id = format!("u-internal-scheduled-rule-{rule}-{now_ms}");
+    let project = if request.cwd.is_empty() {
+        String::new()
+    } else {
+        format!(" (project {})", request.cwd)
+    };
+    // The scheduler's marker must stay the opening line; the rule's header
+    // goes under it.
+    let unmarked = rebon_tool::cron::strip_scheduled_marker(&request.prompt);
+    let body = format!("[Rule {} fired{project}]\n{unmarked}", request.rule_id);
+    let text = if unmarked.len() == request.prompt.len() {
+        body
+    } else {
+        rebon_tool::cron::mark_scheduled_prompt(&body)
+    };
+    rebon_session_host::append_background_scheduled_prompt(
+        store,
+        &router.identity.job_id,
+        id,
+        text,
+    )
+    .map_err(|error| format!("{error:#}"))?;
+    Ok(router.identity.job_id)
 }
 
 /// A job as a rule sees it.
@@ -224,6 +277,49 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn a_router_rule_becomes_the_routers_next_turn_with_the_marker_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BackgroundStore::new(dir.path());
+        let request = LaunchRequest {
+            rule_id: "nightly review".into(),
+            prompt: rebon_tool::cron::mark_scheduled_prompt("Review open pull requests"),
+            cwd: String::new(),
+            permission_mode: "default".into(),
+            to_router: true,
+        };
+        let refused = hand_to_router(&store, &request, 1).unwrap_err();
+        assert!(refused.contains("no router is running"), "{refused}");
+
+        let mut router = store
+            .create_job(
+                "/router".into(),
+                PathBuf::from("."),
+                launch_options(&request).runtime,
+            )
+            .unwrap();
+        router.identity.session_id = Some("router-session".into());
+        router.process.status = BackgroundJobStatus::Idle;
+        store.write_state(&router).unwrap();
+        crate::router::record_router_for_test(&store, &router.identity.job_id);
+
+        assert_eq!(
+            hand_to_router(&store, &request, 2).unwrap(),
+            router.identity.job_id
+        );
+        let queued = store.read_state(&router.identity.job_id).unwrap();
+        assert_eq!(queued.process.status, BackgroundJobStatus::Queued);
+        let text = &queued.identity.pending_prompts[0].text;
+        assert!(
+            text.starts_with(rebon_tool::cron::SCHEDULED_PROMPT_MARKER),
+            "{text}"
+        );
+        assert!(
+            text.contains("[Rule nightly review fired]\nReview open pull requests"),
+            "{text}"
+        );
+    }
+
     fn interval_rule(id: &str) -> AutomationRule {
         AutomationRule {
             id: id.into(),
@@ -233,6 +329,7 @@ mod tests {
             project_cwd: Some("/work/repo".into()),
             permission_mode: "default".into(),
             enabled: true,
+            target: rebon_automation::RuleTarget::NewSession,
         }
     }
 
@@ -422,6 +519,7 @@ mod tests {
                     prompt: "p".into(),
                     cwd: "/work/repo".into(),
                     permission_mode: "default".into(),
+                    to_router: false,
                 })
                 .runtime,
             )
@@ -505,6 +603,7 @@ mod tests {
             prompt: marked.clone(),
             cwd: "/work/repo".into(),
             permission_mode: "auto".into(),
+            to_router: false,
         });
         assert_eq!(options.prompt, marked, "the model still sees the marker");
         assert_eq!(options.name.as_deref(), Some("review deps"));
@@ -517,6 +616,7 @@ mod tests {
             prompt: "review deps".into(),
             cwd: "/w".into(),
             permission_mode: "default".into(),
+            to_router: false,
         });
         assert_eq!(manual.name, None, "an unmarked prompt names itself");
         assert_eq!(

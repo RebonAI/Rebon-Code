@@ -146,6 +146,15 @@ pub(crate) fn describe_router(store: &BackgroundStore) -> String {
     )
 }
 
+/// Record `job_id` as the router, for tests elsewhere that need one.
+#[cfg(test)]
+pub(crate) fn record_router_for_test(store: &BackgroundStore, job_id: &str) {
+    let record = RouterRecord {
+        job_id: job_id.to_string(),
+    };
+    std::fs::write(record_path(store), serde_json::to_vec(&record).unwrap()).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

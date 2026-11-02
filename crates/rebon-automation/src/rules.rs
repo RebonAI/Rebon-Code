@@ -51,6 +51,29 @@ pub struct AutomationRule {
     pub permission_mode: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Where a firing goes: a new session, or the router. Left out of the
+    /// file for a new session, so a file without it means what it always
+    /// did.
+    #[serde(default, skip_serializing_if = "RuleTarget::is_new_session")]
+    pub target: RuleTarget,
+}
+
+/// Where a fired rule's prompt goes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleTarget {
+    /// Launch a new background session with it.
+    #[default]
+    NewSession,
+    /// Hand it to the router, which decides what to do: the project is then
+    /// optional, and a firing never waits for the last one to finish.
+    Router,
+}
+
+impl RuleTarget {
+    pub fn is_new_session(&self) -> bool {
+        *self == Self::NewSession
+    }
 }
 
 /// The whole rules file.
@@ -156,6 +179,7 @@ mod tests {
             project_cwd: Some("/repo".into()),
             permission_mode: "default".into(),
             enabled: true,
+            target: RuleTarget::NewSession,
         }
     }
 

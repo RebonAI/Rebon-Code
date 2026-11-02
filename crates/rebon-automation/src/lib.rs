@@ -30,7 +30,9 @@ pub use prompt::{render_prompt, PromptContext, TEMPLATE_VARS};
 pub use requests::{
     has_run_requests, request_run, requests_dir, take_run_requests, RunRequest, REQUESTS_DIR_NAME,
 };
-pub use rules::{rules_path, AutomationRule, AutomationRules, RULES_FILE_NAME, RULES_VERSION};
+pub use rules::{
+    rules_path, AutomationRule, AutomationRules, RuleTarget, RULES_FILE_NAME, RULES_VERSION,
+};
 pub use schedule::{local_stamp, LocalStamp};
 pub use state::{
     state_path, AutomationRun, AutomationState, RuleState, RuleStats, MAX_RUNS_KEPT,
