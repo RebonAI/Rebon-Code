@@ -158,12 +158,28 @@ pub fn coordinator_session_filter_for_queue(queue_session: bool) -> ToolFilter {
     }
 }
 
+/// Tools only the router session has. Every other session filter denies
+/// them; see `crate::router_mode`.
+pub const ROUTER_ONLY_TOOLS: &[&str] = &[
+    "DispatchWorker",
+    "ContinueWorker",
+    "StopWorker",
+    "SubscribeThread",
+    "Recall",
+];
+
 /// Filter for an Agent Queue supervisor outside CEO mode.
 ///
 /// Queue supervisors retain the ordinary coding tool set used to inspect
-/// worktrees, while CEO-only escalation tools remain unavailable.
+/// worktrees, while CEO-only escalation tools and the router's tools remain
+/// unavailable.
 pub fn queue_session_filter() -> ToolFilter {
-    ToolFilter::unrestricted().with_deny(COORDINATOR_MODE_ONLY_TOOLS.iter().copied())
+    ToolFilter::unrestricted().with_deny(
+        COORDINATOR_MODE_ONLY_TOOLS
+            .iter()
+            .copied()
+            .chain(ROUTER_ONLY_TOOLS.iter().copied()),
+    )
 }
 
 /// Filter for an ordinary non-queue, non-coordinator session.
@@ -172,7 +188,8 @@ pub fn normal_session_filter() -> ToolFilter {
         QUEUE_SESSION_TOOLS
             .iter()
             .copied()
-            .chain(COORDINATOR_MODE_ONLY_TOOLS.iter().copied()),
+            .chain(COORDINATOR_MODE_ONLY_TOOLS.iter().copied())
+            .chain(ROUTER_ONLY_TOOLS.iter().copied()),
     )
 }
 

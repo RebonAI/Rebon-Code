@@ -19,6 +19,7 @@ rebon-acp.workspace = true
 rebon-acp-client.workspace = true
 rebon-agent-core.workspace = true
 rebon-api.workspace = true
+rebon-automation.workspace = true
 rebon-config.workspace = true
 rebon-dialog.workspace = true
 rebon-core.workspace = true

@@ -77,6 +77,7 @@ pub mod ultraplan_preflight;
 pub mod ultraplan_review;
 pub mod ultraplan_run;
 pub mod usage;
+pub mod worker_control;
 pub mod workflow_review;
 
 use std::sync::Arc;

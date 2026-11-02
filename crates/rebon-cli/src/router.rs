@@ -48,19 +48,12 @@ pub(crate) fn current_router(store: &BackgroundStore) -> Option<BackgroundJobSta
 /// The light model the router runs: the active provider's `fast` profile,
 /// else its `small` one. `None` leaves the router on the default model.
 fn router_model() -> Option<String> {
-    let provider = rebon_config::get_active_custom_provider_name()?;
-    let profiles = rebon_config::custom_provider_profiles(&provider).ok()?;
     [
         rebon_types::MODEL_PROFILE_FAST,
         rebon_types::MODEL_PROFILE_SMALL,
     ]
     .into_iter()
-    .find_map(|role| {
-        profiles
-            .iter()
-            .find(|entry| entry.role == role)
-            .and_then(|entry| entry.model.clone())
-    })
+    .find_map(rebon_config::active_provider_profile_model)
 }
 
 fn launch_options(workspace: &Path, model: Option<String>) -> BackgroundLaunchOptions {

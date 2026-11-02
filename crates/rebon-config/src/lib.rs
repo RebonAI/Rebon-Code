@@ -4887,6 +4887,17 @@ pub fn custom_provider_profiles_in(
         .collect())
 }
 
+/// The model the active provider pins to the profile `role`, if it pins one.
+/// `None` when no provider is active or the role follows the session's model.
+pub fn active_provider_profile_model(role: &str) -> Option<String> {
+    let provider = get_active_custom_provider_name()?;
+    custom_provider_profiles(&provider)
+        .ok()?
+        .into_iter()
+        .find(|entry| entry.role == role)
+        .and_then(|entry| entry.model)
+}
+
 /// Pin one profile role to a model, or clear it so the role follows the
 /// session's model.
 ///

@@ -431,6 +431,8 @@ pub struct EngineQueryExecutor {
     /// surface that owns the session host; `None` on a surface with no peers.
     peer_messenger: Option<Arc<dyn rebon_tool::PeerMessenger>>,
     queue_controller: Option<Arc<dyn rebon_tool::QueueController>>,
+    /// How a router session's tools reach its workers.
+    worker_control: Option<Arc<dyn rebon_tool::WorkerControl>>,
     escalation_resolver: Option<rebon_tool::EscalationResolver>,
     policy_store: Option<crate::policy::PolicyStore>,
     policy_store_resolver: Option<crate::policy::PolicyStoreResolver>,
@@ -787,6 +789,7 @@ impl EngineQueryExecutor {
             task_runtime_controller: self.task_runtime_controller.clone(),
             peer_messenger: self.peer_messenger.clone(),
             queue_controller: self.queue_controller.clone(),
+            worker_control: self.worker_control.clone(),
             escalation_resolver: self.escalation_resolver.clone(),
             policy_store: self.policy_store.clone(),
             policy_store_resolver: self.policy_store_resolver.clone(),
@@ -845,6 +848,7 @@ impl EngineQueryExecutor {
             task_runtime_controller: self.task_runtime_controller.clone(),
             peer_messenger: self.peer_messenger.clone(),
             queue_controller: self.queue_controller.clone(),
+            worker_control: self.worker_control.clone(),
             escalation_resolver: self.escalation_resolver.clone(),
             policy_store: self.policy_store.clone(),
             policy_store_resolver: self.policy_store_resolver.clone(),
@@ -908,6 +912,7 @@ impl EngineQueryExecutor {
             task_runtime_controller: None,
             peer_messenger: None,
             queue_controller: None,
+            worker_control: None,
             escalation_resolver: None,
             policy_store: None,
             policy_store_resolver: None,
@@ -1334,6 +1339,12 @@ impl EngineQueryExecutor {
         self
     }
 
+    /// Attach the [`rebon_tool::WorkerControl`] a router session's tools use.
+    pub fn with_worker_control(mut self, control: Arc<dyn rebon_tool::WorkerControl>) -> Self {
+        self.worker_control = Some(control);
+        self
+    }
+
     pub fn with_escalation_resolver(mut self, resolver: rebon_tool::EscalationResolver) -> Self {
         self.escalation_resolver = Some(resolver);
         self
@@ -1507,6 +1518,9 @@ impl EngineQueryExecutor {
         }
         if let Some(controller) = &self.queue_controller {
             ctx = ctx.with_queue_controller(controller.clone());
+        }
+        if let Some(control) = &self.worker_control {
+            ctx = ctx.with_worker_control(control.clone());
         }
         if let Some(resolver) = &self.escalation_resolver {
             ctx = ctx.with_escalation_resolver(resolver.clone());

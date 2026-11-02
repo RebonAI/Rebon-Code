@@ -247,6 +247,188 @@ fn capitalize(text: &str) -> String {
     }
 }
 
+/// Where the router's requests to hand a thread to a worker wait for the
+/// supervisor, which is the only writer of the threads.
+pub const SUBSCRIPTION_REQUESTS_DIR_NAME: &str = "thread-requests";
+
+/// A request that `job_id` own the thread of `pr` from now on.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscriptionRequest {
+    pub pr: PrRef,
+    pub job_id: String,
+    /// Where `gh` runs for it: the subscriber's project.
+    pub cwd: String,
+    pub requested_at_ms: u64,
+}
+
+pub fn subscription_requests_dir(config_home: &std::path::Path) -> std::path::PathBuf {
+    config_home.join(SUBSCRIPTION_REQUESTS_DIR_NAME)
+}
+
+/// File a request for the supervisor's next pass.
+pub fn request_subscription(
+    config_home: &std::path::Path,
+    request: &SubscriptionRequest,
+) -> anyhow::Result<()> {
+    let dir = subscription_requests_dir(config_home);
+    std::fs::create_dir_all(&dir)?;
+    let name: String = request
+        .pr
+        .key()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect();
+    let path = dir.join(format!("{}-{name}.json", request.requested_at_ms));
+    rebon_session::write_file_atomically(&path, &serde_json::to_vec_pretty(request)?)?;
+    Ok(())
+}
+
+/// Take every pending request, oldest first, removing each so it applies
+/// once. One that cannot be read is dropped.
+pub fn take_subscription_requests(dir: &std::path::Path) -> Vec<SubscriptionRequest> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<_> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let request = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+            let _ = std::fs::remove_file(&path);
+            request
+        })
+        .collect()
+}
+
+/// Apply a request: the thread is the requested job's from now on. A thread
+/// already watched keeps its last look, so handing it over does not report
+/// its current state again as news. `true` when anything changed.
+pub fn apply_subscription(state: &mut AutomationState, request: &SubscriptionRequest) -> bool {
+    match state.threads.get_mut(&request.pr.key()) {
+        Some(thread) if thread.job_id == request.job_id && thread.cwd == request.cwd => false,
+        Some(thread) => {
+            thread.job_id = request.job_id.clone();
+            thread.cwd = request.cwd.clone();
+            thread.subscribed_at_ms = request.requested_at_ms;
+            thread.deliveries_ms.clear();
+            true
+        }
+        None => subscribe_prs(
+            state,
+            &request.job_id,
+            &request.cwd,
+            std::slice::from_ref(&request.pr),
+            request.requested_at_ms,
+        ),
+    }
+}
+
+/// The pull request a thread id names: `pr:owner/repo#12`, or a GitHub pull
+/// request URL.
+pub fn parse_thread_ref(text: &str) -> Option<PrRef> {
+    let text = text.trim();
+    if let Some(rest) = text
+        .strip_prefix("pr:")
+        .or_else(|| text.strip_prefix("PR:"))
+    {
+        let (path, number) = rest.split_once('#')?;
+        let (owner, repo) = path.split_once('/')?;
+        return pr_ref(owner, repo, number);
+    }
+    let rest = text
+        .strip_prefix("https://github.com/")
+        .or_else(|| text.strip_prefix("http://github.com/"))?;
+    let mut parts = rest.split('/');
+    let (owner, repo, kind, number) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    if kind != "pull" {
+        return None;
+    }
+    let number = number.split(['?', '#']).next()?;
+    pr_ref(owner, repo, number)
+}
+
+fn pr_ref(owner: &str, repo: &str, number: &str) -> Option<PrRef> {
+    let valid = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    };
+    let number: u64 = number.trim().parse().ok()?;
+    (valid(owner) && valid(repo) && number > 0).then(|| PrRef {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        number,
+        url: format!("https://github.com/{owner}/{repo}/pull/{number}"),
+    })
+}
+
+#[cfg(test)]
+mod subscription_request_tests {
+    use super::*;
+
+    #[test]
+    fn a_thread_id_or_a_url_names_a_pull_request() {
+        let pr = parse_thread_ref("pr:Acme/widgets#12").unwrap();
+        assert_eq!(pr.key(), "pr:acme/widgets#12");
+        assert_eq!(pr.url, "https://github.com/Acme/widgets/pull/12");
+        assert_eq!(
+            parse_thread_ref("https://github.com/acme/widgets/pull/12/files?x=1")
+                .unwrap()
+                .key(),
+            "pr:acme/widgets#12"
+        );
+        for bad in [
+            "pr:acme#12",
+            "pr:acme/widgets#x",
+            "https://github.com/acme/widgets/issues/3",
+            "12",
+        ] {
+            assert!(parse_thread_ref(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_request_hands_a_thread_over_without_reporting_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let pr = parse_thread_ref("pr:acme/widgets#12").unwrap();
+        let mut state = AutomationState::default();
+        subscribe_prs(&mut state, "opener", "/p", std::slice::from_ref(&pr), 1);
+        let last = PrSnapshot {
+            state: PrState::Open,
+            checks_failed: 1,
+            checks_pending: 0,
+            changes_requested: false,
+            checks_summary: None,
+        };
+        state.threads.get_mut(&pr.key()).unwrap().last = Some(last.clone());
+
+        let request = SubscriptionRequest {
+            pr: pr.clone(),
+            job_id: "fixer".into(),
+            cwd: "/wt".into(),
+            requested_at_ms: 5,
+        };
+        request_subscription(dir.path(), &request).unwrap();
+        let taken = take_subscription_requests(&subscription_requests_dir(dir.path()));
+        assert_eq!(taken, [request.clone()]);
+        assert!(take_subscription_requests(&subscription_requests_dir(dir.path())).is_empty());
+
+        assert!(apply_subscription(&mut state, &request));
+        let thread = &state.threads[&pr.key()];
+        assert_eq!(thread.job_id, "fixer");
+        assert_eq!(thread.cwd, "/wt");
+        assert_eq!(thread.last, Some(last));
+        assert!(!apply_subscription(&mut state, &request), "already theirs");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

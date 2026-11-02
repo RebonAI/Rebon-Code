@@ -116,7 +116,15 @@ impl AutomationHost {
             )?),
         };
         let views: Vec<JobView> = jobs.iter().map(job_view).collect();
-        let mut changed = run_pass(
+        // The router's hand-overs first, so this pass already routes to the
+        // new owner.
+        let mut changed = false;
+        for request in rebon_automation::threads::take_subscription_requests(
+            &rebon_automation::threads::subscription_requests_dir(&self.config_home),
+        ) {
+            changed |= rebon_automation::threads::apply_subscription(state, &request);
+        }
+        changed |= run_pass(
             &rules,
             state,
             &views,

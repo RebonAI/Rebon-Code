@@ -246,6 +246,7 @@ pub mod tool_search;
 pub mod ultraplan;
 pub mod validation;
 pub mod web;
+pub mod worker_control;
 pub mod workflow;
 pub mod worktree;
 pub mod write;
@@ -270,6 +271,7 @@ pub use plan_mode::PlanModeContext;
 pub use queue::QueueContext;
 pub use structured_output::StructuredOutputContext;
 pub use tasks::TaskContext;
+pub use worker_control::{DispatchedWorker, WorkerControl, WorkerControlContext, WorkerDispatch};
 pub use team_manager::TeamContext;
 pub use tool_search::ToolSearchContext;
 pub use ultraplan::UltraplanRunContext;
@@ -1490,6 +1492,22 @@ impl ToolContext {
     /// This session's own handle, when its owner published one.
     pub fn peer_handle(&self) -> Option<&str> {
         self.extension::<PeerContext>()?.handle.as_deref()
+    }
+
+    /// Attach the [`WorkerControl`] the router's tools dispatch and steer
+    /// workers through.
+    pub fn with_worker_control(mut self, control: Arc<dyn WorkerControl>) -> Self {
+        self.update_extension::<worker_control::WorkerControlContext>(|context| {
+            context.control = Some(control)
+        });
+        self
+    }
+
+    /// Borrow the attached worker control, if any.
+    pub fn worker_control(&self) -> Option<&Arc<dyn WorkerControl>> {
+        self.extension::<worker_control::WorkerControlContext>()?
+            .control
+            .as_ref()
     }
 
     /// Attach a [`QueueController`] so a queue coordinator session can read the

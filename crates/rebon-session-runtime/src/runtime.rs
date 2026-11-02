@@ -680,6 +680,12 @@ fn build_engine_core(inputs: EngineCoreInputs) -> EngineCore {
         .with_queue_controller(std::sync::Arc::new(
             crate::queue_controller::PublishedQueueController,
         ))
+        .with_worker_control(std::sync::Arc::new(
+            crate::worker_control::HostWorkerControl::new(
+                crate::host::cli_default_store(),
+                rebon_harness::projects_root(),
+            ),
+        ))
         .with_escalation_resolver(tasks.escalation_registry().resolver())
         .with_policy_store(live_policy_store)
         .with_shared_tool_filter(session_filter_handle)

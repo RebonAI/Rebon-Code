@@ -5727,6 +5727,7 @@ dependencies = [
  "rebon-acp-client",
  "rebon-agent-core",
  "rebon-api",
+ "rebon-automation",
  "rebon-config",
  "rebon-core",
  "rebon-dialog",
