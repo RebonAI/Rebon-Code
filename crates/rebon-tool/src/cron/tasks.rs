@@ -154,10 +154,16 @@ struct WakeupSlot {
     budget: Option<WakeupBudget>,
 }
 
+/// File name of a hosted job's wakeup, in its job directory.
+pub const WAKEUP_FILE_NAME: &str = "wakeup.json";
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionCronStore {
     tasks: Arc<Mutex<Vec<SessionCronTask>>>,
     wakeup: Arc<Mutex<WakeupSlot>>,
+    /// Where the wakeup slot is mirrored, for a session a background job
+    /// hosts; see [`Self::persist_wakeup_at`].
+    wakeup_file: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl SessionCronStore {
@@ -261,6 +267,7 @@ impl SessionCronStore {
         };
         slot.armed = Some(wakeup.clone());
         slot.budget = Some(budget);
+        self.mirror_wakeup(&slot);
         Ok(wakeup)
     }
 
@@ -285,7 +292,10 @@ impl SessionCronStore {
     /// End the loop: disarm the wakeup and drop its budget. Returns the
     /// wakeup that was armed.
     pub fn clear_wakeup(&self) -> Option<SessionWakeup> {
-        std::mem::take(&mut *self.wakeup.lock().expect("session wakeup slot poisoned")).armed
+        let mut slot = self.wakeup.lock().expect("session wakeup slot poisoned");
+        let cleared = std::mem::take(&mut *slot).armed;
+        self.mirror_wakeup(&slot);
+        cleared
     }
 
     /// Take the wakeup if it is due at `now_ms`, disarming it so it fires
@@ -302,7 +312,56 @@ impl SessionCronStore {
         if let Some(budget) = slot.budget.as_mut() {
             budget.fired = budget.fired.saturating_add(1);
         }
-        slot.armed.take()
+        let due = slot.armed.take();
+        self.mirror_wakeup(&slot);
+        due
+    }
+
+    /// Mirror the wakeup slot to `path` from now on, for a session a
+    /// background job hosts: the supervisor delivers it from there if the
+    /// job's worker is gone when it falls due ([`deliver_persisted_wakeup`]).
+    ///
+    /// A slot this store already holds — handed over from a terminal — is
+    /// written out; an empty one takes what the file holds, which is how a
+    /// worker started after the last one was reaped picks its loop back up.
+    pub fn persist_wakeup_at(&self, path: PathBuf) {
+        let mut slot = self.wakeup.lock().expect("session wakeup slot poisoned");
+        *self
+            .wakeup_file
+            .lock()
+            .expect("session wakeup file poisoned") = Some(path.clone());
+        if *slot == WakeupSlot::default() {
+            match read_wakeup_slot(&path) {
+                Ok(Some(persisted)) => *slot = persisted,
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    path = %path.display(),
+                    error = %format!("{error:#}"),
+                    "[Cron] ignoring an unreadable wakeup file"
+                ),
+            }
+        }
+        self.mirror_wakeup(&slot);
+    }
+
+    /// Write `slot` to the mirror file, if there is one; an empty slot
+    /// removes it. Called with the slot's lock held, so the file never
+    /// trails the slot.
+    fn mirror_wakeup(&self, slot: &WakeupSlot) {
+        let file = self
+            .wakeup_file
+            .lock()
+            .expect("session wakeup file poisoned");
+        let Some(path) = file.as_ref() else {
+            return;
+        };
+        if let Err(error) = write_wakeup_slot(path, slot) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %format!("{error:#}"),
+                "[Cron] could not mirror the session's wakeup"
+            );
+        }
     }
 
     pub fn mark_fired(&self, ids: &[String], fired_at_ms: i64) {
@@ -418,9 +477,81 @@ impl SessionCronStore {
         let wakeup = take_loop && schedule.wakeup.armed.is_some();
         if take_loop {
             *slot = schedule.wakeup;
+            self.mirror_wakeup(&slot);
         }
         Ok(HandedOff::Taken { tasks, wakeup })
     }
+}
+
+/// The wakeup slot a hosted job mirrored at `path`; `None` when there is
+/// no file.
+fn read_wakeup_slot(path: &Path) -> Result<Option<WakeupSlot>> {
+    match fs::read(path) {
+        Ok(raw) => serde_json::from_slice(&raw)
+            .map(Some)
+            .with_context(|| format!("{} is not a wakeup file", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn write_wakeup_slot(path: &Path, slot: &WakeupSlot) -> Result<()> {
+    if *slot == WakeupSlot::default() {
+        return remove_if_present(path);
+    }
+    let body = serde_json::to_vec(slot).context("serialize the wakeup")?;
+    rebon_session::write_private_file_atomically(path, &body)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// Deliver the wakeup a hosted job mirrored at `path` if it is due at
+/// `now_ms`: hand it to `queue`, which makes it the job's next turn, and
+/// only once that succeeded disarm it and count it against its loop's budget
+/// in the file, exactly as a live worker's own tick would. A `queue` that
+/// fails leaves the file as it was, so the next pass tries again.
+///
+/// Only for a job with no live worker — the supervisor's call. While the
+/// worker lives it writes the file and fires the wakeup itself; once it is
+/// gone the file has no other writer.
+pub fn deliver_persisted_wakeup(
+    path: &Path,
+    now_ms: i64,
+    queue: impl FnOnce(&SessionWakeup) -> Result<()>,
+) -> Result<Option<SessionWakeup>> {
+    let Some(slot) = read_wakeup_slot(path)? else {
+        return Ok(None);
+    };
+    let store = SessionCronStore {
+        wakeup: Arc::new(Mutex::new(slot)),
+        ..Default::default()
+    };
+    if !store
+        .wakeup()
+        .is_some_and(|wakeup| now_ms >= wakeup.fire_at)
+    {
+        return Ok(None);
+    }
+    let due = store.wakeup().expect("checked above");
+    queue(&due)?;
+    store
+        .take_due_wakeup(now_ms)
+        .expect("still due: nothing else holds this store");
+    let slot = store
+        .wakeup
+        .lock()
+        .expect("session wakeup slot poisoned")
+        .clone();
+    write_wakeup_slot(path, &slot)?;
+    Ok(Some(due))
+}
+
+/// Whether a wakeup is armed in the file a hosted job mirrored at `path`:
+/// one the supervisor may have to deliver, so it must stay up for it.
+pub fn persisted_wakeup_armed(path: &Path) -> bool {
+    read_wakeup_slot(path)
+        .ok()
+        .flatten()
+        .is_some_and(|slot| slot.armed.is_some())
 }
 
 fn remove_if_present(path: &Path) -> Result<()> {
@@ -919,6 +1050,158 @@ mod tests {
             }
         );
         assert!(new.arm_wakeup("x", "y", 3, 60_000, None).is_err());
+    }
+
+    fn wakeup_file(dir: &TempDir) -> PathBuf {
+        dir.path().join(WAKEUP_FILE_NAME)
+    }
+
+    #[test]
+    fn a_hosted_jobs_wakeup_is_mirrored_on_every_change() {
+        let dir = tmp_project();
+        let path = wakeup_file(&dir);
+        let store = SessionCronStore::new();
+        store.persist_wakeup_at(path.clone());
+        assert!(!path.exists(), "nothing armed, nothing written");
+
+        let armed = store
+            .arm_wakeup("next", "CI", 0, 60_000, budget(3_600_000, Some(3)))
+            .unwrap();
+        assert_eq!(read_wakeup_slot(&path).unwrap().unwrap().armed, Some(armed));
+
+        store.take_due_wakeup(60_000).expect("fires");
+        let after_fire = read_wakeup_slot(&path)
+            .unwrap()
+            .expect("the budget is still there");
+        assert_eq!(after_fire.armed, None);
+        assert_eq!(after_fire.budget.unwrap().fired, 1);
+
+        store.clear_wakeup();
+        assert!(!path.exists(), "stop ends the loop, file and all");
+    }
+
+    #[test]
+    fn a_new_worker_picks_the_loop_back_up_from_the_file() {
+        let dir = tmp_project();
+        let path = wakeup_file(&dir);
+        let reaped = SessionCronStore::new();
+        reaped.persist_wakeup_at(path.clone());
+        let armed = reaped
+            .arm_wakeup("next", "CI", 0, 600_000, budget(3_600_000, Some(5)))
+            .unwrap();
+
+        let next = SessionCronStore::new();
+        next.persist_wakeup_at(path.clone());
+        assert_eq!(next.wakeup(), Some(armed));
+        assert_eq!(next.wakeup_budget(), reaped.wakeup_budget());
+    }
+
+    #[test]
+    fn a_slot_handed_over_from_a_terminal_wins_over_the_file_and_is_written() {
+        let dir = tmp_project();
+        let path = wakeup_file(&dir);
+        std::fs::write(&path, b"{nope").unwrap();
+        let store = SessionCronStore::new();
+        let handed = store
+            .arm_wakeup("from terminal", "why", 0, 60_000, None)
+            .unwrap();
+        store.persist_wakeup_at(path.clone());
+        assert_eq!(store.wakeup(), Some(handed.clone()));
+        assert_eq!(
+            read_wakeup_slot(&path).unwrap().unwrap().armed,
+            Some(handed)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_wakeup_file_is_ignored_and_replaced() {
+        let dir = tmp_project();
+        let path = wakeup_file(&dir);
+        std::fs::write(&path, b"{nope").unwrap();
+        let store = SessionCronStore::new();
+        store.persist_wakeup_at(path.clone());
+        assert!(store.wakeup().is_none());
+        assert!(!path.exists(), "an empty slot is mirrored as no file");
+    }
+
+    #[test]
+    fn the_supervisor_delivers_a_due_wakeup_once_and_keeps_its_budget() {
+        let dir = tmp_project();
+        let path = wakeup_file(&dir);
+        let worker = SessionCronStore::new();
+        worker.persist_wakeup_at(path.clone());
+        let armed = worker
+            .arm_wakeup("next", "CI", 0, 60_000, budget(3_600_000, Some(2)))
+            .unwrap();
+        drop(worker); // reaped
+
+        assert!(persisted_wakeup_armed(&path));
+        assert_eq!(
+            deliver_persisted_wakeup(&path, 59_999, |_| Ok(())).unwrap(),
+            None,
+            "early"
+        );
+        assert_eq!(
+            deliver_persisted_wakeup(&path, 60_000, |_| Ok(())).unwrap(),
+            Some(armed)
+        );
+        assert_eq!(
+            deliver_persisted_wakeup(&path, 120_000, |_| Ok(())).unwrap(),
+            None,
+            "once"
+        );
+        assert!(
+            !persisted_wakeup_armed(&path),
+            "nothing left to hold the supervisor for"
+        );
+
+        // The worker it wakes inherits the spent wakeup.
+        let revived = SessionCronStore::new();
+        revived.persist_wakeup_at(path.clone());
+        assert_eq!(revived.wakeup_budget().unwrap().fired, 1);
+        revived.arm_wakeup("next", "CI", 1, 60_000, None).unwrap();
+        revived.take_due_wakeup(i64::MAX).unwrap();
+        assert_eq!(
+            revived.arm_wakeup("next", "CI", 2, 60_000, None),
+            Err(WakeupRefused::WakeupsSpent { fired: 2, max: 2 }),
+            "a reap cannot reset a loop's budget"
+        );
+    }
+
+    #[test]
+    fn delivering_with_no_file_or_a_bad_one() {
+        let dir = tmp_project();
+        let path = wakeup_file(&dir);
+        assert_eq!(
+            deliver_persisted_wakeup(&path, 0, |_| Ok(())).unwrap(),
+            None
+        );
+        std::fs::write(&path, b"{nope").unwrap();
+        assert!(deliver_persisted_wakeup(&path, 0, |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn a_wakeup_that_could_not_be_queued_stays_armed_for_the_next_pass() {
+        let dir = tmp_project();
+        let path = wakeup_file(&dir);
+        let worker = SessionCronStore::new();
+        worker.persist_wakeup_at(path.clone());
+        let armed = worker.arm_wakeup("next", "CI", 0, 1_000, None).unwrap();
+        let failed = deliver_persisted_wakeup(&path, 5_000, |_| Err(anyhow::anyhow!("job busy")));
+        assert!(failed.is_err());
+        assert!(persisted_wakeup_armed(&path), "nothing was spent");
+        assert_eq!(
+            deliver_persisted_wakeup(&path, 6_000, |_| Ok(())).unwrap(),
+            Some(armed)
+        );
+    }
+
+    #[test]
+    fn a_store_without_a_file_writes_nothing() {
+        let dir = tmp_project();
+        let store = SessionCronStore::new();
+        store.arm_wakeup("x", "y", 0, 60_000, None).unwrap();
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
     }
 
     #[test]

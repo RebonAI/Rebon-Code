@@ -18,6 +18,7 @@ mod exec;
 use background::RuntimeFieldsExt;
 mod file_scanner;
 mod goal;
+mod hosted_wakeups;
 mod kernel_cmd;
 mod oauth_drive;
 // The session runtime is a crate of its own, so these aliases keep every

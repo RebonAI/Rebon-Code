@@ -104,7 +104,8 @@ impl Tool for ScheduleWakeupTool {
          not re-arm it).\n\
          - The delay is clamped to [60, 3600] seconds; the result says what was used.\n\
          - Session-only, but it moves with the session when a terminal hands it to a \
-         hosted worker or takes it back.\n\
+         hosted worker or takes it back, and in a background session it still fires \
+         after the worker is reaped: the supervisor starts a new one for it.\n\
          \n\
          ## Budget\n\
          Each loop has a budget its re-arms inherit: `budgetSeconds` (how long the loop may \

@@ -59,7 +59,9 @@ pub(crate) use client::*;
 /// All this does is resolve what only the binary knows — its own store, its own
 /// executable — and lend the loop the three things that are the CLI's rather
 /// than the host's: the updater plugin's one-time Windows scheduler migration,
-/// the `gh`-backed pull-request status refresh, and the automation rules. The loop itself lives in
+/// the `gh`-backed pull-request status refresh, and the work scheduled for
+/// later — automation rules, and the wakeups of hosted sessions whose worker
+/// is gone. The loop itself lives in
 /// `rebon-session-host`, and this is the shape design §11 asks the
 /// hidden subcommands to end up in.
 pub(crate) fn run_background_supervisor() -> anyhow::Result<()> {
@@ -75,7 +77,9 @@ pub(crate) fn run_background_supervisor() -> anyhow::Result<()> {
     };
     let automation = crate::automation_host::AutomationHost::new(store.root().to_path_buf());
     let automations = |store: &BackgroundStore, jobs: &[BackgroundJobState], now: u64| {
-        automation.tick(store, jobs, now)
+        // Both run every tick, whatever the other answered.
+        let wakeups = crate::hosted_wakeups::deliver_hosted_wakeups(store, jobs, now)?;
+        Ok(automation.tick(store, jobs, now)? || wakeups)
     };
     rebon_session_host::run_background_supervisor_with_store(
         &store,

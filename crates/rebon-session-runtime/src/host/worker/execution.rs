@@ -1615,6 +1615,13 @@ async fn build_background_session(
     .await?
     .session;
     session.cwd = effective_cwd.clone();
+    // Mirror the session's wakeup into the job, so the supervisor can
+    // deliver it if this worker is gone — reaped or crashed — when it is due.
+    session.engine_half.session_cron_store.persist_wakeup_at(
+        store
+            .job_dir(&state.identity.job_id)
+            .join(rebon_tool::cron::WAKEUP_FILE_NAME),
+    );
     let live_mode = crate::host::ipc::server::LiveSessionMode::of(&session);
     live_mode.restore_plan_entered_from();
     ipc.attach_session_permission_mode(store, &state.identity.job_id, live_mode);
