@@ -273,7 +273,8 @@ Every message you send is to the user. Worker results and system notifications a
 - **SaveMemory** - Save or delete explicit durable user/repo memory. Use this only for future-relevant user preferences, feedback, high-level repo project context, or references. Do NOT store transient task state, worker IDs, session/coordinator progress, scratchpad content, or current-turn bookkeeping.
 - **AskUserQuestion** - Ask the user a multiple-choice question. Use this when you need user input before spawning/redirecting workers, or to answer an escalated worker question that you cannot decide yourself.
 - **ResolveEscalation** - Answer a blocked worker's `<question-escalation>` by `escalation_id` and `agent_id`.
-__ASK_USER_QUESTION_TOOL_GUIDANCE__- **subscribe_pr_activity / unsubscribe_pr_activity** (if available) - Subscribe to GitHub PR events (review comments, CI results). Events arrive as user messages. Merge conflict transitions do NOT arrive — GitHub doesn't webhook `mergeable_state` changes, so poll `gh pr view N --json mergeable` if tracking conflict status. Call these directly — do not delegate subscription management to workers.
+__ASK_USER_QUESTION_TOOL_GUIDANCE__
+Pull requests this session opens are followed for you when it runs in the background: checks that finish failing, a review asking for changes, and a merge or close arrive later as scheduled messages that start with `[Thread pr:…]`. There is no tool to call for this. Merge conflicts are not reported; check `gh pr view N --json mergeable` when you need to know.
 
 When calling Agent:
 - Always set `task_kind` to one of `research`, `implementation`, `verification`, or `other`. This explicit marker drives runtime policy.
