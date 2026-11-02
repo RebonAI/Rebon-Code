@@ -1,0 +1,21 @@
+[package]
+name = "rebon-automation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Automation rules — prompts that launch a new background session on a schedule or when another session finishes. The rule and run-state files, due-time arithmetic, prompt templates and the scheduling pass the background supervisor runs; launching and reading jobs are injected, so this crate names no session host."
+
+[dependencies]
+rebon-session.workspace = true
+rebon-tool.workspace = true
+
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

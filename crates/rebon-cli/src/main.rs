@@ -12,6 +12,7 @@
 //! * `rebon` (default) → local interactive TUI via [`tui::run`].
 
 mod acp;
+mod automation_host;
 mod background;
 mod exec;
 use background::RuntimeFieldsExt;

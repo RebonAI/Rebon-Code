@@ -4514,6 +4514,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rebon-automation"
+version = "1.25.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rebon-session",
+ "rebon-tool",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "rebon-boa-runner"
 version = "1.25.2"
 dependencies = [
@@ -4565,6 +4579,7 @@ dependencies = [
  "rebon-acp-client",
  "rebon-agent-core",
  "rebon-api",
+ "rebon-automation",
  "rebon-boa-runner",
  "rebon-bridge",
  "rebon-command-seat",

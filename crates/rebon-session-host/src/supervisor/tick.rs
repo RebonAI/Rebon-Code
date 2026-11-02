@@ -11,12 +11,12 @@ use crate::*;
 /// What the embedding binary lends the supervisor loop.
 ///
 /// Injected rather than called directly (reach for an outside capability
-/// through a callback). Both of these are the CLI's, not the
-/// host's: one runs a plugin, the other shells out to `gh`. A host crate that
-/// named either would be reaching across the layer it sits above, and a
-/// supervisor that could not run without them would be claiming they are part
-/// of supervising, which they are not — every hook is optional and the loop is
-/// complete without any of them.
+/// through a callback). All of these are the CLI's, not the
+/// host's: one runs a plugin, one shells out to `gh`, one runs automation
+/// rules. A host crate that named any of them would be reaching across the
+/// layer it sits above, and a supervisor that could not run without them
+/// would be claiming they are part of supervising, which they are not — every
+/// hook is optional and the loop is complete without any of them.
 #[derive(Default)]
 pub struct SupervisorHooks<'a> {
     /// A one-time migration run before the first tick. Today: the Windows
@@ -27,6 +27,12 @@ pub struct SupervisorHooks<'a> {
     /// client is watching. `Ok(true)` when a job record changed, so the loop
     /// re-reads them.
     pub refresh_pull_requests:
+        Option<&'a dyn Fn(&BackgroundStore, &[BackgroundJobState], u64) -> anyhow::Result<bool>>,
+    /// Work the binary schedules on its own — automation rules — given this
+    /// tick's jobs once they are reconciled. `Ok(true)` keeps the supervisor
+    /// running with no job to supervise: a rule on a clock needs a living
+    /// process to fire. An error is logged and keeps nothing running.
+    pub scheduled_work:
         Option<&'a dyn Fn(&BackgroundStore, &[BackgroundJobState], u64) -> anyhow::Result<bool>>,
 }
 
@@ -196,6 +202,18 @@ pub fn supervisor_tick(
             }
         }
     }
+    let scheduled_work_resident = match hooks
+        .scheduled_work
+        .map_or(Ok(false), |work| work(store, &jobs, now))
+    {
+        Ok(resident) => resident,
+        Err(err) => {
+            store
+                .append_log_line("supervisor", &format!("scheduled work failed: {err:#}"))
+                .ok();
+            false
+        }
+    };
     let roster = BackgroundRoster {
         supervisor_pid: std::process::id(),
         // Recorded so a reused pid cannot pass for this supervisor once it
@@ -229,6 +247,7 @@ pub fn supervisor_tick(
     store.write_roster(&roster)?;
     let retained_worker_activity_after_spawns = poll_retained_background_worker_children();
     Ok(has_active_jobs
+        || scheduled_work_resident
         || !active_clients.is_empty()
         || retained_worker_activity_before_spawns
         || retained_worker_activity_after_spawns)
@@ -577,4 +596,86 @@ pub fn clear_terminal_worker_process_refs(
         }),
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod scheduled_work_tests {
+    use super::*;
+
+    fn runtime() -> BackgroundRuntimeFields {
+        BackgroundRuntimeFields {
+            provider: None,
+            model: None,
+            fast_mode: None,
+            channels: Vec::new(),
+            development_channels: Vec::new(),
+            provider_format: None,
+            ui_mode: None,
+            effort_level: None,
+            permission_mode: None,
+            capability_mode: rebon_types::AgentCapabilityMode::Normal,
+            settings: Vec::new(),
+            add_dirs: Vec::new(),
+            plugin_dirs: Vec::new(),
+            mcp_configs: Vec::new(),
+            strict_mcp_config: false,
+        }
+    }
+
+    fn tick_with(
+        store: &BackgroundStore,
+        work: &dyn Fn(&BackgroundStore, &[BackgroundJobState], u64) -> anyhow::Result<bool>,
+    ) -> bool {
+        supervisor_tick(
+            store,
+            &SupervisorHooks {
+                scheduled_work: Some(work),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// With no job to supervise, the scheduled work's answer is what decides
+    /// whether the supervisor stays: a rule on a clock needs it running.
+    #[test]
+    fn scheduled_work_keeps_an_idle_supervisor_running_only_when_it_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BackgroundStore::new(dir.path());
+        assert!(tick_with(&store, &|_, _, _| Ok(true)));
+        assert!(!tick_with(&store, &|_, _, _| Ok(false)));
+        assert!(!supervisor_tick(&store, &SupervisorHooks::default()).unwrap());
+    }
+
+    #[test]
+    fn scheduled_work_sees_the_ticks_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BackgroundStore::new(dir.path());
+        let mut job = store
+            .create_job("p".into(), std::path::PathBuf::from("."), runtime())
+            .unwrap();
+        job.process.status = BackgroundJobStatus::Failed;
+        store.write_state(&job).unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        tick_with(&store, &|_, jobs, _| {
+            seen.borrow_mut()
+                .extend(jobs.iter().map(|job| job.identity.job_id.clone()));
+            Ok(false)
+        });
+        assert_eq!(*seen.borrow(), [job.identity.job_id]);
+    }
+
+    #[test]
+    fn failing_scheduled_work_is_logged_and_keeps_nothing_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BackgroundStore::new(dir.path());
+        assert!(!tick_with(&store, &|_, _, _| Err(anyhow::anyhow!(
+            "rules unreadable"
+        ))));
+        let log = std::fs::read_to_string(store.log_path("supervisor")).unwrap();
+        assert!(
+            log.contains("scheduled work failed: rules unreadable"),
+            "{log}"
+        );
+    }
 }

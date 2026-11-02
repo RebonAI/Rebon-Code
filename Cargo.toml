@@ -25,6 +25,7 @@ members = [
     "crates/rebon-acp-client",
     "crates/rebon-agent-core",
     "crates/rebon-api",
+    "crates/rebon-automation",
     "crates/rebon-boa-runner",
     "crates/rebon-bridge",
     "crates/rebon-cli",
@@ -179,6 +180,7 @@ rebon-acp = { path = "crates/rebon-acp" }
 rebon-acp-client = { path = "crates/rebon-acp-client" }
 rebon-proto = { path = "crates/rebon-proto" }
 rebon-agent-core = { path = "crates/rebon-agent-core" }
+rebon-automation = { path = "crates/rebon-automation" }
 rebon-session = { path = "crates/rebon-session" }
 rebon-session-state = { path = "crates/rebon-session-state" }
 rebon-session-host = { path = "crates/rebon-session-host" }
