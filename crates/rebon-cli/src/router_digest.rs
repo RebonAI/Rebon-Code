@@ -47,6 +47,9 @@ struct DigestState {
 struct Roster {
     router_job_id: String,
     router_session_id: Option<String>,
+    /// The watchdog beside the router, when one runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    watchdog_session_id: Option<String>,
     workers: Vec<RosterWorker>,
 }
 
@@ -58,11 +61,16 @@ struct RosterWorker {
     title: String,
 }
 
-fn roster(router: &BackgroundJobState, jobs: &[BackgroundJobState]) -> Roster {
+fn roster(
+    router: &BackgroundJobState,
+    watchdog: Option<&BackgroundJobState>,
+    jobs: &[BackgroundJobState],
+) -> Roster {
     let router_id = router.identity.job_id.as_str();
     Roster {
         router_job_id: router_id.to_string(),
         router_session_id: router.identity.session_id.clone(),
+        watchdog_session_id: watchdog.and_then(|watchdog| watchdog.identity.session_id.clone()),
         workers: jobs
             .iter()
             .filter(|job| job.identity.parent_job_id.as_deref() == Some(router_id))
@@ -136,7 +144,8 @@ impl RouterDigest {
             self.publish(None);
             return false;
         };
-        self.publish(Some(roster(&router, jobs)));
+        let watchdog = crate::router::current(store, crate::router::WATCHDOG);
+        self.publish(Some(roster(&router, watchdog.as_ref(), jobs)));
         let mut slot = self.state.borrow_mut();
         let state = slot.get_or_insert_with(|| {
             std::fs::read(&self.path)
@@ -504,7 +513,7 @@ mod tests {
         let mut mine = worker("w1", "r", BackgroundJobStatus::Running, 1);
         mine.identity.session_id = Some("s1".into());
         let other = worker("w2", "someone", BackgroundJobStatus::Idle, 1);
-        let roster = roster(&router, &[router.clone(), mine, other]);
+        let roster = roster(&router, None, &[router.clone(), mine, other]);
         assert_eq!(roster.router_session_id.as_deref(), Some("router-session"));
         assert_eq!(roster.workers.len(), 1);
         assert_eq!(roster.workers[0].session_id.as_deref(), Some("s1"));

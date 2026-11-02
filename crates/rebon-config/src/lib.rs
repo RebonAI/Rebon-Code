@@ -5474,9 +5474,57 @@ pub fn saved_autonomy_settings_in_dir(config_dir: &Path) -> AutonomySettings {
     }
 }
 
+/// Write `settings` as the `autonomy` object in the user's settings, keeping
+/// every other setting. A budget of `None` is written as no key, which reads
+/// back as no budget.
+pub fn save_autonomy_settings_in_dir(
+    config_dir: &Path,
+    settings: &AutonomySettings,
+) -> anyhow::Result<()> {
+    let target = user_settings_file(config_dir);
+    let mut file = read_settings_json_object(&target)?;
+    let mut autonomy = serde_json::Map::new();
+    autonomy.insert(
+        "recoverCrashedTurns".into(),
+        serde_json::Value::Bool(settings.recover_crashed_turns),
+    );
+    autonomy.insert(
+        "maxAutomatedTurns".into(),
+        serde_json::Value::from(settings.max_automated_turns as u64),
+    );
+    if let Some(budget) = settings.daily_token_budget {
+        autonomy.insert("dailyTokenBudget".into(), serde_json::Value::from(budget));
+    }
+    file.insert("autonomy".into(), serde_json::Value::Object(autonomy));
+    write_settings_json_object(&target, &file)
+}
+
 #[cfg(test)]
 mod autonomy_settings_tests {
-    use super::{saved_autonomy_settings_in_dir, AutonomySettings};
+    use super::{saved_autonomy_settings_in_dir, save_autonomy_settings_in_dir, AutonomySettings};
+
+    #[test]
+    fn saved_settings_read_back_and_keep_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = super::user_settings_file(dir.path());
+        std::fs::write(&path, r#"{"other":42}"#).unwrap();
+        let settings = AutonomySettings {
+            recover_crashed_turns: false,
+            max_automated_turns: 6,
+            daily_token_budget: Some(5_000_000),
+        };
+        save_autonomy_settings_in_dir(dir.path(), &settings).unwrap();
+        assert_eq!(saved_autonomy_settings_in_dir(dir.path()), settings);
+        let unbudgeted = AutonomySettings {
+            daily_token_budget: None,
+            ..settings
+        };
+        save_autonomy_settings_in_dir(dir.path(), &unbudgeted).unwrap();
+        assert_eq!(saved_autonomy_settings_in_dir(dir.path()), unbudgeted);
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["other"], 42);
+    }
 
     #[test]
     fn missing_and_partial_settings_read_as_defaults() {
