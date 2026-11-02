@@ -9,6 +9,10 @@
 //!
 //! What has been reported lives in `<store>/router-digest.json`, which only
 //! the supervisor writes, so a restart neither repeats nor loses a line.
+//!
+//! The same tick publishes `<store>/router-roster.json`: the router's session
+//! and its workers' sessions, for the desktop app, which pins the router and
+//! folds its workers under it. It is removed while no router runs.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -18,6 +22,7 @@ use rebon_session_host::{BackgroundJobState, BackgroundJobStatus, BackgroundStor
 use serde::{Deserialize, Serialize};
 
 const STATE_FILE_NAME: &str = "router-digest.json";
+const ROSTER_FILE_NAME: &str = "router-roster.json";
 /// How long the first line waits for others before the digest goes out.
 const BATCH_MS: u64 = 15_000;
 const MAX_LINE_CHARS: usize = 300;
@@ -37,17 +42,82 @@ struct DigestState {
     pending_since_ms: Option<u64>,
 }
 
+/// Who the router and its workers are, for the desktop app.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Roster {
+    router_job_id: String,
+    router_session_id: Option<String>,
+    workers: Vec<RosterWorker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RosterWorker {
+    job_id: String,
+    session_id: Option<String>,
+    title: String,
+}
+
+fn roster(router: &BackgroundJobState, jobs: &[BackgroundJobState]) -> Roster {
+    let router_id = router.identity.job_id.as_str();
+    Roster {
+        router_job_id: router_id.to_string(),
+        router_session_id: router.identity.session_id.clone(),
+        workers: jobs
+            .iter()
+            .filter(|job| job.identity.parent_job_id.as_deref() == Some(router_id))
+            .map(|job| RosterWorker {
+                job_id: job.identity.job_id.clone(),
+                session_id: job.identity.session_id.clone(),
+                title: job.identity.name.clone(),
+            })
+            .collect(),
+    }
+}
+
 /// The supervisor's digest state between ticks.
 pub(crate) struct RouterDigest {
     path: PathBuf,
+    roster_path: PathBuf,
     state: RefCell<Option<DigestState>>,
+    /// The roster as last written; `None` before the first tick.
+    published: RefCell<Option<Option<Roster>>>,
 }
 
 impl RouterDigest {
     pub(crate) fn new(store: &BackgroundStore) -> Self {
         Self {
             path: store.root().join(STATE_FILE_NAME),
+            roster_path: store.root().join(ROSTER_FILE_NAME),
             state: RefCell::new(None),
+            published: RefCell::new(None),
+        }
+    }
+
+    /// Write the roster when it changed, and remove it while no router runs.
+    fn publish(&self, roster: Option<Roster>) {
+        let mut published = self.published.borrow_mut();
+        if published.as_ref() == Some(&roster) {
+            return;
+        }
+        let result = match &roster {
+            Some(roster) => serde_json::to_vec_pretty(roster)
+                .map_err(anyhow::Error::from)
+                .and_then(|bytes| {
+                    rebon_session::write_file_atomically(&self.roster_path, &bytes)
+                        .map_err(anyhow::Error::from)
+                }),
+            None => match std::fs::remove_file(&self.roster_path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+                _ => Ok(()),
+            },
+        };
+        match result {
+            Ok(()) => *published = Some(roster),
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "rebon: could not publish the router roster");
+            }
         }
     }
 
@@ -60,8 +130,10 @@ impl RouterDigest {
         now_ms: u64,
     ) -> bool {
         let Some(router) = crate::router::current_router(store) else {
+            self.publish(None);
             return false;
         };
+        self.publish(Some(roster(&router, jobs)));
         let mut slot = self.state.borrow_mut();
         let state = slot.get_or_insert_with(|| {
             std::fs::read(&self.path)
@@ -274,6 +346,21 @@ mod tests {
         collect(&mut state, "r2", &[mine], 5);
         assert!(state.pending.is_empty(), "w1 is not r2's");
         assert_eq!(state.router_job_id.as_deref(), Some("r2"));
+    }
+
+    #[test]
+    fn the_roster_lists_the_routers_session_and_its_workers() {
+        let mut router = worker("r", "nobody", BackgroundJobStatus::Idle, 1);
+        router.identity.parent_job_id = None;
+        router.identity.session_id = Some("router-session".into());
+        let mut mine = worker("w1", "r", BackgroundJobStatus::Running, 1);
+        mine.identity.session_id = Some("s1".into());
+        let other = worker("w2", "someone", BackgroundJobStatus::Idle, 1);
+        let roster = roster(&router, &[router.clone(), mine, other]);
+        assert_eq!(roster.router_session_id.as_deref(), Some("router-session"));
+        assert_eq!(roster.workers.len(), 1);
+        assert_eq!(roster.workers[0].session_id.as_deref(), Some("s1"));
+        assert_eq!(roster.workers[0].title, "task w1");
     }
 
     #[test]
