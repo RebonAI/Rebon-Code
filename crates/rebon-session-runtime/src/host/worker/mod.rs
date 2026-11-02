@@ -1,6 +1,7 @@
 pub mod agent_runtime;
 pub mod execution;
 pub mod finalization;
+pub mod idle_compaction;
 pub mod pending_prompt;
 pub mod worktree;
 

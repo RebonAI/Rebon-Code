@@ -1,4 +1,5 @@
 use super::super::*;
+use super::idle_compaction::{armed_wakeup_at, worker_leave_at, HeldIdleCompaction};
 use rebon_core::hooks::{
     append_additional_context, apply_user_prompt_submit_effects, UserPromptSubmitDecision,
 };
@@ -2140,6 +2141,8 @@ async fn release_session_keeping_lock(
             projects_root: session.projects_root.clone(),
         });
     }
+    handed_back.idle_compaction =
+        HeldIdleCompaction::of(session, handed_back.idle_compaction.take());
 }
 
 pub(crate) async fn refresh_agent_view_completion_summary(
@@ -2230,7 +2233,14 @@ pub(crate) async fn process_idle_background_commands(
     let Some(first) = ipc.try_recv_command() else {
         return;
     };
+    // The commands get a session rebuilt from the transcript; an idle
+    // compaction must not be rewriting it underneath them.
+    let mut idle_compaction = handed_back.idle_compaction.take();
+    if let Some(idle) = idle_compaction.as_mut() {
+        idle.settle(store, &state.identity.job_id).await;
+    }
     let Some(session_id) = state.identity.session_id.clone() else {
+        handed_back.idle_compaction = idle_compaction;
         let error = (
             rebon_session_host::HostCallError::SessionFailure,
             "background job has no session for commands".to_string(),
@@ -2275,6 +2285,7 @@ pub(crate) async fn process_idle_background_commands(
         }
     };
     run_idle_background_commands(store, state, ipc, &mut session, first).await;
+    handed_back.idle_compaction = idle_compaction;
     release_session_keeping_lock(&mut session, handed_back).await;
 }
 
@@ -2366,9 +2377,13 @@ async fn wait_for_first_prompt_on_warm_session(
 ) -> anyhow::Result<WarmSessionWait> {
     let owner = ipc.owner();
     let job_id = state.identity.job_id.as_str();
-    loop {
+    let mut idle_compaction = HeldIdleCompaction::of(session, None);
+    let ended = loop {
         let _ = tokio::time::timeout(Duration::from_secs(1), ipc.wake.notified()).await;
         if let Some(first) = ipc.try_recv_command() {
+            if let Some(idle) = idle_compaction.as_mut() {
+                idle.settle(store, job_id).await;
+            }
             run_idle_background_commands(store, state, ipc, session, first).await;
         }
         queue_idle_cron_fires(store, job_id, &session.engine_half.cron_poller);
@@ -2379,7 +2394,7 @@ async fn wait_for_first_prompt_on_warm_session(
                 recorded_pid = ?current.process.pid,
                 "rebon: worker leaving linger — the job record names another owner"
             );
-            return Ok(WarmSessionWait::Ended);
+            break WarmSessionWait::Ended;
         }
         match current.process.status {
             // Only a turn to run brings a parked worker back — a follow-up, or
@@ -2387,7 +2402,7 @@ async fn wait_for_first_prompt_on_warm_session(
             // merely wait are carried by the next turn, not the reason for one.
             BackgroundJobStatus::Queued if current.has_turn_to_run() => {
                 if automated_turn_left_to_supervisor(store, &current) {
-                    return Ok(WarmSessionWait::Ended);
+                    break WarmSessionWait::Ended;
                 }
                 let (cancel, claim) = ipc.start_turn_and(|| {
                     claim_background_job(
@@ -2418,17 +2433,17 @@ async fn wait_for_first_prompt_on_warm_session(
                             "worker_reused",
                             serde_json::json!({ "warmSession": true }),
                         )?;
-                        return Ok(WarmSessionWait::Claimed { claimed, cancel });
+                        break WarmSessionWait::Claimed { claimed, cancel };
                     }
                     WorkerClaim::NoWork => {}
                     WorkerClaim::Stopped | WorkerClaim::OwnedByOther(_) => {
-                        return Ok(WarmSessionWait::Ended);
+                        break WarmSessionWait::Ended;
                     }
                 }
             }
             BackgroundJobStatus::Stopped => {
                 tracing::info!(%job_id, "rebon: worker leaving linger — the job was stopped");
-                return Ok(WarmSessionWait::Ended);
+                break WarmSessionWait::Ended;
             }
             BackgroundJobStatus::Idle
             | BackgroundJobStatus::Succeeded
@@ -2448,28 +2463,48 @@ async fn wait_for_first_prompt_on_warm_session(
                     Ok(true)
                 })?;
                 if !still_owner {
-                    return Ok(WarmSessionWait::Ended);
+                    break WarmSessionWait::Ended;
                 }
             }
             // Only a claim moves the job here, and this worker is the only
             // one that claims under its pid — nothing this loop can follow.
             BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput => {
-                return Ok(WarmSessionWait::Ended);
+                break WarmSessionWait::Ended;
             }
         }
         let idle_since = current
             .process
             .completed_at_ms
             .unwrap_or(current.process.updated_at_ms);
+        let now = now_ms();
+        if let Some(idle) = idle_compaction.as_mut() {
+            idle.tick(
+                store,
+                job_id,
+                Some(&session.engine_half.session_loop),
+                now,
+                idle_since,
+                worker_leave_at(&current, now, idle_since),
+                armed_wakeup_at(&session.engine_half.session_cron_store),
+            );
+        }
         let schedule = Some((
             session.engine_half.cron_poller.as_ref(),
             session.engine_half.session_cron_store.as_ref(),
         ));
-        if !idle_worker_stays(now_ms(), current.linger_deadline_ms(idle_since), schedule) {
+        let compacting = idle_compaction
+            .as_ref()
+            .is_some_and(HeldIdleCompaction::is_running);
+        if !compacting && !idle_worker_stays(now, current.linger_deadline_ms(idle_since), schedule)
+        {
             tracing::info!(%job_id, "rebon: worker leaving linger — nobody asked for it in time");
-            return Ok(WarmSessionWait::Ended);
+            break WarmSessionWait::Ended;
         }
+    };
+    if let Some(idle) = idle_compaction.as_mut() {
+        idle.settle(store, job_id).await;
     }
+    Ok(ended)
 }
 
 /// Whether a parked worker leaves the automatic turn it was about to take up
@@ -2570,7 +2605,7 @@ pub(crate) async fn wait_for_terminal_worker_reuse(
     handed_back: &mut crate::session_handoff::HandedBack,
 ) -> anyhow::Result<bool> {
     let owner = ipc.owner();
-    loop {
+    let reused = loop {
         // A tick, or sooner: a reply that came in over IPC rings `wake`, and
         // a prompt sent to a parked worker should not wait out the tick.
         let _ = tokio::time::timeout(Duration::from_secs(1), ipc.wake.notified()).await;
@@ -2586,7 +2621,7 @@ pub(crate) async fn wait_for_terminal_worker_reuse(
                 recorded_pid = ?state.process.pid,
                 "rebon: worker leaving linger — the job record names another owner"
             );
-            return Ok(false);
+            break false;
         }
         match state.process.status {
             // Only a turn to run brings a parked worker back — a follow-up, or
@@ -2594,14 +2629,14 @@ pub(crate) async fn wait_for_terminal_worker_reuse(
             // merely wait are carried by the next turn, not the reason for one.
             BackgroundJobStatus::Queued if state.has_turn_to_run() => {
                 if automated_turn_left_to_supervisor(store, &state) {
-                    return Ok(false);
+                    break false;
                 }
                 store.append_event(job_id, "worker_reused", serde_json::json!({}))?;
-                return Ok(true);
+                break true;
             }
             BackgroundJobStatus::Stopped => {
                 tracing::info!(%job_id, "rebon: worker leaving linger — the job was stopped");
-                return Ok(false);
+                break false;
             }
             BackgroundJobStatus::Idle
             | BackgroundJobStatus::Succeeded
@@ -2621,11 +2656,11 @@ pub(crate) async fn wait_for_terminal_worker_reuse(
                     Ok(true)
                 })?;
                 if !still_owner {
-                    return Ok(false);
+                    break false;
                 }
             }
             BackgroundJobStatus::Running | BackgroundJobStatus::NeedsInput => {
-                return Ok(true);
+                break true;
             }
         }
         let idle_since = state
@@ -2635,15 +2670,51 @@ pub(crate) async fn wait_for_terminal_worker_reuse(
         // A client holding a lease is watching this session, so the worker is
         // not idle in the sense that matters — it is standing by for someone.
         // The clock only starts once the last lease stops being renewed.
-        let schedule = handed_back
-            .cron
+        let now = now_ms();
+        let crate::session_handoff::HandedBack {
+            cron,
+            session_loop,
+            idle_compaction,
+            ..
+        } = handed_back;
+        if let Some(idle) = idle_compaction.as_mut() {
+            // Only on the loop the next turn runs through, so the turn is
+            // what cancels it.
+            let session_loop = session_loop
+                .as_ref()
+                .filter(|held| held.session_id == idle.session_id)
+                .map(|held| &held.session_loop);
+            let wakeup_at = cron
+                .as_ref()
+                .and_then(|cron| armed_wakeup_at(&cron.session_store));
+            let leave_at = worker_leave_at(&state, now, idle_since);
+            idle.tick(
+                store,
+                job_id,
+                session_loop,
+                now,
+                idle_since,
+                leave_at,
+                wakeup_at,
+            );
+        }
+        let compacting = idle_compaction
+            .as_ref()
+            .is_some_and(HeldIdleCompaction::is_running);
+        let schedule = cron
             .as_ref()
             .map(|cron| (cron.poller.as_ref(), cron.session_store.as_ref()));
-        if !idle_worker_stays(now_ms(), state.linger_deadline_ms(idle_since), schedule) {
+        if !compacting && !idle_worker_stays(now, state.linger_deadline_ms(idle_since), schedule) {
             tracing::info!(%job_id, "rebon: worker leaving linger — nobody asked for it in time");
-            return Ok(false);
+            break false;
         }
+    };
+    // Whatever comes next — a session rebuilt for a turn, or the worker
+    // leaving — the history must not be mid-rewrite.
+    if let Some(idle) = handed_back.idle_compaction.as_mut() {
+        idle.settle(store, job_id).await;
     }
+    Ok(reused)
 }
 
 #[cfg(test)]

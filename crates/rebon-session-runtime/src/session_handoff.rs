@@ -18,6 +18,8 @@ pub struct HandedBack {
     pub kernel_scopes: Option<HeldKernelScopes>,
     pub cron: Option<HeldCron>,
     pub session_loop: Option<HeldSessionLoop>,
+    /// What the worker needs to compact the released session while parked.
+    pub idle_compaction: Option<crate::host::worker::idle_compaction::HeldIdleCompaction>,
 }
 
 /// The session loop a worker's turns run through, kept across the sessions it
