@@ -26,6 +26,18 @@ if git rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1; then
     exit 1
 fi
 
+# The startup banner shows this version's section of the release notes once.
+# Without one, users who upgrade see nothing about what changed.
+notes=crates/rebon-cli/RELEASE_NOTES.md
+if ! awk -v v="$ver" '
+    /^## / { inside = ($2 == v) }
+    inside && /^- [^[:space:]]/ { found = 1 }
+    END { exit !found }
+' "$notes"; then
+    echo "$notes has no notes for $ver — add a '## $ver' section with 1-4 '- ' items first" >&2
+    exit 1
+fi
+
 # Rewrite the version inside the [workspace.package] table only.
 awk -v v="$ver" '
     /^\[workspace\.package\]/ {p=1}

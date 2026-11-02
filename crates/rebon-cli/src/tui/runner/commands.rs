@@ -932,6 +932,12 @@ fn finish_new_session(
 
     // 1. Wipe every transcript view and its measurement cache.
     app.reset_transcript_views();
+    // Release notes belong to the launch's first banner. A session the user
+    // starts later shows the quick actions; notes a narrow terminal never
+    // drew stay unrecorded and come back at the next launch.
+    if show_inline_banner {
+        app.show_startup_release_notes = false;
+    }
     if app.ui_mode == crate::ui_config::UiMode::Inline {
         app.pending_inline_viewport_reset = true;
         app.pending_inline_startup_banner |= show_inline_banner;
@@ -1655,10 +1661,12 @@ mod tests {
         inline_app.ui_mode = crate::ui_config::UiMode::Inline;
         let mut inline_session = make_test_tui_session();
 
+        inline_app.show_startup_release_notes = true;
         apply_user_new_session(&mut inline_app, &mut inline_session);
 
         assert!(inline_app.pending_inline_viewport_reset);
         assert!(inline_app.pending_inline_startup_banner);
+        assert!(!inline_app.show_startup_release_notes);
 
         let mut screen_app = AppState::default();
         let mut screen_session = make_test_tui_session();
