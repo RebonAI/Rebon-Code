@@ -590,8 +590,59 @@ pub fn launch_worker(
         }
         None => None,
     };
+    let job = launch_job(
+        store,
+        router,
+        project,
+        &request.title,
+        &worker_brief(router, request, task_id),
+        isolate,
+        model,
+    )?;
+    Ok(DispatchedWorker {
+        worker_id: job.identity.job_id,
+        task_id: task_id.map(str::to_string),
+        note: (!notes.is_empty()).then(|| notes.join("; ")),
+    })
+}
+
+/// Start the acceptance check of `task`, in `cwd`: its worker's worktree,
+/// or the project. A check runs on the `reviewer` profile's model when one
+/// is set. Used by the supervisor.
+pub fn launch_verifier(
+    store: &BackgroundStore,
+    router: &BackgroundJobState,
+    task: &rebon_work::Task,
+    cwd: &str,
+) -> Result<String, String> {
+    let project = check_project(cwd)?;
+    let model =
+        crate::rebon_config::active_provider_profile_model(rebon_types::MODEL_PROFILE_REVIEWER);
+    let job = launch_job(
+        store,
+        router,
+        project,
+        &format!("Check: {}", task.title),
+        &rebon_work::verifier_brief(task),
+        false,
+        model,
+    )?;
+    Ok(job.identity.job_id)
+}
+
+/// A background job under `router`, in auto permission mode, its prompt
+/// marked as scheduled.
+fn launch_job(
+    store: &BackgroundStore,
+    router: &BackgroundJobState,
+    project: PathBuf,
+    title: &str,
+    prompt: &str,
+    isolate: bool,
+    model: Option<String>,
+) -> Result<BackgroundJobState, String> {
     let options = BackgroundLaunchOptions {
-        prompt: rebon_tool::cron::mark_scheduled_prompt(&worker_brief(router, request, task_id)),
+        prompt: rebon_tool::cron::mark_scheduled_prompt(prompt),
         images: Vec::new(),
         cwd: project,
         isolate_in_worktree: isolate,
@@ -616,22 +667,17 @@ pub fn launch_worker(
             mcp_configs: Vec::new(),
             strict_mcp_config: false,
         },
-        name: Some(request.title.clone()),
+        name: Some(title.to_string()),
         agent_type: None,
         parent_job_id: Some(router.identity.job_id.clone()),
     };
-    let job = rebon_session_host::launch_background_prompt(
+    rebon_session_host::launch_background_prompt(
         store,
         options,
         &crate::host::rebon_exe(),
         crate::host::runtime_permissions::ensure_background_runtime_permission_mode_allowed,
     )
-    .map_err(|error| format!("{error:#}"))?;
-    Ok(DispatchedWorker {
-        worker_id: job.identity.job_id,
-        task_id: task_id.map(str::to_string),
-        note: (!notes.is_empty()).then(|| notes.join("; ")),
-    })
+    .map_err(|error| format!("{error:#}"))
 }
 
 /// What a new worker is told: who sent it, its task and the router's brief.
@@ -649,7 +695,8 @@ fn worker_brief(
     format!(
         "You are a worker dispatched by the Rebon router (job {}). Work on this task on your own; \
          the router reads your final reply, not the person. The task is done only when what it \
-         asks for actually holds; check that yourself before you stop. Finish with a short report: \
+         asks for actually holds; check that yourself before you stop, because an independent \
+         acceptance check will look at the result and send it back if it falls short. Finish with a short report: \
          what you did, the evidence that it is done, what is left, and the URL of any pull request \
          you opened.\n\n\
          Task{task}: {}{done_when}\n\n{}",

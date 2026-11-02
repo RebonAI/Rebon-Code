@@ -232,8 +232,14 @@ fn collect(
             job.process.turn_generation,
         );
         let changed = state.seen.get(&job.identity.job_id) != Some(&now);
+        // A worker or check on a task reports through the task: done once it
+        // passed its check, stuck, blocked. Its turns ending say nothing yet,
+        // and reporting them would have the router answer before the check
+        // has. Only a question it waits on comes straight through.
+        let tasked = task_of(&job.identity.job_id).is_some();
+        let speaks = !tasked || job.process.status == BackgroundJobStatus::NeedsInput;
         if changed {
-            if let Some(line) = line(job, last_reply, task_of) {
+            if let Some(line) = speaks.then(|| line(job, last_reply, task_of)).flatten() {
                 state.pending.push(line);
                 state.pending_since_ms.get_or_insert(now_ms);
             }
@@ -430,11 +436,44 @@ mod tests {
             std::slice::from_ref(&job),
             0,
             &reply,
-            &|_| Some("t-9".into()),
+            &|_| None,
         );
         assert_eq!(
             state.pending,
-            ["- w1 \"task w1\" (task t-9) finished a turn: Fixed add(); 6 tests pass."]
+            ["- w1 \"task w1\" finished a turn: Fixed add(); 6 tests pass."]
+        );
+    }
+
+    #[test]
+    fn a_worker_on_a_task_speaks_only_when_it_waits_for_an_answer() {
+        let mut state = DigestState::default();
+        let mut job = worker("w1", "r", BackgroundJobStatus::Idle, 1);
+        let on_task = |_: &str| Some("t-9".to_string());
+        collect(
+            &mut state,
+            "r",
+            std::slice::from_ref(&job),
+            0,
+            &|_| None,
+            &on_task,
+        );
+        assert!(
+            state.pending.is_empty(),
+            "the task reports once it is checked"
+        );
+        job.process.status = BackgroundJobStatus::NeedsInput;
+        job.process.turn_generation = 2;
+        collect(
+            &mut state,
+            "r",
+            std::slice::from_ref(&job),
+            5,
+            &|_| None,
+            &on_task,
+        );
+        assert_eq!(
+            state.pending,
+            ["- w1 \"task w1\" (task t-9) is waiting for an answer"]
         );
     }
 

@@ -2,8 +2,8 @@
 //!
 //! On its tick, every couple of seconds or at once when a request waits, the
 //! supervisor applies the plans and cancellations the router's tools filed,
-//! follows each task's worker, and dispatches the tasks that are ready, within
-//! the limit on automatic turns. It is the ledger's only writer. What a pass
+//! follows each task's worker and acceptance check, and dispatches the tasks
+//! that are ready, within the limit on automatic turns. It is the ledger's only writer. What a pass
 //! notices that no worker's own digest would say (a task stuck, a task blocked
 //! by another) goes into the router's next digest.
 
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use rebon_session_host::{
     BackgroundJobState, BackgroundJobStatus, BackgroundStore, STALE_PID_EXIT_ERROR,
 };
-use rebon_work::{Ledger, Task, TaskNotice, WorkerPhase, WorkerView};
+use rebon_work::{Hands, Ledger, Task, TaskNotice, WorkerPhase, WorkerView};
 
 const PASS_INTERVAL_MS: u64 = 2_000;
 
@@ -79,8 +79,8 @@ impl WorkHost {
             changed |= rebon_work::apply_request(ledger, request, now_ms);
         }
         let workers: Vec<WorkerView> = jobs.iter().map(worker_view).collect();
-        let mut launch = |task: &Task| launch_task(store, jobs, task);
-        let outcome = rebon_work::run_pass(ledger, &workers, now_ms, max_running, &mut launch);
+        let mut hands = HostHands { store, jobs };
+        let outcome = rebon_work::run_pass(ledger, &workers, now_ms, max_running, &mut hands);
         if changed || outcome.changed {
             if let Err(error) = ledger.save(&rebon_work::ledger_path(&self.home)) {
                 tracing::warn!(error = %format!("{error:#}"), "rebon: could not save the task ledger");
@@ -119,30 +119,80 @@ fn worker_view(job: &BackgroundJobState) -> WorkerView {
     }
 }
 
-/// Start the worker of a planned task, under the router that planned it.
-fn launch_task(
-    store: &BackgroundStore,
-    jobs: &[BackgroundJobState],
-    task: &Task,
-) -> Result<String, String> {
-    let router_id = task
-        .router_job_id
-        .as_deref()
-        .ok_or("the task has no router to work under")?;
-    let router = jobs
-        .iter()
-        .find(|job| job.identity.job_id == router_id)
-        .ok_or_else(|| format!("its router {router_id} is gone"))?;
-    let request = rebon_tool::WorkerDispatch {
-        project: task.project.clone(),
-        title: task.title.clone(),
-        brief: task.goal.clone(),
-        done_when: task.done_when.clone(),
-        isolate: task.isolate,
-        model_profile: task.model_profile.clone(),
-    };
-    crate::session::worker_control::launch_worker(store, router, &request, Some(&task.id))
-        .map(|worker| worker.worker_id)
+/// What a pass does to the world: start jobs, read what they said, queue
+/// rework.
+struct HostHands<'a> {
+    store: &'a BackgroundStore,
+    jobs: &'a [BackgroundJobState],
+}
+
+impl HostHands<'_> {
+    fn job(&self, job_id: &str) -> Option<&BackgroundJobState> {
+        self.jobs.iter().find(|job| job.identity.job_id == job_id)
+    }
+
+    /// The router that planned `task`, which its workers work under.
+    fn router(&self, task: &Task) -> Result<&BackgroundJobState, String> {
+        let router_id = task
+            .router_job_id
+            .as_deref()
+            .ok_or("the task has no router to work under")?;
+        self.job(router_id)
+            .ok_or_else(|| format!("its router {router_id} is gone"))
+    }
+}
+
+impl Hands for HostHands<'_> {
+    fn launch_worker(&mut self, task: &Task) -> Result<String, String> {
+        let router = self.router(task)?;
+        let request = rebon_tool::WorkerDispatch {
+            project: task.project.clone(),
+            title: task.title.clone(),
+            brief: task.goal.clone(),
+            done_when: task.done_when.clone(),
+            isolate: task.isolate,
+            model_profile: task.model_profile.clone(),
+        };
+        crate::session::worker_control::launch_worker(self.store, router, &request, Some(&task.id))
+            .map(|worker| worker.worker_id)
+    }
+
+    /// The check looks where the work is: the worker's worktree, if it has
+    /// one, else the project.
+    fn launch_verifier(&mut self, task: &Task) -> Result<String, String> {
+        let router = self.router(task)?;
+        let cwd = task
+            .worker_job_id
+            .as_deref()
+            .and_then(|worker| self.job(worker))
+            .and_then(|worker| worker.workspace.worktree_path.clone())
+            .unwrap_or_else(|| task.project.clone());
+        crate::session::worker_control::launch_verifier(self.store, router, task, &cwd)
+    }
+
+    fn last_reply(&mut self, job_id: &str) -> Option<String> {
+        let job = self.job(job_id)?;
+        let transcript = rebon_session_host::background_job_transcript_path_in(
+            &rebon_harness::projects_root(),
+            job,
+        )?;
+        rebon_session::last_turn_assistant_text(&transcript)
+            .ok()
+            .flatten()
+    }
+
+    fn rework(&mut self, task: &Task, round: u32, findings: &str) -> Result<(), String> {
+        let worker = task
+            .worker_job_id
+            .as_deref()
+            .ok_or("the task has no worker to send the work back to")?;
+        let id = format!("u-internal-scheduled-rework-{}-{round}", task.id);
+        let text =
+            rebon_tool::cron::mark_scheduled_prompt(&rebon_work::rework_message(round, findings));
+        rebon_session_host::append_background_scheduled_prompt(self.store, worker, id, text)
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+    }
 }
 
 #[cfg(test)]
