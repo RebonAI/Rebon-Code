@@ -683,8 +683,21 @@ enum RouterCommand {
     Start,
     /// Print the router's job, model and worker count.
     Status,
-    /// Stop the router. Its workers keep running.
+    /// Stop the router and its watchdog. Its workers keep running.
     Stop,
+    /// Send the router an event from outside: a chat message, a mail, a hook.
+    /// With a thread a worker owns, it goes straight to that worker.
+    Notify {
+        /// Where it came from, such as im, mail or ci.
+        #[arg(long, default_value = "cli")]
+        source: String,
+        /// The thread it belongs to, as scheme:name (im:team#42).
+        #[arg(long)]
+        thread: Option<String>,
+        /// What happened.
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -1536,8 +1549,34 @@ fn run_router_command(command: RouterCommand) -> anyhow::Result<()> {
             }
         }
         RouterCommand::Status => println!("{}", router::describe_router(&store)),
+        RouterCommand::Notify {
+            source,
+            thread,
+            text,
+        } => {
+            if let Some(thread) = thread.as_deref() {
+                if rebon_work::normalize_thread_key(thread).is_none() {
+                    anyhow::bail!(
+                        "{thread} is not a thread: write scheme:name, such as im:team#42"
+                    );
+                }
+            }
+            rebon_work::file_request(
+                store.root(),
+                &rebon_work::WorkRequest::Event {
+                    source,
+                    thread,
+                    text: text.join(" "),
+                    requested_at_ms: rebon_session_host::now_ms(),
+                },
+            )?;
+            rebon_session_host::ensure_supervisor_running(&store, &background::rebon_exe())?;
+            println!("Sent.");
+        }
         RouterCommand::Stop => match router::stop_router(&store)? {
-            Some(job_id) => println!("Stopped the router {job_id}. Its workers keep running."),
+            Some(job_id) => {
+                println!("Stopped the router {job_id} and its watchdog. Its workers keep running.")
+            }
             None => println!("No router is running."),
         },
     }

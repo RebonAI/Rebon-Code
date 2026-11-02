@@ -32,6 +32,13 @@
 //! on several checkouts, or on one another task is still using, starts from
 //! the project instead.
 //!
+//! Events from outside (a chat message, a mail, a CI hook) come in as
+//! requests too, each with its source and, when it belongs to one, its
+//! thread (`im:team#42`). A thread a worker subscribed to goes straight to
+//! that worker; anything else goes to the router, which decides who owns it
+//! ([`route_event`]). That is the fast and the slow path of the super-agent
+//! design, for any source a script can write a file from.
+//!
 //! Launching workers and reading jobs are the caller's ([`Hands`]). This
 //! crate names no session host.
 
@@ -202,7 +209,7 @@ impl Task {
     }
 }
 
-/// Every task, by id.
+/// Every task, by id, and who owns which thread.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Ledger {
@@ -210,6 +217,43 @@ pub struct Ledger {
     pub version: u32,
     #[serde(default)]
     pub tasks: BTreeMap<String, Task>,
+    /// Threads other than pull requests (those are the automation state's),
+    /// each with the job its events go to.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subscriptions: BTreeMap<String, String>,
+    /// Events delivered lately, by thread (or source) and text, so the same
+    /// event sent twice is delivered once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_events: Vec<RecentEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentEvent {
+    pub key: String,
+    pub digest: u64,
+    pub at_ms: u64,
+}
+
+/// How long the same event counts as a repeat.
+pub const EVENT_REPEAT_MS: u64 = 5 * 60 * 1000;
+/// The longest thread key accepted.
+pub const MAX_THREAD_KEY_CHARS: usize = 200;
+
+/// A thread key as stored: `scheme:rest`, the scheme in lower case. `None`
+/// when the text is not one.
+pub fn normalize_thread_key(text: &str) -> Option<String> {
+    let text = text.trim();
+    let (scheme, rest) = text.split_once(':')?;
+    let rest = rest.trim();
+    let valid = !scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        && !rest.is_empty()
+        && !rest.chars().any(char::is_control)
+        && text.chars().count() <= MAX_THREAD_KEY_CHARS;
+    valid.then(|| format!("{}:{rest}", scheme.to_ascii_lowercase()))
 }
 
 impl Ledger {
@@ -229,7 +273,7 @@ impl Ledger {
         }
         let ledger = Self {
             version: LEDGER_VERSION,
-            tasks: self.tasks.clone(),
+            ..self.clone()
         };
         rebon_session::write_file_atomically(path, &serde_json::to_vec_pretty(&ledger)?)
             .with_context(|| format!("write {}", path.display()))
@@ -325,6 +369,21 @@ pub enum WorkRequest {
         reason: Option<String>,
         requested_at_ms: u64,
     },
+    /// Give a thread's events to a job from now on.
+    Subscribe {
+        thread: String,
+        job_id: String,
+        requested_at_ms: u64,
+    },
+    /// Something happened outside: a message, a mail, a hook. Routed by
+    /// [`route_event`], not applied.
+    Event {
+        source: String,
+        #[serde(default)]
+        thread: Option<String>,
+        text: String,
+        requested_at_ms: u64,
+    },
 }
 
 impl WorkRequest {
@@ -337,6 +396,12 @@ impl WorkRequest {
                 requested_at_ms, ..
             }
             | Self::Cancel {
+                requested_at_ms, ..
+            }
+            | Self::Subscribe {
+                requested_at_ms, ..
+            }
+            | Self::Event {
                 requested_at_ms, ..
             } => *requested_at_ms,
         }
@@ -440,6 +505,14 @@ pub fn apply_request(ledger: &mut Ledger, request: WorkRequest, now_ms: u64) -> 
             ledger.tasks.insert(task.id.clone(), task);
             true
         }
+        WorkRequest::Subscribe { thread, job_id, .. } => {
+            let Some(thread) = normalize_thread_key(&thread) else {
+                return false;
+            };
+            ledger.subscriptions.insert(thread, job_id.clone()) != Some(job_id)
+        }
+        // Events need hands; see `route_event`.
+        WorkRequest::Event { .. } => false,
         WorkRequest::Cancel {
             task_id, reason, ..
         } => match ledger.tasks.get_mut(&task_id) {
@@ -487,6 +560,82 @@ pub trait Hands {
     fn last_reply(&mut self, job_id: &str) -> Option<String>;
     /// Give a task's worker the acceptance check's findings as its next turn.
     fn rework(&mut self, task: &Task, round: u32, findings: &str) -> Result<(), String>;
+    /// Queue `text` as the next turn of `job_id`, or of the router when
+    /// `None`.
+    fn deliver(&mut self, job_id: Option<&str>, text: &str) -> Result<(), String>;
+}
+
+/// Route one event from outside. A thread with a subscriber whose job is
+/// still there and not stopped goes to that job; anything else goes to the
+/// router, which decides who should own it. The same event within
+/// [`EVENT_REPEAT_MS`] is dropped. `true` when the ledger changed.
+pub fn route_event(
+    ledger: &mut Ledger,
+    request: WorkRequest,
+    workers: &[WorkerView],
+    now_ms: u64,
+    hands: &mut dyn Hands,
+) -> bool {
+    let WorkRequest::Event {
+        source,
+        thread,
+        text,
+        ..
+    } = request
+    else {
+        return false;
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    let thread = thread.as_deref().and_then(normalize_thread_key);
+    let key = thread.clone().unwrap_or_else(|| format!("source:{source}"));
+    let digest = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        hasher.finish()
+    };
+    ledger
+        .recent_events
+        .retain(|event| now_ms.saturating_sub(event.at_ms) < EVENT_REPEAT_MS);
+    if ledger
+        .recent_events
+        .iter()
+        .any(|event| event.key == key && event.digest == digest)
+    {
+        return true;
+    }
+    let owner = thread
+        .as_deref()
+        .and_then(|thread| ledger.subscriptions.get(thread))
+        .filter(|job_id| {
+            workers
+                .iter()
+                .any(|worker| worker.job_id == **job_id && worker.phase != WorkerPhase::Stopped)
+        })
+        .cloned();
+    let message = match (&owner, &thread) {
+        (Some(_), Some(thread)) => format!("[Thread {thread} · {source}]\n{text}"),
+        (_, Some(thread)) => format!(
+            "[Event · {source} · thread {thread}, which no worker owns: decide who should, and \
+             hand it over with SubscribeThread, or let it be]\n{text}"
+        ),
+        (_, None) => format!("[Event · {source}]\n{text}"),
+    };
+    match hands.deliver(owner.as_deref(), &message) {
+        Ok(()) => {
+            ledger.recent_events.push(RecentEvent {
+                key,
+                digest,
+                at_ms: now_ms,
+            });
+            true
+        }
+        // Left unrecorded: a source that sends it again gets another try.
+        Err(_) => false,
+    }
 }
 
 /// What a pass did that the router should hear about.
@@ -989,6 +1138,7 @@ mod tests {
         /// Where each worker was started to carry on, if anywhere.
         carried_on: Vec<(String, Option<String>)>,
         frozen: Vec<String>,
+        delivered: Vec<(Option<String>, String)>,
     }
 
     impl Hands for Fake {
@@ -1018,6 +1168,119 @@ mod tests {
                 .push((task.id.clone(), round, findings.to_string()));
             Ok(())
         }
+        fn deliver(&mut self, job_id: Option<&str>, text: &str) -> Result<(), String> {
+            self.delivered
+                .push((job_id.map(str::to_string), text.to_string()));
+            Ok(())
+        }
+    }
+
+    fn event(thread: Option<&str>, text: &str) -> WorkRequest {
+        WorkRequest::Event {
+            source: "im".into(),
+            thread: thread.map(str::to_string),
+            text: text.into(),
+            requested_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn thread_keys_are_a_scheme_and_a_name() {
+        assert_eq!(
+            normalize_thread_key(" IM:team#42 ").as_deref(),
+            Some("im:team#42")
+        );
+        assert_eq!(
+            normalize_thread_key("mail: inbox/7").as_deref(),
+            Some("mail:inbox/7")
+        );
+        for bad in ["team#42", ":x", "im:", "i m:x", "im:a\nb"] {
+            assert_eq!(normalize_thread_key(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_owned_thread_goes_to_its_worker_and_the_rest_to_the_router() {
+        let mut ledger = Ledger::default();
+        apply_request(
+            &mut ledger,
+            WorkRequest::Subscribe {
+                thread: "IM:team#42".into(),
+                job_id: "w".into(),
+                requested_at_ms: 0,
+            },
+            0,
+        );
+        let mut hands = Fake::default();
+        let alive = [worker("w", WorkerPhase::Finished)];
+        route_event(
+            &mut ledger,
+            event(Some("im:team#42"), "ship it?"),
+            &alive,
+            1,
+            &mut hands,
+        );
+        route_event(
+            &mut ledger,
+            event(Some("im:other#1"), "hello"),
+            &alive,
+            2,
+            &mut hands,
+        );
+        route_event(
+            &mut ledger,
+            event(None, "build broke"),
+            &alive,
+            3,
+            &mut hands,
+        );
+        assert_eq!(
+            hands.delivered[0],
+            (
+                Some("w".into()),
+                "[Thread im:team#42 · im]\nship it?".into()
+            )
+        );
+        assert_eq!(hands.delivered[1].0, None);
+        assert!(hands.delivered[1].1.contains("which no worker owns"));
+        assert_eq!(
+            hands.delivered[2],
+            (None, "[Event · im]\nbuild broke".into())
+        );
+
+        // Its worker stopped: the router hears it instead.
+        let stopped = [worker("w", WorkerPhase::Stopped)];
+        route_event(
+            &mut ledger,
+            event(Some("im:team#42"), "anyone?"),
+            &stopped,
+            4,
+            &mut hands,
+        );
+        assert_eq!(hands.delivered[3].0, None);
+    }
+
+    #[test]
+    fn the_same_event_twice_is_delivered_once() {
+        let mut ledger = Ledger::default();
+        let mut hands = Fake::default();
+        route_event(&mut ledger, event(None, "build broke"), &[], 0, &mut hands);
+        route_event(
+            &mut ledger,
+            event(None, "build broke"),
+            &[],
+            1_000,
+            &mut hands,
+        );
+        assert_eq!(hands.delivered.len(), 1);
+        route_event(
+            &mut ledger,
+            event(None, "build broke"),
+            &[],
+            EVENT_REPEAT_MS + 1,
+            &mut hands,
+        );
+        assert_eq!(hands.delivered.len(), 2);
     }
 
     #[test]

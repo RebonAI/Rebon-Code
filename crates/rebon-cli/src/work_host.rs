@@ -75,11 +75,16 @@ impl WorkHost {
         }
         let ledger = slot.as_mut().expect("just loaded");
         let mut changed = false;
-        for request in rebon_work::take_requests(&self.home) {
-            changed |= rebon_work::apply_request(ledger, request, now_ms);
-        }
         let workers: Vec<WorkerView> = jobs.iter().map(worker_view).collect();
         let mut hands = HostHands { store, jobs };
+        for request in rebon_work::take_requests(&self.home) {
+            changed |= match request {
+                event @ rebon_work::WorkRequest::Event { .. } => {
+                    rebon_work::route_event(ledger, event, &workers, now_ms, &mut hands)
+                }
+                request => rebon_work::apply_request(ledger, request, now_ms),
+            };
+        }
         let outcome = rebon_work::run_pass(ledger, &workers, now_ms, max_running, &mut hands);
         if changed || outcome.changed {
             if let Err(error) = ledger.save(&rebon_work::ledger_path(&self.home)) {
@@ -240,6 +245,25 @@ impl Hands for HostHands<'_> {
         rebon_session::last_turn_assistant_text(&transcript)
             .ok()
             .flatten()
+    }
+
+    fn deliver(&mut self, job_id: Option<&str>, text: &str) -> Result<(), String> {
+        let target = match job_id {
+            Some(job_id) => job_id.to_string(),
+            None => crate::router::current_router(self.store)
+                .map(|router| router.identity.job_id)
+                .ok_or("no router is running to take it")?,
+        };
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = format!(
+            "u-internal-scheduled-event-{}-{}",
+            rebon_session_host::now_ms(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let text = rebon_tool::cron::mark_scheduled_prompt(text);
+        rebon_session_host::append_background_scheduled_prompt(self.store, &target, id, text)
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
     }
 
     fn rework(&mut self, task: &Task, round: u32, findings: &str) -> Result<(), String> {

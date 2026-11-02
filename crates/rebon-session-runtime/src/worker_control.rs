@@ -456,6 +456,12 @@ impl HostWorkerControl {
         if let Some(pr) = rebon_automation::threads::parse_thread_ref(id) {
             return Ok(self.render_thread(&pr.key()));
         }
+        if let Some(key) = rebon_work::normalize_thread_key(id) {
+            return Ok(match self.ledger().subscriptions.get(&key) {
+                Some(owner) => format!("Thread {key}: owned by {owner} (Recall it)"),
+                None => format!("{key} is a thread nobody owns; its events come to you."),
+            });
+        }
         if let Some(task) = self.ledger().tasks.get(id) {
             return Ok(self.render_task(&router, task));
         }
@@ -561,13 +567,25 @@ impl WorkerControl for HostWorkerControl {
         worker_id: &str,
     ) -> Result<String, String> {
         let router = self.router(router_session_id)?;
-        let pr = rebon_automation::threads::parse_thread_ref(thread).ok_or_else(|| {
-            format!("{thread} is not a thread: write pr:owner/repo#12 or the pull request's URL")
-        })?;
         let owner = if worker_id == router.identity.job_id {
             router
         } else {
             self.worker(&router, worker_id)?
+        };
+        // Any other thread is the task ledger's: a chat, a mail, anything a
+        // source names with `scheme:rest`.
+        let Some(pr) = rebon_automation::threads::parse_thread_ref(thread) else {
+            let key = rebon_work::normalize_thread_key(thread).ok_or_else(|| {
+                format!(
+                    "{thread} is not a thread: write pr:owner/repo#12, a pull request's URL, or scheme:name such as im:team#42"
+                )
+            })?;
+            self.file(&rebon_work::WorkRequest::Subscribe {
+                thread: key.clone(),
+                job_id: owner.identity.job_id,
+                requested_at_ms: rebon_session_host::now_ms(),
+            })?;
+            return Ok(key);
         };
         // `gh` runs where the owner works: its worktree, else its project.
         let cwd = owner

@@ -552,10 +552,12 @@ impl Tool for SubscribeThreadTool {
     }
 
     fn description(&self) -> &str {
-        "Hand a thread to a worker: later events on it (checks failing, changes \
-         requested, merged, closed) go straight to that worker without passing \
-         through you. A thread is a pull request, written `pr:owner/repo#12` or \
-         as its URL. Handing a thread to a new worker takes it from the old one."
+        "Hand a thread to a worker: later events on it go straight to that \
+         worker without passing through you. A thread is a pull request \
+         (`pr:owner/repo#12` or its URL: checks failing, changes requested, \
+         merged, closed) or anything an outside source names `scheme:name`, \
+         such as a chat thread `im:team#42` or a mail thread `mail:inbox/7`. \
+         Handing a thread to a new worker takes it from the old one."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -564,7 +566,7 @@ impl Tool for SubscribeThreadTool {
             "properties": {
                 "thread": {
                     "type": "string",
-                    "description": "pr:owner/repo#12, or the pull request's URL"
+                    "description": "pr:owner/repo#12, a pull request's URL, or scheme:name such as im:team#42"
                 },
                 "workerId": { "type": "string", "description": "The worker that owns it from now on" }
             },
