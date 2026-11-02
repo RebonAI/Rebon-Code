@@ -42,7 +42,7 @@ pub struct QueueDisplayLine {
 pub struct QueueDisplayLayout {
     /// Whether the banner should be shown at all.
     pub visible: bool,
-    /// Header text, e.g. `"3 queued message(s)"`.
+    /// 包含排队消息数和 ↑ 编辑提示的标题文本。
     pub header: String,
     /// Individual stacked lines, one per queued message.
     pub lines: Vec<QueueDisplayLine>,
@@ -61,10 +61,8 @@ pub fn build_queue_display(input: &QueueDisplayInput) -> QueueDisplayLayout {
     }
 
     let count = input.items.len();
-    let header = format!(
-        "{count} queued message{}",
-        if count == 1 { "" } else { "s" }
-    );
+    let suffix = if count == 1 { "" } else { "s" };
+    let header = format!("{count} queued message{suffix} (Press ↑ to edit message{suffix})");
 
     let cap = if input.max_width > 0 {
         input.max_width
@@ -142,7 +140,7 @@ mod tests {
             items: vec![item("a")],
             max_width: 0,
         });
-        assert_eq!(layout.header, "1 queued message");
+        assert_eq!(layout.header, "1 queued message (Press ↑ to edit message)");
     }
 
     #[test]
@@ -151,7 +149,10 @@ mod tests {
             items: vec![item("a"), item("b"), item("c")],
             max_width: 0,
         });
-        assert_eq!(layout.header, "3 queued messages");
+        assert_eq!(
+            layout.header,
+            "3 queued messages (Press ↑ to edit messages)"
+        );
     }
 
     // ── stacking lines ─────────────────────────────────────────
@@ -261,13 +262,18 @@ mod tests {
         let layout = build_queue_display(&QueueDisplayInput {
             items: vec![
                 item("fix the login bug"),
-                item("this is a very long message that should be truncated to fit within the display width"),
+                item(
+                    "this is a very long message that should be truncated to fit within the display width",
+                ),
                 item("  multiline\nsecond line  "),
             ],
             max_width: 30,
         });
         assert!(layout.visible);
-        assert_eq!(layout.header, "3 queued messages");
+        assert_eq!(
+            layout.header,
+            "3 queued messages (Press ↑ to edit messages)"
+        );
         assert_eq!(layout.lines.len(), 3);
         assert_eq!(layout.lines[0].text, "fix the login bug");
         assert_eq!(
