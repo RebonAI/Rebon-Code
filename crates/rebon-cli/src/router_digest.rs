@@ -122,11 +122,15 @@ impl RouterDigest {
 
     /// One tick. `true` while lines wait to go out, which keeps the
     /// supervisor up for them.
+    /// `notices` are what the task ledger's pass found; `task_of` names the
+    /// task a worker works on.
     pub(crate) fn tick(
         &self,
         store: &BackgroundStore,
         jobs: &[BackgroundJobState],
         now_ms: u64,
+        notices: &[rebon_work::TaskNotice],
+        task_of: &TaskOf<'_>,
     ) -> bool {
         let Some(router) = crate::router::current_router(store) else {
             self.publish(None);
@@ -153,7 +157,19 @@ impl RouterDigest {
                     .flatten()
             })
         };
-        collect(state, router_id, jobs, now_ms, &last_reply);
+        collect(state, router_id, jobs, now_ms, &last_reply, task_of);
+        for notice in notices
+            .iter()
+            .filter(|notice| notice.router_job_id.as_deref() == Some(router_id))
+        {
+            state.pending.push(format!(
+                "- task {} \"{}\" {}",
+                notice.task_id,
+                notice.title,
+                clip(&notice.text)
+            ));
+            state.pending_since_ms.get_or_insert(now_ms);
+        }
         let due = state
             .pending_since_ms
             .is_some_and(|since| now_ms.saturating_sub(since) >= BATCH_MS);
@@ -188,6 +204,8 @@ impl RouterDigest {
 
 /// A worker's last reply, read only for a worker that just finished a turn.
 type LastReply<'a> = dyn Fn(&BackgroundJobState) -> Option<String> + 'a;
+/// The task a worker works on.
+pub(crate) type TaskOf<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
 /// Note every worker of `router_id` whose state moved to one worth a line.
 fn collect(
@@ -196,6 +214,7 @@ fn collect(
     jobs: &[BackgroundJobState],
     now_ms: u64,
     last_reply: &LastReply<'_>,
+    task_of: &TaskOf<'_>,
 ) {
     if state.router_job_id.as_deref() != Some(router_id) {
         *state = DigestState {
@@ -214,7 +233,7 @@ fn collect(
         );
         let changed = state.seen.get(&job.identity.job_id) != Some(&now);
         if changed {
-            if let Some(line) = line(job, last_reply) {
+            if let Some(line) = line(job, last_reply, task_of) {
                 state.pending.push(line);
                 state.pending_since_ms.get_or_insert(now_ms);
             }
@@ -239,7 +258,11 @@ fn status_key(status: BackgroundJobStatus) -> &'static str {
 }
 
 /// The line for a worker's new state, if the state is worth one.
-fn line(job: &BackgroundJobState, last_reply: &LastReply<'_>) -> Option<String> {
+fn line(
+    job: &BackgroundJobState,
+    last_reply: &LastReply<'_>,
+    task_of: &TaskOf<'_>,
+) -> Option<String> {
     let id = &job.identity.job_id;
     let name = &job.identity.name;
     let what = match job.process.status {
@@ -280,7 +303,10 @@ fn line(job: &BackgroundJobState, last_reply: &LastReply<'_>) -> Option<String> 
         }
         BackgroundJobStatus::Stopped => "was stopped".to_string(),
     };
-    Some(format!("- {id} \"{name}\" {what}"))
+    let task = task_of(id)
+        .map(|task| format!(" (task {task})"))
+        .unwrap_or_default();
+    Some(format!("- {id} \"{name}\"{task} {what}"))
 }
 
 fn clip(text: &str) -> String {
@@ -342,13 +368,34 @@ mod tests {
     fn a_worker_is_reported_once_per_settled_turn() {
         let mut state = DigestState::default();
         let mut job = worker("w1", "r", BackgroundJobStatus::Running, 1);
-        collect(&mut state, "r", std::slice::from_ref(&job), 0, &|_| None);
+        collect(
+            &mut state,
+            "r",
+            std::slice::from_ref(&job),
+            0,
+            &|_| None,
+            &|_| None,
+        );
         assert!(state.pending.is_empty(), "running is not news");
 
         job.process.status = BackgroundJobStatus::Idle;
         job.outcome.summary = Some("\nOpened a pull request\nmore".into());
-        collect(&mut state, "r", std::slice::from_ref(&job), 10, &|_| None);
-        collect(&mut state, "r", std::slice::from_ref(&job), 20, &|_| None);
+        collect(
+            &mut state,
+            "r",
+            std::slice::from_ref(&job),
+            10,
+            &|_| None,
+            &|_| None,
+        );
+        collect(
+            &mut state,
+            "r",
+            std::slice::from_ref(&job),
+            20,
+            &|_| None,
+            &|_| None,
+        );
         assert_eq!(
             state.pending,
             ["- w1 \"task w1\" finished a turn: Opened a pull request"]
@@ -358,7 +405,14 @@ mod tests {
         job.process.turn_generation = 2;
         job.process.status = BackgroundJobStatus::Failed;
         job.outcome.error = Some("quota".into());
-        collect(&mut state, "r", std::slice::from_ref(&job), 30, &|_| None);
+        collect(
+            &mut state,
+            "r",
+            std::slice::from_ref(&job),
+            30,
+            &|_| None,
+            &|_| None,
+        );
         assert_eq!(state.pending.len(), 2);
         assert!(state.pending[1].ends_with("failed: quota"));
     }
@@ -370,10 +424,17 @@ mod tests {
         job.outcome.summary = Some("responding: done".into());
         let reply =
             |_: &BackgroundJobState| Some("\n  Fixed add(); 6 tests pass.\nDetails…".to_string());
-        collect(&mut state, "r", std::slice::from_ref(&job), 0, &reply);
+        collect(
+            &mut state,
+            "r",
+            std::slice::from_ref(&job),
+            0,
+            &reply,
+            &|_| Some("t-9".into()),
+        );
         assert_eq!(
             state.pending,
-            ["- w1 \"task w1\" finished a turn: Fixed add(); 6 tests pass."]
+            ["- w1 \"task w1\" (task t-9) finished a turn: Fixed add(); 6 tests pass."]
         );
     }
 
@@ -382,9 +443,16 @@ mod tests {
         let mut state = DigestState::default();
         let mine = worker("w1", "r", BackgroundJobStatus::Idle, 1);
         let other = worker("w2", "someone", BackgroundJobStatus::Idle, 1);
-        collect(&mut state, "r", &[mine.clone(), other], 0, &|_| None);
+        collect(
+            &mut state,
+            "r",
+            &[mine.clone(), other],
+            0,
+            &|_| None,
+            &|_| None,
+        );
         assert_eq!(state.pending.len(), 1);
-        collect(&mut state, "r2", &[mine], 5, &|_| None);
+        collect(&mut state, "r2", &[mine], 5, &|_| None, &|_| None);
         assert!(state.pending.is_empty(), "w1 is not r2's");
         assert_eq!(state.router_job_id.as_deref(), Some("r2"));
     }

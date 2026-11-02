@@ -44,6 +44,7 @@ mod sibling_command;
 mod steering_poller;
 mod thread_routing;
 mod tui;
+mod work_host;
 
 use std::ffi::OsString;
 use std::fs;

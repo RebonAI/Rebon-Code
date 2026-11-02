@@ -271,11 +271,13 @@ pub use plan_mode::PlanModeContext;
 pub use queue::QueueContext;
 pub use structured_output::StructuredOutputContext;
 pub use tasks::TaskContext;
-pub use worker_control::{DispatchedWorker, WorkerControl, WorkerControlContext, WorkerDispatch};
 pub use team_manager::TeamContext;
 pub use tool_search::ToolSearchContext;
 pub use ultraplan::UltraplanRunContext;
 pub use web::WebContext;
+pub use worker_control::{
+    DispatchedWorker, PlannedTask, WorkerControl, WorkerControlContext, WorkerDispatch,
+};
 pub use workflow::WorkflowContext;
 
 pub use agent::{

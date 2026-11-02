@@ -1,0 +1,18 @@
+[package]
+name = "rebon-work"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The router's task ledger: tasks with a goal, a definition of done and dependencies, the request files that plan and cancel them, and the pass the background supervisor runs to dispatch ready tasks and follow their workers. Launching and reading jobs are injected, so this crate names no session host."
+
+[dependencies]
+rebon-session.workspace = true
+
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

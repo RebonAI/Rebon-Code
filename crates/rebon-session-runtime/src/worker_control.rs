@@ -9,7 +9,11 @@
 //! router may steer only its own workers; it may look up any job.
 //!
 //! Threads are handed over through `rebon_automation`'s request files, since
-//! the supervisor is the only writer of the thread table.
+//! the supervisor is the only writer of the thread table. Tasks are planned
+//! and cancelled the same way, through `rebon_work`'s: every worker works on
+//! a task in the router's ledger, which the supervisor dispatches and
+//! follows. [`launch_worker`] is shared with the supervisor, which starts the
+//! workers of planned tasks.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,7 +23,7 @@ use rebon_session_host::{
     BackgroundJobState, BackgroundJobStatus, BackgroundLaunchOptions, BackgroundRuntimeFields,
     BackgroundStore,
 };
-use rebon_tool::{DispatchedWorker, WorkerControl, WorkerDispatch};
+use rebon_tool::{DispatchedWorker, PlannedTask, WorkerControl, WorkerDispatch};
 
 /// The permission mode every worker runs in.
 const WORKER_PERMISSION_MODE: &str = "auto";
@@ -75,79 +79,69 @@ impl HostWorkerControl {
         Ok(worker)
     }
 
-    fn launch(
+    fn ledger(&self) -> rebon_work::Ledger {
+        rebon_work::Ledger::load(&rebon_work::ledger_path(self.config_home())).unwrap_or_default()
+    }
+
+    /// File a request, and make sure a supervisor is up to take it.
+    fn file(&self, request: &rebon_work::WorkRequest) -> Result<(), String> {
+        rebon_work::file_request(self.config_home(), request)
+            .map_err(|error| format!("{error:#}"))?;
+        rebon_session_host::ensure_supervisor_running(&self.store, &crate::host::rebon_exe())
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn plan(
         &self,
         router: &BackgroundJobState,
-        request: &WorkerDispatch,
-    ) -> Result<DispatchedWorker, String> {
-        let project = PathBuf::from(&request.project);
-        if !project.is_absolute() || !project.is_dir() {
-            return Err(format!(
-                "{} is not a project directory; give its absolute path",
-                request.project
-            ));
+        tasks: Vec<PlannedTask>,
+    ) -> Result<Vec<String>, String> {
+        if tasks.is_empty() {
+            return Err("a plan needs at least one task".to_string());
         }
-        let mut notes = Vec::new();
-        let isolate = request.isolate && in_git_repo(&project);
-        if request.isolate && !isolate {
-            notes.push(
-                "the project is not a git repository, so the worker works in the directory itself"
-                    .to_string(),
-            );
+        let now = rebon_session_host::now_ms();
+        let ids: std::collections::BTreeMap<String, String> = tasks
+            .iter()
+            .map(|task| (task.key.clone(), rebon_work::new_task_id(now)))
+            .collect();
+        if ids.len() != tasks.len() {
+            return Err("each task in a plan needs its own key".to_string());
         }
-        let model = match request.model_profile.as_deref() {
-            Some(profile) => {
-                let model = crate::rebon_config::active_provider_profile_model(profile);
-                if model.is_none() {
-                    notes.push(format!(
-                        "no model is set for the `{profile}` profile, so the worker uses the default model"
-                    ));
+        let ledger = self.ledger();
+        let mut planned = Vec::new();
+        for task in &tasks {
+            check_project(&task.project)?;
+            let mut depends_on = Vec::new();
+            for dep in &task.depends_on {
+                match ids.get(dep) {
+                    Some(id) => depends_on.push(id.clone()),
+                    None if ledger.tasks.contains_key(dep) => depends_on.push(dep.clone()),
+                    None => {
+                        return Err(format!(
+                            "task `{}` depends on `{dep}`, which is neither a key in this plan nor a task id",
+                            task.key
+                        ))
+                    }
                 }
-                model
             }
-            None => None,
-        };
-        let options = BackgroundLaunchOptions {
-            prompt: rebon_tool::cron::mark_scheduled_prompt(&worker_brief(router, request)),
-            images: Vec::new(),
-            cwd: project,
-            isolate_in_worktree: isolate,
-            require_worktree: false,
-            // Its commits are what the router hands on; keep them.
-            preserve_worktree_on_success: isolate,
-            queue_session: false,
-            runtime: BackgroundRuntimeFields {
-                provider: None,
-                model,
-                fast_mode: None,
-                channels: Vec::new(),
-                development_channels: Vec::new(),
-                provider_format: None,
-                ui_mode: None,
-                effort_level: None,
-                permission_mode: Some(WORKER_PERMISSION_MODE.to_string()),
-                capability_mode: rebon_types::AgentCapabilityMode::Normal,
-                settings: Vec::new(),
-                add_dirs: Vec::new(),
-                plugin_dirs: Vec::new(),
-                mcp_configs: Vec::new(),
-                strict_mcp_config: false,
-            },
-            name: Some(request.title.clone()),
-            agent_type: None,
-            parent_job_id: Some(router.identity.job_id.clone()),
-        };
-        let job = rebon_session_host::launch_background_prompt(
-            &self.store,
-            options,
-            &crate::host::rebon_exe(),
-            crate::host::runtime_permissions::ensure_background_runtime_permission_mode_allowed,
-        )
-        .map_err(|error| format!("{error:#}"))?;
-        Ok(DispatchedWorker {
-            worker_id: job.identity.job_id,
-            note: (!notes.is_empty()).then(|| notes.join("; ")),
-        })
+            planned.push(rebon_work::NewTask {
+                id: ids[&task.key].clone(),
+                title: task.title.clone(),
+                project: task.project.clone(),
+                goal: task.goal.clone(),
+                done_when: task.done_when.clone(),
+                depends_on,
+                isolate: task.isolate,
+                model_profile: task.model_profile.clone(),
+            });
+        }
+        let order = planned.iter().map(|task| task.id.clone()).collect();
+        self.file(&rebon_work::WorkRequest::Plan {
+            router_job_id: Some(router.identity.job_id.clone()),
+            tasks: planned,
+            requested_at_ms: now,
+        })?;
+        Ok(order)
     }
 
     fn queue_turn(&self, worker: &BackgroundJobState, message: &str) -> Result<(), String> {
@@ -187,6 +181,86 @@ impl HostWorkerControl {
             .unwrap_or_default()
     }
 
+    fn render_task(&self, router: &BackgroundJobState, task: &rebon_work::Task) -> String {
+        let mut lines = vec![format!("Task {} — {}", task.id, task.title)];
+        let mut status = format!("status: {}", task.status.as_str());
+        if let Some(note) = task.note.as_deref() {
+            status.push_str(&format!(" ({note})"));
+        }
+        lines.push(status);
+        lines.push(format!("project: {}", task.project));
+        if !task.done_when.is_empty() {
+            lines.push(format!("done when: {}", task.done_when));
+        }
+        if !task.depends_on.is_empty() {
+            lines.push(format!("depends on: {}", task.depends_on.join(", ")));
+        }
+        if let Some(worker) = task.worker_job_id.as_deref() {
+            lines.push(format!(
+                "worker: {worker} (Recall it for its last reply), attempts: {}",
+                task.attempts
+            ));
+        }
+        if task.router_job_id.as_deref() != Some(router.identity.job_id.as_str()) {
+            lines.push("not one of your tasks".to_string());
+        }
+        let recent: Vec<String> = task
+            .history
+            .iter()
+            .rev()
+            .take(5)
+            .map(|event| format!("  {}", event.what))
+            .collect();
+        if !recent.is_empty() {
+            lines.push("recent:".to_string());
+            lines.extend(recent);
+        }
+        lines.push(format!(
+            "goal:\n{}",
+            tail(task.goal.trim(), RECALL_REPLY_CHARS)
+        ));
+        lines.join("\n")
+    }
+
+    /// The router's tasks that are not settled, for the listing.
+    fn render_open_tasks(&self, router: &BackgroundJobState) -> Option<String> {
+        let ledger = self.ledger();
+        let open: Vec<&rebon_work::Task> = ledger
+            .tasks
+            .values()
+            .filter(|task| {
+                task.router_job_id.as_deref() == Some(router.identity.job_id.as_str())
+                    && !matches!(
+                        task.status,
+                        rebon_work::TaskStatus::Done | rebon_work::TaskStatus::Cancelled
+                    )
+            })
+            .collect();
+        if open.is_empty() {
+            return None;
+        }
+        let mut lines = vec![format!("{} open task(s):", open.len())];
+        for task in open {
+            let worker = task
+                .worker_job_id
+                .as_deref()
+                .map(|worker| format!(", worker {worker}"))
+                .unwrap_or_default();
+            let note = task
+                .note
+                .as_deref()
+                .map(|note| format!(" — {note}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "- {} [{}] {}{worker}{note}",
+                task.id,
+                task.status.as_str(),
+                task.title
+            ));
+        }
+        Some(lines.join("\n"))
+    }
+
     fn render_workers(&self, router: &BackgroundJobState) -> Result<String, String> {
         let mut workers: Vec<_> = self
             .store
@@ -197,8 +271,12 @@ impl HostWorkerControl {
                 job.identity.parent_job_id.as_deref() == Some(router.identity.job_id.as_str())
             })
             .collect();
+        let tasks = self.render_open_tasks(router);
         if workers.is_empty() {
-            return Ok("You have no workers.".to_string());
+            return Ok(match tasks {
+                Some(tasks) => format!("{tasks}\nNo worker has started yet."),
+                None => "You have no workers and no open tasks.".to_string(),
+            });
         }
         workers.sort_by_key(|job| std::cmp::Reverse(job.process.updated_at_ms));
         let total = workers.len();
@@ -221,6 +299,9 @@ impl HostWorkerControl {
         }
         if total > RECALL_MAX_WORKERS {
             lines.push(format!("… and {} older", total - RECALL_MAX_WORKERS));
+        }
+        if let Some(tasks) = tasks {
+            lines.insert(0, tasks);
         }
         Ok(lines.join("\n"))
     }
@@ -286,6 +367,13 @@ impl HostWorkerControl {
         if !threads.is_empty() {
             lines.push(format!("threads: {}", threads.join(", ")));
         }
+        if let Some(task) = self.ledger().task_of_worker(job_id) {
+            lines.push(format!(
+                "task: {} [{}] (Recall it)",
+                task.id,
+                task.status.as_str()
+            ));
+        }
         if let Some(summary) = job.outcome.summary.as_deref() {
             lines.push(format!("summary: {summary}"));
         }
@@ -324,6 +412,9 @@ impl HostWorkerControl {
         if let Some(pr) = rebon_automation::threads::parse_thread_ref(id) {
             return Ok(self.render_thread(&pr.key()));
         }
+        if let Some(task) = self.ledger().tasks.get(id) {
+            return Ok(self.render_task(&router, task));
+        }
         let job = self
             .store
             .read_state(id)
@@ -334,13 +425,70 @@ impl HostWorkerControl {
 
 #[async_trait]
 impl WorkerControl for HostWorkerControl {
+    async fn plan_tasks(
+        &self,
+        router_session_id: &str,
+        tasks: Vec<PlannedTask>,
+    ) -> Result<Vec<String>, String> {
+        let router = self.router(router_session_id)?;
+        self.plan(&router, tasks)
+    }
+
+    async fn cancel_task(
+        &self,
+        router_session_id: &str,
+        task_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), String> {
+        let router = self.router(router_session_id)?;
+        let ledger = self.ledger();
+        let task = ledger
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| format!("there is no task {task_id}"))?;
+        if task.router_job_id.as_deref() != Some(router.identity.job_id.as_str()) {
+            return Err(format!("{task_id} is not one of your tasks"));
+        }
+        if let Some(worker_id) = task.worker_job_id.as_deref() {
+            if let Ok(mut worker) = self.worker(&router, worker_id) {
+                rebon_session_host::stop_background_job_tree_in_store(&self.store, &mut worker)
+                    .map_err(|error| format!("{error:#}"))?;
+            }
+        }
+        self.file(&rebon_work::WorkRequest::Cancel {
+            task_id: task_id.to_string(),
+            reason: reason.map(str::to_string),
+            requested_at_ms: rebon_session_host::now_ms(),
+        })
+    }
+
     async fn dispatch(
         &self,
         router_session_id: &str,
         request: WorkerDispatch,
     ) -> Result<DispatchedWorker, String> {
         let router = self.router(router_session_id)?;
-        self.launch(&router, &request)
+        // A worker started now is still a task: the supervisor follows it
+        // from the ledger like any planned one.
+        let task_id = rebon_work::new_task_id(rebon_session_host::now_ms());
+        let mut dispatched = launch_worker(&self.store, &router, &request, Some(&task_id))?;
+        self.file(&rebon_work::WorkRequest::Bind {
+            router_job_id: Some(router.identity.job_id.clone()),
+            task: rebon_work::NewTask {
+                id: task_id.clone(),
+                title: request.title.clone(),
+                project: request.project.clone(),
+                goal: request.brief.clone(),
+                done_when: request.done_when.clone(),
+                depends_on: Vec::new(),
+                isolate: request.isolate,
+                model_profile: request.model_profile.clone(),
+            },
+            worker_job_id: dispatched.worker_id.clone(),
+            requested_at_ms: rebon_session_host::now_ms(),
+        })?;
+        dispatched.task_id = Some(task_id);
+        Ok(dispatched)
     }
 
     async fn continue_worker(
@@ -402,13 +550,109 @@ impl WorkerControl for HostWorkerControl {
     }
 }
 
-/// What a new worker is told: who sent it and the router's brief.
-fn worker_brief(router: &BackgroundJobState, request: &WorkerDispatch) -> String {
+fn check_project(project: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(project);
+    if !path.is_absolute() || !path.is_dir() {
+        return Err(format!(
+            "{project} is not a project directory; give its absolute path"
+        ));
+    }
+    Ok(path)
+}
+
+/// Start a worker under `router` on `request`, for the task `task_id` when
+/// it has one. Used by `DispatchWorker` and by the supervisor for a planned
+/// task.
+pub fn launch_worker(
+    store: &BackgroundStore,
+    router: &BackgroundJobState,
+    request: &WorkerDispatch,
+    task_id: Option<&str>,
+) -> Result<DispatchedWorker, String> {
+    let project = check_project(&request.project)?;
+    let mut notes = Vec::new();
+    let isolate = request.isolate && in_git_repo(&project);
+    if request.isolate && !isolate {
+        notes.push(
+            "the project is not a git repository, so the worker works in the directory itself"
+                .to_string(),
+        );
+    }
+    let model = match request.model_profile.as_deref() {
+        Some(profile) => {
+            let model = crate::rebon_config::active_provider_profile_model(profile);
+            if model.is_none() {
+                notes.push(format!(
+                    "no model is set for the `{profile}` profile, so the worker uses the default model"
+                ));
+            }
+            model
+        }
+        None => None,
+    };
+    let options = BackgroundLaunchOptions {
+        prompt: rebon_tool::cron::mark_scheduled_prompt(&worker_brief(router, request, task_id)),
+        images: Vec::new(),
+        cwd: project,
+        isolate_in_worktree: isolate,
+        require_worktree: false,
+        // Its commits are what the router hands on; keep them.
+        preserve_worktree_on_success: isolate,
+        queue_session: false,
+        runtime: BackgroundRuntimeFields {
+            provider: None,
+            model,
+            fast_mode: None,
+            channels: Vec::new(),
+            development_channels: Vec::new(),
+            provider_format: None,
+            ui_mode: None,
+            effort_level: None,
+            permission_mode: Some(WORKER_PERMISSION_MODE.to_string()),
+            capability_mode: rebon_types::AgentCapabilityMode::Normal,
+            settings: Vec::new(),
+            add_dirs: Vec::new(),
+            plugin_dirs: Vec::new(),
+            mcp_configs: Vec::new(),
+            strict_mcp_config: false,
+        },
+        name: Some(request.title.clone()),
+        agent_type: None,
+        parent_job_id: Some(router.identity.job_id.clone()),
+    };
+    let job = rebon_session_host::launch_background_prompt(
+        store,
+        options,
+        &crate::host::rebon_exe(),
+        crate::host::runtime_permissions::ensure_background_runtime_permission_mode_allowed,
+    )
+    .map_err(|error| format!("{error:#}"))?;
+    Ok(DispatchedWorker {
+        worker_id: job.identity.job_id,
+        task_id: task_id.map(str::to_string),
+        note: (!notes.is_empty()).then(|| notes.join("; ")),
+    })
+}
+
+/// What a new worker is told: who sent it, its task and the router's brief.
+fn worker_brief(
+    router: &BackgroundJobState,
+    request: &WorkerDispatch,
+    task_id: Option<&str>,
+) -> String {
+    let task = task_id.map(|id| format!(" ({id})")).unwrap_or_default();
+    let done_when = if request.done_when.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\nDone when: {}", request.done_when.trim())
+    };
     format!(
         "You are a worker dispatched by the Rebon router (job {}). Work on this task on your own; \
-         the router reads your final reply, not the person. Finish with a short report: what you \
-         did, what is left, and the URL of any pull request you opened.\n\n\
-         Task: {}\n\n{}",
+         the router reads your final reply, not the person. The task is done only when what it \
+         asks for actually holds; check that yourself before you stop. Finish with a short report: \
+         what you did, the evidence that it is done, what is left, and the URL of any pull request \
+         you opened.\n\n\
+         Task{task}: {}{done_when}\n\n{}",
         router.identity.job_id, request.title, request.brief
     )
 }
@@ -574,6 +818,7 @@ mod tests {
                     project: "relative/path".into(),
                     title: "t".into(),
                     brief: "b".into(),
+                    done_when: String::new(),
                     isolate: false,
                     model_profile: None,
                 },

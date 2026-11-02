@@ -81,6 +81,7 @@ members = [
     "crates/rebon-provider",
     "crates/rebon-rc-runner",
     "crates/rebon-plugin-host",
+    "crates/rebon-work",
 ]
 
 # `rebon-rc-runner` dev-depends on the server by path, and cargo pulls a
@@ -181,6 +182,7 @@ rebon-acp-client = { path = "crates/rebon-acp-client" }
 rebon-proto = { path = "crates/rebon-proto" }
 rebon-agent-core = { path = "crates/rebon-agent-core" }
 rebon-automation = { path = "crates/rebon-automation" }
+rebon-work = { path = "crates/rebon-work" }
 rebon-session = { path = "crates/rebon-session" }
 rebon-session-state = { path = "crates/rebon-session-state" }
 rebon-session-host = { path = "crates/rebon-session-host" }

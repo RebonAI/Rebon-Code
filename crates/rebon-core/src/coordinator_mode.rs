@@ -161,6 +161,8 @@ pub fn coordinator_session_filter_for_queue(queue_session: bool) -> ToolFilter {
 /// Tools only the router session has. Every other session filter denies
 /// them; see `crate::router_mode`.
 pub const ROUTER_ONLY_TOOLS: &[&str] = &[
+    "PlanTasks",
+    "CancelTask",
     "DispatchWorker",
     "ContinueWorker",
     "StopWorker",

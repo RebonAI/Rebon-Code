@@ -4620,6 +4620,7 @@ dependencies = [
  "rebon-types",
  "rebon-ui-seat",
  "rebon-width",
+ "rebon-work",
  "reqwest",
  "serde",
  "serde_json",
@@ -5755,6 +5756,7 @@ dependencies = [
  "rebon-tools-core",
  "rebon-types",
  "rebon-width",
+ "rebon-work",
  "regex",
  "reqwest",
  "serde",
@@ -5939,6 +5941,17 @@ name = "rebon-width"
 version = "1.25.2"
 dependencies = [
  "unicode-width 0.1.14",
+]
+
+[[package]]
+name = "rebon-work"
+version = "1.25.1"
+dependencies = [
+ "anyhow",
+ "rebon-session",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

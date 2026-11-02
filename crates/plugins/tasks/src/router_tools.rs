@@ -1,5 +1,5 @@
-//! The router's tools: start, continue and stop workers, hand threads to
-//! them, and look things up.
+//! The router's tools: plan and cancel tasks, start, continue and stop
+//! workers, hand threads to them, and look things up.
 //!
 //! Each tool resolves the [`WorkerControl`] its session's surface attached
 //! and calls it. Only a router session sees these tools: every other session
@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rebon_tool::{Tool, ToolContext, WorkerControl, WorkerDispatch};
+use rebon_tool::{PlannedTask, Tool, ToolContext, WorkerControl, WorkerDispatch};
 use rebon_tools_core::{
     parse_tool_input, ToolError, ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
 };
@@ -20,9 +20,13 @@ pub const CONTINUE_WORKER_TOOL_NAME: &str = "ContinueWorker";
 pub const STOP_WORKER_TOOL_NAME: &str = "StopWorker";
 pub const SUBSCRIBE_THREAD_TOOL_NAME: &str = "SubscribeThread";
 pub const RECALL_TOOL_NAME: &str = "Recall";
+pub const PLAN_TASKS_TOOL_NAME: &str = "PlanTasks";
+pub const CANCEL_TASK_TOOL_NAME: &str = "CancelTask";
 
 /// Every router tool name.
 pub const ROUTER_TOOL_NAMES: &[&str] = &[
+    PLAN_TASKS_TOOL_NAME,
+    CANCEL_TASK_TOOL_NAME,
     DISPATCH_WORKER_TOOL_NAME,
     CONTINUE_WORKER_TOOL_NAME,
     STOP_WORKER_TOOL_NAME,
@@ -43,6 +47,10 @@ pub struct StopWorkerTool;
 pub struct SubscribeThreadTool;
 #[derive(Debug, Clone, Default)]
 pub struct RecallTool;
+#[derive(Debug, Clone, Default)]
+pub struct PlanTasksTool;
+#[derive(Debug, Clone, Default)]
+pub struct CancelTaskTool;
 
 /// The control and the router's session id, or the refusal every tool gives
 /// outside a router session.
@@ -85,6 +93,8 @@ struct DispatchInput {
     title: String,
     brief: String,
     #[serde(default)]
+    done_when: Option<String>,
+    #[serde(default)]
     isolate: bool,
     #[serde(default)]
     model_profile: Option<String>,
@@ -97,8 +107,10 @@ impl Tool for DispatchWorkerTool {
     }
 
     fn description(&self) -> &str {
-        "Start a worker on one task in one project. Returns its id at once; you \
-         hear from it in a later digest, so do not wait.\n\
+        "Start a worker on one task in one project now. Returns the worker's id \
+         and its task's id at once; you hear from it in a later digest, so do \
+         not wait. For work in several steps, or that has to wait for other \
+         work, use PlanTasks instead.\n\
          \n\
          The worker sees only `brief`. Make it self-contained: the goal, what \
          done looks like, what is already known (with ids it can look up), and \
@@ -126,6 +138,10 @@ impl Tool for DispatchWorkerTool {
                 "brief": {
                     "type": "string",
                     "description": "Everything the worker needs to know"
+                },
+                "doneWhen": {
+                    "type": "string",
+                    "description": "What must hold for the task to be done, checkably"
                 },
                 "isolate": {
                     "type": "boolean",
@@ -176,6 +192,7 @@ impl Tool for DispatchWorkerTool {
                     project: parsed.project.trim().to_string(),
                     title: parsed.title.trim().to_string(),
                     brief: parsed.brief,
+                    done_when: parsed.done_when.unwrap_or_default().trim().to_string(),
                     isolate: parsed.isolate,
                     model_profile: parsed
                         .model_profile
@@ -185,11 +202,227 @@ impl Tool for DispatchWorkerTool {
             )
             .await
             .map_err(|error| execution_error(self, error))?;
-        let mut result = json!({ "workerId": dispatched.worker_id, "started": true });
+        let mut result = json!({
+            "workerId": dispatched.worker_id,
+            "taskId": dispatched.task_id,
+            "started": true,
+        });
         if let Some(note) = dispatched.note {
             result["note"] = json!(note);
         }
         Ok(result)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PlannedTaskInput {
+    key: String,
+    title: String,
+    project: String,
+    goal: String,
+    done_when: String,
+    #[serde(default)]
+    depends_on: Vec<String>,
+    #[serde(default)]
+    isolate: bool,
+    #[serde(default)]
+    model_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct PlanInput {
+    tasks: Vec<PlannedTaskInput>,
+}
+
+#[async_trait]
+impl Tool for PlanTasksTool {
+    fn id(&self) -> ToolId {
+        ToolId::new(PLAN_TASKS_TOOL_NAME)
+    }
+
+    fn description(&self) -> &str {
+        "Plan work as tasks. Each task gets a worker of its own once the tasks it \
+         depends on are done; the supervisor dispatches and follows them, so you \
+         do not start or wait for them yourself. Returns each task's id at once.\n\
+         \n\
+         Give every task a `key` for this plan, and name the tasks it waits for in \
+         `dependsOn`, by key or by the id of a task planned before. `goal` is the \
+         worker's whole brief: it sees nothing else. `doneWhen` says, checkably, \
+         what must hold for the task to be done. Tasks that do not depend on each \
+         other run side by side; set `isolate` on a task that changes code while \
+         others may touch the same checkout."
+    }
+
+    fn input_schema(&self) -> ToolInputSchema {
+        json!({
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "key": { "type": "string", "description": "This task's name within the plan" },
+                            "title": { "type": "string", "description": "A few words naming the task" },
+                            "project": { "type": "string", "description": "Absolute path of the project directory" },
+                            "goal": { "type": "string", "description": "Everything the worker needs to know" },
+                            "doneWhen": { "type": "string", "description": "What must hold for the task to be done, checkably" },
+                            "dependsOn": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Keys in this plan, or ids of earlier tasks, that must be done first"
+                            },
+                            "isolate": { "type": "boolean", "description": "Work in a git worktree of its own" },
+                            "modelProfile": { "type": "string", "description": "A model profile such as fast or reasoning; omit for the default" }
+                        },
+                        "required": ["key", "title", "project", "goal", "doneWhen"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["tasks"],
+            "additionalProperties": false
+        })
+    }
+
+    fn is_read_only(&self, _input: &Value) -> bool {
+        false
+    }
+
+    async fn validate_input(
+        &self,
+        input: &Value,
+        _context: &ToolContext,
+    ) -> ToolResult<ValidationOutcome> {
+        let parsed: PlanInput = parse_tool_input(self.id(), input)?;
+        if parsed.tasks.is_empty() {
+            return Ok(ValidationOutcome::invalid(
+                "a plan needs at least one task".to_string(),
+                INVALID_INPUT_CODE,
+            ));
+        }
+        for task in &parsed.tasks {
+            if let Some(invalid) = required(&task.key, "key")
+                .or_else(|| required(&task.title, "title"))
+                .or_else(|| required(&task.project, "project"))
+                .or_else(|| required(&task.goal, "goal"))
+                .or_else(|| required(&task.done_when, "doneWhen"))
+            {
+                return Ok(invalid);
+            }
+            if task.goal.chars().count() > MAX_BRIEF_CHARS {
+                return Ok(ValidationOutcome::invalid(
+                    format!(
+                        "the goal of `{}` is longer than {MAX_BRIEF_CHARS} characters",
+                        task.key
+                    ),
+                    INVALID_INPUT_CODE,
+                ));
+            }
+        }
+        Ok(ValidationOutcome::valid())
+    }
+
+    async fn call(&self, input: Value, context: &ToolContext) -> ToolResult<Value> {
+        let parsed: PlanInput = parse_tool_input(self.id(), &input)?;
+        let (control, session_id) = control_and_session(self, context)?;
+        let keys: Vec<String> = parsed
+            .tasks
+            .iter()
+            .map(|task| task.key.trim().to_string())
+            .collect();
+        let tasks = parsed
+            .tasks
+            .into_iter()
+            .map(|task| PlannedTask {
+                key: task.key.trim().to_string(),
+                title: task.title.trim().to_string(),
+                project: task.project.trim().to_string(),
+                goal: task.goal,
+                done_when: task.done_when.trim().to_string(),
+                depends_on: task
+                    .depends_on
+                    .into_iter()
+                    .map(|dep| dep.trim().to_string())
+                    .filter(|dep| !dep.is_empty())
+                    .collect(),
+                isolate: task.isolate,
+                model_profile: task
+                    .model_profile
+                    .map(|profile| profile.trim().to_string())
+                    .filter(|profile| !profile.is_empty()),
+            })
+            .collect();
+        let ids = control
+            .plan_tasks(session_id, tasks)
+            .await
+            .map_err(|error| execution_error(self, error))?;
+        let tasks: serde_json::Map<String, Value> = keys
+            .into_iter()
+            .zip(ids)
+            .map(|(key, id)| (key, Value::String(id)))
+            .collect();
+        Ok(json!({ "planned": true, "tasks": tasks }))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CancelInput {
+    task_id: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[async_trait]
+impl Tool for CancelTaskTool {
+    fn id(&self) -> ToolId {
+        ToolId::new(CANCEL_TASK_TOOL_NAME)
+    }
+
+    fn description(&self) -> &str {
+        "Cancel one of your tasks: its worker is stopped and the task is not \
+         dispatched again. Tasks that depend on it are blocked until you plan \
+         them anew."
+    }
+
+    fn input_schema(&self) -> ToolInputSchema {
+        json!({
+            "type": "object",
+            "properties": {
+                "taskId": { "type": "string", "description": "The task's id" },
+                "reason": { "type": "string", "description": "Why, kept with the task" }
+            },
+            "required": ["taskId"],
+            "additionalProperties": false
+        })
+    }
+
+    fn is_read_only(&self, _input: &Value) -> bool {
+        false
+    }
+
+    async fn validate_input(
+        &self,
+        input: &Value,
+        _context: &ToolContext,
+    ) -> ToolResult<ValidationOutcome> {
+        let parsed: CancelInput = parse_tool_input(self.id(), input)?;
+        Ok(required(&parsed.task_id, "taskId").unwrap_or_else(ValidationOutcome::valid))
+    }
+
+    async fn call(&self, input: Value, context: &ToolContext) -> ToolResult<Value> {
+        let parsed: CancelInput = parse_tool_input(self.id(), &input)?;
+        let (control, session_id) = control_and_session(self, context)?;
+        let task_id = parsed.task_id.trim();
+        control
+            .cancel_task(session_id, task_id, parsed.reason.as_deref())
+            .await
+            .map_err(|error| execution_error(self, error))?;
+        Ok(json!({ "taskId": task_id, "cancelled": true }))
     }
 }
 
@@ -381,10 +614,11 @@ impl Tool for RecallTool {
     }
 
     fn description(&self) -> &str {
-        "Look up an id: a worker, a thread (`pr:owner/repo#12`) or the router \
-         itself. You get a short digest with the ids next to it, which you can \
+        "Look up an id: a task (`t-…`), a worker, a thread (`pr:owner/repo#12`) \
+         or the router itself. You get a short digest with the ids next to it, which you can \
          Recall in turn: a worker lists its threads and last reply, a thread \
-         names its worker. With no id, lists your workers. Follow the chain \
+         names its worker, a task names its worker and what it waits for. With \
+         no id, lists your open tasks and your workers. Follow the chain \
          instead of answering from memory."
     }
 
@@ -435,6 +669,30 @@ mod tests {
 
     #[async_trait]
     impl WorkerControl for Recorder {
+        async fn plan_tasks(
+            &self,
+            router: &str,
+            tasks: Vec<PlannedTask>,
+        ) -> Result<Vec<String>, String> {
+            self.calls.lock().unwrap().push(format!(
+                "plan {router} {}",
+                tasks
+                    .iter()
+                    .map(|task| format!("{}<-{}", task.key, task.depends_on.join("+")))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+            Ok(tasks.iter().map(|task| format!("t-{}", task.key)).collect())
+        }
+        async fn cancel_task(
+            &self,
+            _router: &str,
+            task: &str,
+            _reason: Option<&str>,
+        ) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("cancel {task}"));
+            Ok(())
+        }
         async fn dispatch(
             &self,
             router: &str,
@@ -446,6 +704,7 @@ mod tests {
             ));
             Ok(DispatchedWorker {
                 worker_id: "w1".into(),
+                task_id: Some("t-1".into()),
                 note: None,
             })
         }
@@ -495,6 +754,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(started["workerId"], "w1");
+        assert_eq!(started["taskId"], "t-1");
         ContinueWorkerTool
             .call(json!({"workerId": " w1 ", "message": "next"}), &ctx)
             .await
@@ -517,6 +777,41 @@ mod tests {
             .call(json!({"workerId": "someone-else"}), &ctx)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_plan_maps_each_key_to_its_task_id() {
+        let control = Arc::new(Recorder::default());
+        let ctx = context(control.clone());
+        let input = json!({"tasks": [
+            {"key": "api", "title": "API", "project": "/p", "goal": "g", "doneWhen": "tests pass"},
+            {"key": "ui", "title": "UI", "project": "/p", "goal": "g", "doneWhen": "it renders",
+             "dependsOn": ["api"]}
+        ]});
+        assert!(PlanTasksTool
+            .validate_input(&input, &ctx)
+            .await
+            .unwrap()
+            .is_valid());
+        let planned = PlanTasksTool.call(input, &ctx).await.unwrap();
+        assert_eq!(planned["tasks"]["api"], "t-api");
+        assert_eq!(planned["tasks"]["ui"], "t-ui");
+        CancelTaskTool
+            .call(json!({"taskId": "t-ui"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            *control.calls.lock().unwrap(),
+            ["plan router-session api<-,ui<-api", "cancel t-ui"]
+        );
+        let missing_done = json!({"tasks": [
+            {"key": "a", "title": "A", "project": "/p", "goal": "g", "doneWhen": " "}
+        ]});
+        assert!(!PlanTasksTool
+            .validate_input(&missing_done, &ctx)
+            .await
+            .unwrap()
+            .is_valid());
     }
 
     #[tokio::test]

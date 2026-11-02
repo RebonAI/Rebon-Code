@@ -27,7 +27,7 @@
 //! | `todo_write` (the todo store) | the TUI's task pane renders it directly |
 //! | `queue` (`QueueContext`) | `ToolContext` hands out the controller the coordinator sets |
 //!
-//! Turning the plugin off takes all nineteen tools and three attachment
+//! Turning the plugin off takes all twenty-one tools and three attachment
 //! producers off their process seats. Task runtime state and stores already
 //! created by the session are untouched: the model just loses the plugin
 //! surfaces that read and write them.
@@ -86,8 +86,9 @@ pub use roster::{
     render_teammate_roster_context, RosterAttachmentPoller, RosterAttachmentProducer,
 };
 pub use router_tools::{
-    ContinueWorkerTool, DispatchWorkerTool, RecallTool, StopWorkerTool, SubscribeThreadTool,
-    CONTINUE_WORKER_TOOL_NAME, DISPATCH_WORKER_TOOL_NAME, RECALL_TOOL_NAME, ROUTER_TOOL_NAMES,
+    CancelTaskTool, ContinueWorkerTool, DispatchWorkerTool, PlanTasksTool, RecallTool,
+    StopWorkerTool, SubscribeThreadTool, CANCEL_TASK_TOOL_NAME, CONTINUE_WORKER_TOOL_NAME,
+    DISPATCH_WORKER_TOOL_NAME, PLAN_TASKS_TOOL_NAME, RECALL_TOOL_NAME, ROUTER_TOOL_NAMES,
     STOP_WORKER_TOOL_NAME, SUBSCRIBE_THREAD_TOOL_NAME,
 };
 pub use runtime::take_pending_teammate_messages;
@@ -119,7 +120,7 @@ const ROSTER_PROVIDER_ID: &str = "tasks/roster";
 /// Attachment-seat provider id for the periodic task nudge.
 const REMINDER_PROVIDER_ID: &str = "tasks/reminder";
 
-/// The nineteen tools, in registration order.
+/// The twenty-one tools, in registration order.
 ///
 /// Public so a test that needs the whole builtin catalogue on a bare
 /// [`rebon_core::Engine`] can register them without standing up a kernel.
@@ -139,6 +140,8 @@ pub fn tools() -> Vec<Arc<dyn rebon_tool::Tool>> {
         Arc::new(QueueVerdictTool),
         Arc::new(QueueDispatchTool),
         Arc::new(QueueBlockTool),
+        Arc::new(PlanTasksTool),
+        Arc::new(CancelTaskTool),
         Arc::new(DispatchWorkerTool),
         Arc::new(ContinueWorkerTool),
         Arc::new(StopWorkerTool),
@@ -163,6 +166,8 @@ pub const TOOL_NAMES: &[&str] = &[
     QUEUE_VERDICT_TOOL_NAME,
     QUEUE_DISPATCH_TOOL_NAME,
     QUEUE_BLOCK_TOOL_NAME,
+    PLAN_TASKS_TOOL_NAME,
+    CANCEL_TASK_TOOL_NAME,
     DISPATCH_WORKER_TOOL_NAME,
     CONTINUE_WORKER_TOOL_NAME,
     STOP_WORKER_TOOL_NAME,
@@ -354,8 +359,8 @@ mod tests {
     /// `TodoWrite` and the five `Task*` tools are each other's off switch —
     /// `is_todo_v2_enabled()` decides which half a session sees, and the
     /// seat honours `is_enabled()`. So no one environment resolves all
-    /// nineteen; the eighteen that are live by default are here and
-    /// [`the_switch_reaches_todo_write_too`] covers the nineteenth.
+    /// twenty-one; the twenty that are live by default are here and
+    /// [`the_switch_reaches_todo_write_too`] covers the twenty-first.
     const DEFAULT_ON: &[&str] = &[
         TASK_CREATE_TOOL_NAME,
         TASK_GET_TOOL_NAME,
@@ -370,6 +375,8 @@ mod tests {
         QUEUE_VERDICT_TOOL_NAME,
         QUEUE_DISPATCH_TOOL_NAME,
         QUEUE_BLOCK_TOOL_NAME,
+        PLAN_TASKS_TOOL_NAME,
+        CANCEL_TASK_TOOL_NAME,
         DISPATCH_WORKER_TOOL_NAME,
         CONTINUE_WORKER_TOOL_NAME,
         STOP_WORKER_TOOL_NAME,
@@ -502,8 +509,8 @@ mod tests {
         let (kernel, registry) = boot();
         let seat = seat(&kernel);
 
-        assert_eq!(TOOL_NAMES.len(), 19);
-        assert_eq!(DEFAULT_ON.len(), 18);
+        assert_eq!(TOOL_NAMES.len(), 21);
+        assert_eq!(DEFAULT_ON.len(), 20);
         for name in DEFAULT_ON {
             assert!(
                 seat.resolve(name, None).unwrap().is_some(),
@@ -654,7 +661,7 @@ mod tests {
         assert_eq!(attachment_seat.provider_ids(), all);
     }
 
-    /// The nineteenth tool. In a non-interactive session the halves swap:
+    /// The twenty-first tool. In a non-interactive session the halves swap:
     /// `TodoWrite` is the live one and the five `Task*` tools are not. The
     /// plugin switch still governs both halves.
     #[test]
