@@ -100,6 +100,35 @@ pub(super) fn submit_or_queue_with_images(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn submit_or_queue_with_images_and_uuid(
     app: &mut AppState,
+    text: String,
+    images: Vec<rebon_session_host::BackgroundImageAttachment>,
+    user_message_uuid: Option<String>,
+    session: &mut TuiEngineSession,
+    handle: &Handle,
+    active_prompt: &mut Option<ActivePrompt>,
+    pending_permission: &mut Option<PendingPermission>,
+    ui_mode: UiMode,
+) -> bool {
+    submit_or_queue_from(
+        app,
+        text,
+        images,
+        user_message_uuid,
+        session,
+        handle,
+        active_prompt,
+        pending_permission,
+        ui_mode,
+        TypedLine::ByTheUser,
+    )
+}
+
+/// The submit path for a line that did not come from this terminal's keyboard:
+/// a plugin's `$.prompt.submit` or a remote controller's inject. Such a line is
+/// submitted like a typed one, except that it is never read as `@name message`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn submit_or_queue_from(
+    app: &mut AppState,
     mut text: String,
     images: Vec<rebon_session_host::BackgroundImageAttachment>,
     user_message_uuid: Option<String>,
@@ -108,6 +137,7 @@ pub(super) fn submit_or_queue_with_images_and_uuid(
     active_prompt: &mut Option<ActivePrompt>,
     pending_permission: &mut Option<PendingPermission>,
     ui_mode: UiMode,
+    typed: TypedLine,
 ) -> bool {
     let injected_images = images
         .iter()
@@ -269,21 +299,23 @@ pub(super) fn submit_or_queue_with_images_and_uuid(
         active_prompt,
         cursor_offset_before_submit,
         transcript_len_before_submit,
-        TypedLine::ByTheUser,
+        typed,
     )
 }
 
 /// Where the line being submitted came from.
 ///
-/// A typed `@name` is an address; an expansion a command chose is text, and
-/// running an address check on it would let a plugin's output be diverted to
-/// another session by a `@` it happens to contain.
+/// A typed `@name` is an address; text a plugin, a command or a remote client
+/// chose is text, and running an address check on it would let that text be
+/// diverted to another session by a `@` it happens to contain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TypedLine {
+pub(super) enum TypedLine {
     /// What the person typed at the prompt.
     ByTheUser,
     /// What a `Prompt` command expanded to.
     Expanded,
+    /// What a plugin or a remote controller submitted on the person's behalf.
+    Injected,
 }
 
 /// The submit path once the `command-registry` seat has had its look: the
@@ -5888,6 +5920,69 @@ mod tests {
             "the teammate named in the line was not written to"
         );
         assert!(app.pending_goal_clarification.is_none());
+
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    /// A plugin's `$.prompt.submit` and a remote controller's inject are text
+    /// somebody else chose: an `@bob` in them reaches the model, even though the
+    /// same line typed here is delivered to bob.
+    #[test]
+    fn an_injected_at_word_is_prompt_text_even_when_somebody_answers() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut session = make_test_tui_session();
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        let mut app = AppState::new();
+        let registry = Arc::new(rebon_plugin_tasks::runtime::TaskRegistry::new());
+        app.tasks = registry.clone();
+        session.engine_half.tasks = registry;
+        let bob = insert_running_teammate(&app, "bob", "teammate-bob");
+        let mut active_prompt = None;
+
+        // Typed, the line is an address: bob gets it and no turn starts.
+        app.input = "@bob take the parser".into();
+        app.cursor_offset = app.input.len();
+        assert!(!submit_or_queue(
+            &mut app,
+            "@bob take the parser".into(),
+            &mut session,
+            &handle,
+            &mut active_prompt,
+            &mut None,
+            UiMode::Screen,
+        ));
+        runtime.block_on(tokio::task::yield_now());
+        assert_eq!(
+            teammate_pending_messages(&app, &bob),
+            vec!["take the parser".to_string()]
+        );
+        assert!(submitted_prompt(&recorder).is_none());
+
+        // Injected, the same words are a prompt for this session.
+        assert!(!super::submit_or_queue_from(
+            &mut app,
+            "@bob review the lexer".into(),
+            Vec::new(),
+            None,
+            &mut session,
+            &handle,
+            &mut active_prompt,
+            &mut None,
+            UiMode::Screen,
+            super::TypedLine::Injected,
+        ));
+        runtime.block_on(tokio::task::yield_now());
+        assert_eq!(
+            submitted_prompt(&recorder).as_deref(),
+            Some("@bob review the lexer")
+        );
+        assert_eq!(
+            teammate_pending_messages(&app, &bob),
+            vec!["take the parser".to_string()],
+            "the injected line was not delivered to bob"
+        );
 
         drop(active_prompt.take());
         runtime.shutdown_background();

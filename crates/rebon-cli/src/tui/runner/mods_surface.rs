@@ -42,7 +42,7 @@ use crate::tui::permission_modal::PendingPermission;
 use crate::tui::wiring::TuiEngineSession;
 use crate::ui_config::UiMode;
 
-use super::submit::submit_or_queue;
+use super::submit::{submit_or_queue_from, TypedLine};
 use super::transcript_messages::inject_mod_notice;
 use super::ActivePrompt;
 
@@ -722,14 +722,19 @@ fn submit_mod_prompt(
         "prompt",
         &format!("{plugin} submitted a prompt"),
     );
-    submit_or_queue(
+    // Submitted like a typed line, but never read as `@name message`: the
+    // plugin chose this text, and a `@` in it is not the person naming a reader.
+    submit_or_queue_from(
         app,
         text,
+        Vec::new(),
+        None,
         session,
         handle,
         active_prompt,
         pending_permission,
         ui_mode,
+        TypedLine::Injected,
     );
 }
 

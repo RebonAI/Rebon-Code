@@ -2922,7 +2922,7 @@ fn publish_transcript_conditionally(
     Ok(())
 }
 
-fn sync_parent_directory(path: &Path) {
+pub(crate) fn sync_parent_directory(path: &Path) {
     #[cfg(windows)]
     let _ = path;
     #[cfg(not(windows))]

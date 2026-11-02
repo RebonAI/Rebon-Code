@@ -80,6 +80,7 @@ mod summary;
 pub mod supervisor;
 mod supervisor_clients;
 mod transcript_preview;
+mod waiting_agent_messages;
 mod warm_peek;
 /// The compatibility goldens that must not break. Tests only.
 #[cfg(test)]
@@ -193,6 +194,10 @@ use transcript_preview::read_transcript_preview;
 pub use transcript_preview::{
     background_job_transcript_cwd, background_job_transcript_path_in,
     preserved_background_worktree_path, shorten_excerpt, shorten_labelled_excerpt,
+};
+pub use waiting_agent_messages::{
+    load_waiting_agent_messages, save_waiting_agent_messages, waiting_agent_messages_path,
+    WaitingAgentMessage, WAITING_AGENT_MESSAGES_SUFFIX,
 };
 pub use warm_peek::warm_background_job_for_peek_in_store;
 pub use worktree_path::{

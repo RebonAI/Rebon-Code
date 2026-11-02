@@ -56,7 +56,7 @@ use super::permission_flow::{
     apply_permission_modal_action_for_session, set_permission_mode_for_session,
     submit_ask_user_question_if_ready,
 };
-use super::submit::submit_or_queue_with_images_and_uuid;
+use super::submit::{submit_or_queue_from, TypedLine};
 use super::ActivePrompt;
 
 /// Runs one mailbox `RunCommand`.
@@ -165,6 +165,14 @@ pub(super) struct ForegroundControl {
     /// The session the listener was started for, so a session switch restarts
     /// it on the new session's project directory instead of keeping the old.
     agent_endpoint_session: Option<(PathBuf, String, String)>,
+    /// Where this session's waiting agent messages are kept on disk, once it
+    /// holds the lock.
+    waiting_path: Option<PathBuf>,
+    /// What that file holds, so it is rewritten only when the set changes.
+    waiting_saved: Vec<rebon_session_host::WaitingAgentMessage>,
+    /// The session whose file was last read back. Reading happens once per
+    /// session: after that, memory is what is waiting and the file follows it.
+    waiting_restored_for: Option<(PathBuf, String, String)>,
 }
 
 impl ForegroundControl {
@@ -177,6 +185,9 @@ impl ForegroundControl {
             )),
             agent_endpoint: None,
             agent_endpoint_session: None,
+            waiting_path: None,
+            waiting_saved: Vec::new(),
+            waiting_restored_for: None,
         }
     }
 
@@ -243,6 +254,9 @@ impl ForegroundControl {
         // old session had been told says nothing about the new one.
         self.agent_inbox.set_session(&identity.2);
         self.stop_agent_endpoint();
+        // Before the listener can accept anything new: what this session was
+        // still holding when its last owner exited comes back first.
+        self.restore_waiting_agent_messages(session, &identity);
         // Remembered even when start fails: retrying every event-loop pass
         // would bind and discard a port each time, and the mailbox capability
         // is still advertised either way.
@@ -265,6 +279,117 @@ impl ForegroundControl {
                 );
                 self.mailbox.set_agent_endpoint(None);
             }
+        }
+    }
+
+    /// Put back the agent messages this session's file says were still
+    /// waiting, and remember the file for [`Self::record_waiting_agent_messages`].
+    ///
+    /// They come back as riders: the person who quit did not get to see them,
+    /// so they join the next turn, but reopening a session is not a reason for
+    /// it to start one on its own.
+    ///
+    /// Once per session. The listener failing to start, or the lock being lost
+    /// and taken back, brings this session here again, and by then the file
+    /// may still list a message a turn has since read; memory is right and the
+    /// next snapshot corrects the file.
+    ///
+    /// On a switch from another session, the inbox still holds that session's
+    /// messages (it outlives the runtime). They go back to that session's file,
+    /// so they reach it when it is reopened rather than riding into this one.
+    fn restore_waiting_agent_messages(
+        &mut self,
+        session: &TuiEngineSession,
+        identity: &(PathBuf, String, String),
+    ) {
+        if self.waiting_restored_for.as_ref() == Some(identity) {
+            return;
+        }
+        self.hand_back_waiting_agent_messages(session);
+        self.waiting_restored_for = Some(identity.clone());
+        let path =
+            rebon_session_host::waiting_agent_messages_path(&identity.0, &identity.1, &identity.2);
+        let saved = rebon_session_host::load_waiting_agent_messages(&path);
+        let held = waiting_agent_messages(session);
+        let returning = saved
+            .iter()
+            .filter(|message| {
+                !held
+                    .iter()
+                    .any(|waiting| waiting.message_id == message.message_id)
+            })
+            .map(|message| DeferredAgentMessage {
+                message_id: message.message_id.clone(),
+                text: message.text.clone(),
+                from_session_id: message.from_session_id.clone(),
+                hops: message.hops,
+                verdict: rebon_tool::peer::WakeVerdict::Refused,
+            })
+            .collect::<Vec<_>>();
+        if !returning.is_empty() {
+            tracing::info!(
+                count = returning.len(),
+                session_id = %identity.2,
+                "rebon: restored agent messages still waiting from the last run"
+            );
+            let mid_turn_queue = &session.engine_half.runtime.mid_turn_queue;
+            session
+                .engine_half
+                .session_loop
+                .inbox()
+                .push_agent_messages(returning, &mid_turn_queue.reply_ledger());
+        }
+        self.waiting_saved = saved;
+        self.waiting_path = Some(path);
+    }
+
+    /// Move the agent messages the inbox holds for the session it last served
+    /// into that session's file, beside what the file already listed.
+    fn hand_back_waiting_agent_messages(&mut self, session: &TuiEngineSession) {
+        let Some(path) = self.waiting_path.take() else {
+            return;
+        };
+        let mut waiting = std::mem::take(&mut self.waiting_saved);
+        let held = session
+            .engine_half
+            .session_loop
+            .inbox()
+            .take_agent_items()
+            .into_iter()
+            .filter_map(waiting_from_context_item);
+        for message in held {
+            if !waiting
+                .iter()
+                .any(|seen| seen.message_id == message.message_id)
+            {
+                waiting.push(message);
+            }
+        }
+        if let Err(error) = rebon_session_host::save_waiting_agent_messages(&path, &waiting) {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "rebon: could not hand waiting agent messages back to the session they were sent to"
+            );
+        }
+    }
+
+    /// Write what is still waiting to this session's file when it changed.
+    fn record_waiting_agent_messages(&mut self, session: &TuiEngineSession) {
+        let Some(path) = self.waiting_path.as_ref() else {
+            return;
+        };
+        let waiting = waiting_agent_messages(session);
+        if waiting == self.waiting_saved {
+            return;
+        }
+        match rebon_session_host::save_waiting_agent_messages(path, &waiting) {
+            Ok(()) => self.waiting_saved = waiting,
+            Err(error) => tracing::warn!(
+                %error,
+                path = %path.display(),
+                "rebon: could not record the agent messages still waiting"
+            ),
         }
     }
 
@@ -346,6 +471,7 @@ impl ForegroundControl {
             return;
         }
         self.apply_pending_agent_messages(session, active_prompt);
+        self.record_waiting_agent_messages(session);
         let activity = current_streaming_activity(app);
         for claim in self.mailbox.claims() {
             let command_id = claim.envelope.command_id.clone();
@@ -459,7 +585,9 @@ impl ForegroundControl {
                 // Runs the prompt now, or queues it behind the in-flight turn —
                 // same path as a locally-typed submit. The "should exit" return
                 // is ignored: a remote controller cannot quit the local TUI.
-                let _ = submit_or_queue_with_images_and_uuid(
+                // Never read as `@name message`: only a line typed at this
+                // terminal is an address.
+                let _ = submit_or_queue_from(
                     app,
                     message,
                     images,
@@ -469,6 +597,7 @@ impl ForegroundControl {
                     active_prompt,
                     pending_permission,
                     ui_mode,
+                    TypedLine::Injected,
                 );
                 Ok(None)
             }
@@ -536,6 +665,97 @@ impl ForegroundControl {
             }
         }
     }
+}
+
+impl Drop for ForegroundControl {
+    /// A message the listener accepted after the last event-loop pass never
+    /// reached the session's inbox, so the last snapshot does not list it.
+    /// Close the listener first, so nothing more arrives, then add whatever it
+    /// was still holding to the file.
+    fn drop(&mut self) {
+        self.stop_agent_endpoint();
+        let Some(path) = self.waiting_path.as_ref() else {
+            return;
+        };
+        let arrived = self.agent_inbox.take_pending_messages();
+        if arrived.is_empty() {
+            return;
+        }
+        let mut waiting = std::mem::take(&mut self.waiting_saved);
+        for accepted in arrived {
+            if waiting
+                .iter()
+                .any(|message| message.message_id == accepted.envelope.message_id)
+            {
+                continue;
+            }
+            waiting.push(rebon_session_host::WaitingAgentMessage {
+                text: rebon_session_host::frame_agent_message(&accepted.envelope),
+                message_id: accepted.envelope.message_id,
+                from_session_id: accepted.envelope.from_session_id,
+                hops: accepted.envelope.hops,
+            });
+        }
+        if let Err(error) = rebon_session_host::save_waiting_agent_messages(path, &waiting) {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "rebon: could not record the agent messages that arrived while exiting"
+            );
+        }
+    }
+}
+
+/// Every agent message this session holds and no turn has read yet: those
+/// waiting in its inbox for the next turn, then those queued for the running
+/// turn's next tool round. Each appears once.
+fn waiting_agent_messages(
+    session: &TuiEngineSession,
+) -> Vec<rebon_session_host::WaitingAgentMessage> {
+    use crate::session::session_inbox::ContextSource;
+    let inbox = session
+        .engine_half
+        .session_loop
+        .inbox()
+        .pending_context_items(ContextSource::Agent)
+        .into_iter()
+        .filter_map(waiting_from_context_item);
+    let queued = session
+        .engine_half
+        .runtime
+        .mid_turn_queue
+        .pending_agent_messages()
+        .into_iter()
+        .map(|message| rebon_session_host::WaitingAgentMessage {
+            message_id: message.message_id,
+            from_session_id: message.from_session_id,
+            hops: message.hops,
+            text: message.text,
+        });
+    let mut waiting: Vec<rebon_session_host::WaitingAgentMessage> = Vec::new();
+    for message in inbox.chain(queued) {
+        if !waiting
+            .iter()
+            .any(|seen| seen.message_id == message.message_id)
+        {
+            waiting.push(message);
+        }
+    }
+    waiting
+}
+
+/// The record of a waiting inbox item, when it is another session's message.
+fn waiting_from_context_item(
+    item: crate::session::session_inbox::ContextItem,
+) -> Option<rebon_session_host::WaitingAgentMessage> {
+    let message_id = item.agent_message_id?;
+    let (from_session_id, hops) = item.inbound?;
+    Some(rebon_session_host::WaitingAgentMessage {
+        message_id,
+        from_session_id,
+        hops,
+        text: item.text,
+    })
 }
 
 /// What the running turn is working on, for the status sidecar.
@@ -1055,6 +1275,229 @@ mod tests {
                 rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1
             )),
             "the depth travels with the message, not with the turn"
+        );
+    }
+
+    /// A message still waiting when the terminal quits is on disk, comes back
+    /// the next time the session is opened without starting a turn of its own,
+    /// and leaves the file once a turn has carried it.
+    #[tokio::test]
+    async fn a_waiting_agent_message_survives_the_terminal_exiting() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let identity = (
+            root.path().to_path_buf(),
+            "/work/repo".to_string(),
+            "sess-waiting".to_string(),
+        );
+        let path =
+            rebon_session_host::waiting_agent_messages_path(&identity.0, &identity.1, &identity.2);
+
+        // First run: a message past the hop bound waits, and is recorded.
+        {
+            let mut session = super::super::test_support::make_test_tui_session();
+            let mut control = ForegroundControl::new(&session);
+            control.restore_waiting_agent_messages(&session, &identity);
+            let mut app = AppState::new();
+            let handle = tokio::runtime::Handle::current();
+            let mut active = None;
+            let applied = control.apply(
+                &mut app,
+                &mut session,
+                &handle,
+                &mut active,
+                &mut None,
+                UiMode::Screen,
+                "cmd-agent-deep",
+                agent_message(
+                    "m-deep",
+                    "sess-sender",
+                    "the fifth hand-off",
+                    rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1,
+                ),
+            );
+            assert!(matches!(applied, Ok(None)), "got {applied:?}");
+            control.record_waiting_agent_messages(&session);
+            let saved = rebon_session_host::load_waiting_agent_messages(&path);
+            assert_eq!(
+                saved
+                    .iter()
+                    .map(|m| m.message_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["m-deep"]
+            );
+            assert!(saved[0].text.contains("the fifth hand-off"));
+        }
+
+        // Second run: it is back in the inbox, as a rider.
+        let session = super::super::test_support::make_test_tui_session();
+        let mut control = ForegroundControl::new(&session);
+        control.restore_waiting_agent_messages(&session, &identity);
+        let inbox = session.engine_half.session_loop.inbox();
+        assert!(inbox.has_context(), "the message came back");
+        assert!(
+            !inbox.has_waking_context(),
+            "reopening a session does not start a turn for it"
+        );
+
+        // Restoring again in the same process does not add it twice.
+        control.restore_waiting_agent_messages(&session, &identity);
+        let items = super::super::context_prompts::drain_model_context_items(&session);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].agent_message_id.as_deref(), Some("m-deep"));
+        assert_eq!(
+            items[0].inbound,
+            Some((
+                "sess-sender".to_string(),
+                rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1
+            ))
+        );
+
+        // A turn carried it: nothing waits, and the file goes.
+        control.record_waiting_agent_messages(&session);
+        assert!(!path.exists());
+    }
+
+    /// Apply one agent message past the hop bound, so it waits in the inbox.
+    fn leave_a_waiting_message(
+        control: &ForegroundControl,
+        session: &mut TuiEngineSession,
+        message_id: &str,
+    ) {
+        let mut app = AppState::new();
+        let handle = tokio::runtime::Handle::current();
+        let applied = control.apply(
+            &mut app,
+            session,
+            &handle,
+            &mut None,
+            &mut None,
+            UiMode::Screen,
+            "cmd-agent",
+            agent_message(
+                message_id,
+                "sess-sender",
+                "waiting",
+                rebon_tool::peer::MAX_AGENT_MESSAGE_HOPS + 1,
+            ),
+        );
+        assert!(matches!(applied, Ok(None)), "got {applied:?}");
+    }
+
+    fn waiting_ids(path: &std::path::Path) -> Vec<String> {
+        rebon_session_host::load_waiting_agent_messages(path)
+            .into_iter()
+            .map(|message| message.message_id)
+            .collect()
+    }
+
+    /// The same session reached again — the listener failed to start, or the
+    /// lock came back — does not read the file again: a message a turn read
+    /// since the last snapshot must not come back from it.
+    #[tokio::test]
+    async fn reaching_the_same_session_again_does_not_restore_what_a_turn_read() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let identity = (
+            root.path().to_path_buf(),
+            "/work/repo".to_string(),
+            "sess-again".to_string(),
+        );
+        let path =
+            rebon_session_host::waiting_agent_messages_path(&identity.0, &identity.1, &identity.2);
+        let mut session = super::super::test_support::make_test_tui_session();
+        let mut control = ForegroundControl::new(&session);
+        control.restore_waiting_agent_messages(&session, &identity);
+        leave_a_waiting_message(&control, &mut session, "m-read");
+        control.record_waiting_agent_messages(&session);
+        assert_eq!(waiting_ids(&path), ["m-read"]);
+
+        // A turn reads it before the next snapshot, and the session is reached
+        // again while the file still lists it.
+        let items = super::super::context_prompts::drain_model_context_items(&session);
+        assert_eq!(items.len(), 1);
+        control.restore_waiting_agent_messages(&session, &identity);
+
+        assert!(!session.engine_half.session_loop.inbox().has_context());
+        control.record_waiting_agent_messages(&session);
+        assert!(!path.exists());
+    }
+
+    /// The inbox outlives a session switch. What it holds for the session left
+    /// behind goes back to that session's file instead of into the new one's.
+    #[tokio::test]
+    async fn a_session_switch_hands_waiting_messages_back_to_their_session() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let first = (
+            root.path().to_path_buf(),
+            "/work/repo".to_string(),
+            "sess-first".to_string(),
+        );
+        let second = (
+            root.path().to_path_buf(),
+            "/work/repo".to_string(),
+            "sess-second".to_string(),
+        );
+        let first_path =
+            rebon_session_host::waiting_agent_messages_path(&first.0, &first.1, &first.2);
+        let second_path =
+            rebon_session_host::waiting_agent_messages_path(&second.0, &second.1, &second.2);
+        let mut session = super::super::test_support::make_test_tui_session();
+        let mut control = ForegroundControl::new(&session);
+        control.restore_waiting_agent_messages(&session, &first);
+        leave_a_waiting_message(&control, &mut session, "m-recorded");
+        control.record_waiting_agent_messages(&session);
+        // Arrives after the last snapshot, so only memory has it.
+        leave_a_waiting_message(&control, &mut session, "m-unrecorded");
+
+        control.restore_waiting_agent_messages(&session, &second);
+
+        assert_eq!(waiting_ids(&first_path), ["m-recorded", "m-unrecorded"]);
+        assert!(
+            !session.engine_half.session_loop.inbox().has_context(),
+            "the first session's messages do not ride into the second's turn"
+        );
+        control.record_waiting_agent_messages(&session);
+        assert!(!second_path.exists());
+    }
+
+    /// A message the listener accepted after the last pass is written out when
+    /// the terminal shuts down, beside what was already recorded.
+    #[tokio::test]
+    async fn a_message_accepted_while_exiting_is_recorded_on_drop() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let identity = (
+            root.path().to_path_buf(),
+            "/work/repo".to_string(),
+            "sess-exiting".to_string(),
+        );
+        let path =
+            rebon_session_host::waiting_agent_messages_path(&identity.0, &identity.1, &identity.2);
+        rebon_session_host::save_waiting_agent_messages(
+            &path,
+            &[rebon_session_host::WaitingAgentMessage {
+                message_id: "m-earlier".into(),
+                from_session_id: "sess-a".into(),
+                hops: 0,
+                text: "<teammate-message>earlier</teammate-message>".into(),
+            }],
+        )
+        .expect("seed");
+        let session = super::super::test_support::make_test_tui_session();
+        let mut control = ForegroundControl::new(&session);
+        control.restore_waiting_agent_messages(&session, &identity);
+        let envelope = agent_message("m-late", "sess-b", "late", 0)
+            .into_agent_message()
+            .expect("an agent message");
+        let _ = control.agent_inbox.accept(envelope);
+
+        drop(control);
+
+        let saved = rebon_session_host::load_waiting_agent_messages(&path);
+        assert_eq!(
+            saved
+                .iter()
+                .map(|m| m.message_id.as_str())
+                .collect::<Vec<_>>(),
+            ["m-earlier", "m-late"]
         );
     }
 
