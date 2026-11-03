@@ -4428,7 +4428,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-acp"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4455,7 +4455,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-acp-client"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4476,7 +4476,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-agent-core"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4495,7 +4495,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-api"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4515,7 +4515,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-automation"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4529,7 +4529,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-boa-runner"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "boa_engine 0.19.1",
  "boa_gc 0.19.1",
@@ -4560,7 +4560,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-cli"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4639,7 +4639,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-code-runner"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "futures-util",
  "libc",
@@ -4653,7 +4653,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-command-seat"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "rebon-kernel",
  "rebon-slash-commands",
@@ -4662,7 +4662,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-config"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "rebon-api",
@@ -4680,7 +4680,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-config-seat"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "rebon-kernel",
  "rebon-types",
@@ -4688,7 +4688,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-core"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4728,22 +4728,22 @@ dependencies = [
 
 [[package]]
 name = "rebon-customselect"
-version = "1.27.1"
+version = "1.27.2"
 
 [[package]]
 name = "rebon-design-system"
-version = "1.27.1"
+version = "1.27.2"
 
 [[package]]
 name = "rebon-dialog"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "rebon-customselect",
 ]
 
 [[package]]
 name = "rebon-group"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "fs2",
@@ -4755,7 +4755,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-harness"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4816,7 +4816,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-hooks"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "async-trait",
  "rebon-tools-core",
@@ -4831,7 +4831,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-i18n-gen"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -4839,7 +4839,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-instructions"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "rebon-kernel",
  "rebon-session",
@@ -4848,7 +4848,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-kernel"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -4858,7 +4858,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-kernel-seats"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4889,7 +4889,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-math"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "ratex-katex-fonts",
  "ratex-layout",
@@ -4901,7 +4901,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-mcp-channel"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -4923,7 +4923,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-message-tui"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "pulldown-cmark",
  "ratatui",
@@ -4937,7 +4937,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-permission-relay"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "rebon-session",
  "serde",
@@ -4947,7 +4947,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-permissions"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "rebon-shell-policy",
  "rebon-tools-core",
@@ -4956,11 +4956,11 @@ dependencies = [
 
 [[package]]
 name = "rebon-picker"
-version = "1.27.1"
+version = "1.27.2"
 
 [[package]]
 name = "rebon-plugin-agents"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4993,7 +4993,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-browser"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5014,7 +5014,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-computer-use"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5045,7 +5045,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-cron"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "async-trait",
  "rebon-core",
@@ -5060,7 +5060,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-escalation"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5075,7 +5075,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-groups"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5092,7 +5092,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-host"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5126,7 +5126,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-image-gen"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5147,7 +5147,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-lsp-mcp"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5167,7 +5167,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-mcp"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5194,7 +5194,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-memory"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "async-trait",
  "rebon-api",
@@ -5217,7 +5217,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-model-prompt"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "rebon-api",
  "rebon-core",
@@ -5226,7 +5226,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-model-routing"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5249,7 +5249,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-monitor"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -5266,7 +5266,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-node-host"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "rebon-kernel",
  "tracing",
@@ -5274,7 +5274,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-notebook"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5292,7 +5292,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-onboarding"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5318,7 +5318,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-package"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "rebon-hooks",
@@ -5332,7 +5332,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-plan-mode"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5351,7 +5351,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-profile"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5373,7 +5373,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-protocol"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -5383,7 +5383,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-remote"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -5400,7 +5400,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-sandbox"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5422,7 +5422,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-skill"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5446,7 +5446,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-structured-output"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "async-trait",
  "rebon-core",
@@ -5459,7 +5459,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-supervisor"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "rebon-plugin-protocol",
  "rebon-verve-host",
@@ -5473,7 +5473,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-tasks"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5499,7 +5499,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-updater"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -5520,7 +5520,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-web"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5542,7 +5542,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-plugin-workflow"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5566,7 +5566,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-proto"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "libc",
  "rebon-types",
@@ -5580,7 +5580,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-provider"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5603,7 +5603,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-rc-runner"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5653,7 +5653,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-render"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "rebon-design-system",
  "rebon-shell-policy",
@@ -5667,7 +5667,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-schema-gen"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "rebon-proto",
  "rebon-render",
@@ -5679,7 +5679,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-session"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "fs2",
@@ -5695,7 +5695,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-session-host"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5718,7 +5718,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-session-runtime"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5771,7 +5771,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-session-state"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "rebon-permissions",
  "rebon-proto",
@@ -5786,14 +5786,14 @@ dependencies = [
 
 [[package]]
 name = "rebon-shell"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "rebon-shell-policy"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "rebon-tools-core",
  "serde_json",
@@ -5802,7 +5802,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-slash-commands"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "rebon-types",
  "tracing",
@@ -5810,14 +5810,14 @@ dependencies = [
 
 [[package]]
 name = "rebon-spinner"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "rebon-types",
 ]
 
 [[package]]
 name = "rebon-tool"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5862,7 +5862,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-tools-core"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -5876,7 +5876,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-tui"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "base64 0.22.1",
  "image 0.25.10",
@@ -5901,7 +5901,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-types"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "getrandom 0.2.17",
  "rebon-tools-core",
@@ -5915,7 +5915,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-ui-seat"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "rebon-dialog",
  "rebon-kernel",
@@ -5925,7 +5925,7 @@ dependencies = [
 
 [[package]]
 name = "rebon-verve-host"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "cordis-verve",
  "serde_json",
@@ -5938,14 +5938,14 @@ dependencies = [
 
 [[package]]
 name = "rebon-width"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "unicode-width 0.1.14",
 ]
 
 [[package]]
 name = "rebon-work"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "anyhow",
  "rebon-session",
@@ -6384,7 +6384,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-win"
-version = "1.27.1"
+version = "1.27.2"
 dependencies = [
  "fs2",
  "serde",
