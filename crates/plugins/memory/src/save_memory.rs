@@ -80,6 +80,10 @@ impl Tool for SaveMemoryTool {
                 "target_file": {
                     "type": "string",
                     "description": "Optional basename-only .md target. No path separators, absolute paths, drive/UNC prefixes, `..`, or MEMORY.md."
+                },
+                "project": {
+                    "type": "string",
+                    "description": "Only with scope `repo`: the absolute path of a project whose memory this belongs in, when that is not the project this session runs in. Sessions working in that project read it."
                 }
             },
             "required": ["action", "scope"],
@@ -112,13 +116,25 @@ impl Tool for SaveMemoryTool {
     }
 
     async fn call(&self, input: Value, context: &ToolContext) -> ToolResult<Value> {
-        let request = parse_input(&input)?;
-        let cwd = context.cwd().ok_or_else(|| ToolError::InvalidInput {
+        let ParsedInput { request, project } = parse_input(&input)?;
+        let session_cwd = context.cwd().ok_or_else(|| ToolError::InvalidInput {
             tool: self.id(),
             reason: "cwd_missing: SaveMemory requires ToolContext.cwd() to resolve repo memory"
                 .into(),
             error_code: Some(INVALID_INPUT_CODE),
         })?;
+        // Repo memory is keyed by a project directory: this session's, or
+        // the one `project` names.
+        let cwd = match project.as_deref() {
+            Some(project) if !std::path::Path::new(project).is_dir() => {
+                return Err(invalid(
+                    &self.id(),
+                    format!("`project` is not a directory: {project}"),
+                ));
+            }
+            Some(project) => project,
+            None => session_cwd,
+        };
 
         let outcome = save_memory(cwd, request).map_err(|err| ToolError::InvalidInput {
             tool: self.id(),
@@ -148,7 +164,14 @@ impl Tool for SaveMemoryTool {
     }
 }
 
-fn parse_input(input: &Value) -> ToolResult<SaveMemoryRequest> {
+/// The request, and the project whose repo memory it goes to when that is
+/// not the session's own.
+struct ParsedInput {
+    request: SaveMemoryRequest,
+    project: Option<String>,
+}
+
+fn parse_input(input: &Value) -> ToolResult<ParsedInput> {
     let tool = ToolId::new(SAVE_MEMORY_TOOL_NAME);
     let object = input.as_object().ok_or_else(|| ToolError::InvalidInput {
         tool: tool.clone(),
@@ -169,17 +192,36 @@ fn parse_input(input: &Value) -> ToolResult<SaveMemoryRequest> {
         .transpose()
         .map_err(|err| invalid(&tool, err.to_string()))?;
 
-    Ok(SaveMemoryRequest {
-        action,
-        scope,
-        memory_type,
-        title: optional_string(object, "title", &tool)?,
-        description: optional_string(object, "description", &tool)?,
-        content: optional_string(object, "content", &tool)?,
-        source,
-        reason: optional_string(object, "reason", &tool)?,
-        dedupe_key: optional_string(object, "dedupe_key", &tool)?,
-        target_file: optional_string(object, "target_file", &tool)?,
+    let project = optional_string(object, "project", &tool)?;
+    if let Some(project) = project.as_deref() {
+        if scope != rebon_session::memory_paths::MemoryScope::Repo {
+            return Err(invalid(
+                &tool,
+                "`project` names whose repo memory to write; use it only with scope `repo`".into(),
+            ));
+        }
+        if !std::path::Path::new(project).is_absolute() {
+            return Err(invalid(
+                &tool,
+                format!("`project` must be an absolute path: {project}"),
+            ));
+        }
+    }
+
+    Ok(ParsedInput {
+        request: SaveMemoryRequest {
+            action,
+            scope,
+            memory_type,
+            title: optional_string(object, "title", &tool)?,
+            description: optional_string(object, "description", &tool)?,
+            content: optional_string(object, "content", &tool)?,
+            source,
+            reason: optional_string(object, "reason", &tool)?,
+            dedupe_key: optional_string(object, "dedupe_key", &tool)?,
+            target_file: optional_string(object, "target_file", &tool)?,
+        },
+        project,
     })
 }
 
@@ -343,5 +385,81 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Memory updated"));
+    }
+
+    fn project_memory(project: &str) -> Value {
+        json!({
+            "action": "upsert",
+            "scope": "repo",
+            "type": "project",
+            "title": "Verify with cargo test",
+            "description": "The acceptance check runs cargo test -p calc",
+            "content": "Run `cargo test -p calc` before calling a change done.",
+            "project": project,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_named_project_gets_the_repo_memory_instead_of_the_sessions_own() {
+        let _env = EnvGuard::new();
+        let project = tempfile::tempdir().expect("project dir");
+        let project_path = project.path().to_string_lossy().into_owned();
+        let session = tempfile::tempdir().expect("router workspace");
+        let context = ToolContext::new().with_cwd(session.path().to_string_lossy().into_owned());
+
+        let output = SaveMemoryTool
+            .call(project_memory(&project_path), &context)
+            .await
+            .unwrap();
+
+        let written = std::path::PathBuf::from(output["memory_path"].as_str().unwrap());
+        let project_dir =
+            rebon_session::memory_paths::repo_memory_dir(&project_path).expect("project memory");
+        let session_dir =
+            rebon_session::memory_paths::repo_memory_dir(&session.path().to_string_lossy())
+                .expect("session memory");
+        assert!(written.starts_with(&project_dir), "{written:?}");
+        assert!(
+            !session_dir.exists(),
+            "nothing lands in the session's own memory"
+        );
+        let index = std::fs::read_to_string(project_dir.join("MEMORY.md")).unwrap();
+        assert!(index.contains("cargo test -p calc"));
+    }
+
+    #[tokio::test]
+    async fn a_project_needs_repo_scope_an_absolute_path_and_a_directory() {
+        let _env = EnvGuard::new();
+        let context = ToolContext::new().with_cwd("/repo");
+
+        let mut user_scoped = project_memory("/somewhere");
+        user_scoped["scope"] = json!("user");
+        let outcome = SaveMemoryTool
+            .validate_input(&user_scoped, &context)
+            .await
+            .unwrap();
+        assert!(!outcome.is_valid());
+        assert!(outcome.message.unwrap().contains("only with scope `repo`"));
+
+        let outcome = SaveMemoryTool
+            .validate_input(&project_memory("relative/dir"), &context)
+            .await
+            .unwrap();
+        assert!(!outcome.is_valid());
+        assert!(outcome.message.unwrap().contains("absolute path"));
+
+        let missing = tempfile::tempdir().expect("temp").path().join("gone");
+        let error = SaveMemoryTool
+            .call(project_memory(&missing.to_string_lossy()), &context)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not a directory"), "{error}");
+    }
+
+    #[test]
+    fn the_schema_offers_a_project_for_repo_memory() {
+        let schema = SaveMemoryTool.input_schema();
+        assert_eq!(schema["properties"]["project"]["type"], "string");
+        assert_eq!(schema["required"], json!(["action", "scope"]));
     }
 }

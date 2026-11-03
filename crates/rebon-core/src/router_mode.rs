@@ -30,7 +30,9 @@ use rebon_tool::ToolFilter;
 /// - `Recall` renders what an id points to (a worker, a thread, a trigger)
 ///   along with the ids next to it.
 /// - `ScheduleWakeup` lets the router come back to something on its own.
-/// - `SaveMemory` keeps what the person wants remembered.
+/// - `SaveMemory` keeps what should outlive the conversation: the person's
+///   preferences in user memory, and what a task taught about a project in
+///   that project's memory, where its workers read it.
 /// - `ToolSearch` / `InvokeDeferredTool` reach deferred tools.
 pub const ROUTER_SESSION_TOOLS: &[&str] = &[
     "PlanTasks",
@@ -88,7 +90,7 @@ Every piece of work is a task in your ledger, with a goal, what done means (`don
 - **SubscribeThread** — hand a thread (for example `pr:owner/repo#12`) to a worker. Later events on it go straight to that worker without passing through you. Subscribe the worker that opened a pull request, or the one you put in charge of it.
 - **Recall** — look up an id: a task, a worker, a thread or a trigger. With no id you get your open tasks and your workers. You get a short digest and the ids next to it, and you can follow them. When the person asks "how is that fix going?", start from the ids you have and follow the chain to the worker, then to its pull request, then to its latest change. Do not guess from memory.
 - **ScheduleWakeup** — come back to something later on your own, for example to check on a long task.
-- **SaveMemory** — keep a preference or a standing instruction the person gave you.
+- **SaveMemory** — keep what should outlive this conversation (see Keeping Memory).
 
 ## 3. What Reaches You
 
@@ -108,7 +110,15 @@ A worker starts with nothing but your brief. A good brief:
 
 A worker can split a large task further by running its own team (`/ceo`). Hand it the whole task instead of splitting it yourself into steps it could manage alone.
 
-## 5. Talking to the Person
+## 5. Keeping Memory
+
+Your conversation is compacted as it grows and begins anew when you are restarted. Memory is what carries over, and it is also how workers you have not started yet learn what you know. Save as you go, not at the end:
+- **About the person** — scope `user`: their preferences, standing instructions, how they want results reported, decisions they made. Every session reads it.
+- **About a project** — scope `repo` with `project` set to the project's directory: how a change there is verified (the commands its acceptance checks ran), a pitfall a failed check or a rework round exposed, a design decision, where things live. Every worker in that project reads its memory, so write it for them.
+- Save when a task settles after rework or gets stuck, when the person corrects you, and when they decide something. Give a memory the same title when you update it, so it replaces the old one instead of piling up beside it.
+- Do not save task status, ids or progress: the ledger and Recall hold those.
+
+## 6. Talking to the Person
 
 Be brief. Lead with what happened or what you did. Mention a worker or thread by its id once, so the person can ask about it later. Do not narrate tool calls, and do not thank workers or reply to them; their reports are signals for you, not conversation.
 "#;
@@ -131,6 +141,16 @@ mod tests {
         for tool in ["Bash", "Edit", "Write", "Read", "Agent", "AskUserQuestion"] {
             assert!(!filter.allows(tool, &[]), "{tool}");
         }
+    }
+
+    #[test]
+    fn the_prompt_sends_project_lessons_where_that_projects_workers_read_them() {
+        let prompt = router_system_prompt();
+        assert!(prompt.contains("## 5. Keeping Memory"));
+        assert!(prompt.contains("scope `user`"));
+        assert!(prompt.contains("scope `repo` with `project` set to the project's directory"));
+        assert!(prompt.contains("Do not save task status"));
+        assert!(ROUTER_SESSION_TOOLS.contains(&"SaveMemory"));
     }
 
     #[test]
