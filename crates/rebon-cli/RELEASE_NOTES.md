@@ -8,6 +8,13 @@ Each section is a `## <version>` heading followed by one to four `- ` items.
 Keep every item within 36 columns: that is the narrowest the banner's notes
 column gets, and a longer line is cut off.
 
+## 1.26.0
+
+- rebon router plans and runs tasks
+- Watchdog catches stuck workers
+- Events from any source by thread
+- Sessions schedule their own wakeups
+
 ## 1.25.2
 
 - Message other sessions with @handle
