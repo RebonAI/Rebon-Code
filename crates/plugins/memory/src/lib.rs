@@ -47,6 +47,7 @@ pub mod attachments;
 pub mod dialog;
 pub mod memory;
 pub mod prompt_section;
+pub mod read_memory;
 pub mod save_memory;
 pub mod services;
 pub mod update_hook;
@@ -54,6 +55,7 @@ pub mod update_hook;
 pub use attachments::{NestedMemoryAttachmentPoller, NestedMemoryProducer};
 pub use dialog::{MemoryDialogState, MemoryFileEntry};
 pub use prompt_section::MemoryPromptSections;
+pub use read_memory::{ReadMemoryTool, READ_MEMORY_TOOL_NAME};
 pub use save_memory::{SaveMemoryTool, SAVE_MEMORY_TOOL_NAME};
 pub use services::MemoryAgentPrompts;
 pub use update_hook::{MemoryUpdateNotification, MEMORY_NOTIFICATION_FIELD};
@@ -63,12 +65,17 @@ pub const PLUGIN_ID: &str = "memory";
 
 const PROVIDER_ID: &str = "memory";
 
-/// The one tool.
+/// The two tools: `SaveMemory`, and `ReadMemory` for the router, which has
+/// no file tools (other sessions' filters deny it; see
+/// `rebon_core::coordinator_mode::ROUTER_ONLY_TOOLS`).
 ///
 /// Public so a test that needs the whole builtin catalogue on a bare
 /// [`rebon_core::Engine`] can register it without standing up a kernel.
 pub fn tools() -> Vec<Arc<dyn rebon_tool::Tool>> {
-    vec![Arc::new(SaveMemoryTool) as Arc<dyn rebon_tool::Tool>]
+    vec![
+        Arc::new(SaveMemoryTool) as Arc<dyn rebon_tool::Tool>,
+        Arc::new(ReadMemoryTool) as Arc<dyn rebon_tool::Tool>,
+    ]
 }
 
 /// `/memory` as the command seat sees it.
@@ -261,15 +268,21 @@ mod tests {
             .context()
             .get::<ToolSeatService>()
             .expect("the seat is on the root");
-        assert!(seat.resolve(SAVE_MEMORY_TOOL_NAME, None).unwrap().is_some());
+        for tool in [SAVE_MEMORY_TOOL_NAME, READ_MEMORY_TOOL_NAME] {
+            assert!(seat.resolve(tool, None).unwrap().is_some(), "{tool}");
+        }
 
         registry
             .set_enabled(PLUGIN_ID, false)
             .expect("memory is a feature plugin");
-        assert!(seat.resolve(SAVE_MEMORY_TOOL_NAME, None).unwrap().is_none());
+        for tool in [SAVE_MEMORY_TOOL_NAME, READ_MEMORY_TOOL_NAME] {
+            assert!(seat.resolve(tool, None).unwrap().is_none(), "{tool}");
+        }
 
         registry.set_enabled(PLUGIN_ID, true).expect("and back");
-        assert!(seat.resolve(SAVE_MEMORY_TOOL_NAME, None).unwrap().is_some());
+        for tool in [SAVE_MEMORY_TOOL_NAME, READ_MEMORY_TOOL_NAME] {
+            assert!(seat.resolve(tool, None).unwrap().is_some(), "{tool}");
+        }
     }
 
     /// `/memory` is this plugin's command, carrying the wide surface set in

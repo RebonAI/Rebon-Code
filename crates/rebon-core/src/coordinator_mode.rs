@@ -168,6 +168,8 @@ pub const ROUTER_ONLY_TOOLS: &[&str] = &[
     "StopWorker",
     "SubscribeThread",
     "Recall",
+    // Every other session reads memory files with Read.
+    "ReadMemory",
 ];
 
 /// Filter for an Agent Queue supervisor outside CEO mode.

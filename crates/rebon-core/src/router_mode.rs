@@ -30,6 +30,8 @@ use rebon_tool::ToolFilter;
 /// - `Recall` renders what an id points to (a worker, a thread, a trigger)
 ///   along with the ids next to it.
 /// - `ScheduleWakeup` lets the router come back to something on its own.
+/// - `ReadMemory` shows user memory or a project's, since the router has no
+///   file tools.
 /// - `SaveMemory` keeps what should outlive the conversation: the person's
 ///   preferences in user memory, and what a task taught about a project in
 ///   that project's memory, where its workers read it.
@@ -43,6 +45,7 @@ pub const ROUTER_SESSION_TOOLS: &[&str] = &[
     "SubscribeThread",
     "Recall",
     "ScheduleWakeup",
+    "ReadMemory",
     "SaveMemory",
     "ToolSearch",
     "InvokeDeferredTool",
@@ -90,6 +93,7 @@ Every piece of work is a task in your ledger, with a goal, what done means (`don
 - **SubscribeThread** — hand a thread (for example `pr:owner/repo#12`) to a worker. Later events on it go straight to that worker without passing through you. Subscribe the worker that opened a pull request, or the one you put in charge of it.
 - **Recall** — look up an id: a task, a worker, a thread or a trigger. With no id you get your open tasks and your workers. You get a short digest and the ids next to it, and you can follow them. When the person asks "how is that fix going?", start from the ids you have and follow the chain to the worker, then to its pull request, then to its latest change. Do not guess from memory.
 - **ScheduleWakeup** — come back to something later on your own, for example to check on a long task.
+- **ReadMemory** — read what is remembered: the person's memory, or a project's (`project`, its directory). With no `file` you get the index; name a file it lists to read that memory.
 - **SaveMemory** — keep what should outlive this conversation (see Keeping Memory).
 
 ## 3. What Reaches You
@@ -115,7 +119,8 @@ A worker can split a large task further by running its own team (`/ceo`). Hand i
 Your conversation is compacted as it grows and begins anew when you are restarted. Memory is what carries over, and it is also how workers you have not started yet learn what you know. Save as you go, not at the end:
 - **About the person** — scope `user`: their preferences, standing instructions, how they want results reported, decisions they made. Every session reads it.
 - **About a project** — scope `repo` with `project` set to the project's directory: how a change there is verified (the commands its acceptance checks ran), a pitfall a failed check or a rework round exposed, a design decision, where things live. Every worker in that project reads its memory, so write it for them.
-- Save when a task settles after rework or gets stuck, when the person corrects you, and when they decide something. Give a memory the same title when you update it, so it replaces the old one instead of piling up beside it.
+- Read a project's memory with ReadMemory before you save to it, and update the memory that already covers the point (same title) instead of adding one beside it. Read it before you brief a worker there, too, and pass on what bears on the task.
+- Save when a task settles after rework or gets stuck, when the person corrects you, and when they decide something.
 - Do not save task status, ids or progress: the ledger and Recall hold those.
 
 ## 6. Talking to the Person
@@ -150,7 +155,28 @@ mod tests {
         assert!(prompt.contains("scope `user`"));
         assert!(prompt.contains("scope `repo` with `project` set to the project's directory"));
         assert!(prompt.contains("Do not save task status"));
+        assert!(prompt.contains("Read a project's memory with ReadMemory before you save to it"));
         assert!(ROUTER_SESSION_TOOLS.contains(&"SaveMemory"));
+        assert!(ROUTER_SESSION_TOOLS.contains(&"ReadMemory"));
+    }
+
+    #[test]
+    fn only_the_router_reads_memory_through_read_memory() {
+        assert!(router_session_filter().allows("ReadMemory", &[]));
+        // Everyone else reads memory files with Read, or (the watchdog)
+        // does not read them at all.
+        for (name, filter) in [
+            ("normal", crate::coordinator_mode::normal_session_filter()),
+            ("queue", crate::coordinator_mode::queue_session_filter()),
+            (
+                "coordinator",
+                crate::coordinator_mode::coordinator_session_filter(),
+            ),
+            ("async agent", crate::coordinator_mode::async_agent_filter()),
+            ("watchdog", crate::watchdog_mode::watchdog_session_filter()),
+        ] {
+            assert!(!filter.allows("ReadMemory", &[]), "{name}");
+        }
     }
 
     #[test]

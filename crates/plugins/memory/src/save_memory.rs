@@ -2,6 +2,7 @@ use crate::memory::save::{
     parse_scope, save_memory, MemoryContentType, MemorySource, SaveMemoryAction, SaveMemoryRequest,
 };
 use async_trait::async_trait;
+use rebon_session::memory_paths::MemoryScope;
 use rebon_tool::{Tool, ToolContext};
 use rebon_tools_core::{
     validation_outcome_from, PermissionDecision, ToolError, ToolId, ToolInputSchema, ToolResult,
@@ -123,18 +124,8 @@ impl Tool for SaveMemoryTool {
                 .into(),
             error_code: Some(INVALID_INPUT_CODE),
         })?;
-        // Repo memory is keyed by a project directory: this session's, or
-        // the one `project` names.
-        let cwd = match project.as_deref() {
-            Some(project) if !std::path::Path::new(project).is_dir() => {
-                return Err(invalid(
-                    &self.id(),
-                    format!("`project` is not a directory: {project}"),
-                ));
-            }
-            Some(project) => project,
-            None => session_cwd,
-        };
+        let cwd =
+            memory_cwd(project.as_deref(), session_cwd).map_err(|why| invalid(&self.id(), why))?;
 
         let outcome = save_memory(cwd, request).map_err(|err| ToolError::InvalidInput {
             tool: self.id(),
@@ -161,6 +152,36 @@ impl Tool for SaveMemoryTool {
         }
 
         Ok(result)
+    }
+}
+
+/// Why `project` cannot name whose memory to use with `scope`, if it
+/// cannot: it names a project's repo memory, so it needs scope `repo`, and
+/// it must be an absolute path. `ReadMemory` takes it on the same terms.
+pub(crate) fn project_problem(scope: MemoryScope, project: &str) -> Option<String> {
+    if scope != MemoryScope::Repo {
+        return Some(
+            "`project` names a project's repo memory; use it only with scope `repo`".into(),
+        );
+    }
+    if !std::path::Path::new(project).is_absolute() {
+        return Some(format!("`project` must be an absolute path: {project}"));
+    }
+    None
+}
+
+/// The directory repo memory is keyed by: the project `project` names,
+/// which must exist, or else the session's own.
+pub(crate) fn memory_cwd<'a>(
+    project: Option<&'a str>,
+    session_cwd: &'a str,
+) -> Result<&'a str, String> {
+    match project {
+        Some(project) if !std::path::Path::new(project).is_dir() => {
+            Err(format!("`project` is not a directory: {project}"))
+        }
+        Some(project) => Ok(project),
+        None => Ok(session_cwd),
     }
 }
 
@@ -193,19 +214,11 @@ fn parse_input(input: &Value) -> ToolResult<ParsedInput> {
         .map_err(|err| invalid(&tool, err.to_string()))?;
 
     let project = optional_string(object, "project", &tool)?;
-    if let Some(project) = project.as_deref() {
-        if scope != rebon_session::memory_paths::MemoryScope::Repo {
-            return Err(invalid(
-                &tool,
-                "`project` names whose repo memory to write; use it only with scope `repo`".into(),
-            ));
-        }
-        if !std::path::Path::new(project).is_absolute() {
-            return Err(invalid(
-                &tool,
-                format!("`project` must be an absolute path: {project}"),
-            ));
-        }
+    if let Some(why) = project
+        .as_deref()
+        .and_then(|project| project_problem(scope, project))
+    {
+        return Err(invalid(&tool, why));
     }
 
     Ok(ParsedInput {
