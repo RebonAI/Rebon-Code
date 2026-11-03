@@ -1107,11 +1107,8 @@ pub(crate) fn claimed_prompts_transcript_state_in_messages(
     messages: &[rebon_session::TranscriptEntry],
     claimed: &[PendingPrompt],
 ) -> PendingPromptTranscriptState {
-    // The turn's head prompt produced a durable user row. A message another
-    // agent sent mid-turn is an injected attachment with its own generated
-    // uuid, so it is not expected to appear under its message id — only the
-    // head is checked, which is also what keeps the durability rule about
-    // "the prompt this turn started from" rather than every injection.
+    // scheduled continuation 与用户追加消息都必须按 claim 顺序留下持久行；
+    // 首条的完成证据不能替代后续 continuation 的落盘证据。
     let head = &claimed[0];
     let head_row = pending_prompt_row_uuid(head);
     let mut ids: Vec<&str> = vec![head_row.as_str()];
@@ -1119,7 +1116,7 @@ pub(crate) fn claimed_prompts_transcript_state_in_messages(
         claimed
             .iter()
             .skip(1)
-            .filter(|prompt| prompt.typed_by_user())
+            .filter(|prompt| !prompt.is_agent_message())
             .map(|prompt| prompt.id.as_str()),
     );
     let found = pending_prompts_transcript_state_in_messages(messages, &ids);

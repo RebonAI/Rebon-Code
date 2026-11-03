@@ -1310,6 +1310,113 @@ fn pending_prompt_completion_marker_does_not_replace_transcript_evidence() {
     );
 }
 
+#[test]
+fn claimed_scheduled_batch_requires_every_durable_row() {
+    let ids = [
+        "u-internal-scheduled-router-batch-0",
+        "u-internal-scheduled-router-batch-1",
+        "u-internal-scheduled-router-batch-2",
+    ];
+    for typed_head in [false, true] {
+        let claimed = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let mut prompt = pending_prompt(id, "continue", Vec::new());
+                if index != 0 || !typed_head {
+                    prompt.origin = Some(rebon_session_host::PendingPromptOrigin::Scheduled);
+                }
+                prompt.claimed_turn_generation = Some(4);
+                prompt.completed_turn_generation = Some(4);
+                prompt
+            })
+            .collect::<Vec<_>>();
+        for missing in [None, Some(0), Some(1), Some(2)] {
+            let mut messages = Vec::new();
+            let mut parent = None;
+            for (index, id) in ids.iter().enumerate() {
+                if missing == Some(index) {
+                    continue;
+                }
+                messages.push(scheduled_injection_row(id, parent, index as u64));
+                parent = Some(*id);
+            }
+            messages.push(assistant_row("a-final", parent.unwrap(), "end_turn"));
+            let expected = match missing {
+                None => PendingPromptTranscriptState::Completed,
+                Some(0) => PendingPromptTranscriptState::Missing,
+                Some(_) => PendingPromptTranscriptState::ResumeSavedUser,
+            };
+            assert_eq!(
+                claimed_prompts_transcript_state_in_messages(&messages, &claimed),
+                expected,
+                "typed_head={typed_head}, missing={missing:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn claimed_scheduled_batch_requires_a_response_after_the_last_continuation() {
+    let ids = [
+        "u-internal-scheduled-router-before-response",
+        "u-internal-scheduled-router-after-response",
+    ];
+    let claimed = ids.map(|id| {
+        let mut prompt = pending_prompt(id, "continue", Vec::new());
+        prompt.origin = Some(rebon_session_host::PendingPromptOrigin::Scheduled);
+        prompt.claimed_turn_generation = Some(9);
+        prompt
+    });
+    let mut messages = vec![
+        scheduled_injection_row(ids[0], None, 0),
+        assistant_row("a-earlier", ids[0], "end_turn"),
+        scheduled_injection_row(ids[1], Some("a-earlier"), 1),
+    ];
+    assert_eq!(
+        claimed_prompts_transcript_state_in_messages(&messages, &claimed),
+        PendingPromptTranscriptState::ResumeSavedUser
+    );
+    messages.push(assistant_row("a-resumed", ids[1], "end_turn"));
+    assert_eq!(
+        claimed_prompts_transcript_state_in_messages(&messages, &claimed),
+        PendingPromptTranscriptState::Completed
+    );
+    let mut reclaimed = claimed;
+    for prompt in &mut reclaimed {
+        prompt.claimed_turn_generation = Some(10);
+    }
+    assert_eq!(
+        claimed_prompts_transcript_state_in_messages(&messages, &reclaimed),
+        PendingPromptTranscriptState::Completed
+    );
+}
+
+#[test]
+fn claimed_scheduled_batch_requires_rows_in_claim_order() {
+    let ids = [
+        "u-internal-scheduled-router-first",
+        "u-internal-scheduled-router-second",
+        "u-internal-scheduled-router-third",
+    ];
+    let claimed = ids.map(|id| {
+        let mut prompt = pending_prompt(id, "continue", Vec::new());
+        prompt.origin = Some(rebon_session_host::PendingPromptOrigin::Scheduled);
+        prompt.claimed_turn_generation = Some(2);
+        prompt
+    });
+    let messages = vec![
+        scheduled_injection_row(ids[0], None, 0),
+        scheduled_injection_row(ids[2], Some(ids[0]), 1),
+        scheduled_injection_row(ids[1], Some(ids[2]), 2),
+        assistant_row("a-final", ids[1], "end_turn"),
+    ];
+    assert_eq!(
+        claimed_prompts_transcript_state_in_messages(&messages, &claimed),
+        PendingPromptTranscriptState::ResumeSavedUser
+    );
+}
+
 /// A scheduled prompt — a cron fire, or the router's coordination message —
 /// is injected mid-turn. The row that injection writes is named for the prompt,
 /// so the turn that answered it can prove it did: this is the shape the
