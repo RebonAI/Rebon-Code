@@ -1309,3 +1309,224 @@ fn pending_prompt_completion_marker_does_not_replace_transcript_evidence() {
         PendingPromptTranscriptState::Missing
     );
 }
+
+/// A scheduled prompt — a cron fire, or the router's coordination message —
+/// is injected mid-turn. The row that injection writes is named for the prompt,
+/// so the turn that answered it can prove it did: this is the shape the
+/// executor produces for `pending_prompt_attachment_message`.
+fn scheduled_injection_row(
+    prompt_id: &str,
+    parent: Option<&str>,
+    iteration: u64,
+) -> rebon_session::TranscriptEntry {
+    let mut entry = rebon_session::TranscriptWriteEntry::new(
+        "user",
+        serde_json::json!({
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "[Scheduled task: delivered by Rebon's scheduler]"}],
+            },
+            "isMeta": true,
+            "queuedCommand": true,
+            "runtimeAttachment": true,
+            "iteration": iteration,
+        }),
+    )
+    .with_uuid(prompt_id);
+    if let Some(parent) = parent {
+        entry = entry.with_parent(parent);
+    }
+    rebon_session::finalize_transcript_entry(&entry)
+}
+
+fn assistant_row(uuid: &str, parent: &str, stop_reason: &str) -> rebon_session::TranscriptEntry {
+    rebon_session::finalize_transcript_entry(
+        &rebon_session::TranscriptWriteEntry::new(
+            "assistant",
+            serde_json::json!({
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "coordination received"}],
+                    "stop_reason": stop_reason
+                }
+            }),
+        )
+        .with_uuid(uuid)
+        .with_parent(parent),
+    )
+}
+
+/// The field failure this fixes: a scheduled prompt was claimed, injected,
+/// answered and finished, and the job was still failed with "no durable user
+/// row for the claimed prompt". The prompt's row existed only under an
+/// anonymous name, so the check could not find it.
+#[test]
+fn a_scheduled_prompt_answered_mid_turn_is_found_by_the_row_its_injection_wrote() {
+    let prompt_id = "u-internal-scheduled-router-1793698808520-2";
+    let mut head = pending_prompt(prompt_id, "[Scheduled task] continue", Vec::new());
+    head.origin = Some(rebon_session_host::PendingPromptOrigin::Scheduled);
+    head.claimed_turn_generation = Some(1);
+
+    let prompt_row = scheduled_injection_row(prompt_id, Some("u-user-turn-head"), 23);
+    let terminal = assistant_row("a-answered", prompt_id, "end_turn");
+
+    // Mid-turn: the row is durable but the turn has not answered yet.
+    assert_eq!(
+        claimed_prompts_transcript_state_in_messages(
+            std::slice::from_ref(&prompt_row),
+            std::slice::from_ref(&head)
+        ),
+        PendingPromptTranscriptState::ResumeSavedUser
+    );
+    assert_eq!(
+        claimed_prompts_transcript_state_in_messages(
+            &[prompt_row, terminal],
+            std::slice::from_ref(&head)
+        ),
+        PendingPromptTranscriptState::Completed,
+        "the claimed prompt's row is durable and the turn after it answered"
+    );
+}
+
+/// The same turn with many continuations: each injection writes its own named
+/// row, chained behind the last, so every one of them is durable and the turn
+/// reads as completed once it answers.
+#[test]
+fn several_scheduled_continuations_each_keep_their_own_durable_row() {
+    let ids = [
+        "u-internal-scheduled-router-1-0",
+        "u-internal-scheduled-router-1-1",
+        "u-internal-scheduled-router-1-2",
+    ];
+    let head_row = rebon_session::finalize_transcript_entry(
+        &rebon_session::TranscriptWriteEntry::new(
+            "user",
+            serde_json::json!({"message": {"role": "user", "content": "do the work"}}),
+        )
+        .with_uuid("u-turn-head"),
+    );
+    let mut messages = vec![head_row];
+
+    let mut parent = "u-turn-head".to_string();
+    for (iteration, id) in ids.iter().enumerate() {
+        let row = scheduled_injection_row(id, Some(&parent), iteration as u64);
+        messages.push(row);
+        parent = id.to_string();
+    }
+    // Every continuation is durable under its own name, in arrival order.
+    for id in ids {
+        assert_eq!(
+            pending_prompt_transcript_state_in_messages(&messages, id),
+            PendingPromptTranscriptState::ResumeSavedUser,
+            "{id} is durable and still unanswered"
+        );
+    }
+
+    messages.push(assistant_row("a-final", &parent, "end_turn"));
+    for id in ids {
+        assert_eq!(
+            pending_prompt_transcript_state_in_messages(&messages, id),
+            PendingPromptTranscriptState::Completed,
+            "{id} was answered by the turn it joined"
+        );
+    }
+}
+
+/// A prompt appended after the turn already produced tool rounds is still
+/// findable, and the turn it joined is reported finished only once it ends.
+#[test]
+fn a_continuation_appended_after_a_tool_round_is_answered_by_the_same_turn() {
+    let prompt_id = "u-internal-scheduled-rework-1";
+    let mut head = pending_prompt(prompt_id, "[Scheduled task] keep going", Vec::new());
+    head.origin = Some(rebon_session_host::PendingPromptOrigin::Scheduled);
+    head.claimed_turn_generation = Some(3);
+
+    let head_row = rebon_session::finalize_transcript_entry(
+        &rebon_session::TranscriptWriteEntry::new(
+            "user",
+            serde_json::json!({"message": {"role": "user", "content": "start"}}),
+        )
+        .with_uuid("u-turn-head"),
+    );
+    let tool_use = assistant_row("a-tool-use", "u-turn-head", "tool_use");
+    let tool_result = rebon_session::finalize_transcript_entry(
+        &rebon_session::TranscriptWriteEntry::new(
+            "user",
+            serde_json::json!({
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": "ok"}]
+                }
+            }),
+        )
+        .with_uuid("u-tool-result")
+        .with_parent("a-tool-use"),
+    );
+    let appended = scheduled_injection_row(prompt_id, Some("u-tool-result"), 2);
+
+    let partial = vec![head_row, tool_use, tool_result, appended];
+    assert_eq!(
+        claimed_prompts_transcript_state_in_messages(&partial, std::slice::from_ref(&head)),
+        PendingPromptTranscriptState::ResumeSavedUser,
+        "the tool round did not end the turn"
+    );
+    let mut completed = partial;
+    completed.push(assistant_row("a-final", prompt_id, "end_turn"));
+    assert_eq!(
+        claimed_prompts_transcript_state_in_messages(&completed, std::slice::from_ref(&head)),
+        PendingPromptTranscriptState::Completed
+    );
+}
+
+/// The old broken shape is still a failure. A scheduled injection that left
+/// only an anonymous `u-attach-…` row gives the check nothing to find, and it
+/// must keep saying so rather than accepting a turn whose prompt has no
+/// durable record.
+#[test]
+fn a_scheduled_prompt_with_only_an_anonymous_row_is_still_not_durable() {
+    let prompt_id = "u-internal-scheduled-router-1793698808520-2";
+    let mut head = pending_prompt(prompt_id, "[Scheduled task] continue", Vec::new());
+    head.origin = Some(rebon_session_host::PendingPromptOrigin::Scheduled);
+    head.claimed_turn_generation = Some(1);
+
+    let anonymous = scheduled_injection_row("u-attach-sess-23-1793698828646498800", None, 23);
+    let terminal = assistant_row(
+        "a-answered",
+        "u-attach-sess-23-1793698828646498800",
+        "end_turn",
+    );
+
+    assert_eq!(
+        claimed_prompts_transcript_state_in_messages(
+            &[anonymous, terminal],
+            std::slice::from_ref(&head)
+        ),
+        PendingPromptTranscriptState::Missing,
+        "a row under another name is not the claimed prompt's durable row"
+    );
+}
+
+/// A continuation interrupted before it answered resumes instead of being run
+/// again from scratch: its row is durable, so the next owner continues the
+/// turn rather than duplicating the prompt.
+#[test]
+fn an_interrupted_continuation_resumes_the_saved_row_instead_of_duplicating_it() {
+    let prompt_id = "u-internal-scheduled-wakeup-1";
+    let mut head = pending_prompt(prompt_id, "[Scheduled task] wake", Vec::new());
+    head.origin = Some(rebon_session_host::PendingPromptOrigin::Scheduled);
+    head.claimed_turn_generation = Some(2);
+
+    let interrupted = scheduled_injection_row(prompt_id, Some("u-turn-head"), 1);
+    assert_eq!(
+        claimed_prompts_transcript_state_in_messages(
+            std::slice::from_ref(&interrupted),
+            std::slice::from_ref(&head)
+        ),
+        PendingPromptTranscriptState::ResumeSavedUser,
+        "durable prompt row, no answer yet: resume it"
+    );
+    assert!(
+        interrupted_tool_result_entry(&PendingPromptTranscriptState::ResumeSavedUser).is_none(),
+        "a resume with a sound transcript needs no repair row"
+    );
+}

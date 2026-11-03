@@ -199,14 +199,28 @@ fn a_scheduled_prompt_reaches_the_model_as_itself_not_as_user_input() {
     prompt.origin = Some(PendingPromptOrigin::Scheduled);
 
     let message = pending_prompt_attachment_message(&prompt);
-    let [rebon_api::ContentBlock::Text(text)] = message.content.as_slice() else {
-        panic!(
-            "one text block, no queued-user marker: {:?}",
-            message.content
-        );
-    };
-    assert_eq!(text.text, prompt.text);
-    assert!(!text.text.contains("<rebon-queued-user-input"));
+    let texts = message
+        .content
+        .iter()
+        .filter_map(rebon_api::ContentBlock::as_text)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    // Named for the prompt. That name is what the executor writes the row
+    // under, and what the completion check looks the row up by; without it the
+    // injection became an anonymous `u-attach-…` row and a finished turn read
+    // back as having no durable user row at all.
+    assert_eq!(
+        texts,
+        vec![
+            format!("<rebon-visible-runtime-attachment uuid=\"{}\">", prompt.id),
+            prompt.text.clone(),
+            format!("<rebon-visible-runtime-model-text>\n{}", prompt.text),
+        ]
+    );
+    // Still not the person's words: no queued-user marker anywhere in it.
+    assert!(!texts
+        .iter()
+        .any(|text| text.contains("<rebon-queued-user-input")));
 
     let (_dir, store) = store();
     let mut state = store

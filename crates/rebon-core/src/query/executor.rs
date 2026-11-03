@@ -35,6 +35,15 @@ fn attachment_poller_turn_id(session_id: &str, user_message_uuid: Option<&str>) 
     }
 }
 
+/// Whether a transcript row id names a prompt the runtime generated for
+/// itself: a cron fire, a wakeup, a router coordination message, a task
+/// notification. Such a row is durable and must be findable by the id the
+/// turn claimed, but it is never the person's words — not in the transcript's
+/// `isMeta` marking, and not in what a client is told the user sent.
+fn is_internal_prompt_row(uuid: &str) -> bool {
+    uuid.starts_with("u-internal-")
+}
+
 fn queued_attachment_entry_payload(
     content_value: serde_json::Value,
     local_user_uuid: &str,
@@ -42,7 +51,7 @@ fn queued_attachment_entry_payload(
 ) -> serde_json::Value {
     let mut payload = user_message_entry_payload(
         content_value,
-        local_user_uuid.starts_with("u-internal-"),
+        is_internal_prompt_row(local_user_uuid),
         false,
         false,
     );
@@ -2862,7 +2871,12 @@ impl TurnEventLoop<'_> {
                 }
                 if let Some(pub_ref) = &update_publisher {
                     let update_content = api_blocks_to_acp_content_blocks(&visible_message.content);
-                    if !update_content.is_empty() {
+                    // An internal prompt (`u-internal-…`) is the runtime's own
+                    // traffic — a cron fire, a router coordination message. Its
+                    // row is durable and named for the prompt, but echoing it as
+                    // a queued user message would render it as words a person
+                    // typed, which it is not.
+                    if !update_content.is_empty() && !is_internal_prompt_row(&local_user_uuid) {
                         pub_ref
                             .publish_to(
                                 &session_id,
@@ -3667,7 +3681,7 @@ impl EngineQueryExecutor {
 
             let mut user_payload = user_message_entry_payload(
                 transcript_content_value(&user_content),
-                replay_only || user_uuid.starts_with("u-internal-"),
+                replay_only || is_internal_prompt_row(&user_uuid),
                 false,
                 false,
             );
@@ -5296,6 +5310,33 @@ mod attachment_poller_turn_tests {
             3,
         );
         assert!(visible.get("isMeta").is_none());
+    }
+
+    /// A runtime-generated prompt is written under its own id, so the turn that
+    /// answered it can prove it did — but it is never shown as something the
+    /// person sent. One rule decides both, so the two cannot drift apart.
+    #[test]
+    fn an_internal_prompt_row_is_named_and_never_shown_as_user_input() {
+        assert!(is_internal_prompt_row(
+            "u-internal-scheduled-router-1793698808520-2"
+        ));
+        assert!(is_internal_prompt_row("u-internal-scheduled-1-0"));
+        assert!(!is_internal_prompt_row("u-user-follow-up"));
+        assert!(!is_internal_prompt_row("u-agent-message-m-1"));
+
+        let internal = queued_attachment_entry_payload(
+            serde_json::Value::String("[Scheduled task] continue".into()),
+            "u-internal-scheduled-router-1793698808520-2",
+            23,
+        );
+        assert_eq!(internal["isMeta"], serde_json::Value::Bool(true));
+
+        let typed = queued_attachment_entry_payload(
+            serde_json::Value::String("also check the docs".into()),
+            "u-user-typed",
+            23,
+        );
+        assert!(typed.get("isMeta").is_none());
     }
 
     struct RecordingPoller(Arc<Mutex<Vec<bool>>>);

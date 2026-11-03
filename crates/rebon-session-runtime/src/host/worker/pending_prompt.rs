@@ -646,12 +646,20 @@ pub(crate) fn pending_prompt_attachment_message(prompt: &PendingPrompt) -> rebon
         );
     }
     if !prompt.typed_by_user() {
-        return rebon_api::Message {
-            role: rebon_api::Role::User,
-            content: vec![rebon_api::ContentBlock::Text(rebon_api::TextBlock {
-                text: prompt.text.clone(),
-            })],
-        };
+        // A scheduled prompt is the runtime's own traffic, not a person's
+        // words: it arrives as a visible runtime attachment, so no queued-user
+        // marker and no queued-message row. It still has to be *named* — the
+        // row a mid-turn injection writes carries the prompt's id, which is
+        // what the completion check looks the row up by. Left unnamed, the
+        // executor wrote an anonymous `u-attach-…` row, and a scheduled
+        // prompt that was injected, answered and finished read back as having
+        // no durable user row at all.
+        let text = prompt.text.clone();
+        return rebon_core::query::visible_runtime_attachment_message(
+            &prompt.id,
+            text.clone(),
+            text,
+        );
     }
     let mut content = vec![rebon_api::ContentBlock::Text(rebon_api::TextBlock {
         text: prompt.text.clone(),
