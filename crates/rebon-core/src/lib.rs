@@ -1199,12 +1199,14 @@ impl Tool for FeatureProjectionTool {
         serde_json::json!({"type": "object"})
     }
     fn should_defer(&self) -> bool {
-        // Monitor, NotebookEdit, Mcp and SaveMemory are the deferred
-        // four; the other stand-ins project eagerly, exactly as the
-        // tools they stand for do.
+        // Monitor, NotebookEdit and Mcp are the deferred three; the
+        // other stand-ins project eagerly, exactly as the tools they
+        // stand for do.
         !matches!(
             self.0,
-            rebon_tool::STRUCTURED_OUTPUT_TOOL_NAME | rebon_tools_core::SKILL_TOOL_NAME
+            rebon_tool::STRUCTURED_OUTPUT_TOOL_NAME
+                | rebon_tools_core::SKILL_TOOL_NAME
+                | SAVE_MEMORY_TOOL_NAME
         )
     }
     fn kind(&self) -> rebon_tools_core::ToolKind {

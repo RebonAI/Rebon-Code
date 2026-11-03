@@ -219,6 +219,7 @@ fn stable_builtin_exposure_policy_projects_expected_eager_and_deferred_sets() {
         "AskUserQuestion",
         "EnterPlanMode",
         "ExitPlanMode",
+        "SaveMemory",
     ] {
         if registered.contains(name) {
             assert!(eager.contains(name), "{name} should be eager");
@@ -229,7 +230,6 @@ fn stable_builtin_exposure_policy_projects_expected_eager_and_deferred_sets() {
 
     for name in [
         "Mcp",
-        "SaveMemory",
         "SendMessage",
         "CronCreate",
         "CronList",
@@ -530,7 +530,7 @@ async fn tool_search_discovery_does_not_change_provider_visible_tools() {
     engine
         .invoke_tool(
             rebon_tool::TOOL_SEARCH_TOOL_NAME,
-            json!({ "query": "select:GatewayDeferred,SaveMemory" }),
+            json!({ "query": "select:GatewayDeferred,Monitor" }),
             &context,
         )
         .await
@@ -542,6 +542,6 @@ async fn tool_search_discovery_does_not_change_provider_visible_tools() {
     assert_eq!(before_names, after_names);
     assert!(!after_names.contains(&"GatewayDeferred"));
     assert!(after_names.contains(&"AskUserQuestion"));
-    assert!(!after_names.contains(&"SaveMemory"));
+    assert!(!after_names.contains(&"Monitor"));
     assert!(after_names.contains(&rebon_tool::INVOKE_DEFERRED_TOOL_NAME));
 }

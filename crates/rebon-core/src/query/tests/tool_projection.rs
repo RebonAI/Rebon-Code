@@ -17,12 +17,17 @@ fn runtime_tool_projection_uses_one_projection_for_visible_deferred_and_capabili
 
     assert!(visible.contains(&rebon_tool::TOOL_SEARCH_TOOL_NAME.to_string()));
     assert!(visible.contains(&rebon_tool::INVOKE_DEFERRED_TOOL_NAME.to_string()));
-    assert!(!visible.contains(&"SaveMemory".to_string()));
+    assert!(!visible.contains(&"Monitor".to_string()));
     assert!(projection
         .deferred_tool_names
+        .contains(&"Monitor".to_string()));
+    assert!(projection.tool_search_index.names().contains(&"Monitor"));
+    assert!(available.contains(&"Monitor".to_string()));
+    // SaveMemory is offered outright, not behind ToolSearch.
+    assert!(visible.contains(&"SaveMemory".to_string()));
+    assert!(!projection
+        .deferred_tool_names
         .contains(&"SaveMemory".to_string()));
-    assert!(projection.tool_search_index.names().contains(&"SaveMemory"));
-    assert!(available.contains(&"SaveMemory".to_string()));
 }
 
 /// Chat's whole promise is that nothing can touch the workspace, so the
@@ -128,7 +133,7 @@ fn normal_projection_keeps_full_tools_and_standard_deferred_behavior() {
         .contains(&rebon_tool::INVOKE_DEFERRED_TOOL_NAME.to_string()));
     assert!(projection
         .deferred_tool_names
-        .contains(&"SaveMemory".to_string()));
+        .contains(&"Monitor".to_string()));
     let bash = projection
         .provider_visible_tools
         .iter()

@@ -735,7 +735,7 @@ fn context_command_counts_only_toolsearch_loaded_deferred_tools() {
                             rebon_render::transcript_row::AssistantToolUseBlock {
                                 id: "tu-toolsearch".into(),
                                 name: rebon_tool::TOOL_SEARCH_TOOL_NAME.into(),
-                                input: serde_json::json!({"query": "select:SaveMemory"}),
+                                input: serde_json::json!({"query": "select:Monitor"}),
                                 tool_call_content: None,
                                 raw_output: None,
                                 title: None,
@@ -765,7 +765,7 @@ fn context_command_counts_only_toolsearch_loaded_deferred_tools() {
                             content: rebon_render::transcript_row::ToolResultContent::Text(
                                 serde_json::json!({
                                     "result": "<function>{}</function>",
-                                    "matched_tools": ["SaveMemory"],
+                                    "matched_tools": ["Monitor"],
                                     "total_deferred_tools": 10
                                 })
                                 .to_string(),
@@ -786,7 +786,7 @@ fn context_command_counts_only_toolsearch_loaded_deferred_tools() {
     let inputs = crate::session_shell::session_command_inputs_from_app(&app, session.ui_mode);
     let output = execute_context_command(&inputs, &session);
     assert!(output.contains("  deferred tools:"), "output: {output}");
-    assert!(output.contains("SaveMemory"), "output: {output}");
+    assert!(output.contains("Monitor"), "output: {output}");
 }
 
 #[test]

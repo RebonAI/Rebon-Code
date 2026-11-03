@@ -51,6 +51,14 @@ impl BuiltinToolExposurePolicy {
             // hidden where one cannot (see `unattended_dead_end`).
             "PlanLedger" => ToolExposure::Eager,
 
+            // SaveMemory is eager because deferring it starved memory. A
+            // model reaches for a tool it can see; one it must first look
+            // up with ToolSearch it saved through almost never. And the
+            // memory prompt section offers the tool only to a turn that
+            // carries it, so a deferred SaveMemory also told every session
+            // with Write/Edit to hand-edit memory files instead.
+            "SaveMemory" => ToolExposure::Eager,
+
             // NotebookEdit only applies to .ipynb files, which most
             // sessions never touch — it stays discoverable via ToolSearch
             // rather than costing every session its schema.
@@ -82,9 +90,9 @@ impl BuiltinToolExposurePolicy {
 
             // `ListPeers` only finds a session for `SendMessage` to reach, so it
             // is loaded with it rather than sent in every session's tool list.
-            "Mcp" | "Monitor" | "SaveMemory" | "SendMessage" | "ListPeers" | "CronCreate"
-            | "CronList" | "CronDelete" | "ScheduleWakeup" | "Sleep" | "TeamCreate"
-            | "TeamDelete" | "WebSearch" | "WebFetch" => ToolExposure::Deferred,
+            "Mcp" | "Monitor" | "SendMessage" | "ListPeers" | "CronCreate" | "CronList"
+            | "CronDelete" | "ScheduleWakeup" | "Sleep" | "TeamCreate" | "TeamDelete"
+            | "WebSearch" | "WebFetch" => ToolExposure::Deferred,
 
             name if name.starts_with("mcp__") => {
                 if tool.should_defer() {

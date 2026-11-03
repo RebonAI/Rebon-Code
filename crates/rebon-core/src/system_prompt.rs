@@ -1542,13 +1542,13 @@ mod tests {
             "ToolSearch".into(),
             "InvokeDeferredTool".into(),
         ];
-        let deferred = vec!["SaveMemory".into()];
+        let deferred = vec!["CronCreate".into()];
         let section = runtime_tools_section(&tools, &deferred);
 
         assert!(section.contains("not exhaustive"));
         assert!(section.contains("deferred tools below"));
         assert!(section.contains("ToolSearch with query \"select:<name>[,<name>...]\""));
-        assert!(section.contains("SaveMemory"));
+        assert!(section.contains("CronCreate"));
     }
 
     #[test]
