@@ -8,6 +8,11 @@ Each section is a `## <version>` heading followed by one to four `- ` items.
 Keep every item within 36 columns: that is the narrowest the banner's notes
 column gets, and a longer line is cut off.
 
+## 1.27.1
+
+- Router reads project memory first
+- It updates notes, not repeats them
+
 ## 1.27.0
 
 - SaveMemory is always on hand
