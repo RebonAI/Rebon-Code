@@ -63,12 +63,16 @@ fn entry_is_meta_user(entry: &rebon_session::TranscriptEntry) -> bool {
 /// Meta entries mostly ride inside a turn (attachments, runtime context) and
 /// are not boundaries. The exceptions are rows nobody typed that a turn was
 /// started from. An internal prompt (`u-internal-…`) — a task notification, a
-/// cron fire, a follow-up the session queued for itself — is meta. Another
-/// session's message that started a turn is a runtime attachment like the same
-/// message queued into a running turn, but written as the turn's own prompt
-/// rather than queued (`queuedCommand`). Missing either left a mirror on the
-/// previous boundary, so the streamed text of every such turn piled up in one
-/// overlay that was never cleared.
+/// cron fire, a follow-up the session queued for itself — is meta, and opens a
+/// turn only when it is the row that turn opened with. The same prompt
+/// delivered into a *running* turn is a queued runtime attachment: it rides
+/// along and must not end the turn that is answering it, or the mirror would
+/// cut that turn at every continuation. Another session's message that started
+/// a turn is a runtime attachment like the same message queued into a running
+/// turn, but written as the turn's own prompt rather than queued
+/// (`queuedCommand`). Missing any of these left a mirror on the previous
+/// boundary, so the streamed text of every such turn piled up in one overlay
+/// that was never cleared.
 fn entry_is_user_turn(entry: &rebon_session::TranscriptEntry) -> bool {
     if entry.entry_type != "user" {
         return false;
@@ -80,11 +84,10 @@ fn entry_is_user_turn(entry: &rebon_session::TranscriptEntry) -> bool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false)
     };
-    let opened_by_another_session = flag("runtimeAttachment") && !flag("queuedCommand");
-    if entry_is_meta_user(entry)
-        && !entry.uuid.starts_with("u-internal-")
-        && !opened_by_another_session
-    {
+    let queued = flag("queuedCommand");
+    let opened_by_another_session = flag("runtimeAttachment") && !queued;
+    let opened_by_an_internal_prompt = entry.uuid.starts_with("u-internal-") && !queued;
+    if entry_is_meta_user(entry) && !opened_by_an_internal_prompt && !opened_by_another_session {
         return false;
     }
     let Some(content) = entry
@@ -1234,6 +1237,53 @@ mod tests {
         let opened = persisted_remote_turn(&entries, "u-agent-message-m-2");
         assert!(opened.boundary_found);
         assert_eq!(opened.assistant_text, "on it");
+    }
+
+    /// The same internal prompt delivered into a *running* turn is a queued
+    /// runtime attachment: it rides along with the turn that is answering it.
+    /// Treating it as a boundary cut that turn at every continuation the
+    /// router sent, so the mirror dropped everything the turn produced after
+    /// the injection.
+    #[test]
+    fn an_internal_prompt_injected_mid_turn_does_not_end_the_turn() {
+        let mut injection = meta_user_entry(
+            "u-internal-scheduled-router-1793698808520-2",
+            "[Scheduled task] continue",
+        );
+        injection.raw["queuedCommand"] = serde_json::json!(true);
+        injection.raw["runtimeAttachment"] = serde_json::json!(true);
+        injection.raw["iteration"] = serde_json::json!(23);
+
+        let entries = vec![
+            transcript_entry(
+                "user",
+                "u-typed",
+                serde_json::json!([{"type": "text", "text": "do the work"}]),
+            ),
+            transcript_entry(
+                "assistant",
+                "a-1",
+                serde_json::json!([{"type": "text", "text": "working"}]),
+            ),
+            injection,
+            transcript_entry(
+                "assistant",
+                "a-2",
+                serde_json::json!([{"type": "text", "text": " and done"}]),
+            ),
+        ];
+
+        assert_eq!(
+            last_remote_user_turn_uuid(&entries).as_deref(),
+            Some("u-typed"),
+            "a continuation the turn is answering did not open a turn"
+        );
+        let turn = persisted_remote_turn(&entries, "u-typed");
+        assert!(
+            !turn.next_user_found,
+            "the continuation did not end the turn it joined"
+        );
+        assert_eq!(turn.assistant_text, "working and done");
     }
 
     #[test]
