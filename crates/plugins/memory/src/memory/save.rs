@@ -383,32 +383,36 @@ fn required_trimmed(value: Option<&str>, field: &str) -> Result<String, SaveMemo
     }
 }
 
-pub fn validate_target_file(raw: &str) -> Result<String, SaveMemoryError> {
+/// A file name that names one memory inside a memory directory: a `.md`
+/// basename, and nothing else.
+///
+/// The one rule for a name that names a single memory, so `SaveMemory`'s
+/// `target_file` and `ReadMemory`'s `file` cannot drift apart. It says
+/// nothing about the index, because the two sides ask for the index
+/// differently: a writer must not name `MEMORY.md`
+/// ([`validate_target_file`] rejects it), while a reader asks for the index
+/// by leaving the name out.
+pub fn validate_memory_file_name(raw: &str) -> Result<String, SaveMemoryError> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(SaveMemoryError::Validation(
-            "target_file must not be empty".to_string(),
-        ));
-    }
-    if trimmed.eq_ignore_ascii_case(ENTRYPOINT_NAME) {
-        return Err(SaveMemoryError::Validation(
-            "target_file must not be MEMORY.md (case-insensitive)".to_string(),
+            "memory file name must not be empty".to_string(),
         ));
     }
     if !trimmed.ends_with(".md") {
         return Err(SaveMemoryError::Validation(
-            "target_file must end with .md".to_string(),
+            "memory file name must end with .md".to_string(),
         ));
     }
     if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
         return Err(SaveMemoryError::Validation(
-            "target_file must be a basename only with no path separators or `..`".to_string(),
+            "memory file name must be a basename only with no path separators or `..`".to_string(),
         ));
     }
     if trimmed.starts_with("//") || trimmed.starts_with("\\\\") || has_windows_drive_prefix(trimmed)
     {
         return Err(SaveMemoryError::Validation(
-            "target_file must not be absolute, UNC, or Windows drive-prefixed".to_string(),
+            "memory file name must not be absolute, UNC, or Windows drive-prefixed".to_string(),
         ));
     }
     if Path::new(trimmed)
@@ -416,10 +420,22 @@ pub fn validate_target_file(raw: &str) -> Result<String, SaveMemoryError> {
         .any(|component| !matches!(component, Component::Normal(_)))
     {
         return Err(SaveMemoryError::Validation(
-            "target_file must be a simple basename".to_string(),
+            "memory file name must be a simple basename".to_string(),
         ));
     }
     Ok(trimmed.to_string())
+}
+
+/// [`validate_memory_file_name`], plus the one rule that belongs to writing
+/// alone: a memory is not the index it is listed in.
+pub fn validate_target_file(raw: &str) -> Result<String, SaveMemoryError> {
+    let name = validate_memory_file_name(raw)?;
+    if name.eq_ignore_ascii_case(ENTRYPOINT_NAME) {
+        return Err(SaveMemoryError::Validation(
+            "target_file must not be MEMORY.md (case-insensitive)".to_string(),
+        ));
+    }
+    Ok(name)
 }
 
 fn has_windows_drive_prefix(value: &str) -> bool {

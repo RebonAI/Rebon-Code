@@ -276,4 +276,22 @@ mod tests {
             ToolExposure::Eager
         );
     }
+
+    /// The memory pair is direct, not deferred: the router consults both in
+    /// the same turn it decides something, and a ToolSearch round trip in
+    /// between is the difference between memory being used and being
+    /// skipped. It is why `InvokeDeferredTool` refuses `ReadMemory` — that
+    /// refusal is this table's answer, not a missing registration.
+    #[test]
+    fn the_memory_tools_are_direct_on_every_surface() {
+        for surface in [ExecutionSurface::Interactive, ExecutionSurface::Unattended] {
+            for name in ["ReadMemory", "SaveMemory"] {
+                assert_eq!(
+                    exposure(surface, name),
+                    ToolExposure::Eager,
+                    "{name} must reach the model without a discovery round trip"
+                );
+            }
+        }
+    }
 }
