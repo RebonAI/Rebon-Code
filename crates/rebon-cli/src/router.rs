@@ -85,20 +85,56 @@ pub(crate) fn current_router(store: &BackgroundStore) -> Option<BackgroundJobSta
     current(store, ROUTER)
 }
 
-/// The light model both run: the active provider's `fast` profile, else its
-/// `small` one. `None` leaves them on the default model.
-fn light_model() -> Option<String> {
+/// The provider and model a resident records at launch.
+///
+/// A resident is rebuilt from this record whenever its worker is reaped or
+/// crashes, and the model it runs is half of the session's prompt-cache key
+/// (`stable_session_prompt_cache_key`). A record that named neither made every
+/// rebuild re-resolve the global default, so one session could run on one
+/// provider before an idle hour and another afterwards: a new cache key and a
+/// full re-prefill of a conversation nothing had changed. Recording the launch
+/// identity keeps reaps from moving the session; it does not pin the record
+/// against the person — `/model` inside the router still writes it, and a
+/// global provider/model change applies when the router is next started.
+///
+/// The model is the provider's `fast` profile, else its `small` one, else the
+/// provider's own model — the same order the resident ran on before, recorded
+/// so a rebuild cannot drift off it.
+fn resident_identity() -> (Option<String>, Option<String>) {
+    resident_identity_in(&rebon_config::config_home_dir())
+}
+
+/// [`resident_identity`] against an explicit config directory, so the launch
+/// decision is testable without the machine's own provider.
+fn resident_identity_in(config_dir: &Path) -> (Option<String>, Option<String>) {
+    let Some(provider) = rebon_config::resolve_from_dir(config_dir).ok().flatten() else {
+        return (None, None);
+    };
+    let model = light_model_in(config_dir, &provider.name)
+        .or_else(|| Some(provider.model.trim().to_string()).filter(|model| !model.is_empty()));
+    (Some(provider.name), model)
+}
+
+/// The provider's `fast` profile model, else its `small` one, in that order.
+fn light_model_in(config_dir: &Path, provider_name: &str) -> Option<String> {
+    let profiles = rebon_config::custom_provider_profiles_in(config_dir, provider_name).ok()?;
     [
         rebon_types::MODEL_PROFILE_FAST,
         rebon_types::MODEL_PROFILE_SMALL,
     ]
     .into_iter()
-    .find_map(rebon_config::active_provider_profile_model)
+    .find_map(|role| {
+        profiles
+            .iter()
+            .find(|entry| entry.role == role)
+            .and_then(|entry| entry.model.clone())
+    })
 }
 
 fn launch_options(
     resident: Resident,
     workspace: &Path,
+    provider: Option<String>,
     model: Option<String>,
 ) -> BackgroundLaunchOptions {
     BackgroundLaunchOptions {
@@ -110,7 +146,7 @@ fn launch_options(
         preserve_worktree_on_success: false,
         queue_session: false,
         runtime: BackgroundRuntimeFields {
-            provider: None,
+            provider,
             model,
             fast_mode: None,
             channels: Vec::new(),
@@ -142,9 +178,10 @@ fn ensure(
     }
     let workspace = workspace(store, resident);
     std::fs::create_dir_all(&workspace)?;
+    let (provider, model) = resident_identity();
     let job = crate::background::launch_background_prompt(
         store,
-        launch_options(resident, &workspace, light_model()),
+        launch_options(resident, &workspace, provider, model),
     )?;
     let record = Record {
         job_id: job.identity.job_id.clone(),
@@ -248,6 +285,7 @@ pub(crate) fn record_for_test(store: &BackgroundStore, resident: Resident, job_i
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::background::RuntimeFieldsExt;
 
     #[test]
     fn each_resident_runs_in_its_own_directory_in_auto_mode_and_starts_as_itself() {
@@ -256,18 +294,106 @@ mod tests {
         let options = launch_options(
             ROUTER,
             &router_workspace(&store),
+            Some("ollama".into()),
             Some("light-model".into()),
         );
         assert_eq!(options.prompt, "/router");
         assert_eq!(options.cwd, dir.path().join("router"));
         assert_eq!(options.runtime.permission_mode.as_deref(), Some("auto"));
+        assert_eq!(options.runtime.provider.as_deref(), Some("ollama"));
         assert_eq!(options.runtime.model.as_deref(), Some("light-model"));
         assert!(!options.isolate_in_worktree);
         assert_eq!(options.parent_job_id, None);
-        let watchdog = launch_options(WATCHDOG, &workspace(&store, WATCHDOG), None);
+        let watchdog = launch_options(
+            WATCHDOG,
+            &workspace(&store, WATCHDOG),
+            Some("ollama".into()),
+            None,
+        );
         assert_eq!(watchdog.prompt, "/watchdog");
         assert_eq!(watchdog.cwd, dir.path().join("watchdog"));
         assert_eq!(watchdog.name.as_deref(), Some("Rebon Watchdog"));
+    }
+
+    /// A resident is rebuilt from its job record on every wake, so the provider
+    /// has to live in that record. It used to be left out, and a rebuild then
+    /// followed whatever provider the global config named by then: one session
+    /// ran on one provider before an idle hour and on another afterwards, which
+    /// is a different prompt-cache namespace and a full re-prefill.
+    #[test]
+    fn a_rebuilt_resident_keeps_the_provider_it_started_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BackgroundStore::new(dir.path());
+        let job = store
+            .create_job(
+                ROUTER.command.into(),
+                router_workspace(&store),
+                launch_options(
+                    ROUTER,
+                    &router_workspace(&store),
+                    Some("ollama".into()),
+                    Some("light-model".into()),
+                )
+                .runtime,
+            )
+            .unwrap();
+        record_for_test(&store, ROUTER, &job.identity.job_id);
+        let recorded = current_router(&store).expect("the recorded router");
+        assert_eq!(
+            recorded.identity.runtime.provider.as_deref(),
+            Some("ollama"),
+            "the record is what a rebuild resolves its provider from"
+        );
+        assert_eq!(
+            recorded.identity.runtime.model.as_deref(),
+            Some("light-model")
+        );
+        let rebuilt = recorded
+            .identity
+            .runtime
+            .to_runtime_override()
+            .expect("the record converts to launch overrides");
+        assert_eq!(rebuilt.provider.as_deref(), Some("ollama"));
+        assert_eq!(rebuilt.model.as_deref(), Some("light-model"));
+    }
+
+    /// The launch identity is read once, from the config as it stands then: a
+    /// light profile when the provider declares one, else the provider's own
+    /// model. That is what a rebuild then reuses instead of re-resolving.
+    #[test]
+    fn the_launch_identity_names_the_active_provider_and_its_light_model() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"activeCustomProvider":"vendor","customProviders":[
+                {"name":"vendor","format":"openai","baseUrl":"https://example.com","apiKey":"sk",
+                 "model":"vendor-pro","models":["vendor-pro","vendor-flash"],
+                 "modelProfiles":{"small":{"model":"vendor-flash"}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resident_identity_in(dir.path()),
+            (Some("vendor".to_string()), Some("vendor-flash".to_string())),
+            "the provider is recorded with the light model it actually runs"
+        );
+
+        // A provider that declares no light profile runs its own model, which
+        // is recorded rather than left for the next rebuild to guess.
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"activeCustomProvider":"vendor","customProviders":[
+                {"name":"vendor","format":"openai","baseUrl":"https://example.com","apiKey":"sk",
+                 "model":"vendor-pro"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resident_identity_in(dir.path()),
+            (Some("vendor".to_string()), Some("vendor-pro".to_string()))
+        );
+
+        // No provider at all leaves the record empty, as before.
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        assert_eq!(resident_identity_in(dir.path()), (None, None));
     }
 
     fn resident_job(store: &BackgroundStore, resident: Resident) -> BackgroundJobState {
@@ -275,7 +401,7 @@ mod tests {
             .create_job(
                 resident.command.into(),
                 workspace(store, resident),
-                launch_options(resident, &workspace(store, resident), None).runtime,
+                launch_options(resident, &workspace(store, resident), None, None).runtime,
             )
             .unwrap();
         job.process.status = BackgroundJobStatus::Succeeded;
