@@ -88,11 +88,11 @@ mod warm_peek;
 mod wire_contract_tests;
 mod worktree_path;
 
-pub use autonomy::{automated_turn_hold, running_turns, AutomatedTurnHold, AutomatedTurnLimits};
 pub use attach_job::{
     attach_background_job_in_store, mirrorable_background_job_in_store, AttachedJob,
     BackgroundAttachMode,
 };
+pub use autonomy::{automated_turn_hold, running_turns, AutomatedTurnHold, AutomatedTurnLimits};
 pub use day::{
     civil_from_days, current_local_day_number, date_from_day_number, day_number_from_date,
     day_number_from_ms, local_day_number, local_utc_offset_seconds,
@@ -283,11 +283,13 @@ pub fn generate_command_id() -> String {
     format!("cmd-{:x}{:016x}", now_ms(), random)
 }
 
+pub const PENDING_PROMPT_ID_PREFIX: &str = "pp-";
+
 pub fn generate_pending_prompt_id() -> String {
     let mut buf = [0u8; 8];
     let _ = getrandom::getrandom(&mut buf);
     let random = u64::from_le_bytes(buf);
-    format!("pp-{:x}{:016x}", now_ms(), random)
+    format!("{PENDING_PROMPT_ID_PREFIX}{:x}{:016x}", now_ms(), random)
 }
 
 /// Trim + drop-if-empty (job name / summary helper).
