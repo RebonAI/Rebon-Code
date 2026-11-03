@@ -16,7 +16,7 @@
 //! 2. **The literal text is `Memory updated in <path> · /memory to edit`.**
 //! Pinned. Note the `·` U+00B7 separator.
 
-use crate::memory::relative_path::relative_memory_path;
+use crate::memory::relative_path::{relative_memory_path, relative_memory_path_without_cwd};
 
 /// Format the memory-update notification line.
 ///
@@ -34,10 +34,24 @@ pub fn format_update_notification(memory_path: &str, home_dir: &str, cwd: &str) 
 /// ([`rebon_session::platform_home_dir`]). With no home directory the
 /// `~`-form is simply never the shorter one.
 pub fn format_update_notification_from_env(memory_path: &str, cwd: &str) -> String {
-    let home = rebon_session::platform_home_dir()
-        .map(|home| home.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let home = platform_home();
     format_update_notification(memory_path, &home, cwd)
+}
+
+/// [`format_update_notification`] for a call with no cwd to shorten against.
+///
+/// User memory is keyed by the config home rather than by a project, so a call
+/// that touches only it has no cwd. The line is the same literal; only the
+/// display path drops its cwd candidate instead of inventing one.
+pub fn format_update_notification_without_cwd(memory_path: &str) -> String {
+    let display = relative_memory_path_without_cwd(memory_path, &platform_home());
+    format!("Memory updated in {display} \u{00B7} /memory to edit")
+}
+
+fn platform_home() -> String {
+    rebon_session::platform_home_dir()
+        .map(|home| home.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

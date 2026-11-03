@@ -193,29 +193,10 @@ fn read_file_name(raw: &str) -> ToolResult<Option<String>> {
 
 /// The memory directory `request` reads from.
 fn memory_dir(request: &ReadRequest, context: &ToolContext) -> ToolResult<std::path::PathBuf> {
-    let cwd = match request.scope {
-        // The person's memory is keyed by the config home alone: neither
-        // `project` nor the session's cwd takes part in it.
-        MemoryScope::User => None,
-        MemoryScope::Repo => Some(repo_memory_cwd(request, context)?),
-    };
+    let cwd =
+        memory_cwd(request.scope, request.project.as_deref(), context.cwd()).map_err(invalid)?;
     memory_dir_for_scope(request.scope, cwd)
         .ok_or_else(|| invalid("no config home to find memory in".into()))
-}
-
-/// The directory repo memory is keyed by: the project `project` names, or the
-/// session's own when it names none.
-fn repo_memory_cwd<'a>(request: &'a ReadRequest, context: &'a ToolContext) -> ToolResult<&'a str> {
-    let Some(project) = request.project.as_deref() else {
-        return context.cwd().ok_or_else(|| {
-            invalid(
-                "cwd_missing: ReadMemory reads this session's repo memory from its cwd; \
-                 pass `project` to name one"
-                    .into(),
-            )
-        });
-    };
-    memory_cwd(Some(project), project).map_err(invalid)
 }
 
 fn invalid(reason: String) -> ToolError {
@@ -505,6 +486,75 @@ mod tests {
         ] {
             let error = engine
                 .invoke_tool(READ_MEMORY_TOOL_NAME, call.clone(), &context)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    rebon_tools_core::ToolError::InvalidInput {
+                        error_code: Some(400),
+                        ..
+                    }
+                ),
+                "{call}: {error:?}"
+            );
+        }
+    }
+
+    /// A provider whose strict mode rewrites the schema to require every
+    /// declared property must still be answerable: the nullable pair is what
+    /// makes `scope`-only calls expressible once `file` and `project` are
+    /// forced present.
+    ///
+    /// This is the shape the live router hit — all three names in `required`.
+    /// The tool cannot stop a provider from rewriting the schema, so what it
+    /// must guarantee is that the rewritten schema has a legal call for every
+    /// documented use.
+    #[tokio::test]
+    async fn a_strict_schema_that_requires_every_property_still_has_a_legal_call() {
+        use rebon_tool::validation::validate_schema;
+
+        let _home = Home::new();
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path().to_string_lossy().into_owned();
+        let workspace = tempfile::tempdir().unwrap();
+        let context = router(&workspace);
+        let file = save_lesson(&project_path, &context).await;
+
+        let mut strict = ReadMemoryTool.input_schema();
+        strict["required"] = json!(["scope", "project", "file"]);
+        assert_eq!(
+            strict["properties"]["project"]["type"],
+            json!(["string", "null"])
+        );
+
+        for call in [
+            json!({"scope": "user", "project": null, "file": null}),
+            json!({"scope": "user", "project": null, "file": "MEMORY.md"}),
+            json!({"scope": "repo", "project": project_path, "file": null}),
+            json!({"scope": "repo", "project": null, "file": null}),
+            json!({"scope": "repo", "project": project_path, "file": file}),
+        ] {
+            validate_schema(READ_MEMORY_TOOL_NAME, &strict, &call).unwrap_or_else(|error| {
+                panic!("{call} is refused by the strict schema: {error:?}")
+            });
+            ReadMemoryTool
+                .call(call.clone(), &context)
+                .await
+                .unwrap_or_else(|error| panic!("{call} is refused at call time: {error}"));
+        }
+
+        // The rewrite must not turn the nullable pair into a licence for any
+        // value: a strict schema still refuses an integer where a string or
+        // null is declared.
+        for call in [
+            json!({"scope": "user", "project": 7, "file": null}),
+            json!({"scope": "user", "project": null, "file": false}),
+        ] {
+            validate_schema(READ_MEMORY_TOOL_NAME, &strict, &call)
+                .expect_err("a strict schema must still reject a wrong-typed value");
+            let error = ReadMemoryTool
+                .call(call.clone(), &context)
                 .await
                 .unwrap_err();
             assert!(

@@ -69,15 +69,7 @@
 /// applicable. Tie-breaker is `<=`, so the home-relative form wins
 /// on ties.
 pub fn relative_memory_path(path: &str, home_dir: &str, cwd: &str) -> String {
-    let relative_to_home = if path.starts_with(home_dir) {
-        let suffix = &path[home_dir.len()..];
-        let mut s = String::with_capacity(1 + suffix.len());
-        s.push('~');
-        s.push_str(suffix);
-        Some(s)
-    } else {
-        None
-    };
+    let relative_to_home = home_relative(path, home_dir);
 
     let relative_to_cwd = if path.starts_with(cwd) {
         let suffix = relative_path_from(cwd, path);
@@ -102,6 +94,29 @@ pub fn relative_memory_path(path: &str, home_dir: &str, cwd: &str) -> String {
         (None, Some(cwd)) => cwd,
         (None, None) => path.to_string(),
     }
+}
+
+/// [`relative_memory_path`] for a caller that has no cwd: the home-relative
+/// form when the file is inside home, the absolute path otherwise.
+///
+/// User memory is keyed by the config home and not by any project, so a call
+/// that only touches it has no cwd to shorten against. Rather than pass a
+/// stand-in cwd — which would silently pick the wrong form — the cwd branch is
+/// simply not offered, and the home branch is the same one function.
+pub fn relative_memory_path_without_cwd(path: &str, home_dir: &str) -> String {
+    home_relative(path, home_dir).unwrap_or_else(|| path.to_string())
+}
+
+/// `~` + the suffix after `home_dir`, when `path` starts with it.
+fn home_relative(path: &str, home_dir: &str) -> Option<String> {
+    if !path.starts_with(home_dir) {
+        return None;
+    }
+    let suffix = &path[home_dir.len()..];
+    let mut s = String::with_capacity(1 + suffix.len());
+    s.push('~');
+    s.push_str(suffix);
+    Some(s)
 }
 
 /// Returns:
@@ -511,6 +526,26 @@ mod tests {
                 "relative_memory_path({path:?}, {home:?}, {cwd:?})"
             );
         }
+    }
+
+    /// With no cwd there is no cwd form to compare against: inside home the
+    /// `~` form is used, outside it the path stays absolute — never `./…`
+    /// from some stand-in cwd.
+    #[test]
+    fn relative_memory_path_without_cwd_never_invents_a_cwd_form() {
+        assert_eq!(
+            relative_memory_path_without_cwd("/home/u/.rebon/memory/user/a.md", "/home/u"),
+            "~/.rebon/memory/user/a.md"
+        );
+        assert_eq!(
+            relative_memory_path_without_cwd("/srv/elsewhere/a.md", "/home/u"),
+            "/srv/elsewhere/a.md"
+        );
+        assert_eq!(
+            relative_memory_path("/srv/elsewhere/a.md", "/home/u", "/srv/elsewhere"),
+            "./a.md",
+            "the cwd form is what the no-cwd variant deliberately omits"
+        );
     }
 
     #[test]

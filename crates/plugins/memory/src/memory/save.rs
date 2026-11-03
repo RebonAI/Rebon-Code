@@ -153,8 +153,13 @@ pub fn parse_scope(raw: &str) -> Result<MemoryScope, SaveMemoryError> {
     }
 }
 
+/// Save or delete a durable memory.
+///
+/// `cwd` is the directory repo memory is keyed by, and it is `None` for
+/// scope `user`, which the config home keys on its own. Passing `None` with
+/// scope `repo` is a validation error rather than a guess.
 pub fn save_memory(
-    cwd: &str,
+    cwd: Option<&str>,
     input: SaveMemoryRequest,
 ) -> Result<SaveMemoryOutcome, SaveMemoryError> {
     match input.action {
@@ -164,7 +169,7 @@ pub fn save_memory(
 }
 
 pub fn delete_memory(
-    cwd: &str,
+    cwd: Option<&str>,
     input: SaveMemoryRequest,
 ) -> Result<SaveMemoryOutcome, SaveMemoryError> {
     let memory_dir = memory_dir(cwd, input.scope)?;
@@ -196,7 +201,7 @@ pub fn delete_memory(
 }
 
 fn upsert_memory(
-    cwd: &str,
+    cwd: Option<&str>,
     input: SaveMemoryRequest,
 ) -> Result<SaveMemoryOutcome, SaveMemoryError> {
     let memory_type = input.memory_type.ok_or_else(|| {
@@ -261,8 +266,22 @@ fn upsert_memory(
     })
 }
 
-fn memory_dir(cwd: &str, scope: MemoryScope) -> Result<PathBuf, SaveMemoryError> {
-    memory_paths::memory_dir_for_scope(scope, Some(cwd)).ok_or_else(|| {
+/// The memory directory for a scope.
+///
+/// User memory is keyed by the config home, so it needs no cwd; repo memory is
+/// keyed by a directory, so it does. Asking for the latter without one is a
+/// validation error rather than a silent fallback to whatever the process
+/// happens to be running in.
+fn memory_dir(cwd: Option<&str>, scope: MemoryScope) -> Result<PathBuf, SaveMemoryError> {
+    let cwd = match scope {
+        MemoryScope::User => None,
+        MemoryScope::Repo => Some(cwd.ok_or_else(|| {
+            SaveMemoryError::Validation(
+                "scope `repo` needs the project directory to key its memory by".to_string(),
+            )
+        })?),
+    };
+    memory_paths::memory_dir_for_scope(scope, cwd).ok_or_else(|| {
         SaveMemoryError::Validation(
             "could not resolve memory directory for requested scope".to_string(),
         )
@@ -657,7 +676,7 @@ mod tests {
     #[test]
     fn creates_user_scope_memory_file_and_index() {
         let env = EnvGuard::new();
-        let outcome = save_memory("/repo", upsert(MemoryScope::User, "User Pref")).unwrap();
+        let outcome = save_memory(Some("/repo"), upsert(MemoryScope::User, "User Pref")).unwrap();
         let path = outcome.memory_path.unwrap();
         assert_eq!(
             path,
@@ -677,7 +696,7 @@ mod tests {
         let mut req = upsert(MemoryScope::Repo, "Launch Plan");
         req.memory_type = Some(MemoryContentType::Project);
         req.dedupe_key = None;
-        let outcome = save_memory("/definitely/not/a/repo", req).unwrap();
+        let outcome = save_memory(Some("/definitely/not/a/repo"), req).unwrap();
         let path = outcome.memory_path.unwrap();
         assert!(path.starts_with(env.config_home_path.join("projects")));
         assert_eq!(path.file_name().unwrap(), "project-launch-plan.md");
@@ -689,8 +708,8 @@ mod tests {
     #[test]
     fn updating_same_title_or_dedupe_does_not_duplicate_index() {
         let _env = EnvGuard::new();
-        save_memory("/repo", upsert(MemoryScope::User, "User Pref")).unwrap();
-        let outcome = save_memory("/repo", upsert(MemoryScope::User, "User Pref")).unwrap();
+        save_memory(Some("/repo"), upsert(MemoryScope::User, "User Pref")).unwrap();
+        let outcome = save_memory(Some("/repo"), upsert(MemoryScope::User, "User Pref")).unwrap();
         assert_eq!(outcome.status, "updated");
         let index = fs::read_to_string(outcome.index_path).unwrap();
         assert_eq!(index.lines().count(), 1);
@@ -731,7 +750,7 @@ mod tests {
         req.description = Some("Use colon: value # literal [a] {b}".to_string());
         req.dedupe_key = Some("dedupe: key # one".to_string());
 
-        let outcome = save_memory("/repo", req.clone()).unwrap();
+        let outcome = save_memory(Some("/repo"), req.clone()).unwrap();
         let raw = fs::read_to_string(outcome.memory_path.as_ref().unwrap()).unwrap();
         assert!(raw.contains("name: 'Plan: alpha #1 [draft] {x}'"));
         assert!(raw.contains("description: 'Use colon: value # literal [a] {b}'"));
@@ -742,7 +761,7 @@ mod tests {
         assert_eq!(parsed.description(), req.description.as_deref());
         assert_eq!(parsed.fields.get("dedupe_key"), req.dedupe_key.as_ref());
 
-        let updated = save_memory("/repo", req).unwrap();
+        let updated = save_memory(Some("/repo"), req).unwrap();
         assert_eq!(updated.status, "updated");
     }
 
@@ -753,7 +772,7 @@ mod tests {
         req.description = Some("Keep \\slashes\\ and 'single' plus \"double\" quotes".to_string());
         req.dedupe_key = Some("key's \\path".to_string());
 
-        let outcome = save_memory("/repo", req.clone()).unwrap();
+        let outcome = save_memory(Some("/repo"), req.clone()).unwrap();
         let raw = fs::read_to_string(outcome.memory_path.unwrap()).unwrap();
         assert!(raw.contains("name: 'Bob''s \"quoted\" C:\\path\\file'"));
         assert!(
@@ -771,7 +790,7 @@ mod tests {
         let _env = EnvGuard::new();
         for title in ["*anchor", "- list item", "# heading", "[link]", "{flow}"] {
             let req = upsert(MemoryScope::User, title);
-            let outcome = save_memory("/repo", req.clone()).unwrap();
+            let outcome = save_memory(Some("/repo"), req.clone()).unwrap();
             let raw = fs::read_to_string(outcome.memory_path.unwrap()).unwrap();
             assert!(raw.contains(&format!("name: '{title}'")));
             assert_eq!(parse_frontmatter(&raw).frontmatter.name(), Some(title));
@@ -785,7 +804,7 @@ mod tests {
         req.description = Some("Desc one\n\nDesc two".to_string());
         req.dedupe_key = Some("key one\nkey two".to_string());
 
-        let outcome = save_memory("/repo", req).unwrap();
+        let outcome = save_memory(Some("/repo"), req).unwrap();
         let raw = fs::read_to_string(outcome.memory_path.unwrap()).unwrap();
         let parsed = parse_frontmatter(&raw).frontmatter;
         assert_eq!(parsed.name(), Some("Line one Line two Line three"));
@@ -799,7 +818,7 @@ mod tests {
     #[test]
     fn deleting_target_file_removes_index_entry() {
         let _env = EnvGuard::new();
-        let outcome = save_memory("/repo", upsert(MemoryScope::User, "User Pref")).unwrap();
+        let outcome = save_memory(Some("/repo"), upsert(MemoryScope::User, "User Pref")).unwrap();
         let path = outcome.memory_path.clone().unwrap();
         let delete = SaveMemoryRequest {
             action: SaveMemoryAction::Delete,
@@ -813,7 +832,7 @@ mod tests {
             dedupe_key: None,
             target_file: Some("user-user-pref.md".to_string()),
         };
-        let deleted = save_memory("/repo", delete).unwrap();
+        let deleted = save_memory(Some("/repo"), delete).unwrap();
         assert_eq!(deleted.status, "deleted");
         assert!(!path.exists());
         assert_eq!(fs::read_to_string(outcome.index_path).unwrap(), "");

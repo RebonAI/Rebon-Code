@@ -6,7 +6,8 @@
 //! - `type: "object"` envelope check
 //! - `required: [...]` — missing required keys
 //! - `properties.*.type` — type validation for string, integer, number,
-//!   boolean, array, object
+//!   boolean, array, object — including the union form `["string", "null"]`
+//!   a tool uses to make a property omittable under a strict schema
 //! - `additionalProperties: false` — unexpected keys
 //! - `enum: [...]` — string enum membership
 //! - nested `items: { type: "object", ... }` for array-of-objects
@@ -81,16 +82,23 @@ pub fn validate_schema(
     if let Some(props) = properties {
         for (key, prop_schema) in props {
             if let Some(value) = input_obj.get(key) {
-                // Skip null for optional fields (not in required list).
+                // A present key holding null is read as "this optional field
+                // is absent": every tool parses null into `None`, and
+                // `properties` has always been validated that way. Declaring
+                // `null` in a union is therefore about the type list, not
+                // about making null legal.
                 if value.is_null() {
                     continue;
                 }
-                // Type check.
-                if let Some(expected_type) = prop_schema.get("type").and_then(Value::as_str) {
-                    if !value_matches_type(value, expected_type) {
+                // Type check, against every name the schema declares.
+                if let Some(types) = declared_types(prop_schema) {
+                    if !types
+                        .iter()
+                        .any(|expected| value_matches_type(value, expected))
+                    {
                         err.type_mismatches.push(TypeMismatch {
                             param: key.clone(),
-                            expected: expected_type.into(),
+                            expected: types.join(" or "),
                             received: json_type_name(value).into(),
                         });
                     }
@@ -134,18 +142,39 @@ fn validate_array_items(
     items_schema: &Value,
     err: &mut InputValidationError,
 ) {
-    let item_type = items_schema.get("type").and_then(Value::as_str);
+    let Some(types) = declared_types(items_schema) else {
+        return;
+    };
 
     for (i, item) in items.iter().enumerate() {
-        if let Some(expected) = item_type {
-            if !value_matches_type(item, expected) {
-                err.type_mismatches.push(TypeMismatch {
-                    param: format!("{parent_key}[{i}]"),
-                    expected: expected.into(),
-                    received: json_type_name(item).into(),
-                });
-            }
+        if !types
+            .iter()
+            .any(|expected| value_matches_type(item, expected))
+        {
+            err.type_mismatches.push(TypeMismatch {
+                param: format!("{parent_key}[{i}]"),
+                expected: types.join(" or "),
+                received: json_type_name(item).into(),
+            });
         }
+    }
+}
+
+/// The type names a schema declares.
+///
+/// JSON Schema spells `type` as one name or as a non-empty array of them, and
+/// both appear in this crate's tool schemas: `"type": ["string", "null"]` is
+/// how a property stays omittable under a provider that requires every
+/// declared property to be present. Reading only the string form would let the
+/// array form skip the type check entirely.
+fn declared_types(schema: &Value) -> Option<Vec<&str>> {
+    match schema.get("type")? {
+        Value::String(name) => Some(vec![name.as_str()]),
+        Value::Array(names) => {
+            let names: Vec<&str> = names.iter().filter_map(Value::as_str).collect();
+            (!names.is_empty()).then_some(names)
+        }
+        _ => None,
     }
 }
 
@@ -162,6 +191,10 @@ fn value_matches_type(value: &Value, expected: &str) -> bool {
         "boolean" => value.is_boolean(),
         "array" => value.is_array(),
         "object" => value.is_object(),
+        // Named, not left to the pass-through below: in a union it is the
+        // member that decides whether null is legal, and an unknown name
+        // would answer yes for every value.
+        "null" => value.is_null(),
         _ => true, // Unknown type — pass through.
     }
 }
@@ -338,6 +371,72 @@ mod tests {
         let schema = read_schema();
         let input = json!({ "file_path": "/f", "offset": null });
         assert!(validate_schema("Read", &schema, &input).is_ok());
+    }
+
+    /// The array form of `type` is a union, and it has to constrain the
+    /// non-null branch: a nullable `file` still refuses an integer.
+    #[test]
+    fn nullable_union_checks_the_non_null_branch() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "file": { "type": ["string", "null"] },
+                "scope": { "type": "string" }
+            },
+            "required": ["scope"],
+            "additionalProperties": false
+        });
+        for input in [
+            json!({ "scope": "user" }),
+            json!({ "scope": "user", "file": null }),
+            json!({ "scope": "user", "file": "a.md" }),
+        ] {
+            assert!(
+                validate_schema("ReadMemory", &schema, &input).is_ok(),
+                "{input}"
+            );
+        }
+        let err = validate_schema(
+            "ReadMemory",
+            &schema,
+            &json!({ "scope": "user", "file": 7 }),
+        )
+        .unwrap_err();
+        assert_eq!(err.type_mismatches.len(), 1);
+        assert_eq!(err.type_mismatches[0].param, "file");
+        assert_eq!(err.type_mismatches[0].expected, "string or null");
+        assert_eq!(err.type_mismatches[0].received, "integer");
+    }
+
+    /// A union of two real types accepts either and nothing else.
+    #[test]
+    fn a_union_accepts_only_its_members() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "value": { "type": ["string", "integer"] } },
+            "additionalProperties": false
+        });
+        assert!(validate_schema("Browser", &schema, &json!({ "value": "x" })).is_ok());
+        assert!(validate_schema("Browser", &schema, &json!({ "value": 3 })).is_ok());
+        let err = validate_schema("Browser", &schema, &json!({ "value": true })).unwrap_err();
+        assert_eq!(err.type_mismatches[0].expected, "string or integer");
+        assert_eq!(err.type_mismatches[0].received, "boolean");
+    }
+
+    /// An array `items` union is checked the same way.
+    #[test]
+    fn array_items_union_is_checked() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "values": { "type": "array", "items": { "type": ["string", "null"] } }
+            },
+            "additionalProperties": false
+        });
+        assert!(validate_schema("X", &schema, &json!({ "values": ["a", null] })).is_ok());
+        let err = validate_schema("X", &schema, &json!({ "values": ["a", 2] })).unwrap_err();
+        assert_eq!(err.type_mismatches[0].param, "values[1]");
+        assert_eq!(err.type_mismatches[0].expected, "string or null");
     }
 
     #[test]

@@ -83,8 +83,8 @@ impl Tool for SaveMemoryTool {
                     "description": "Optional basename-only .md target. No path separators, absolute paths, drive/UNC prefixes, `..`, or MEMORY.md."
                 },
                 "project": {
-                    "type": "string",
-                    "description": "Only with scope `repo`: the absolute path of a project whose memory this belongs in, when that is not the project this session runs in. Sessions working in that project read it."
+                    "type": ["string", "null"],
+                    "description": "Only with scope `repo`: the absolute path of a project whose memory this belongs in, when that is not the project this session runs in. Sessions working in that project read it. Omit it or pass null for the session's own project; never pass it with scope `user`."
                 }
             },
             "required": ["action", "scope"],
@@ -118,20 +118,15 @@ impl Tool for SaveMemoryTool {
 
     async fn call(&self, input: Value, context: &ToolContext) -> ToolResult<Value> {
         let ParsedInput { request, project } = parse_input(&input)?;
-        let session_cwd = context.cwd().ok_or_else(|| ToolError::InvalidInput {
-            tool: self.id(),
-            reason: "cwd_missing: SaveMemory requires ToolContext.cwd() to resolve repo memory"
-                .into(),
-            error_code: Some(INVALID_INPUT_CODE),
-        })?;
-        let cwd =
-            memory_cwd(project.as_deref(), session_cwd).map_err(|why| invalid(&self.id(), why))?;
+        let cwd = memory_cwd(request.scope, project.as_deref(), context.cwd())
+            .map_err(|why| invalid(&self.id(), why))?;
 
-        let outcome = save_memory(cwd, request).map_err(|err| ToolError::InvalidInput {
-            tool: self.id(),
-            reason: err.to_string(),
-            error_code: Some(INVALID_INPUT_CODE),
-        })?;
+        let outcome =
+            save_memory(cwd.as_deref(), request).map_err(|err| ToolError::InvalidInput {
+                tool: self.id(),
+                reason: err.to_string(),
+                error_code: Some(INVALID_INPUT_CODE),
+            })?;
 
         let mut result = json!({
             "status": outcome.status,
@@ -144,10 +139,19 @@ impl Tool for SaveMemoryTool {
         });
 
         if let Some(path) = outcome.memory_path.as_ref() {
-            let note = crate::memory::update_notification::format_update_notification_from_env(
-                &path.to_string_lossy(),
-                cwd,
-            );
+            let path = path.to_string_lossy();
+            let note = match cwd.as_deref() {
+                Some(cwd) => {
+                    crate::memory::update_notification::format_update_notification_from_env(
+                        &path, cwd,
+                    )
+                }
+                // User memory is keyed by the config home, so there is no
+                // project directory to shorten the path against.
+                None => crate::memory::update_notification::format_update_notification_without_cwd(
+                    &path,
+                ),
+            };
             result["memoryNotification"] = Value::String(note);
         }
 
@@ -170,18 +174,30 @@ pub(crate) fn project_problem(scope: MemoryScope, project: &str) -> Option<Strin
     None
 }
 
-/// The directory repo memory is keyed by: the project `project` names,
-/// which must exist, or else the session's own.
+/// The directory repo memory is keyed by: the project `project` names, which
+/// must exist, or else the session's own.
+///
+/// Scope `user` needs neither, and returns `None`: user memory is keyed by the
+/// config home, so a session without a cwd can still read and write it.
 pub(crate) fn memory_cwd<'a>(
+    scope: MemoryScope,
     project: Option<&'a str>,
-    session_cwd: &'a str,
-) -> Result<&'a str, String> {
-    match project {
-        Some(project) if !std::path::Path::new(project).is_dir() => {
+    session_cwd: Option<&'a str>,
+) -> Result<Option<&'a str>, String> {
+    if scope != MemoryScope::Repo {
+        return Ok(None);
+    }
+    match (project, session_cwd) {
+        (Some(project), _) if !std::path::Path::new(project).is_dir() => {
             Err(format!("`project` is not a directory: {project}"))
         }
-        Some(project) => Ok(project),
-        None => Ok(session_cwd),
+        (Some(project), _) => Ok(Some(project)),
+        (None, Some(cwd)) => Ok(Some(cwd)),
+        (None, None) => Err(
+            "cwd_missing: scope `repo` keys its memory by a project directory; \
+             pass `project` to name one"
+                .into(),
+        ),
     }
 }
 
@@ -472,7 +488,108 @@ mod tests {
     #[test]
     fn the_schema_offers_a_project_for_repo_memory() {
         let schema = SaveMemoryTool.input_schema();
-        assert_eq!(schema["properties"]["project"]["type"], "string");
+        // Nullable, like `ReadMemory`'s: a provider that requires every
+        // declared property can be answered with null for scope `user`.
+        assert_eq!(
+            schema["properties"]["project"]["type"],
+            json!(["string", "null"])
+        );
         assert_eq!(schema["required"], json!(["action", "scope"]));
+    }
+
+    /// User memory is keyed by the config home, so a session with no cwd can
+    /// still save and delete it — and it must not land in any project bucket.
+    #[tokio::test]
+    async fn user_scope_needs_no_cwd_and_stays_out_of_every_project() {
+        let _env = EnvGuard::new();
+        let context = ToolContext::new();
+        let saved = SaveMemoryTool
+            .call(
+                json!({
+                    "action": "upsert",
+                    "scope": "user",
+                    "type": "feedback",
+                    "title": "Prefer terse replies",
+                    "description": "The person wants the short version",
+                    "content": "Answer briefly.",
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved["scope"], "user");
+        let path = std::path::PathBuf::from(saved["memory_path"].as_str().unwrap());
+        let user_dir = rebon_session::memory_paths::user_memory_dir().expect("user memory dir");
+        assert!(path.starts_with(&user_dir), "{path:?} escaped user memory");
+        assert!(
+            !path.to_string_lossy().contains("projects"),
+            "user memory must not be keyed by a project: {path:?}"
+        );
+        let note = saved["memoryNotification"].as_str().unwrap();
+        assert!(note.starts_with("Memory updated in "), "{note}");
+        assert!(
+            !note.contains("./"),
+            "a no-cwd save has no cwd form to show: {note}"
+        );
+
+        let deleted = SaveMemoryTool
+            .call(
+                json!({
+                    "action": "delete",
+                    "scope": "user",
+                    "target_file": path.file_name().unwrap().to_string_lossy(),
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted["status"], "deleted");
+        assert!(!path.exists());
+    }
+
+    /// Repo memory without a project directory has nothing to key itself by,
+    /// and says so instead of falling back to the process's directory.
+    #[tokio::test]
+    async fn repo_scope_without_a_directory_is_refused_not_guessed() {
+        let _env = EnvGuard::new();
+        let context = ToolContext::new();
+        let error = SaveMemoryTool
+            .call(
+                json!({
+                    "action": "upsert",
+                    "scope": "repo",
+                    "type": "project",
+                    "title": "Where does this go",
+                    "description": "Nothing to key it by",
+                    "content": "Body.",
+                }),
+                &context,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cwd_missing"), "{error}");
+        assert!(error.to_string().contains("pass `project`"), "{error}");
+
+        let project = tempfile::tempdir().expect("project dir");
+        let saved = SaveMemoryTool
+            .call(
+                json!({
+                    "action": "upsert",
+                    "scope": "repo",
+                    "type": "project",
+                    "title": "Where does this go",
+                    "description": "Keyed by the project",
+                    "content": "Body.",
+                    "project": project.path().to_string_lossy(),
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+        let path = std::path::PathBuf::from(saved["memory_path"].as_str().unwrap());
+        let project_dir =
+            rebon_session::memory_paths::repo_memory_dir(&project.path().to_string_lossy())
+                .unwrap();
+        assert!(path.starts_with(&project_dir), "{path:?}");
     }
 }
