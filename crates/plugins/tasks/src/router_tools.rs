@@ -86,6 +86,13 @@ fn required(value: &str, field: &str) -> Option<ValidationOutcome> {
         .then(|| ValidationOutcome::invalid(format!("`{field}` is required"), INVALID_INPUT_CODE))
 }
 
+/// An optional text field, trimmed; blank is the same as absent.
+fn trimmed(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct DispatchInput {
@@ -98,6 +105,8 @@ struct DispatchInput {
     isolate: bool,
     #[serde(default)]
     model_profile: Option<String>,
+    #[serde(default)]
+    worker: Option<String>,
 }
 
 #[async_trait]
@@ -120,7 +129,15 @@ impl Tool for DispatchWorkerTool {
          touch the same checkout; it then works in its own git worktree. Leave \
          it off for research and read-only work. Leave `modelProfile` out \
          unless the task clearly needs a lighter (`fast`) or stronger \
-         (`reasoning`) model than the default."
+         (`reasoning`) model than the default.\n\
+         \n\
+         Set `worker` to one of your workers to give it this task as its next \
+         turn instead of starting a new one, when its session already knows \
+         the ground: follow-up work in the same project or worktree. The task \
+         waits while that worker is busy, and is checked like any other. A \
+         worker idle past its prompt cache has its history compacted as it \
+         resumes; one whose context has grown long is replaced by a fresh \
+         worker on its own."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -150,6 +167,10 @@ impl Tool for DispatchWorkerTool {
                 "modelProfile": {
                     "type": "string",
                     "description": "A model profile such as fast or reasoning; omit for the default"
+                },
+                "worker": {
+                    "type": "string",
+                    "description": "Id of one of your workers to take the task as its next turn; omit for a new worker"
                 }
             },
             "required": ["project", "title", "brief"],
@@ -185,6 +206,8 @@ impl Tool for DispatchWorkerTool {
     async fn call(&self, input: Value, context: &ToolContext) -> ToolResult<Value> {
         let parsed: DispatchInput = parse_tool_input(self.id(), &input)?;
         let (control, session_id) = control_and_session(self, context)?;
+        let worker = trimmed(parsed.worker);
+        let started = worker.is_none();
         let dispatched = control
             .dispatch(
                 session_id,
@@ -194,10 +217,8 @@ impl Tool for DispatchWorkerTool {
                     brief: parsed.brief,
                     done_when: parsed.done_when.unwrap_or_default().trim().to_string(),
                     isolate: parsed.isolate,
-                    model_profile: parsed
-                        .model_profile
-                        .map(|profile| profile.trim().to_string())
-                        .filter(|profile| !profile.is_empty()),
+                    model_profile: trimmed(parsed.model_profile),
+                    worker,
                 },
             )
             .await
@@ -205,7 +226,7 @@ impl Tool for DispatchWorkerTool {
         let mut result = json!({
             "workerId": dispatched.worker_id,
             "taskId": dispatched.task_id,
-            "started": true,
+            "started": started,
         });
         if let Some(note) = dispatched.note {
             result["note"] = json!(note);
@@ -228,6 +249,8 @@ struct PlannedTaskInput {
     isolate: bool,
     #[serde(default)]
     model_profile: Option<String>,
+    #[serde(default)]
+    worker: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -243,7 +266,7 @@ impl Tool for PlanTasksTool {
     }
 
     fn description(&self) -> &str {
-        "Plan work as tasks. Each task gets a worker of its own once the tasks it \
+        "Plan work as tasks. Each task gets a worker once the tasks it \
          depends on are done; the supervisor dispatches and follows them, so you \
          do not start or wait for them yourself. Returns each task's id at once.\n\
          \n\
@@ -252,7 +275,14 @@ impl Tool for PlanTasksTool {
          worker's whole brief: it sees nothing else. `doneWhen` says, checkably, \
          what must hold for the task to be done. Tasks that do not depend on each \
          other run side by side; set `isolate` on a task that changes code while \
-         others may touch the same checkout."
+         others may touch the same checkout.\n\
+         \n\
+         A task that depends on one other task alone, on the same ground, goes \
+         to that task's worker as its next turn, so the worker keeps what it \
+         learned. Set `worker` to give a task to one of your workers by name: \
+         follow-up work on ground it already knows. A worker idle past its \
+         prompt cache has its history compacted as it resumes; one whose \
+         context has grown long is replaced by a fresh worker on its own."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -276,7 +306,8 @@ impl Tool for PlanTasksTool {
                                 "description": "Keys in this plan, or ids of earlier tasks, that must be done first"
                             },
                             "isolate": { "type": "boolean", "description": "Work in a git worktree of its own" },
-                            "modelProfile": { "type": "string", "description": "A model profile such as fast or reasoning; omit for the default" }
+                            "modelProfile": { "type": "string", "description": "A model profile such as fast or reasoning; omit for the default" },
+                            "worker": { "type": "string", "description": "Id of one of your workers to take it as its next turn; omit to let the supervisor choose" }
                         },
                         "required": ["key", "title", "project", "goal", "doneWhen"],
                         "additionalProperties": false
@@ -350,10 +381,8 @@ impl Tool for PlanTasksTool {
                     .filter(|dep| !dep.is_empty())
                     .collect(),
                 isolate: task.isolate,
-                model_profile: task
-                    .model_profile
-                    .map(|profile| profile.trim().to_string())
-                    .filter(|profile| !profile.is_empty()),
+                model_profile: trimmed(task.model_profile),
+                worker: trimmed(task.worker),
             })
             .collect();
         let ids = control
@@ -443,7 +472,9 @@ impl Tool for ContinueWorkerTool {
         "Give one of your workers its next turn. It resumes its own session \
          with everything it learned so far, so prefer this to starting a fresh \
          worker on related work. Returns at once; a running worker takes the \
-         message when its current turn ends."
+         message when its current turn ends. Use it for an answer, a correction \
+         or a nudge. New work that should be checked when it is done is a task: \
+         give it to the worker with `worker` on DispatchWorker or PlanTasks."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -667,6 +698,8 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         calls: Mutex<Vec<String>>,
+        /// The `worker` each dispatch and planned task asked for.
+        workers: Mutex<Vec<Option<String>>>,
     }
 
     #[async_trait]
@@ -676,6 +709,10 @@ mod tests {
             router: &str,
             tasks: Vec<PlannedTask>,
         ) -> Result<Vec<String>, String> {
+            self.workers
+                .lock()
+                .unwrap()
+                .extend(tasks.iter().map(|task| task.worker.clone()));
             self.calls.lock().unwrap().push(format!(
                 "plan {router} {}",
                 tasks
@@ -700,6 +737,7 @@ mod tests {
             router: &str,
             request: WorkerDispatch,
         ) -> Result<DispatchedWorker, String> {
+            self.workers.lock().unwrap().push(request.worker.clone());
             self.calls.lock().unwrap().push(format!(
                 "dispatch {router} {} {} isolate={}",
                 request.project, request.title, request.isolate
@@ -779,6 +817,42 @@ mod tests {
             .call(json!({"workerId": "someone-else"}), &ctx)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_task_can_name_the_worker_to_take_it() {
+        let control = Arc::new(Recorder::default());
+        let ctx = context(control.clone());
+        let queued = DispatchWorkerTool
+            .call(
+                json!({"project": "/p", "title": "Next", "brief": "do it", "worker": " w1 "}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued["started"], false);
+        let started = DispatchWorkerTool
+            .call(
+                json!({"project": "/p", "title": "Other", "brief": "do it", "worker": " "}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(started["started"], true);
+        let input = json!({"tasks": [
+            {"key": "a", "title": "A", "project": "/p", "goal": "g", "doneWhen": "d", "worker": "w2"},
+            {"key": "b", "title": "B", "project": "/p", "goal": "g", "doneWhen": "d"}
+        ]});
+        assert!(PlanTasksTool
+            .validate_input(&input, &ctx)
+            .await
+            .unwrap()
+            .is_valid());
+        PlanTasksTool.call(input, &ctx).await.unwrap();
+        assert_eq!(
+            *control.workers.lock().unwrap(),
+            [Some("w1".to_string()), None, Some("w2".to_string()), None]
+        );
     }
 
     #[tokio::test]

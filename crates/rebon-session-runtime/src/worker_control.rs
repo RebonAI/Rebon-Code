@@ -102,6 +102,21 @@ impl HostWorkerControl {
         Ok(worker)
     }
 
+    /// A worker a task can be given to: one of the router's, not stopped.
+    fn worker_to_continue(
+        &self,
+        router: &BackgroundJobState,
+        worker_id: &str,
+    ) -> Result<BackgroundJobState, String> {
+        let worker = self.worker(router, worker_id)?;
+        if worker.process.status == BackgroundJobStatus::Stopped {
+            return Err(format!(
+                "{worker_id} was stopped; leave `worker` out to start a new one"
+            ));
+        }
+        Ok(worker)
+    }
+
     fn ledger(&self) -> rebon_work::Ledger {
         rebon_work::Ledger::load(&rebon_work::ledger_path(self.config_home())).unwrap_or_default()
     }
@@ -147,6 +162,9 @@ impl HostWorkerControl {
                     }
                 }
             }
+            if let Some(worker) = task.worker.as_deref() {
+                self.worker_to_continue(router, worker)?;
+            }
             planned.push(rebon_work::NewTask {
                 id: ids[&task.key].clone(),
                 title: task.title.clone(),
@@ -156,6 +174,7 @@ impl HostWorkerControl {
                 depends_on,
                 isolate: task.isolate,
                 model_profile: task.model_profile.clone(),
+                worker: task.worker.clone(),
             });
         }
         let order = planned.iter().map(|task| task.id.clone()).collect();
@@ -324,6 +343,7 @@ impl HostWorkerControl {
         }
         workers.sort_by_key(|job| std::cmp::Reverse(job.process.updated_at_ms));
         let total = workers.len();
+        let now = rebon_session_host::now_ms();
         let mut lines = vec![format!("{total} worker(s), most recent first:")];
         for job in workers.iter().take(RECALL_MAX_WORKERS) {
             let summary = job
@@ -333,8 +353,12 @@ impl HostWorkerControl {
                 .and_then(|summary| summary.lines().next())
                 .map(|line| format!(" — {line}"))
                 .unwrap_or_default();
+            let session = self
+                .finished_session_note(job, now)
+                .map(|note| format!(" · {note}"))
+                .unwrap_or_default();
             lines.push(format!(
-                "- {} [{}] {} ({}){summary}",
+                "- {} [{}] {} ({}){session}{summary}",
                 job.identity.job_id,
                 status_name(job.process.status),
                 job.identity.name,
@@ -348,6 +372,18 @@ impl HostWorkerControl {
             lines.insert(0, tasks);
         }
         Ok(lines.join("\n"))
+    }
+
+    /// [`session_note`] for a worker whose turn has ended; nothing for one
+    /// that is busy, stopped or failed, which takes no task either way.
+    fn finished_session_note(&self, job: &BackgroundJobState, now_ms: u64) -> Option<String> {
+        if !matches!(
+            job.process.status,
+            BackgroundJobStatus::Idle | BackgroundJobStatus::Succeeded
+        ) {
+            return None;
+        }
+        session_note(&worker_activity(&self.projects_root, job)?, now_ms)
     }
 
     fn render_thread(&self, key: &str) -> String {
@@ -420,6 +456,11 @@ impl HostWorkerControl {
         }
         if let Some(summary) = job.outcome.summary.as_deref() {
             lines.push(format!("summary: {summary}"));
+        }
+        if !is_router {
+            if let Some(note) = self.finished_session_note(job, rebon_session_host::now_ms()) {
+                lines.push(format!("session: {note}"));
+            }
         }
         let active = matches!(
             job.process.status,
@@ -521,19 +562,50 @@ impl WorkerControl for HostWorkerControl {
         // A worker started now is still a task: the supervisor follows it
         // from the ledger like any planned one.
         let task_id = rebon_work::new_task_id(rebon_session_host::now_ms());
+        let task = rebon_work::NewTask {
+            id: task_id.clone(),
+            title: request.title.clone(),
+            project: request.project.clone(),
+            goal: request.brief.clone(),
+            done_when: request.done_when.clone(),
+            depends_on: Vec::new(),
+            isolate: request.isolate,
+            model_profile: request.model_profile.clone(),
+            worker: request.worker.clone(),
+        };
+        // A task for an existing worker is the supervisor's to hand over:
+        // it waits while the worker is busy, and starts a fresh one instead
+        // if the worker's context has grown long.
+        if let Some(worker_id) = request.worker.as_deref() {
+            check_project(&request.project)?;
+            let worker = self.worker_to_continue(&router, worker_id)?;
+            self.file(&rebon_work::WorkRequest::Plan {
+                router_job_id: Some(router.identity.job_id.clone()),
+                tasks: vec![task],
+                requested_at_ms: rebon_session_host::now_ms(),
+            })?;
+            let busy = matches!(
+                worker.process.status,
+                BackgroundJobStatus::Queued
+                    | BackgroundJobStatus::Running
+                    | BackgroundJobStatus::NeedsInput
+            );
+            return Ok(DispatchedWorker {
+                worker_id: worker_id.to_string(),
+                task_id: Some(task_id),
+                note: Some(if busy {
+                    format!(
+                        "{worker_id} is busy; it takes the task as its next turn once it is free"
+                    )
+                } else {
+                    format!("{worker_id} takes the task as its next turn")
+                }),
+            });
+        }
         let mut dispatched = launch_worker(&self.store, &router, &request, Some(&task_id))?;
         self.file(&rebon_work::WorkRequest::Bind {
             router_job_id: Some(router.identity.job_id.clone()),
-            task: rebon_work::NewTask {
-                id: task_id.clone(),
-                title: request.title.clone(),
-                project: request.project.clone(),
-                goal: request.brief.clone(),
-                done_when: request.done_when.clone(),
-                depends_on: Vec::new(),
-                isolate: request.isolate,
-                model_profile: request.model_profile.clone(),
-            },
+            task,
             worker_job_id: dispatched.worker_id.clone(),
             requested_at_ms: rebon_session_host::now_ms(),
         })?;
@@ -666,6 +738,85 @@ pub fn launch_worker(
         task_id: task_id.map(str::to_string),
         note: (!notes.is_empty()).then(|| notes.join("; ")),
     })
+}
+
+/// Whether the finished worker `job` should take another task, by the
+/// group's warmth rules (`rebon_group::warmth`): idle past its prompt cache
+/// (an hour) it is cold but still takes it, compacting as it resumes;
+/// carrying more than 60% of its window it is long, and a fresh worker
+/// takes the task instead.
+pub fn worker_fit(
+    projects_root: &Path,
+    job: &BackgroundJobState,
+    now_ms: u64,
+) -> rebon_work::WorkerFit {
+    fit_of(worker_activity(projects_root, job).as_ref(), now_ms)
+}
+
+fn worker_activity(
+    projects_root: &Path,
+    job: &BackgroundJobState,
+) -> Option<rebon_group::warmth::Activity> {
+    let session_id = job.identity.session_id.as_deref()?;
+    let transcript = rebon_session_host::background_job_transcript_path_in(projects_root, job)?;
+    Some(rebon_group::warmth::rebon_transcript_activity(
+        &transcript,
+        session_id,
+    ))
+}
+
+fn fit_of(activity: Option<&rebon_group::warmth::Activity>, now_ms: u64) -> rebon_work::WorkerFit {
+    use rebon_group::warmth::{self, State};
+    use rebon_work::WorkerFit;
+    let Some(activity) = activity else {
+        return WorkerFit::Unknown;
+    };
+    let rules = rebon_group::model::Warmth::default();
+    if warmth::long_context(activity, &rules) {
+        return WorkerFit::Long;
+    }
+    match warmth::state(activity, &rules, now_ms) {
+        State::Warm => WorkerFit::Warm,
+        State::Cold => WorkerFit::Cold,
+        // The job says its turn ended, whatever the transcript's last row
+        // says; only how long it has sat idle is left to read.
+        State::Busy => {
+            let idle_ms = activity
+                .last_activity_ms
+                .map_or(0, |last| now_ms.saturating_sub(last));
+            if idle_ms > u64::from(rules.idle_minutes) * 60_000 {
+                WorkerFit::Cold
+            } else {
+                WorkerFit::Warm
+            }
+        }
+        State::Unknown => WorkerFit::Unknown,
+    }
+}
+
+/// How a finished worker's session stands, for the router deciding where
+/// the next task goes: how long it has been idle, how much context it
+/// carries, and what that means for giving it more work.
+fn session_note(activity: &rebon_group::warmth::Activity, now_ms: u64) -> Option<String> {
+    let idle_minutes = now_ms.saturating_sub(activity.last_activity_ms?) / 60_000;
+    let idle = if idle_minutes >= 120 {
+        format!("{}h", idle_minutes / 60)
+    } else {
+        format!("{idle_minutes}m")
+    };
+    let context = activity
+        .context_tokens
+        .map(|tokens| format!(", context ~{}k tokens", (tokens + 500) / 1000))
+        .unwrap_or_default();
+    let fit = match fit_of(Some(activity), now_ms) {
+        rebon_work::WorkerFit::Warm => "warm: a good one for follow-up work",
+        rebon_work::WorkerFit::Cold => {
+            "past its prompt cache: it compacts its history before it takes more work"
+        }
+        rebon_work::WorkerFit::Long => "its context is long: new work goes to a fresh worker",
+        rebon_work::WorkerFit::Unknown => return None,
+    };
+    Some(format!("idle {idle}{context}; {fit}"))
 }
 
 /// Start the acceptance check of `task`, in `cwd`: its worker's worktree,
@@ -930,10 +1081,97 @@ mod tests {
                     done_when: String::new(),
                     isolate: false,
                     model_profile: None,
+                    worker: None,
                 },
             )
             .await
             .unwrap_err();
         assert!(refused.contains("not a project directory"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn a_task_for_a_stopped_or_stranger_worker_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BackgroundStore::new(dir.path());
+        let router = job(&store, "router-session", None);
+        let mut stopped = job(&store, "w1", Some(&router.identity.job_id));
+        stopped.process.status = BackgroundJobStatus::Stopped;
+        store.write_state(&stopped).unwrap();
+        let stranger = job(&store, "w2", None);
+        let control = HostWorkerControl::new(store.clone(), dir.path().join("projects"));
+        let request = |worker: &str| WorkerDispatch {
+            project: dir.path().display().to_string(),
+            title: "t".into(),
+            brief: "b".into(),
+            done_when: String::new(),
+            isolate: false,
+            model_profile: None,
+            worker: Some(worker.to_string()),
+        };
+
+        let refused = control
+            .dispatch("router-session", request(&stopped.identity.job_id))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("leave `worker` out"), "{refused}");
+        let refused = control
+            .dispatch("router-session", request(&stranger.identity.job_id))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("not one of your workers"), "{refused}");
+        assert!(
+            !rebon_work::requests_dir(dir.path()).exists(),
+            "nothing was filed"
+        );
+    }
+
+    fn activity(idle_minutes: u64, tokens: u64) -> rebon_group::warmth::Activity {
+        rebon_group::warmth::Activity {
+            last_activity_ms: Some(1_000_000_000 - idle_minutes * 60_000),
+            busy: Some(false),
+            context_tokens: Some(tokens),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_finished_worker_reads_warm_cold_or_long() {
+        use rebon_work::WorkerFit;
+        let now = 1_000_000_000;
+        assert_eq!(fit_of(None, now), WorkerFit::Unknown);
+        assert_eq!(fit_of(Some(&activity(5, 100_000)), now), WorkerFit::Warm);
+        // Past the cache with more than a short context: it compacts first.
+        assert_eq!(fit_of(Some(&activity(90, 100_000)), now), WorkerFit::Cold);
+        // A short context is cheap to re-read however long it sat.
+        assert_eq!(fit_of(Some(&activity(90, 20_000)), now), WorkerFit::Warm);
+        // Past 60% of the window: long, warm or not.
+        assert_eq!(fit_of(Some(&activity(5, 150_000)), now), WorkerFit::Long);
+        let open_turn = rebon_group::warmth::Activity {
+            busy: Some(true),
+            ..activity(90, 100_000)
+        };
+        assert_eq!(fit_of(Some(&open_turn), now), WorkerFit::Cold);
+    }
+
+    #[test]
+    fn the_session_note_says_idle_time_context_and_what_to_do() {
+        let now = 1_000_000_000;
+        let note = session_note(&activity(42, 85_400), now).unwrap();
+        assert_eq!(
+            note,
+            "idle 42m, context ~85k tokens; warm: a good one for follow-up work"
+        );
+        let note = session_note(&activity(180, 100_000), now).unwrap();
+        assert!(
+            note.starts_with("idle 3h, context ~100k tokens; past its prompt cache"),
+            "{note}"
+        );
+        assert!(session_note(&activity(5, 150_000), now)
+            .unwrap()
+            .contains("fresh worker"));
+        assert_eq!(
+            session_note(&rebon_group::warmth::Activity::default(), now),
+            None
+        );
     }
 }

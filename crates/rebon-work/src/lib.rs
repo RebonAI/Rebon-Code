@@ -32,6 +32,15 @@
 //! on several checkouts, or on one another task is still using, starts from
 //! the project instead.
 //!
+//! A worker that finished its task keeps its session, and the next task in
+//! the same ground goes to it rather than to a new worker: the task the
+//! router names it for ([`NewTask::worker`]), or one that depends on its
+//! task alone and carries on where it worked. It runs as that worker's next
+//! turn and is checked like any other. A worker idle past its prompt cache
+//! still takes it (its history is compacted as it resumes); one whose
+//! context has grown long does not, and a fresh worker starts in its place
+//! ([`WorkerFit`]).
+//!
 //! Events from outside (a chat message, a mail, a CI hook) come in as
 //! requests too, each with its source and, when it belongs to one, its
 //! thread (`im:team#42`). A thread a worker subscribed to goes straight to
@@ -42,7 +51,7 @@
 //! Launching workers and reading jobs are the caller's ([`Hands`]). This
 //! crate names no session host.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -175,6 +184,13 @@ pub struct Task {
     /// The task whose worktree it carries on in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherited_from: Option<String>,
+    /// The existing worker the router asked to take it, as its next turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_worker: Option<String>,
+    /// The later task its worker went on to. What that worker does from
+    /// then on is the later task's, so this one no longer follows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handed_on_to: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     /// Why it stands where it does, when that needs saying: what it waits
@@ -282,7 +298,7 @@ impl Ledger {
     /// The task `job_id` works on or checks, if any.
     pub fn task_of_worker(&self, job_id: &str) -> Option<&Task> {
         self.tasks.values().find(|task| {
-            task.worker_job_id.as_deref() == Some(job_id)
+            (task.worker_job_id.as_deref() == Some(job_id) && task.handed_on_to.is_none())
                 || task.verifier_job_id.as_deref() == Some(job_id)
                 || task
                     .verdicts
@@ -308,6 +324,10 @@ pub struct NewTask {
     pub isolate: bool,
     #[serde(default)]
     pub model_profile: Option<String>,
+    /// An existing worker to take it as its next turn, because its session
+    /// already knows the ground. It waits while that worker is busy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
 }
 
 impl NewTask {
@@ -332,6 +352,8 @@ impl NewTask {
             worktree: None,
             worktree_commit: None,
             inherited_from: None,
+            requested_worker: self.worker,
+            handed_on_to: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             note: None,
@@ -544,6 +566,29 @@ pub struct WorkerView {
     pub worktree: Option<String>,
 }
 
+/// Whether a finished worker's session is worth giving another task, read
+/// from its files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerFit {
+    /// Idle within its prompt cache, with room left in its context.
+    Warm,
+    /// Idle past its prompt cache: re-reading its history costs a full
+    /// read, so it is compacted as the worker resumes, and the worker keeps
+    /// what it learned.
+    Cold,
+    /// Its context is long enough to crowd or mislead the next task.
+    Long,
+    /// Its files could not be read.
+    Unknown,
+}
+
+impl WorkerFit {
+    /// Whether the next task should go to it rather than to a fresh worker.
+    pub fn takes_another_task(self) -> bool {
+        matches!(self, Self::Warm | Self::Cold)
+    }
+}
+
 /// What a pass does to the world, injected so the rules can be tested
 /// without a session host.
 pub trait Hands {
@@ -551,6 +596,11 @@ pub trait Hands {
     /// `worktree` the worker carries on in that worktree instead of the
     /// project.
     fn launch_worker(&mut self, task: &Task, worktree: Option<&str>) -> Result<String, String>;
+    /// Give `task` to the finished worker `job_id` as its next turn
+    /// ([`next_task_brief`]).
+    fn continue_worker(&mut self, task: &Task, job_id: &str) -> Result<(), String>;
+    /// Whether the finished worker `job_id` should take another task.
+    fn worker_fit(&mut self, job_id: &str) -> WorkerFit;
     /// Commit everything in `worktree` as the task's work. The commit, or
     /// `None` when there was nothing to commit.
     fn freeze(&mut self, task: &Task, worktree: &str) -> Result<Option<String>, String>;
@@ -704,7 +754,7 @@ pub fn run_pass(
     for task in ledger.tasks.values_mut() {
         follow(task, workers, now_ms, hands, &mut outcome);
     }
-    dispatch_ready(ledger, now_ms, max_running, hands, &mut outcome);
+    dispatch_ready(ledger, workers, now_ms, max_running, hands, &mut outcome);
     outcome
 }
 
@@ -742,7 +792,9 @@ fn follow(
     hands: &mut dyn Hands,
     outcome: &mut PassOutcome,
 ) {
-    if matches!(task.status, TaskStatus::Cancelled | TaskStatus::Planned) {
+    if matches!(task.status, TaskStatus::Cancelled | TaskStatus::Planned)
+        || task.handed_on_to.is_some()
+    {
         return;
     }
     let Some(worker_id) = task.worker_job_id.clone() else {
@@ -931,6 +983,7 @@ fn follow_check(
 
 fn dispatch_ready(
     ledger: &mut Ledger,
+    workers: &[WorkerView],
     now_ms: u64,
     max_running: usize,
     hands: &mut dyn Hands,
@@ -946,18 +999,42 @@ fn dispatch_ready(
         .iter()
         .filter_map(|(id, task)| Some((id.clone(), task.worktree.clone()?)))
         .collect();
+    // Who worked on each task, and where, for a task after it to go back to.
+    let earlier: BTreeMap<String, EarlierWork> = ledger
+        .tasks
+        .iter()
+        .filter_map(|(id, task)| {
+            Some((
+                id.clone(),
+                EarlierWork {
+                    worker: task.worker_job_id.clone()?,
+                    project: task.project.clone(),
+                    worktree: task.worktree.clone(),
+                },
+            ))
+        })
+        .collect();
     // Worktrees a task is working in or being checked in: nobody else may
     // carry on there meanwhile.
-    let mut busy: std::collections::BTreeSet<String> = ledger
+    let mut busy: BTreeSet<String> = ledger
         .tasks
         .values()
         .filter(|task| matches!(task.status, TaskStatus::Running | TaskStatus::Verifying))
         .filter_map(|task| task.worktree.clone())
         .collect();
+    // Workers an open task is using: none of them takes another meanwhile.
+    let mut engaged: BTreeSet<String> = ledger
+        .tasks
+        .values()
+        .filter(|task| matches!(task.status, TaskStatus::Running | TaskStatus::Verifying))
+        .filter(|task| task.handed_on_to.is_none())
+        .filter_map(|task| task.worker_job_id.clone())
+        .collect();
     let mut running = statuses
         .values()
         .filter(|status| matches!(status, TaskStatus::Running | TaskStatus::Verifying))
         .count();
+    let mut handed_on: Vec<(String, String)> = Vec::new();
     let mut planned: Vec<&mut Task> = ledger
         .tasks
         .values_mut()
@@ -1006,12 +1083,65 @@ fn dispatch_ready(
             .iter()
             .filter_map(|dep| worktrees.get(dep).map(|worktree| (dep, worktree)))
             .collect();
-        let carry_on = match inherited.as_slice() {
+        let mut carry_on = match inherited.as_slice() {
             [(dep, worktree)] if !busy.contains(*worktree) => {
                 Some(((*dep).clone(), (*worktree).clone()))
             }
             _ => None,
         };
+        let mut why_fresh = None;
+        match reusable_worker(task, &earlier, carry_on.as_ref(), workers, &engaged, &busy) {
+            Reuse::Wait(note) => {
+                if task.note.as_deref() != Some(note.as_str()) {
+                    task.note = Some(note);
+                    outcome.changed = true;
+                }
+                continue;
+            }
+            Reuse::Fresh(reason) => why_fresh = reason,
+            Reuse::Worker { job_id, worktree } => match hands.worker_fit(&job_id) {
+                fit if fit.takes_another_task() => match hands.continue_worker(task, &job_id) {
+                    Ok(()) => {
+                        task.worker_job_id = Some(job_id.clone());
+                        task.attempts += 1;
+                        task.set(TaskStatus::Running, None, now_ms);
+                        task.record(
+                            now_ms,
+                            format!("continued on {job_id}, whose session knows the ground"),
+                        );
+                        if let Some(worktree) = worktree {
+                            if let Some((dep, inherited)) = &carry_on {
+                                if *inherited == worktree {
+                                    task.inherited_from = Some(dep.clone());
+                                }
+                            }
+                            busy.insert(worktree.clone());
+                            task.worktree = Some(worktree);
+                        }
+                        engaged.insert(job_id.clone());
+                        handed_on.push((job_id, task.id.clone()));
+                        running += 1;
+                        outcome.changed = true;
+                        continue;
+                    }
+                    Err(error) => why_fresh = Some(format!("{job_id} could not take it ({error})")),
+                },
+                WorkerFit::Long => {
+                    why_fresh = Some(format!("{job_id}'s context has grown long"));
+                    // The named worker's ground is still the place to work.
+                    if carry_on.is_none() {
+                        carry_on = worktree
+                            .filter(|worktree| !busy.contains(worktree))
+                            .map(|worktree| (job_id.clone(), worktree));
+                    }
+                }
+                _ => {
+                    if task.requested_worker.is_some() {
+                        why_fresh = Some(format!("{job_id}'s session could not be read"));
+                    }
+                }
+            },
+        }
         match hands.launch_worker(
             task,
             carry_on.as_ref().map(|(_, worktree)| worktree.as_str()),
@@ -1021,11 +1151,20 @@ fn dispatch_ready(
                 task.attempts += 1;
                 task.set(TaskStatus::Running, None, now_ms);
                 task.record(now_ms, format!("dispatched to {job_id}"));
-                if let Some((dep, worktree)) = carry_on {
-                    task.record(now_ms, format!("carries on in {dep}'s worktree {worktree}"));
+                if let Some(why) = why_fresh {
+                    task.record(now_ms, format!("a fresh worker took it: {why}"));
+                }
+                if let Some((from, worktree)) = carry_on {
+                    task.record(
+                        now_ms,
+                        format!("carries on in {from}'s worktree {worktree}"),
+                    );
                     busy.insert(worktree.clone());
                     task.worktree = Some(worktree);
-                    task.inherited_from = Some(dep);
+                    // `from` is a task, or the worker the router named.
+                    if statuses.contains_key(&from) {
+                        task.inherited_from = Some(from);
+                    }
                 }
                 running += 1;
                 outcome.changed = true;
@@ -1038,6 +1177,123 @@ fn dispatch_ready(
             ),
         }
     }
+    // A worker that took a new task leaves the tasks it did before behind.
+    for (job_id, task_id) in handed_on {
+        for earlier in ledger.tasks.values_mut() {
+            if earlier.id != task_id
+                && earlier.worker_job_id.as_deref() == Some(job_id.as_str())
+                && earlier.handed_on_to.is_none()
+            {
+                earlier.handed_on_to = Some(task_id.clone());
+                earlier.record(now_ms, format!("its worker {job_id} went on to {task_id}"));
+            }
+        }
+    }
+}
+
+/// Where an earlier task was worked on.
+struct EarlierWork {
+    worker: String,
+    project: String,
+    worktree: Option<String>,
+}
+
+enum Reuse {
+    /// Give it to this finished worker, which works in `worktree`.
+    Worker {
+        job_id: String,
+        worktree: Option<String>,
+    },
+    /// The worker the router named is busy: wait for it.
+    Wait(String),
+    /// Start a fresh worker, and say why when the router named one.
+    Fresh(Option<String>),
+}
+
+/// The existing worker a planned task should go to: the one the router
+/// named, or else, for a task that depends on one other alone, that task's
+/// worker when the next task's ground is its ground (the worktree it carries
+/// on in, or the same project with no isolation asked for).
+fn reusable_worker(
+    task: &Task,
+    earlier: &BTreeMap<String, EarlierWork>,
+    carry_on: Option<&(String, String)>,
+    workers: &[WorkerView],
+    engaged: &BTreeSet<String>,
+    busy: &BTreeSet<String>,
+) -> Reuse {
+    let view = |job_id: &str| workers.iter().find(|worker| worker.job_id == job_id);
+    if let Some(job_id) = task.requested_worker.clone() {
+        let worktree = view(&job_id).and_then(|worker| worker.worktree.clone());
+        if engaged.contains(&job_id) {
+            return Reuse::Wait(format!(
+                "waiting for its worker {job_id} to finish its task"
+            ));
+        }
+        return match view(&job_id).map(|worker| &worker.phase) {
+            Some(WorkerPhase::Active) => Reuse::Wait(format!(
+                "waiting for its worker {job_id} to finish its turn"
+            )),
+            Some(WorkerPhase::Finished)
+                if worktree
+                    .as_ref()
+                    .is_some_and(|worktree| busy.contains(worktree)) =>
+            {
+                Reuse::Wait(format!(
+                    "waiting for the work in {job_id}'s worktree to finish"
+                ))
+            }
+            Some(WorkerPhase::Finished) => Reuse::Worker { job_id, worktree },
+            Some(WorkerPhase::Failed(_)) => Reuse::Fresh(Some(format!("{job_id} failed"))),
+            Some(WorkerPhase::Stopped) => Reuse::Fresh(Some(format!("{job_id} was stopped"))),
+            None => Reuse::Fresh(Some(format!("{job_id} is gone"))),
+        };
+    }
+    let [dep] = task.depends_on.as_slice() else {
+        return Reuse::Fresh(None);
+    };
+    let Some(before) = earlier.get(dep) else {
+        return Reuse::Fresh(None);
+    };
+    let same_ground = match (&before.worktree, carry_on) {
+        (Some(worktree), Some((_, inherited))) => worktree == inherited,
+        (None, None) => !task.isolate && before.project == task.project,
+        _ => false,
+    };
+    match view(&before.worker) {
+        Some(worker)
+            if same_ground
+                && worker.phase == WorkerPhase::Finished
+                && !engaged.contains(&before.worker) =>
+        {
+            Reuse::Worker {
+                job_id: before.worker.clone(),
+                worktree: worker.worktree.clone(),
+            }
+        }
+        _ => Reuse::Fresh(None),
+    }
+}
+
+/// The turn a finished worker gets when it is given its next task.
+pub fn next_task_brief(task: &Task) -> String {
+    let done_when = if task.done_when.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\nDone when: {}", task.done_when.trim())
+    };
+    format!(
+        "[Next task from the router: {id}]\n\
+         Your previous task is closed. This is a new one, given to you because your session \
+         already knows the ground. Work on it as on any task: it is done only when what it asks \
+         for actually holds, and an independent acceptance check will look at the result. \
+         Finish with a short report: what you did, the evidence that it is done, what is left, \
+         and the URL of any pull request you opened.\n\n\
+         Task ({id}): {title}{done_when}\n\n{goal}",
+        id = task.id,
+        title = task.title,
+        goal = task.goal.trim(),
+    )
 }
 
 /// What every acceptance check is told. The same for every task: the check
@@ -1103,6 +1359,7 @@ mod tests {
             depends_on: deps.iter().map(|dep| dep.to_string()).collect(),
             isolate: false,
             model_profile: None,
+            worker: None,
         }
     }
 
@@ -1139,6 +1396,10 @@ mod tests {
         carried_on: Vec<(String, Option<String>)>,
         frozen: Vec<String>,
         delivered: Vec<(Option<String>, String)>,
+        /// How each worker's session reads; unknown unless set.
+        fits: BTreeMap<String, WorkerFit>,
+        /// Tasks given to an existing worker, as (task, worker).
+        continued: Vec<(String, String)>,
     }
 
     impl Hands for Fake {
@@ -1150,6 +1411,13 @@ mod tests {
             self.carried_on
                 .push((task.id.clone(), worktree.map(str::to_string)));
             Ok(format!("w-{}", task.id))
+        }
+        fn continue_worker(&mut self, task: &Task, job_id: &str) -> Result<(), String> {
+            self.continued.push((task.id.clone(), job_id.to_string()));
+            Ok(())
+        }
+        fn worker_fit(&mut self, job_id: &str) -> WorkerFit {
+            self.fits.get(job_id).copied().unwrap_or(WorkerFit::Unknown)
         }
         fn freeze(&mut self, task: &Task, worktree: &str) -> Result<Option<String>, String> {
             self.frozen.push(format!("{}@{worktree}", task.id));
@@ -1593,6 +1861,168 @@ mod tests {
         assert_eq!(ledger.tasks["a"].status, TaskStatus::Cancelled);
         assert!(!has_open_tasks(&ledger));
         assert!(hands.launched.is_empty(), "it was already running");
+    }
+
+    /// `a` is done; `b` waits for it alone. One pass with `a`'s worker as
+    /// `view` shows, `fit` the way its session reads.
+    fn after_a(view: WorkerView, fit: WorkerFit, b: NewTask) -> (Ledger, Fake) {
+        let mut ledger = Ledger::default();
+        plan(&mut ledger, vec![new("a", &[]), b], 1);
+        let mut hands = Fake::default();
+        run_pass(&mut ledger, &[], 2, 3, &mut hands);
+        hands.fits.insert("w-a".into(), fit);
+        let worktree = view.worktree.clone();
+        pass_check(&mut ledger, &mut hands, "a", worktree.as_deref(), 3);
+        (ledger, hands)
+    }
+
+    #[test]
+    fn the_next_task_on_the_same_ground_goes_to_the_worker_that_knows_it() {
+        let mut view = worker("w-a", WorkerPhase::Finished);
+        view.worktree = Some("/wt/a".into());
+        let (mut ledger, mut hands) = after_a(view, WorkerFit::Warm, new("b", &["a"]));
+        assert_eq!(hands.launched, ["a"], "no fresh worker for b");
+        assert_eq!(hands.continued, [("b".to_string(), "w-a".to_string())]);
+        let b = &ledger.tasks["b"];
+        assert_eq!(b.status, TaskStatus::Running);
+        assert_eq!(b.worker_job_id.as_deref(), Some("w-a"));
+        assert_eq!(b.worktree.as_deref(), Some("/wt/a"));
+        assert_eq!(b.inherited_from.as_deref(), Some("a"));
+        assert_eq!(ledger.tasks["a"].handed_on_to.as_deref(), Some("b"));
+        assert_eq!(
+            ledger.task_of_worker("w-a").map(|task| task.id.as_str()),
+            Some("b")
+        );
+
+        // The worker working again is b's work: a stays done.
+        let mut busy = worker("w-a", WorkerPhase::Active);
+        busy.worktree = Some("/wt/a".into());
+        run_pass(&mut ledger, &[busy], 10, 3, &mut hands);
+        assert_eq!(ledger.tasks["a"].status, TaskStatus::Done);
+        assert_eq!(ledger.tasks["b"].status, TaskStatus::Running);
+        // And b is checked like any task when it finishes.
+        pass_check(&mut ledger, &mut hands, "a", Some("/wt/a"), 11);
+        assert_eq!(ledger.tasks["b"].status, TaskStatus::Done);
+        assert_eq!(ledger.tasks["a"].status, TaskStatus::Done);
+    }
+
+    #[test]
+    fn a_worker_past_its_cache_still_takes_it_and_a_long_context_does_not() {
+        let (ledger, hands) = after_a(
+            worker("w-a", WorkerPhase::Finished),
+            WorkerFit::Cold,
+            new("b", &["a"]),
+        );
+        assert_eq!(hands.continued, [("b".to_string(), "w-a".to_string())]);
+        assert_eq!(ledger.tasks["b"].worktree, None);
+
+        let mut view = worker("w-a", WorkerPhase::Finished);
+        view.worktree = Some("/wt/a".into());
+        let (ledger, hands) = after_a(view, WorkerFit::Long, new("b", &["a"]));
+        assert!(hands.continued.is_empty());
+        // A fresh worker, still carrying on where the work is.
+        assert_eq!(
+            hands.carried_on.last().unwrap(),
+            &("b".to_string(), Some("/wt/a".to_string()))
+        );
+        assert!(ledger.tasks["b"]
+            .history
+            .iter()
+            .any(|event| event.what.contains("context has grown long")));
+        assert_eq!(ledger.tasks["a"].handed_on_to, None);
+    }
+
+    #[test]
+    fn a_task_asking_for_isolation_or_other_ground_gets_a_fresh_worker() {
+        let mut isolated = new("b", &["a"]);
+        isolated.isolate = true;
+        let (_, hands) = after_a(
+            worker("w-a", WorkerPhase::Finished),
+            WorkerFit::Warm,
+            isolated,
+        );
+        assert!(hands.continued.is_empty());
+
+        let mut elsewhere = new("b", &["a"]);
+        elsewhere.project = "/other".into();
+        let (_, hands) = after_a(
+            worker("w-a", WorkerPhase::Finished),
+            WorkerFit::Warm,
+            elsewhere,
+        );
+        assert!(hands.continued.is_empty());
+    }
+
+    #[test]
+    fn a_task_naming_a_worker_waits_for_it_and_then_goes_to_it() {
+        let mut ledger = Ledger::default();
+        plan(&mut ledger, vec![new("a", &[])], 1);
+        let mut hands = Fake::default();
+        hands.fits.insert("w-a".into(), WorkerFit::Warm);
+        run_pass(&mut ledger, &[], 2, 3, &mut hands);
+        let mut follow_up = new("b", &[]);
+        follow_up.worker = Some("w-a".into());
+        plan(&mut ledger, vec![follow_up], 3);
+
+        // a's worker is still on a: b waits rather than starting elsewhere.
+        run_pass(
+            &mut ledger,
+            &[worker("w-a", WorkerPhase::Active)],
+            4,
+            3,
+            &mut hands,
+        );
+        assert_eq!(ledger.tasks["b"].status, TaskStatus::Planned);
+        assert!(ledger.tasks["b"]
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("w-a")));
+        assert_eq!(hands.launched, ["a"]);
+
+        pass_check(&mut ledger, &mut hands, "a", None, 5);
+        assert_eq!(ledger.tasks["a"].status, TaskStatus::Done);
+        assert_eq!(hands.continued, [("b".to_string(), "w-a".to_string())]);
+        assert_eq!(ledger.tasks["b"].worker_job_id.as_deref(), Some("w-a"));
+    }
+
+    #[test]
+    fn a_named_worker_that_is_gone_or_stopped_is_replaced_and_the_reason_kept() {
+        for (phase, why) in [
+            (None, "is gone"),
+            (Some(WorkerPhase::Stopped), "was stopped"),
+        ] {
+            let mut ledger = Ledger::default();
+            let mut task = new("b", &[]);
+            task.worker = Some("w-x".into());
+            plan(&mut ledger, vec![task], 1);
+            let mut hands = Fake::default();
+            let views: Vec<WorkerView> = phase
+                .into_iter()
+                .map(|phase| worker("w-x", phase))
+                .collect();
+            run_pass(&mut ledger, &views, 2, 3, &mut hands);
+            assert_eq!(hands.launched, ["b"]);
+            assert!(
+                ledger.tasks["b"]
+                    .history
+                    .iter()
+                    .any(|event| event.what.contains(why)),
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_planned_task_without_a_worker_field_still_reads() {
+        let task: NewTask =
+            serde_json::from_str(r#"{"id":"a","title":"t","project":"/p","goal":"g"}"#).unwrap();
+        assert_eq!(task.worker, None);
+        let ledger: Ledger = serde_json::from_str(
+            r#"{"tasks":{"a":{"id":"a","title":"t","project":"/p","goal":"g","status":"done","createdAtMs":1,"updatedAtMs":1}}}"#,
+        )
+        .unwrap();
+        assert_eq!(ledger.tasks["a"].handed_on_to, None);
+        assert_eq!(ledger.tasks["a"].requested_worker, None);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-/// A task for a new worker.
+/// A task for a new worker, or for one of the router's workers to take next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerDispatch {
     /// The project directory the worker works in.
@@ -26,6 +26,10 @@ pub struct WorkerDispatch {
     /// A model profile (`fast`, `reasoning`, …) for a task that needs a
     /// lighter or a stronger model than the default.
     pub model_profile: Option<String>,
+    /// One of the router's workers to take the task as its next turn
+    /// instead of a new worker, because its session already knows the
+    /// ground.
+    pub worker: Option<String>,
 }
 
 /// A started worker.
@@ -34,7 +38,9 @@ pub struct DispatchedWorker {
     pub worker_id: String,
     /// The task the worker was started for, in the router's task ledger.
     pub task_id: Option<String>,
-    /// Set when the requested isolation could not be given, saying why.
+    /// Something the router should know about how it was started: the
+    /// requested isolation could not be given, or the task waits for the
+    /// existing worker it went to.
     pub note: Option<String>,
 }
 
@@ -51,6 +57,8 @@ pub struct PlannedTask {
     pub depends_on: Vec<String>,
     pub isolate: bool,
     pub model_profile: Option<String>,
+    /// One of the router's workers to take it as its next turn.
+    pub worker: Option<String>,
 }
 
 #[async_trait]

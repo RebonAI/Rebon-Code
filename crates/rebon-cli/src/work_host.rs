@@ -211,6 +211,7 @@ impl Hands for HostHands<'_> {
             done_when: task.done_when.clone(),
             isolate,
             model_profile: task.model_profile.clone(),
+            worker: None,
         };
         crate::session::worker_control::launch_worker(self.store, router, &request, Some(&task.id))
             .map(|worker| worker.worker_id)
@@ -266,6 +267,32 @@ impl Hands for HostHands<'_> {
             .map_err(|error| format!("{error:#}"))
     }
 
+    /// The task's brief goes in as the worker's next turn, the way a
+    /// rework does. Its id names the task and the attempt, so a pass that
+    /// runs again before the ledger is saved files the same prompt.
+    fn continue_worker(&mut self, task: &Task, job_id: &str) -> Result<(), String> {
+        let id = format!(
+            "u-internal-scheduled-task-{}-{}",
+            task.id,
+            task.attempts + 1
+        );
+        let text = rebon_tool::cron::mark_scheduled_prompt(&rebon_work::next_task_brief(task));
+        rebon_session_host::append_background_scheduled_prompt(self.store, job_id, id, text)
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn worker_fit(&mut self, job_id: &str) -> rebon_work::WorkerFit {
+        match self.job(job_id) {
+            Some(job) => crate::session::worker_control::worker_fit(
+                &rebon_harness::projects_root(),
+                job,
+                rebon_session_host::now_ms(),
+            ),
+            None => rebon_work::WorkerFit::Unknown,
+        }
+    }
+
     fn rework(&mut self, task: &Task, round: u32, findings: &str) -> Result<(), String> {
         let worker = task
             .worker_job_id
@@ -302,6 +329,7 @@ mod tests {
                     depends_on: Vec::new(),
                     isolate: false,
                     model_profile: None,
+                    worker: None,
                 }],
                 requested_at_ms: 1,
             },
