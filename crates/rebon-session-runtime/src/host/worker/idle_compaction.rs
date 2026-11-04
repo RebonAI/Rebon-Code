@@ -32,8 +32,10 @@ pub const IDLE_COMPACTION_LEAD_MS: u64 = 5 * 60 * 1000;
 /// Never sooner than this after a turn: a worker that leaves quickly (a
 /// foreground job whose terminal closed) is let go as it is.
 pub const IDLE_COMPACTION_MIN_IDLE_MS: u64 = 30 * 60 * 1000;
-/// The terminal's floor: a conversation this small is not worth a summary.
-pub const IDLE_COMPACTION_MIN_TOKENS: u32 = 8_000;
+/// A conversation this small is not worth a summary. The system prompt and
+/// tools alone come to about 8k, so the floor sits well above them: what is
+/// compacted has to be the conversation, not the session's fixed overhead.
+pub const IDLE_COMPACTION_MIN_TOKENS: u32 = 20_000;
 /// How long settling waits for a cancelled run to let go.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -397,6 +399,24 @@ mod tests {
         assert!(!idle_compaction_due(now, T0, now, None, 7_999, true, None));
         assert!(!idle_compaction_due(
             now, T0, now, None, 50_000, false, None
+        ));
+    }
+
+    #[test]
+    fn a_session_not_much_past_its_system_prompt_is_left_as_it_is() {
+        let now = T0 + 2 * HOUR;
+        let leave_at = T0 + 3 * HOUR;
+        assert!(!idle_compaction_due(
+            now, T0, leave_at, None, 15_000, true, None
+        ));
+        assert!(idle_compaction_due(
+            now,
+            T0,
+            leave_at,
+            None,
+            IDLE_COMPACTION_MIN_TOKENS,
+            true,
+            None
         ));
     }
 
