@@ -460,6 +460,7 @@ impl Tool for CancelTaskTool {
 struct ContinueInput {
     worker_id: String,
     message: String,
+    question_id: Option<u64>,
 }
 
 #[async_trait]
@@ -472,8 +473,12 @@ impl Tool for ContinueWorkerTool {
         "Give one of your workers its next turn. It resumes its own session \
          with everything it learned so far, so prefer this to starting a fresh \
          worker on related work. Returns at once; a running worker takes the \
-         message when its current turn ends. Use it for an answer, a correction \
-         or a nudge. New work that should be checked when it is done is a task: \
+         message when its current turn ends. If Recall shows a pending auto-mode \
+         question, pass its questionId with your decision to release that call \
+         instead of queuing behind it. This withdraws only the question: your \
+         guidance is not user authorization and grants no tool permissions. \
+         Use it for an answer, a correction or a nudge. New work that should be \
+         checked when it is done is a task: \
          give it to the worker with `worker` on DispatchWorker or PlanTasks."
     }
 
@@ -482,7 +487,8 @@ impl Tool for ContinueWorkerTool {
             "type": "object",
             "properties": {
                 "workerId": { "type": "string", "description": "The worker's id" },
-                "message": { "type": "string", "description": "What to do next" }
+                "message": { "type": "string", "description": "What to do next, or the router's decision on a pending question" },
+                "questionId": { "type": "integer", "minimum": 0, "description": "Pending auto-mode question id from Recall; releases only that question, never a tool permission" }
             },
             "required": ["workerId", "message"],
             "additionalProperties": false
@@ -509,10 +515,13 @@ impl Tool for ContinueWorkerTool {
         let (control, session_id) = control_and_session(self, context)?;
         let worker_id = parsed.worker_id.trim();
         control
-            .continue_worker(session_id, worker_id, &parsed.message)
+            .continue_worker(session_id, worker_id, &parsed.message, parsed.question_id)
             .await
             .map_err(|error| execution_error(self, error))?;
-        Ok(json!({ "workerId": worker_id, "queued": true }))
+        Ok(
+            json!({ "workerId": worker_id, "queued": parsed.question_id.is_none(),
+            "questionResolved": parsed.question_id.is_some() }),
+        )
     }
 }
 
@@ -753,11 +762,15 @@ mod tests {
             router: &str,
             worker: &str,
             message: &str,
+            question_id: Option<u64>,
         ) -> Result<(), String> {
+            let question = question_id
+                .map(|id| format!(" question={id}"))
+                .unwrap_or_default();
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("continue {router} {worker} {message}"));
+                .push(format!("continue {router} {worker} {message}{question}"));
             Ok(())
         }
         async fn stop_worker(&self, _router: &str, worker: &str) -> Result<(), String> {
@@ -815,6 +828,36 @@ mod tests {
         assert_eq!(recalled, "recall workers");
         assert!(StopWorkerTool
             .call(json!({"workerId": "someone-else"}), &ctx)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_router_question_reply_reaches_the_control_instead_of_the_next_turn_queue() {
+        let control = Arc::new(Recorder::default());
+        let ctx = context(control.clone());
+        let result = ContinueWorkerTool
+            .call(
+                json!({
+                    "workerId": "w1", "message": "Choose the compatible patch", "questionId": 42
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["queued"], false);
+        assert_eq!(result["questionResolved"], true);
+        assert_eq!(
+            control.calls.lock().unwrap().last().unwrap(),
+            "continue router-session w1 Choose the compatible patch question=42"
+        );
+        assert!(ContinueWorkerTool
+            .validate_input(
+                &json!({
+                    "workerId": "w1", "message": "go", "questionId": -1
+                }),
+                &ctx
+            )
             .await
             .is_err());
     }

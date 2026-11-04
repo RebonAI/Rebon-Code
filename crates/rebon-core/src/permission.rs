@@ -1476,6 +1476,24 @@ pub fn sub_agent_auto_mode_gate_from(
     Some(Arc::new(SubAgentAutoModeGate { broker: base }))
 }
 
+/// The mode-sensitive tool checks in a worker must see the same live auto
+/// state as its inherited broker, including nested workers and plan-from-auto.
+/// Other modes keep the worker's existing defaults; this grants no permissions.
+pub fn sub_agent_auto_mode_from(broker: &Arc<dyn PermissionBroker>) -> Option<String> {
+    let base = user_prompt_permission_broker_from_inner(broker, true)?;
+    let hooks = if let Some(channel) = base.as_any().downcast_ref::<ChannelPermissionBroker>() {
+        channel.current_hooks()
+    } else {
+        base.as_any()
+            .downcast_ref::<crate::AcpPermissionBroker>()?
+            .hooks
+            .clone()
+    }?;
+    hooks
+        .auto_gates(hooks.current_mode())
+        .then(|| "auto".to_string())
+}
+
 /// The worker-side gate. It holds the session's prompt broker and asks the
 /// same `auto_mode_gate` the main session uses, so verdict caching, the
 /// classifier timeout and the `/permissions` record cannot drift between the
@@ -1750,6 +1768,14 @@ pub(crate) fn permission_denial_reason(
 ) -> String {
     let extra_text = extra_text.map(str::trim).filter(|text| !text.is_empty());
     if option_id == "reject_once" {
+        // A router can withdraw only its worker's question, not answer as the
+        // person or approve the underlying action. Preserve that lower trust
+        // attribution rather than labelling the feedback as a user decision.
+        if let Some(guidance) = extra_text.filter(|text| {
+            text.starts_with(rebon_tool::worker_control::ROUTER_QUESTION_GUIDANCE_PREFIX)
+        }) {
+            return guidance.to_string();
+        }
         let mut reason = "The user chose \"No, chat with this\".".to_owned();
         if let Some(note) = note {
             reason.push(' ');
@@ -2697,6 +2723,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn router_question_guidance_is_not_attributed_to_the_user() {
+        let feedback = format!(
+            "{}\nChoose the compatible patch.",
+            rebon_tool::worker_control::ROUTER_QUESTION_GUIDANCE_PREFIX
+        );
+        let reason = permission_denial_reason("reject_once", Some(&feedback), None);
+        assert!(reason.contains("Choose the compatible patch"));
+        assert!(reason.contains("not user authorization"));
+        assert!(!reason.contains("The user chose"));
+        // Ordinary human feedback still takes the existing response path.
+        assert!(
+            permission_denial_reason("reject_once", Some("Wait"), None).contains("The user chose")
+        );
+    }
+
     #[tokio::test]
     async fn broker_denial_includes_extra_text() {
         let (broker, mut rx) = ChannelPermissionBroker::new("sess-1");
@@ -3276,6 +3318,87 @@ mod tests {
 
     fn sub_agent_message_input() -> Value {
         json!({"to": "researcher", "message": "start on task 1"})
+    }
+
+    #[test]
+    fn nested_workers_inherit_live_auto_state_without_inheriting_bypass() {
+        let (channel, _rx) = ChannelPermissionBroker::new("parent");
+        let (hooks, _sink, mode) = hooks_with_mode_cell(PermissionMode::Auto);
+        channel.set_auto_mode_hooks(Some(hooks));
+        let broker: Arc<dyn PermissionBroker> = Arc::new(channel);
+        let nested: Arc<dyn PermissionBroker> = Arc::new(
+            rebon_tool::AutoApproveExceptSensitivePermissionBroker::new(broker),
+        );
+        assert_eq!(sub_agent_auto_mode_from(&nested).as_deref(), Some("auto"));
+        for next in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::DontAsk,
+            PermissionMode::BypassPermissions,
+        ] {
+            *mode.lock().unwrap() = next;
+            assert_eq!(sub_agent_auto_mode_from(&nested), None, "{next:?}");
+        }
+        *mode.lock().unwrap() = PermissionMode::Auto;
+        assert_eq!(sub_agent_auto_mode_from(&nested).as_deref(), Some("auto"));
+        for origin in [
+            Some(PermissionMode::Auto),
+            Some(PermissionMode::Default),
+            None,
+        ] {
+            let (channel, _rx) = ChannelPermissionBroker::new("planning-parent");
+            channel.set_auto_mode_hooks(Some(plan_hooks(origin).0));
+            let broker: Arc<dyn PermissionBroker> = Arc::new(channel);
+            assert_eq!(
+                sub_agent_auto_mode_from(&broker).as_deref(),
+                (origin == Some(PermissionMode::Auto)).then_some("auto")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn router_guidance_releases_auto_questions_without_fabricating_user_answers() {
+        let (broker, mut rx) = ChannelPermissionBroker::new("auto-worker");
+        broker.set_auto_mode_hooks(Some(hooks_with_mode(PermissionMode::Auto).0));
+        let task = tokio::spawn(async move {
+            let input = json!({"questions": [{"question": "Which compatible patch?"}]});
+            broker
+                .resolve(
+                    &NamedEchoTool("AskUserQuestion"),
+                    input.clone(),
+                    &ToolContext::new().with_tool_use_id("question-call"),
+                    PermissionDecision::ask(
+                        PermissionRequest::new("Answer questions?", "Choose")
+                            .with_options(["allow_once", "reject_once"]),
+                        Some(input),
+                    ),
+                )
+                .await
+        });
+        let query = rx
+            .recv()
+            .await
+            .expect("questions still use the broker's data path");
+        query
+            .response_tx
+            .send(PermissionAnswer::Selected {
+                option_id: "reject_once".into(),
+                updated_input: None,
+                extra_text: Some(format!(
+                    "{}\nUse the compatible patch already authorized.",
+                    rebon_tool::worker_control::ROUTER_QUESTION_GUIDANCE_PREFIX
+                )),
+            })
+            .unwrap();
+        let error = task
+            .await
+            .unwrap()
+            .expect_err("the question must not run with made-up answers");
+        assert!(matches!(error, ToolError::PermissionDenied { .. }));
+        let text = error.to_string();
+        assert!(text.contains("Use the compatible patch already authorized"));
+        assert!(text.contains("not user authorization"));
+        assert!(!text.contains("The user chose"));
     }
 
     #[tokio::test]

@@ -487,6 +487,9 @@ impl EngineSubAgentSpawner {
         // has nobody to answer an interactive prompt.
         let auto_mode_gate =
             rebon_core::permission::sub_agent_auto_mode_gate_from(&sensitive_permission_broker);
+        // Tool-level auto checks and the inherited gate must read the same
+        // live policy; otherwise a nested worker silently sees the default.
+        let permission_mode_broker = sensitive_permission_broker.clone();
         let mut worker_permission_broker =
             AutoApproveExceptSensitivePermissionBroker::with_background_probe(
                 sensitive_permission_broker,
@@ -505,6 +508,9 @@ impl EngineSubAgentSpawner {
         let worker_permission_broker = Arc::new(worker_permission_broker);
         let mut child_context = rebon_tool::ToolContext::new()
             .with_permission_broker(worker_permission_broker)
+            .with_permission_mode_provider(move || {
+                rebon_core::permission::sub_agent_auto_mode_from(&permission_mode_broker)
+            })
             .with_agent_id(agent_id.clone())
             .with_task_list_id(task_list_id.clone())
             .with_workflow_nesting_depth(spec.workflow_nesting_depth)

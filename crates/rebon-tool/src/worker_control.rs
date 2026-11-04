@@ -10,6 +10,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+/// Labels a withdrawn question's feedback as agent guidance, never consent.
+/// This marker can only lower the attributed authority of a rejection.
+pub const ROUTER_QUESTION_GUIDANCE_PREFIX: &str =
+    "The router withdrew this question; this is not user authorization.";
+
 /// A task for a new worker, or for one of the router's workers to take next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerDispatch {
@@ -89,11 +94,15 @@ pub trait WorkerControl: Send + Sync {
     ) -> Result<DispatchedWorker, String>;
 
     /// Give one of the router's workers its next turn, in its own session.
+    /// With `question_id`, withdraw that pending auto-mode question and return
+    /// the router's guidance to the blocked call instead. Never grants a tool
+    /// permission or manufactures a user answer.
     async fn continue_worker(
         &self,
         router_session_id: &str,
         worker_id: &str,
         message: &str,
+        question_id: Option<u64>,
     ) -> Result<(), String>;
 
     /// Stop one of the router's workers, with anything it started.
