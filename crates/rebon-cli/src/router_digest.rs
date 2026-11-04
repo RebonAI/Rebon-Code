@@ -274,10 +274,16 @@ fn collect(
         .filter(|job| job.identity.parent_job_id.as_deref() == Some(router_id))
         .collect();
     for job in &workers {
-        let now = (
-            status_key(job.process.status).to_string(),
-            job.process.turn_generation,
-        );
+        let key = match job
+            .outcome
+            .pending_permission
+            .as_ref()
+            .filter(|_| job.process.status == BackgroundJobStatus::NeedsInput)
+        {
+            Some(query) => format!("needs_input:{}", query.query_id),
+            None => status_key(job.process.status).to_string(),
+        };
+        let now = (key, job.process.turn_generation);
         let changed = state.seen.get(&job.identity.job_id) != Some(&now);
         // A worker or check on a task reports through the task: done once it
         // passed its check, stuck, blocked. Its turns ending say nothing yet,
@@ -342,6 +348,21 @@ fn line(
             clip(job.outcome.error.as_deref().unwrap_or("no error recorded"))
         ),
         BackgroundJobStatus::NeedsInput => {
+            if let Some(query) = job.outcome.pending_permission.as_ref().filter(|query| {
+                query.tool.as_deref() == Some("AskUserQuestion")
+                    && job.identity.runtime.permission_mode.as_deref() == Some("auto")
+            }) {
+                let question = query
+                    .tool_input
+                    .as_ref()
+                    .and_then(|input| input.get("questions"))
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|questions| questions.first())
+                    .and_then(|question| question.get("question"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("question details available through Recall");
+                return Some(format!("- {id} \"{name}\" is waiting on questionId {}: {}. Recall the worker, decide from existing authorization, then ContinueWorker with questionId; do not queue behind the question.", query.query_id, clip(question)));
+            }
             let asking = job.outcome.pending_permission.as_ref().and_then(|query| {
                 query
                     .title
@@ -521,6 +542,49 @@ mod tests {
         assert_eq!(
             state.pending,
             ["- w1 \"task w1\" (task t-9) is waiting for an answer"]
+        );
+    }
+
+    #[test]
+    fn each_question_in_one_turn_reaches_the_router_even_after_digest_reload() {
+        let mut state = DigestState::default();
+        let mut job = worker("w1", "r", BackgroundJobStatus::NeedsInput, 1);
+        job.identity.runtime.permission_mode = Some("auto".into());
+        for id in [42, 43] {
+            job.outcome.pending_permission = Some(
+                serde_json::from_value(serde_json::json!({
+                    "queryId": id, "turnGeneration": 1, "tool": "AskUserQuestion",
+                    "title": "Answer questions?", "options": [],
+                    "toolInput": {"questions": [{"question": "Choose a patch strategy"}]}
+                }))
+                .unwrap(),
+            );
+            collect(
+                &mut state,
+                "r",
+                std::slice::from_ref(&job),
+                id,
+                &|_| None,
+                &|_| Some("t-9".into()),
+            );
+            assert!(state
+                .pending
+                .last()
+                .unwrap()
+                .contains(&format!("questionId {id}")));
+            assert!(state
+                .pending
+                .last()
+                .unwrap()
+                .contains("Choose a patch strategy"));
+            state = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        }
+        assert_eq!(state.pending.len(), 2);
+        collect(&mut state, "r", &[job], 44, &|_| None, &|_| None);
+        assert_eq!(
+            state.pending.len(),
+            2,
+            "same question is not reported again"
         );
     }
 

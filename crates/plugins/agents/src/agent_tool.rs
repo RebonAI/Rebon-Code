@@ -2168,7 +2168,13 @@ impl AgentTool {
                         model: parsed.sub_agent.model.clone(),
                         model_profile: parsed.sub_agent.model_profile.clone(),
                         provider: parsed.sub_agent.provider.clone(),
-                        mode: parsed.mode.clone(),
+                        // Auto is the parent's decision policy, not a model
+                        // default. Keep explicit plan/default choices intact
+                        // and never inherit bypass as an implicit grant.
+                        mode: parsed
+                            .mode
+                            .clone()
+                            .or_else(|| context.permission_mode().filter(|mode| mode == "auto")),
                         effort: parsed.effort.clone(),
                         description: parsed.description.clone(),
                         system: workflow_lineage
@@ -5561,6 +5567,45 @@ mod tests {
             manager.calls.lock().unwrap().is_empty(),
             "the teammate must not have been spawned"
         );
+    }
+
+    #[tokio::test]
+    async fn named_teammates_inherit_auto_but_keep_explicit_modes_and_nonauto_defaults() {
+        let _home = TestConfigHome::new("agent-auto-inheritance");
+        for (parent, explicit, expected) in [
+            ("auto", None, Some("auto")),
+            ("auto", Some("plan"), Some("plan")),
+            ("auto", Some("default"), Some("default")),
+            ("default", None, None),
+            ("bypassPermissions", None, None),
+        ] {
+            let manager = Arc::new(ScriptedTeamManager {
+                result: TeammateSpawnResult {
+                    team_name: "alpha".into(),
+                    agent_id: "alice@alpha".into(),
+                    task_id: "tabc1234".into(),
+                    reused: false,
+                    handoff: None,
+                },
+                calls: Mutex::new(Vec::new()),
+            });
+            let context = ToolContext::new()
+                .with_session_id("session-auto-inheritance")
+                .with_permission_mode(parent)
+                .with_team_manager(manager.clone() as Arc<dyn rebon_tool::TeamManager>);
+            let mut input =
+                json!({"prompt": "inspect the parser", "name": "alice", "team_name": "alpha"});
+            if let Some(explicit) = explicit {
+                input["mode"] = json!(explicit);
+            }
+            AgentTool::new().call(input, &context).await.unwrap();
+            let calls = manager.calls.lock().unwrap();
+            assert_eq!(
+                calls[0].mode.as_deref(),
+                expected,
+                "{parent} / {explicit:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -5,6 +5,135 @@ use rebon_core::permission::{
 };
 use rebon_session_host::{BackgroundPermissionOptionSnapshot, BackgroundPermissionQuerySnapshot};
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_router_decision_releases_only_its_auto_workers_exact_pending_question() {
+    use rebon_tool::WorkerControl;
+    let (_dir, store) = store();
+    let mut router = store
+        .create_job("router".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    router.identity.session_id = Some("router-session".into());
+    store.write_state(&router).unwrap();
+    let mut state = store
+        .create_job("authorized patch".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.identity.session_id = Some("worker-session".into());
+    state.identity.parent_job_id = Some(router.identity.job_id.clone());
+    state.identity.runtime.permission_mode = Some("auto".into());
+    state.process.status = BackgroundJobStatus::Running;
+    state.process.turn_generation = 1;
+    let ipc = start_background_ipc_server(&store, &state.identity.job_id).unwrap();
+    install_ipc_owner(&mut state, &ipc);
+    store.write_state(&state).unwrap();
+    let turn_cancel = ipc.start_turn();
+    let (broker, receiver) = ChannelPermissionBroker::new("worker-session");
+    ipc.attach_permission_receiver(1, receiver);
+    let (response_tx, mut response_rx) = tokio::sync::oneshot::channel();
+    broker.forward_direct(OutboundPermissionQuery {
+        id: 1,
+        tool_name: "AskUserQuestion".into(),
+        tool_call_id: "patch-question".into(),
+        session_id: "worker-session".into(),
+        title: "Answer questions?".into(),
+        message: "Choose a patch strategy".into(),
+        tool_input: Some(serde_json::json!({"questions": [{"question": "Patch both repos?"}]})),
+        metadata: None,
+        options: ["allow_once", "reject_once"]
+            .into_iter()
+            .map(|id| PermissionQueryOption {
+                option_id: id.into(),
+                label: id.into(),
+                kind: if id == "reject_once" {
+                    PermissionOptionKind::RejectOnce
+                } else {
+                    PermissionOptionKind::AllowOnce
+                },
+            })
+            .collect(),
+        response_tx,
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let pending = loop {
+        if let Some(pending) = store
+            .read_state(&state.identity.job_id)
+            .unwrap()
+            .outcome
+            .pending_permission
+        {
+            break pending;
+        }
+        assert!(Instant::now() < deadline, "question was not published");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    // Recreate the controller from durable state, as on a router wake.
+    let control =
+        crate::worker_control::HostWorkerControl::new(store.clone(), store.root().join("projects"));
+    let text = control
+        .recall("router-session", Some(&state.identity.job_id))
+        .await
+        .unwrap();
+    assert!(text.contains("Patch both repos?"));
+    assert!(control
+        .continue_worker("router-session", &state.identity.job_id, "go", None)
+        .await
+        .is_err());
+    assert!(control
+        .continue_worker(
+            "router-session",
+            &state.identity.job_id,
+            "stale",
+            Some(pending.query_id + 1)
+        )
+        .await
+        .is_err());
+    assert!(matches!(
+        response_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    control
+        .continue_worker(
+            "router-session",
+            &state.identity.job_id,
+            "Both patches are already authorized; choose compatible versions",
+            Some(pending.query_id),
+        )
+        .await
+        .unwrap();
+    match response_rx.await.unwrap() {
+        PermissionAnswer::Selected {
+            option_id,
+            updated_input,
+            extra_text,
+        } => {
+            assert_eq!(option_id, "reject_once", "never approve a tool");
+            assert!(updated_input.is_none(), "never fabricate user answers");
+            let guidance = extra_text.unwrap();
+            assert!(guidance.contains("Both patches are already authorized"));
+            assert!(guidance.contains("not user authorization"));
+        }
+        PermissionAnswer::Cancelled => panic!("router guidance was lost"),
+    }
+    let resumed = store.read_state(&state.identity.job_id).unwrap();
+    assert_eq!(resumed.process.status, BackgroundJobStatus::Running);
+    assert!(resumed.outcome.pending_permission.is_none());
+    assert_eq!(
+        resumed.identity.pending_prompts, state.identity.pending_prompts,
+        "no next turn queued behind the question"
+    );
+    assert!(!turn_cancel.is_cancelled());
+    assert!(control
+        .continue_worker(
+            "router-session",
+            &state.identity.job_id,
+            "duplicate",
+            Some(pending.query_id)
+        )
+        .await
+        .is_err());
+    drop(broker);
+    ipc.cancel.cancel();
+}
+
 #[test]
 fn a_running_turn_refuses_only_a_permission_retry() {
     let retry = ["retry".to_string()];

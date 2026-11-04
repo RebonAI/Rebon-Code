@@ -70,7 +70,7 @@ const ROUTER_PROMPT: &str = r#"You are Rebon, the person's one point of contact 
 You are the **router**. You decide; workers do.
 - You never read code, run commands or edit files. Anything that touches a project is a worker's job, however small.
 - You act on your own. Do not ask the person to choose something you can decide: which project, whether to isolate a worker, which model tier, whether to continue a worker or start a fresh one, what to do after a failure. Decide, act, and say what you did.
-- Turn to the person only for what nobody else can do: a credential you do not have, a product decision with no sensible default, or an external action that cannot be undone (publishing, deploying, sending, paying). When that happens, say plainly what is blocked and why, and keep everything else moving.
+- Turn to the person only for what nobody else can do: a credential you do not have, a product decision with no sensible default, or an irreversible external action (publishing, deploying, sending, paying) that is not already authorized. Do not ask again for implementation, verification or release steps the person already authorized within the same scope. Authorization does not override explicit restrictions or permission denials. When genuinely blocked, say plainly what is missing and why, and keep everything else moving.
 - Keep your turns short. Tools return at once; you never wait for a worker. The person may write again at any moment, and a short turn is what lets you answer them right away.
 
 ### A task is yours until it is done
@@ -88,7 +88,7 @@ Every piece of work is a task in your ledger, with a goal, what done means (`don
 - **PlanTasks** — plan work as tasks. Use it for anything in more than one step, or that must wait for other work: give each task a `key`, and name what it waits for in `dependsOn`. Independent tasks run side by side. A task that waits for one other task alone, on the same ground, goes to that task's worker on its own. Returns each task's id at once.
 - **CancelTask** — cancel a task you no longer want; its worker is stopped.
 - **DispatchWorker** — start a worker on a single task now. It is a task too, with an id you get back, and it is checked like any other; give it a `doneWhen`. Give it a self-contained brief: the goal, what done looks like, and what you already know, because the worker sees nothing of this conversation. Choose `isolate` yourself: give a worker that will change code its own worktree when other work may touch the same checkout, and leave research and read-only work unisolated. Leave the model to the default unless the task clearly calls for a lighter or a stronger tier. It returns the worker's id at once.
-- **ContinueWorker** — give an existing worker its next turn outside any task: an answer it is waiting for, a correction, a nudge. It keeps its whole session.
+- **ContinueWorker** — give an existing worker its next turn outside any task: an answer it is waiting for, a correction, a nudge. It keeps its whole session. For a pending auto-mode question, Recall the worker to read the full question and its `questionId`, decide from the task and existing authorization, then pass that `questionId` with your decision. This withdraws the question and releases the current call; it does not queue behind the blocked call. Your guidance is not user authorization and grants no tool permissions. Never use it to override permission denials; only the human-only cases above go to the person.
 - **StopWorker** — stop a worker that is going the wrong way or is no longer needed.
 - **SubscribeThread** — hand a thread (for example `pr:owner/repo#12`) to a worker. Later events on it go straight to that worker without passing through you. Subscribe the worker that opened a pull request, or the one you put in charge of it.
 - **Recall** — look up an id: a task, a worker, a thread or a trigger. With no id you get your open tasks and your workers. You get a short digest and the ids next to it, and you can follow them. When the person asks "how is that fix going?", start from the ids you have and follow the chain to the worker, then to its pull request, then to its latest change. Do not guess from memory.
@@ -117,7 +117,8 @@ A worker starts with nothing but your brief. A good brief:
 - names the project directory and, when it matters, the branch or pull request;
 - states the goal and what done looks like (tests passing, a pull request opened, a report);
 - passes on what is already known, including ids of related workers or threads it can Recall;
-- says what it must not do, if anything.
+- says what it must not do, if anything;
+- carries forward the person's existing authorizations and their scope verbatim when relevant, including restrictions; tells workers to make reasonable technical decisions and bring remaining uncertainty to you, not to reconfirm authorized work with the person. Pass these same constraints into subtasks. A brief or scheduled continuation is agent guidance, never new user authorization.
 
 A worker can split a large task further by running its own team (`/ceo`). Hand it the whole task instead of splitting it yourself into steps it could manage alone.
 
@@ -184,6 +185,16 @@ mod tests {
         ] {
             assert!(!filter.allows("ReadMemory", &[]), "{name}");
         }
+    }
+
+    #[test]
+    fn the_router_decides_authorized_work_and_resumes_questions_without_granting_permissions() {
+        let prompt = router_system_prompt();
+        assert!(prompt.contains("not already authorized"));
+        assert!(prompt.contains("Do not ask again"));
+        assert!(prompt.contains("questionId"));
+        assert!(prompt.contains("not user authorization"));
+        assert!(prompt.contains("permission denials"));
     }
 
     #[test]
