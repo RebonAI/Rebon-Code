@@ -8,6 +8,12 @@ Each section is a `## <version>` heading followed by one to four `- ` items.
 Keep every item within 36 columns: that is the narrowest the banner's notes
 column gets, and a longer line is cut off.
 
+## 1.27.3
+
+- Workers take their follow-up tasks
+- Stale sessions compact on resume
+- Idle compaction starts at 20k
+
 ## 1.27.2
 
 - ReadMemory accepts user and index
