@@ -59,12 +59,43 @@ struct RosterWorker {
     job_id: String,
     session_id: Option<String>,
     title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    has_active_responsibility: Option<bool>,
 }
+
+pub(crate) fn worker_has_responsibility(
+    job: &BackgroundJobState,
+    work: Option<bool>,
+    threads: Option<bool>,
+) -> Option<bool> {
+    if matches!(
+        job.process.status,
+        BackgroundJobStatus::Queued
+            | BackgroundJobStatus::Running
+            | BackgroundJobStatus::NeedsInput
+    ) || !job.identity.pending_prompts.is_empty()
+        || job.outcome.pending_permission.is_some()
+        || job.outcome.pull_requests.iter().any(|pr| {
+            pr.state.as_deref().is_none_or(|state| {
+                !matches!(state.to_ascii_uppercase().as_str(), "MERGED" | "CLOSED")
+            })
+        })
+        || work == Some(true)
+        || threads == Some(true)
+    {
+        Some(true)
+    } else {
+        work.zip(threads).map(|_| false)
+    }
+}
+
+type ResponsibilityOf<'a> = dyn Fn(&BackgroundJobState) -> Option<bool> + 'a;
 
 fn roster(
     router: &BackgroundJobState,
     watchdog: Option<&BackgroundJobState>,
     jobs: &[BackgroundJobState],
+    responsibility_of: &ResponsibilityOf<'_>,
 ) -> Roster {
     let router_id = router.identity.job_id.as_str();
     Roster {
@@ -78,6 +109,7 @@ fn roster(
                 job_id: job.identity.job_id.clone(),
                 session_id: job.identity.session_id.clone(),
                 title: job.identity.name.clone(),
+                has_active_responsibility: responsibility_of(job),
             })
             .collect(),
     }
@@ -139,13 +171,19 @@ impl RouterDigest {
         now_ms: u64,
         notices: &[rebon_work::TaskNotice],
         task_of: &TaskOf<'_>,
+        responsibility_of: &ResponsibilityOf<'_>,
     ) -> bool {
         let Some(router) = crate::router::current_router(store) else {
             self.publish(None);
             return false;
         };
         let watchdog = crate::router::current(store, crate::router::WATCHDOG);
-        self.publish(Some(roster(&router, watchdog.as_ref(), jobs)));
+        self.publish(Some(roster(
+            &router,
+            watchdog.as_ref(),
+            jobs,
+            responsibility_of,
+        )));
         let mut slot = self.state.borrow_mut();
         let state = slot.get_or_insert_with(|| {
             std::fs::read(&self.path)
@@ -513,11 +551,109 @@ mod tests {
         let mut mine = worker("w1", "r", BackgroundJobStatus::Running, 1);
         mine.identity.session_id = Some("s1".into());
         let other = worker("w2", "someone", BackgroundJobStatus::Idle, 1);
-        let roster = roster(&router, None, &[router.clone(), mine, other]);
+        let roster = roster(&router, None, &[router.clone(), mine, other], &|job| {
+            worker_has_responsibility(job, Some(false), Some(false))
+        });
         assert_eq!(roster.router_session_id.as_deref(), Some("router-session"));
         assert_eq!(roster.workers.len(), 1);
         assert_eq!(roster.workers[0].session_id.as_deref(), Some("s1"));
         assert_eq!(roster.workers[0].title, "task w1");
+        assert_eq!(roster.workers[0].has_active_responsibility, Some(true));
+        let wire = serde_json::to_value(&roster).unwrap();
+        assert_eq!(wire["workers"][0]["hasActiveResponsibility"], true);
+    }
+
+    #[test]
+    fn only_known_unowned_terminal_workers_have_no_responsibility() {
+        for status in [
+            BackgroundJobStatus::Idle,
+            BackgroundJobStatus::Succeeded,
+            BackgroundJobStatus::Failed,
+            BackgroundJobStatus::Stopped,
+        ] {
+            let job = worker("w1", "r", status, 1);
+            assert_eq!(
+                worker_has_responsibility(&job, Some(false), Some(false)),
+                Some(false)
+            );
+            assert_eq!(worker_has_responsibility(&job, None, Some(false)), None);
+            assert_eq!(worker_has_responsibility(&job, Some(false), None), None);
+            assert_eq!(
+                worker_has_responsibility(&job, Some(true), None),
+                Some(true)
+            );
+            assert_eq!(
+                worker_has_responsibility(&job, None, Some(true)),
+                Some(true)
+            );
+        }
+    }
+
+    #[test]
+    fn active_queued_and_waiting_workers_cannot_be_archived() {
+        for status in [
+            BackgroundJobStatus::Running,
+            BackgroundJobStatus::Queued,
+            BackgroundJobStatus::NeedsInput,
+        ] {
+            let job = worker("w1", "r", status, 1);
+            assert_eq!(
+                worker_has_responsibility(&job, Some(false), Some(false)),
+                Some(true)
+            );
+        }
+        let mut job = worker("w1", "r", BackgroundJobStatus::Succeeded, 1);
+        job.identity.pending_prompts.push(
+            rebon_session_host::PendingPrompt::new(
+                "pending".into(),
+                "next task".into(),
+                Vec::new(),
+                1,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            worker_has_responsibility(&job, Some(false), Some(false)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn open_or_unknown_prs_protect_workers_but_closed_prs_do_not() {
+        let mut job = worker("w1", "r", BackgroundJobStatus::Succeeded, 1);
+        let pr: rebon_session_host::BackgroundPullRequestStatus = serde_json::from_value(serde_json::json!({
+            "url": "https://github.com/RebonAI/Rebon-Code/pull/42", "owner": "RebonAI", "repo": "Rebon-Code", "number": 42,
+            "state": "OPEN", "updatedAtMs": 1
+        })).unwrap();
+        job.outcome.pull_requests.push(pr);
+        for state in [Some("OPEN"), None, Some("UNKNOWN")] {
+            job.outcome.pull_requests[0].state = state.map(str::to_string);
+            assert_eq!(
+                worker_has_responsibility(&job, Some(false), Some(false)),
+                Some(true)
+            );
+        }
+        for state in ["CLOSED", "MERGED", "closed"] {
+            job.outcome.pull_requests[0].state = Some(state.into());
+            assert_eq!(
+                worker_has_responsibility(&job, Some(false), Some(false)),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn a_roster_without_responsibility_stays_unknown_and_round_trips() {
+        let old = serde_json::json!({"jobId": "w1", "sessionId": "s1", "title": "past work"});
+        let worker: RosterWorker = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(worker.has_active_responsibility, None);
+        assert_eq!(serde_json::to_value(worker).unwrap(), old);
+        for active in [false, true] {
+            let wire = serde_json::json!({"jobId": "w1", "sessionId": "s1", "title": "past work", "hasActiveResponsibility": active});
+            let worker: RosterWorker = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(worker.has_active_responsibility, Some(active));
+            assert_eq!(serde_json::to_value(worker).unwrap(), wire);
+        }
     }
 
     #[test]

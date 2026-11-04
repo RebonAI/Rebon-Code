@@ -45,6 +45,24 @@ impl WorkHost {
             .map(|task| task.id.clone())
     }
 
+    pub(crate) fn worker_has_responsibility(&self, worker_job_id: &str) -> Option<bool> {
+        let slot = self.ledger.borrow();
+        let ledger = slot.as_ref()?;
+        Some(
+            ledger
+                .subscriptions
+                .values()
+                .any(|owner| owner == worker_job_id)
+                || ledger.tasks.values().any(|task| {
+                    !task.status.is_settled()
+                        && ((task.worker_job_id.as_deref() == Some(worker_job_id)
+                            && task.handed_on_to.is_none())
+                            || task.verifier_job_id.as_deref() == Some(worker_job_id)
+                            || task.requested_worker.as_deref() == Some(worker_job_id))
+                }),
+        )
+    }
+
     /// One tick. `true` while a task is open; the notices are for the router.
     pub(crate) fn tick(
         &self,
@@ -311,6 +329,93 @@ impl Hands for HostHands<'_> {
 mod tests {
     use super::*;
     use rebon_work::{NewTask, WorkRequest};
+
+    #[test]
+    fn worker_responsibility_is_unknown_until_the_ledger_loads() {
+        let host = WorkHost::new(PathBuf::new());
+        assert_eq!(host.worker_has_responsibility("w1"), None);
+        *host.ledger.borrow_mut() = Some(Ledger::default());
+        assert_eq!(host.worker_has_responsibility("w1"), Some(false));
+        host.ledger
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .subscriptions
+            .insert("mail:review".into(), "w1".into());
+        assert_eq!(host.worker_has_responsibility("w1"), Some(true));
+        assert_eq!(host.worker_has_responsibility("w2"), Some(false));
+    }
+
+    #[test]
+    fn every_unsettled_assignment_protects_the_worker_and_its_verifier() {
+        let host = WorkHost::new(PathBuf::new());
+        let mut ledger = Ledger::default();
+        rebon_work::apply_request(
+            &mut ledger,
+            WorkRequest::Plan {
+                router_job_id: Some("router".into()),
+                tasks: vec![NewTask {
+                    id: "t1".into(),
+                    title: "work".into(),
+                    project: "project".into(),
+                    goal: "work".into(),
+                    done_when: "done".into(),
+                    depends_on: Vec::new(),
+                    isolate: false,
+                    model_profile: None,
+                    worker: Some("requested".into()),
+                }],
+                requested_at_ms: 1,
+            },
+            1,
+        );
+        let task = ledger.tasks.get_mut("t1").unwrap();
+        task.worker_job_id = Some("worker".into());
+        task.verifier_job_id = Some("verifier".into());
+        *host.ledger.borrow_mut() = Some(ledger);
+        for status in [
+            rebon_work::TaskStatus::Planned,
+            rebon_work::TaskStatus::Running,
+            rebon_work::TaskStatus::Verifying,
+        ] {
+            host.ledger
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .tasks
+                .get_mut("t1")
+                .unwrap()
+                .status = status;
+            for worker in ["worker", "verifier", "requested"] {
+                assert_eq!(
+                    host.worker_has_responsibility(worker),
+                    Some(true),
+                    "{status:?} {worker}"
+                );
+            }
+        }
+        for status in [
+            rebon_work::TaskStatus::Done,
+            rebon_work::TaskStatus::Cancelled,
+            rebon_work::TaskStatus::Stuck,
+        ] {
+            host.ledger
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .tasks
+                .get_mut("t1")
+                .unwrap()
+                .status = status;
+            for worker in ["worker", "verifier", "requested"] {
+                assert_eq!(
+                    host.worker_has_responsibility(worker),
+                    Some(false),
+                    "{status:?} {worker}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_planned_task_whose_router_is_gone_is_stuck_and_the_router_is_told() {

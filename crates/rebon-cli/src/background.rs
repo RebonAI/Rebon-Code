@@ -89,11 +89,19 @@ pub(crate) fn run_background_supervisor() -> anyhow::Result<()> {
             .max_automated_turns
             .max(1);
         let (working, notices) = work.tick(store, jobs, now, max_running);
+        let automating = automation.tick(store, jobs, now);
         let task_of = |worker: &str| work.task_of_worker(worker);
-        let digesting = digest.tick(store, jobs, now, &notices, &task_of);
+        let responsibility_of = |job: &BackgroundJobState| {
+            crate::router_digest::worker_has_responsibility(
+                job,
+                work.worker_has_responsibility(job.job_id()),
+                automation.worker_has_responsibility(job.job_id()),
+            )
+        };
+        let digesting = digest.tick(store, jobs, now, &notices, &task_of, &responsibility_of);
         watchdog.tick(store, jobs, now, &task_of);
         let wakeups = crate::hosted_wakeups::deliver_hosted_wakeups(store, jobs, now)?;
-        Ok(automation.tick(store, jobs, now)? || wakeups || recovering || digesting || working)
+        Ok(automating? || wakeups || recovering || digesting || working)
     };
     let admit = |job: &BackgroundJobState, running_turns: usize, now: u64| {
         autonomy.admit(&store, job, running_turns, now)

@@ -53,6 +53,18 @@ impl AutomationHost {
         }
     }
 
+    pub(crate) fn worker_has_responsibility(&self, worker_job_id: &str) -> Option<bool> {
+        let slot = self.state.borrow();
+        let state = slot.as_ref()?;
+        Some(state.threads.values().any(|thread| {
+            thread.job_id == worker_job_id
+                && thread
+                    .last
+                    .as_ref()
+                    .is_none_or(|last| last.state == rebon_automation::threads::PrState::Open)
+        }))
+    }
+
     /// The supervisor tick's hook: a pass when one is due or a Run now is
     /// waiting, launching through the CLI's gated background launch.
     /// `Ok(true)` keeps the supervisor running.
@@ -267,6 +279,59 @@ fn launch_options(request: &LaunchRequest) -> BackgroundLaunchOptions {
 mod tests {
     use super::*;
     use rebon_automation::{AutomationRule, AutomationTrigger};
+
+    #[test]
+    fn thread_responsibility_is_unknown_until_state_is_loaded() {
+        let host = AutomationHost::new(PathBuf::new());
+        assert_eq!(host.worker_has_responsibility("worker"), None);
+        *host.state.borrow_mut() = Some(AutomationState::default());
+        assert_eq!(host.worker_has_responsibility("worker"), Some(false));
+    }
+
+    #[test]
+    fn a_thread_protects_its_owner_until_it_is_closed_or_removed() {
+        use rebon_automation::threads::{subscribe_prs, PrRef, PrSnapshot, PrState};
+        let host = AutomationHost::new(PathBuf::new());
+        let mut state = AutomationState::default();
+        subscribe_prs(
+            &mut state,
+            "worker",
+            "project",
+            &[PrRef {
+                owner: "RebonAI".into(),
+                repo: "Rebon-Code".into(),
+                number: 42,
+                url: "https://github.com/RebonAI/Rebon-Code/pull/42".into(),
+            }],
+            1,
+        );
+        *host.state.borrow_mut() = Some(state);
+        assert_eq!(host.worker_has_responsibility("worker"), Some(true));
+        assert_eq!(host.worker_has_responsibility("other"), Some(false));
+        for status in [PrState::Open, PrState::Closed, PrState::Merged] {
+            host.state
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .threads
+                .values_mut()
+                .next()
+                .unwrap()
+                .last = Some(PrSnapshot {
+                state: status,
+                checks_failed: 0,
+                checks_pending: 0,
+                changes_requested: false,
+                checks_summary: None,
+            });
+            assert_eq!(
+                host.worker_has_responsibility("worker"),
+                Some(status == PrState::Open)
+            );
+        }
+        host.state.borrow_mut().as_mut().unwrap().threads.clear();
+        assert_eq!(host.worker_has_responsibility("worker"), Some(false));
+    }
 
     fn write_rules(config_home: &std::path::Path, rules: Vec<AutomationRule>) {
         AutomationRules {
