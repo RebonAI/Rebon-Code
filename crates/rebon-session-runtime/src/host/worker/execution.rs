@@ -1,5 +1,7 @@
 use super::super::*;
-use super::idle_compaction::{armed_wakeup_at, worker_leave_at, HeldIdleCompaction};
+use super::idle_compaction::{
+    arm_cold_resume_compaction, armed_wakeup_at, worker_leave_at, HeldIdleCompaction,
+};
 use rebon_core::hooks::{
     append_additional_context, apply_user_prompt_submit_effects, UserPromptSubmitDecision,
 };
@@ -1823,6 +1825,8 @@ async fn execute_background_job_inner(
     }
     let mut resume_saved_user =
         pending_transcript_state == PendingPromptTranscriptState::ResumeSavedUser;
+    // Read before the build, which binds the new session's id into `state`.
+    let resumes_session = state.identity.session_id.is_some();
     let resume_cwd = if state.identity.resume_only {
         Some(state.identity.cwd.clone())
     } else {
@@ -1931,6 +1935,10 @@ async fn execute_background_job_inner(
     // auto-compact slider writes config.json while this worker is parked,
     // and the person moving it expects the very next turn to honour it.
     rebon_harness::refresh_auto_compact_token_limit(&session.model.prune_level);
+    // Also after the model, so the floor lands on the budget this turn uses.
+    if resumes_session {
+        arm_cold_resume_compaction(store, &state.identity.job_id, &session);
+    }
 
     // Say which agent this turn runs under. The router lives in this process
     // and nothing asked it before, so `agent` was `None` in every snapshot the

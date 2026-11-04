@@ -198,7 +198,9 @@ pub fn compact_due(activity: &Activity, warmth: &Warmth, now_ms: u64) -> bool {
         && long_context(activity, warmth)
 }
 
-fn long_context(activity: &Activity, warmth: &Warmth) -> bool {
+/// Whether the context the last request carried is past the group's share
+/// of the window: long enough that a full re-read is expensive anyway.
+pub fn long_context(activity: &Activity, warmth: &Warmth) -> bool {
     activity
         .context_tokens
         .is_some_and(|tokens| tokens as f64 > long_context_tokens(activity, warmth))
@@ -229,6 +231,13 @@ fn find_transcript(root: &Path, session_id: &str) -> Option<PathBuf> {
         .flatten()
         .map(|entry| entry.path().join(&name))
         .find(|path| path.is_file())
+}
+
+/// What a Rebon session's files say about it, read from the transcript at
+/// `path` and the compacted baseline beside it, for a caller that already
+/// knows where the transcript is.
+pub fn rebon_transcript_activity(path: &Path, session_id: &str) -> Activity {
+    rebon_activity(path, session_id)
 }
 
 /// Rebon's `/compact` leaves the transcript as it is and writes the compacted

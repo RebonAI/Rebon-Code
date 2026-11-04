@@ -970,6 +970,16 @@ async fn compact_before_request(
     pending_cache_miss_reason: &mut CacheMissReason,
 ) -> PreTurnCompactFlow {
     params.max_tokens = cap_max_tokens_for_model(params.max_tokens, params.prune_level.as_ref());
+    // A cold-resume floor belongs to the turn's first request only. Take it
+    // before the manual branch so a `/compact` in that slot consumes it too.
+    let cold_resume_floor = if iteration == 0 {
+        params
+            .prune_level
+            .as_ref()
+            .and_then(|handle| handle.budget.take_compact_once_if_at_least())
+    } else {
+        None
+    };
     let (manual_compact_requested, manual_compact_instructions) = params
         .prune_level
         .as_ref()
@@ -1020,34 +1030,54 @@ async fn compact_before_request(
         .prune_level
         .as_ref()
         .map(|handle| std::cmp::max(estimated_input_tokens, handle.budget.last_input_tokens()));
+    // The prompt cache is gone after a long idle, so the first request pays
+    // full price for the history anyway; summarise it instead once it is
+    // large enough to be worth it. Same gates as auto-compact, lower bar.
+    let cold_resume_compact = cold_resume_floor.is_some_and(|floor| {
+        pre_turn_budget_tokens.is_some_and(|tokens| tokens >= floor)
+            && params
+                .prune_level
+                .as_ref()
+                .is_some_and(|handle| handle.budget.auto_compact_allowed())
+    });
     // 硬裁剪会丢失摘要需要的原文；即使自动阈值较高，也先在同一次请求前尝试摘要。
     let pre_turn_auto_compact = (iteration == 0 || exceeds_hard_guard)
         && !*skip_auto_compact
-        && params.prune_level.as_ref().is_some_and(|handle| {
-            let tokens = pre_turn_budget_tokens.unwrap_or_default();
-            let tokens = if exceeds_hard_guard {
-                tokens.max(handle.budget.auto_compact_threshold())
-            } else {
-                tokens
-            };
-            handle.budget.should_auto_compact_for_tokens(tokens)
-        });
+        && (cold_resume_compact
+            || params.prune_level.as_ref().is_some_and(|handle| {
+                let tokens = pre_turn_budget_tokens.unwrap_or_default();
+                let tokens = if exceeds_hard_guard {
+                    tokens.max(handle.budget.auto_compact_threshold())
+                } else {
+                    tokens
+                };
+                handle.budget.should_auto_compact_for_tokens(tokens)
+            }));
     if pre_turn_auto_compact {
         let msg_count = manager.len();
         if manager.is_empty() {
             // Nothing to compact.
         } else {
-            tracing::info!(
-                messages = msg_count,
-                threshold = params
-                    .prune_level
-                    .as_ref()
-                    .map(|handle| handle.budget.auto_compact_threshold())
-                    .unwrap_or_default(),
-                estimated_input_tokens,
-                budget_tokens = pre_turn_budget_tokens.unwrap_or_default(),
-                "turn_control: pre-turn context budget exceeded, compacting prior history"
-            );
+            if cold_resume_compact {
+                tracing::info!(
+                    messages = msg_count,
+                    floor = cold_resume_floor.unwrap_or_default(),
+                    budget_tokens = pre_turn_budget_tokens.unwrap_or_default(),
+                    "turn_control: cold resume, compacting history the expired prompt cache would resend"
+                );
+            } else {
+                tracing::info!(
+                    messages = msg_count,
+                    threshold = params
+                        .prune_level
+                        .as_ref()
+                        .map(|handle| handle.budget.auto_compact_threshold())
+                        .unwrap_or_default(),
+                    estimated_input_tokens,
+                    budget_tokens = pre_turn_budget_tokens.unwrap_or_default(),
+                    "turn_control: pre-turn context budget exceeded, compacting prior history"
+                );
+            }
 
             let (before_tokens, after_tokens, new_baseline_required) = compact_history(
                 manager,
@@ -1975,6 +2005,120 @@ mod pre_turn_compact_tests {
             messages.push(ApiMessage::user_text("request"));
         }
         (params, ContextManager::new(None, messages))
+    }
+
+    /// A history well under both the auto-compact threshold and the hard
+    /// guard, so only a cold-resume floor can make it compact.
+    fn cold_resume_params_and_manager() -> (QueryParams, ContextManager) {
+        let params = QueryParams {
+            max_tokens: 8_000,
+            prune_level: Some(PruneLevelHandle::with_context_window(
+                PruneLevel::Conservative,
+                200_000,
+            )),
+            ..QueryParams::new("mock", Vec::new())
+        };
+        let mut messages = vec![ApiMessage::user_text("x".repeat(80_000))];
+        for _ in 0..5 {
+            messages.push(ApiMessage::assistant_text("answer"));
+            messages.push(ApiMessage::user_text("request"));
+        }
+        (params, ContextManager::new(None, messages))
+    }
+
+    /// Run one `compact_before_request` with the floor armed at
+    /// `floor(estimate)`; returns how many model requests it made and the
+    /// cache-miss reason it reported.
+    async fn run_with_cold_resume_floor(
+        iteration: usize,
+        floor: impl FnOnce(u32) -> u32,
+    ) -> (usize, CacheMissReason) {
+        let (mut params, mut manager) = cold_resume_params_and_manager();
+        let handle = params.prune_level.as_ref().unwrap();
+        let estimate = next_request_input_estimate(&manager, &params);
+        assert!(!handle.budget.should_auto_compact_for_tokens(estimate));
+        let target = hard_context_guard_target(Some(handle), params.max_tokens).unwrap();
+        assert!(estimate <= target);
+        handle.budget.compact_once_if_at_least(floor(estimate));
+
+        let mock = MockModelClient::new();
+        mock.push_turn(vec![
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlockStart::Text {
+                    text: "summary of the idle session".into(),
+                },
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::MessageStop,
+        ]);
+        let session = SessionHandle::new(Arc::new(mock.clone()));
+        let (raw_tx, _rx) = mpsc::unbounded_channel();
+        let tx = QueryEventSender::new(raw_tx, &params.turn_hooks);
+        let mut skip = false;
+        let mut pending = CacheMissReason::None;
+        let PreTurnCompactFlow::Ran {
+            cache_miss_reason, ..
+        } = compact_before_request(
+            &mut manager,
+            &mut params,
+            &session,
+            &tx,
+            iteration,
+            &mut skip,
+            &mut pending,
+        )
+        .await
+        else {
+            panic!("pre-turn compaction must not restart the loop");
+        };
+        (mock.captured_requests().len(), cache_miss_reason)
+    }
+
+    #[tokio::test]
+    async fn cold_resume_floor_below_history_compacts_first_request() {
+        let (requests, reason) = run_with_cold_resume_floor(0, |estimate| estimate / 2).await;
+        assert_eq!(requests, 1, "the summary request must run");
+        assert_eq!(reason, CacheMissReason::CompactReplacedMessages);
+    }
+
+    #[tokio::test]
+    async fn cold_resume_floor_above_history_does_not_compact() {
+        let (requests, reason) = run_with_cold_resume_floor(0, |estimate| estimate + 1).await;
+        assert_eq!(requests, 0);
+        assert_eq!(reason, CacheMissReason::None);
+    }
+
+    #[tokio::test]
+    async fn cold_resume_floor_is_ignored_after_the_first_request() {
+        let (requests, _) = run_with_cold_resume_floor(1, |estimate| estimate / 2).await;
+        assert_eq!(requests, 0);
+    }
+
+    #[tokio::test]
+    async fn cold_resume_floor_respects_disabled_auto_compact_and_is_consumed() {
+        let (mut params, mut manager) = cold_resume_params_and_manager();
+        let handle = params.prune_level.clone().unwrap();
+        handle.budget.set_auto_compact_enabled(false);
+        handle.budget.compact_once_if_at_least(1);
+        let mock = MockModelClient::new();
+        let session = SessionHandle::new(Arc::new(mock.clone()));
+        let (raw_tx, _rx) = mpsc::unbounded_channel();
+        let tx = QueryEventSender::new(raw_tx, &params.turn_hooks);
+        let mut skip = false;
+        let mut pending = CacheMissReason::None;
+        compact_before_request(
+            &mut manager,
+            &mut params,
+            &session,
+            &tx,
+            0,
+            &mut skip,
+            &mut pending,
+        )
+        .await;
+        assert!(mock.captured_requests().is_empty());
+        assert_eq!(handle.budget.take_compact_once_if_at_least(), None);
     }
 
     #[tokio::test]

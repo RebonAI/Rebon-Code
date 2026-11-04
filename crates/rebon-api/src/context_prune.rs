@@ -300,6 +300,9 @@ pub struct ContextBudget {
     force_compact_once: AtomicU8, // 0=no, 1=yes
     /// Optional one-shot instructions attached to a manual `/compact`.
     manual_compact_instructions: Mutex<Option<String>>,
+    /// One-shot token floor: compact before the next request when the
+    /// history is at least this large. 0 means unset.
+    compact_once_if_at_least: AtomicU32,
     /// Consecutive auto-compact failures. When this reaches
     /// `MAX_CONSECUTIVE_COMPACT_FAILURES`, `should_auto_compact()`
     /// returns false to avoid hammering a failing compact path.
@@ -326,6 +329,7 @@ impl ContextBudget {
             auto_compact_enabled: AtomicU8::new(1),
             force_compact_once: AtomicU8::new(0),
             manual_compact_instructions: Mutex::new(None),
+            compact_once_if_at_least: AtomicU32::new(0),
             consecutive_compact_failures: AtomicU32::new(0),
         }
     }
@@ -510,6 +514,33 @@ impl ContextBudget {
         (true, instructions)
     }
 
+    /// Ask for one compaction before the next request if the history is
+    /// at least `min_tokens`. A worker resuming after its prompt cache
+    /// expired sets this: the next request pays full price anyway, so
+    /// it may as well send a summary. A later call replaces the floor.
+    pub fn compact_once_if_at_least(&self, min_tokens: u32) {
+        // 0 is the "unset" marker, so the smallest real floor is 1.
+        self.compact_once_if_at_least
+            .store(min_tokens.max(1), Ordering::Release);
+    }
+
+    /// Check and atomically clear the floor set by
+    /// [`Self::compact_once_if_at_least`].
+    pub fn take_compact_once_if_at_least(&self) -> Option<u32> {
+        match self.compact_once_if_at_least.swap(0, Ordering::AcqRel) {
+            0 => None,
+            floor => Some(floor),
+        }
+    }
+
+    /// Whether auto-compaction may run at all: enabled and the circuit
+    /// breaker has not tripped. The token threshold is the caller's.
+    pub fn auto_compact_allowed(&self) -> bool {
+        self.auto_compact_enabled.load(Ordering::Relaxed) != 0
+            && self.consecutive_compact_failures.load(Ordering::Relaxed)
+                < MAX_CONSECUTIVE_COMPACT_FAILURES
+    }
+
     /// Whether the current token usage exceeds the auto-compact
     /// threshold. Does NOT consume the one-shot flag — call
     /// [`Self::take_compact_once`] separately for `/compact`.
@@ -525,9 +556,7 @@ impl ContextBudget {
     /// threshold while respecting the same enable flag and circuit
     /// breaker as [`Self::should_auto_compact`].
     pub fn should_auto_compact_for_tokens(&self, input_tokens: u32) -> bool {
-        self.auto_compact_enabled.load(Ordering::Relaxed) != 0
-            && self.consecutive_compact_failures.load(Ordering::Relaxed)
-                < MAX_CONSECUTIVE_COMPACT_FAILURES
+        self.auto_compact_allowed()
             && input_tokens >= self.auto_compact_threshold.load(Ordering::Relaxed)
     }
 
@@ -3508,6 +3537,38 @@ mod tests {
         budget.force_compact_once();
 
         assert_eq!(budget.take_compact_once_with_instructions(), (true, None));
+    }
+
+    #[test]
+    fn context_budget_compact_floor_is_one_shot_and_keeps_latest() {
+        let budget = ContextBudget::new(1_000_000);
+        assert_eq!(budget.take_compact_once_if_at_least(), None);
+
+        budget.compact_once_if_at_least(8_000);
+        budget.compact_once_if_at_least(12_000);
+        assert_eq!(budget.take_compact_once_if_at_least(), Some(12_000));
+        assert_eq!(budget.take_compact_once_if_at_least(), None);
+
+        // A zero floor still arms; it must not read back as unset.
+        budget.compact_once_if_at_least(0);
+        assert_eq!(budget.take_compact_once_if_at_least(), Some(1));
+        // The manual flag is a separate one-shot.
+        assert_eq!(budget.take_compact_once_with_instructions(), (false, None));
+    }
+
+    #[test]
+    fn context_budget_auto_compact_allowed_ignores_threshold() {
+        let budget = ContextBudget::new(1_000_000);
+        assert!(budget.auto_compact_allowed());
+        assert!(!budget.should_auto_compact_for_tokens(10));
+
+        budget.set_auto_compact_enabled(false);
+        assert!(!budget.auto_compact_allowed());
+        budget.set_auto_compact_enabled(true);
+        for _ in 0..3 {
+            budget.record_compact_failure();
+        }
+        assert!(!budget.auto_compact_allowed());
     }
 
     #[test]

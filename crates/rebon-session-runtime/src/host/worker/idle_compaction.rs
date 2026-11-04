@@ -69,6 +69,57 @@ pub(crate) fn idle_compaction_due(
         .min(before_leaving)
 }
 
+/// Whether a session last written at `last_activity_ms` resumes past the
+/// prompt cache, so its first request would resend the history uncached.
+/// No activity on record says nothing, so it is not due.
+pub(crate) fn cold_resume_compaction_due(now: u64, last_activity_ms: Option<u64>) -> bool {
+    last_activity_ms.is_some_and(|last| now.saturating_sub(last) >= IDLE_COMPACTION_DELAY_MS)
+}
+
+/// Arm one compaction before the first request of a resumed session that has
+/// sat idle past the prompt cache.
+///
+/// The parked worker's own idle compaction covers a worker that stays alive.
+/// This covers the rest: a worker that was reaped, crashed or restarted, or
+/// whose idle compaction was cancelled or skipped. The transcript's mtime is
+/// its last write, and a newer `.compact.json` counts as activity, so a
+/// session already compacted while idle is left alone. A recovered turn's
+/// saved user row is already in the transcript and only makes this later.
+pub(crate) fn arm_cold_resume_compaction(
+    store: &BackgroundStore,
+    job_id: &str,
+    session: &crate::EngineSession,
+) {
+    if session.engine_half.runtime.session_agents.current_id() != "local"
+        || !rebon_config::saved_idle_auto_compact_enabled()
+    {
+        return;
+    }
+    // The built session's own path: a resume moves the transcript into the
+    // cwd it runs in, worktree or not, before this point.
+    let path = rebon_session::transcript_file_path(
+        &session.projects_root,
+        &session.cwd,
+        &session.session_id,
+    );
+    let last_activity_ms =
+        rebon_group::warmth::rebon_transcript_activity(&path, &session.session_id).last_activity_ms;
+    let now = rebon_types::wall_clock_ms();
+    if !cold_resume_compaction_due(now, last_activity_ms) {
+        return;
+    }
+    session
+        .model
+        .prune_level
+        .budget
+        .compact_once_if_at_least(IDLE_COMPACTION_MIN_TOKENS);
+    let _ = store.append_event(
+        job_id,
+        "cold_resume_compaction_armed",
+        serde_json::json!({ "idleMs": last_activity_ms.map_or(0, |last| now.saturating_sub(last)) }),
+    );
+}
+
 /// What a parked worker keeps to compact the session it released.
 pub struct HeldIdleCompaction {
     pub(crate) session_id: String,
@@ -347,6 +398,20 @@ mod tests {
         assert!(!idle_compaction_due(
             now, T0, now, None, 50_000, false, None
         ));
+    }
+
+    #[test]
+    fn a_cold_resume_compacts_once_the_cache_hour_has_passed() {
+        assert!(!cold_resume_compaction_due(T0 + HOUR - 1, Some(T0)));
+        assert!(cold_resume_compaction_due(T0 + HOUR, Some(T0)));
+        assert!(cold_resume_compaction_due(T0 + 5 * HOUR, Some(T0)));
+    }
+
+    #[test]
+    fn a_cold_resume_without_activity_or_from_the_future_is_left_alone() {
+        assert!(!cold_resume_compaction_due(T0 + 5 * HOUR, None));
+        // A clock that went backwards reads as no idle time at all.
+        assert!(!cold_resume_compaction_due(T0, Some(T0 + HOUR)));
     }
 
     #[test]

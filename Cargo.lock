@@ -5732,6 +5732,7 @@ dependencies = [
  "rebon-config",
  "rebon-core",
  "rebon-dialog",
+ "rebon-group",
  "rebon-harness",
  "rebon-hooks",
  "rebon-kernel-seats",

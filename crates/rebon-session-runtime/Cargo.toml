@@ -22,6 +22,7 @@ rebon-api.workspace = true
 rebon-automation.workspace = true
 rebon-config.workspace = true
 rebon-dialog.workspace = true
+rebon-group.workspace = true
 rebon-core.workspace = true
 rebon-harness.workspace = true
 rebon-hooks.workspace = true
