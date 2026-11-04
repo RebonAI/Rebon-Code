@@ -4,7 +4,12 @@ pub(super) use rebon_types::wall_clock_ms;
 
 use crate::session::commands::fmt_tokens;
 
-pub(super) const NEW_SESSION_HINT_TOKENS_THRESHOLD: u32 = 8_000;
+/// The context below which an idle session is neither compacted nor worth
+/// a `/clear` hint. The system prompt and tools alone come to about 8k, so
+/// the floor sits well above them: it should measure the conversation, not
+/// the session's fixed overhead. The background worker uses the same floor
+/// (`IDLE_COMPACTION_MIN_TOKENS`).
+pub(super) const NEW_SESSION_HINT_TOKENS_THRESHOLD: u32 = 20_000;
 pub(super) const NEW_SESSION_HINT_IDLE_DELAY: Duration = Duration::from_secs(60 * 60);
 const STALE_SESSION_WARNING_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -674,7 +679,7 @@ mod tests {
                 false,
                 NEW_SESSION_HINT_IDLE_DELAY,
             ),
-            Some("Use /clear to save ~8.0k tokens".into())
+            Some("Use /clear to save ~20.0k tokens".into())
         );
     }
 
@@ -722,7 +727,7 @@ mod tests {
                 false,
                 NEW_SESSION_HINT_IDLE_DELAY,
             ),
-            Some("Use /clear to save ~8.0k tokens".into())
+            Some("Use /clear to save ~20.0k tokens".into())
         );
         assert_eq!(
             footer_new_session_hint(
