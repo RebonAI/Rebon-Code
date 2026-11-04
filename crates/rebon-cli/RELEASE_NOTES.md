@@ -8,6 +8,12 @@ Each section is a `## <version>` heading followed by one to four `- ` items.
 Keep every item within 36 columns: that is the narrowest the banner's notes
 column gets, and a longer line is cut off.
 
+## 1.27.4
+
+- Auto workers keep router permissions
+- Questions return to the router
+- Router ownership stays in sync
+
 ## 1.27.3
 
 - Workers take their follow-up tasks
