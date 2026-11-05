@@ -370,6 +370,7 @@ fn build_body(
                 (rebon_render::UserContentBlock::Text { text }, _) => {
                     MessageBodyKind::UserText(UserTextBodyWidget::from_raw(
                         text,
+                        user.is_task_notification_row(),
                         input.add_margin,
                         input.verbose,
                         user.plan_content.clone(),

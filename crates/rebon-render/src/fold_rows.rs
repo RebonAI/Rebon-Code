@@ -94,16 +94,28 @@ pub fn tool_result_only_user(
     }
 }
 
-/// `true` iff `msg` is a user message flagged `isMeta: true` — an
-/// attachment/reminder injection the engine persists to the transcript
-/// for replay fidelity but which renders as nothing (see `to_message_row`).
-/// These rows must be *transparent* to the collapse
+/// `true` iff `msg` is a model-only meta user row. Internally sourced task
+/// notifications are visible, even when persisted with `isMeta: true`.
+/// Other attachment/reminder injections are transparent to collapse
 /// grouping: the engine inserts one between every iteration
 /// (`query.rs` AttachmentInjected handler), so a naive walk that treats
 /// them as run-breakers chops every consecutive read/search chain into
 /// 1-tool fragments and the summary never fires.
 pub fn is_meta_user(msg: &Message) -> bool {
-    matches!(msg, Message::User(u) if u.is_meta == Some(true))
+    matches!(msg, Message::User(u) if u.is_meta == Some(true) && !is_internal_task_notification(u))
+}
+
+pub(crate) fn is_internal_task_notification(user: &crate::transcript_row::UserMessage) -> bool {
+    rebon_types::is_task_notification_row_uuid(&user.uuid)
+        && user.message.content.iter().any(|block| {
+            matches!(block, UserContentBlock::Text(text) if text.text.contains("<task-notification>"))
+        })
+}
+
+/// Whether a user row is the runtime's own rather than a person's: flagged
+/// model-only, or written under a task-notification row id.
+fn is_internal_user_row(user: &crate::transcript_row::UserMessage) -> bool {
+    user.is_meta == Some(true) || rebon_types::is_task_notification_row_uuid(&user.uuid)
 }
 
 /// `true` iff `msg` is an assistant message whose only content is
@@ -563,23 +575,23 @@ fn message_thinking_count(message: &Message) -> usize {
 /// person typed? Teammate messages and task notifications ride in as user
 /// rows, and the fold keeps them from breaking a thinking group the way a
 /// real prompt does.
-pub fn user_text_is_coordinator_notification(text: &str) -> bool {
-    matches!(
-        detect_user_text_kind(text),
-        UserTextKind::TeammateMessage | UserTextKind::TaskNotification
-    )
+pub fn user_text_is_coordinator_notification(text: &str, internal: bool) -> bool {
+    matches!(detect_user_text_kind(text), UserTextKind::TeammateMessage)
+        || (internal && matches!(detect_user_text_kind(text), UserTextKind::TaskNotification))
 }
 
-pub fn user_block_breaks_thinking_boundary(block: &UserContentBlock) -> bool {
+pub fn user_block_breaks_thinking_boundary(block: &UserContentBlock, internal: bool) -> bool {
     match block {
         UserContentBlock::ToolResult(_) => false,
-        UserContentBlock::Text(text) => !user_text_is_coordinator_notification(&text.text),
+        UserContentBlock::Text(text) => {
+            !user_text_is_coordinator_notification(&text.text, internal)
+        }
         UserContentBlock::Image(_) => true,
     }
 }
 
 pub fn message_has_non_tool_user_content(msg: &Message) -> bool {
-    matches!(msg, Message::User(u) if u.message.content.iter().any(user_block_breaks_thinking_boundary))
+    matches!(msg, Message::User(u) if u.message.content.iter().any(|block| user_block_breaks_thinking_boundary(block, is_internal_user_row(u))))
 }
 
 pub fn message_allows_prior_thinking_preview(msg: &Message) -> bool {
@@ -595,7 +607,7 @@ pub fn message_allows_prior_thinking_preview(msg: &Message) -> bool {
         Message::User(u) => u.message.content.iter().any(|block| {
             matches!(
                 block,
-                UserContentBlock::Text(text) if user_text_is_coordinator_notification(&text.text)
+                UserContentBlock::Text(text) if user_text_is_coordinator_notification(&text.text, is_internal_user_row(u))
             )
         }),
         Message::System(system) => system.subtype == "turn_duration",

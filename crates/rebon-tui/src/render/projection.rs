@@ -14,10 +14,9 @@ pub(super) fn to_message_row(
 ) -> Option<RmMessageRow> {
     match msg {
         Message::User(u) => {
-            // Meta messages (attachment injections like plan_mode
-            // reminders, date_change, skill_listing). These are sent to
-            // the API but never rendered as transcript rows.
-            if u.is_meta == Some(true) {
+            // Internal task notices are the visible exception to the
+            // otherwise hidden model-only attachment rows.
+            if rebon_render::fold_rows::is_meta_user(msg) {
                 return None;
             }
             let content = u

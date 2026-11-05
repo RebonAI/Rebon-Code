@@ -383,7 +383,7 @@ fn compact_transcript_keeps_thinking_preview_before_coordinator_notifications() 
     reducer(
         &mut s,
         Action::Commit(user(
-            "u-task",
+            "u-internal-task-notification-1",
             "<task-notification>\n<summary>background agent launched</summary>\n<status>running</status>\n</task-notification>",
         )),
     );

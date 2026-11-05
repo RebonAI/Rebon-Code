@@ -442,7 +442,8 @@ pub(crate) fn task_notification_pending_prompt_id(notification: &TaskNotificatio
             (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
         });
     format!(
-        "u-internal-task-notification-{:016x}-{hash:016x}",
+        "{}-{:016x}-{hash:016x}",
+        rebon_types::TASK_NOTIFICATION_ROW_UUID_PREFIX,
         notification.generation
     )
 }

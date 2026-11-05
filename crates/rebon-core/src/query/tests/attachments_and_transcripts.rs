@@ -727,6 +727,48 @@ fn a_cross_session_frame_replays_after_a_resume() {
     );
 }
 
+/// A task notification delivered into a running turn travels as a visible
+/// attachment under its task-notification row id. The model reads exactly
+/// the notification it read when it arrived as a bare user message, live and
+/// after a resume.
+#[test]
+fn a_mid_turn_task_notification_reaches_the_model_unchanged() {
+    let notice = "<task-notification>\n<task-id>t-1</task-id>\n<status>completed</status>\n<summary>done</summary>\n</task-notification>";
+    let uuid = "u-internal-task-notification-sess-1-2";
+    let message = visible_runtime_attachment_message(uuid, notice.to_string(), notice.to_string());
+    assert_eq!(
+        local_user_uuid_from_attachment(&message).as_deref(),
+        Some(uuid)
+    );
+    assert!(is_visible_runtime_attachment(&message));
+    let live = model_message_for_attachment(&message);
+    assert_eq!(live, rebon_api::Message::user_text(notice.to_string()));
+    assert_eq!(
+        visible_message_for_attachment(&message).content,
+        live.content
+    );
+
+    let entries = vec![rebon_session::TranscriptEntry {
+        entry_type: "user".into(),
+        uuid: uuid.into(),
+        parent_uuid: None,
+        timestamp: None,
+        raw: json!({
+            "queuedCommand": true,
+            "runtimeAttachment": true,
+            "isMeta": true,
+            "origin": {"kind": "task_notification"},
+            "message": {
+                "role": "user",
+                "content": visible_message_for_attachment(&message).content,
+            },
+        }),
+    }];
+
+    let messages = transcript_to_api_messages(&entries);
+    assert_eq!(messages, vec![live]);
+}
+
 #[test]
 fn transcript_replay_sends_runtime_attachment_model_text_unwrapped() {
     let message = visible_runtime_attachment_message(

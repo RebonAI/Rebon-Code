@@ -24,6 +24,7 @@ mod summary_envelope;
 mod task_status;
 mod text;
 mod time_fmt;
+mod transcript_row_id;
 mod types;
 mod ultraplan_manifest;
 mod ultraplan_plan;
@@ -47,6 +48,7 @@ pub use summary_envelope::{display_text_for_summary_envelope, summary_envelope_t
 pub use task_status::{ListTask, TaskListStatus, TaskStatus};
 pub use text::{truncate_chars, xml_escape, xml_unescape};
 pub use time_fmt::{format_system_time_iso_ms, wall_clock_ms, wall_clock_ms_u128};
+pub use transcript_row_id::{is_task_notification_row_uuid, TASK_NOTIFICATION_ROW_UUID_PREFIX};
 pub use types::*;
 pub use ultraplan_manifest::*;
 pub use ultraplan_plan::*;

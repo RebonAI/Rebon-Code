@@ -172,6 +172,26 @@ fn render_code_sequence(
 }
 
 #[test]
+fn internal_task_notice_projects_but_matching_user_quote_stays_a_user_row() {
+    let text = "<task-notification><summary>finished</summary></task-notification>";
+    let mut internal = user("u-internal-task-notification-1", text);
+    let Message::User(internal_user) = &mut internal else {
+        unreachable!()
+    };
+    internal_user.is_meta = Some(true);
+    assert!(!rebon_render::fold_rows::is_meta_user(&internal));
+    assert!(to_message_row(&internal, ToolOutputVerbosity::Normal, 80).is_some());
+    let quoted = user("u-user-quoted", text);
+    assert!(to_message_row(&quoted, ToolOutputVerbosity::Normal, 80).is_some());
+    let mut unrelated_meta = user("u-internal-other", "private context");
+    let Message::User(meta) = &mut unrelated_meta else {
+        unreachable!()
+    };
+    meta.is_meta = Some(true);
+    assert!(to_message_row(&unrelated_meta, ToolOutputVerbosity::Normal, 80).is_none());
+}
+
+#[test]
 fn bash_command_header_folds_to_three_visual_lines_without_folding_output() {
     let command = format!("START-{}-END", "x".repeat(400));
     for status in [

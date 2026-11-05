@@ -1,8 +1,8 @@
 //! Persisted transcript entries in, display rows out — the one producer.
 //!
 //! This is the pass every surface needs, so it is written once here: recover a
-//! malformed line, drop the meta and runtime-context rows the engine injected
-//! for the model, strip the `<system-reminder>` and `<additional_context>`
+//! malformed line, drop model-only meta and runtime-context rows while keeping
+//! sourced task notifications, strip the `<system-reminder>` and `<additional_context>`
 //! bodies out of what the person actually typed, drop the tool calls that
 //! render in their own surface, fold each persisted tool result back onto the
 //! `tool_use` block it belongs to, and synthesize the plan card an approved
@@ -149,6 +149,20 @@ pub fn replayed_rows(entries: &[TranscriptLine<'_>]) -> (Vec<Message>, ReplaySta
                         is_meta: None,
                     }));
                     stats.committed += 1;
+                }
+                continue;
+            }
+            if entry
+                .raw
+                .pointer("/origin/kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("task_notification")
+            {
+                if crate::fold_rows::is_internal_task_notification(u) {
+                    if let Some(notice) = strip_replayed_user_system_reminders(msg.clone()) {
+                        messages.push(notice);
+                        stats.committed += 1;
+                    }
                 }
                 continue;
             }
@@ -478,7 +492,7 @@ pub fn try_recover_message(entry: &TranscriptLine<'_>) -> Option<Message> {
                 })],
             },
             is_compact_summary: None,
-            is_meta: None,
+            is_meta: entry.raw.get("isMeta").and_then(serde_json::Value::as_bool),
             is_visible_in_transcript_only: None,
             image_paste_ids: None,
             plan_content: None,
@@ -674,6 +688,52 @@ mod tests {
             let (rows, _) = rows_of(&raw);
             assert!(rows.is_empty(), "{name} should leave no row on replay");
         }
+    }
+
+    #[test]
+    fn task_notification_origin_replays_as_a_card_but_identical_user_quotes_stay_user_rows() {
+        let notification = "<task-notification>\n<task-id>task-1</task-id>\n<status>completed</status>\n<summary>finished</summary>\n</task-notification>";
+        let raw = vec![
+            json!({
+                "type": "user", "uuid": "u-user-first", "timestamp": "t",
+                "message": {"role": "user", "content": [{"type": "text", "text": notification}]}
+            }),
+            json!({
+                "type": "user", "uuid": "u-internal-task-notification-1", "timestamp": "t",
+                "isMeta": true, "origin": {"kind": "task_notification"},
+                "message": {"role": "user", "content": [{"type": "text", "text": notification}]}
+            }),
+            json!({
+                "type": "user", "uuid": "u-internal-task-notification-2", "timestamp": "t",
+                "isMeta": true, "origin": {"kind": "task_notification"},
+                "message": {"role": "user", "content": notification}
+            }),
+            json!({
+                "type": "user", "uuid": "u-internal-task-notification-escalation", "timestamp": "t",
+                "isMeta": true, "origin": {"kind": "task_notification"},
+                "message": {"role": "user", "content": "private escalation context"}
+            }),
+            json!({
+                "type": "user", "uuid": "u-internal-legacy", "timestamp": "t",
+                "isMeta": true,
+                "message": {"role": "user", "content": "private context from older transcript"}
+            }),
+            json!({
+                "type": "user", "uuid": "u-user-later", "timestamp": "t",
+                "message": {"role": "user", "content": [{"type": "text", "text": notification}]}
+            }),
+        ];
+        let (rows, stats) = rows_of(&raw);
+        assert_eq!(stats.committed, 4);
+        assert_eq!(stats.recovered, 3);
+        assert!(matches!(&rows[0], Message::User(user) if user.uuid == "u-user-first"));
+        assert!(
+            matches!(&rows[1], Message::User(user) if user.uuid == "u-internal-task-notification-1")
+        );
+        assert!(
+            matches!(&rows[2], Message::User(user) if user.uuid == "u-internal-task-notification-2")
+        );
+        assert!(matches!(&rows[3], Message::User(user) if user.uuid == "u-user-later"));
     }
 
     #[test]

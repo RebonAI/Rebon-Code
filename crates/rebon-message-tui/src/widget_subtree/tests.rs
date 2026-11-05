@@ -30,9 +30,40 @@ fn assert_text_modifier(buf: &Buffer, y: u16, needle: &str, modifier: Modifier, 
 }
 
 #[test]
+fn task_notification_widget_uses_source_and_preserves_user_quotes() {
+    let notice = "<task-notification>\n<task-id>task-1</task-id>\n<status>completed</status>\n<summary>finished</summary>\n</task-notification>";
+    for (internal, quoted) in [(true, false), (false, true)] {
+        let widget = UserTextBodyWidget::from_raw(
+            notice,
+            internal,
+            false,
+            false,
+            None,
+            None,
+            false,
+            MessagesRenderTheme::plain(),
+            Style::new(),
+        );
+        let mut buf = make_buf(90, 8);
+        widget.render_to_buffer(Rect::new(0, 0, 90, 8), &mut buf);
+        let rendered = (0..8)
+            .map(|y| line_at(&buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("finished"), "{rendered}");
+        assert_eq!(
+            rendered.contains("<task-id>task-1</task-id>"),
+            quoted,
+            "{rendered}"
+        );
+    }
+}
+
+#[test]
 fn teammate_completion_uses_status_gutter() {
     let widget = UserTextBodyWidget::from_raw(
         "<teammate-message teammate_id=\"fix-d1-transport\">{\"type\":\"task_completed\",\"taskId\":\"7\",\"taskSubject\":\"Fix transport\"}</teammate-message>",
+        false,
         false,
         false,
         None,
@@ -51,6 +82,7 @@ fn teammate_completion_uses_status_gutter() {
 fn teammate_message_uses_message_gutter_and_visible_body() {
     let widget = UserTextBodyWidget::from_raw(
         "<teammate-message teammate_id=\"fix-d1-transport\" summary=\"done\">D1 complete\nHandoff ready.</teammate-message>",
+        false,
         false,
         false,
         None,

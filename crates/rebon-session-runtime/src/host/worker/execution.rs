@@ -944,7 +944,7 @@ fn worker_turn_origin(state: &BackgroundJobState) -> crate::session_loop::TurnOr
                 TurnOrigin::IdleContext
             }
             Some(rebon_session_host::PendingPromptOrigin::Scheduled) => TurnOrigin::Scheduled,
-            None if prompt.id.starts_with("u-internal-task-notification-") => {
+            None if rebon_types::is_task_notification_row_uuid(&prompt.id) => {
                 TurnOrigin::TaskNotification
             }
             None => TurnOrigin::User,

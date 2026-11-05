@@ -48,9 +48,11 @@ fn is_group_prompt_row(uuid: &str) -> bool {
     uuid.starts_with("u-internal-group-")
 }
 
-fn mark_group_prompt_origin(payload: &mut serde_json::Value, uuid: &str) {
+fn mark_internal_prompt_origin(payload: &mut serde_json::Value, uuid: &str) {
     if is_group_prompt_row(uuid) {
         payload["origin"] = serde_json::json!({"kind": "group"});
+    } else if rebon_types::is_task_notification_row_uuid(uuid) {
+        payload["origin"] = serde_json::json!({"kind": "task_notification"});
     }
 }
 
@@ -67,6 +69,30 @@ fn group_prompt_origin_is_persisted_only_for_structured_group_inputs() {
     assert!(quoted.get("isMeta").is_none());
 }
 
+#[test]
+fn task_notification_origin_is_persisted_without_reclassifying_user_quotes() {
+    let content = serde_json::json!([{"type": "text", "text": "<task-notification><summary>done</summary></task-notification>"}]);
+    let internal =
+        queued_attachment_entry_payload(content.clone(), "u-internal-task-notification-1", 1);
+    assert_eq!(internal["origin"]["kind"], "task_notification");
+    assert_eq!(internal["isMeta"], true);
+    assert_eq!(internal["message"]["content"], content);
+    let string_content =
+        serde_json::json!("<task-notification><summary>done</summary></task-notification>");
+    let compact = queued_attachment_entry_payload(
+        string_content.clone(),
+        "u-internal-task-notification-2",
+        2,
+    );
+    assert_eq!(compact["origin"]["kind"], "task_notification");
+    assert_eq!(compact["message"]["content"], string_content);
+    let foreground = queued_attachment_entry_payload(content.clone(), "u-internal-session-1", 1);
+    assert!(foreground.get("origin").is_none());
+    let quoted = queued_attachment_entry_payload(content, "u-user-quote", 2);
+    assert!(quoted.get("origin").is_none());
+    assert!(quoted.get("isMeta").is_none());
+}
+
 fn queued_attachment_entry_payload(
     content_value: serde_json::Value,
     local_user_uuid: &str,
@@ -79,7 +105,7 @@ fn queued_attachment_entry_payload(
         false,
     );
     payload["queuedCommand"] = serde_json::Value::Bool(true);
-    mark_group_prompt_origin(&mut payload, local_user_uuid);
+    mark_internal_prompt_origin(&mut payload, local_user_uuid);
     payload["iteration"] = serde_json::json!(iteration);
     payload
 }
@@ -2899,8 +2925,12 @@ impl TurnEventLoop<'_> {
                     // traffic — a cron fire, a router coordination message. Its
                     // row is durable and named for the prompt, but echoing it as
                     // a queued user message would render it as words a person
-                    // typed, which it is not.
-                    if !update_content.is_empty() && !is_internal_prompt_row(&local_user_uuid) {
+                    // typed, which it is not. A task notification is the
+                    // exception: its row id makes every live view draw it as a
+                    // notification card, the way replay draws the same row.
+                    let echoed = !is_internal_prompt_row(&local_user_uuid)
+                        || rebon_types::is_task_notification_row_uuid(&local_user_uuid);
+                    if !update_content.is_empty() && echoed {
                         pub_ref
                             .publish_to(
                                 &session_id,
@@ -3717,7 +3747,7 @@ impl EngineQueryExecutor {
             if opens_turn_with_agent_message(&user_uuid) {
                 user_payload[RUNTIME_ATTACHMENT_ENTRY_KEY] = serde_json::Value::Bool(true);
             }
-            mark_group_prompt_origin(&mut user_payload, &user_uuid);
+            mark_internal_prompt_origin(&mut user_payload, &user_uuid);
             if replay_only {
                 user_payload.as_object_mut().unwrap().insert(
                     "permissionReplay".to_string(),

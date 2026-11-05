@@ -63,6 +63,23 @@ pub fn ensure_internal_submit_payload_user_uuid(
     ensure_submit_payload_user_uuid_with_prefix(submit, session_id, "u-internal")
 }
 
+pub fn ensure_task_notification_submit_payload_user_uuid(
+    submit: &mut SubmitPayload,
+    session_id: &str,
+) -> String {
+    ensure_submit_payload_user_uuid_with_prefix(
+        submit,
+        session_id,
+        rebon_types::TASK_NOTIFICATION_ROW_UUID_PREFIX,
+    )
+}
+
+/// The row id for a task notification delivered into a running turn, from
+/// the same spelling and counter as the one that opens a turn.
+pub fn new_task_notification_row_uuid(session_id: &str) -> String {
+    new_user_uuid(session_id, rebon_types::TASK_NOTIFICATION_ROW_UUID_PREFIX)
+}
+
 fn ensure_submit_payload_user_uuid_with_prefix(
     submit: &mut SubmitPayload,
     session_id: &str,
@@ -71,14 +88,18 @@ fn ensure_submit_payload_user_uuid_with_prefix(
     if let Some(uuid) = submit.user_message_uuid.clone() {
         return uuid;
     }
-    static USER_UUID_COUNTER: AtomicU64 = AtomicU64::new(0);
-    let counter = USER_UUID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let uuid = format!(
-        "{prefix}-{session_id}-{}-{counter}",
-        rebon_types::wall_clock_ms_u128()
-    );
+    let uuid = new_user_uuid(session_id, prefix);
     submit.user_message_uuid = Some(uuid.clone());
     uuid
+}
+
+fn new_user_uuid(session_id: &str, prefix: &str) -> String {
+    static USER_UUID_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = USER_UUID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{prefix}-{session_id}-{}-{counter}",
+        rebon_types::wall_clock_ms_u128()
+    )
 }
 
 /// Only `rebon-cli`'s tests name this; see the visibility rule in `crates/REBON.md`.

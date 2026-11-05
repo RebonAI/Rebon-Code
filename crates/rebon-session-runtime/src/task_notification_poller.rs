@@ -376,7 +376,17 @@ impl AttachmentPoller for TaskNotificationPoller {
             if let Some(output_file) = notification.output_file {
                 turn.report_paths.push(PathBuf::from(output_file));
             }
-            messages.push(ApiMessage::user_text(notification.message));
+            // Delivered under a task-notification row id, as a turn-start
+            // notification is: the id is what lets the transcript, replay
+            // and the live view show it as a notification and keep a
+            // person's quote of the same text as their words. The model
+            // reads the notification text unchanged.
+            let uuid = crate::submit_payload::new_task_notification_row_uuid(request.session_id);
+            messages.push(rebon_core::query::visible_runtime_attachment_message(
+                &uuid,
+                notification.message.clone(),
+                notification.message,
+            ));
         }
         messages
     }
@@ -524,11 +534,29 @@ mod tests {
         task_id
     }
 
+    /// The notification text a delivered attachment shows, after checking it
+    /// arrived under a task-notification row id with the model reading the
+    /// same text.
     fn message_text(message: &ApiMessage) -> &str {
-        match &message.content[0] {
-            ContentBlock::Text(text) => &text.text,
-            other => panic!("expected text attachment, got {other:?}"),
-        }
+        let texts = message
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text(text) => text.text.as_str(),
+                other => panic!("expected text attachment, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        let [marker, visible, model] = texts[..] else {
+            panic!("expected a visible runtime attachment, got {texts:?}");
+        };
+        let uuid = marker
+            .split_once("uuid=\"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(uuid, _)| uuid)
+            .unwrap_or_else(|| panic!("no row id in {marker}"));
+        assert!(rebon_types::is_task_notification_row_uuid(uuid), "{uuid}");
+        assert!(model.ends_with(visible), "{model:?} vs {visible:?}");
+        visible
     }
 
     #[test]

@@ -64,15 +64,22 @@ pub fn extract_agent_view_summary_text(
                     }
                 }
             }
-            rebon_types::SessionUpdate::QueuedUserMessage { content, .. } => {
+            rebon_types::SessionUpdate::QueuedUserMessage { uuid, content, .. } => {
                 flush_assistant(&mut lines, &mut assistant);
                 let text = content
                     .iter()
                     .filter_map(content_block_summary)
                     .collect::<Vec<_>>()
                     .join(" ");
+                // A task notification is echoed into the turn too, but the
+                // person did not write it.
+                let label = if rebon_types::is_task_notification_row_uuid(uuid) {
+                    "task notification"
+                } else {
+                    "queued user"
+                };
                 if let Some(text) = clean_inline(&text) {
-                    lines.push(format!("queued user: {}", truncate_chars(&text, 500)));
+                    lines.push(format!("{label}: {}", truncate_chars(&text, 500)));
                 }
             }
             rebon_types::SessionUpdate::ThinkingDelta { text } => {
@@ -423,6 +430,30 @@ mod tests {
 
         assert!(got.contains("user: repair auth tests"));
         assert!(got.contains("assistant: Fixed the failing tests."));
+    }
+
+    #[test]
+    fn extract_labels_queued_rows_by_their_source() {
+        let queued = |uuid: &str, text: &str| {
+            params(rebon_types::SessionUpdate::QueuedUserMessage {
+                uuid: uuid.into(),
+                content: vec![text_block(text)],
+                image_paste_ids: None,
+            })
+        };
+        let notice = "<task-notification><summary>done</summary></task-notification>";
+        let updates = vec![
+            queued("u-internal-task-notification-s-1-0", notice),
+            queued("u-user-s-2-1", notice),
+        ];
+
+        let got = extract_agent_view_summary_text("run checks", &updates);
+
+        assert!(
+            got.contains(&format!("task notification: {notice}")),
+            "{got}"
+        );
+        assert!(got.contains(&format!("queued user: {notice}")), "{got}");
     }
 
     #[test]

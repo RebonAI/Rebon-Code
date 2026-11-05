@@ -153,6 +153,8 @@ pub struct UserTextInput {
     pub fork_subagent_enabled: bool,
     /// Feature gate for channel messages (`<channel source="…">`).
     pub channels_enabled: bool,
+    /// Whether the row has an internal notification source, independent of its text.
+    pub internal_notification: bool,
     /// Whether teammate/swarm messages are enabled.
     pub agent_swarms_enabled: bool,
 }
@@ -236,7 +238,7 @@ pub fn project_user_text(input: &UserTextInput) -> UserTextProjection {
             ),
         );
     }
-    if input.text.contains("<task-notification>") {
+    if input.internal_notification && input.text.contains("<task-notification>") {
         if let Some(notif) =
             crate::simple_messages::project_user_agent_notification(&input.text, input.add_margin)
         {
@@ -517,6 +519,7 @@ three";
             github_webhooks_enabled: false,
             fork_subagent_enabled: false,
             channels_enabled: false,
+            internal_notification: false,
             agent_swarms_enabled: false,
         }
     }
@@ -633,8 +636,17 @@ three";
                 _ => None,
             })
             .expect("a long body folds");
-        assert_eq!(hidden, 30 - TEAMMATE_BODY_FOLD_HEAD_ROWS - TEAMMATE_BODY_FOLD_TAIL_ROWS);
-        assert_eq!(folded.iter().filter(|l| matches!(l, UserPromptDisplayLine::Text(_))).count(), TEAMMATE_BODY_FOLD_HEAD_ROWS + TEAMMATE_BODY_FOLD_TAIL_ROWS + 1);
+        assert_eq!(
+            hidden,
+            30 - TEAMMATE_BODY_FOLD_HEAD_ROWS - TEAMMATE_BODY_FOLD_TAIL_ROWS
+        );
+        assert_eq!(
+            folded
+                .iter()
+                .filter(|l| matches!(l, UserPromptDisplayLine::Text(_)))
+                .count(),
+            TEAMMATE_BODY_FOLD_HEAD_ROWS + TEAMMATE_BODY_FOLD_TAIL_ROWS + 1
+        );
     }
 
     /// A dozen long paragraphs take many rows: the fold counts rows on screen,
@@ -681,6 +693,20 @@ three";
     }
 
     #[test]
+    fn quoted_task_notification_remains_a_prompt_without_internal_source() {
+        let notification = "<task-notification>\n<task-id>task-1</task-id>\n<status>completed</status>\n<summary>finished</summary>\n</task-notification>";
+        for text in [
+            notification.to_string(),
+            format!("Please explain this:\n{notification}"),
+        ] {
+            let projected = project_user_text(&input(&text));
+            assert!(
+                matches!(projected, UserTextProjection::Prompt { text: body, .. } if body == text)
+            );
+        }
+    }
+
+    #[test]
     fn routes_teammate_task_notification_resource_and_deferred_feature_cases() {
         let mut i = input("<teammate-message teammate_id=\"a\">plain</teammate-message>");
         i.agent_swarms_enabled = true;
@@ -695,10 +721,10 @@ three";
         completed.agent_swarms_enabled = true;
         assert!(project_user_text(&completed).is_teammate_task_completion());
 
+        let mut notification = input("<task-notification><summary>x</summary></task-notification>");
+        notification.internal_notification = true;
         assert!(matches!(
-            project_user_text(&input(
-                "<task-notification><summary>x</summary></task-notification>"
-            )),
+            project_user_text(&notification),
             UserTextProjection::TaskNotification(_)
         ));
         assert!(matches!(

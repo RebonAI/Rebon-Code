@@ -1587,10 +1587,10 @@ pub fn latest_active_run_for_session(
 /// display fallback when no sidecar title exists.
 ///
 /// Reads the jsonl, walks entries in file order, and returns the first
-/// entry whose `type` is `"user"` and whose `message.content` resolves
-/// to a non-empty string. Returns `None` if the file is missing, has
-/// no user entries, or every user entry is a tool-result wrapper with
-/// no human text.
+/// entry whose `type` is `"user"`, has no internal source, and whose
+/// `message.content` resolves to a non-empty string. Returns `None` if the
+/// file is missing, has no human user entries, or every user entry is a
+/// tool-result wrapper with no human text.
 ///
 /// Deliberately does **not** run the full chain walker from
 /// [`reconstruct_chain`] — we want the *oldest* user message (the one
@@ -1606,7 +1606,20 @@ pub fn extract_first_user_message_text(
     let bytes = std::fs::read(&path).ok()?;
     let entries = parse_transcript_jsonl(&bytes);
     for entry in entries {
-        if entry.entry_type != "user" {
+        if entry.entry_type != "user"
+            || entry.raw.get("isMeta").and_then(Value::as_bool) == Some(true)
+            || entry
+                .raw
+                .pointer("/message/isMeta")
+                .and_then(Value::as_bool)
+                == Some(true)
+            || entry.uuid.starts_with("u-internal-")
+            || entry
+                .raw
+                .pointer("/origin/kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| matches!(kind, "group" | "task_notification"))
+        {
             continue;
         }
         if let Some(text) = extract_user_text_from_raw(&entry.raw) {
@@ -6429,6 +6442,35 @@ mod tests {
     }
 
     // ── extract_first_user_message_text ────────────────────────────────
+
+    #[test]
+    fn first_user_title_skips_internal_notices_but_keeps_verbatim_user_quote() {
+        let root_dir = temp_projects_root("extract-notification-source");
+        let root = root_dir.path();
+        let notice = "<task-notification><summary>done</summary></task-notification>";
+        let entries = vec![
+            TranscriptWriteEntry::new(
+                "user",
+                json!({
+                    "isMeta": true, "origin": {"kind": "task_notification"},
+                    "message": {"role": "user", "content": notice}
+                }),
+            )
+            .with_uuid("u-internal-task-notification-1"),
+            TranscriptWriteEntry::new(
+                "user",
+                json!({
+                    "message": {"role": "user", "content": notice}
+                }),
+            )
+            .with_uuid("u-user-quoted"),
+        ];
+        write_transcript_entries(root, "/tmp/repo", "sess-notice", entries).unwrap();
+        assert_eq!(
+            extract_first_user_message_text(root, "/tmp/repo", "sess-notice").as_deref(),
+            Some(notice)
+        );
+    }
 
     #[test]
     fn extract_first_user_message_text_handles_string_content() {

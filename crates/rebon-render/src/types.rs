@@ -45,6 +45,14 @@ pub struct UserMessage {
     pub timestamp: Option<String>,
 }
 
+impl UserMessage {
+    /// Whether the runtime wrote this row as a task notification, as its id
+    /// says, rather than a person writing text that contains one.
+    pub fn is_task_notification_row(&self) -> bool {
+        rebon_types::is_task_notification_row_uuid(&self.uuid)
+    }
+}
+
 /// Minimal assistant-message shape the renderer reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssistantMessage {

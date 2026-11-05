@@ -760,6 +760,7 @@ impl UserTextBodyWidget {
     /// Build from a raw user-text payload using the child projection.
     pub fn from_raw(
         user_text: &str,
+        internal_notification: bool,
         add_margin: bool,
         verbose: bool,
         plan_content: Option<String>,
@@ -778,6 +779,7 @@ impl UserTextBodyWidget {
             github_webhooks_enabled: false,
             fork_subagent_enabled: false,
             channels_enabled: false,
+            internal_notification,
             agent_swarms_enabled: true,
         });
         let prefix = if projection.is_teammate_task_completion() {

@@ -9,11 +9,10 @@
 //!
 //! The outer dispatch is on the `Message` variant:
 //!
-//! * `Message::User` — dropped from the projection entirely when the row
-//!   is a meta message (`is_meta == Some(true)`); those attachment
-//!   injections (plan-mode reminders, `date_change`, skill listings) go
-//!   to the API but are never shown. Otherwise it projects to
-//!   `RmMessageRow::User`, mapping each `UserContentBlock` on its own:
+//! * `Message::User` — meta attachment injections (plan-mode reminders,
+//!   `date_change`, skill listings) are hidden; internally sourced task
+//!   notifications remain visible as summary cards. Other user rows project
+//!   to `RmMessageRow::User`, mapping each `UserContentBlock` on its own:
 //!   `Text` to a text block, `Image` to an image block with no source
 //!   hint, and `ToolResult` through `user_tool_result_content_block`.
 //! * `Message::Assistant` — projects to `RmMessageRow::Assistant`,

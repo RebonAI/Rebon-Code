@@ -21,7 +21,10 @@ use rebon_types::{
 
 use crate::session::session_inbox::ReadyInput;
 use crate::session::session_loop::{EscalationDelivery, TaskNotificationClaim, TurnDeliveries};
-use crate::session::submit_payload::{ensure_internal_submit_payload_user_uuid, SubmitPayload};
+use crate::session::submit_payload::{
+    ensure_internal_submit_payload_user_uuid, ensure_task_notification_submit_payload_user_uuid,
+    SubmitPayload,
+};
 use crate::session::ultraplan_run::UltraplanPhase;
 use crate::tui::app::{AppState, PromptCompletionStatus};
 use crate::tui::dispatch::{
@@ -624,7 +627,7 @@ fn maybe_spawn_task_notification_prompt(
         skill_invocations: Vec::new(),
     };
     let user_message_uuid =
-        ensure_internal_submit_payload_user_uuid(&mut submit, &session.session_id);
+        ensure_task_notification_submit_payload_user_uuid(&mut submit, &session.session_id);
     let turn_id = format!("{}:{user_message_uuid}", session.session_id);
     let pending_ids = session
         .engine_half
@@ -3011,6 +3014,10 @@ mod tests {
         );
         let requests = recorder.take_requests();
         assert_eq!(requests.len(), 1);
+        assert!(requests[0]
+            .user_message_uuid
+            .as_deref()
+            .is_some_and(rebon_types::is_task_notification_row_uuid));
         assert_eq!(
             requests[0].coordinator_report_paths,
             vec![output_file.to_string()]

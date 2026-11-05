@@ -192,7 +192,12 @@ pub fn render_message(input: &RenderMessageInput, theme: &MessageRenderTheme) ->
         ) => {
             let mut lines = Vec::new();
             for (block, projection) in message.content.iter().zip(blocks.iter()) {
-                lines.extend(render_user_block(block, projection, theme));
+                lines.extend(render_user_block(
+                    block,
+                    projection,
+                    message.is_task_notification_row(),
+                    theme,
+                ));
             }
             Text::from(lines)
         }
@@ -351,6 +356,7 @@ pub fn render_notebook_edit_rejected(
 fn render_user_block(
     block: &UserContentBlock,
     projection: &UserBlockProjection,
+    internal_notification: bool,
     theme: &MessageRenderTheme,
 ) -> Vec<Line<'static>> {
     let mut lines = margin_lines(user_block_add_margin(projection));
@@ -375,6 +381,7 @@ fn render_user_block(
                 github_webhooks_enabled: false,
                 fork_subagent_enabled: false,
                 channels_enabled: false,
+                internal_notification,
                 agent_swarms_enabled: true,
             });
             let prefix = if child_projection.is_teammate_task_completion() {
