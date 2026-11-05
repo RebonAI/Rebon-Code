@@ -1503,7 +1503,10 @@ mod tests {
         let store = BackgroundStore::new(dir.path());
         let project = dir.path().join("app");
         std::fs::create_dir_all(&project).unwrap();
-        let router = job(&store, "quiet-router-session", None);
+        let mut router = job(&store, "quiet-router-session", None);
+        router.process.pid = Some(std::process::id());
+        router.process.pid_identity = rebon_session_host::process_identity(std::process::id());
+        store.write_state(&router).unwrap();
         plan_request(dir.path(), &router.identity.job_id, "t-q", &project);
         let control = HostWorkerControl::new(store, dir.path().join("projects"))
             .with_grant_verifier(Arc::new(TargetNamedVerifier));
