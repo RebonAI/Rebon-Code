@@ -968,6 +968,11 @@ mod tests {
 
     #[test]
     fn prepared_full_history_commit_switches_session_atomically() {
+        // Switching sessions rewrites process-global env; hold the env lock
+        // so parallel tests cannot observe or clobber it.
+        let _guard = crate::test_env::lock_env();
+        let _env =
+            crate::session::commands::EnvRestore::new(&["REBON_SESSION_ID", "REBON_TEAM_NAME"]);
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let root = tempfile::tempdir().unwrap();
         let mut session = super::super::test_support::make_test_tui_session();
@@ -1050,6 +1055,11 @@ mod tests {
 
     #[test]
     fn committing_a_prepared_resume_replaces_the_previous_session_title() {
+        // Switching sessions rewrites process-global env; hold the env lock
+        // so parallel tests cannot observe or clobber it.
+        let _guard = crate::test_env::lock_env();
+        let _env =
+            crate::session::commands::EnvRestore::new(&["REBON_SESSION_ID", "REBON_TEAM_NAME"]);
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let root = tempfile::tempdir().unwrap();
         let mut session = super::super::test_support::make_test_tui_session();
@@ -1092,6 +1102,11 @@ mod tests {
 
     #[test]
     fn committing_a_prepared_resume_clears_the_title_when_the_target_has_none() {
+        // Switching sessions rewrites process-global env; hold the env lock
+        // so parallel tests cannot observe or clobber it.
+        let _guard = crate::test_env::lock_env();
+        let _env =
+            crate::session::commands::EnvRestore::new(&["REBON_SESSION_ID", "REBON_TEAM_NAME"]);
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let root = tempfile::tempdir().unwrap();
         let mut session = super::super::test_support::make_test_tui_session();
@@ -1168,6 +1183,11 @@ mod tests {
 
     #[test]
     fn committing_a_cross_cwd_resume_rebinds_the_complete_future_runtime() {
+        // Switching sessions rewrites process-global env; hold the env lock
+        // so parallel tests cannot observe or clobber it.
+        let _guard = crate::test_env::lock_env();
+        let _env =
+            crate::session::commands::EnvRestore::new(&["REBON_SESSION_ID", "REBON_TEAM_NAME"]);
         let tokio_runtime = tokio::runtime::Runtime::new().unwrap();
         let root = tempfile::tempdir().unwrap();
         let mut session = super::super::test_support::make_test_tui_session();
@@ -1354,6 +1374,11 @@ mod tests {
     /// directory's cron went unattended until the terminal was restarted.
     #[test]
     fn resuming_after_mirroring_starts_the_scheduler_again() {
+        // Switching sessions rewrites process-global env; hold the env lock
+        // so parallel tests cannot observe or clobber it.
+        let _guard = crate::test_env::lock_env();
+        let _env =
+            crate::session::commands::EnvRestore::new(&["REBON_SESSION_ID", "REBON_TEAM_NAME"]);
         let tokio_runtime = tokio::runtime::Runtime::new().unwrap();
         let _entered = tokio_runtime.enter();
         let root = tempfile::tempdir().unwrap();
@@ -1414,6 +1439,11 @@ mod tests {
     /// no-op, because a scheduler already existed.
     #[test]
     fn resuming_into_another_directory_rebinds_the_scheduler_to_it() {
+        // Switching sessions rewrites process-global env; hold the env lock
+        // so parallel tests cannot observe or clobber it.
+        let _guard = crate::test_env::lock_env();
+        let _env =
+            crate::session::commands::EnvRestore::new(&["REBON_SESSION_ID", "REBON_TEAM_NAME"]);
         fn scheduler_lock_is_free(cwd: &str) -> bool {
             let cron = rebon_tool::cron::tasks::cron_dir(std::path::Path::new(cwd));
             std::fs::create_dir_all(&cron).unwrap();

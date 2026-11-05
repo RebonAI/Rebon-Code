@@ -1679,6 +1679,11 @@ mod tests {
 
     #[test]
     fn internal_new_session_resets_inline_viewport_without_startup_banner() {
+        // Switching sessions rewrites process-global env; hold the env lock
+        // so parallel tests cannot observe or clobber it.
+        let _guard = crate::test_env::lock_env();
+        let _env =
+            crate::session::commands::EnvRestore::new(&["REBON_SESSION_ID", "REBON_TEAM_NAME"]);
         let mut app = AppState::default();
         app.ui_mode = crate::ui_config::UiMode::Inline;
         let mut session = make_test_tui_session();
@@ -1691,6 +1696,11 @@ mod tests {
 
     #[test]
     fn apply_new_session_clears_previous_session_title() {
+        // Switching sessions rewrites process-global env; hold the env lock
+        // so parallel tests cannot observe or clobber it.
+        let _guard = crate::test_env::lock_env();
+        let _env =
+            crate::session::commands::EnvRestore::new(&["REBON_SESSION_ID", "REBON_TEAM_NAME"]);
         let mut app = AppState::default();
         app.session_title = Some("Previous session".into());
         let mut session = make_test_tui_session();
@@ -1860,6 +1870,11 @@ mod tests {
 
     #[test]
     fn apply_new_session_forces_custom_status_line_refresh() {
+        // Switching sessions rewrites process-global env; hold the env lock
+        // so parallel tests cannot observe or clobber it.
+        let _guard = crate::test_env::lock_env();
+        let _env =
+            crate::session::commands::EnvRestore::new(&["REBON_SESSION_ID", "REBON_TEAM_NAME"]);
         let mut app = AppState::default();
         app.custom_status_line =
             crate::tui::runner::custom_status_line::CustomStatusLineState::configured(Some(
@@ -1892,6 +1907,11 @@ mod tests {
 
     #[test]
     fn apply_new_session_resets_status_line_usage_inputs() {
+        // Switching sessions rewrites process-global env; hold the env lock
+        // so parallel tests cannot observe or clobber it.
+        let _guard = crate::test_env::lock_env();
+        let _env =
+            crate::session::commands::EnvRestore::new(&["REBON_SESSION_ID", "REBON_TEAM_NAME"]);
         let mut app = AppState::default();
         app.usage_mut()
             .reset(wall_clock_ms().saturating_sub(30_000));
@@ -1927,6 +1947,11 @@ mod tests {
 
     #[test]
     fn apply_new_session_clears_active_goal() {
+        // Switching sessions rewrites process-global env; hold the env lock
+        // so parallel tests cannot observe or clobber it.
+        let _guard = crate::test_env::lock_env();
+        let _env =
+            crate::session::commands::EnvRestore::new(&["REBON_SESSION_ID", "REBON_TEAM_NAME"]);
         let mut app = AppState::default();
         app.goal = Some(crate::goal::GoalState::new_now("ship the feature"));
         app.deferred_goal_submit_payloads
@@ -2793,6 +2818,11 @@ mod new_session_command_tests {
     /// agent keeps running and quietly stops being recorded.
     #[test]
     fn a_new_session_moves_the_agent_layer_with_it() {
+        // Switching sessions rewrites process-global env; hold the env lock
+        // so parallel tests cannot observe or clobber it.
+        let _guard = crate::test_env::lock_env();
+        let _env =
+            crate::session::commands::EnvRestore::new(&["REBON_SESSION_ID", "REBON_TEAM_NAME"]);
         let mut app = AppState::new();
         let mut session = make_test_tui_session();
         let projects = TempDir::new().unwrap();
@@ -2813,6 +2843,11 @@ mod new_session_command_tests {
     /// session metadata or open file-history boundary.
     #[test]
     fn a_new_session_preserves_the_runtime_captured_by_an_old_turn() {
+        // Switching sessions rewrites process-global env; hold the env lock
+        // so parallel tests cannot observe or clobber it.
+        let _guard = crate::test_env::lock_env();
+        let _env =
+            crate::session::commands::EnvRestore::new(&["REBON_SESSION_ID", "REBON_TEAM_NAME"]);
         let mut app = AppState::new();
         let mut session = make_test_tui_session();
         let projects = TempDir::new().unwrap();
@@ -2873,6 +2908,11 @@ mod new_session_command_tests {
     /// has to actually produce a session that accepts input again.
     #[test]
     fn a_new_session_leaves_a_parked_session_behind() {
+        // Switching sessions rewrites process-global env; hold the env lock
+        // so parallel tests cannot observe or clobber it.
+        let _guard = crate::test_env::lock_env();
+        let _env =
+            crate::session::commands::EnvRestore::new(&["REBON_SESSION_ID", "REBON_TEAM_NAME"]);
         let mut app = AppState::new();
         let mut session = make_test_tui_session();
         let projects = TempDir::new().unwrap();
