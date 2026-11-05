@@ -582,24 +582,20 @@ impl ChannelPermissionBroker {
             .auto_mode_classifier_transcript()
             .unwrap_or_default();
         let user_grant_source = context.user_grant_source();
-        if let Some(source) = &user_grant_source {
-            if source.authorization_withdrawn().await {
-                return AutoModeGateOutcome::Deny {
-                    reason: "This router's authorization was withdrawn by a later user message or an explicit revoke; ask the person before continuing automated actions".to_string(),
-                    fresh: false,
-                };
-            }
-        }
-        // Read for every decision, not once per turn: a revocation must reach
-        // the very next call.
-        let user_grants = match user_grant_source {
-            Some(source) => source.grants().await,
-            None => Vec::new(),
+        let grant_snapshot = match &user_grant_source {
+            Some(source) => source.snapshot().await,
+            None => rebon_tool::UserGrantSnapshot::default(),
         };
-        let grants_line = crate::auto_mode_classifier::user_grants_line(&user_grants);
+        if grant_snapshot.authorization_withdrawn {
+            return AutoModeGateOutcome::Deny {
+                reason: "This router's authorization was withdrawn by a later user message or an explicit revoke; ask the person before continuing automated actions".to_string(),
+                fresh: false,
+            };
+        }
+        let grants_line = crate::auto_mode_classifier::user_grants_line(&grant_snapshot.grants);
         let classifier_key = auto_mode_classifier_cache_key(
             &input_json,
-            &format!("{grants_line}{transcript}"),
+            &format!("{grants_line}\0{}{transcript}", grant_snapshot.revision),
             context,
         );
         let denial_key =
@@ -607,6 +603,11 @@ impl ChannelPermissionBroker {
         if verdicts.take_exemption(tool_name, &input_json) {
             verdicts.forget_verdict(tool_name, &classifier_key);
             verdicts.forget_verdict(tool_name, &denial_key);
+            if let Some(denial) =
+                grant_changed_during_decision(&user_grant_source, &grant_snapshot).await
+            {
+                return denial;
+            }
             tracing::info!(
                 tool = tool_name,
                 "auto-mode gate consumed a user-approved one-shot exemption"
@@ -625,6 +626,11 @@ impl ChannelPermissionBroker {
             };
         }
         if verdicts.is_allowed(tool_name, &classifier_key) {
+            if let Some(denial) =
+                grant_changed_during_decision(&user_grant_source, &grant_snapshot).await
+            {
+                return denial;
+            }
             tracing::debug!(
                 tool = tool_name,
                 "auto-mode gate replayed a classifier allow for unchanged context"
@@ -652,11 +658,16 @@ impl ChannelPermissionBroker {
             cwd: context.cwd().map(str::to_owned),
             isolated_worktree: context.is_isolated_worktree(),
             workflow_nesting_depth: context.workflow_nesting_depth(),
-            user_grants,
+            user_grants: grant_snapshot.grants.clone(),
         };
         let result =
             tokio::time::timeout(AUTO_MODE_CLASSIFIER_TIMEOUT, classifier.classify(request)).await;
 
+        if let Some(denial) =
+            grant_changed_during_decision(&user_grant_source, &grant_snapshot).await
+        {
+            return denial;
+        }
         if !hooks.auto_gates(hooks.current_mode()) {
             tracing::debug!(
                 tool = tool_name,
@@ -718,6 +729,24 @@ impl ChannelPermissionBroker {
             }
         }
     }
+}
+
+async fn grant_changed_during_decision(
+    source: &Option<Arc<dyn rebon_tool::UserGrantSource>>,
+    before: &rebon_tool::UserGrantSnapshot,
+) -> Option<AutoModeGateOutcome> {
+    let source = source.as_ref()?;
+    let current = source.snapshot().await;
+    if current.authorization_withdrawn {
+        return Some(AutoModeGateOutcome::Deny {
+            reason: "This router's authorization was withdrawn by a later user message or an explicit revoke; ask the person before continuing automated actions".to_string(),
+            fresh: false,
+        });
+    }
+    (current != *before).then(|| AutoModeGateOutcome::Deny {
+        reason: "Router authorization changed while the tool call was being decided; retry against the current grants".to_string(),
+        fresh: false,
+    })
 }
 
 fn now_ms() -> u64 {
@@ -4512,41 +4541,48 @@ mod tests {
     }
 
     /// The grants a worker's host hands its broker.
-    struct FixedGrants(StdMutex<Vec<rebon_tool::UserGrant>>, StdMutex<bool>);
+    struct FixedGrants(StdMutex<(Vec<rebon_tool::UserGrant>, bool, u64)>);
 
     impl FixedGrants {
         fn new() -> Arc<Self> {
-            Arc::new(Self(StdMutex::new(Vec::new()), StdMutex::new(false)))
+            Arc::new(Self(StdMutex::new((Vec::new(), false, 0))))
         }
 
         fn issue(&self, id: &str, action: &str, target: &str) {
-            self.0.lock().unwrap().push(rebon_tool::UserGrant {
+            let mut state = self.0.lock().unwrap();
+            state.0.push(rebon_tool::UserGrant {
                 id: id.to_owned(),
                 action: action.to_owned(),
                 target: target.to_owned(),
                 user_quote: format!("{action} to {target}"),
                 proposal_quote: None,
             });
+            state.2 += 1;
         }
 
         fn revoke(&self, id: &str) {
-            self.0.lock().unwrap().retain(|grant| grant.id != id);
+            let mut state = self.0.lock().unwrap();
+            state.0.retain(|grant| grant.id != id);
+            state.2 += 1;
         }
 
         fn withdraw(&self) {
-            self.0.lock().unwrap().clear();
-            *self.1.lock().unwrap() = true;
+            let mut state = self.0.lock().unwrap();
+            state.0.clear();
+            state.1 = true;
+            state.2 += 1;
         }
     }
 
     #[async_trait::async_trait]
     impl rebon_tool::UserGrantSource for FixedGrants {
-        async fn grants(&self) -> Vec<rebon_tool::UserGrant> {
-            self.0.lock().unwrap().clone()
-        }
-
-        async fn authorization_withdrawn(&self) -> bool {
-            *self.1.lock().unwrap()
+        async fn snapshot(&self) -> rebon_tool::UserGrantSnapshot {
+            let state = self.0.lock().unwrap();
+            rebon_tool::UserGrantSnapshot {
+                grants: state.0.clone(),
+                authorization_withdrawn: state.1,
+                revision: state.2.to_string(),
+            }
         }
     }
 
@@ -4680,6 +4716,158 @@ mod tests {
             classifier.call_count(),
             2,
             "back to the first denial, replayed"
+        );
+    }
+
+    #[derive(Debug)]
+    struct PausingGrantClassifier {
+        entered: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        resume: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AutoModeClassifier for PausingGrantClassifier {
+        async fn classify(
+            &self,
+            _request: AutoModeClassifierRequest,
+        ) -> anyhow::Result<AutoModeClassifierOutcome> {
+            self.entered
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .send(())
+                .unwrap();
+            let resume = self.resume.lock().unwrap().take().unwrap();
+            resume.await.unwrap();
+            Ok(allow())
+        }
+    }
+
+    #[tokio::test]
+    async fn withdrawal_during_classification_cannot_run_or_cache_the_old_allow() {
+        let grants = FixedGrants::new();
+        grants.issue("g-1", "git push", "branch main");
+        let (broker, _rx) = ChannelPermissionBroker::new("sess-worker");
+        let (hooks, _) = hooks_with_mode(PermissionMode::Auto);
+        broker.set_auto_mode_hooks(Some(hooks));
+        broker.set_user_grant_source(Some(grants.clone()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        broker.set_auto_mode_classifier(Some(Arc::new(PausingGrantClassifier {
+            entered: StdMutex::new(Some(entered_tx)),
+            resume: StdMutex::new(Some(resume_rx)),
+        })));
+        let context = ToolContext::new()
+            .with_auto_mode_classifier_transcript("User: [Scheduled task] push to main\n");
+        let input = json!({"x": 1});
+        let in_flight = broker.resolve(
+            &EchoTool,
+            input.clone(),
+            &context,
+            ask_decision(input.clone()),
+        );
+        let change_grants = async {
+            entered_rx.await.unwrap();
+            grants.withdraw();
+            grants.issue("g-2", "git push", "branch main");
+            resume_tx.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(in_flight, change_grants);
+        assert!(matches!(result, Err(ToolError::PermissionDenied { .. })));
+        assert!(
+            broker
+                .resolve(&EchoTool, input.clone(), &context, ask_decision(input))
+                .await
+                .is_err(),
+            "the stale allow must not be reusable"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_grants_during_classification_require_a_new_verdict() {
+        let grants = FixedGrants::new();
+        grants.issue("g-1", "git push", "branch main");
+        let (broker, _rx) = ChannelPermissionBroker::new("sess-worker");
+        let (hooks, _) = hooks_with_mode(PermissionMode::Auto);
+        broker.set_auto_mode_hooks(Some(hooks));
+        broker.set_user_grant_source(Some(grants.clone()));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        broker.set_auto_mode_classifier(Some(Arc::new(PausingGrantClassifier {
+            entered: StdMutex::new(Some(entered_tx)),
+            resume: StdMutex::new(Some(resume_rx)),
+        })));
+        let context = ToolContext::new()
+            .with_auto_mode_classifier_transcript("User: [Scheduled task] push to main\n");
+        let input = json!({"x": 1});
+        let in_flight = broker.resolve(
+            &EchoTool,
+            input.clone(),
+            &context,
+            ask_decision(input.clone()),
+        );
+        let change_grants = async {
+            entered_rx.await.unwrap();
+            grants.revoke("g-1");
+            grants.issue("g-2", "git push", "branch main");
+            resume_tx.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(in_flight, change_grants);
+        assert!(matches!(result, Err(ToolError::PermissionDenied { .. })));
+
+        let classifier = Arc::new(RecordingClassifier::new(FixedClassifierResult::Outcome(
+            allow(),
+        )));
+        broker.set_auto_mode_classifier(Some(classifier.clone()));
+        broker
+            .resolve(&EchoTool, input.clone(), &context, ask_decision(input))
+            .await
+            .expect("a replacement grant needs a new classifier decision");
+        assert_eq!(classifier.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reissued_identical_grant_does_not_reuse_the_old_allow() {
+        let grants = FixedGrants::new();
+        grants.issue("g-1", "git push", "branch main");
+        let (broker, classifier) = broker_with(allow());
+        broker.set_user_grant_source(Some(grants.clone()));
+        let context = ToolContext::new().with_auto_mode_classifier_transcript("User: push\n");
+        let input = json!({"x": 1});
+        broker
+            .resolve(
+                &EchoTool,
+                input.clone(),
+                &context,
+                ask_decision(input.clone()),
+            )
+            .await
+            .unwrap();
+        broker
+            .resolve(
+                &EchoTool,
+                input.clone(),
+                &context,
+                ask_decision(input.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            classifier.call_count(),
+            1,
+            "unchanged authorization uses the cache"
+        );
+        grants.revoke("g-1");
+        grants.issue("g-1", "git push", "branch main");
+        broker
+            .resolve(&EchoTool, input.clone(), &context, ask_decision(input))
+            .await
+            .unwrap();
+        assert_eq!(
+            classifier.call_count(),
+            2,
+            "reissued authorization needs a new verdict"
         );
     }
 

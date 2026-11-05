@@ -1435,7 +1435,10 @@ mod tests {
             dir.path().to_path_buf(),
             "w-mine".into(),
         );
-        let seen = mine.grants().await;
+        let initial = mine.snapshot().await;
+        assert!(!initial.authorization_withdrawn);
+        let initial_revision = initial.revision.clone();
+        let seen = initial.grants;
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].target, "branch main");
         assert_eq!(seen[0].user_quote, "fix CI, then push to main");
@@ -1475,8 +1478,10 @@ mod tests {
             "actually don't push to main",
         )
         .unwrap();
-        assert!(mine.grants().await.is_empty());
-        assert!(mine.authorization_withdrawn().await);
+        let withdrawn = mine.snapshot().await;
+        assert!(withdrawn.grants.is_empty());
+        assert!(withdrawn.authorization_withdrawn);
+        assert_ne!(withdrawn.revision, initial_revision);
         let denied = control
             .grant_authorizations("router-session", vec![draft("branch main", "t-mine")])
             .await

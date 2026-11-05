@@ -1042,12 +1042,28 @@ pub struct UserGrant {
     pub proposal_quote: Option<String>,
 }
 
-/// The live grants for this session's task, read afresh for every auto-mode
-/// decision so a revocation lands at once. Any failure is no grant.
+/// A coherent view of the worker's authorization, including changes that
+/// leave the same visible grants (such as a revoke followed by reissue).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UserGrantSnapshot {
+    pub grants: Vec<UserGrant>,
+    pub authorization_withdrawn: bool,
+    pub revision: String,
+}
+
+/// The live grants for this session's task. The gate reads one coherent
+/// snapshot before classification and rechecks it before any allow is used.
 #[async_trait]
 pub trait UserGrantSource: Send + Sync {
-    async fn grants(&self) -> Vec<UserGrant>;
-    async fn authorization_withdrawn(&self) -> bool;
+    async fn snapshot(&self) -> UserGrantSnapshot;
+
+    async fn grants(&self) -> Vec<UserGrant> {
+        self.snapshot().await.grants
+    }
+
+    async fn authorization_withdrawn(&self) -> bool {
+        self.snapshot().await.authorization_withdrawn
+    }
 }
 
 /// The surface-owned peer messenger attached to a [`ToolContext`].

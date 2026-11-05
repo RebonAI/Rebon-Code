@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use rebon_tool::{LauncherUserStatement, UserGrant};
+use rebon_tool::{LauncherUserStatement, UserGrant, UserGrantSnapshot};
 
 /// How many statements a grant is checked against: the most recent ones.
 pub(crate) const MAX_STATEMENTS: usize = 60;
@@ -123,14 +123,23 @@ impl TaskGrantSource {
         }
     }
 
-    fn read(&self) -> Vec<UserGrant> {
+    fn read(&self) -> UserGrantSnapshot {
         let Ok(ledger) = rebon_work::Ledger::load(&rebon_work::ledger_path(&self.home)) else {
-            return Vec::new();
+            return UserGrantSnapshot {
+                authorization_withdrawn: true,
+                ..Default::default()
+            };
         };
-        let book = rebon_work::load_grants(&self.home);
+        let Ok(book) = rebon_work::GrantBook::load(&rebon_work::grants_path(&self.home)) else {
+            return UserGrantSnapshot {
+                authorization_withdrawn: true,
+                ..Default::default()
+            };
+        };
         let now = rebon_session_host::now_ms();
         let store = rebon_session_host::BackgroundStore::new(self.home.clone());
-        book.for_worker(&ledger, &self.worker_job_id, now)
+        let grants = book
+            .for_worker(&ledger, &self.worker_job_id, now)
             .into_iter()
             .filter(|grant| {
                 store.read_state(&grant.router_job_id).is_ok_and(|router| {
@@ -146,36 +155,28 @@ impl TaskGrantSource {
                 user_quote: grant.user_quote.clone(),
                 proposal_quote: grant.proposal_quote.clone(),
             })
-            .collect()
+            .collect();
+        UserGrantSnapshot {
+            grants,
+            authorization_withdrawn: book.router_revoked_for_worker(&ledger, &self.worker_job_id),
+            revision: serde_json::to_string(&book).expect("grant book is serializable"),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl rebon_tool::UserGrantSource for TaskGrantSource {
-    async fn grants(&self) -> Vec<UserGrant> {
+    async fn snapshot(&self) -> UserGrantSnapshot {
         let source = Self {
             home: self.home.clone(),
             worker_job_id: self.worker_job_id.clone(),
         };
         tokio::task::spawn_blocking(move || source.read())
             .await
-            .unwrap_or_default()
-    }
-
-    async fn authorization_withdrawn(&self) -> bool {
-        let home = self.home.clone();
-        let worker_job_id = self.worker_job_id.clone();
-        tokio::task::spawn_blocking(move || {
-            let Ok(ledger) = rebon_work::Ledger::load(&rebon_work::ledger_path(&home)) else {
-                return true;
-            };
-            let Ok(book) = rebon_work::GrantBook::load(&rebon_work::grants_path(&home)) else {
-                return true;
-            };
-            book.router_revoked_for_worker(&ledger, &worker_job_id)
-        })
-        .await
-        .unwrap_or(true)
+            .unwrap_or(UserGrantSnapshot {
+                authorization_withdrawn: true,
+                ..Default::default()
+            })
     }
 }
 
