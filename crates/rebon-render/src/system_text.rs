@@ -471,6 +471,7 @@ pub fn project_system_text_message(input: &SystemTextMessageInput) -> SystemText
                     | "turn_duration"
                     | "provider_switch"
                     | "mod_notice"
+                    | "group_message"
                     | "compact"
             ) && !input.verbose
                 && level == "info"
@@ -977,6 +978,20 @@ mod tests {
             panic!("an error notice shows");
         };
         assert_eq!(error.marker, Some(SystemVisualMarker::BlackCircle));
+    }
+
+    #[test]
+    fn group_notice_keeps_content_visible_in_compact_mode() {
+        let content = "[Agent group \"ops\"] planner asks (r4): review patch";
+        let projection = project_system_text_message(&input(SystemTextProjectionInput::Generic {
+            subtype: "group_message".into(),
+            level: "info".into(),
+            content: Some(content.into()),
+        }));
+        let SystemTextProjection::Generic(display) = projection else {
+            panic!("group content must be visible");
+        };
+        assert_eq!(display.content, content);
     }
 
     #[test]

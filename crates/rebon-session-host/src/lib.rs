@@ -123,7 +123,7 @@ pub use legacy_foreground::{
     ForegroundCommandResponse, ForegroundCommandResult, ForegroundQuestion,
     ForegroundQuestionAnswer, ForegroundQuestionOption, ForegroundSessionStatus,
     AGENT_MESSAGE_CAPABILITY, FOREGROUND_AGENT_TOKEN_SUFFIX, FOREGROUND_PROTOCOL_VERSION,
-    FOREGROUND_STATUS_SUFFIX, TERMINAL_ID_ENV,
+    FOREGROUND_STATUS_SUFFIX, GROUP_PROMPT_CAPABILITY, TERMINAL_ID_ENV,
 };
 // `client::owner` and `client::session_host_client` keep their old crate-root
 // paths, so grouping them under `client/` moved no caller.

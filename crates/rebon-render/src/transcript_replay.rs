@@ -27,8 +27,8 @@ use std::collections::{HashMap, HashSet};
 use crate::tool_output::tool_result_update_content;
 use crate::transcript_row::{
     AssistantContentBlock, AssistantMessage, AssistantMessageInner, AssistantRole,
-    AssistantTextBlock, Message, ToolResultContent, UserContentBlock, UserMessage,
-    UserMessageInner, UserRole, UserTextBlock,
+    AssistantTextBlock, Message, SystemLevel, SystemMessage, ToolResultContent, UserContentBlock,
+    UserMessage, UserMessageInner, UserRole, UserTextBlock,
 };
 
 /// One persisted transcript line, as [`replayed_rows`] needs to see it.
@@ -119,6 +119,39 @@ pub fn replayed_rows(entries: &[TranscriptLine<'_>]) -> (Vec<Message>, ReplaySta
         // would otherwise leak `<system-reminder>` bodies and
         // `[Request interrupted by user]` into the resumed rows.
         if let Message::User(ref u) = msg {
+            if entry
+                .raw
+                .pointer("/origin/kind")
+                .and_then(serde_json::Value::as_str)
+                == Some("group")
+            {
+                let Some(Message::User(group)) = strip_replayed_user_system_reminders(msg.clone())
+                else {
+                    continue;
+                };
+                let text = group
+                    .message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        UserContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !text.is_empty() {
+                    messages.push(Message::System(SystemMessage {
+                        uuid: u.uuid.clone(),
+                        timestamp: u.timestamp.clone(),
+                        subtype: "group_message".into(),
+                        content: Some(text),
+                        level: Some(SystemLevel::Info),
+                        is_meta: None,
+                    }));
+                    stats.committed += 1;
+                }
+                continue;
+            }
             let meta_top = u.is_meta == Some(true);
             let meta_nested = entry
                 .raw
@@ -641,6 +674,41 @@ mod tests {
             let (rows, _) = rows_of(&raw);
             assert!(rows.is_empty(), "{name} should leave no row on replay");
         }
+    }
+
+    #[test]
+    fn group_origin_projects_content_as_group_notice_without_hiding_user_quotes() {
+        let content = "[Agent group \"ops\"] planner asks (r4): review the patch";
+        let raw = vec![
+            json!({
+                "type": "user", "uuid": "u-internal-group-command-1",
+                "timestamp": "2026-09-06T00:00:00.000Z", "isMeta": true,
+                "origin": {"kind": "group"},
+                "message": {"role": "user", "content": [
+                    {"type": "text", "text": "<system-reminder>private group briefing: group_send</system-reminder>"},
+                    {"type": "text", "text": content}
+                ]}
+            }),
+            json!({
+                "type": "user", "uuid": "u-user-2",
+                "timestamp": "2026-09-06T00:00:01.000Z",
+                "message": {"role": "user", "content": [{"type": "text", "text": content}]}
+            }),
+            json!({
+                "type": "user", "uuid": "u-legacy-3",
+                "timestamp": "2026-09-06T00:00:02.000Z",
+                "message": {"role": "user", "content": [{"type": "text", "text": content}]}
+            }),
+        ];
+        let (rows, stats) = rows_of(&raw);
+        assert_eq!(stats.committed, 3);
+        let Message::System(group) = &rows[0] else {
+            panic!("group origin must render as system")
+        };
+        assert_eq!(group.subtype, "group_message");
+        assert_eq!(group.content.as_deref(), Some(content));
+        assert!(matches!(rows[1], Message::User(_)));
+        assert!(matches!(rows[2], Message::User(_)));
     }
 
     /// The reminder the harness appended is not what the person typed, but

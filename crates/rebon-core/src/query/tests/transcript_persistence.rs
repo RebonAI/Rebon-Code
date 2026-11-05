@@ -1,6 +1,47 @@
 use super::*;
 
 #[tokio::test]
+async fn group_turn_persists_origin_and_model_context_without_claiming_user_authorship() {
+    let engine = build_engine_with_tools(Vec::new());
+    let client = MockModelClient::new();
+    client.push_turn(text_turn("msg-group", "done"));
+    let projects_root_dir = temp_projects_root("group-origin");
+    let projects_root = projects_root_dir.path();
+    let session_id = "sess-group-origin";
+    let cwd = "/tmp/group-origin";
+    let executor = EngineQueryExecutor::new(engine, Arc::new(client), projects_root, "mock-model");
+    let mut request = basic_prompt_request(session_id, cwd);
+    let group_text = "[Agent group ops] planner asks (r4): review patch";
+    request.prompt = vec![
+        AcpContentBlock::Text(TextContent {
+            text: "<system-reminder>private group briefing</system-reminder>".into(),
+            annotations: None,
+        }),
+        AcpContentBlock::Text(TextContent {
+            text: group_text.into(),
+            annotations: None,
+        }),
+    ];
+    request.user_message_uuid = Some("u-internal-group-cmd-group-1".into());
+    executor.execute(request).await.unwrap();
+    let path = rebon_session::transcript_file_path(projects_root, cwd, session_id);
+    let entries: Vec<serde_json::Value> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let user = entries
+        .iter()
+        .find(|entry| entry["uuid"] == "u-internal-group-cmd-group-1")
+        .unwrap();
+    assert_eq!(user["origin"]["kind"], "group");
+    assert_eq!(user["isMeta"], true);
+    let content = user["message"]["content"].to_string();
+    assert!(content.contains(group_text));
+    assert!(content.contains("private group briefing"));
+}
+
+#[tokio::test]
 async fn assistant_transcript_entry_records_served_model_and_requested_mismatch() {
     // The provider-reported model (from `message_start`) lands in
     // `message.model`; when it differs from the requested model (a dated

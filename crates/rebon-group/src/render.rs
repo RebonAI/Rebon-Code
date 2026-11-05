@@ -195,8 +195,8 @@ pub fn label(group: &Group, entries: &[Entry]) -> String {
 }
 
 /// What wakes a member for what the user posted to it in the desktop app:
-/// the user's own words in full, as the user's message, and how to report
-/// back. What the rest of the group wrote is only counted. `None` when
+/// the user's own words in full, as the user's message. What the rest of the
+/// group wrote is only counted. `None` when
 /// nothing in `entries` is from the user.
 pub fn user_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
     let mine: Vec<&Entry> = entries
@@ -230,18 +230,6 @@ pub fn user_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
             "\n\n(+{others} more from the group in group_inbox)"
         ));
     }
-    let asks: Vec<&str> = mine
-        .iter()
-        .filter_map(|entry| entry.id.as_deref())
-        .collect();
-    if !asks.is_empty() {
-        text.push_str(&format!(
-            "\n\nWhen done, report back with group_send (kind reply, re {}, to \"user\"). If the \
-             work settled something the whole group should keep, record it with group_remember \
-             too.",
-            asks.join(" / ")
-        ));
-    }
     Some(text)
 }
 
@@ -268,18 +256,14 @@ fn id_tag(entry: &Entry) -> String {
         .map_or_else(String::new, |id| format!(" ({id})"))
 }
 
-/// What the app types into a CLI's input to wake it: one line, since a
-/// terminal submits on Enter and folds long pastes away, that says who
-/// asked what and where the rest is. It reads as the user's message, so it
-/// says plainly that it is relayed.
+/// The one-line group wake summary: who asked what and where to read more.
+/// The delivery transport marks the source; these bytes alone cannot tell a
+/// genuine group delivery from a user's identical quotation.
 pub fn terminal_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
     let requests: Vec<&Entry> = entries.iter().filter(|entry| wakes(entry)).collect();
     if requests.is_empty() {
         return None;
     }
-    let asked = requests
-        .iter()
-        .any(|entry| entry.kind == EntryKind::Request);
     let asks = requests
         .iter()
         .take(3)
@@ -304,8 +288,8 @@ pub fn terminal_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
     } else {
         String::new()
     };
-    // The user's own request reads as the user's message, which it is; an
-    // agent's says plainly that it is relayed and is not the user speaking.
+    // The user's own request keeps its authorship; a mixed batch identifies
+    // each sender by name rather than assigning the whole batch to the user.
     if requests.iter().all(|entry| entry.is_from_user()) {
         let asks = requests
             .iter()
@@ -320,25 +304,13 @@ pub fn terminal_prompt(group: &Group, entries: &[Entry]) -> Option<String> {
             })
             .collect::<Vec<_>>()
             .join(" | ");
-        let guidance = if asked {
-            "When done, report back with group_send (kind reply, re the request id, to \"user\"), and record anything settled for the whole group with group_remember."
-        } else if requests.iter().any(|entry| entry.kind == EntryKind::Reply) {
-            "The user has answered your question. Read the full reply with group_inbox and continue the original task."
-        } else {
-            "Read the full message with group_inbox."
-        };
         return Some(format!(
-            "[Agent group \"{}\"] {asks}{rest}. {guidance}",
+            "[Agent group \"{}\"] {asks}{rest} (full text: group_inbox)",
             group.name
         ));
     }
-    let guidance = if asked {
-        "Read it with group_inbox and answer with group_send (kind reply, re the request id)."
-    } else {
-        "Read it with group_inbox; answer with group_send only if it needs an answer, never just to acknowledge."
-    };
     Some(format!(
-        "[Relayed by Rebon from agent group \"{}\" — agent messages are from other agents, not me; messages from user are the user's own words] {asks}{rest}. {guidance}",
+        "[Agent group \"{}\" — relayed] {asks}{rest} (full text: group_inbox)",
         group.name
     ))
 }
@@ -575,7 +547,7 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.contains("+1 more in group_inbox"), "{prompt}");
-        assert!(prompt.contains("not me"));
+        assert!(prompt.contains("— relayed"));
     }
 
     #[test]
@@ -590,8 +562,8 @@ mod tests {
             "{prompt}"
         );
         assert!(!prompt.contains("(?)"), "{prompt}");
-        assert!(prompt.contains("not me"), "{prompt}");
-        assert!(prompt.contains("never just to acknowledge"), "{prompt}");
+        assert!(prompt.contains("— relayed"), "{prompt}");
+        assert!(!prompt.contains("never just to acknowledge"), "{prompt}");
         assert!(!prompt.contains("re the request id"), "{prompt}");
         let mut reply = entry(2, "planner", EntryKind::Reply, "tests pass");
         reply.re = Some("r1".into());
@@ -614,8 +586,8 @@ mod tests {
         // The user's own note reads as theirs, with nothing to report back.
         let prompt =
             terminal_prompt(&group(), &[entry(6, "user", EntryKind::Note, "use v2")]).unwrap();
-        assert!(prompt.contains("] use v2."), "{prompt}");
-        assert!(prompt.contains("Read the full message"), "{prompt}");
+        assert!(prompt.contains("] use v2"), "{prompt}");
+        assert!(!prompt.contains("Read the full message"), "{prompt}");
         assert!(!prompt.contains("report back"), "{prompt}");
     }
 
@@ -624,8 +596,8 @@ mod tests {
         let asks = [entry(4, "user", EntryKind::Request, "fix the login bug")];
         let prompt = terminal_prompt(&group(), &asks).unwrap();
         assert!(prompt.contains("(r4) fix the login bug"), "{prompt}");
-        assert!(prompt.contains("to \"user\""), "{prompt}");
-        assert!(!prompt.contains("not me"), "{prompt}");
+        assert!(!prompt.contains("group_send"), "{prompt}");
+        assert!(!prompt.contains("— relayed"), "{prompt}");
         // Mixed with an agent's, the whole prompt stays marked as relayed.
         let mixed = [
             entry(4, "user", EntryKind::Request, "fix it"),
@@ -633,9 +605,26 @@ mod tests {
         ];
         assert!(terminal_prompt(&group(), &mixed)
             .unwrap()
-            .contains("not me"));
+            .contains("— relayed"));
         let text = reminder(&group(), &asks).unwrap();
         assert!(text.contains("from=\"user\""), "{text}");
+    }
+
+    #[test]
+    fn terminal_wake_keeps_group_content_without_internal_guidance() {
+        let prompt = terminal_prompt(
+            &group(),
+            &[entry(
+                1,
+                "planner",
+                EntryKind::Request,
+                "Please review the patch",
+            )],
+        )
+        .unwrap();
+        assert!(prompt.contains("Please review the patch"));
+        assert!(!prompt.contains("Read it with group_inbox"));
+        assert!(!prompt.contains("report back with group_send"));
     }
 
     #[test]
@@ -654,7 +643,7 @@ mod tests {
         );
         assert!(prompt.contains("\n\nand be quick"), "{prompt}");
         assert!(prompt.contains("+1 more from the group"), "{prompt}");
-        assert!(prompt.contains("re r4, to \"user\""), "{prompt}");
+        assert!(!prompt.contains("re r4, to \"user\""), "{prompt}");
         assert_eq!(
             user_prompt(&group(), &[entry(3, "planner", EntryKind::Request, "x")]),
             None

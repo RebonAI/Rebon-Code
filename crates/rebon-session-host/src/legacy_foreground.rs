@@ -81,6 +81,9 @@ pub enum ForegroundCommand {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<BackgroundImageAttachment>,
     },
+    GroupPrompt {
+        message: String,
+    },
     /// Run a slash command against the live session. The foreground runner
     /// returns the command's presentation payload through the result sidecar.
     RunCommand {
@@ -115,7 +118,9 @@ pub enum ForegroundCommand {
     /// applies on the next turn because the worker rebuilds its session per
     /// turn. A foreground TUI holds one long-lived session, so the mode has to
     /// arrive as a command and land on the live mode cell to take effect at all.
-    SetPermissionMode { mode: String },
+    SetPermissionMode {
+        mode: String,
+    },
     /// One agent in another session sends this session a message.
     ///
     /// The mailbox rung of the client ladder: a foreground TUI that advertises
@@ -384,6 +389,7 @@ pub struct ForegroundCommandEnvelope {
 /// message file it cannot parse. A sender that sees neither leaves the message
 /// undelivered and says so instead of writing it into that void.
 pub const AGENT_MESSAGE_CAPABILITY: &str = "agent_message";
+pub const GROUP_PROMPT_CAPABILITY: &str = "group_prompt";
 
 /// Where a foreground TUI's agent endpoint listens, and where its token is.
 ///
@@ -449,9 +455,7 @@ pub struct ForegroundSessionStatus {
     /// and on every status written by a hosted owner's projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_endpoint: Option<ForegroundAgentEndpointInfo>,
-    /// What this publisher can deliver that its predecessor could not. Today
-    /// only [`AGENT_MESSAGE_CAPABILITY`], and empty on every status written
-    /// before the field existed.
+    /// Capabilities supported by this publisher; empty on older statuses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
     /// What this session is doing right now — the tool or file it is working
@@ -1597,6 +1601,31 @@ mod tests {
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("agentEndpoint"), "{written}");
         assert!(!written.contains("capabilities"), "{written}");
+    }
+
+    #[test]
+    fn group_prompt_round_trips_as_a_distinct_command() {
+        let command = ForegroundCommand::GroupPrompt {
+            message: "[Agent group \"ops\"] planner asks (r4): check tests".into(),
+        };
+        let value = serde_json::to_value(&command).unwrap();
+        assert_eq!(value["kind"], "group_prompt");
+        assert_eq!(
+            serde_json::from_value::<ForegroundCommand>(value).unwrap(),
+            command
+        );
+        let injected: ForegroundCommand = serde_json::from_value(serde_json::json!({
+            "kind": "inject", "message": "[Agent group \"ops\"] planner asks (r4): check tests"
+        }))
+        .unwrap();
+        assert_ne!(injected, command);
+        let root = tmp_root();
+        send_foreground_command(root.path(), "/work/proj", "sess-group", &command).unwrap();
+        let claims = drain_foreground_commands(root.path(), "/work/proj", "sess-group");
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].envelope.version, FOREGROUND_PROTOCOL_VERSION);
+        assert_eq!(claims[0].envelope.command, command);
+        complete_foreground_command(&claims[0]).unwrap();
     }
 
     #[test]

@@ -45,6 +45,7 @@ use crate::background::{
     command_was_already_resolved, is_compact_command, validate_question_answer,
 };
 use crate::session::mid_turn_queue::DeferredAgentMessage;
+use crate::session::submit_payload::SubmitPayload;
 use crate::session_shell::session_command_inputs_from_app;
 use crate::tui::app::AppState;
 use crate::tui::permission_modal::{PendingPermission, PermissionKind, PermissionModalAction};
@@ -52,12 +53,15 @@ use crate::tui::wiring::TuiEngineSession;
 use crate::ui_config::UiMode;
 
 use super::interrupt_flow::remote_cancel_active_prompt;
+use super::live_agent_view::with_main_agent_view;
 use super::permission_flow::{
     apply_permission_modal_action_for_session, set_permission_mode_for_session,
     submit_ask_user_question_if_ready,
 };
+use super::prompt_lifecycle::{admit_active_prompt, local_turn_rejection};
 use super::submit::{submit_or_queue_from, TypedLine};
 use super::ActivePrompt;
+use crate::tui::dispatch::apply_internal_submit;
 
 /// Runs one mailbox `RunCommand`.
 ///
@@ -601,6 +605,45 @@ impl ForegroundControl {
                 );
                 Ok(None)
             }
+            ForegroundCommand::GroupPrompt { message } => {
+                if message.trim().is_empty() {
+                    return Err("empty group message".to_string());
+                }
+                let submit = SubmitPayload {
+                    text: message,
+                    model_text: None,
+                    user_message_uuid: Some(format!("u-internal-group-{command_id}")),
+                    image_pastes: Vec::new(),
+                    directory_attachments: Vec::new(),
+                    execution_policy: None,
+                    skill_invocations: Vec::new(),
+                };
+                if active_prompt.is_some() || app.goal_check.is_pending() {
+                    app.deferred_internal_submit_payloads.push(submit);
+                    return Ok(None);
+                }
+                if let Some(reason) = local_turn_rejection(app, session, None) {
+                    return Err(reason);
+                }
+                with_main_agent_view(app, |app| {
+                    let submit = apply_internal_submit(app, submit, &session.session_id)
+                        .expect("group prompt is nonempty");
+                    if let Some(active) = admit_active_prompt(
+                        app,
+                        session,
+                        handle,
+                        None,
+                        super::LocalTurnSource::IdleContext,
+                        submit,
+                    ) {
+                        *active_prompt = Some(active);
+                        app.is_loading = true;
+                        Ok(None)
+                    } else {
+                        Err("group prompt could not start".into())
+                    }
+                })
+            }
             ForegroundCommand::RunCommand { name, args } => {
                 let handler = self
                     .command_handler
@@ -1057,6 +1100,120 @@ mod tests {
             session.engine_half.runtime.mid_turn_queue.pending_len(),
             0,
             "a duplicate id must not be queued a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_prompt_reaches_model_without_becoming_user_intent_or_user_row() {
+        let mut session = super::super::test_support::make_test_tui_session();
+        let recorder = Arc::new(RecordingExecutor::default());
+        session.set_test_executor(recorder.clone());
+        let control = ForegroundControl::new(&session);
+        let mut app = AppState::new();
+        let handle = tokio::runtime::Handle::current();
+        let mut active = None;
+        let text = "[Agent group \"ops\"] planner asks (r4): review the patch";
+        let outcome = control.apply(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active,
+            &mut None,
+            UiMode::Screen,
+            "cmd-group-1",
+            ForegroundCommand::GroupPrompt {
+                message: text.into(),
+            },
+        );
+        assert!(matches!(outcome, Ok(None)), "{outcome:?}");
+        assert!(active.is_some());
+        let request = recorder.first_request().await;
+        assert_eq!(request.user_prompt, None);
+        assert_eq!(
+            request.user_message_uuid.as_deref(),
+            Some("u-internal-group-cmd-group-1")
+        );
+        assert!(request.prompt.iter().any(|block| matches!(
+            block,
+            rebon_types::ContentBlock::Text(body) if body.text.contains(text)
+        )));
+        assert!(app
+            .rebon_tui
+            .transcript
+            .rows()
+            .iter()
+            .any(|row| matches!(row,
+                rebon_tui::Message::System(system) if system.subtype == "group_message"
+                    && system.content.as_deref() == Some(text)
+            )));
+        assert!(!app
+            .rebon_tui
+            .transcript
+            .rows()
+            .iter()
+            .any(|row| matches!(row, rebon_tui::Message::User(_))));
+    }
+
+    #[tokio::test]
+    async fn group_prompt_queues_as_internal_when_turn_is_running() {
+        let mut session = super::super::test_support::make_test_tui_session();
+        let recorder = Arc::new(RecordingExecutor::default());
+        session.set_test_executor(recorder.clone());
+        let control = ForegroundControl::new(&session);
+        let mut app = AppState::new();
+        let handle = tokio::runtime::Handle::current();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let mut active = Some(ActivePrompt::new(rx, rebon_types::PromptCancel::new()));
+        let result = control.apply(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active,
+            &mut None,
+            UiMode::Screen,
+            "cmd-group-2",
+            ForegroundCommand::GroupPrompt {
+                message: "planner asks: review the patch".into(),
+            },
+        );
+        assert!(matches!(result, Ok(None)), "{result:?}");
+        assert!(app.queued_commands.is_empty());
+        assert_eq!(app.deferred_internal_submit_payloads.len(), 1);
+        assert_eq!(
+            app.deferred_internal_submit_payloads[0]
+                .user_message_uuid
+                .as_deref(),
+            Some("u-internal-group-cmd-group-2")
+        );
+        let empty = control.apply(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active,
+            &mut None,
+            UiMode::Screen,
+            "cmd-empty-group",
+            ForegroundCommand::GroupPrompt {
+                message: "   ".into(),
+            },
+        );
+        assert_eq!(empty.unwrap_err(), "empty group message");
+        assert_eq!(app.deferred_internal_submit_payloads.len(), 1);
+
+        active = None;
+        super::super::prompt_lifecycle::maybe_spawn_next_queued_prompt(
+            &mut app,
+            &mut session,
+            &handle,
+            &mut active,
+        );
+        assert!(active.is_some());
+        assert!(app.deferred_internal_submit_payloads.is_empty());
+        let request = recorder.first_request().await;
+        assert_eq!(request.user_prompt, None);
+        assert_eq!(
+            request.user_message_uuid.as_deref(),
+            Some("u-internal-group-cmd-group-2")
         );
     }
 

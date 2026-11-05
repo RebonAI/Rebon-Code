@@ -385,7 +385,10 @@ impl ForegroundMailbox {
             // A live TUI drains `ForegroundCommand::AgentMessage` even when its
             // listener could not bind, so the capability is advertised whenever
             // the mailbox itself is.
-            capabilities: vec![rebon_session_host::AGENT_MESSAGE_CAPABILITY.to_string()],
+            capabilities: vec![
+                rebon_session_host::AGENT_MESSAGE_CAPABILITY.to_string(),
+                rebon_session_host::GROUP_PROMPT_CAPABILITY.to_string(),
+            ],
             activity: activity.map(str::to_string),
         };
         let written = rebon_session_host::write_foreground_status(&self.projects_root, &status);
@@ -625,6 +628,10 @@ mod tests {
 
         assert!(mailbox.publish(true, None, None, Some("Bash cargo test")));
         assert_eq!(read().activity.as_deref(), Some("Bash cargo test"));
+        assert!(read()
+            .capabilities
+            .iter()
+            .any(|capability| capability == rebon_session_host::GROUP_PROMPT_CAPABILITY));
 
         // Only the activity moved. The claim is still acknowledged — a caller
         // waits on `true` — but the file keeps the older activity until the

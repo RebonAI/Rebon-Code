@@ -49,7 +49,8 @@ fn user_answer_reaches_only_the_asking_members_inbox_and_wakes_it() {
     assert!(!prompt.contains("When done, report back"));
     let terminal = render::terminal_prompt(&group, &[answer]).unwrap();
     assert!(terminal.contains("answer to"));
-    assert!(terminal.contains("continue the original task"));
+    assert!(terminal.contains("选择方案一"));
+    assert!(!terminal.contains("continue the original task"));
 }
 
 #[test]
@@ -158,5 +159,6 @@ fn a_user_answer_among_agent_requests_still_names_its_authority() {
         .unwrap();
     let prompt = render::terminal_prompt(&store.load(&id).unwrap(), &[answer, task]).unwrap();
     assert!(prompt.contains("user answers"));
-    assert!(prompt.contains("messages from user are the user's own words"));
+    assert!(prompt.contains("— relayed"));
+    assert!(prompt.contains("user answers"));
 }

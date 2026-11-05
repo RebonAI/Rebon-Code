@@ -44,6 +44,29 @@ fn is_internal_prompt_row(uuid: &str) -> bool {
     uuid.starts_with("u-internal-")
 }
 
+fn is_group_prompt_row(uuid: &str) -> bool {
+    uuid.starts_with("u-internal-group-")
+}
+
+fn mark_group_prompt_origin(payload: &mut serde_json::Value, uuid: &str) {
+    if is_group_prompt_row(uuid) {
+        payload["origin"] = serde_json::json!({"kind": "group"});
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn group_prompt_origin_is_persisted_only_for_structured_group_inputs() {
+    let content = serde_json::json!([{"type": "text", "text": "group content"}]);
+    let group = queued_attachment_entry_payload(content.clone(), "u-internal-group-cmd-1", 1);
+    assert_eq!(group["origin"]["kind"], "group");
+    assert_eq!(group["isMeta"], true);
+    assert_eq!(group["message"]["content"], content);
+    let quoted = queued_attachment_entry_payload(content, "u-user-quoted", 1);
+    assert!(quoted.get("origin").is_none());
+    assert!(quoted.get("isMeta").is_none());
+}
+
 fn queued_attachment_entry_payload(
     content_value: serde_json::Value,
     local_user_uuid: &str,
@@ -56,6 +79,7 @@ fn queued_attachment_entry_payload(
         false,
     );
     payload["queuedCommand"] = serde_json::Value::Bool(true);
+    mark_group_prompt_origin(&mut payload, local_user_uuid);
     payload["iteration"] = serde_json::json!(iteration);
     payload
 }
@@ -3693,6 +3717,7 @@ impl EngineQueryExecutor {
             if opens_turn_with_agent_message(&user_uuid) {
                 user_payload[RUNTIME_ATTACHMENT_ENTRY_KEY] = serde_json::Value::Bool(true);
             }
+            mark_group_prompt_origin(&mut user_payload, &user_uuid);
             if replay_only {
                 user_payload.as_object_mut().unwrap().insert(
                     "permissionReplay".to_string(),

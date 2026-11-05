@@ -670,6 +670,20 @@ fn commit_submit_payload_to_transcript_with_meta(
         ensure_submit_payload_user_uuid(submit, session_id)
     };
     let timestamp = format_system_time_iso_ms(SystemTime::now());
+    if uuid.starts_with("u-internal-group-") {
+        reducer(
+            &mut app.rebon_tui,
+            Action::Commit(Message::System(rebon_tui::SystemMessage {
+                uuid,
+                timestamp,
+                subtype: "group_message".into(),
+                content: Some(submit.text.clone()),
+                level: Some(rebon_tui::SystemLevel::Info),
+                is_meta: None,
+            })),
+        );
+        return;
+    }
     let mut content = Vec::new();
     if !submit.text.is_empty() {
         content.push(UserContentBlock::Text(UserTextBlock {
@@ -1082,6 +1096,32 @@ mod tests {
             }
             other => panic!("expected user message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn group_submit_is_a_visible_group_notice_not_a_user_prompt() {
+        let mut app = AppState::new();
+        let text = "[Agent group \"ops\"] planner asks (r4): review the patch";
+        let submit = apply_submit_with_images_and_uuid(
+            &mut app,
+            text,
+            "sess-test",
+            Vec::new(),
+            Some("u-internal-group-claim-1".into()),
+        )
+        .unwrap();
+        assert_eq!(submit.prompt_text(), text);
+        let Message::System(group) = &app.rebon_tui.transcript.rows()[0] else {
+            panic!("expected group notice");
+        };
+        assert_eq!(group.subtype, "group_message");
+        assert_eq!(group.content.as_deref(), Some(text));
+        let mut quoted = AppState::new();
+        apply_submit(&mut quoted, text, "sess-test").unwrap();
+        assert!(matches!(
+            quoted.rebon_tui.transcript.rows()[0],
+            Message::User(_)
+        ));
     }
 
     #[test]
