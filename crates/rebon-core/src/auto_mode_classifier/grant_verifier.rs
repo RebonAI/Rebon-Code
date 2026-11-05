@@ -141,8 +141,26 @@ pub(crate) fn judge_response(response: &str, request: &GrantVerifierRequest) -> 
     // 引文可能是禁止语句的子串；找到原文不等于获得同意。
     let words = statement.text.to_lowercase();
     if [
-        "don't", "do not", "never", "not yet", "wait", "不要", "先别", "别", "请勿", "禁止",
-        "取消", "撤销", "撤回", "暂停",
+        "don't",
+        "do not",
+        "never",
+        "not yet",
+        "no ",
+        "not ",
+        "stop",
+        "不行",
+        "拒绝",
+        "不同意",
+        "wait",
+        "不要",
+        "先别",
+        "别",
+        "请勿",
+        "禁止",
+        "取消",
+        "撤销",
+        "撤回",
+        "暂停",
     ]
     .iter()
     .any(|denial| words.contains(denial))
@@ -151,6 +169,28 @@ pub(crate) fn judge_response(response: &str, request: &GrantVerifierRequest) -> 
     }
     match &proposal_quote {
         Some(proposal) => {
+            // 无附带动作参数的回复只能使用清晰肯定词；模型不能把「不行」解释成同意。
+            if !matches!(
+                words.trim(),
+                "yes"
+                    | "yep"
+                    | "yeah"
+                    | "go"
+                    | "go ahead"
+                    | "ok"
+                    | "okay"
+                    | "sure"
+                    | "please do"
+                    | "好"
+                    | "好的"
+                    | "可以"
+                    | "同意"
+                    | "是的"
+                    | "按你说的做"
+                    | "按这个方案执行吧"
+            ) {
+                return refuse("the person's reply did not directly affirm the proposal");
+            }
             let answered = statement
                 .replying_to
                 .as_deref()
@@ -242,6 +282,7 @@ mod tests {
         for text in [
             "actually, don't push to main",
             "do not push to main",
+            "No push to main",
             "不要 push to main",
             "wait, not yet; push to main later",
         ] {
@@ -252,6 +293,20 @@ mod tests {
                     GrantVerdict::Refused { .. }
                 ),
                 "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_negative_reply_to_a_proposal_is_not_an_affirmation() {
+        for reply in ["No", "不行", "stop"] {
+            let request = request(&[(reply, Some("Shall I push the fix to main?"))]);
+            assert!(
+                matches!(
+                    judge_response(&answer("granted", reply, "push the fix to main"), &request),
+                    GrantVerdict::Refused { .. }
+                ),
+                "{reply}"
             );
         }
     }
