@@ -685,6 +685,17 @@ enum RouterCommand {
     Status,
     /// Stop the router and its watchdog. Its workers keep running.
     Stop,
+    /// List what you authorized the router's workers to do, and whether each
+    /// authorization still applies.
+    Grants,
+    /// Withdraw authorizations at once: name grant ids, or pass --all.
+    Revoke {
+        /// Every live authorization.
+        #[arg(long, conflicts_with = "ids")]
+        all: bool,
+        /// The grant ids, as `rebon router grants` lists them.
+        ids: Vec<String>,
+    },
     /// Send the router an event from outside: a chat message, a mail, a hook.
     /// With a thread a worker owns, it goes straight to that worker.
     Notify {
@@ -1573,6 +1584,44 @@ fn run_router_command(command: RouterCommand) -> anyhow::Result<()> {
             rebon_session_host::ensure_supervisor_running(&store, &background::rebon_exe())?;
             println!("Sent.");
         }
+        RouterCommand::Grants => {
+            let home = store.root();
+            let ledger = rebon_work::Ledger::load(&rebon_work::ledger_path(home))?;
+            let now = rebon_session_host::now_ms();
+            let book = rebon_work::GrantBook::load(&rebon_work::grants_path(home))?;
+            if book.grants.is_empty() {
+                println!("No authorizations.");
+            }
+            let mut grants = book.grants;
+            grants.sort_by(|a, b| b.issued_at_ms.cmp(&a.issued_at_ms));
+            for grant in grants {
+                println!(
+                    "{}  [{}]  {}  (tasks: {}; you said: \u{201c}{}\u{201d})",
+                    grant.id,
+                    grant.state(&ledger, now).as_str(),
+                    grant.summary,
+                    grant.task_ids.join(", "),
+                    grant.user_quote,
+                );
+            }
+        }
+        RouterCommand::Revoke { all, ids } => {
+            if !all && ids.is_empty() {
+                anyhow::bail!("name the grant ids to revoke, or pass --all");
+            }
+            let home = store.root();
+            let ledger = rebon_work::Ledger::load(&rebon_work::ledger_path(home))?;
+            let now = rebon_session_host::now_ms();
+            let ids = if all { Vec::new() } else { ids };
+            let revoked = rebon_work::update_grants(home, &ledger, now, |book| {
+                book.revoke(None, &ids, &ledger, now)
+            })?;
+            if revoked.is_empty() {
+                println!("Nothing live to revoke.");
+            } else {
+                println!("Revoked: {}", revoked.join(", "));
+            }
+        }
         RouterCommand::Stop => match router::stop_router(&store)? {
             Some(job_id) => {
                 println!("Stopped the router {job_id} and its watchdog. Its workers keep running.")
@@ -1970,6 +2019,32 @@ async fn route_main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn router_authorization_commands_parse_without_a_session() {
+        let grants = Cli::try_parse_from(["rebon", "router", "grants"]).unwrap();
+        assert!(matches!(
+            grants.command,
+            Some(Command::Router {
+                command: RouterCommand::Grants
+            })
+        ));
+        let revoke = Cli::try_parse_from(["rebon", "router", "revoke", "g-1"]).unwrap();
+        assert!(matches!(
+            revoke.command,
+            Some(Command::Router {
+                command: RouterCommand::Revoke { all: false, ids }
+            }) if ids == ["g-1"]
+        ));
+        let all = Cli::try_parse_from(["rebon", "router", "revoke", "--all"]).unwrap();
+        assert!(matches!(
+            all.command,
+            Some(Command::Router {
+                command: RouterCommand::Revoke { all: true, ids }
+            }) if ids.is_empty()
+        ));
+        assert!(Cli::try_parse_from(["rebon", "router", "revoke", "--all", "g-1"]).is_err());
+    }
     use rebon_plugin_updater::cli::{UpdateCliCommand, UpdateServiceCommand};
 
     #[test]

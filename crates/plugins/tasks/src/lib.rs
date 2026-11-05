@@ -27,7 +27,7 @@
 //! | `todo_write` (the todo store) | the TUI's task pane renders it directly |
 //! | `queue` (`QueueContext`) | `ToolContext` hands out the controller the coordinator sets |
 //!
-//! Turning the plugin off takes all twenty-one tools and three attachment
+//! Turning the plugin off takes all twenty-four tools and three attachment
 //! producers off their process seats. Task runtime state and stores already
 //! created by the session are untouched: the model just loses the plugin
 //! surfaces that read and write them.
@@ -86,9 +86,11 @@ pub use roster::{
     render_teammate_roster_context, RosterAttachmentPoller, RosterAttachmentProducer,
 };
 pub use router_tools::{
-    CancelTaskTool, ContinueWorkerTool, DispatchWorkerTool, PlanTasksTool, RecallTool,
-    StopWorkerTool, SubscribeThreadTool, CANCEL_TASK_TOOL_NAME, CONTINUE_WORKER_TOOL_NAME,
-    DISPATCH_WORKER_TOOL_NAME, PLAN_TASKS_TOOL_NAME, RECALL_TOOL_NAME, ROUTER_TOOL_NAMES,
+    CancelTaskTool, ContinueWorkerTool, DispatchWorkerTool, GrantAuthorizationTool,
+    ListAuthorizationsTool, PlanTasksTool, RecallTool, RevokeAuthorizationTool, StopWorkerTool,
+    SubscribeThreadTool, CANCEL_TASK_TOOL_NAME, CONTINUE_WORKER_TOOL_NAME,
+    DISPATCH_WORKER_TOOL_NAME, GRANT_AUTHORIZATION_TOOL_NAME, LIST_AUTHORIZATIONS_TOOL_NAME,
+    PLAN_TASKS_TOOL_NAME, RECALL_TOOL_NAME, REVOKE_AUTHORIZATION_TOOL_NAME, ROUTER_TOOL_NAMES,
     STOP_WORKER_TOOL_NAME, SUBSCRIBE_THREAD_TOOL_NAME,
 };
 pub use runtime::take_pending_teammate_messages;
@@ -120,7 +122,7 @@ const ROSTER_PROVIDER_ID: &str = "tasks/roster";
 /// Attachment-seat provider id for the periodic task nudge.
 const REMINDER_PROVIDER_ID: &str = "tasks/reminder";
 
-/// The twenty-one tools, in registration order.
+/// The twenty-four tools, in registration order.
 ///
 /// Public so a test that needs the whole builtin catalogue on a bare
 /// [`rebon_core::Engine`] can register them without standing up a kernel.
@@ -147,6 +149,9 @@ pub fn tools() -> Vec<Arc<dyn rebon_tool::Tool>> {
         Arc::new(StopWorkerTool),
         Arc::new(SubscribeThreadTool),
         Arc::new(RecallTool),
+        Arc::new(GrantAuthorizationTool),
+        Arc::new(RevokeAuthorizationTool),
+        Arc::new(ListAuthorizationsTool),
     ]
 }
 
@@ -173,6 +178,9 @@ pub const TOOL_NAMES: &[&str] = &[
     STOP_WORKER_TOOL_NAME,
     SUBSCRIBE_THREAD_TOOL_NAME,
     RECALL_TOOL_NAME,
+    GRANT_AUTHORIZATION_TOOL_NAME,
+    REVOKE_AUTHORIZATION_TOOL_NAME,
+    LIST_AUTHORIZATIONS_TOOL_NAME,
 ];
 
 #[derive(Default)]
@@ -359,8 +367,8 @@ mod tests {
     /// `TodoWrite` and the five `Task*` tools are each other's off switch —
     /// `is_todo_v2_enabled()` decides which half a session sees, and the
     /// seat honours `is_enabled()`. So no one environment resolves all
-    /// twenty-one; the twenty that are live by default are here and
-    /// [`the_switch_reaches_todo_write_too`] covers the twenty-first.
+    /// twenty-four; the twenty-three that are live by default are here and
+    /// [`the_switch_reaches_todo_write_too`] covers the last one.
     const DEFAULT_ON: &[&str] = &[
         TASK_CREATE_TOOL_NAME,
         TASK_GET_TOOL_NAME,
@@ -382,6 +390,9 @@ mod tests {
         STOP_WORKER_TOOL_NAME,
         SUBSCRIBE_THREAD_TOOL_NAME,
         RECALL_TOOL_NAME,
+        GRANT_AUTHORIZATION_TOOL_NAME,
+        REVOKE_AUTHORIZATION_TOOL_NAME,
+        LIST_AUTHORIZATIONS_TOOL_NAME,
     ];
 
     /// Sets one variable for as long as it is held, under the same lock
@@ -509,8 +520,8 @@ mod tests {
         let (kernel, registry) = boot();
         let seat = seat(&kernel);
 
-        assert_eq!(TOOL_NAMES.len(), 21);
-        assert_eq!(DEFAULT_ON.len(), 20);
+        assert_eq!(TOOL_NAMES.len(), 24);
+        assert_eq!(DEFAULT_ON.len(), 23);
         for name in DEFAULT_ON {
             assert!(
                 seat.resolve(name, None).unwrap().is_some(),
@@ -661,7 +672,7 @@ mod tests {
         assert_eq!(attachment_seat.provider_ids(), all);
     }
 
-    /// The twenty-first tool. In a non-interactive session the halves swap:
+    /// The twenty-fourth tool. In a non-interactive session the halves swap:
     /// `TodoWrite` is the live one and the five `Task*` tools are not. The
     /// plugin switch still governs both halves.
     #[test]

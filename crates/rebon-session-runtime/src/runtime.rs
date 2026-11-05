@@ -684,7 +684,12 @@ fn build_engine_core(inputs: EngineCoreInputs) -> EngineCore {
             crate::worker_control::HostWorkerControl::new(
                 crate::host::cli_default_store(),
                 rebon_harness::projects_root(),
-            ),
+            )
+            .with_grant_verifier(std::sync::Arc::new(
+                rebon_core::auto_mode_classifier::grant_verifier::ModelGrantVerifier::new(
+                    runtime_model.clone(),
+                ),
+            )),
         ))
         .with_escalation_resolver(tasks.escalation_registry().resolver())
         .with_policy_store(live_policy_store)

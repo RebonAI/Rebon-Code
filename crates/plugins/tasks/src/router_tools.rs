@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rebon_tool::{PlannedTask, Tool, ToolContext, WorkerControl, WorkerDispatch};
+use rebon_tool::{GrantDraft, PlannedTask, Tool, ToolContext, WorkerControl, WorkerDispatch};
 use rebon_tools_core::{
     parse_tool_input, ToolError, ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
 };
@@ -22,6 +22,9 @@ pub const SUBSCRIBE_THREAD_TOOL_NAME: &str = "SubscribeThread";
 pub const RECALL_TOOL_NAME: &str = "Recall";
 pub const PLAN_TASKS_TOOL_NAME: &str = "PlanTasks";
 pub const CANCEL_TASK_TOOL_NAME: &str = "CancelTask";
+pub const GRANT_AUTHORIZATION_TOOL_NAME: &str = "GrantAuthorization";
+pub const REVOKE_AUTHORIZATION_TOOL_NAME: &str = "RevokeAuthorization";
+pub const LIST_AUTHORIZATIONS_TOOL_NAME: &str = "ListAuthorizations";
 
 /// Every router tool name.
 pub const ROUTER_TOOL_NAMES: &[&str] = &[
@@ -32,6 +35,9 @@ pub const ROUTER_TOOL_NAMES: &[&str] = &[
     STOP_WORKER_TOOL_NAME,
     SUBSCRIBE_THREAD_TOOL_NAME,
     RECALL_TOOL_NAME,
+    GRANT_AUTHORIZATION_TOOL_NAME,
+    REVOKE_AUTHORIZATION_TOOL_NAME,
+    LIST_AUTHORIZATIONS_TOOL_NAME,
 ];
 
 const INVALID_INPUT_CODE: i64 = 400;
@@ -51,6 +57,12 @@ pub struct RecallTool;
 pub struct PlanTasksTool;
 #[derive(Debug, Clone, Default)]
 pub struct CancelTaskTool;
+#[derive(Debug, Clone, Default)]
+pub struct GrantAuthorizationTool;
+#[derive(Debug, Clone, Default)]
+pub struct RevokeAuthorizationTool;
+#[derive(Debug, Clone, Default)]
+pub struct ListAuthorizationsTool;
 
 /// The control and the router's session id, or the refusal every tool gives
 /// outside a router session.
@@ -698,6 +710,277 @@ impl Tool for RecallTool {
     }
 }
 
+const MAX_GRANT_DRAFTS: usize = 8;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct GrantDraftInput {
+    action: String,
+    target: String,
+    summary: String,
+    task_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct GrantInput {
+    grants: Vec<GrantDraftInput>,
+}
+
+#[async_trait]
+impl Tool for GrantAuthorizationTool {
+    fn id(&self) -> ToolId {
+        ToolId::new(GRANT_AUTHORIZATION_TOOL_NAME)
+    }
+
+    fn description(&self) -> &str {
+        "Record a risky step the person authorized, so the workers on those tasks \
+         are not stopped for it. Call it right after planning when the person's \
+         request itself named a risky step (\"fix CI, then push to main\"), and \
+         after the person says yes to a step you proposed. Name the action \
+         (`git push`) and the exact thing that makes it risky (`branch main`), and \
+         the task ids it is for. Each one is checked against the person's own \
+         words and issued only if they named it; one that is refused needs the \
+         person's say first. Never call it for a step the person did not name."
+    }
+
+    fn input_schema(&self) -> ToolInputSchema {
+        json!({
+            "type": "object",
+            "properties": {
+                "grants": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_GRANT_DRAFTS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": { "type": "string", "description": "What may be done, such as `git push` or `npm publish`" },
+                            "target": { "type": "string", "description": "The specific thing that makes it risky, such as `branch main`" },
+                            "summary": { "type": "string", "description": "One line for the person" },
+                            "taskIds": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "minItems": 1,
+                                "description": "The tasks it is for, all in one project"
+                            }
+                        },
+                        "required": ["action", "target", "summary", "taskIds"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["grants"],
+            "additionalProperties": false
+        })
+    }
+
+    fn is_read_only(&self, _input: &Value) -> bool {
+        false
+    }
+
+    async fn validate_input(
+        &self,
+        input: &Value,
+        _context: &ToolContext,
+    ) -> ToolResult<ValidationOutcome> {
+        let parsed: GrantInput = parse_tool_input(self.id(), input)?;
+        if parsed.grants.is_empty() {
+            return Ok(ValidationOutcome::invalid(
+                "`grants` needs at least one entry".to_string(),
+                INVALID_INPUT_CODE,
+            ));
+        }
+        if parsed.grants.len() > MAX_GRANT_DRAFTS {
+            return Ok(ValidationOutcome::invalid(
+                format!("at most {MAX_GRANT_DRAFTS} grants at once"),
+                INVALID_INPUT_CODE,
+            ));
+        }
+        for grant in &parsed.grants {
+            for (value, field) in [
+                (&grant.action, "action"),
+                (&grant.target, "target"),
+                (&grant.summary, "summary"),
+            ] {
+                if let Some(invalid) = required(value, field) {
+                    return Ok(invalid);
+                }
+            }
+            if grant.task_ids.iter().all(|id| id.trim().is_empty()) {
+                return Ok(ValidationOutcome::invalid(
+                    "each grant needs the task ids it is for".to_string(),
+                    INVALID_INPUT_CODE,
+                ));
+            }
+        }
+        Ok(ValidationOutcome::valid())
+    }
+
+    async fn call(&self, input: Value, context: &ToolContext) -> ToolResult<Value> {
+        let parsed: GrantInput = parse_tool_input(self.id(), &input)?;
+        let (control, session_id) = control_and_session(self, context)?;
+        let drafts = parsed
+            .grants
+            .into_iter()
+            .map(|grant| GrantDraft {
+                action: grant.action.trim().to_string(),
+                target: grant.target.trim().to_string(),
+                summary: grant.summary.trim().to_string(),
+                task_ids: grant
+                    .task_ids
+                    .iter()
+                    .map(|id| id.trim().to_string())
+                    .filter(|id| !id.is_empty())
+                    .collect(),
+            })
+            .collect();
+        let decisions = control
+            .grant_authorizations(session_id, drafts)
+            .await
+            .map_err(|error| execution_error(self, error))?;
+        let issued: Vec<Value> = decisions
+            .iter()
+            .map(|decision| {
+                json!({
+                    "action": decision.action,
+                    "target": decision.target,
+                    "grantId": decision.grant_id,
+                    "issued": decision.grant_id.is_some(),
+                    "reason": decision.reason,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "grants": issued,
+            "note": "Tell the person, in a line each, which steps were authorized (with their grant ids) and which were not. A step that was not authorized needs their say first."
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RevokeInput {
+    #[serde(default)]
+    grant_ids: Vec<String>,
+    #[serde(default)]
+    all: bool,
+}
+
+#[async_trait]
+impl Tool for RevokeAuthorizationTool {
+    fn id(&self) -> ToolId {
+        ToolId::new(REVOKE_AUTHORIZATION_TOOL_NAME)
+    }
+
+    fn description(&self) -> &str {
+        "Withdraw authorizations the person no longer gives. Call it as soon as \
+         the person takes a step back (\"don't push yet\", \"stop deploying\"), \
+         before anything else, naming the grant ids or `all`. Workers lose the \
+         authorization on their next step."
+    }
+
+    fn input_schema(&self) -> ToolInputSchema {
+        json!({
+            "type": "object",
+            "properties": {
+                "grantIds": { "type": "array", "items": { "type": "string" } },
+                "all": { "type": "boolean", "description": "Every live authorization of yours" }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    fn is_read_only(&self, _input: &Value) -> bool {
+        false
+    }
+
+    async fn validate_input(
+        &self,
+        input: &Value,
+        _context: &ToolContext,
+    ) -> ToolResult<ValidationOutcome> {
+        let parsed: RevokeInput = parse_tool_input(self.id(), input)?;
+        let named = parsed.grant_ids.iter().any(|id| !id.trim().is_empty());
+        Ok(match (named, parsed.all) {
+            (false, false) => ValidationOutcome::invalid(
+                "name `grantIds` or set `all`".to_string(),
+                INVALID_INPUT_CODE,
+            ),
+            (true, true) => ValidationOutcome::invalid(
+                "give `grantIds` or `all`, not both".to_string(),
+                INVALID_INPUT_CODE,
+            ),
+            _ => ValidationOutcome::valid(),
+        })
+    }
+
+    async fn call(&self, input: Value, context: &ToolContext) -> ToolResult<Value> {
+        let parsed: RevokeInput = parse_tool_input(self.id(), &input)?;
+        let (control, session_id) = control_and_session(self, context)?;
+        let ids = if parsed.all {
+            Vec::new()
+        } else {
+            parsed
+                .grant_ids
+                .iter()
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty())
+                .collect()
+        };
+        let revoked = control
+            .revoke_authorizations(session_id, ids)
+            .await
+            .map_err(|error| execution_error(self, error))?;
+        Ok(json!({ "revoked": revoked }))
+    }
+}
+
+#[async_trait]
+impl Tool for ListAuthorizationsTool {
+    fn id(&self) -> ToolId {
+        ToolId::new(LIST_AUTHORIZATIONS_TOOL_NAME)
+    }
+
+    fn description(&self) -> &str {
+        "List your authorizations: what each allows, the tasks it is for, and \
+         whether it still applies."
+    }
+
+    fn input_schema(&self) -> ToolInputSchema {
+        json!({ "type": "object", "properties": {}, "additionalProperties": false })
+    }
+
+    fn is_read_only(&self, _input: &Value) -> bool {
+        true
+    }
+
+    fn is_concurrency_safe(&self, _input: &Value) -> bool {
+        true
+    }
+
+    async fn call(&self, _input: Value, context: &ToolContext) -> ToolResult<Value> {
+        let (control, session_id) = control_and_session(self, context)?;
+        let listing = control
+            .list_authorizations(session_id)
+            .await
+            .map_err(|error| execution_error(self, error))?;
+        Ok(Value::Array(
+            listing
+                .into_iter()
+                .map(|grant| {
+                    json!({
+                        "grantId": grant.grant_id,
+                        "summary": grant.summary,
+                        "taskIds": grant.task_ids,
+                        "state": grant.state,
+                    })
+                })
+                .collect(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -793,6 +1076,70 @@ mod tests {
         ToolContext::new()
             .with_session_id("router-session")
             .with_worker_control(control)
+    }
+
+    #[tokio::test]
+    async fn authorization_input_is_checked_before_anything_is_asked() {
+        let ctx = context(Arc::new(Recorder::default()));
+        let valid = |outcome: ValidationOutcome| outcome.is_valid();
+        assert!(valid(
+            GrantAuthorizationTool
+                .validate_input(
+                    &json!({"grants": [{"action": "git push", "target": "branch main", "summary": "push", "taskIds": ["t-1"]}]}),
+                    &ctx
+                )
+                .await
+                .unwrap()
+        ));
+        for bad in [
+            json!({"grants": []}),
+            json!({"grants": [{"action": " ", "target": "branch main", "summary": "push", "taskIds": ["t-1"]}]}),
+            json!({"grants": [{"action": "git push", "target": "branch main", "summary": "push", "taskIds": [" "]}]}),
+        ] {
+            assert!(
+                !valid(
+                    GrantAuthorizationTool
+                        .validate_input(&bad, &ctx)
+                        .await
+                        .unwrap()
+                ),
+                "{bad}"
+            );
+        }
+        assert!(!valid(
+            RevokeAuthorizationTool
+                .validate_input(&json!({}), &ctx)
+                .await
+                .unwrap()
+        ));
+        assert!(!valid(
+            RevokeAuthorizationTool
+                .validate_input(&json!({"grantIds": ["g-1"], "all": true}), &ctx)
+                .await
+                .unwrap()
+        ));
+        assert!(valid(
+            RevokeAuthorizationTool
+                .validate_input(&json!({"all": true}), &ctx)
+                .await
+                .unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_host_that_keeps_no_authorizations_says_so() {
+        let ctx = context(Arc::new(Recorder::default()));
+        assert!(GrantAuthorizationTool
+            .call(
+                json!({"grants": [{"action": "git push", "target": "branch main", "summary": "push", "taskIds": ["t-1"]}]}),
+                &ctx
+            )
+            .await
+            .is_err());
+        assert!(RevokeAuthorizationTool
+            .call(json!({"all": true}), &ctx)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

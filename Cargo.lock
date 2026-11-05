@@ -5949,6 +5949,7 @@ name = "rebon-work"
 version = "1.27.4"
 dependencies = [
  "anyhow",
+ "fs2",
  "rebon-session",
  "serde",
  "serde_json",

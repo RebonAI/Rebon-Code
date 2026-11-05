@@ -19,4 +19,5 @@ mod scheduled_prompt;
 mod supervisor_process_reaper;
 mod task_bridge;
 mod task_bridge_worker;
+mod user_grants;
 mod worker_finalization;

@@ -363,11 +363,20 @@ pub(crate) fn queue_live_background_prompt(
     prompt: PendingPrompt,
 ) -> anyhow::Result<()> {
     let queued_at = now_ms();
+    let is_router = crate::worker_control::recorded_job(
+        store.root(),
+        crate::worker_control::ROUTER_RECORD_FILE,
+    )
+    .as_deref()
+        == Some(job_id);
     store.update_state(job_id, |state| {
         owner.ensure_matches(state)?;
         let acceptance = state.append_pending_prompt(prompt.clone())?;
         if !acceptance.appended {
             return Ok(());
+        }
+        if is_router && prompt.typed_by_user() && !prompt.id.is_empty() {
+            crate::host::user_grants::note_user_prompt(store.root(), job_id, &prompt.text)?;
         }
         if !matches!(
             state.process.status,

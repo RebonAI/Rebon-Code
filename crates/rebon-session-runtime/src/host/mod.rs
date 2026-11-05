@@ -19,6 +19,7 @@ pub mod permission_snapshot;
 pub mod runtime_fields;
 pub mod runtime_permissions;
 pub mod task_bridge;
+pub(crate) mod user_grants;
 pub mod worker;
 
 #[cfg(test)]

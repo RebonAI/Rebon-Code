@@ -687,6 +687,19 @@ async fn finish_background_turn(
     // turn ended, so a client reacting to `idle` reads the total including it.
     if let Ok(outcome) = execution.as_ref() {
         publish_turn_usage(session, store, &state.identity.job_id, &outcome.usage);
+        // The reply the person's next message answers. Read from the
+        // transcript this process just wrote; it is the agent's own words, so
+        // it only ever supplies a referent, never consent.
+        if let Some(reply) =
+            rebon_session_host::background_job_transcript_path_in(&session.projects_root, state)
+                .and_then(|path| {
+                    rebon_session::last_turn_assistant_text(&path)
+                        .ok()
+                        .flatten()
+                })
+        {
+            crate::host::user_grants::note_agent_reply(&state.identity.job_id, &reply);
+        }
     }
     ipc.events.publish_turn(
         rebon_session_host::TurnStreamState::Idle,
@@ -1938,6 +1951,41 @@ async fn execute_background_job_inner(
     // Also after the model, so the floor lands on the budget this turn uses.
     if resumes_session {
         arm_cold_resume_compaction(store, &state.identity.job_id, &session);
+    }
+
+    // What carries IPC tokens or decides authority is off limits to every
+    // file tool of a background job: the job store's state files, each
+    // session's owner and live records, and the router's work directory
+    // (its ledger, requests and grants). A shell command is left to the
+    // classifier.
+    session
+        .engine_half
+        .runtime
+        .permission_broker
+        .set_protected_paths(rebon_core::permission::ProtectedPaths {
+            dirs: vec![store.jobs_dir(), rebon_work::work_dir(store.root())],
+            record_roots: vec![session.projects_root.clone()],
+            record_suffixes: vec![
+                rebon_session::SESSION_OWNER_SUFFIX.to_string(),
+                rebon_session_host::FOREGROUND_STATUS_SUFFIX.to_string(),
+                rebon_session_host::FOREGROUND_AGENT_TOKEN_SUFFIX.to_string(),
+            ],
+        });
+
+    // A router's worker reads the grants the person issued for its task, on
+    // every auto-mode decision. Per turn, like the stop gate: the session is
+    // rebuilt per turn.
+    if state.parent_job_id().is_some() {
+        session
+            .engine_half
+            .runtime
+            .permission_broker
+            .set_user_grant_source(Some(Arc::new(
+                crate::host::user_grants::TaskGrantSource::new(
+                    store.root().to_path_buf(),
+                    state.identity.job_id.clone(),
+                ),
+            )));
     }
 
     // Say which agent this turn runs under. The router lives in this process

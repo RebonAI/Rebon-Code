@@ -276,7 +276,8 @@ pub use tool_search::ToolSearchContext;
 pub use ultraplan::UltraplanRunContext;
 pub use web::WebContext;
 pub use worker_control::{
-    DispatchedWorker, PlannedTask, WorkerControl, WorkerControlContext, WorkerDispatch,
+    DispatchedWorker, GrantDecision, GrantDraft, GrantListing, PlannedTask, WorkerControl,
+    WorkerControlContext, WorkerDispatch,
 };
 pub use workflow::WorkflowContext;
 
@@ -1002,6 +1003,51 @@ struct ScratchpadContext {
 #[derive(Clone, Default)]
 pub struct AutoModeContext {
     pub classifier_transcript: Option<Arc<str>>,
+    /// The grants that cover this session's task, when it is a router's
+    /// worker. Installed by the host.
+    pub user_grants: Option<Arc<dyn UserGrantSource>>,
+}
+
+/// Something the person typed into a session, as that session's host
+/// recorded it when it arrived through a live client connection. Never built
+/// from transcript text, a task field or anything a model wrote.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LauncherUserStatement {
+    /// Order of arrival in that session, from 1.
+    pub seq: u64,
+    pub text: String,
+    /// The agent's last reply before this arrived, so a bare "yes" can be
+    /// read against the proposal it answers. Agent-authored: it supplies the
+    /// referent, never the consent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replying_to: Option<String>,
+}
+
+/// A risky step the person authorized for this session's task, as the
+/// classifier reads it. Issued by the router's host after a verifier found
+/// it in the person's own words; never written by a model.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserGrant {
+    pub id: String,
+    /// What may be done, such as `git push`.
+    pub action: String,
+    /// The specific thing that makes it risky, such as `branch main`.
+    pub target: String,
+    /// The person's own words it rests on.
+    pub user_quote: String,
+    /// The proposal the person's words answered, when they were a "yes".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_quote: Option<String>,
+}
+
+/// The live grants for this session's task, read afresh for every auto-mode
+/// decision so a revocation lands at once. Any failure is no grant.
+#[async_trait]
+pub trait UserGrantSource: Send + Sync {
+    async fn grants(&self) -> Vec<UserGrant>;
+    async fn authorization_withdrawn(&self) -> bool;
 }
 
 /// The surface-owned peer messenger attached to a [`ToolContext`].
@@ -1345,6 +1391,17 @@ impl ToolContext {
         self.extension::<AutoModeContext>()?
             .classifier_transcript
             .as_deref()
+    }
+
+    pub fn with_user_grant_source(mut self, source: Arc<dyn UserGrantSource>) -> Self {
+        self.update_extension::<AutoModeContext>(|auto| {
+            auto.user_grants = Some(source);
+        });
+        self
+    }
+
+    pub fn user_grant_source(&self) -> Option<Arc<dyn UserGrantSource>> {
+        self.extension::<AutoModeContext>()?.user_grants.clone()
     }
 
     pub fn with_additional_working_directories<I, S>(mut self, dirs: I) -> Self

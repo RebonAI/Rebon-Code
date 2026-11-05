@@ -6,13 +6,15 @@
 //! done, within a limit on how many run at once, and follows the worker
 //! until the task settles. Nobody has to watch it in between.
 //!
-//! Two kinds of file under `<home>/work/`, each with one writer:
+//! Files under `<home>/work/`:
 //!
 //! - `ledger.json` ([`Ledger`]): every task and where it stands. Written
 //!   only by the supervisor, which runs [`run_pass`] on its tick.
 //! - `requests/*.json` ([`WorkRequest`]): plans, bindings and cancellations
 //!   from anyone else (the router's tools, later the desktop app), taken
 //!   and applied by the supervisor at the start of its pass.
+//! - `grants.json` ([`GrantBook`]): the risky steps the person authorized
+//!   for the router's tasks, issued by the router's host ([`update_grants`]).
 //!
 //! Task ids are chosen by whoever files the request ([`new_task_id`]), so a
 //! tool can answer with the id at once, before the supervisor has seen it.
@@ -57,6 +59,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+
+mod grants;
+pub use grants::*;
 
 pub const WORK_DIR_NAME: &str = "work";
 pub const LEDGER_FILE_NAME: &str = "ledger.json";
@@ -470,6 +475,42 @@ pub fn file_request(home: &Path, request: &WorkRequest) -> anyhow::Result<()> {
     ));
     rebon_session::write_file_atomically(&path, &serde_json::to_vec_pretty(request)?)
         .with_context(|| format!("write {}", path.display()))
+}
+
+/// A task as its router planned it, wherever it is: in the ledger, or still
+/// in a request the supervisor has not applied. The router's job and the
+/// task's project, which is what a grant is bound to. Reads requests without
+/// taking them.
+pub fn find_planned_task(home: &Path, task_id: &str) -> Option<(Option<String>, String)> {
+    if let Ok(ledger) = Ledger::load(&ledger_path(home)) {
+        if let Some(task) = ledger.tasks.get(task_id) {
+            return Some((task.router_job_id.clone(), task.project.clone()));
+        }
+    }
+    let entries = std::fs::read_dir(requests_dir(home)).ok()?;
+    entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|path| {
+            let bytes = std::fs::read(path).ok()?;
+            serde_json::from_slice::<WorkRequest>(&bytes).ok()
+        })
+        .find_map(|request| match request {
+            WorkRequest::Plan {
+                router_job_id,
+                tasks,
+                ..
+            } => tasks
+                .into_iter()
+                .find(|task| task.id == task_id)
+                .map(|task| (router_job_id, task.project)),
+            WorkRequest::Bind {
+                router_job_id,
+                task,
+                ..
+            } if task.id == task_id => Some((router_job_id, task.project)),
+            _ => None,
+        })
 }
 
 /// Take every pending request, oldest first, removing each so it applies

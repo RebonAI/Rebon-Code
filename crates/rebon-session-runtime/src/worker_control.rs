@@ -17,13 +17,20 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use rebon_core::auto_mode_classifier::grant_verifier::{
+    GrantVerdict, GrantVerifier, GrantVerifierRequest,
+};
 use rebon_session_host::{
     BackgroundJobState, BackgroundJobStatus, BackgroundLaunchOptions, BackgroundRuntimeFields,
     BackgroundStore,
 };
-use rebon_tool::{DispatchedWorker, PlannedTask, WorkerControl, WorkerDispatch};
+use rebon_tool::{
+    DispatchedWorker, GrantDecision, GrantDraft, GrantListing, PlannedTask, WorkerControl,
+    WorkerDispatch,
+};
 
 /// Where `rebon router start` records the router's job, and the watchdog's.
 pub const ROUTER_RECORD_FILE: &str = "router.json";
@@ -46,6 +53,9 @@ const RECALL_MAX_WORKERS: usize = 30;
 pub struct HostWorkerControl {
     store: BackgroundStore,
     projects_root: PathBuf,
+    /// Checks a router's grant drafts against the person's own words.
+    /// Without one, no grant is issued.
+    grant_verifier: Option<Arc<dyn GrantVerifier>>,
 }
 
 impl HostWorkerControl {
@@ -53,7 +63,39 @@ impl HostWorkerControl {
         Self {
             store,
             projects_root,
+            grant_verifier: None,
         }
+    }
+
+    pub fn with_grant_verifier(mut self, verifier: Arc<dyn GrantVerifier>) -> Self {
+        self.grant_verifier = Some(verifier);
+        self
+    }
+
+    /// The project every one of `task_ids` is in, when each is a task of
+    /// `router_job_id`'s, planned or already in the ledger.
+    fn grant_project(&self, router_job_id: &str, task_ids: &[String]) -> Result<String, String> {
+        if task_ids.is_empty() {
+            return Err("it names no task".to_string());
+        }
+        let mut project: Option<String> = None;
+        for task_id in task_ids {
+            let (router, task_project) = rebon_work::find_planned_task(self.config_home(), task_id)
+                .ok_or_else(|| format!("{task_id} is not a task of yours"))?;
+            if router.as_deref() != Some(router_job_id) {
+                return Err(format!("{task_id} is not a task of yours"));
+            }
+            match &project {
+                None => project = Some(task_project),
+                Some(first) if first == &task_project => {}
+                Some(_) => {
+                    return Err(
+                        "its tasks are in different projects; ask once per project".to_string()
+                    )
+                }
+            }
+        }
+        Ok(project.expect("at least one task"))
     }
 
     /// The automation files live beside the jobs, as the supervisor reads
@@ -735,6 +777,169 @@ impl WorkerControl for HostWorkerControl {
     async fn recall(&self, router_session_id: &str, id: Option<&str>) -> Result<String, String> {
         self.recall_sync(router_session_id, id)
     }
+
+    async fn grant_authorizations(
+        &self,
+        router_session_id: &str,
+        drafts: Vec<GrantDraft>,
+    ) -> Result<Vec<GrantDecision>, String> {
+        let router = self.router(router_session_id)?;
+        // The watchdog acts for the router, but the person's words were heard
+        // by the router's own process: only the router can ask.
+        if router.identity.session_id.as_deref() != Some(router_session_id) {
+            return Err("only the router itself can ask for authorizations".to_string());
+        }
+        let verifier = self
+            .grant_verifier
+            .clone()
+            .ok_or("this host cannot check authorizations, so it issues none")?;
+        let router_job_id = router.identity.job_id.clone();
+        let router_pid = router.process.pid.ok_or("router has no live process")?;
+        let router_pid_identity = router
+            .process
+            .pid_identity
+            .clone()
+            .ok_or("router has no verifiable process identity")?;
+        let statements = crate::host::user_grants::statements(&router_job_id);
+        let statements: Vec<_> = statements.last().cloned().into_iter().collect();
+        let source_epoch = rebon_work::load_grants(self.config_home()).user_epoch(&router_job_id);
+        let mut decisions = Vec::with_capacity(drafts.len());
+        for draft in drafts {
+            let refuse = |reason: String| GrantDecision {
+                action: draft.action.clone(),
+                target: draft.target.clone(),
+                grant_id: None,
+                reason,
+            };
+            let project = match self.grant_project(&router_job_id, &draft.task_ids) {
+                Ok(project) => project,
+                Err(reason) => {
+                    decisions.push(refuse(reason));
+                    continue;
+                }
+            };
+            let verdict = verifier
+                .verify(&GrantVerifierRequest {
+                    action: draft.action.clone(),
+                    target: draft.target.clone(),
+                    summary: draft.summary.clone(),
+                    statements: statements.clone(),
+                })
+                .await;
+            let (user_quote, proposal_quote) = match verdict {
+                GrantVerdict::Granted {
+                    user_quote,
+                    proposal_quote,
+                } => (user_quote, proposal_quote),
+                GrantVerdict::Refused { reason } => {
+                    decisions.push(refuse(format!("not authorized: {reason}")));
+                    continue;
+                }
+            };
+            let now = rebon_session_host::now_ms();
+            let grant = rebon_work::Grant {
+                id: rebon_work::new_grant_id(now),
+                router_job_id: router_job_id.clone(),
+                router_pid,
+                router_pid_identity: router_pid_identity.clone(),
+                project,
+                task_ids: draft.task_ids.clone(),
+                action: draft.action.clone(),
+                target: draft.target.clone(),
+                summary: draft.summary.clone(),
+                user_quote: user_quote.clone(),
+                proposal_quote,
+                issued_at_ms: now,
+                expires_at_ms: now + rebon_work::MAX_GRANT_AGE_MS,
+                revoked_at_ms: None,
+                consent_withdrawn: false,
+            };
+            let grant_id = grant.id.clone();
+            let ledger = self.ledger();
+            match rebon_work::update_grants(self.config_home(), &ledger, now, |book| {
+                if book.user_epoch(&router_job_id) != source_epoch
+                    || book.denied_by_later_message(&router_job_id, &draft.action, &draft.target)
+                {
+                    false
+                } else {
+                    book.grants.push(grant);
+                    true
+                }
+            }) {
+                Ok(false) => decisions.push(refuse(
+                    "a later user message withdrew this step or changed the authorization context"
+                        .into(),
+                )),
+                Ok(true) => {
+                    let _ = self.store.append_event(
+                        &router_job_id,
+                        "authorization_granted",
+                        serde_json::json!({
+                            "grantId": &grant_id,
+                            "action": &draft.action,
+                            "target": &draft.target,
+                            "taskIds": &draft.task_ids,
+                            "userQuote": &user_quote,
+                        }),
+                    );
+                    decisions.push(GrantDecision {
+                        action: draft.action.clone(),
+                        target: draft.target.clone(),
+                        grant_id: Some(grant_id),
+                        reason: format!("the person said: \u{201c}{user_quote}\u{201d}"),
+                    });
+                }
+                Err(error) => decisions.push(refuse(format!("could not be recorded: {error:#}"))),
+            }
+        }
+        Ok(decisions)
+    }
+
+    async fn revoke_authorizations(
+        &self,
+        router_session_id: &str,
+        ids: Vec<String>,
+    ) -> Result<Vec<String>, String> {
+        let router = self.router(router_session_id)?;
+        let ledger = self.ledger();
+        let now = rebon_session_host::now_ms();
+        let revoked = rebon_work::update_grants(self.config_home(), &ledger, now, |book| {
+            book.revoke(Some(&router.identity.job_id), &ids, &ledger, now)
+        })
+        .map_err(|error| format!("{error:#}"))?;
+        if !revoked.is_empty() {
+            let _ = self.store.append_event(
+                &router.identity.job_id,
+                "authorization_revoked",
+                serde_json::json!({ "grantIds": revoked }),
+            );
+        }
+        Ok(revoked)
+    }
+
+    async fn list_authorizations(
+        &self,
+        router_session_id: &str,
+    ) -> Result<Vec<GrantListing>, String> {
+        let router = self.router(router_session_id)?;
+        let ledger = self.ledger();
+        let now = rebon_session_host::now_ms();
+        let mut grants: Vec<rebon_work::Grant> = rebon_work::load_grants(self.config_home())
+            .grants
+            .into_iter()
+            .filter(|grant| grant.router_job_id == router.identity.job_id)
+            .collect();
+        grants.sort_by(|a, b| b.issued_at_ms.cmp(&a.issued_at_ms));
+        Ok(grants
+            .into_iter()
+            .map(|grant| GrantListing {
+                state: grant.state(&ledger, now).as_str().to_string(),
+                grant_id: grant.id,
+                summary: grant.summary,
+                task_ids: grant.task_ids,
+            })
+            .collect())
+    }
 }
 
 /// Withdraw a router-owned auto worker's question, never approve a tool.
@@ -1083,6 +1288,225 @@ mod tests {
         job.process.status = BackgroundJobStatus::Idle;
         store.write_state(&job).unwrap();
         job
+    }
+
+    /// Grants when the person's words name the target; the real one is a
+    /// model, judged elsewhere.
+    struct TargetNamedVerifier;
+
+    #[async_trait]
+    impl GrantVerifier for TargetNamedVerifier {
+        async fn verify(&self, request: &GrantVerifierRequest) -> GrantVerdict {
+            let target = request.target.trim_start_matches("branch ");
+            match request
+                .statements
+                .iter()
+                .find(|statement| statement.text.contains(target))
+            {
+                Some(statement) => GrantVerdict::Granted {
+                    user_quote: statement.text.clone(),
+                    proposal_quote: None,
+                },
+                None => GrantVerdict::Refused {
+                    reason: "not named".to_string(),
+                },
+            }
+        }
+    }
+
+    fn plan_request(home: &Path, router_job_id: &str, task_id: &str, project: &Path) {
+        rebon_work::file_request(
+            home,
+            &rebon_work::WorkRequest::Plan {
+                router_job_id: Some(router_job_id.to_string()),
+                tasks: vec![rebon_work::NewTask {
+                    id: task_id.to_string(),
+                    title: "fix CI".into(),
+                    project: project.to_string_lossy().to_string(),
+                    goal: "fix CI".into(),
+                    done_when: String::new(),
+                    depends_on: Vec::new(),
+                    isolate: false,
+                    model_profile: None,
+                    worker: None,
+                }],
+                requested_at_ms: rebon_session_host::now_ms(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn draft(target: &str, task_id: &str) -> GrantDraft {
+        GrantDraft {
+            action: "git push".into(),
+            target: target.into(),
+            summary: format!("push to {target}"),
+            task_ids: vec![task_id.to_string()],
+        }
+    }
+
+    #[tokio::test]
+    async fn grants_rest_on_the_persons_words_and_reach_only_the_tasks_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BackgroundStore::new(dir.path());
+        let project = dir.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut router = job(&store, "router-session", None);
+        router.process.pid = Some(std::process::id());
+        router.process.pid_identity = rebon_session_host::process_identity(std::process::id());
+        store.write_state(&router).unwrap();
+        let other_router = job(&store, "other-router-session", None);
+        let router_id = router.identity.job_id.clone();
+        plan_request(dir.path(), &router_id, "t-mine", &project);
+        plan_request(
+            dir.path(),
+            &other_router.identity.job_id,
+            "t-theirs",
+            &project,
+        );
+        crate::host::user_grants::note_user_prompt(
+            dir.path(),
+            &router_id,
+            "fix CI, then push to main",
+        )
+        .unwrap();
+
+        let unchecked = HostWorkerControl::new(store.clone(), dir.path().join("projects"));
+        assert!(
+            unchecked
+                .grant_authorizations("router-session", vec![draft("branch main", "t-mine")])
+                .await
+                .is_err(),
+            "no verifier, no grant"
+        );
+
+        let control = HostWorkerControl::new(store.clone(), dir.path().join("projects"))
+            .with_grant_verifier(Arc::new(TargetNamedVerifier));
+        let decisions = control
+            .grant_authorizations(
+                "router-session",
+                vec![
+                    draft("branch main", "t-mine"),
+                    draft("branch release", "t-mine"),
+                    draft("branch main", "t-theirs"),
+                    draft("branch main", "t-nowhere"),
+                ],
+            )
+            .await
+            .unwrap();
+        let issued: Vec<bool> = decisions.iter().map(|d| d.grant_id.is_some()).collect();
+        assert_eq!(issued, [true, false, false, false], "{decisions:?}");
+        assert!(decisions[2].reason.contains("not a task of yours"));
+
+        // The task's worker sees it once the supervisor has bound the task.
+        let mut ledger = rebon_work::Ledger::default();
+        let mut task = rebon_work::Task {
+            id: "t-mine".into(),
+            title: "fix CI".into(),
+            project: project.to_string_lossy().to_string(),
+            goal: "fix CI".into(),
+            done_when: String::new(),
+            depends_on: Vec::new(),
+            isolate: false,
+            model_profile: None,
+            router_job_id: Some(router_id.clone()),
+            status: rebon_work::TaskStatus::Running,
+            worker_job_id: Some("w-mine".into()),
+            attempts: 1,
+            verifier_job_id: None,
+            verifier_attempts: 0,
+            rework_rounds: 0,
+            verdicts: Vec::new(),
+            worktree: None,
+            worktree_commit: None,
+            inherited_from: None,
+            requested_worker: None,
+            handed_on_to: None,
+            created_at_ms: rebon_session_host::now_ms(),
+            updated_at_ms: rebon_session_host::now_ms(),
+            note: None,
+            history: Vec::new(),
+        };
+        ledger.tasks.insert(task.id.clone(), task.clone());
+        ledger.save(&rebon_work::ledger_path(dir.path())).unwrap();
+
+        use rebon_tool::UserGrantSource as _;
+        let mine = crate::host::user_grants::TaskGrantSource::new(
+            dir.path().to_path_buf(),
+            "w-mine".into(),
+        );
+        let seen = mine.grants().await;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].target, "branch main");
+        assert_eq!(seen[0].user_quote, "fix CI, then push to main");
+        let stranger =
+            crate::host::user_grants::TaskGrantSource::new(dir.path().to_path_buf(), "w-x".into());
+        assert!(stranger.grants().await.is_empty());
+
+        // The live grant is visible to the user and persists until withdrawn.
+        let listed = control.list_authorizations("router-session").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].state, "live");
+        assert_eq!(mine.grants().await.len(), 1);
+
+        // Recovery with another router process cannot inherit the prior
+        // process's grant even while it remains in grants.json.
+        router.process.pid_identity = Some("restarted-process".into());
+        store.write_state(&router).unwrap();
+        assert!(mine.grants().await.is_empty());
+        router.process.pid_identity = rebon_session_host::process_identity(std::process::id());
+        store.write_state(&router).unwrap();
+        assert_eq!(mine.grants().await.len(), 1);
+        router.process.pid = None;
+        store.write_state(&router).unwrap();
+        assert!(
+            mine.grants().await.is_empty(),
+            "a missing source fails closed"
+        );
+        router.process.pid = Some(std::process::id());
+        store.write_state(&router).unwrap();
+        assert_eq!(mine.grants().await.len(), 1);
+
+        // A later direct denial fences every worker of the router, not just
+        // the worker whose grant was active.
+        crate::host::user_grants::note_user_prompt(
+            dir.path(),
+            &router_id,
+            "actually don't push to main",
+        )
+        .unwrap();
+        assert!(mine.grants().await.is_empty());
+        assert!(mine.authorization_withdrawn().await);
+        let denied = control
+            .grant_authorizations("router-session", vec![draft("branch main", "t-mine")])
+            .await
+            .unwrap();
+        assert!(denied[0].grant_id.is_none(), "{denied:?}");
+
+        // A withdrawn grant cannot revive after its task settles.
+        task.status = rebon_work::TaskStatus::Done;
+        ledger.tasks.insert(task.id.clone(), task);
+        ledger.save(&rebon_work::ledger_path(dir.path())).unwrap();
+        assert!(mine.grants().await.is_empty());
+
+        crate::host::user_grants::forget(&router_id);
+    }
+
+    #[tokio::test]
+    async fn nothing_typed_through_the_live_door_means_nothing_to_grant_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BackgroundStore::new(dir.path());
+        let project = dir.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        let router = job(&store, "quiet-router-session", None);
+        plan_request(dir.path(), &router.identity.job_id, "t-q", &project);
+        let control = HostWorkerControl::new(store, dir.path().join("projects"))
+            .with_grant_verifier(Arc::new(TargetNamedVerifier));
+        let decisions = control
+            .grant_authorizations("quiet-router-session", vec![draft("branch main", "t-q")])
+            .await
+            .unwrap();
+        assert!(decisions[0].grant_id.is_none());
     }
 
     #[tokio::test]

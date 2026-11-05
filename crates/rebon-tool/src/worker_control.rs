@@ -66,6 +66,42 @@ pub struct PlannedTask {
     pub worker: Option<String>,
 }
 
+/// A risky step the router believes the person authorized, for some of its
+/// tasks. Only a draft: the host issues a grant for it only when the
+/// person's own words bear it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantDraft {
+    /// What would be done, such as `git push`.
+    pub action: String,
+    /// The specific thing that makes it risky, such as `branch main`.
+    pub target: String,
+    /// One line for the person.
+    pub summary: String,
+    /// The router's tasks it is for. All must be in one project.
+    pub task_ids: Vec<String>,
+}
+
+/// What became of one draft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantDecision {
+    pub action: String,
+    pub target: String,
+    /// The grant's id when it was issued; `None` when it was refused.
+    pub grant_id: Option<String>,
+    /// Why, in a line: the words it rests on, or what was missing.
+    pub reason: String,
+}
+
+/// A grant as `ListAuthorizations` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantListing {
+    pub grant_id: String,
+    pub summary: String,
+    pub task_ids: Vec<String>,
+    /// `live`, `revoked`, `expired` or `tasks settled`.
+    pub state: String,
+}
+
 #[async_trait]
 pub trait WorkerControl: Send + Sync {
     /// Plan tasks for the router whose session is `router_session_id`. The
@@ -122,6 +158,35 @@ pub trait WorkerControl: Send + Sync {
     /// as a short digest that lists the ids next to it. With no id, list the
     /// router's workers.
     async fn recall(&self, router_session_id: &str, id: Option<&str>) -> Result<String, String>;
+
+    /// Ask for grants for risky steps the person authorized. Each draft is
+    /// issued only if the person's own words, as the host recorded them,
+    /// name the step.
+    async fn grant_authorizations(
+        &self,
+        _router_session_id: &str,
+        _drafts: Vec<GrantDraft>,
+    ) -> Result<Vec<GrantDecision>, String> {
+        Err("this host cannot issue authorizations".to_string())
+    }
+
+    /// Revoke the router's live grants with these ids, or all of them when
+    /// `ids` is empty. Returns the ids revoked.
+    async fn revoke_authorizations(
+        &self,
+        _router_session_id: &str,
+        _ids: Vec<String>,
+    ) -> Result<Vec<String>, String> {
+        Err("this host keeps no authorizations".to_string())
+    }
+
+    /// The router's grants, newest first.
+    async fn list_authorizations(
+        &self,
+        _router_session_id: &str,
+    ) -> Result<Vec<GrantListing>, String> {
+        Err("this host keeps no authorizations".to_string())
+    }
 }
 
 /// Storage for the attached [`WorkerControl`], read and written through

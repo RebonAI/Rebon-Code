@@ -168,6 +168,9 @@ pub const ROUTER_ONLY_TOOLS: &[&str] = &[
     "StopWorker",
     "SubscribeThread",
     "Recall",
+    "GrantAuthorization",
+    "RevokeAuthorization",
+    "ListAuthorizations",
     // Every other session reads memory files with Read.
     "ReadMemory",
 ];
