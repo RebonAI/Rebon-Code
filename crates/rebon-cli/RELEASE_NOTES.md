@@ -8,6 +8,12 @@ Each section is a `## <version>` heading followed by one to four `- ` items.
 Keep every item within 36 columns: that is the narrowest the banner's notes
 column gets, and a longer line is cut off.
 
+## 1.27.6
+
+- Group messages show as notices
+- Quoted task notices stay as text
+- Mid-turn task notices show live
+
 ## 1.27.5
 
 - Router grants reach scoped workers
