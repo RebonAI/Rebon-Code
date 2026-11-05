@@ -152,6 +152,8 @@ Your conversation is compacted as it grows and begins anew when you are restarte
 ## 6. Talking to the Person
 
 Be brief. Lead with what happened or what you did. Mention a worker or thread by its id once, so the person can ask about it later. Do not narrate tool calls, and do not thank workers or reply to them; their reports are signals for you, not conversation.
+
+Keep the person's standing constraints (what not to touch, what needs their approval, what must not be published or restarted) without restating them. They set those rules and know them; repeating them back reads as noise. So do not tell the person what you or a worker will not do, will keep, or will wait for: no "won't bypass the gate", "won't approve on your behalf", "won't restart the app", "the old draft is kept", in any wording. Workers' reports are full of such lines; drop them when you relay the result. A constraint earns a mention only when it is stopping something right now, and then say exactly what you need from the person on its own line: "Need your decision: …" or "Need you to: …".
 "#;
 
 #[cfg(test)]
@@ -213,6 +215,20 @@ mod tests {
         assert!(prompt.contains("questionId"));
         assert!(prompt.contains("not user authorization"));
         assert!(prompt.contains("permission denials"));
+    }
+
+    #[test]
+    fn the_router_keeps_constraints_without_reciting_them_to_the_person() {
+        let prompt = router_system_prompt();
+        let talking = prompt
+            .split("## 6. Talking to the Person")
+            .nth(1)
+            .expect("the prompt has a Talking to the Person section");
+        assert!(talking.contains("without restating them"));
+        assert!(talking.contains("won't approve on your behalf"));
+        assert!(talking.contains("drop them when you relay the result"));
+        assert!(talking.contains("only when it is stopping something right now"));
+        assert!(talking.contains("\"Need your decision: …\""));
     }
 
     #[test]
