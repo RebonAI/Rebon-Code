@@ -8,6 +8,12 @@ Each section is a `## <version>` heading followed by one to four `- ` items.
 Keep every item within 36 columns: that is the narrowest the banner's notes
 column gets, and a longer line is cut off.
 
+## 1.27.7
+
+- Router talks to you via TellPerson
+- Router reports progress on its own
+- Quiet work gets a progress check
+
 ## 1.27.6
 
 - Group messages show as notices
