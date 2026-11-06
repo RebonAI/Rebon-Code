@@ -35,6 +35,7 @@ pub(crate) use rebon_session_runtime::{
 };
 mod router;
 mod router_digest;
+mod router_progress;
 mod serve;
 mod session_agent_router;
 #[cfg(test)]

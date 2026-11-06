@@ -63,6 +63,32 @@ impl WorkHost {
         )
     }
 
+    /// Where `router_job_id`'s tasks stand, for its progress checks: whether
+    /// any is still open, and a line per task that changes as the task moves.
+    pub(crate) fn progress_of(&self, router_job_id: &str) -> (bool, Vec<String>) {
+        let slot = self.ledger.borrow();
+        let Some(ledger) = slot.as_ref() else {
+            return (false, Vec::new());
+        };
+        let mut open = false;
+        let mut lines = Vec::new();
+        for task in ledger
+            .tasks
+            .values()
+            .filter(|task| task.router_job_id.as_deref() == Some(router_job_id))
+        {
+            open |= !task.status.is_settled();
+            lines.push(format!(
+                "task {} {} {} {}",
+                task.id,
+                task.status.as_str(),
+                task.attempts,
+                task.rework_rounds
+            ));
+        }
+        (open, lines)
+    }
+
     /// One tick. `true` while a task is open; the notices are for the router.
     pub(crate) fn tick(
         &self,
