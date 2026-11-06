@@ -657,6 +657,45 @@ pub fn publish_turn_usage(
     }
 }
 
+/// The reply the person's next message answers, read from the transcript this
+/// process just wrote. It is the agent's own words, so it only ever supplies
+/// a referent, never consent. A router speaks to the person only through
+/// `TellPerson`, so for it this is what it told them, and a turn that told
+/// them anything is noted as its last report, which the supervisor's
+/// progress checks count from.
+fn note_turn_reply(
+    session: &crate::EngineSession,
+    store: &BackgroundStore,
+    state: &BackgroundJobState,
+) {
+    let Some(path) =
+        rebon_session_host::background_job_transcript_path_in(&session.projects_root, state)
+    else {
+        return;
+    };
+    let job_id = &state.identity.job_id;
+    let router =
+        session.engine_half.coordinator_mode_handle.mode() == rebon_tool::SessionMode::Router;
+    let reply = if router {
+        rebon_session::last_turn_person_text(&path)
+    } else {
+        rebon_session::last_turn_assistant_text(&path)
+    };
+    let Some(reply) = reply.ok().flatten() else {
+        return;
+    };
+    crate::host::user_grants::note_agent_reply(job_id, &reply);
+    if router {
+        if let Err(error) = rebon_session_host::person_report::note_person_report(
+            store,
+            job_id,
+            rebon_session_host::now_ms(),
+        ) {
+            tracing::warn!(%error, job_id, "could not note the router's report");
+        }
+    }
+}
+
 /// Close the turn out: publish what it produced, then let the session go.
 ///
 /// Everything here happens after the model is done and before the caller gets
@@ -687,19 +726,7 @@ async fn finish_background_turn(
     // turn ended, so a client reacting to `idle` reads the total including it.
     if let Ok(outcome) = execution.as_ref() {
         publish_turn_usage(session, store, &state.identity.job_id, &outcome.usage);
-        // The reply the person's next message answers. Read from the
-        // transcript this process just wrote; it is the agent's own words, so
-        // it only ever supplies a referent, never consent.
-        if let Some(reply) =
-            rebon_session_host::background_job_transcript_path_in(&session.projects_root, state)
-                .and_then(|path| {
-                    rebon_session::last_turn_assistant_text(&path)
-                        .ok()
-                        .flatten()
-                })
-        {
-            crate::host::user_grants::note_agent_reply(&state.identity.job_id, &reply);
-        }
+        note_turn_reply(session, store, state);
     }
     ipc.events.publish_turn(
         rebon_session_host::TurnStreamState::Idle,

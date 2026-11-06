@@ -15,6 +15,7 @@ pub mod env;
 mod file_mention;
 mod kernel_plugin;
 mod paste_content;
+mod person_channel;
 mod reasoning_effort;
 mod secure_token;
 mod session_id;
@@ -48,6 +49,9 @@ pub use summary_envelope::{display_text_for_summary_envelope, summary_envelope_t
 pub use task_status::{ListTask, TaskListStatus, TaskStatus};
 pub use text::{truncate_chars, xml_escape, xml_unescape};
 pub use time_fmt::{format_system_time_iso_ms, wall_clock_ms, wall_clock_ms_u128};
+pub use person_channel::{
+    tell_person_message, TELL_PERSON_MESSAGE_FIELD, TELL_PERSON_TOOL_NAME,
+};
 pub use transcript_row_id::{is_task_notification_row_uuid, TASK_NOTIFICATION_ROW_UUID_PREFIX};
 pub use types::*;
 pub use ultraplan_manifest::*;

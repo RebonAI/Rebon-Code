@@ -61,6 +61,7 @@ mod legacy_foreground;
 /// that already exist: hosted job records and foreground `.live.json`
 /// heartbeats.
 pub mod peers;
+pub mod person_report;
 mod process_liveness;
 pub mod protocol;
 mod respawned_job;

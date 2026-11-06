@@ -2381,6 +2381,93 @@ pub fn last_turn_assistant_text(path: &Path) -> std::io::Result<Option<String>> 
     Ok(Some(paragraphs.join("\n\n")))
 }
 
+/// What the person was told in the transcript's last turn, for a session
+/// that speaks to them through `TellPerson` (the router).
+///
+/// Every `TellPerson` message counts, in order. A message the person typed
+/// that no `TellPerson` call answered afterwards is answered by the turn's
+/// last text instead, so a reply the router wrote without the tool is still
+/// the one the person saw. Text in a turn the person did not start (a digest,
+/// an event, a wakeup) is the router's own work and counts for nothing.
+///
+/// The turn starts at the last prompt that is not a mid-turn attachment.
+/// `Ok(None)` when the person was told nothing.
+pub fn last_turn_person_text(path: &Path) -> std::io::Result<Option<String>> {
+    let Some(loaded) = load_transcript_from_file(path)? else {
+        return Ok(None);
+    };
+    let messages = loaded.messages;
+    let Some(start) = messages.iter().rposition(|entry| {
+        turn_prompt_text(entry).is_some() && !is_mid_turn_attachment(&entry.raw)
+    }) else {
+        return Ok(None);
+    };
+    let mut told: Vec<String> = Vec::new();
+    // The last text written since a typed message no report answered.
+    let mut owed: Option<Option<String>> = None;
+    for entry in &messages[start..] {
+        match entry.entry_type.as_str() {
+            "user" if turn_prompt_text(entry).is_some() && is_person_prompt(&entry.raw) => {
+                owed = Some(None);
+            }
+            "assistant" => {
+                let blocks = entry
+                    .raw
+                    .get("message")
+                    .and_then(|message| message.get("content"))
+                    .and_then(Value::as_array);
+                for block in blocks.into_iter().flatten() {
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("tool_use") => {
+                            let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+                            let input = block.get("input").unwrap_or(&Value::Null);
+                            if let Some(message) = rebon_types::tell_person_message(name, input) {
+                                told.push(message.to_string());
+                                owed = None;
+                            }
+                        }
+                        Some("text") => {
+                            let text = block.get("text").and_then(Value::as_str).unwrap_or("");
+                            if let Some(last) = owed.as_mut().filter(|_| !text.trim().is_empty()) {
+                                *last = Some(text.trim().to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    told.extend(owed.flatten());
+    Ok((!told.is_empty()).then(|| told.join("\n\n")))
+}
+
+/// A prompt row the engine queued into a running turn rather than one that
+/// started a turn.
+fn is_mid_turn_attachment(raw: &Value) -> bool {
+    ["runtimeAttachment", "queuedCommand"]
+        .iter()
+        .any(|key| raw.get(*key).and_then(Value::as_bool) == Some(true))
+}
+
+/// A user row the person typed: not one the engine or another agent wrote
+/// (`u-internal-…` scheduled and group deliveries, `u-agent-message-…`
+/// peer messages, `isMeta` context).
+fn is_person_prompt(raw: &Value) -> bool {
+    let uuid = raw.get("uuid").and_then(Value::as_str).unwrap_or("");
+    let meta = raw.get("isMeta").and_then(Value::as_bool) == Some(true)
+        || raw
+            .get("message")
+            .and_then(|message| message.get("isMeta"))
+            .and_then(Value::as_bool)
+            == Some(true);
+    !meta
+        && !uuid.starts_with("u-internal-")
+        && !uuid.starts_with("u-agent-message-")
+        && !uuid.starts_with("u-attach-")
+}
+
 fn summarize_request_fingerprint(request: &SummarizeConversationRequest) -> [u8; 32] {
     let mut hasher = Sha256::new();
     let mode = match request.mode {
@@ -6924,6 +7011,115 @@ mod tests {
             last_turn_assistant_text(&tool_only).unwrap(),
             None,
             "a turn that ended on a tool call said nothing"
+        );
+    }
+
+    fn tell(id: &str, message: &str) -> Value {
+        json!({"type":"tool_use","id":id,"name":"TellPerson","input":{"message":message}})
+    }
+
+    /// `rows` as one chain, each the child of the one before.
+    fn write_chain(path: &Path, rows: &[Value]) {
+        let mut parent = Value::Null;
+        let chained: Vec<Value> = rows
+            .iter()
+            .map(|row| {
+                let mut row = row.clone();
+                row["parentUuid"] = parent.clone();
+                parent = row["uuid"].clone();
+                row
+            })
+            .collect();
+        write_jsonl(path, &chained);
+    }
+
+    #[test]
+    fn the_person_hears_reports_and_answers_but_not_the_routers_work() {
+        let root_dir = temp_projects_root("last-turn-person");
+        let root = root_dir.path();
+        let digest = json!({"type":"user","uuid":"u-internal-scheduled-digest-1","isMeta":true,"message":{"content":"[Worker digest]"}});
+
+        // A digest turn the router worked through without reporting.
+        let silent = root.join("silent.jsonl");
+        write_chain(
+            &silent,
+            &[
+                digest.clone(),
+                json!({"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"Nothing needs the person."}]}}),
+            ],
+        );
+        assert_eq!(last_turn_person_text(&silent).unwrap(), None);
+
+        // A digest turn with a report: only the report.
+        let reported = root.join("reported.jsonl");
+        write_chain(
+            &reported,
+            &[
+                digest.clone(),
+                json!({"type":"assistant","uuid":"a1","message":{"content":[
+                    {"type":"text","text":"t-1 passed; telling them."},
+                    tell("c1", "t-1 is done: the login test passes.")
+                ]}}),
+                json!({"type":"assistant","uuid":"a2","message":{"content":[{"type":"text","text":"Reported."}]}}),
+            ],
+        );
+        assert_eq!(
+            last_turn_person_text(&reported).unwrap().as_deref(),
+            Some("t-1 is done: the login test passes.")
+        );
+
+        // The person asked and the router answered without the tool: its
+        // last text is the answer, not the notes before it.
+        let answered = root.join("answered.jsonl");
+        write_chain(
+            &answered,
+            &[
+                json!({"type":"user","uuid":"pp-1","message":{"content":"how is the fix going?"}}),
+                json!({"type":"assistant","uuid":"a1","message":{"content":[
+                    {"type":"text","text":"Recalling t-1."},
+                    {"type":"tool_use","id":"c1","name":"Recall","input":{"id":"t-1"}}
+                ]}}),
+                json!({"type":"user","uuid":"r1","message":{"content":[{"type":"tool_result","tool_use_id":"c1","content":"running"}]}}),
+                json!({"type":"assistant","uuid":"a2","message":{"content":[{"type":"text","text":"t-1 is still running."}]}}),
+            ],
+        );
+        assert_eq!(
+            last_turn_person_text(&answered).unwrap().as_deref(),
+            Some("t-1 is still running.")
+        );
+
+        // A report answered the question, so the text after it is work.
+        let told = root.join("told.jsonl");
+        write_chain(
+            &told,
+            &[
+                json!({"type":"user","uuid":"pp-1","message":{"content":"fix the login page"}}),
+                json!({"type":"assistant","uuid":"a1","message":{"content":[
+                    tell("c1", "On it as t-1."),
+                    {"type":"text","text":"Planned."}
+                ]}}),
+            ],
+        );
+        assert_eq!(
+            last_turn_person_text(&told).unwrap().as_deref(),
+            Some("On it as t-1.")
+        );
+
+        // A digest turn the person wrote into: the report before, and the
+        // answer to what they wrote.
+        let joined = root.join("joined.jsonl");
+        write_chain(
+            &joined,
+            &[
+                digest,
+                json!({"type":"assistant","uuid":"a1","message":{"content":[tell("c1", "t-1 is done.")]}}),
+                json!({"type":"user","uuid":"pp-2","queuedCommand":true,"message":{"content":"and t-2?"}}),
+                json!({"type":"assistant","uuid":"a2","message":{"content":[{"type":"text","text":"t-2 is next."}]}}),
+            ],
+        );
+        assert_eq!(
+            last_turn_person_text(&joined).unwrap().as_deref(),
+            Some("t-1 is done.\n\nt-2 is next.")
         );
     }
 

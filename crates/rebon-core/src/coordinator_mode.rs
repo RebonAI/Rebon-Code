@@ -173,6 +173,8 @@ pub const ROUTER_ONLY_TOOLS: &[&str] = &[
     "ListAuthorizations",
     // Every other session reads memory files with Read.
     "ReadMemory",
+    // Every other session talks to the person in its own replies.
+    rebon_types::TELL_PERSON_TOOL_NAME,
 ];
 
 /// Filter for an Agent Queue supervisor outside CEO mode.

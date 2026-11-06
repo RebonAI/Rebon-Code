@@ -25,6 +25,7 @@ pub const CANCEL_TASK_TOOL_NAME: &str = "CancelTask";
 pub const GRANT_AUTHORIZATION_TOOL_NAME: &str = "GrantAuthorization";
 pub const REVOKE_AUTHORIZATION_TOOL_NAME: &str = "RevokeAuthorization";
 pub const LIST_AUTHORIZATIONS_TOOL_NAME: &str = "ListAuthorizations";
+pub use rebon_types::TELL_PERSON_TOOL_NAME;
 
 /// Every router tool name.
 pub const ROUTER_TOOL_NAMES: &[&str] = &[
@@ -38,10 +39,13 @@ pub const ROUTER_TOOL_NAMES: &[&str] = &[
     GRANT_AUTHORIZATION_TOOL_NAME,
     REVOKE_AUTHORIZATION_TOOL_NAME,
     LIST_AUTHORIZATIONS_TOOL_NAME,
+    TELL_PERSON_TOOL_NAME,
 ];
 
 const INVALID_INPUT_CODE: i64 = 400;
 const MAX_BRIEF_CHARS: usize = 40_000;
+/// A report is a few lines the person reads, not a document.
+const MAX_REPORT_CHARS: usize = 4_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct DispatchWorkerTool;
@@ -63,6 +67,8 @@ pub struct GrantAuthorizationTool;
 pub struct RevokeAuthorizationTool;
 #[derive(Debug, Clone, Default)]
 pub struct ListAuthorizationsTool;
+#[derive(Debug, Clone, Default)]
+pub struct TellPersonTool;
 
 /// The control and the router's session id, or the refusal every tool gives
 /// outside a router session.
@@ -978,6 +984,75 @@ impl Tool for ListAuthorizationsTool {
                 })
                 .collect(),
         ))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct TellPersonInput {
+    message: String,
+}
+
+#[async_trait]
+impl Tool for TellPersonTool {
+    fn id(&self) -> ToolId {
+        ToolId::new(TELL_PERSON_TOOL_NAME)
+    }
+
+    fn description(&self) -> &str {
+        "Say something to the person. This is the only way your words reach \
+         them: your plain text, your other tool calls and the digests you read \
+         are your own work, which they do not see. Use it to answer them, to \
+         report progress (work planned, a task done, stuck or blocked, \
+         everything finished) and to ask for what only they can give. \
+         Markdown; name tasks and workers by id."
+    }
+
+    fn input_schema(&self) -> ToolInputSchema {
+        json!({
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "What the person reads: short, leading with what happened"
+                }
+            },
+            "required": ["message"],
+            "additionalProperties": false
+        })
+    }
+
+    fn is_read_only(&self, _input: &Value) -> bool {
+        true
+    }
+
+    fn is_concurrency_safe(&self, _input: &Value) -> bool {
+        false
+    }
+
+    async fn validate_input(
+        &self,
+        input: &Value,
+        _context: &ToolContext,
+    ) -> ToolResult<ValidationOutcome> {
+        let parsed: TellPersonInput = parse_tool_input(self.id(), input)?;
+        if let Some(invalid) = required(&parsed.message, "message") {
+            return Ok(invalid);
+        }
+        if parsed.message.chars().count() > MAX_REPORT_CHARS {
+            return Ok(ValidationOutcome::invalid(
+                format!("keep it under {MAX_REPORT_CHARS} characters; the person reads it whole"),
+                INVALID_INPUT_CODE,
+            ));
+        }
+        Ok(ValidationOutcome::valid())
+    }
+
+    async fn call(&self, input: Value, _context: &ToolContext) -> ToolResult<Value> {
+        let _: TellPersonInput = parse_tool_input(self.id(), &input)?;
+        // The call itself is the message: the transcript row it leaves is
+        // what the person's side of the conversation is drawn from.
+        Ok(Value::String("The person has it.".to_string()))
     }
 }
 
