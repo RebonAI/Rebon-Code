@@ -28,15 +28,13 @@
 
 use async_trait::async_trait;
 use rebon_tool::edit::{
-    check_read_before_edit, check_read_before_edit_with_state, enforce_edit_path_scope,
-    explicitly_authorized_write_path, is_auto_memory_path, normalize_path,
-    FILE_MODIFIED_SINCE_READ_CODE, INVALID_INPUT_CODE, NOT_FILE_CODE, NOT_FOUND_CODE,
+    enforce_edit_path_scope, explicitly_authorized_write_path, is_auto_memory_path, normalize_path,
+    INVALID_INPUT_CODE, NOT_FILE_CODE, NOT_FOUND_CODE,
 };
 use rebon_tool::{Tool, ToolContext};
 use rebon_tools_core::{
-    file_state::{file_mtime_ms, FileState},
-    require_valid_input, validation_outcome_from, PermissionDecision, PermissionRequest, ToolError,
-    ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
+    file_state::FileState, require_valid_input, validation_outcome_from, PermissionDecision,
+    PermissionRequest, ToolError, ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
 };
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -116,8 +114,7 @@ impl Tool for NotebookEditTool {
         "Replaces, inserts, or deletes a single cell in a Jupyter notebook (.ipynb).\n\
          \n\
          Usage:\n\
-         - `notebook_path` must be an absolute path to an existing .ipynb file. Read it first; \
-         this tool errors if you have not.\n\
+         - `notebook_path` must be an absolute path to an existing .ipynb file.\n\
          - `cell_id` is the cell's `id` field as it appears in the notebook JSON. For older \
          notebooks whose cells have no `id`, pass the 0-based cell index as a string instead.\n\
          - `edit_mode` is `replace` (default), `insert`, or `delete`.\n\
@@ -181,10 +178,7 @@ impl Tool for NotebookEditTool {
         input: &Value,
         context: &ToolContext,
     ) -> ToolResult<ValidationOutcome> {
-        match prepare_input(self.id(), input, context) {
-            Ok(parsed) => check_read_before_edit(&parsed.notebook_path, "", context),
-            refused => validation_outcome_from(refused),
-        }
+        validation_outcome_from(prepare_input(self.id(), input, context))
     }
 
     async fn check_permissions(
@@ -227,28 +221,9 @@ impl Tool for NotebookEditTool {
     async fn call(&self, input: Value, context: &ToolContext) -> ToolResult<Value> {
         let parsed = prepare_input(self.id(), &input, context)?;
 
-        let observed_state = context
-            .file_state_cache()
-            .and_then(|cache| cache.get(&parsed.notebook_path));
+        // The cell is resolved against the notebook as it is now, under the
+        // path lock; there is no read-state precondition.
         let _file_guard = rebon_tool::lock_file_for_write(&parsed.notebook_path).await;
-        rebon_tool::ensure_file_not_mutated_in_current_batch(
-            &parsed.notebook_path,
-            context,
-            self.id(),
-            FILE_MODIFIED_SINCE_READ_CODE,
-        )?;
-
-        let state_check =
-            check_read_before_edit_with_state(&parsed.notebook_path, "", context, observed_state)?;
-        if !state_check.is_valid() {
-            return Err(ToolError::InvalidInput {
-                tool: self.id(),
-                reason: state_check
-                    .message
-                    .unwrap_or_else(|| "NotebookEdit precondition failed".into()),
-                error_code: state_check.error_code,
-            });
-        }
 
         let raw = match fs::read_to_string(&parsed.notebook_path) {
             Ok(raw) => raw,
@@ -304,18 +279,14 @@ impl Tool for NotebookEditTool {
                 source: err.into(),
             }
         })?;
-        rebon_tool::record_file_mutation_in_current_batch(&parsed.notebook_path, context);
 
-        // Keep the file-state cache honest: the model's Read snapshot of
-        // this notebook is now stale, and refreshing it here is what lets
-        // a follow-up NotebookEdit run without another Read.
+        // Record what this session just wrote: it marks the notebook as seen
+        // for a later Write, and gives Read's range merge current content.
         if let Some(cache) = context.file_state_cache() {
-            let timestamp_ms = file_mtime_ms(&parsed.notebook_path).unwrap_or(0);
             cache.set(
                 &parsed.notebook_path,
                 FileState {
                     content: serialized.clone(),
-                    timestamp_ms,
                     offset: None,
                     limit: None,
                     is_partial_view: false,
@@ -608,9 +579,8 @@ fn generate_cell_id() -> String {
 ///
 /// Both entry points ask the same three questions in the same order — does
 /// the input parse, does the path clear the edit scope, is the parsed request
-/// well-formed. They part company afterwards: `validate_input` answers the
-/// read-before-edit question from the cache, `call` answers it against the
-/// state it is about to write.
+/// well-formed. Resolving the cell is left to `call`, against the notebook
+/// it is about to rewrite.
 fn prepare_input(
     tool: ToolId,
     input: &Value,
@@ -751,7 +721,6 @@ fn validate_parsed_input(input: &NotebookEditInput) -> ToolResult<ValidationOutc
 mod tests {
     use super::*;
     use rebon_agent_core::file_history::FileHistoryTracker;
-    use rebon_tool::edit::MUST_READ_BEFORE_EDIT_CODE;
     use rebon_tools_core::file_state::FileStateCache;
     use rebon_tools_core::PermissionBehavior;
     use serde_json::json;
@@ -815,7 +784,6 @@ mod tests {
             path,
             FileState {
                 content: content.to_string(),
-                timestamp_ms: file_mtime_ms(path).unwrap_or(0),
                 offset: None,
                 limit: None,
                 is_partial_view: false,
@@ -1343,12 +1311,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn requires_read_before_edit() {
+    async fn edits_a_notebook_this_session_never_read() {
         let dir = TempDir::new();
         let path = write_notebook(&dir);
-        let ctx = ToolContext::new().with_file_state_cache(FileStateCache::new());
+        let cache = FileStateCache::new();
+        let ctx = ToolContext::new().with_file_state_cache(cache.clone());
 
-        let err = tool()
+        tool()
             .call(
                 json!({
                     "notebook_path": path.to_string_lossy(),
@@ -1358,32 +1327,22 @@ mod tests {
                 &ctx,
             )
             .await
-            .unwrap_err();
+            .expect("no Read is required before a NotebookEdit");
 
-        match err {
-            ToolError::InvalidInput { error_code, .. } => {
-                assert_eq!(error_code, Some(MUST_READ_BEFORE_EDIT_CODE))
-            }
-            other => panic!("expected InvalidInput, got {other:?}"),
-        }
+        assert_eq!(read_notebook(&path)["cells"][1]["source"], json!(["x\n"]));
+        assert_eq!(
+            cache.get(&path).unwrap().content,
+            fs::read_to_string(&path).unwrap()
+        );
     }
 
+    /// Two NotebookEdits of one notebook, back to back: both apply, and an
+    /// outside change to the notebook after it was read does not block them.
     #[tokio::test]
-    async fn refreshes_cache_so_a_second_edit_needs_no_reread() {
+    async fn back_to_back_edits_apply_despite_a_stale_snapshot() {
         let dir = TempDir::new();
         let path = write_notebook(&dir);
-        let cache = FileStateCache::new();
-        cache.set(
-            &path,
-            FileState {
-                content: fs::read_to_string(&path).unwrap(),
-                timestamp_ms: file_mtime_ms(&path).unwrap_or(0),
-                offset: None,
-                limit: None,
-                is_partial_view: false,
-            },
-        );
-        let ctx = ToolContext::new().with_file_state_cache(cache);
+        let ctx = observed_context(&path, "{\"stale\": true}", None);
 
         tool()
             .call(
@@ -1406,67 +1365,8 @@ mod tests {
                 &ctx,
             )
             .await
-            .expect("second notebook edit should not require another Read");
+            .expect("second notebook edit applies to the first one's result");
 
-        assert_eq!(
-            read_notebook(&path)["cells"][1]["source"],
-            json!(["second\n"])
-        );
-    }
-
-    #[tokio::test]
-    async fn same_dispatch_batch_rejects_second_notebook_edit() {
-        let dir = TempDir::new();
-        let path = write_notebook(&dir);
-        let initial = fs::read_to_string(&path).unwrap();
-        let context = observed_context(&path, &initial, None).with_fresh_file_mutation_batch();
-
-        tool()
-            .call(
-                json!({
-                    "notebook_path": path.to_string_lossy(),
-                    "cell_id": "compute",
-                    "new_source": "first\n"
-                }),
-                &context,
-            )
-            .await
-            .expect("first notebook edit in the batch");
-        let error = tool()
-            .call(
-                json!({
-                    "notebook_path": path.to_string_lossy(),
-                    "cell_id": "compute",
-                    "new_source": "second\n"
-                }),
-                &context,
-            )
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            ToolError::InvalidInput {
-                error_code: Some(FILE_MODIFIED_SINCE_READ_CODE),
-                ..
-            }
-        ));
-        assert_eq!(
-            read_notebook(&path)["cells"][1]["source"],
-            json!(["first\n"])
-        );
-
-        tool()
-            .call(
-                json!({
-                    "notebook_path": path.to_string_lossy(),
-                    "cell_id": "compute",
-                    "new_source": "second\n"
-                }),
-                &context.clone().with_fresh_file_mutation_batch(),
-            )
-            .await
-            .expect("a later batch may build on the refreshed notebook cache");
         assert_eq!(
             read_notebook(&path)["cells"][1]["source"],
             json!(["second\n"])
@@ -1474,7 +1374,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn parallel_notebook_edits_serialize_and_reject_the_stale_writer() {
+    async fn parallel_notebook_edits_serialize_on_the_path_lock() {
         let dir = TempDir::new();
         let path = write_notebook(&dir);
         let initial = fs::read_to_string(&path).unwrap();
@@ -1538,17 +1438,13 @@ mod tests {
 
         release_tx.send(()).unwrap();
         first.await.unwrap().expect("first notebook edit");
-        let error = second.await.unwrap().unwrap_err();
-        assert!(matches!(
-            error,
-            ToolError::InvalidInput {
-                error_code: Some(FILE_MODIFIED_SINCE_READ_CODE),
-                ..
-            }
-        ));
+        second
+            .await
+            .unwrap()
+            .expect("the second edit applies to the first one's result");
         assert_eq!(
             read_notebook(&path)["cells"][1]["source"],
-            json!(["first\n"])
+            json!(["second\n"])
         );
     }
 

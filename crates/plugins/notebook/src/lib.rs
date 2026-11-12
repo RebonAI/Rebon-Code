@@ -1,8 +1,8 @@
 //! `notebook`: the feature plugin that puts `NotebookEdit` on the process
 //! tool seat.
 //!
-//! The implementation and its tests live here. The read-before-edit check,
-//! path-scope gate, mutation ledger and history tracker remain shared with
+//! The implementation and its tests live here. The path-scope gate, the
+//! per-path write lock and the history tracker remain shared with
 //! the core file tools in `rebon-tool`.
 //!
 //! `NotebookEdit` stays in `rebon_tools_core::BUILTIN_TOOL_FACTS` with kind

@@ -1,34 +1,38 @@
-//! Per-session cache of files the model has observed via the `Read` tool, used
-//! by `Edit` / `Write` to enforce "must read before edit" and to detect
-//! external modification between a Read and a write.
+//! Per-session cache of files the model has observed: what `Read` showed,
+//! what this session's own `Edit` / `Write` / `MultiEdit` / `NotebookEdit`
+//! wrote, and what the system prompt quoted verbatim.
 //!
 //! The cache is a plain `HashMap` behind a `Mutex`: no LRU eviction and no byte
 //! cap.
 //!
+//! It is not a freshness gate. Nothing compares a cached snapshot with the
+//! file on disk before writing — files change under the session all the time
+//! (formatters, hooks, other agents), and refusing over that costs a round
+//! for nothing. `Edit` matches `old_string` against the current content
+//! instead. Two things read the cache:
+//!
+//! * **`Write`'s "seen" rule.** Overwriting an existing file needs either
+//!   an entry here that is not a partial view, or `overwrite: true`.
+//! * **`Read`'s range merge**, which widens a new range to an overlapping one
+//!   it already showed while the content is unchanged (`content`, `offset`,
+//!   `limit`).
+//!
 //! Key invariants:
 //!
-//! * Read stores the **raw file content** (not rendered / not line-numbered)
-//!   along with the file's current mtime.
-//! * Edit/Write **refresh the entry immediately after writing to disk**,
-//!   setting `timestamp_ms` to the post-write mtime and clearing `offset` /
-//!   `limit`. That is what lets the model call Edit multiple times on the same
-//!   file *without* re-reading: the next decisive check compares disk content
-//!   with the just-written cached snapshot, and the mtime stays useful metadata
-//!   rather than a gate on content validation.
+//! * Read stores the **raw file content** (not rendered / not line-numbered).
+//! * Edit/Write **refresh the entry immediately after writing to disk** with
+//!   the new content, clearing `offset` / `limit`.
 //! * `is_partial_view` is **not** a Read concept. It is set only when
 //!   auto-injected memory content (REBON.md / MEMORY.md / CLAUDE.md) was
 //!   processed (stripped HTML comments, stripped frontmatter, truncated
 //!   MEMORY.md) such that the bytes the model saw no longer match the bytes on
-//!   disk. In that one case `content` holds the RAW disk bytes (so diffing
-//!   against disk still works) and Edit/Write refuse until the model performs
-//!   an explicit Read to see the real content. Regular `offset` / `limit` /
-//!   auto-truncation does NOT set this flag — the Read path stores exactly what
-//!   the model saw.
+//!   disk. Such an entry does not count as seen for `Write`. Regular
+//!   `offset` / `limit` / auto-truncation does NOT set this flag — the Read
+//!   path stores exactly what the model saw.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::UNIX_EPOCH;
 
 /// Snapshot of a file as observed by the harness.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,9 +42,6 @@ pub struct FileState {
     /// truncation note). For post-Edit/Write refresh, this is the new
     /// content just written to disk.
     pub content: String,
-    /// Whole milliseconds since the Unix epoch at observation time; 0 if
-    /// the stat failed.
-    pub timestamp_ms: u64,
     /// 1-based starting line of the Read, or `None` for full reads /
     /// post-Edit / post-Write refreshes.
     pub offset: Option<u64>,
@@ -49,11 +50,11 @@ pub struct FileState {
     /// True when this entry was populated by auto-injection (REBON.md
     /// / MEMORY.md) and the injected content did not match disk
     /// (stripped HTML comments, stripped frontmatter, truncated
-    /// MEMORY.md). The model has only seen a transformed view; Edit /
-    /// Write require an explicit Read first. `content` here holds the
-    /// RAW disk bytes (so it can still be diffed against disk), not
-    /// what the model saw. Never set from the Read path — `offset` / `limit` /
-    /// auto-truncation do not imply a partial view.
+    /// MEMORY.md). The model has only seen a transformed view, so the
+    /// entry does not count as seen for Write. `content` here holds the
+    /// RAW disk bytes, not what the model saw. Never set from the Read
+    /// path — `offset` / `limit` / auto-truncation do not imply a partial
+    /// view.
     pub is_partial_view: bool,
 }
 
@@ -158,18 +159,6 @@ pub fn normalize_path_key(path: &Path) -> String {
     }
 }
 
-/// Read the file's mtime as whole milliseconds since the Unix epoch —
-/// `modified().duration_since(UNIX_EPOCH)` truncated by `as_millis()`.
-///
-/// Returns `Ok(0)` if the platform doesn't expose a monotonic mtime
-/// (rare); returns an `Err` if the file itself can't be stat-ed.
-pub fn file_mtime_ms(path: &Path) -> std::io::Result<u64> {
-    let meta = std::fs::metadata(path)?;
-    let modified = meta.modified()?;
-    let d = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
-    Ok(d.as_millis() as u64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,7 +174,6 @@ mod tests {
             &p,
             FileState {
                 content: "hello".into(),
-                timestamp_ms: 1000,
                 offset: None,
                 limit: None,
                 is_partial_view: false,
@@ -193,15 +181,13 @@ mod tests {
         );
         let got = cache.get(&p).unwrap();
         assert_eq!(got.content, "hello");
-        assert_eq!(got.timestamp_ms, 1000);
         assert!(!got.is_partial_view);
 
-        // Post-edit refresh: new content and higher timestamp.
+        // Post-edit refresh: new content.
         cache.set(
             &p,
             FileState {
                 content: "hello world".into(),
-                timestamp_ms: 1001,
                 offset: None,
                 limit: None,
                 is_partial_view: false,
@@ -209,7 +195,6 @@ mod tests {
         );
         let got = cache.get(&p).unwrap();
         assert_eq!(got.content, "hello world");
-        assert_eq!(got.timestamp_ms, 1001);
     }
 
     #[test]
@@ -220,7 +205,6 @@ mod tests {
             &p,
             FileState {
                 content: "line1\nline2".into(),
-                timestamp_ms: 500,
                 offset: Some(10),
                 limit: Some(2),
                 is_partial_view: true,
@@ -257,7 +241,6 @@ mod tests {
             &written,
             FileState {
                 content: "x".into(),
-                timestamp_ms: 1,
                 offset: None,
                 limit: None,
                 is_partial_view: false,
@@ -278,7 +261,6 @@ mod tests {
             &p,
             FileState {
                 content: "x".into(),
-                timestamp_ms: 1,
                 offset: None,
                 limit: None,
                 is_partial_view: false,
@@ -295,7 +277,6 @@ mod tests {
             &p,
             FileState {
                 content: "x".into(),
-                timestamp_ms: 1,
                 offset: None,
                 limit: None,
                 is_partial_view: false,
@@ -305,24 +286,5 @@ mod tests {
         assert_eq!(prev.content, "x");
         assert!(!cache.has(&p));
         assert!(cache.remove(&p).is_none());
-    }
-
-    #[test]
-    fn file_mtime_ms_reads_present_file() {
-        let dir = tempfile::Builder::new()
-            .prefix("rebon-fsc-")
-            .tempdir()
-            .unwrap();
-        let p = dir.path().join("m.txt");
-        std::fs::write(&p, b"hi").unwrap();
-        let ts = file_mtime_ms(&p).expect("mtime");
-        assert!(ts > 0, "mtime_ms should be positive for a fresh file");
-    }
-
-    #[test]
-    fn file_mtime_ms_missing_file_is_err() {
-        let dir = std::env::temp_dir();
-        let p = dir.join(format!("rebon-fsc-nope-{}.txt", std::process::id()));
-        assert!(file_mtime_ms(&p).is_err());
     }
 }

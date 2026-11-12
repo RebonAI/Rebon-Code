@@ -280,8 +280,9 @@ pub struct InjectedPromptFile {
     /// The raw bytes on disk.
     pub content: String,
     /// Whether the prompt showed less than the whole file (truncated by a
-    /// line/byte cap or a runtime budget). A partial view forces the model to
-    /// `Read` before it may edit.
+    /// line/byte cap or a runtime budget). A partial view does not count as
+    /// seen: `Write` will not replace the file without a `Read` or
+    /// `overwrite: true`.
     pub is_partial_view: bool,
 }
 

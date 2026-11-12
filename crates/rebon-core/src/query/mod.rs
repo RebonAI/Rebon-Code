@@ -280,8 +280,8 @@ pub struct QueryParams {
     pub compact_custom_instructions: Option<String>,
     /// Controls how the compacted summary should be shaped.
     pub compact_summary_options: rebon_api::CompactSummaryOptions,
-    /// Shared per-session file-state cache. Read registers observed files;
-    /// Edit / Write consult it to enforce "must read first".
+    /// Shared per-session file-state cache. Read and the file tools record
+    /// what the session has seen; Write consults it before replacing a file.
     pub file_state_cache: Option<FileStateCache>,
     /// Optional request-scoped execution policy for this query turn.
     pub execution_policy: Option<ExecutionPolicy>,

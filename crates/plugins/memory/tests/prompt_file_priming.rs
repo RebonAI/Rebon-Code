@@ -80,7 +80,7 @@ fn a_budget_omitted_memory_md_is_primed_as_partial() {
     assert_eq!(state.content, body, "raw disk bytes stored in cache");
     assert!(
         state.is_partial_view,
-        "runtime-budget-omitted MEMORY.md must force Read before Edit/Write"
+        "runtime-budget-omitted MEMORY.md must not count as seen for Write"
     );
     assert_eq!(state.offset, None);
     assert_eq!(state.limit, None);

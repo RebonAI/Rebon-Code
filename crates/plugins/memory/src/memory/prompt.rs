@@ -664,14 +664,15 @@ pub fn load_memory_prompt_with_options(cwd: &str, options: MemoryPromptOptions) 
 ///
 /// Callers (notably `rebon-core`) use this
 /// to prime `FileStateCache` with the RAW disk bytes while setting
-/// `is_partial_view = content_differs_from_disk`, so Edit/Write can enforce
-/// "must Read before Edit" when the model has only seen a transformed view.
+/// `is_partial_view = content_differs_from_disk`, so a transformed view does
+/// not count as seen: Write will not replace the file without a Read or
+/// `overwrite: true`.
 ///
 /// * `path` — absolute path of the MEMORY.md file on disk.
 /// * `raw_content` — unmodified bytes as read from disk.
 /// * `content_differs_from_disk` — true iff the injected prompt content
 /// would differ from `raw_content` (i.e. existing truncation or prompt-budget
-/// omission fired) — the edit-safety comparison Edit/Write gate on.
+/// omission fired) — what keeps the entry from counting as seen for Write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryEntrypointSnapshot {
     /// Absolute path of the MEMORY.md file on disk.

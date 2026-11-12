@@ -143,61 +143,6 @@ fn existing_file_identity(_path: &Path) -> Option<String> {
     None
 }
 
-#[derive(Debug, Default)]
-struct FileMutationBatch;
-
-fn file_mutation_registry() -> &'static Mutex<HashMap<String, Weak<FileMutationBatch>>> {
-    static MUTATIONS: OnceLock<Mutex<HashMap<String, Weak<FileMutationBatch>>>> = OnceLock::new();
-    MUTATIONS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub fn ensure_file_not_mutated_in_current_batch(
-    path: &Path,
-    context: &ToolContext,
-    tool: ToolId,
-    error_code: i64,
-) -> ToolResult<()> {
-    let Some(batch) = context.file_mutation_batch.as_ref() else {
-        return Ok(());
-    };
-    let registry = file_mutation_registry();
-    let mut mutations = registry
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    mutations.retain(|_, owner| owner.strong_count() > 0);
-    let already_mutated = file_access_keys(path).iter().any(|key| {
-        mutations
-            .get(key)
-            .and_then(Weak::upgrade)
-            .is_some_and(|owner| Arc::ptr_eq(&owner, batch))
-    });
-    if already_mutated {
-        return Err(ToolError::InvalidInput {
-            tool,
-            reason: format!(
-                "File {} was already modified by another file tool in this parallel tool batch. Read its latest contents in a later tool batch before retrying so the earlier change is preserved.",
-                path.display()
-            ),
-            error_code: Some(error_code),
-        });
-    }
-    Ok(())
-}
-
-pub fn record_file_mutation_in_current_batch(path: &Path, context: &ToolContext) {
-    let Some(batch) = context.file_mutation_batch.as_ref() else {
-        return;
-    };
-    let registry = file_mutation_registry();
-    let mut mutations = registry
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    mutations.retain(|_, owner| owner.strong_count() > 0);
-    for key in file_access_keys(path) {
-        mutations.insert(key, Arc::downgrade(batch));
-    }
-}
-
 pub mod agent;
 pub mod agent_registry;
 pub mod bash;
@@ -207,6 +152,7 @@ pub mod container_sandbox;
 pub mod core_tools;
 pub mod cron;
 pub mod edit;
+mod edit_match;
 pub mod escalation;
 pub mod execution_surface;
 pub mod external_agent;
@@ -1107,17 +1053,13 @@ pub struct ToolContext {
     plugin_tools: Option<Arc<dyn PluginToolProvider>>,
     tool_resolver: Option<Arc<dyn ToolResolver>>,
     tool_filter: Option<ToolFilter>,
-    /// Per-session cache of files the model has observed via Read,
-    /// used by Edit / Write to enforce "must read before edit" and to
-    /// detect external modification. Handle is cheap to clone (Arc
+    /// Per-session cache of files the model has observed (Read, its own
+    /// writes, verbatim prompt injections). Write consults it to refuse
+    /// replacing a file never seen; nothing compares it with disk before a
+    /// write. Handle is cheap to clone (Arc
     /// internally); all derived contexts in a query share the same
     /// underlying map.
     file_state_cache: Option<FileStateCache>,
-    /// Shared by every tool call emitted in one model response. A successful
-    /// mutation records its path against this token so a later-scheduled
-    /// same-path mutation from the same parallel batch cannot mistake the
-    /// refreshed shared cache for a sequential user-approved edit.
-    file_mutation_batch: Option<Arc<FileMutationBatch>>,
     file_history_tracker: Option<Arc<dyn FileHistoryTracker>>,
     shell_process_registry: Option<Arc<ShellProcessRegistry>>,
     /// Optional request-scoped execution policy for the current prompt turn.
@@ -1141,7 +1083,7 @@ impl ToolContext {
     /// The budget is 25. Adding a direct field must bump this constant and
     /// the destructuring in `tool_context_direct_field_budget`; the point of
     /// both is that the next field is a deliberate choice, not a reflex.
-    pub const DIRECT_FIELDS: usize = 24;
+    pub const DIRECT_FIELDS: usize = 23;
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -1203,10 +1145,6 @@ impl std::fmt::Debug for ToolContext {
                 &self.discovered_deferred_tools().is_some(),
             )
             .field("has_file_state_cache", &self.file_state_cache.is_some())
-            .field(
-                "has_file_mutation_batch",
-                &self.file_mutation_batch.is_some(),
-            )
             .field(
                 "parallel_agent_write_batch",
                 &self.parallel_agent_write_batch(),
@@ -1880,8 +1818,8 @@ impl ToolContext {
         self.extension::<ToolSearchContext>()?.discovered.as_ref()
     }
 
-    /// Attach a shared [`FileStateCache`] so Read can register files
-    /// and Edit / Write can enforce "must read first".
+    /// Attach a shared [`FileStateCache`] so Read and the file tools can
+    /// register what the session has seen, and Write can consult it.
     pub fn with_file_state_cache(mut self, cache: FileStateCache) -> Self {
         self.file_state_cache = Some(cache);
         self
@@ -1893,13 +1831,6 @@ impl ToolContext {
     /// directly.
     pub fn file_state_cache(&self) -> Option<&FileStateCache> {
         self.file_state_cache.as_ref()
-    }
-
-    /// Start a fresh logical tool-dispatch batch. All clones keep the same
-    /// token; the next model response gets a new token.
-    pub fn with_fresh_file_mutation_batch(mut self) -> Self {
-        self.file_mutation_batch = Some(Arc::new(FileMutationBatch));
-        self
     }
 
     pub fn with_parallel_agent_write_batch(mut self, parallel: bool) -> Self {
@@ -2922,7 +2853,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use rebon_tools_core::file_state::{file_mtime_ms, FileState};
+    use rebon_tools_core::file_state::FileState;
     use rebon_tools_core::PermissionRequest;
 
     use super::*;
@@ -2976,7 +2907,6 @@ mod tests {
             file,
             FileState {
                 content: content.to_string(),
-                timestamp_ms: file_mtime_ms(file).unwrap_or(0),
                 offset: None,
                 limit: None,
                 is_partial_view: false,
@@ -3050,13 +2980,8 @@ mod tests {
 
     /// Wait until `expected` parties hold or await the path lock.
     ///
-    /// Every file-mutation tool snapshots the file-state cache and only
-    /// *then* awaits `lock_file_for_write`, so "queued on the lock" is
-    /// the observable form of "has already taken its snapshot" — which
-    /// is the ordering these tests need to establish before they release
-    /// the first writer. Releasing it earlier lets the first writer
-    /// refresh the shared cache first, and the second writer then
-    /// correctly sees nothing stale.
+    /// The second writer has to be queued on the lock before the first is
+    /// released, or the test would not show that the two serialize.
     ///
     /// `file_access_lock` hands every caller its own `Arc` while the
     /// registry keeps only a `Weak`, so the strong count is exactly the
@@ -3086,7 +3011,7 @@ mod tests {
         initial: &str,
         first_input: Value,
         second_input: Value,
-        expected_after_first: &str,
+        expected_after_both: &str,
         shared_cache: bool,
     ) {
         std::fs::write(&file, initial).unwrap();
@@ -3145,15 +3070,13 @@ mod tests {
 
         release_tx.send(()).unwrap();
         first.await.unwrap().expect("first write should succeed");
-        let second_error = second.await.unwrap().unwrap_err();
-        assert!(matches!(
-            second_error,
-            ToolError::InvalidInput {
-                error_code: Some(edit::FILE_MODIFIED_SINCE_READ_CODE),
-                ..
-            }
-        ));
-        assert_eq!(std::fs::read_to_string(file).unwrap(), expected_after_first);
+        // The second runs against what the first wrote: no snapshot
+        // comparison, so a writer queued behind another is not stale.
+        second
+            .await
+            .unwrap()
+            .expect("second write applies to the first one's result");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), expected_after_both);
     }
 
     #[test]
@@ -3251,85 +3174,8 @@ mod tests {
                     "alpha beta",
                     first_kind.first_input(&file),
                     second_kind.second_input(&file),
-                    "ALPHA beta",
-                    shared_cache,
-                )
-                .await;
-            }
-        }
-    }
-
-    async fn assert_same_batch_rejects_later_scheduled_mutation(
-        first_tool: Arc<dyn Tool>,
-        second_tool: Arc<dyn Tool>,
-        file: PathBuf,
-        initial: &str,
-        first_input: Value,
-        second_input: Value,
-        expected_after_first: &str,
-        expected_after_next_batch: &str,
-    ) {
-        std::fs::write(&file, initial).unwrap();
-        let base_context = observed_context(
-            &file,
-            initial,
-            FileStateCache::new(),
-            Arc::new(ProbeHistoryTracker {
-                entered: Arc::new(AtomicBool::new(false)),
-            }),
-        );
-        let batch_context = base_context.clone().with_fresh_file_mutation_batch();
-
-        first_tool
-            .call(first_input, &batch_context)
-            .await
-            .expect("first batch mutation");
-        let error = second_tool
-            .call(second_input.clone(), &batch_context)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ToolError::InvalidInput {
-                error_code: Some(edit::FILE_MODIFIED_SINCE_READ_CODE),
-                ..
-            }
-        ));
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            expected_after_first
-        );
-
-        second_tool
-            .call(second_input, &base_context.with_fresh_file_mutation_batch())
-            .await
-            .expect("a later model-response batch may build on the refreshed cache");
-        assert_eq!(
-            std::fs::read_to_string(file).unwrap(),
-            expected_after_next_batch
-        );
-    }
-
-    #[tokio::test]
-    async fn same_dispatch_batch_rejects_later_scheduled_same_path_mutations() {
-        let dir = tempfile::tempdir().unwrap();
-
-        for first_kind in FileMutationToolKind::ALL {
-            for second_kind in FileMutationToolKind::ALL {
-                let file = dir.path().join(format!(
-                    "batch-{}-then-{}.txt",
-                    first_kind.name(),
-                    second_kind.name()
-                ));
-                assert_same_batch_rejects_later_scheduled_mutation(
-                    first_kind.tool(),
-                    second_kind.tool(),
-                    file.clone(),
-                    "alpha beta",
-                    first_kind.first_input(&file),
-                    second_kind.second_input(&file),
-                    "ALPHA beta",
                     "ALPHA BETA",
+                    shared_cache,
                 )
                 .await;
             }
@@ -3342,27 +3188,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn file_mutation_tools_reject_parallel_stale_writes_with_shared_cache() {
+    async fn file_mutation_tools_serialize_same_path_with_shared_cache() {
         assert_file_mutation_tools_serialize_same_path(true).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// Two sessions both create the same new file: the one that loses the
+    /// path lock finds an existing file it has never seen and refuses,
+    /// rather than silently replacing the other session's file.
     async fn parallel_new_file_writes_do_not_silently_overwrite() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("new.txt");
         let path_lock = file_access_lock(&file);
-        let shared_cache = FileStateCache::new();
         let first_entered = Arc::new(tokio::sync::Notify::new());
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let first_context = ToolContext::new()
-            .with_file_state_cache(shared_cache.clone())
+            .with_file_state_cache(FileStateCache::new())
             .with_file_history_tracker(Arc::new(BlockingHistoryTracker {
                 entered: first_entered.clone(),
                 release: Mutex::new(release_rx),
             }));
         let second_entered = Arc::new(AtomicBool::new(false));
         let second_context = ToolContext::new()
-            .with_file_state_cache(shared_cache)
+            .with_file_state_cache(FileStateCache::new())
             .with_file_history_tracker(Arc::new(ProbeHistoryTracker {
                 entered: second_entered.clone(),
             }));
@@ -3400,7 +3248,7 @@ mod tests {
         assert!(matches!(
             error,
             ToolError::InvalidInput {
-                error_code: Some(edit::MUST_READ_BEFORE_EDIT_CODE),
+                error_code: Some(write::UNSEEN_OVERWRITE_CODE),
                 ..
             }
         ));
@@ -4942,7 +4790,6 @@ mod tests {
             "tool_resolver",
             "tool_filter",
             "file_state_cache",
-            "file_mutation_batch",
             "file_history_tracker",
             "shell_process_registry",
             "execution_policy",
@@ -4969,7 +4816,6 @@ mod tests {
             tool_resolver: _,
             tool_filter: _,
             file_state_cache: _,
-            file_mutation_batch: _,
             file_history_tracker: _,
             shell_process_registry: _,
             execution_policy: _,

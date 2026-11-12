@@ -632,8 +632,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A file a batch Read left out of the model's view was not seen, so
+    /// Write may not replace it. Once it is seen, a later change on disk
+    /// does not take that back, and Edit never needed the Read.
     #[tokio::test]
-    async fn omitted_batch_read_does_not_authorize_write_or_edit() {
+    async fn omitted_batch_read_does_not_count_as_seen_for_write() {
         use rebon_tool::{Tool, ToolContext};
 
         let dir = tempfile::tempdir().unwrap();
@@ -657,17 +660,11 @@ mod tests {
         assert!(!projected.contains("marker-9"));
         assert!(cache.get(&paths[0]).is_some());
         assert!(cache.get(&paths[9]).is_none());
-        assert!(rebon_tool::WriteTool
+        let error = rebon_tool::WriteTool
             .call(json!({"file_path":paths[9],"content":"replacement"}), &ctx)
             .await
-            .is_err());
-        assert!(rebon_tool::EditTool
-            .call(
-                json!({"file_path":paths[9],"old_string":"marker-9","new_string":"changed"}),
-                &ctx
-            )
-            .await
-            .is_err());
+            .unwrap_err();
+        assert!(error.to_string().contains("has not been read"), "{error}");
         assert!(std::fs::read_to_string(&paths[9])
             .unwrap()
             .starts_with("marker-9"));
@@ -689,17 +686,10 @@ mod tests {
         assert!(!read_tool_result_for_model(&result, true)
             .to_plain_text()
             .contains("external change"));
+        // The omitted re-read leaves the earlier observation in place.
         assert_eq!(cache.get(&paths[9]).unwrap().content, previous.content);
-        let error = rebon_tool::WriteTool
-            .call(json!({"file_path":paths[9],"content":"replacement"}), &ctx)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("modified since"), "{error}");
 
-        rebon_tool::ReadTool
-            .call(json!({"targets": [{"path": paths[9]}]}), &ctx)
-            .await
-            .unwrap();
+        // Edit matches the current content; no fresh Read is needed.
         rebon_tool::EditTool
             .call(
                 json!({"file_path":paths[9],"old_string":"external change","new_string":"edited"}),

@@ -15,7 +15,7 @@ pub mod process_tree;
 pub mod shell_stream_order;
 pub mod workflow_graph;
 
-pub use file_state::{file_mtime_ms, normalize_path_key, FileState, FileStateCache};
+pub use file_state::{normalize_path_key, FileState, FileStateCache};
 pub use process_tree::ProcessTreeGuard;
 pub use workflow_graph::{
     WorkflowAgentNodeMeta, WorkflowGraph, WorkflowGraphEdge, WorkflowGraphEdgeKind,

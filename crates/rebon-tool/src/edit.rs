@@ -1,9 +1,8 @@
 use crate::{Tool, ToolContext};
 use async_trait::async_trait;
 use rebon_tools_core::{
-    file_state::{file_mtime_ms, FileState},
-    require_valid_input, validation_outcome_from, PermissionDecision, PermissionRequest, ToolError,
-    ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
+    file_state::FileState, require_valid_input, validation_outcome_from, PermissionDecision,
+    PermissionRequest, ToolError, ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -16,14 +15,6 @@ pub const NOT_FILE_CODE: i64 = 2;
 pub(crate) const IDENTICAL_STRINGS_CODE: i64 = 3;
 pub(crate) const OLD_STRING_NOT_FOUND_CODE: i64 = 4;
 pub(crate) const AMBIGUOUS_MATCH_CODE: i64 = 5;
-/// The target file was never observed via `Read`, or was only read
-/// as a partial view: Edit requires a full Read of the file first.
-pub const MUST_READ_BEFORE_EDIT_CODE: i64 = 6;
-/// The file on disk has changed since the last observed Read (by an
-/// external process — another shell, a linter, a watch task). The
-/// cached snapshot is stale and Edit would corrupt the file if it
-/// replaced text that no longer exists.
-pub const FILE_MODIFIED_SINCE_READ_CODE: i64 = 7;
 pub(crate) const UNSUPPORTED_MEDIA_CODE: i64 = 8;
 
 #[derive(Debug, Clone, Default)]
@@ -59,11 +50,6 @@ impl Tool for EditTool {
         "Performs exact string replacements in files.\n\
          \n\
          Usage:\n\
-         - You must use your `Read` tool at least once in the conversation before editing. \
-         This tool will error if you attempt an edit without reading the file.\n\
-         - A same-file Read and Edit, or multiple mutations of the same file, are dependent \
-         operations and must not be sent in one parallel tool batch. If this tool reports \
-         modified-since-read, Read the file again and preserve the latest contents before retrying.\n\
          - When editing text from Read tool output, ensure you preserve the exact indentation \
          (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format \
          is: line number + tab. Everything after that is the actual file content to match. \
@@ -103,10 +89,7 @@ impl Tool for EditTool {
         input: &Value,
         context: &ToolContext,
     ) -> ToolResult<ValidationOutcome> {
-        match prepare_input(self.id(), input, context) {
-            Ok(parsed) => check_read_before_edit(&parsed.file_path, &parsed.old_string, context),
-            refused => validation_outcome_from(refused),
-        }
+        validation_outcome_from(prepare_input(self.id(), input, context))
     }
 
     async fn check_permissions(
@@ -143,36 +126,10 @@ impl Tool for EditTool {
     async fn call(&self, input: Value, context: &ToolContext) -> ToolResult<Value> {
         let parsed = prepare_input(self.id(), &input, context)?;
 
-        let observed_state = context
-            .file_state_cache()
-            .and_then(|cache| cache.get(&parsed.file_path));
+        // `old_string` is matched against the file as it is now, under the
+        // path lock — not against what an earlier Read saw — so a formatter
+        // or another writer touching the file is not by itself a failure.
         let _file_guard = crate::lock_file_for_write(&parsed.file_path).await;
-        crate::ensure_file_not_mutated_in_current_batch(
-            &parsed.file_path,
-            context,
-            self.id(),
-            FILE_MODIFIED_SINCE_READ_CODE,
-        )?;
-
-        // Must-read-before-edit + external-modification guard. Runs
-        // only when the session has a file-state cache — tests that
-        // construct a bare `ToolContext::new()` get the previous,
-        // unchecked behaviour.
-        let state_check = check_read_before_edit_with_state(
-            &parsed.file_path,
-            &parsed.old_string,
-            context,
-            observed_state,
-        )?;
-        if !state_check.is_valid() {
-            return Err(ToolError::InvalidInput {
-                tool: self.id(),
-                reason: state_check
-                    .message
-                    .unwrap_or_else(|| "Edit precondition failed".into()),
-                error_code: state_check.error_code,
-            });
-        }
 
         let old_content = match fs::read(&parsed.file_path) {
             Ok(bytes) => Some(
@@ -195,21 +152,36 @@ impl Tool for EditTool {
         };
 
         let (updated, edit_type, replacements, original_text) = match old_content {
+            Some(content) if parsed.old_string.is_empty() => {
+                if !content.is_empty() {
+                    return Err(ToolError::InvalidInput {
+                        tool: self.id(),
+                        reason: format!(
+                            "{} already exists and is not empty. An empty `old_string` only \
+                             creates a file; put the text to replace in `old_string`.",
+                            parsed.file_path.display()
+                        ),
+                        error_code: Some(OLD_STRING_NOT_FOUND_CODE),
+                    });
+                }
+                (parsed.new_string.clone(), "update", 1, Some(content))
+            }
             Some(content) => {
-                // Normalize old_string / new_string line endings to match the
-                // file.  Models typically emit bare LF, but on Windows files
-                // often use CRLF — the mismatch causes every edit to fail.
-                let file_uses_crlf = content.contains("\r\n");
-                let old_str = normalize_line_endings(&parsed.old_string, file_uses_crlf);
-                let new_str = normalize_line_endings(&parsed.new_string, file_uses_crlf);
-
-                let occurrences = content.matches(&*old_str).count();
+                // Line endings follow the file: models emit bare LF, files
+                // on Windows are often CRLF.
+                let anchor = crate::edit_match::find_anchor(
+                    &content,
+                    &parsed.old_string,
+                    &parsed.new_string,
+                );
+                let occurrences = anchor.occurrences;
                 if occurrences == 0 {
                     return Err(ToolError::InvalidInput {
                         tool: self.id(),
                         reason: format!(
-                            "`old_string` was not found in {}",
-                            parsed.file_path.display()
+                            "`old_string` was not found in {}. {}",
+                            parsed.file_path.display(),
+                            crate::edit_match::closest_region_report(&content, &parsed.old_string)
                         ),
                         error_code: Some(OLD_STRING_NOT_FOUND_CODE),
                     });
@@ -217,16 +189,19 @@ impl Tool for EditTool {
                 if occurrences > 1 && !parsed.replace_all {
                     return Err(ToolError::InvalidInput {
                         tool: self.id(),
-                        reason: format!(
-                            "`old_string` matched {occurrences} times; set `replace_all` to true to replace every occurrence"
+                        reason: ambiguous_match_reason(
+                            &format!("in {}", parsed.file_path.display()),
+                            &content,
+                            &anchor.old,
+                            occurrences,
                         ),
                         error_code: Some(AMBIGUOUS_MATCH_CODE),
                     });
                 }
                 let updated = if parsed.replace_all {
-                    content.replace(&*old_str, &*new_str)
+                    content.replace(&*anchor.old, &anchor.new)
                 } else {
-                    content.replacen(&*old_str, &*new_str, 1)
+                    content.replacen(&*anchor.old, &anchor.new, 1)
                 };
                 (
                     updated,
@@ -272,18 +247,14 @@ impl Tool for EditTool {
             tool: self.id(),
             source: err.into(),
         })?;
-        crate::record_file_mutation_in_current_batch(&parsed.file_path, context);
 
-        // Refresh the cache with (new content, new mtime) so the
-        // next Edit on the same file does not trip errorCode 7.
-        // This is the key to "consecutive Edit without re-Read".
+        // Record what this session just wrote: it marks the file as seen
+        // for a later Write, and gives Read's range merge current content.
         if let Some(cache) = context.file_state_cache() {
-            let timestamp_ms = file_mtime_ms(&parsed.file_path).unwrap_or(0);
             cache.set(
                 &parsed.file_path,
                 FileState {
                     content: updated.clone(),
-                    timestamp_ms,
                     offset: None,
                     limit: None,
                     is_partial_view: false,
@@ -309,9 +280,8 @@ impl Tool for EditTool {
 ///
 /// Both entry points ask the same three questions in the same order — does
 /// the input parse, does the path clear the edit scope, is the parsed request
-/// well-formed. They part company afterwards: `validate_input` answers the
-/// read-before-edit question from the cache alone, `call` answers it against
-/// the state it is about to write.
+/// well-formed. Whether `old_string` matches is answered only by `call`,
+/// against the content it is about to rewrite.
 fn prepare_input(tool: ToolId, input: &Value, context: &ToolContext) -> ToolResult<EditInput> {
     let parsed = parse_input(input)?;
     enforce_edit_path_scope(tool.clone(), &parsed.file_path, context)?;
@@ -462,80 +432,22 @@ pub fn enforce_edit_path_scope(tool: ToolId, path: &Path, context: &ToolContext)
     crate::path_scope::enforce_write_path_policy(tool, context, path, "file_path")
 }
 
-/// Enforce the "must-have-been-Read" precondition before Edit.
-///
-/// Rules:
-///
-/// * No cache on the context → no-op (preserves legacy call-sites).
-/// * Creating a new file (empty `old_string`, file doesn't exist) →
-///   no-op. Read has nothing to observe yet.
-/// * Cache has no entry for the path → `MUST_READ_BEFORE_EDIT_CODE`.
-/// * Cache entry is a partial view (auto-injected REBON.md /
-///   MEMORY.md whose processed content differs from disk) →
-///   `MUST_READ_BEFORE_EDIT_CODE`, with a message telling the model
-///   to perform an explicit Read. Not triggered by `offset` / `limit`
-///   / auto-truncation — regular partial reads are legal to Edit.
-/// * The on-disk content differs from the cached snapshot →
-///   `FILE_MODIFIED_SINCE_READ_CODE`. Comparing content on every
-///   decisive check avoids missing same-millisecond writes while still
-///   accepting mtime-only changes from cloud-sync tools.
-pub fn check_read_before_edit(
-    path: &Path,
-    old_string: &str,
-    context: &ToolContext,
-) -> ToolResult<ValidationOutcome> {
-    let observed_state = context.file_state_cache().and_then(|cache| cache.get(path));
-    check_read_before_edit_with_state(path, old_string, context, observed_state)
-}
-
-pub fn check_read_before_edit_with_state(
-    path: &Path,
-    old_string: &str,
-    context: &ToolContext,
-    observed_state: Option<FileState>,
-) -> ToolResult<ValidationOutcome> {
-    if context.file_state_cache().is_none() {
-        return Ok(ValidationOutcome::valid());
-    }
-    let exists = path.exists();
-    if !exists && old_string.is_empty() {
-        return Ok(ValidationOutcome::valid());
-    }
-    match observed_state {
-        None => Ok(ValidationOutcome::invalid(
-            format!(
-                "File has not been read yet. Use the Read tool with {} first, \
-                 then retry the Edit. Read establishes the baseline content that Edit \
-                 matches `old_string` against.",
-                json!({"targets": [{"path": path}]}),
-            ),
-            MUST_READ_BEFORE_EDIT_CODE,
-        )),
-        Some(state) if state.is_partial_view => Ok(ValidationOutcome::invalid(
-            format!(
-                "{} is only visible through an auto-injected view (REBON.md / MEMORY.md), \
-                 and the injected content differs from what's on disk. Run Read on this \
-                 file first to observe the real contents, then retry the Edit.",
-                path.display()
-            ),
-            MUST_READ_BEFORE_EDIT_CODE,
-        )),
-        Some(state) => {
-            let disk = fs::read_to_string(path).ok();
-            if disk.as_deref() != Some(state.content.as_str()) {
-                return Ok(ValidationOutcome::invalid(
-                    format!(
-                        "File {} was modified since your last Read (external edit, \
-                         formatter, or linter). Re-run Read on this file before \
-                         attempting Edit, then build `old_string` from the fresh contents.",
-                        path.display()
-                    ),
-                    FILE_MODIFIED_SINCE_READ_CODE,
-                ));
-            }
-            Ok(ValidationOutcome::valid())
-        }
-    }
+/// The error for an `old_string` that matches more than once: where each
+/// match is, and how to pick one. `whose_text` names the text the line
+/// numbers belong to (`in /path`); `MultiEdit` prefixes the failing edit's
+/// index.
+pub(crate) fn ambiguous_match_reason(
+    whose_text: &str,
+    content: &str,
+    needle: &str,
+    occurrences: usize,
+) -> String {
+    format!(
+        "`old_string` matched {occurrences} times {whose_text}; it must match exactly once.\n{}\
+         Add surrounding lines to `old_string` to pick one, or set `replace_all` to true to \
+         replace every occurrence.",
+        crate::edit_match::match_listing(content, needle, occurrences)
+    )
 }
 
 /// Adapt a model-supplied string to match the file's line-ending style.
@@ -937,14 +849,12 @@ mod tests {
     }
 
     /// Helper: pre-populate the cache as if Read had just observed
-    /// the file, so tests can focus on the post-Read contract.
+    /// the file.
     fn register_read(cache: &FileStateCache, path: &Path, content: &str) {
-        let ts = file_mtime_ms(path).unwrap_or(0);
         cache.set(
             path,
             FileState {
                 content: content.to_string(),
-                timestamp_ms: ts,
                 offset: None,
                 limit: None,
                 is_partial_view: false,
@@ -952,41 +862,45 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn edit_fails_when_file_not_read() {
-        let dir = TempDir::new();
-        let file = dir.path().join("unseen.txt");
-        fs::write(&file, "hello world").unwrap();
-        let cache = FileStateCache::new();
-        let ctx = ToolContext::new().with_file_state_cache(cache);
+    fn edit_input(file: &Path, old: &str, new: &str) -> Value {
+        json!({
+            "file_path": file.to_string_lossy(),
+            "old_string": old,
+            "new_string": new
+        })
+    }
 
-        let err = tool()
-            .call(
-                json!({
-                    "file_path": file.to_string_lossy(),
-                    "old_string": "hello",
-                    "new_string": "HELLO"
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap_err();
+    fn invalid_reason(err: ToolError, expected_code: i64) -> String {
         match err {
             ToolError::InvalidInput {
                 error_code, reason, ..
             } => {
-                assert_eq!(error_code, Some(MUST_READ_BEFORE_EDIT_CODE));
-                assert!(
-                    reason.contains("Read tool"),
-                    "reason should tell the model to Read: {reason}"
-                );
-                assert!(
-                    reason.contains(&json!({"targets":[{"path":file}]}).to_string()),
-                    "{reason}"
-                );
+                assert_eq!(error_code, Some(expected_code), "{reason}");
+                reason
             }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
+    }
+
+    /// Edit has no read-state precondition: a session cache with no entry
+    /// for the file does not stop it, and the write marks the file as seen.
+    #[tokio::test]
+    async fn edit_applies_to_a_file_this_session_never_read() {
+        let dir = TempDir::new();
+        let file = dir.path().join("unseen.txt");
+        fs::write(&file, "hello world").unwrap();
+        let cache = FileStateCache::new();
+        let ctx = ToolContext::new().with_file_state_cache(cache.clone());
+
+        tool()
+            .call(edit_input(&file, "hello", "HELLO"), &ctx)
+            .await
+            .expect("no Read is required before an Edit");
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), "HELLO world");
+        let state = cache.get(&file).expect("the edit records the file as seen");
+        assert_eq!(state.content, "HELLO world");
+        assert!(!state.is_partial_view);
     }
 
     #[tokio::test]
@@ -1026,21 +940,18 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "hello world");
     }
 
-    /// Only entries marked as auto-injected partial views (REBON.md /
-    /// MEMORY.md whose processed content differs from disk) should be
-    /// rejected — the flag is never set by the Read path itself.
+    /// An auto-injected partial view (a truncated MEMORY.md) used to force a
+    /// Read first. Edit matches the bytes on disk, so it no longer matters.
     #[tokio::test]
-    async fn edit_fails_when_cache_entry_is_auto_injected_partial_view() {
+    async fn edit_applies_over_an_auto_injected_partial_view() {
         let dir = TempDir::new();
         let file = dir.path().join("partial.txt");
         fs::write(&file, "line1\nline2\nline3\n").unwrap();
         let cache = FileStateCache::new();
-        let ts = file_mtime_ms(&file).unwrap_or(0);
         cache.set(
             &file,
             FileState {
                 content: "line1\nline2\nline3\n".to_string(),
-                timestamp_ms: ts,
                 offset: None,
                 limit: None,
                 is_partial_view: true,
@@ -1048,36 +959,18 @@ mod tests {
         );
         let ctx = ToolContext::new().with_file_state_cache(cache);
 
-        let err = tool()
-            .call(
-                json!({
-                    "file_path": file.to_string_lossy(),
-                    "old_string": "line1",
-                    "new_string": "LINE1"
-                }),
-                &ctx,
-            )
+        tool()
+            .call(edit_input(&file, "line1", "LINE1"), &ctx)
             .await
-            .unwrap_err();
-        match err {
-            ToolError::InvalidInput {
-                error_code, reason, ..
-            } => {
-                assert_eq!(error_code, Some(MUST_READ_BEFORE_EDIT_CODE));
-                assert!(
-                    reason.contains("auto-injected"),
-                    "reason should name the auto-injected view: {reason}"
-                );
-            }
-            other => panic!("expected InvalidInput, got {other:?}"),
-        }
+            .unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "LINE1\nline2\nline3\n");
     }
 
-    /// Core "consecutive Edits are not falsely rejected" regression: after one Read, two
-    /// back-to-back Edits must succeed without re-Read. The post-write
-    /// cache refresh is what makes this work.
+    /// Two Edits of one file, back to back (what a response's same-file
+    /// edits become once they run in order): both apply, the second
+    /// against the first one's result.
     #[tokio::test]
-    async fn edit_succeeds_after_read_then_edit_then_edit() {
+    async fn two_edits_on_one_file_apply_back_to_back() {
         let dir = TempDir::new();
         let file = dir.path().join("chain.txt");
         fs::write(&file, "alpha beta gamma").unwrap();
@@ -1085,96 +978,139 @@ mod tests {
         register_read(&cache, &file, "alpha beta gamma");
         let ctx = ToolContext::new().with_file_state_cache(cache.clone());
 
-        // First edit.
         tool()
-            .call(
-                json!({
-                    "file_path": file.to_string_lossy(),
-                    "old_string": "alpha",
-                    "new_string": "ALPHA"
-                }),
-                &ctx,
-            )
+            .call(edit_input(&file, "alpha", "ALPHA"), &ctx)
             .await
             .expect("first edit");
-
-        // Cache should reflect the post-write state and its mtime.
-        let disk_after_first = fs::read_to_string(&file).unwrap();
-        let state_after_first = cache.get(&file).unwrap();
-        assert_eq!(state_after_first.content, disk_after_first);
-        assert_eq!(
-            state_after_first.timestamp_ms,
-            file_mtime_ms(&file).unwrap_or(0)
-        );
-        assert!(!state_after_first.is_partial_view);
-
-        // Second edit against a substring untouched by the first.
         tool()
+            .call(edit_input(&file, "ALPHA beta", "ALPHA BETA"), &ctx)
+            .await
+            .expect("second edit matches the first edit's result");
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), "ALPHA BETA gamma");
+        let state = cache.get(&file).unwrap();
+        assert_eq!(state.content, "ALPHA BETA gamma");
+        assert!(!state.is_partial_view);
+    }
+
+    /// A formatter, hook, or another agent changed the file after this
+    /// session read it. The cached snapshot is stale, but the anchor is still
+    /// unique in the current content, so the Edit applies to that content.
+    #[tokio::test]
+    async fn edit_applies_after_an_outside_change_when_the_anchor_is_still_unique() {
+        let dir = TempDir::new();
+        let file = dir.path().join("drift.txt");
+        fs::write(&file, "fn main() {\n    run();\n}\n").unwrap();
+        let cache = FileStateCache::new();
+        register_read(&cache, &file, "fn main() {\n    run();\n}\n");
+        let ctx = ToolContext::new().with_file_state_cache(cache.clone());
+
+        fs::write(&file, "// formatted\nfn main() {\n    run();\n}\n").unwrap();
+
+        tool()
+            .call(edit_input(&file, "    run();", "    run_fast();"), &ctx)
+            .await
+            .expect("a stale snapshot does not block an edit whose anchor still matches");
+
+        let expected = "// formatted\nfn main() {\n    run_fast();\n}\n";
+        assert_eq!(fs::read_to_string(&file).unwrap(), expected);
+        assert_eq!(cache.get(&file).unwrap().content, expected);
+    }
+
+    #[tokio::test]
+    async fn not_found_shows_the_closest_current_region_with_line_numbers() {
+        let dir = TempDir::new();
+        let file = dir.path().join("indent.rs");
+        let content = "use std::fmt;\n\nfn render() {\n    let width = 80;\n    \
+                       let height = 24;\n    draw(width, height);\n}\n\nfn tail() {}\n";
+        fs::write(&file, content).unwrap();
+
+        // Indented with two spaces where the file has four.
+        let err = tool()
             .call(
-                json!({
-                    "file_path": file.to_string_lossy(),
-                    "old_string": "gamma",
-                    "new_string": "GAMMA"
-                }),
-                &ctx,
+                edit_input(
+                    &file,
+                    "  let width = 80;\n  let height = 24;",
+                    "  let width = 120;\n  let height = 40;",
+                ),
+                &ToolContext::new().with_file_state_cache(FileStateCache::new()),
             )
             .await
-            .expect("second edit should not require another Read");
+            .unwrap_err();
+        let reason = invalid_reason(err, OLD_STRING_NOT_FOUND_CODE);
 
-        assert_eq!(fs::read_to_string(&file).unwrap(), "ALPHA beta GAMMA",);
-        let state_after_second = cache.get(&file).unwrap();
-        assert_eq!(state_after_second.content, "ALPHA beta GAMMA");
+        assert!(reason.contains("`old_string` was not found in"), "{reason}");
+        assert!(reason.contains("lines 4-5"), "{reason}");
+        assert!(reason.contains("whitespace"), "{reason}");
+        for expected in [
+            "     1\tuse std::fmt;",
+            "     3\tfn render() {",
+            "     4\t    let width = 80;",
+            "     5\t    let height = 24;",
+            "     8\t",
+        ] {
+            assert!(reason.contains(expected), "missing {expected:?}: {reason}");
+        }
+        assert!(
+            !reason.contains("fn tail"),
+            "context stays near the region: {reason}"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn not_found_in_an_empty_file_says_so() {
+        let dir = TempDir::new();
+        let file = dir.path().join("empty.txt");
+        fs::write(&file, "").unwrap();
+
+        let err = tool()
+            .call(edit_input(&file, "anything", "else"), &ToolContext::new())
+            .await
+            .unwrap_err();
+        let reason = invalid_reason(err, OLD_STRING_NOT_FOUND_CODE);
+        assert!(reason.contains("The file is empty."), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_match_lists_each_line_number() {
+        let dir = TempDir::new();
+        let file = dir.path().join("dupes.txt");
+        fs::write(&file, "start\nretry();\nmiddle\nretry();\nend\n").unwrap();
+
+        let err = tool()
+            .call(
+                edit_input(&file, "retry();", "retry(3);"),
+                &ToolContext::new(),
+            )
+            .await
+            .unwrap_err();
+        let reason = invalid_reason(err, AMBIGUOUS_MATCH_CODE);
+
+        assert!(reason.contains("matched 2 times"), "{reason}");
+        assert!(reason.contains("line 2:"), "{reason}");
+        assert!(reason.contains("line 4:"), "{reason}");
+        assert!(reason.contains("     1\tstart"), "{reason}");
+        assert!(reason.contains("     5\tend"), "{reason}");
+        assert!(reason.contains("replace_all"), "{reason}");
         assert_eq!(
-            state_after_second.timestamp_ms,
-            file_mtime_ms(&file).unwrap_or(0)
+            fs::read_to_string(&file).unwrap(),
+            "start\nretry();\nmiddle\nretry();\nend\n"
         );
     }
 
     #[tokio::test]
-    async fn edit_fails_when_file_externally_modified_between_reads() {
+    async fn empty_old_string_does_not_rewrite_an_existing_file() {
         let dir = TempDir::new();
-        let file = dir.path().join("drift.txt");
-        fs::write(&file, "original content").unwrap();
-        let cache = FileStateCache::new();
-        // Simulate a cached Read whose timestamp is newer than the
-        // filesystem can report, then change only the bytes on disk.
-        cache.set(
-            &file,
-            FileState {
-                content: "original content".to_string(),
-                timestamp_ms: u64::MAX,
-                offset: None,
-                limit: None,
-                is_partial_view: false,
-            },
-        );
-        let ctx = ToolContext::new().with_file_state_cache(cache);
-
-        fs::write(&file, "someone else got here first").unwrap();
+        let file = dir.path().join("existing.txt");
+        fs::write(&file, "keep me").unwrap();
 
         let err = tool()
-            .call(
-                json!({
-                    "file_path": file.to_string_lossy(),
-                    "old_string": "original",
-                    "new_string": "ORIGINAL"
-                }),
-                &ctx,
-            )
+            .call(edit_input(&file, "", "clobber"), &ToolContext::new())
             .await
             .unwrap_err();
-        match err {
-            ToolError::InvalidInput {
-                error_code, reason, ..
-            } => {
-                assert_eq!(error_code, Some(FILE_MODIFIED_SINCE_READ_CODE));
-                assert!(
-                    reason.contains("modified"),
-                    "reason should mention external modification: {reason}"
-                );
-            }
-            other => panic!("expected InvalidInput, got {other:?}"),
-        }
+        invalid_reason(err, OLD_STRING_NOT_FOUND_CODE);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "keep me");
     }
 
     #[tokio::test]

@@ -31,7 +31,7 @@ pub use crate::prompt_seat::PluginPromptSection;
 
 use std::path::PathBuf;
 
-use rebon_tools_core::{file_mtime_ms, FileState, FileStateCache};
+use rebon_tools_core::{FileState, FileStateCache};
 
 use crate::context_accounting::{
     prompt_text_section_report, PromptCostReport, PromptSectionReport,
@@ -758,8 +758,8 @@ pub fn resolve_dynamic_context_with_language(
 ///
 /// Implements the behaviour of two call sites:
 /// * Every instruction file the startup scan found is seeded into the
-///   cache, so Edit/Write can
-///   enforce "must Read first" against them from turn one.
+///   cache, so Write treats them as seen (no `overwrite` needed) from turn
+///   one.
 /// * The same for the per-tool-round
 ///   nested-memory attachments.
 ///
@@ -768,22 +768,21 @@ pub fn resolve_dynamic_context_with_language(
 /// showed less than all of them. REBON.md is injected unchanged by
 /// [`load_rebon_md`] (no truncation, no HTML-comment strip, no frontmatter
 /// strip). A seat-reported file may well be partial — the memory entrypoint
-/// is capped and budgeted — and a partial view forces the model to run Read
-/// before Edit/Write.
+/// is capped and budgeted — and a partial view does not count as seen, so
+/// Write asks for a Read (or `overwrite: true`) before replacing it.
 ///
 /// Intentionally idempotent: every call overwrites whatever was there
 /// before. The engine drives one turn at a time with a fresh cache in
 /// the default TUI wiring, so re-priming is a no-op relative to the
 /// last turn. When a shared cache persists across turns (coordinator /
 /// worker inheritance via `spec.tool_context.file_state_cache()`), the
-/// overwrite keeps the cached timestamp / content aligned with disk
-/// — which is exactly what we want when the system prompt re-injects
-/// these files each turn.
+/// overwrite keeps the cached content aligned with disk — which is exactly
+/// what we want when the system prompt re-injects these files each turn.
 ///
 /// Errors reading individual files are swallowed: a missing document means no
-/// entry, which is strictly better than failing the whole turn. The
-/// Edit/Write "must Read first" check will continue to trip the model if it
-/// tries to edit a file we couldn't prime, which is the correct behaviour.
+/// entry, which is strictly better than failing the whole turn. A file we
+/// couldn't prime is simply unseen: Write asks for a Read (or
+/// `overwrite: true`) before replacing it.
 pub fn prime_injected_prompt_files(
     cache: &FileStateCache,
     cwd: &str,
@@ -793,12 +792,10 @@ pub fn prime_injected_prompt_files(
     for file in rebon_instructions::instruction_files::discover_instruction_files(cwd) {
         let path_buf = PathBuf::from(&file.path);
         let path = std::fs::canonicalize(&path_buf).unwrap_or(path_buf);
-        let timestamp_ms = file_mtime_ms(&path).unwrap_or(0);
         cache.set(
             &path,
             FileState {
                 content: file.raw_content.unwrap_or(file.content),
-                timestamp_ms,
                 offset: None,
                 limit: None,
                 is_partial_view: file.content_differs_from_disk,
@@ -811,12 +808,10 @@ pub fn prime_injected_prompt_files(
         return;
     };
     for injected in seat.injected_files(cwd) {
-        let timestamp_ms = file_mtime_ms(&injected.path).unwrap_or(0);
         cache.set(
             &injected.path,
             FileState {
                 content: injected.content,
-                timestamp_ms,
                 offset: None,
                 limit: None,
                 is_partial_view: injected.is_partial_view,
@@ -2489,27 +2484,10 @@ mod tests {
     }
 
     #[test]
-    fn register_sets_mtime_for_primed_entries() {
-        let g = HomeGuard::new();
-        let cwd = isolated_cwd(&g, "mtime-check");
-        let path = seed_project_rebon_md(&cwd, "# Project\n");
-        let cache = FileStateCache::new();
-
-        prime_injected_prompt_files(&cache, &cwd.to_string_lossy(), None);
-
-        let state = cache.get(&path).expect("cached");
-        assert!(
-            state.timestamp_ms > 0,
-            "timestamp should be read from disk (got {})",
-            state.timestamp_ms
-        );
-    }
-
-    #[test]
     fn register_overwrites_stale_entry_with_fresh_disk_bytes() {
         // Covers the "persistent shared cache across turns" case: if a
         // prior turn cached a stale MEMORY.md, the next turn's priming
-        // must refresh the entry so Edit/Write see current disk bytes.
+        // must refresh the entry with current disk bytes.
         let g = HomeGuard::new();
         let cwd = isolated_cwd(&g, "overwrite");
         let path = seed_project_rebon_md(&cwd, "# v1\n");
@@ -2520,7 +2498,6 @@ mod tests {
             &path,
             FileState {
                 content: "# stale\n".to_string(),
-                timestamp_ms: 1,
                 offset: Some(10),
                 limit: Some(5),
                 is_partial_view: true,

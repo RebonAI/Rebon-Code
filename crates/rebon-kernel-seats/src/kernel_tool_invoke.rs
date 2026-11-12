@@ -165,8 +165,8 @@ pub struct EngineToolInvokeHost {
     engine: Arc<Engine>,
     workspace_root: PathBuf,
     broker: Arc<SeatToolBroker>,
-    /// Shared across invokes so read-before-edit sequences (Read → Edit)
-    /// work like they do inside a session.
+    /// Shared across invokes so a file one invoke Read or wrote counts as
+    /// seen for a later Write, as it does inside a session.
     file_state: FileStateCache,
 }
 

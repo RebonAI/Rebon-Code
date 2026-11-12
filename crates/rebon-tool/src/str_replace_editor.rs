@@ -8,8 +8,10 @@
 //!
 //! Execution is a translation layer, not a second editor: `view` delegates to
 //! [`ReadTool`], `create` and `insert` to [`WriteTool`], and `str_replace` to
-//! [`EditTool`], so permissions, the read-before-write file-state cache, and
-//! path scoping behave exactly as they do for the native tools.
+//! [`EditTool`], so permissions, the file-state cache, and path scoping
+//! behave exactly as they do for the native tools. `insert` is an edit of the
+//! file's current content, so its Write carries `overwrite: true`: like
+//! `str_replace`, it needs no prior `view`.
 
 use crate::edit::EditTool;
 use crate::read::ReadTool;
@@ -278,7 +280,7 @@ fn translate(input: &Value, for_validation: bool) -> ToolResult<Translated> {
             };
             Ok(Translated {
                 target: Target::Write,
-                input: json!({ "file_path": display, "content": content }),
+                input: json!({ "file_path": display, "content": content, "overwrite": true }),
             })
         }
     }
@@ -324,62 +326,6 @@ fn splice_insert(path: &Path, insert_line: i64, new_str: &str) -> ToolResult<Str
         result.push('\n');
     }
     Ok(result)
-}
-
-/// Rewrite a delegate's recovery advice into this tool's vocabulary.
-///
-/// Rebon requires a `Read` before an edit; upstream's editor does not. A model
-/// on the bootstrap request has never been shown `Read` or `Edit`, so telling
-/// it to "use the Read tool, then retry the Edit" names two tools it cannot
-/// call. The precondition is real and stays enforced — only the instruction is
-/// translated.
-fn retarget_guidance(outcome: ValidationOutcome, translated: &Translated) -> ValidationOutcome {
-    if outcome.is_valid() {
-        return outcome;
-    }
-    let Some(message) = outcome.message else {
-        return ValidationOutcome {
-            result: outcome.result,
-            message: None,
-            error_code: outcome.error_code,
-        };
-    };
-    let path = translated
-        .input
-        .get("file_path")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let native = match translated.target {
-        Target::Edit => "Edit",
-        Target::Write => "Write",
-        _ => {
-            return ValidationOutcome {
-                result: outcome.result,
-                message: Some(message),
-                error_code: outcome.error_code,
-            }
-        }
-    };
-    let rewritten = message
-        .replace(
-            &format!(
-                "Use the Read tool with {} first",
-                json!({"targets": [{"path": path}]})
-            ),
-            &format!(
-                "Run `{STR_REPLACE_EDITOR_TOOL_NAME}` with command=view and path={path} first"
-            ),
-        )
-        .replace(&format!("then retry the {native}"), "then retry this edit")
-        .replace(
-            &format!("Read the file again and retry the {native}"),
-            "View the file again and retry this edit",
-        );
-    ValidationOutcome {
-        result: outcome.result,
-        message: Some(rewritten),
-        error_code: outcome.error_code,
-    }
 }
 
 /// Serve `view` on a directory: two levels deep, hidden entries and the two
@@ -472,10 +418,7 @@ impl Tool for StrReplaceEditorTool {
             refused => return validation_outcome_from(refused),
         };
         match translated.tool() {
-            Some(tool) => Ok(retarget_guidance(
-                tool.validate_input(&translated.input, context).await?,
-                &translated,
-            )),
+            Some(tool) => tool.validate_input(&translated.input, context).await,
             None => Ok(ValidationOutcome::valid()),
         }
     }
@@ -752,54 +695,35 @@ mod tests {
         assert!(result["content"].as_str().unwrap().contains("a.txt"));
     }
 
+    /// Neither `str_replace` nor `insert` needs a prior `view`, even in a
+    /// session with a file-state cache.
     #[tokio::test]
-    async fn read_before_edit_advice_is_translated_into_this_tool_vocabulary() {
+    async fn edits_need_no_prior_view() {
         let dir = tempdir();
         let file = dir.path().join("a.txt");
         std::fs::write(&file, "alpha\n").unwrap();
-        let outcome = StrReplaceEditorTool
-            .validate_input(
-                &json!({
-                    "command": "str_replace",
-                    "path": file,
-                    "old_str": "alpha",
-                    "new_str": "beta",
-                }),
-                &ToolContext::new().with_file_state_cache(Default::default()),
-            )
-            .await
-            .unwrap();
-        assert!(!outcome.is_valid());
-        let message = outcome.message.unwrap();
-        assert!(
-            message.contains("str_replace_editor` with command=view"),
-            "recovery advice must name a tool the bootstrap catalog exposes: {message}"
-        );
-        assert!(
-            !message.contains("Use the Read tool"),
-            "stale advice leaked: {message}"
-        );
-    }
+        let ctx = ToolContext::new().with_file_state_cache(Default::default());
+        let tool = StrReplaceEditorTool;
 
-    #[test]
-    fn read_before_write_advice_is_translated_with_escaped_path() {
-        let path = "/a/quoted\"file.txt";
-        let translated = Translated {
-            target: Target::Write,
-            input: json!({"file_path": path}),
-        };
-        let message = format!(
-            "File has not been read yet. Use the Read tool with {} first before overwriting it.",
-            json!({"targets": [{"path": path}]})
-        );
-        let outcome = retarget_guidance(ValidationOutcome::invalid(message, 6), &translated);
-        let message = outcome.message.unwrap();
-        assert!(
-            message.contains("str_replace_editor` with command=view"),
-            "{message}"
-        );
-        assert!(!message.contains("Use the Read tool"), "{message}");
-        assert!(message.contains(path), "{message}");
+        let replace = json!({
+            "command": "str_replace",
+            "path": file,
+            "old_str": "alpha",
+            "new_str": "beta",
+        });
+        assert!(tool
+            .validate_input(&replace, &ctx)
+            .await
+            .unwrap()
+            .is_valid());
+        tool.call(replace, &ctx).await.unwrap();
+
+        let ctx = ToolContext::new().with_file_state_cache(Default::default());
+        let insert =
+            json!({ "command": "insert", "path": file, "insert_line": 1, "new_str": "gamma" });
+        assert!(tool.validate_input(&insert, &ctx).await.unwrap().is_valid());
+        tool.call(insert, &ctx).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta\ngamma\n");
     }
 
     #[test]

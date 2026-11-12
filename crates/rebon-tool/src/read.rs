@@ -6,9 +6,8 @@ use image::{
     AnimationDecoder, ImageDecoder, ImageFormat,
 };
 use rebon_tools_core::{
-    file_state::{file_mtime_ms, FileState},
-    require_valid_input, validation_outcome_from, ToolError, ToolId, ToolInputSchema, ToolResult,
-    ValidationOutcome,
+    file_state::FileState, require_valid_input, validation_outcome_from, ToolError, ToolId,
+    ToolInputSchema, ToolResult, ValidationOutcome,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -651,10 +650,9 @@ impl ReadTool {
         }
 
         // Register this observation in the per-session file-state
-        // cache so that Edit / Write can enforce "must Read before
-        // edit" and detect external mods. Store the RAW disk content,
-        // not the rendered line-numbered text — Edit's post-write
-        // content comparison compares against what's on disk.
+        // cache: it marks the file as seen (Write may then replace it
+        // without `overwrite`) and feeds the range merge above. Store the
+        // RAW disk content, not the rendered line-numbered text.
         //
         // `is_partial_view` is intentionally **always false** on the
         // Read path. The flag is a semantic marker for auto-injected
@@ -667,12 +665,10 @@ impl ReadTool {
                 || was_line_truncated
                 || was_byte_truncated
                 || emitted_lines < total_lines;
-            let timestamp_ms = file_mtime_ms(&parsed.file_path).unwrap_or(0);
             cache.set(
                 &parsed.file_path,
                 FileState {
                     content: content.clone(),
-                    timestamp_ms,
                     offset: if had_explicit_range {
                         Some(start_line as u64)
                     } else {
@@ -2820,7 +2816,6 @@ mod tests {
         assert!(!state.is_partial_view);
         assert!(state.offset.is_none());
         assert!(state.limit.is_none());
-        assert!(state.timestamp_ms > 0);
     }
 
     #[tokio::test]
