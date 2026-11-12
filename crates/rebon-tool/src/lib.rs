@@ -174,6 +174,8 @@ pub mod powershell;
 pub mod queue;
 pub mod read;
 mod read_outline;
+mod response_changes;
+pub use response_changes::{changed_earlier_in_response, record_file_change};
 mod search_walk;
 mod shell_failure_marker;
 mod shell_foreground;
@@ -1840,6 +1842,13 @@ impl ToolContext {
     pub fn with_parallel_agent_write_batch(mut self, parallel: bool) -> Self {
         self.update_extension::<SubAgentContext>(|agent| agent.parallel_write_batch = parallel);
         self
+    }
+
+    /// Start a fresh record of the files this response's calls change (see
+    /// [`changed_earlier_in_response`]). Every clone shares it; the next
+    /// response gets a new one.
+    pub fn with_fresh_response_changes(self) -> Self {
+        self.with_extension(response_changes::ResponseChanges::default())
     }
 
     pub fn parallel_agent_write_batch(&self) -> bool {

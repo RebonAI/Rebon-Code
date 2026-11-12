@@ -238,6 +238,47 @@ async fn edit_not_found_returns_the_closest_region_of_the_file() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), body, "untouched");
 }
 
+/// Each response gets its own record of changed files: an insert by line
+/// number after an Edit of the same file in that response is refused, not
+/// applied at a line the Edit moved.
+#[tokio::test]
+async fn a_positional_edit_after_a_change_in_the_same_response_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("list.txt");
+    std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+    let engine = build_engine_with_tools(vec![
+        Arc::new(rebon_tool::EditTool),
+        Arc::new(rebon_tool::StrReplaceEditorTool),
+    ]);
+    let (_, requests) = run_batch(
+        engine,
+        dir.path(),
+        &[
+            (
+                "Edit",
+                "toolu_edit",
+                json!({"file_path": file, "old_string": "one\n", "new_string": "zero\none\n"}),
+            ),
+            (
+                "str_replace_editor",
+                "toolu_insert",
+                json!({"command": "insert", "path": file, "insert_line": 2, "new_str": "between"}),
+            ),
+        ],
+    )
+    .await;
+
+    let (edit, is_error) = result_text(&requests, "toolu_edit");
+    assert!(!is_error, "{edit}");
+    let (insert, is_error) = result_text(&requests, "toolu_insert");
+    assert!(is_error, "{insert}");
+    assert!(insert.contains("earlier call in this response"), "{insert}");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "zero\none\ntwo\nthree\n"
+    );
+}
+
 #[tokio::test]
 async fn a_failed_mutation_skips_the_later_mutations_of_its_batch() {
     let dir = tempfile::tempdir().unwrap();

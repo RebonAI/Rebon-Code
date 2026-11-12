@@ -1,8 +1,8 @@
 use crate::{Tool, ToolContext};
 use async_trait::async_trait;
 use rebon_tools_core::{
-    file_state::FileState, require_valid_input, validation_outcome_from, PermissionDecision,
-    PermissionRequest, ToolError, ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
+    require_valid_input, validation_outcome_from, PermissionDecision, PermissionRequest, ToolError,
+    ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -256,19 +256,18 @@ impl Tool for EditTool {
             source: err.into(),
         })?;
 
-        // Record what this session just wrote: it marks the file as seen
-        // for a later Write, and gives Read's range merge current content.
+        // Record what this session just wrote. Creating the file, or filling
+        // an empty one, writes every byte, so the file now counts as seen;
+        // replacing a span shows the model only that span, so it refreshes an
+        // entry that is there and makes no unseen file seen.
         if let Some(cache) = context.file_state_cache() {
-            cache.set(
-                &parsed.file_path,
-                FileState {
-                    content: updated.clone(),
-                    offset: None,
-                    limit: None,
-                    is_partial_view: false,
-                },
-            );
+            if parsed.old_string.is_empty() {
+                cache.record_whole_write(&parsed.file_path, updated.clone());
+            } else {
+                cache.record_partial_write(&parsed.file_path, updated.clone());
+            }
         }
+        crate::record_file_change(context, &parsed.file_path);
 
         let result = json!({
             "type": edit_type,
@@ -486,6 +485,7 @@ current lines. Several edits to one file in one response apply in order.";
 mod tests {
     use super::*;
     use crate::tasks::test_support::TestConfigHome;
+    use rebon_tools_core::file_state::FileState;
     use rebon_tools_core::file_state::FileStateCache;
     use rebon_tools_core::PermissionBehavior;
     use serde_json::json;
@@ -898,7 +898,9 @@ mod tests {
     }
 
     /// Edit has no read-state precondition: a session cache with no entry
-    /// for the file does not stop it, and the write marks the file as seen.
+    /// for the file does not stop it. The model saw only the span it
+    /// replaced, so the edit does not make the file count as seen, and a
+    /// later Write still needs a Read or `overwrite`.
     #[tokio::test]
     async fn edit_applies_to_a_file_this_session_never_read() {
         let dir = TempDir::new();
@@ -913,9 +915,43 @@ mod tests {
             .expect("no Read is required before an Edit");
 
         assert_eq!(fs::read_to_string(&file).unwrap(), "HELLO world");
-        let state = cache.get(&file).expect("the edit records the file as seen");
-        assert_eq!(state.content, "HELLO world");
+        assert!(cache.get(&file).is_none(), "a blind edit is not a read");
+        let err = crate::WriteTool
+            .call(
+                json!({ "file_path": file.to_string_lossy(), "content": "replaced" }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        invalid_reason(err, crate::write::UNSEEN_OVERWRITE_CODE);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "HELLO world");
+    }
+
+    /// An edit of a file the session has seen keeps it seen, with the new
+    /// content; one that creates a file makes it seen.
+    #[tokio::test]
+    async fn edits_keep_a_seen_file_seen_and_a_created_file_is_seen() {
+        let dir = TempDir::new();
+        let seen = dir.path().join("seen.txt");
+        fs::write(&seen, "alpha beta").unwrap();
+        let cache = FileStateCache::new();
+        register_read(&cache, &seen, "alpha beta");
+        let ctx = ToolContext::new().with_file_state_cache(cache.clone());
+
+        tool()
+            .call(edit_input(&seen, "alpha", "ALPHA"), &ctx)
+            .await
+            .unwrap();
+        let state = cache.get(&seen).unwrap();
+        assert_eq!(state.content, "ALPHA beta");
         assert!(!state.is_partial_view);
+
+        let created = dir.path().join("created.txt");
+        tool()
+            .call(edit_input(&created, "", "fresh"), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(cache.get(&created).unwrap().content, "fresh");
     }
 
     #[tokio::test]

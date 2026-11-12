@@ -430,7 +430,8 @@ async fn run_tool_round(
     let tool_batch_context = context
         .clone()
         .with_auto_mode_classifier_transcript(auto_mode_classifier_transcript)
-        .with_parallel_agent_write_batch(parallel_agent_write_batch);
+        .with_parallel_agent_write_batch(parallel_agent_write_batch)
+        .with_fresh_response_changes();
     let tools = engine.tool_resolver_for_context(&tool_batch_context);
     let mut cancelled_during_dispatch = false;
 

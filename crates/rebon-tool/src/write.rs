@@ -1,8 +1,8 @@
 use crate::{Tool, ToolContext};
 use async_trait::async_trait;
 use rebon_tools_core::{
-    file_state::FileState, require_valid_input, validation_outcome_from, PermissionDecision,
-    PermissionRequest, ToolError, ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
+    require_valid_input, validation_outcome_from, PermissionDecision, PermissionRequest, ToolError,
+    ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -214,16 +214,9 @@ impl Tool for WriteTool {
         // file needs no `overwrite`, and Read's range merge sees current
         // content.
         if let Some(cache) = context.file_state_cache() {
-            cache.set(
-                &parsed.file_path,
-                FileState {
-                    content: parsed.content.clone(),
-                    offset: None,
-                    limit: None,
-                    is_partial_view: false,
-                },
-            );
+            cache.record_whole_write(&parsed.file_path, parsed.content.clone());
         }
+        crate::record_file_change(context, &parsed.file_path);
 
         let write_type = if original_text.is_some() {
             "update"
@@ -423,6 +416,7 @@ fn lean_schema() -> ToolInputSchema {
 mod tests {
     use super::*;
     use crate::tasks::test_support::TestConfigHome;
+    use rebon_tools_core::file_state::FileState;
     use rebon_tools_core::file_state::FileStateCache;
     use rebon_tools_core::PermissionBehavior;
     use serde_json::json;

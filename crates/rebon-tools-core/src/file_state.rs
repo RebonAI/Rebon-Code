@@ -21,7 +21,10 @@
 //!
 //! * Read stores the **raw file content** (not rendered / not line-numbered).
 //! * Edit/Write **refresh the entry immediately after writing to disk** with
-//!   the new content, clearing `offset` / `limit`.
+//!   the new content, clearing `offset` / `limit`. Only a whole-file write
+//!   (`Write`, a file an edit creates) makes an unseen file seen; an edit of
+//!   an existing file refreshes an entry that is there and adds none, since
+//!   the model saw only the text it replaced.
 //! * `is_partial_view` is **not** a Read concept. It is set only when
 //!   auto-injected memory content (REBON.md / MEMORY.md / CLAUDE.md) was
 //!   processed (stripped HTML comments, stripped frontmatter, truncated
@@ -90,6 +93,40 @@ impl FileStateCache {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.insert(key, state);
+        }
+    }
+
+    /// Record that a whole file was just written with `content`: the writer
+    /// chose every byte, so the file now counts as seen.
+    pub fn record_whole_write(&self, path: &Path, content: String) {
+        self.set(
+            path,
+            FileState {
+                content,
+                offset: None,
+                limit: None,
+                is_partial_view: false,
+            },
+        );
+    }
+
+    /// Record that part of a file was just rewritten in place (an `Edit`, a
+    /// notebook cell), leaving its content `content`.
+    ///
+    /// An edit shows the model only the text it replaced, so it does not
+    /// make an unseen file seen: with no entry this records nothing, and a
+    /// partial view stays partial. An entry that was already seen gets the
+    /// new content, for `Read`'s range merge.
+    pub fn record_partial_write(&self, path: &Path, content: String) {
+        let key = normalize_path_key(path);
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = guard.get_mut(&key) {
+            entry.content = content;
+            entry.offset = None;
+            entry.limit = None;
         }
     }
 
@@ -163,6 +200,53 @@ pub fn normalize_path_key(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// A partial write never creates an entry or upgrades a partial view;
+    /// a whole write makes the file seen.
+    #[test]
+    fn only_a_whole_write_makes_a_file_seen() {
+        let cache = FileStateCache::new();
+        let unseen = PathBuf::from("/tmp/unseen.txt");
+        cache.record_partial_write(&unseen, "edited".into());
+        assert!(cache.get(&unseen).is_none());
+
+        let injected = PathBuf::from("/tmp/MEMORY.md");
+        cache.set(
+            &injected,
+            FileState {
+                content: "raw".into(),
+                offset: None,
+                limit: None,
+                is_partial_view: true,
+            },
+        );
+        cache.record_partial_write(&injected, "raw edited".into());
+        let state = cache.get(&injected).unwrap();
+        assert_eq!(state.content, "raw edited");
+        assert!(state.is_partial_view);
+
+        let read = PathBuf::from("/tmp/read.txt");
+        cache.set(
+            &read,
+            FileState {
+                content: "a\nb".into(),
+                offset: Some(2),
+                limit: Some(1),
+                is_partial_view: false,
+            },
+        );
+        cache.record_partial_write(&read, "a\nB".into());
+        let state = cache.get(&read).unwrap();
+        assert_eq!(
+            (state.content.as_str(), state.offset, state.limit),
+            ("a\nB", None, None)
+        );
+
+        cache.record_whole_write(&unseen, "whole".into());
+        let state = cache.get(&unseen).unwrap();
+        assert_eq!(state.content, "whole");
+        assert!(!state.is_partial_view);
+    }
 
     #[test]
     fn roundtrip_full_read_then_overwrite() {

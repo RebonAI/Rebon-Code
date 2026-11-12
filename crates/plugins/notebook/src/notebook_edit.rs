@@ -33,8 +33,8 @@ use rebon_tool::edit::{
 };
 use rebon_tool::{Tool, ToolContext};
 use rebon_tools_core::{
-    file_state::FileState, require_valid_input, validation_outcome_from, PermissionDecision,
-    PermissionRequest, ToolError, ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
+    require_valid_input, validation_outcome_from, PermissionDecision, PermissionRequest, ToolError,
+    ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
 };
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -46,6 +46,9 @@ pub use rebon_tool::NOTEBOOK_EDIT_TOOL_NAME;
 const NOT_A_NOTEBOOK_CODE: i64 = 10;
 /// `cell_id` did not resolve to a cell in this notebook.
 const CELL_NOT_FOUND_CODE: i64 = 11;
+/// `cell_id` is an index, and an earlier call of the same response already
+/// changed the notebook, so the index may name a different cell now.
+const POSITION_MOVED_CODE: i64 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditMode {
@@ -256,6 +259,28 @@ impl Tool for NotebookEditTool {
                 error_code: Some(NOT_A_NOTEBOOK_CODE),
             })?;
 
+        // A cell named by its index was chosen against the notebook as the
+        // model last saw it. Once an earlier call of this response changed
+        // the notebook, that index may name another cell, so refuse rather
+        // than edit the wrong one.
+        if let Some(cell_id) = parsed.cell_id.as_deref() {
+            if names_cell_by_position(&notebook, cell_id)
+                && rebon_tool::changed_earlier_in_response(context, &parsed.notebook_path)
+            {
+                return Err(ToolError::InvalidInput {
+                    tool: self.id(),
+                    reason: format!(
+                        "`cell_id` \"{cell_id}\" names a cell by its position, and an earlier call \
+                         in this response already changed {}, so position {cell_id} may no longer \
+                         be the cell you meant. Nothing was changed. Re-issue this edit in a new \
+                         response, after looking at the notebook again.",
+                        parsed.notebook_path.display()
+                    ),
+                    error_code: Some(POSITION_MOVED_CODE),
+                });
+            }
+        }
+
         let uses_crlf = raw.contains("\r\n");
         let trailing_newline = raw.ends_with('\n');
         let outcome = apply_notebook_edit(&self.id(), &mut notebook, &parsed)?;
@@ -280,19 +305,13 @@ impl Tool for NotebookEditTool {
             }
         })?;
 
-        // Record what this session just wrote: it marks the notebook as seen
-        // for a later Write, and gives Read's range merge current content.
+        // Record what this session just wrote. A cell edit shows the model
+        // only that cell, so it refreshes an entry that is there and makes no
+        // unseen notebook seen.
         if let Some(cache) = context.file_state_cache() {
-            cache.set(
-                &parsed.notebook_path,
-                FileState {
-                    content: serialized.clone(),
-                    offset: None,
-                    limit: None,
-                    is_partial_view: false,
-                },
-            );
+            cache.record_partial_write(&parsed.notebook_path, serialized.clone());
         }
+        rebon_tool::record_file_change(context, &parsed.notebook_path);
 
         // `filePath` + `oldString` + `newString` is the shape the shared
         // renderer turns into a diff card. Scoped to the cell source, so
@@ -470,6 +489,20 @@ fn not_a_notebook(tool: &ToolId, detail: &str) -> ToolError {
         reason: format!("This file is not a Jupyter notebook: {detail}."),
         error_code: Some(NOT_A_NOTEBOOK_CODE),
     }
+}
+
+/// Whether `cell_id` would be resolved as a 0-based index: no cell has it as
+/// its `id`, and it is a number.
+fn names_cell_by_position(notebook: &Value, cell_id: &str) -> bool {
+    let cells = notebook
+        .get("cells")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    !cells
+        .iter()
+        .any(|cell| cell.get("id").and_then(Value::as_str) == Some(cell_id))
+        && cell_id.parse::<usize>().is_ok()
 }
 
 /// Resolve `cell_id` to a position: the `id` field first, then a
@@ -721,6 +754,7 @@ fn validate_parsed_input(input: &NotebookEditInput) -> ToolResult<ValidationOutc
 mod tests {
     use super::*;
     use rebon_agent_core::file_history::FileHistoryTracker;
+    use rebon_tools_core::file_state::FileState;
     use rebon_tools_core::file_state::FileStateCache;
     use rebon_tools_core::PermissionBehavior;
     use serde_json::json;
@@ -1330,10 +1364,82 @@ mod tests {
             .expect("no Read is required before a NotebookEdit");
 
         assert_eq!(read_notebook(&path)["cells"][1]["source"], json!(["x\n"]));
-        assert_eq!(
-            cache.get(&path).unwrap().content,
-            fs::read_to_string(&path).unwrap()
-        );
+        // The model saw one cell, not the notebook: it is not "seen".
+        assert!(cache.get(&path).is_none());
+    }
+
+    /// A seen notebook stays seen after a cell edit, with the new content.
+    #[tokio::test]
+    async fn a_cell_edit_keeps_a_seen_notebook_seen() {
+        let dir = TempDir::new();
+        let path = write_notebook(&dir);
+        let context = observed_context(&path, &fs::read_to_string(&path).unwrap(), None);
+
+        tool()
+            .call(
+                json!({
+                    "notebook_path": path.to_string_lossy(),
+                    "cell_id": "compute",
+                    "new_source": "y\n"
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+        let state = context.file_state_cache().unwrap().get(&path).unwrap();
+        assert_eq!(state.content, fs::read_to_string(&path).unwrap());
+        assert!(!state.is_partial_view);
+    }
+
+    /// Two deletes by index in one response: the second index was counted
+    /// before the first delete shifted the cells, so it is refused rather
+    /// than deleting the wrong cell. Cells named by `id` are not affected,
+    /// and a new response may use an index again.
+    #[tokio::test]
+    async fn a_cell_index_after_an_earlier_change_in_the_response_is_refused() {
+        let dir = TempDir::new();
+        let path = write_notebook(&dir);
+        let response = ToolContext::new().with_fresh_response_changes();
+        let delete = |cell_id: &str| {
+            json!({
+                "notebook_path": path.to_string_lossy(),
+                "cell_id": cell_id,
+                "new_source": "",
+                "edit_mode": "delete"
+            })
+        };
+
+        tool().call(delete("0"), &response).await.unwrap();
+        let err = tool().call(delete("0"), &response).await.unwrap_err();
+        match err {
+            ToolError::InvalidInput {
+                error_code, reason, ..
+            } => {
+                assert_eq!(error_code, Some(POSITION_MOVED_CODE));
+                assert!(reason.contains("earlier call in this response"), "{reason}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        let cells = read_notebook(&path)["cells"].as_array().unwrap().clone();
+        assert_eq!(cells.len(), 1, "only the first delete applied");
+        assert_eq!(cells[0]["id"], "compute");
+
+        // By id, the cell is found wherever it moved.
+        tool()
+            .call(
+                json!({
+                    "notebook_path": path.to_string_lossy(),
+                    "cell_id": "compute",
+                    "new_source": "z\n"
+                }),
+                &response,
+            )
+            .await
+            .unwrap();
+
+        let next = ToolContext::new().with_fresh_response_changes();
+        tool().call(delete("0"), &next).await.unwrap();
+        assert!(read_notebook(&path)["cells"].as_array().unwrap().is_empty());
     }
 
     /// Two NotebookEdits of one notebook, back to back: both apply, and an

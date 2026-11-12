@@ -11,7 +11,11 @@
 //! [`EditTool`], so permissions, the file-state cache, and path scoping
 //! behave exactly as they do for the native tools. `insert` is an edit of the
 //! file's current content, so its Write carries `overwrite: true`: like
-//! `str_replace`, it needs no prior `view`.
+//! `str_replace`, it needs no prior `view`, and like it, it does not make a
+//! file the model never viewed count as seen. An insert names a line number,
+//! so after an earlier call of the same response changed the file it is
+//! refused (see [`crate::changed_earlier_in_response`]). A delegate's
+//! recovery advice is reworded into this tool's commands and fields.
 
 use crate::edit::EditTool;
 use crate::read::ReadTool;
@@ -418,7 +422,13 @@ impl Tool for StrReplaceEditorTool {
             refused => return validation_outcome_from(refused),
         };
         match translated.tool() {
-            Some(tool) => tool.validate_input(&translated.input, context).await,
+            Some(tool) => {
+                let mut outcome = tool.validate_input(&translated.input, context).await?;
+                if let Some(message) = outcome.message.take() {
+                    outcome.message = Some(retarget(&message, &translated));
+                }
+                Ok(outcome)
+            }
             None => Ok(ValidationOutcome::valid()),
         }
     }
@@ -451,6 +461,22 @@ impl Tool for StrReplaceEditorTool {
     }
 
     async fn call(&self, input: Value, context: &ToolContext) -> ToolResult<Value> {
+        let inserting = command_of(&input).is_ok_and(|command| command == "insert");
+        if inserting {
+            // `insert_line` was chosen against the file as the model last
+            // saw it; after an earlier change in this response that line may
+            // be somewhere else.
+            let path = path_of(&input)?;
+            if crate::changed_earlier_in_response(context, &path) {
+                return Err(invalid(format!(
+                    "`insert_line` is a line number, and an earlier call in this response already \
+                     changed {}, so that line may no longer be where you meant. Nothing was \
+                     changed. Run `{STR_REPLACE_EDITOR_TOOL_NAME}` with command=view on it, then \
+                     insert in a new response.",
+                    path.display()
+                )));
+            }
+        }
         let translated = translate(&input, false)?;
         match translated.target {
             Target::ListDirectory(ref root) => list_directory(root),
@@ -470,9 +496,86 @@ impl Tool for StrReplaceEditorTool {
                 let tool = translated
                     .tool()
                     .expect("non-listing targets resolve to a native tool");
-                tool.call(translated.input, context).await
+                let path = translated
+                    .input
+                    .get("file_path")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from);
+                // `insert` is a whole-file Write underneath, but the model saw
+                // only the line it named: the file's "seen" state stays what
+                // it was.
+                let seen_before = match (inserting, context.file_state_cache(), &path) {
+                    (true, Some(cache), Some(path)) => Some(cache.get(path)),
+                    _ => None,
+                };
+                let result = tool
+                    .call(translated.input.clone(), context)
+                    .await
+                    .map_err(|err| retarget_error(err, &translated))?;
+                if let (Some(before), Some(cache), Some(path)) =
+                    (seen_before, context.file_state_cache(), &path)
+                {
+                    match before {
+                        None => {
+                            cache.remove(path);
+                        }
+                        Some(state) if state.is_partial_view => {
+                            if let Some(mut now) = cache.get(path) {
+                                now.is_partial_view = true;
+                                cache.set(path, now);
+                            }
+                        }
+                        Some(_) => {}
+                    }
+                }
+                Ok(result)
             }
         }
+    }
+}
+
+/// Rewrite a delegate's recovery advice into this tool's vocabulary.
+///
+/// An Anchored Minimal session has this tool and `bash`, nothing else: advice
+/// that names `Read`, `Write`'s `overwrite`, or `Edit`'s parameter names
+/// points at tools and fields it cannot use. Only the wording changes; the
+/// rule behind it is the delegate's.
+fn retarget(message: &str, translated: &Translated) -> String {
+    let path = translated
+        .input
+        .get("file_path")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    message
+        .replace(
+            "Read it first, or pass `overwrite: true` to replace it.",
+            &format!(
+                "Run `{STR_REPLACE_EDITOR_TOOL_NAME}` with command=view and path={path} first, then \
+                 change it with `str_replace` or `insert`; `create` only makes new files."
+            ),
+        )
+        .replace(
+            "Add surrounding lines to `old_string` to pick one, or set `replace_all` to true to \
+             replace every occurrence.",
+            "Add surrounding lines to `old_str` to pick one.",
+        )
+        .replace("line-number prefixes of Read output", "line-number prefixes of `view` output")
+        .replace("`old_string`", "`old_str`")
+        .replace("`new_string`", "`new_str`")
+}
+
+fn retarget_error(error: ToolError, translated: &Translated) -> ToolError {
+    match error {
+        ToolError::InvalidInput {
+            tool,
+            reason,
+            error_code,
+        } => ToolError::InvalidInput {
+            tool,
+            reason: retarget(&reason, translated),
+            error_code,
+        },
+        other => other,
     }
 }
 
@@ -724,6 +827,148 @@ mod tests {
         assert!(tool.validate_input(&insert, &ctx).await.unwrap().is_valid());
         tool.call(insert, &ctx).await.unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta\ngamma\n");
+    }
+
+    /// Two inserts by line number in one response: the second one's line was
+    /// counted before the first moved everything below it, so it is refused
+    /// rather than landing in the wrong place. A new response may insert.
+    #[tokio::test]
+    async fn a_second_positional_insert_in_one_response_is_refused() {
+        let dir = tempdir();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+        let response = ToolContext::new().with_fresh_response_changes();
+        let tool = StrReplaceEditorTool;
+
+        tool.call(
+            json!({ "command": "insert", "path": file, "insert_line": 1, "new_str": "A" }),
+            &response,
+        )
+        .await
+        .unwrap();
+        let err = tool
+            .call(
+                json!({ "command": "insert", "path": file, "insert_line": 3, "new_str": "B" }),
+                &response,
+            )
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("earlier call in this response"),
+            "{message}"
+        );
+        assert!(message.contains("command=view"), "{message}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "one\nA\ntwo\nthree\n"
+        );
+
+        // A content-anchored replace after it is fine.
+        tool.call(
+            json!({ "command": "str_replace", "path": file, "old_str": "three", "new_str": "3" }),
+            &response,
+        )
+        .await
+        .unwrap();
+
+        let next = ToolContext::new().with_fresh_response_changes();
+        tool.call(
+            json!({ "command": "insert", "path": file, "insert_line": 3, "new_str": "B" }),
+            &next,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "one\nA\ntwo\nB\n3\n"
+        );
+    }
+
+    /// `insert` and `str_replace` on a file never viewed do not make it seen:
+    /// the model saw one line, not the file.
+    #[tokio::test]
+    async fn edits_of_an_unviewed_file_do_not_count_as_seeing_it() {
+        let dir = tempdir();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "alpha\n").unwrap();
+        let cache = rebon_tools_core::FileStateCache::new();
+        let ctx = ToolContext::new().with_file_state_cache(cache.clone());
+        let tool = StrReplaceEditorTool;
+
+        tool.call(
+            json!({ "command": "insert", "path": file, "insert_line": 1, "new_str": "beta" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            cache.get(&file).is_none(),
+            "insert must not mark the file seen"
+        );
+        tool.call(
+            json!({ "command": "str_replace", "path": file, "old_str": "beta", "new_str": "gamma" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            cache.get(&file).is_none(),
+            "str_replace must not mark the file seen"
+        );
+
+        // After a view, an insert keeps it seen with the new content.
+        tool.call(json!({ "command": "view", "path": file }), &ctx)
+            .await
+            .unwrap();
+        tool.call(
+            json!({ "command": "insert", "path": file, "insert_line": 0, "new_str": "top" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let state = cache.get(&file).expect("still seen");
+        assert!(!state.is_partial_view);
+        assert_eq!(state.content, "top\nalpha\ngamma\n");
+    }
+
+    /// Recovery advice names this tool's commands and fields: the bootstrap
+    /// toolset has no `Read`, no `overwrite`, no `replace_all`.
+    #[tokio::test]
+    async fn recovery_advice_uses_this_tools_vocabulary() {
+        let dir = tempdir();
+        let file = dir.path().join("dupes.txt");
+        std::fs::write(&file, "retry();\nretry();\n").unwrap();
+        let err = StrReplaceEditorTool
+            .call(
+                json!({ "command": "str_replace", "path": file, "old_str": "retry();", "new_str": "x" }),
+                &ToolContext::new(),
+            )
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Add surrounding lines to `old_str` to pick one."),
+            "{message}"
+        );
+        assert!(!message.contains("replace_all"), "{message}");
+        assert!(!message.contains("`old_string`"), "{message}");
+
+        let translated = Translated {
+            target: Target::Write,
+            input: json!({ "file_path": "/a/b.txt" }),
+        };
+        let advice = retarget(
+            "/a/b.txt already exists and has not been read in this session. Read it first, or \
+             pass `overwrite: true` to replace it.",
+            &translated,
+        );
+        assert!(
+            advice.contains("command=view and path=/a/b.txt"),
+            "{advice}"
+        );
+        assert!(!advice.contains("overwrite"), "{advice}");
+        assert!(!advice.contains("Read it first"), "{advice}");
     }
 
     #[test]

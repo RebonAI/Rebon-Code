@@ -30,8 +30,8 @@ use crate::edit::{
 use crate::{Tool, ToolContext};
 use async_trait::async_trait;
 use rebon_tools_core::{
-    file_state::FileState, require_valid_input, validation_outcome_from, PermissionDecision,
-    PermissionRequest, ToolError, ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
+    require_valid_input, validation_outcome_from, PermissionDecision, PermissionRequest, ToolError,
+    ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -302,19 +302,18 @@ impl Tool for MultiEditTool {
             source: err.into(),
         })?;
 
-        // Record what this session just wrote: it marks the file as seen
-        // for a later Write, and gives Read's range merge current content.
+        // Record what this session just wrote. Creating the file writes every
+        // byte, so it now counts as seen; edits of an existing file show the
+        // model only the spans they replace, so they refresh an entry that is
+        // there and make no unseen file seen.
         if let Some(cache) = context.file_state_cache() {
-            cache.set(
-                &parsed.file_path,
-                FileState {
-                    content: updated.clone(),
-                    offset: None,
-                    limit: None,
-                    is_partial_view: false,
-                },
-            );
+            if original.is_none() {
+                cache.record_whole_write(&parsed.file_path, updated.clone());
+            } else {
+                cache.record_partial_write(&parsed.file_path, updated.clone());
+            }
         }
+        crate::record_file_change(context, &parsed.file_path);
 
         // `oldString` / `newString` carry the narrowest span of the file
         // that actually changed, so the shared diff renderer (which
@@ -714,6 +713,7 @@ fn lean_schema() -> ToolInputSchema {
 mod tests {
     use super::*;
     use crate::tasks::test_support::TestConfigHome;
+    use rebon_tools_core::file_state::FileState;
     use rebon_tools_core::file_state::FileStateCache;
     use rebon_tools_core::PermissionBehavior;
     use serde_json::json;
@@ -766,6 +766,36 @@ mod tests {
         assert_eq!(out["editCount"], json!(2));
         assert_eq!(out["replacements"], json!(2));
         assert_eq!(fs::read_to_string(&file).unwrap(), "ALPHA beta GAMMA");
+    }
+
+    /// Editing a file the session never read does not make it seen; one
+    /// MultiEdit creates is.
+    #[tokio::test]
+    async fn a_blind_multi_edit_does_not_count_as_seeing_the_file() {
+        let dir = TempDir::new();
+        let file = dir.path().join("demo.txt");
+        fs::write(&file, "alpha beta").unwrap();
+        let cache = FileStateCache::new();
+        let ctx = ToolContext::new().with_file_state_cache(cache.clone());
+
+        tool()
+            .call(
+                json!({ "file_path": file.to_string_lossy(), "edits": [edit("alpha", "ALPHA")] }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(cache.get(&file).is_none());
+
+        let created = dir.path().join("new.txt");
+        tool()
+            .call(
+                json!({ "file_path": created.to_string_lossy(), "edits": [edit("", "fresh")] }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cache.get(&created).unwrap().content, "fresh");
     }
 
     /// The defining difference from N separate Edit calls: edit 1 may
@@ -1063,7 +1093,7 @@ mod tests {
             .await
             .expect("no Read is required before a MultiEdit");
         assert_eq!(fs::read_to_string(&file).unwrap(), "HELLO world");
-        assert_eq!(cache.get(&file).unwrap().content, "HELLO world");
+        assert!(cache.get(&file).is_none(), "a blind edit is not a read");
     }
 
     #[tokio::test]
@@ -1072,6 +1102,7 @@ mod tests {
         let file = dir.path().join("cache.txt");
         fs::write(&file, "alpha beta").unwrap();
         let cache = FileStateCache::new();
+        cache.record_whole_write(&file, "alpha beta".into());
         let ctx = ToolContext::new().with_file_state_cache(cache.clone());
 
         tool()
