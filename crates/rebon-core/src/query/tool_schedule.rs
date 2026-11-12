@@ -128,17 +128,26 @@ pub(super) fn skipped_message(index: usize, tool: &str, why: Stranded) -> String
 
 /// Whether a call's outcome means the step did not happen as planned.
 ///
-/// A shell tool reports a failing command as a successful call with a
-/// non-zero `exitCode` (or `timedOut`), and the step after `cargo build` is
-/// as stranded by that as by a tool error. So is one whose command was moved
-/// to the background at its timeout (`backgrounded`): it has not finished.
-/// A `null` exit code alone is a `run_in_background` launch, which the model
-/// asked for, not a failure.
-pub(super) fn stranding(outcome: &Result<Value, ToolErrorPresentation>) -> Option<Stranded> {
+/// Any tool error does. Beyond that, only a call that ran a command in this
+/// call — `Bash` or `PowerShell` — is read for how the command went: other
+/// tools carry an `exitCode` that describes something else (`ShellStop`
+/// reporting a shell that finished long ago). For those, a non-zero
+/// `exitCode`, a `timedOut`, or a terminating `signal` (a segfault, an
+/// out-of-memory kill) leaves the step after `cargo build` as stranded as a
+/// tool error would. So does a command moved to the background at its
+/// timeout (`backgrounded`): it has not finished. A `null` exit code alone is
+/// a `run_in_background` launch, which the model asked for, not a failure.
+pub(super) fn stranding(
+    tool_name: &str,
+    outcome: &Result<Value, ToolErrorPresentation>,
+) -> Option<Stranded> {
     let value = match outcome {
         Err(_) => return Some(Stranded::Failed),
         Ok(value) => value,
     };
+    if !runs_a_command(tool_name) {
+        return None;
+    }
     if value.get("backgrounded").and_then(Value::as_bool) == Some(true) {
         return Some(Stranded::StillRunning);
     }
@@ -146,8 +155,18 @@ pub(super) fn stranding(outcome: &Result<Value, ToolErrorPresentation>) -> Optio
         .get("exitCode")
         .and_then(Value::as_i64)
         .is_some_and(|code| code != 0)
-        || value.get("timedOut").and_then(Value::as_bool) == Some(true);
+        || value.get("timedOut").and_then(Value::as_bool) == Some(true)
+        || value.get("signal").is_some_and(|signal| !signal.is_null());
     failed.then_some(Stranded::Failed)
+}
+
+/// The tools whose result reports a command they ran in this call, under any
+/// name the model may use for them.
+fn runs_a_command(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "Bash" | "BashTool" | "bash" | "PowerShell" | "PowerShellTool"
+    )
 }
 
 fn interrupted() -> ToolErrorPresentation {
@@ -298,7 +317,7 @@ pub(super) async fn run_staged(
                 }
             };
             if !concurrent && first_stranding_barrier.is_none() {
-                if let Some(why) = stranding(&outcome) {
+                if let Some(why) = stranding(&name, &outcome) {
                     first_stranding_barrier = Some((index, name.clone(), why));
                 }
             }
@@ -328,24 +347,68 @@ mod tests {
 
     #[test]
     fn a_non_zero_exit_or_timeout_is_a_failure_but_a_background_launch_is_not() {
-        assert_eq!(stranding(&Err(interrupted())), Some(Stranded::Failed));
         assert_eq!(
-            stranding(&Ok(json!({"exitCode": 2}))),
+            stranding("Bash", &Err(interrupted())),
             Some(Stranded::Failed)
         );
         assert_eq!(
-            stranding(&Ok(json!({"exitCode": 0, "timedOut": true}))),
+            stranding("Edit", &Err(interrupted())),
+            Some(Stranded::Failed)
+        );
+        for name in ["Bash", "bash", "BashTool", "PowerShell"] {
+            assert_eq!(
+                stranding(name, &Ok(json!({"exitCode": 2}))),
+                Some(Stranded::Failed),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            stranding("Bash", &Ok(json!({"exitCode": 0, "timedOut": true}))),
             Some(Stranded::Failed)
         );
         assert_eq!(
-            stranding(&Ok(json!({"exitCode": 0, "timedOut": false}))),
+            stranding("Bash", &Ok(json!({"exitCode": 0, "timedOut": false}))),
             None
         );
         assert_eq!(
-            stranding(&Ok(json!({"shellId": "s1", "exitCode": null}))),
+            stranding("Bash", &Ok(json!({"shellId": "s1", "exitCode": null}))),
             None
         );
-        assert_eq!(stranding(&Ok(json!({"type": "update"}))), None);
+        assert_eq!(stranding("Edit", &Ok(json!({"type": "update"}))), None);
+    }
+
+    /// `ShellStop` on a shell that finished long ago succeeds and echoes
+    /// that shell's exit code; it ran no command, so it strands nothing.
+    #[test]
+    fn an_exit_code_from_a_tool_that_ran_no_command_is_not_a_failure() {
+        let stop_noop = json!({
+            "shellId": "sh_1",
+            "status": "exited",
+            "alreadyCompleted": true,
+            "exitCode": 2,
+        });
+        assert_eq!(stranding("ShellStop", &Ok(stop_noop)), None);
+        assert_eq!(
+            stranding("TaskStop", &Ok(json!({"exitCode": 1, "timedOut": true}))),
+            None
+        );
+    }
+
+    /// A command killed by a signal (a segfault, an out-of-memory kill)
+    /// reports no exit code; it failed all the same.
+    #[test]
+    fn a_command_killed_by_a_signal_is_a_failure() {
+        assert_eq!(
+            stranding(
+                "Bash",
+                &Ok(json!({"exitCode": null, "timedOut": false, "signal": 11}))
+            ),
+            Some(Stranded::Failed)
+        );
+        assert_eq!(
+            stranding("Bash", &Ok(json!({"exitCode": null, "signal": null}))),
+            None
+        );
     }
 
     /// A foreground command moved to the background at its timeout has not
@@ -353,12 +416,15 @@ mod tests {
     #[test]
     fn a_command_backgrounded_at_its_timeout_strands_the_rest() {
         assert_eq!(
-            stranding(&Ok(json!({
-                "exitCode": null,
-                "timedOut": true,
-                "backgrounded": true,
-                "shellId": "sh_1"
-            }))),
+            stranding(
+                "Bash",
+                &Ok(json!({
+                    "exitCode": null,
+                    "timedOut": true,
+                    "backgrounded": true,
+                    "shellId": "sh_1"
+                }))
+            ),
             Some(Stranded::StillRunning)
         );
     }
