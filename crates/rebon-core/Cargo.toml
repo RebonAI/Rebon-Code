@@ -18,6 +18,7 @@ rebon-api.workspace = true
 rebon-bridge.workspace = true
 rebon-instructions.workspace = true
 rebon-permissions.workspace = true
+rebon-shell-policy.workspace = true
 rebon-tool.workspace = true
 rebon-tools-core.workspace = true
 rebon-hooks.workspace = true

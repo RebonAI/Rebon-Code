@@ -234,7 +234,12 @@ impl PolicyEvaluator {
     /// produce the same outcome anyway).
     /// Evaluate a batch under one consistent rule snapshot. Ask rules override
     /// allows, and a deny on any target vetoes the entire call.
-    fn evaluate_read_batch(&self, tool_name: &str, input: &Value) -> Option<(PolicyOutcome, bool)> {
+    fn evaluate_read_batch(
+        &self,
+        tool_name: &str,
+        input: &Value,
+        cwd: Option<&str>,
+    ) -> Option<(PolicyOutcome, bool)> {
         if !rebon_tools_core::builtin_tool_facts_for_name(tool_name)
             .is_some_and(|facts| facts.name == "Read")
             || input.get("targets").is_none()
@@ -263,6 +268,7 @@ impl PolicyEvaluator {
                         tool_name,
                         &target_input,
                         &guard.rules,
+                        cwd,
                     )
                 {
                     continue;
@@ -297,8 +303,68 @@ impl PolicyEvaluator {
         Some((outcome, ask))
     }
 
+    /// Judge the paths a read-only Bash command names (`cat`, `rg`, `sed -n`,
+    /// …) by the rules that guard the Read tool, the way
+    /// [`Self::evaluate_read_batch`] judges a Read batch's targets: a deny on
+    /// any of them denies the call, an ask makes it ask. `None` when the
+    /// command is not one the shell policy proves read-only, or names no
+    /// path: the ordinary Bash decision applies.
+    ///
+    /// Without this, a person's `deny: Read(./secrets/**)` held for the Read
+    /// tool and for nothing else, and `cat secrets/token` read it anyway.
+    fn evaluate_shell_reads(
+        &self,
+        tool_name: &str,
+        input: &Value,
+        cwd: Option<&str>,
+    ) -> Option<(PolicyOutcome, bool)> {
+        let input = normalize_shell_input(tool_name, input, cwd);
+        let paths = rebon_shell_policy::read_only::read_only_shell_paths(tool_name, &input)?;
+        if paths.is_empty() {
+            return None;
+        }
+        let guard = self.store.inner.read().expect("policy store poisoned");
+        let mut ask = false;
+        for path in &paths {
+            let target_input = serde_json::json!({ "file_path": path });
+            for rule in &guard.rules {
+                if rule.rule_behavior == PermissionBehavior::Allow
+                    || !rule_applies_to_tool(&rule.rule_value.tool_name, "Read")
+                    || !matches_input(
+                        &rule.rule_value,
+                        rule.rule_behavior,
+                        "Read",
+                        &target_input,
+                        &guard.rules,
+                        cwd,
+                    )
+                {
+                    continue;
+                }
+                match rule.rule_behavior {
+                    PermissionBehavior::Deny => {
+                        return Some((
+                            PolicyOutcome::AutoDeny {
+                                matched: rule.rule_value.clone(),
+                            },
+                            false,
+                        ))
+                    }
+                    PermissionBehavior::Ask => ask = true,
+                    PermissionBehavior::Allow => {}
+                }
+            }
+        }
+        ask.then_some((PolicyOutcome::PassThrough, true))
+    }
+
     pub fn evaluate(&self, tool_name: &str, input: &Value, cwd: Option<&str>) -> PolicyOutcome {
-        if let Some((outcome, _)) = self.evaluate_read_batch(tool_name, input) {
+        if let Some((outcome, _)) = self.evaluate_read_batch(tool_name, input, cwd) {
+            return outcome;
+        }
+        if let Some((outcome @ PolicyOutcome::AutoDeny { .. }, _)) =
+            self.evaluate_shell_reads(tool_name, input, cwd)
+        {
             return outcome;
         }
         // Ignore a leading working-directory wrapper when it points
@@ -317,6 +383,7 @@ impl PolicyEvaluator {
                 tool_name,
                 &input,
                 &guard.rules,
+                cwd,
             ) {
                 continue;
             }
@@ -478,6 +545,7 @@ fn matches_input(
     tool_name: &str,
     input: &Value,
     rules: &[PermissionRule],
+    cwd: Option<&str>,
 ) -> bool {
     let Some(rule_content) = rule_value.rule_content.as_deref() else {
         // Rule without content matches any call to the tool.
@@ -493,7 +561,9 @@ fn matches_input(
     // from the tool rather than from a list here.
     if let Some(field) = rebon_tools_core::file_target_field_for_name(tool_name) {
         let path = input.get(field).and_then(|v| v.as_str()).unwrap_or("");
-        return matches_path_rule(rule_content, path);
+        return matches_path_rule(rule_content, path)
+            || (behavior != PermissionBehavior::Allow
+                && matches_resolved_path_rule(rule_content, path, cwd));
     }
     match tool_name {
         // Two shells, two grammars. Sharing one arm meant PowerShell
@@ -814,6 +884,58 @@ fn matches_bash_prefix_rule(head: &str, tail: &str, argv: &[String]) -> bool {
     rest == tail
 }
 
+/// [`matches_path_rule`] with the rule and the path both read lexically
+/// (`./`, `..`), relative ones from `cwd` when there is one.
+///
+/// The file tools hand the rules absolute paths, and a shell command names
+/// them as typed, while a person writes `Read(./secrets/**)`. Compared
+/// literally, that rule matched neither. Only deny and ask rules are read
+/// this way (see `matches_input`): reading an allow rule more widely would
+/// let it auto-allow calls it never matched before.
+fn matches_resolved_path_rule(rule: &str, path: &str, cwd: Option<&str>) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let cwd = cwd.filter(|cwd| !cwd.is_empty());
+    matches_path_rule(&resolve_lexically(cwd, rule), &resolve_lexically(cwd, path))
+}
+
+/// `path` with its `.` and `..` segments folded, made absolute against `cwd`
+/// when it is relative and there is one, without touching the filesystem.
+/// `~` and patterns that are not paths (`*`, `**`) are left as they are.
+fn resolve_lexically(cwd: Option<&str>, path: &str) -> String {
+    let path = path.replace('\\', "/");
+    if path == "*" || path == "**" || path.starts_with('~') {
+        return path;
+    }
+    let is_absolute =
+        path.starts_with('/') || path.as_bytes().get(1).is_some_and(|byte| *byte == b':');
+    let (root, rest) = if is_absolute {
+        match path.split_once('/') {
+            Some((drive, rest)) if drive.ends_with(':') => (format!("{drive}/"), rest.to_string()),
+            _ => ("/".to_string(), path.trim_start_matches('/').to_string()),
+        }
+    } else {
+        match cwd {
+            Some(cwd) => {
+                return resolve_lexically(None, &format!("{}/{path}", cwd.replace('\\', "/")))
+            }
+            None => (String::new(), path),
+        }
+    };
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in rest.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            segment => segments.push(segment),
+        }
+    }
+    format!("{root}{}", segments.join("/"))
+}
+
 /// Match a file-path rule against a tool `file_path` argument.
 ///
 /// Supported forms:
@@ -978,9 +1100,27 @@ impl PermissionBroker for RulesBasedPermissionBroker {
         decision: PermissionDecision,
     ) -> ToolResult<Value> {
         let effective_input = decision.updated_input.as_ref().unwrap_or(&input);
-        let batch = self
-            .evaluator
-            .evaluate_read_batch(tool.id().as_str(), effective_input);
+        let batch =
+            self.evaluator
+                .evaluate_read_batch(tool.id().as_str(), effective_input, context.cwd());
+        // A rule that asks before a path is read asks before the shell
+        // reads it too, whatever the command's own decision was. A deny
+        // comes back from `evaluate` below.
+        if matches!(
+            self.evaluator
+                .evaluate_shell_reads(tool.id().as_str(), effective_input, context.cwd()),
+            Some((PolicyOutcome::PassThrough, true))
+        ) && decision.behavior != rebon_tools_core::PermissionBehavior::Deny
+        {
+            let ask = PermissionDecision::ask(
+                rebon_tools_core::PermissionRequest::new(
+                    "Read files",
+                    "A stored rule requires approval to read a path this command names.",
+                ),
+                Some(effective_input.clone()),
+            );
+            return self.delegate.resolve(tool, input, context, ask).await;
+        }
         let is_batch = batch.is_some();
         if batch.is_some() && decision.behavior == rebon_tools_core::PermissionBehavior::Deny {
             return self.delegate.resolve(tool, input, context, decision).await;
@@ -1068,11 +1208,11 @@ mod tests {
             PolicyOutcome::AutoAllow { .. }
         ));
         assert!(matches!(
-            evaluator.evaluate_read_batch("Read", &batch(&["/safe/a", "/safe/private/b"])),
+            evaluator.evaluate_read_batch("Read", &batch(&["/safe/a", "/safe/private/b"]), None),
             Some((PolicyOutcome::PassThrough, true))
         ));
         assert!(matches!(
-            evaluator.evaluate_read_batch("Read", &batch(&["/safe/private/b", "/secret/c"])),
+            evaluator.evaluate_read_batch("Read", &batch(&["/safe/private/b", "/secret/c"]), None),
             Some((PolicyOutcome::AutoDeny { .. }, false))
         ));
         assert!(matches!(
@@ -1346,7 +1486,8 @@ mod tests {
             PermissionBehavior::Allow,
             "Agent",
             &covered,
-            &[]
+            &[],
+            None
         ));
 
         let partly_covered = json!({
@@ -1357,7 +1498,8 @@ mod tests {
             PermissionBehavior::Allow,
             "Agent",
             &partly_covered,
-            &[]
+            &[],
+            None
         ));
     }
 
@@ -1377,7 +1519,8 @@ mod tests {
             PermissionBehavior::Allow,
             "Agent",
             &named,
-            &[]
+            &[],
+            None
         ));
     }
 
@@ -1393,14 +1536,16 @@ mod tests {
             PermissionBehavior::Allow,
             "Agent",
             &pathless,
-            &[]
+            &[],
+            None
         ));
         assert!(matches_input(
             &rule,
             PermissionBehavior::Deny,
             "Agent",
             &pathless,
-            &[]
+            &[],
+            None
         ));
     }
 
@@ -2618,5 +2763,157 @@ mod tests {
             None,
         );
         assert_eq!(outcome, PolicyOutcome::PassThrough);
+    }
+
+    // ── Reads through the shell answer to the Read rules ──────────────
+
+    /// What the shell-first toolset has to keep: a `deny: Read(...)` stops
+    /// the same read made with `cat`, `rg`, `sed -n` or `git show`, by any
+    /// spelling of the path, and nothing it does not cover.
+    #[test]
+    fn a_read_deny_rule_judges_the_paths_a_read_only_shell_command_names() {
+        let store = PolicyStore::new();
+        store.deny("Read(./secrets/**)", PermissionRuleSource::ProjectSettings);
+        let evaluator = PolicyEvaluator::new(store);
+        let bash = |command: &str| {
+            evaluator.evaluate("Bash", &json!({ "command": command }), Some("/repo"))
+        };
+        for denied in [
+            "cat secrets/x",
+            "rg foo secrets/",
+            "sed -n 1,5p secrets/x",
+            "head -n 3 ./secrets/x",
+            "cat /repo/secrets/x",
+            "cat src/../secrets/x",
+            "find secrets -name x",
+            "git show HEAD:secrets/x",
+            "ls secrets",
+            "cat src/a.rs secrets/x",
+            "cat src/a.rs | grep -n foo secrets/y",
+            "cd /repo && cat secrets/x",
+        ] {
+            assert!(
+                matches!(bash(denied), PolicyOutcome::AutoDeny { .. }),
+                "expected {denied:?} to be denied"
+            );
+        }
+        for allowed in [
+            "cat src/a.rs",
+            "rg secrets src/",
+            "rg foo",
+            "echo secrets/x",
+            "cat /other/secrets/x",
+            "cat secretsfile",
+        ] {
+            assert_eq!(bash(allowed), PolicyOutcome::PassThrough, "{allowed:?}");
+        }
+        // Without a working directory a relative rule still matches the path
+        // as typed.
+        assert!(matches!(
+            evaluator.evaluate("Bash", &json!({ "command": "cat secrets/x" }), None),
+            PolicyOutcome::AutoDeny { .. }
+        ));
+    }
+
+    /// The Read tool hands the rules absolute paths, and the relative rule
+    /// now bites there too; an allow rule is not widened the same way.
+    #[test]
+    fn a_relative_read_deny_rule_matches_the_read_tools_absolute_path() {
+        let store = PolicyStore::new();
+        store.deny("Read(./secrets/**)", PermissionRuleSource::ProjectSettings);
+        store.allow("Read(./src/**)", PermissionRuleSource::ProjectSettings);
+        let evaluator = PolicyEvaluator::new(store);
+        let cwd = Some("/repo");
+        assert!(matches!(
+            evaluator.evaluate("Read", &json!({ "file_path": "/repo/secrets/x" }), cwd),
+            PolicyOutcome::AutoDeny { .. }
+        ));
+        assert!(matches!(
+            evaluator.evaluate(
+                "Read",
+                &json!({ "targets": [{ "path": "/repo/src/a.rs" }, { "path": "/repo/secrets/x" }] }),
+                cwd
+            ),
+            PolicyOutcome::AutoDeny { .. }
+        ));
+        assert_eq!(
+            evaluator.evaluate("Read", &json!({ "file_path": "/repo/src/a.rs" }), cwd),
+            PolicyOutcome::PassThrough
+        );
+    }
+
+    struct ReadOnlyBash;
+
+    #[async_trait]
+    impl Tool for ReadOnlyBash {
+        fn id(&self) -> ToolId {
+            ToolId::new("Bash")
+        }
+        fn description(&self) -> &str {
+            "test bash"
+        }
+        fn input_schema(&self) -> ToolInputSchema {
+            json!({ "type": "object", "additionalProperties": true })
+        }
+        async fn call(&self, input: Value, _context: &ToolContext) -> ToolResult<Value> {
+            Ok(input)
+        }
+    }
+
+    /// The broker end to end: a read-only command the tool itself allows is
+    /// refused under a deny rule, made to ask under an ask rule, and left
+    /// alone when it names nothing the rules cover.
+    #[tokio::test]
+    async fn the_rules_broker_holds_shell_reads_to_the_read_rules() {
+        let store = PolicyStore::new();
+        let source = PermissionRuleSource::ProjectSettings;
+        store.deny("Read(./secrets/**)", source);
+        store.push_rule(PermissionRule {
+            source,
+            rule_behavior: PermissionBehavior::Ask,
+            rule_value: permission_rule_value_from_string("Read(./private/**)"),
+        });
+        let delegate = Arc::new(RecordingDelegate::default());
+        let broker = RulesBasedPermissionBroker::new(store, delegate.clone());
+        let context = ToolContext::new().with_cwd("/repo");
+        let run = |command: &str| {
+            let input = json!({ "command": command });
+            let broker = &broker;
+            let context = &context;
+            async move {
+                broker
+                    .resolve(
+                        &ReadOnlyBash,
+                        input.clone(),
+                        context,
+                        PermissionDecision::allow(input),
+                    )
+                    .await
+            }
+        };
+
+        let denied = run("cat secrets/x").await.unwrap_err();
+        assert!(
+            matches!(denied, ToolError::PermissionDenied { .. }),
+            "{denied:?}"
+        );
+        assert!(
+            delegate.decisions().is_empty(),
+            "a denied read never reaches the delegate"
+        );
+
+        run("rg token private/").await.unwrap();
+        run("cat src/a.rs").await.unwrap();
+        let decisions = delegate.decisions();
+        assert_eq!(
+            decisions
+                .iter()
+                .map(|decision| decision.behavior)
+                .collect::<Vec<_>>(),
+            vec![
+                rebon_tools_core::PermissionBehavior::Ask,
+                rebon_tools_core::PermissionBehavior::Allow,
+            ]
+        );
     }
 }

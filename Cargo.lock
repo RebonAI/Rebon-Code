@@ -4715,6 +4715,7 @@ dependencies = [
  "rebon-proto",
  "rebon-session",
  "rebon-session-state",
+ "rebon-shell-policy",
  "rebon-tool",
  "rebon-tools-core",
  "rebon-types",

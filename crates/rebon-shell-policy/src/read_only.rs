@@ -18,9 +18,10 @@
 use serde_json::Value;
 
 use crate::lexer::{simple_command_segments, READ_ONLY_ARGV};
-
-mod sed;
 use crate::powershell_shape::{canonical_cmdlet, powershell_segments};
+
+mod operands;
+mod sed;
 
 /// Whether `input`'s command only reads.
 ///
@@ -41,6 +42,28 @@ pub fn is_read_only_shell_command(tool_name: &str, input: &Value) -> bool {
             .is_some_and(|segments| segments.iter().all(|argv| powershell_argv_only_reads(argv))),
         _ => false,
     }
+}
+
+/// The files and directories a read-only Bash command names, so the rules
+/// that guard the Read tool can judge the same read made through the shell.
+///
+/// `None` when the command is not one [`is_read_only_shell_command`]
+/// accepts: such a command asks already, and nothing here could say what it
+/// reads. Paths come back as written, relative ones unresolved; patterns,
+/// scripts and option values are left out (see `operands`). PowerShell is
+/// not covered.
+pub fn read_only_shell_paths(tool_name: &str, input: &Value) -> Option<Vec<String>> {
+    if !matches!(tool_name, "Bash" | "BashTool") || !is_read_only_shell_command(tool_name, input) {
+        return None;
+    }
+    let command = input.get("command").and_then(Value::as_str)?;
+    let segments = simple_command_segments(command.trim(), &READ_ONLY_ARGV).ok()?;
+    Some(
+        segments
+            .iter()
+            .flat_map(|argv| operands::read_paths(argv))
+            .collect(),
+    )
 }
 
 /// One POSIX argv: a program that only reads, with arguments that keep it so.
@@ -476,6 +499,23 @@ mod tests {
         ] {
             assert!(!bash(command), "expected {command:?} to ask");
         }
+    }
+
+    #[test]
+    fn a_read_only_command_names_the_paths_it_reads() {
+        let paths = |command: &str| read_only_shell_paths("Bash", &json!({ "command": command }));
+        assert_eq!(
+            paths("cat secrets/x | head -5 && rg foo src/ secrets"),
+            Some(vec!["secrets/x".into(), "src/".into(), "secrets".into()])
+        );
+        assert_eq!(paths("rg foo"), Some(Vec::new()));
+        // Not read-only: the ordinary decision applies, and it asks.
+        assert_eq!(paths("cat secrets/x > out"), None);
+        assert_eq!(paths("rm secrets/x"), None);
+        assert_eq!(
+            read_only_shell_paths("PowerShell", &json!({ "command": "Get-Content x" })),
+            None
+        );
     }
 
     #[test]
