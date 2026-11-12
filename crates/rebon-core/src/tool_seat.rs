@@ -306,6 +306,14 @@ impl Tool for ProviderGuardedTool {
         self.tool.model_input_schema()
     }
 
+    fn normalize_input(
+        &self,
+        input: serde_json::Value,
+        context: &ToolContext,
+    ) -> serde_json::Value {
+        self.tool.normalize_input(input, context)
+    }
+
     fn is_enabled(&self) -> bool {
         self.active.load(Ordering::Acquire) && self.tool.is_enabled()
     }

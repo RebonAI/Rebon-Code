@@ -2335,6 +2335,17 @@ pub trait Tool: Send + Sync {
         self.input_schema()
     }
 
+    /// Rewrite a model's input into the shape this tool documents, before
+    /// anything else sees it — schema validation, the permission rules, the
+    /// call. For the harmless variants a model reaches for from habit
+    /// (another name for a field, a path relative to the working directory),
+    /// so that a call whose meaning is plain is not refused a whole round,
+    /// and so the rules judge the same canonical input the tool runs.
+    /// Default: unchanged.
+    fn normalize_input(&self, input: Value, _context: &ToolContext) -> Value {
+        input
+    }
+
     /// Whether the tool is currently enabled.
     fn is_enabled(&self) -> bool {
         true

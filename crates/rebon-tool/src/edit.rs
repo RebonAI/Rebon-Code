@@ -70,6 +70,15 @@ impl Tool for EditTool {
         }
     }
 
+    /// A relative `file_path` is taken from the working directory, before the
+    /// rules judge it.
+    fn normalize_input(&self, mut input: Value, context: &ToolContext) -> Value {
+        if let Some(object) = input.as_object_mut() {
+            crate::path_scope::absolutize_input_field(object, "file_path", context);
+        }
+        input
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
@@ -290,7 +299,8 @@ impl Tool for EditTool {
 /// well-formed. Whether `old_string` matches is answered only by `call`,
 /// against the content it is about to rewrite.
 fn prepare_input(tool: ToolId, input: &Value, context: &ToolContext) -> ToolResult<EditInput> {
-    let parsed = parse_input(input)?;
+    let mut parsed = parse_input(input)?;
+    parsed.file_path = crate::path_scope::absolute_from_cwd(parsed.file_path, context);
     enforce_edit_path_scope(tool.clone(), &parsed.file_path, context)?;
     require_valid_input(
         tool,
@@ -925,6 +935,23 @@ mod tests {
             .unwrap_err();
         invalid_reason(err, crate::write::UNSEEN_OVERWRITE_CODE);
         assert_eq!(fs::read_to_string(&file).unwrap(), "HELLO world");
+    }
+
+    #[tokio::test]
+    async fn a_relative_path_is_taken_from_the_working_directory() {
+        let dir = TempDir::new();
+        fs::write(dir.path().join("lib.rs"), "fn a() {}\n").unwrap();
+        let ctx = ToolContext::new().with_cwd(dir.path().to_string_lossy().to_string());
+        let input = json!({ "file_path": "lib.rs", "old_string": "a()", "new_string": "b()" });
+        assert_eq!(
+            tool().normalize_input(input.clone(), &ctx)["file_path"],
+            json!(dir.path().join("lib.rs").display().to_string())
+        );
+        tool().call(input, &ctx).await.unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("lib.rs")).unwrap(),
+            "fn b() {}\n"
+        );
     }
 
     /// An edit of a file the session has seen keeps it seen, with the new

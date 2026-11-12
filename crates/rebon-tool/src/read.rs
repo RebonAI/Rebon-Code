@@ -233,28 +233,63 @@ impl Tool for ReadTool {
         }
     }
 
+    /// What a call may carry: the batch form (`targets`) or a single file the
+    /// conventional way (`file_path` — or `path` — with `offset` / `limit`).
+    /// Models reach for the single-file form from habit; refusing it cost a
+    /// whole round for a call whose meaning was plain. The schema the model
+    /// is shown is narrower, per profile ([`Self::model_input_schema`]).
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
             "properties": {
-                "targets": {
-                    "type": "array", "minItems": 1, "maxItems": MAX_READ_TARGETS,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string"},
-                            "start": {"type": "integer", "minimum": 1},
-                            "end": {"type": "integer", "minimum": 1},
-                            "symbol": {"type": "string", "minLength": 1},
-                            "pages": {"type": "string"}
-                        },
-                        "required": ["path"], "additionalProperties": false
-                    }
-                }
+                "targets": targets_schema(true),
+                "file_path": {"type": "string"},
+                "path": {"type": "string"},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1},
+                "pages": {"type": "string"}
             },
-            "required": ["targets"],
             "additionalProperties": false
         })
+    }
+
+    /// `path` → `file_path` at the top, `file_path` → `path` in a target, and
+    /// relative paths taken from the working directory — so the rules match
+    /// the same canonical, absolute input the read runs.
+    fn normalize_input(&self, mut input: Value, context: &ToolContext) -> Value {
+        let Some(object) = input.as_object_mut() else {
+            return input;
+        };
+        if !object.contains_key("file_path") {
+            if let Some(path) = object.remove("path") {
+                object.insert("file_path".into(), path);
+            }
+        }
+        crate::path_scope::absolutize_input_field(object, "file_path", context);
+        if let Some(Value::Array(targets)) = object.get_mut("targets") {
+            for target in targets.iter_mut().filter_map(Value::as_object_mut) {
+                if !target.contains_key("path") {
+                    if let Some(path) = target.remove("file_path") {
+                        target.insert("path".into(), path);
+                    }
+                }
+                crate::path_scope::absolutize_input_field(target, "path", context);
+            }
+        }
+        input
+    }
+
+    fn model_input_schema(&self) -> ToolInputSchema {
+        if crate::legacy_prompt_profile() {
+            json!({
+                "type": "object",
+                "properties": { "targets": targets_schema(false) },
+                "required": ["targets"],
+                "additionalProperties": false
+            })
+        } else {
+            lean_schema()
+        }
     }
 
     fn is_concurrency_safe(&self, _input: &Value) -> bool {
@@ -472,6 +507,18 @@ impl Tool for ReadTool {
                     cache.set(&path, state);
                 }
             }
+        }
+        // A single-file call (`file_path`, no `targets`) that failed is a
+        // failed call, not a batch with one error in it.
+        let single_file = input.get("targets").is_none_or(Value::is_null);
+        if single_file && results.len() == 1 && results[0]["type"] == "error" {
+            let error = results[0]["error"].as_str().unwrap_or("Read failed");
+            let prefix = format!("invalid input for tool `{FILE_READ_TOOL_NAME}`: ");
+            return Err(ToolError::InvalidInput {
+                tool: self.id(),
+                reason: error.strip_prefix(&prefix).unwrap_or(error).to_string(),
+                error_code: Some(INVALID_INPUT_CODE),
+            });
         }
         Ok(json!({"type": "batch", "results": results}))
     }
@@ -714,8 +761,45 @@ fn prepare_requests(
     let object = input
         .as_object()
         .ok_or_else(|| invalid("Read input must be an object"))?;
-    if object.keys().any(|key| key != "targets") {
-        return Err(invalid("Only `targets` is allowed in Read input"));
+    let present = |key: &str| object.get(key).is_some_and(|value| !value.is_null());
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "targets" | "file_path" | "path" | "offset" | "limit" | "pages"
+        )
+    }) {
+        return Err(invalid(
+            "Unknown Read parameter: pass `file_path` (with optional `offset`, `limit`, `pages`), \
+             or `targets`",
+        ));
+    }
+    // The conventional single-file call: `file_path` (or `path`), `offset`
+    // as the first line, `limit` lines.
+    if !present("targets") {
+        let path = object
+            .get("file_path")
+            .filter(|value| !value.is_null())
+            .or_else(|| object.get("path").filter(|value| !value.is_null()))
+            .ok_or_else(|| invalid("Read needs a `file_path`"))?;
+        let mut single = json!({ "file_path": path });
+        for key in ["offset", "limit", "pages"] {
+            if let Some(value) = object.get(key).filter(|value| !value.is_null()) {
+                single[key] = value.clone();
+            }
+        }
+        let parsed = prepare_input(tool, &single, context)?;
+        if context.coordinator_mode() {
+            enforce_coordinator_report_read_allowed(&parsed.file_path, context)?;
+        }
+        return Ok(vec![parsed]);
+    }
+    if ["file_path", "path", "offset", "limit", "pages"]
+        .iter()
+        .any(|key| present(key))
+    {
+        return Err(invalid(
+            "Pass either `targets` or a single `file_path`, not both",
+        ));
     }
     let targets = object
         .get("targets")
@@ -730,12 +814,18 @@ fn prepare_requests(
         let obj = target
             .as_object()
             .ok_or_else(|| invalid("Each target must be an object"))?;
-        if obj
-            .keys()
-            .any(|key| !matches!(key.as_str(), "path" | "start" | "end" | "pages" | "symbol"))
-        {
+        if obj.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "path" | "file_path" | "start" | "end" | "pages" | "symbol"
+            )
+        }) {
             return Err(invalid("Unknown target field"));
         }
+        let path = obj
+            .get("path")
+            .filter(|value| !value.is_null())
+            .or_else(|| obj.get("file_path"));
         let symbol = match obj.get("symbol").filter(|value| !value.is_null()) {
             Some(value) => Some(
                 value
@@ -767,7 +857,7 @@ fn prepare_requests(
         if end.is_some_and(|end| end < start) {
             return Err(invalid("Target `end` must not precede `start`"));
         }
-        let mut single = json!({"file_path": obj.get("path"), "offset": start});
+        let mut single = json!({"file_path": path, "offset": start});
         if let Some(end) = end {
             single["limit"] = json!(end.saturating_sub(start).saturating_add(1));
         }
@@ -847,7 +937,8 @@ fn merge_batch_requests(requests: Vec<ReadInput>, content: &str) -> Vec<ReadInpu
 /// the parsed request make sense — so they ask them here. `validate_input`
 /// reports the answer as a verdict, `call` takes the parsed request and runs.
 fn prepare_input(tool: ToolId, input: &Value, context: &ToolContext) -> ToolResult<ReadInput> {
-    let parsed = parse_input(input)?;
+    let mut parsed = parse_input(input)?;
+    parsed.file_path = crate::path_scope::absolute_from_cwd(parsed.file_path, context);
     crate::path_scope::enforce_read_path_policy(tool.clone(), context, &parsed.file_path, "path")?;
     require_valid_input(
         tool,
@@ -1619,14 +1710,51 @@ fn pdf_output_dir() -> PathBuf {
     ))
 }
 
+/// The `targets` array. `lenient` is what dispatch accepts (a target may
+/// name its file `file_path` too); the strict form is what the legacy profile
+/// shows the model.
+fn targets_schema(lenient: bool) -> Value {
+    let mut properties = json!({
+        "path": {"type": "string"},
+        "start": {"type": "integer", "minimum": 1},
+        "end": {"type": "integer", "minimum": 1},
+        "symbol": {"type": "string", "minLength": 1},
+        "pages": {"type": "string"}
+    });
+    let mut item = json!({ "type": "object", "additionalProperties": false });
+    if lenient {
+        properties["file_path"] = json!({"type": "string"});
+    } else {
+        item["required"] = json!(["path"]);
+    }
+    item["properties"] = properties;
+    json!({ "type": "array", "minItems": 1, "maxItems": MAX_READ_TARGETS, "items": item })
+}
+
+/// Provider-visible schema under the lean prompt profile: the conventional
+/// single-file shape models already expect.
+fn lean_schema() -> ToolInputSchema {
+    json!({
+        "type": "object",
+        "properties": {
+            "file_path": {"type": "string"},
+            "offset": {"type": "integer", "minimum": 1},
+            "limit": {"type": "integer", "minimum": 1},
+            "pages": {"type": "string"}
+        },
+        "required": ["file_path"],
+        "additionalProperties": false
+    })
+}
+
 /// Provider-visible description under the lean prompt profile.
 const LEAN_DESCRIPTION: &str =
-    "Read files (not directories), including images and PDFs. `targets` holds 1-16 \
-files, each an absolute `path` with optional 1-indexed inclusive `start`/`end`, a `symbol` to \
-read, or PDF `pages` (\"1-5\"; required above 10 pages, at most 20). Files up to 600 lines \
-come back whole, longer ones in windows of at least 300 lines. Output is capped at 16 KiB per \
-file and 32 KiB per call; omitted targets are named for retry. Each line is prefixed with its \
-number and a tab.";
+    "Read a file (not a directory), including images and PDFs. `file_path` is absolute or \
+relative to the working directory; `offset` is the 1-indexed line to start at and `limit` the \
+number of lines; `pages` (\"1-5\") selects PDF pages, required above 10 pages, at most 20. Files \
+up to 600 lines come back whole, longer ones in windows of at least 300 lines; output is capped \
+at 16 KiB. Each line is prefixed with its number and a tab. To read several files, make several \
+Read calls in one response.";
 
 #[cfg(test)]
 mod tests {
@@ -1691,30 +1819,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_legacy_and_unknown_input_fields() {
+    async fn rejects_mixed_and_unknown_input_fields() {
         let dir = TempDir::new();
         let path = dir.path().join("file.txt");
         fs::write(&path, "hello\n").unwrap();
         let context = ToolContext::new();
         for input in [
-            json!({"file_path": path}),
             json!({"targets": [{"path": path}], "offset": 1}),
+            json!({"targets": [{"path": path}], "file_path": path}),
             json!({"targets": [{"path": path, "limit": 1}]}),
             json!({"targets": []}),
+            json!({"file_path": path, "start": 2}),
+            json!({}),
         ] {
-            assert!(!tool()
-                .validate_input(&input, &context)
-                .await
-                .unwrap()
-                .is_valid());
+            assert!(
+                !tool()
+                    .validate_input(&input, &context)
+                    .await
+                    .unwrap()
+                    .is_valid(),
+                "{input}"
+            );
             assert!(tool().call(input, &context).await.is_err());
         }
-        let schema = tool().input_schema();
-        assert_eq!(schema["required"], json!(["targets"]));
-        assert!(schema["properties"].get("file_path").is_none());
-        assert!(schema["properties"]["targets"]["items"]["properties"]
+    }
+
+    /// The conventional single-file call, a `path` alias, a target's
+    /// `file_path`, and a path relative to the working directory are all
+    /// read, as the batch form is.
+    #[tokio::test]
+    async fn accepts_the_conventional_single_file_shape_and_relative_paths() {
+        let dir = TempDir::new();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let context = ToolContext::new().with_cwd(dir.path().to_string_lossy().to_string());
+        let read = |input: Value| {
+            let context = context.clone();
+            async move {
+                let input = tool().normalize_input(input, &context);
+                assert!(
+                    tool()
+                        .validate_input(&input, &context)
+                        .await
+                        .unwrap()
+                        .is_valid(),
+                    "{input}"
+                );
+                tool().call(input, &context).await.unwrap()
+            }
+        };
+        for input in [
+            json!({"file_path": path}),
+            json!({"path": path}),
+            json!({"file_path": "file.txt"}),
+            json!({"file_path": "./file.txt", "offset": 1, "limit": 2}),
+            json!({"targets": [{"file_path": "file.txt"}]}),
+        ] {
+            let result = read(input.clone()).await;
+            let file = &result["results"][0]["file"];
+            assert_eq!(
+                file["filePath"].as_str().map(PathBuf::from),
+                Some(path.clone()),
+                "{input}: {result}"
+            );
+            assert!(file["content"].as_str().unwrap().contains("one"), "{input}");
+        }
+
+        // Normalization gives the rules the canonical, absolute shape.
+        let normalized = tool().normalize_input(json!({"path": "file.txt"}), &context);
+        assert_eq!(normalized, json!({"file_path": path.display().to_string()}));
+    }
+
+    /// Dispatch accepts every shape; each profile shows the model one.
+    #[test]
+    fn schemas_accept_every_shape_and_show_one() {
+        let accepted = tool().input_schema();
+        assert!(accepted.get("required").is_none());
+        for key in ["targets", "file_path", "path", "offset", "limit", "pages"] {
+            assert!(accepted["properties"].get(key).is_some(), "{key}");
+        }
+        assert!(accepted["properties"]["targets"]["items"]["properties"]
             .get("symbol")
             .is_some());
+        let lean = lean_schema();
+        assert_eq!(lean["required"], json!(["file_path"]));
+        assert!(lean["properties"].get("targets").is_none());
     }
 
     #[tokio::test]

@@ -133,6 +133,15 @@ impl Tool for MultiEditTool {
         Some("batch atomic multiple replacements one file")
     }
 
+    /// A relative `file_path` is taken from the working directory, before the
+    /// rules judge it.
+    fn normalize_input(&self, mut input: Value, context: &ToolContext) -> Value {
+        if let Some(object) = input.as_object_mut() {
+            crate::path_scope::absolutize_input_field(object, "file_path", context);
+        }
+        input
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
@@ -529,7 +538,8 @@ fn changed_span(original: &str, updated: &str) -> (String, String) {
 /// well-formed. Whether each `old_string` matches is answered only by
 /// `call`, against the content it is about to rewrite.
 fn prepare_input(tool: ToolId, input: &Value, context: &ToolContext) -> ToolResult<MultiEditInput> {
-    let parsed = parse_input(input)?;
+    let mut parsed = parse_input(input)?;
+    parsed.file_path = crate::path_scope::absolute_from_cwd(parsed.file_path, context);
     enforce_edit_path_scope(tool.clone(), &parsed.file_path, context)?;
     require_valid_input(
         tool,

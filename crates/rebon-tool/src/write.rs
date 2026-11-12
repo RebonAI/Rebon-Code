@@ -77,6 +77,15 @@ impl Tool for WriteTool {
         }
     }
 
+    /// A relative `file_path` is taken from the working directory, before the
+    /// rules judge it.
+    fn normalize_input(&self, mut input: Value, context: &ToolContext) -> Value {
+        if let Some(object) = input.as_object_mut() {
+            crate::path_scope::absolutize_input_field(object, "file_path", context);
+        }
+        input
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
@@ -250,7 +259,8 @@ impl Tool for WriteTool {
 /// request well-formed. Both then ask [`check_overwrite`]; only `call`'s
 /// answer, given under the path lock, is decisive.
 fn prepare_input(tool: ToolId, input: &Value, context: &ToolContext) -> ToolResult<WriteInput> {
-    let parsed = parse_input(input)?;
+    let mut parsed = parse_input(input)?;
+    parsed.file_path = crate::path_scope::absolute_from_cwd(parsed.file_path, context);
     enforce_write_path_scope(tool.clone(), &parsed.file_path, context)?;
     require_valid_input(
         tool,
@@ -508,6 +518,25 @@ mod tests {
             .unwrap();
         assert!(!result.is_valid());
         assert_eq!(result.error_code, Some(INVALID_INPUT_CODE));
+    }
+
+    /// With a working directory, a relative path is taken from it, both by
+    /// the dispatch-time normalization the rules see and by the call.
+    #[tokio::test]
+    async fn a_relative_path_is_taken_from_the_working_directory() {
+        let dir = TempDir::new();
+        let ctx = ToolContext::new().with_cwd(dir.path().to_string_lossy().to_string());
+        let input = json!({ "file_path": "sub/../notes.txt", "content": "hello" });
+        let normalized = tool().normalize_input(input.clone(), &ctx);
+        assert_eq!(
+            normalized["file_path"],
+            json!(dir.path().join("notes.txt").display().to_string())
+        );
+        tool().call(input, &ctx).await.unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+            "hello"
+        );
     }
 
     #[tokio::test]

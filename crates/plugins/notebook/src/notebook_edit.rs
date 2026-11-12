@@ -136,6 +136,15 @@ impl Tool for NotebookEditTool {
         Some("jupyter ipython python notebook cell")
     }
 
+    /// A relative `notebook_path` is taken from the working directory, before the
+    /// rules judge it.
+    fn normalize_input(&self, mut input: Value, context: &ToolContext) -> Value {
+        if let Some(object) = input.as_object_mut() {
+            rebon_tool::path_scope::absolutize_input_field(object, "notebook_path", context);
+        }
+        input
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
@@ -619,7 +628,8 @@ fn prepare_input(
     input: &Value,
     context: &ToolContext,
 ) -> ToolResult<NotebookEditInput> {
-    let parsed = parse_input(input)?;
+    let mut parsed = parse_input(input)?;
+    parsed.notebook_path = rebon_tool::path_scope::absolute_from_cwd(parsed.notebook_path, context);
     enforce_edit_path_scope(tool.clone(), &parsed.notebook_path, context)?;
     require_valid_input(
         tool,

@@ -1091,6 +1091,10 @@ impl Engine {
             }
         }
 
+        // The tool's canonical shape first (a `path` alias, a relative path
+        // made absolute), so validation, the rules and the call all see it.
+        let target_input = tool.normalize_input(target_input, context);
+
         // Centralized schema-level validation.
         // Catches missing required params, unexpected params, and type
         // mismatches before the tool's own validate_input runs.

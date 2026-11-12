@@ -69,10 +69,14 @@ async fn minimal_tool_search_promotes_full_schema_on_the_next_request() {
         .iter()
         .find(|tool| tool.name == "Read")
         .expect("Read should remain provider-visible after schema promotion");
+    // The full schema, not the bootstrap one: PDF `pages`, top-level in the
+    // lean single-file shape, per target in the legacy batch shape.
+    let properties = &promoted_read.input_schema["properties"];
     assert!(
-        promoted_read.input_schema["properties"]["targets"]["items"]["properties"]
-            .get("pages")
-            .is_some()
+        properties.get("pages").is_some()
+            || properties["targets"]["items"]["properties"]
+                .get("pages")
+                .is_some()
     );
     let promoted = requests[1]
         .tools

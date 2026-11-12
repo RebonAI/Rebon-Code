@@ -20,6 +20,47 @@ pub fn resolve_context_path(path: &Path, cwd: &Path, _context: &ToolContext) -> 
     }
 }
 
+/// A file path the model passed, made absolute the way a shell would: a
+/// relative one is taken from the session's working directory. Unchanged
+/// when it is already absolute, or when the context has no working directory
+/// to take it from (the tool then refuses it as not absolute).
+///
+/// The file tools used to refuse a relative path outright, which cost a whole
+/// round for a call whose meaning was plain. Every scope and permission check
+/// runs on the resolved path, so nothing is reachable this way that the
+/// absolute spelling would not reach.
+pub fn absolute_from_cwd(path: PathBuf, context: &ToolContext) -> PathBuf {
+    match context.cwd() {
+        Some(cwd) if !path.is_absolute() && !cwd.is_empty() => {
+            lexically_normalize_path(&Path::new(cwd).join(&path))
+        }
+        _ => path,
+    }
+}
+
+/// [`absolute_from_cwd`] on one string field of a tool input, in place; a
+/// missing or non-string field is left alone.
+pub fn absolutize_input_field(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    context: &ToolContext,
+) {
+    let Some(serde_json::Value::String(path)) = object.get(key) else {
+        return;
+    };
+    let trimmed = path.trim();
+    if trimmed.is_empty() || Path::new(trimmed).is_absolute() {
+        return;
+    }
+    let absolute = absolute_from_cwd(PathBuf::from(trimmed), context);
+    if absolute.is_absolute() {
+        object.insert(
+            key.to_string(),
+            serde_json::Value::String(absolute.display().to_string()),
+        );
+    }
+}
+
 /// Whether a write to `path` would change a repository's git metadata:
 /// anything inside a `.git` directory, or a `.git` file itself (a worktree's
 /// pointer at its git directory).

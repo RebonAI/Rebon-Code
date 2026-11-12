@@ -105,6 +105,34 @@ fn dispatch_order(events: &[QueryEvent]) -> Vec<String> {
         .collect()
 }
 
+/// A model's habitual Read — one `file_path`, relative to the working
+/// directory — gets through dispatch's schema check and reads the file,
+/// instead of costing a round on "`targets` is missing".
+#[tokio::test]
+async fn a_conventional_relative_read_goes_through_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("x.py"), "print('hi')\n").unwrap();
+    let (_, requests) = run_batch(
+        file_tools_engine(),
+        dir.path(),
+        &[
+            ("Read", "toolu_plain", json!({"file_path": "x.py"})),
+            (
+                "Read",
+                "toolu_alias",
+                json!({"path": "./x.py", "offset": 1, "limit": 5}),
+            ),
+        ],
+    )
+    .await;
+
+    for id in ["toolu_plain", "toolu_alias"] {
+        let (text, is_error) = result_text(&requests, id);
+        assert!(!is_error, "{id}: {text}");
+        assert!(text.contains("print('hi')"), "{id}: {text}");
+    }
+}
+
 #[tokio::test]
 async fn write_then_bash_read_in_one_batch_sees_the_new_content() {
     let dir = tempfile::tempdir().unwrap();

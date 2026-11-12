@@ -145,10 +145,14 @@ fn normal_projection_keeps_full_tools_and_standard_deferred_behavior() {
         .iter()
         .find(|tool| tool.name == "Read")
         .expect("Normal mode should expose Read's full schema");
+    // The full schema, not the bootstrap one: PDF `pages`, top-level in the
+    // lean single-file shape, per target in the legacy batch shape.
+    let properties = &read.input_schema["properties"];
     assert!(
-        read.input_schema["properties"]["targets"]["items"]["properties"]
-            .get("pages")
-            .is_some()
+        properties.get("pages").is_some()
+            || properties["targets"]["items"]["properties"]
+                .get("pages")
+                .is_some()
     );
 }
 
