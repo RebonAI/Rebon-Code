@@ -784,7 +784,13 @@ pub fn build_request_body(request: &CreateMessageRequest) -> Value {
             // enabled; passing `None` lets the API use its default (1).
             (Some(param), None)
         }
-        _ => (None, request.temperature),
+        // Say "off" out loud: some Anthropic-compatible endpoints (Ollama's
+        // deepseek models) think by default when the field is absent.
+        Some(ThinkingConfig::Disabled) => (
+            Some(serde_json::json!({ "type": "disabled" })),
+            request.temperature,
+        ),
+        None => (None, request.temperature),
     };
 
     let system = request.system.as_deref().map(|text| {
@@ -1027,6 +1033,16 @@ mod tests {
         let _lock_guard = prompt_cache_env_lock();
         let _env_guard = PromptCacheEnvGuard::install(value);
         f()
+    }
+
+    #[test]
+    fn disabled_thinking_is_sent_explicitly() {
+        let mut request = CreateMessageRequest::simple("m", "hi");
+        request.thinking = Some(ThinkingConfig::Disabled);
+        assert_eq!(build_request_body(&request)["thinking"]["type"], "disabled");
+
+        request.thinking = None;
+        assert!(build_request_body(&request).get("thinking").is_none());
     }
 
     fn cache_test_request() -> CreateMessageRequest {

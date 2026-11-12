@@ -624,22 +624,90 @@ async fn run_query_auto_continues_signed_thinking_after_max_tokens() {
     }));
 }
 
+fn carries_cut_off_reasoning(request: &CreateMessageRequest, reasoning: &str) -> bool {
+    request.messages.iter().any(|message| {
+        message.content.iter().any(|block| {
+            matches!(block, ApiContentBlock::Text(text)
+                if text.text.contains("ran out of output tokens while you were still reasoning")
+                    && text.text.contains(reasoning))
+        })
+    })
+}
+
+fn has_thinking_block(request: &CreateMessageRequest) -> bool {
+    request.messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, ApiContentBlock::Thinking(_)))
+    })
+}
+
+/// Reasoning cut off by max_tokens, on a provider that will not take an
+/// unsigned thinking block back, cannot be continued. The step is asked
+/// again without thinking, with the reasoning as text, instead of ending
+/// the turn with nothing done.
 #[tokio::test]
-async fn run_query_does_not_continue_unsigned_thinking_after_max_tokens() {
+async fn run_query_reasks_reasoning_cut_off_by_max_tokens_without_thinking() {
     let engine = Arc::new(Engine::new());
     let mock = MockModelClient::new();
     mock.push_turn(thinking_turn_with_stop(
         "msg_part_1",
-        "planning the next edit",
+        "planning the next edit: plan-marker",
         None,
         None,
         StopReason::MaxTokens,
     ));
-    mock.push_turn(text_turn("msg_part_2", "must not be requested"));
+    mock.push_turn(text_turn("msg_part_2", "the answer"));
     let client: Arc<dyn ModelClient> = Arc::new(mock.clone());
 
     let params = QueryParams::new("mock", vec![ApiMessage::user_text("finish the edit")])
         .with_max_iterations(3);
+    let mut rx = run_query(
+        engine,
+        SessionHandle::new(client),
+        params,
+        ToolContext::new(),
+        CancelToken::new(),
+    );
+    let events = drain(&mut rx).await;
+
+    match events.last().expect("terminal event") {
+        QueryEvent::Done { final_message, .. } => {
+            assert_eq!(final_message.text(), "the answer");
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+    let requests = mock.captured_requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].thinking, Some(ThinkingConfig::Disabled));
+    assert!(carries_cut_off_reasoning(&requests[1], "plan-marker"));
+    assert!(
+        !has_thinking_block(&requests[1]),
+        "the unsigned thinking block itself must not be replayed"
+    );
+}
+
+/// A re-ask that is cut off again gets one more; past that the turn ends
+/// the way it did before, rather than re-asking forever.
+#[tokio::test]
+async fn run_query_stops_reasking_after_repeated_reasoning_cut_offs() {
+    let engine = Arc::new(Engine::new());
+    let mock = MockModelClient::new();
+    for id in ["msg_1", "msg_2", "msg_3"] {
+        mock.push_turn(thinking_turn_with_stop(
+            id,
+            "still planning",
+            None,
+            None,
+            StopReason::MaxTokens,
+        ));
+    }
+    mock.push_turn(text_turn("msg_4", "must not be requested"));
+    let client: Arc<dyn ModelClient> = Arc::new(mock.clone());
+
+    let params = QueryParams::new("mock", vec![ApiMessage::user_text("finish the edit")])
+        .with_max_iterations(8);
     let mut rx = run_query(
         engine,
         SessionHandle::new(client),
@@ -656,7 +724,22 @@ async fn run_query_does_not_continue_unsigned_thinking_after_max_tokens() {
             ..
         })
     ));
-    assert_eq!(mock.captured_requests().len(), 1);
+    assert_eq!(mock.captured_requests().len(), 3);
+}
+
+/// Each re-ask carries only the end of very long reasoning.
+#[test]
+fn a_cut_off_note_carries_the_end_of_long_reasoning() {
+    let reasoning = format!("start-marker {} end-marker", "x".repeat(60_000));
+    let mut messages = vec![ApiMessage::user_text("go")];
+    super::turn_control::attach_cut_off_reasoning_for_test(&mut messages, &reasoning);
+    let ApiContentBlock::Text(note) = messages[0].content.last().unwrap() else {
+        panic!("a text note");
+    };
+    assert!(note.text.contains("end-marker"));
+    assert!(!note.text.contains("start-marker"));
+    assert!(note.text.contains("[earlier reasoning omitted]"));
+    assert!(note.text.len() < 49_000);
 }
 
 #[tokio::test]

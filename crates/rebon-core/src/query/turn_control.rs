@@ -136,6 +136,82 @@ impl Drop for TurnGuard {
 const MAX_AUTOMATIC_MAX_TOKEN_CONTINUATIONS: usize = 3;
 const MAX_TOKEN_CONTINUATION_PROMPT: &str = "Continue exactly where the previous response stopped. Do not repeat any already emitted text. If you were emitting JSON or code, continue from the next character so the combined output remains valid.";
 
+/// Re-asks per turn, in a row, for a response cut off mid-reasoning (see
+/// [`reasoning_cut_off`]). Each re-ask turns thinking off, so it normally
+/// acts; more cut-offs in a row means it cannot, and the turn ends as before.
+const MAX_REASONING_CUT_OFF_REASKS: usize = 2;
+
+/// How much of the cut-off reasoning the re-ask carries: its end, where the
+/// plan it was converging on is. 48 000 characters is about 12 000 tokens,
+/// once, on that request only.
+const CARRIED_REASONING_CHARS: usize = 48_000;
+
+/// A response that ran out of output tokens while still reasoning, before
+/// any answer or tool call. The reasoning is all it holds, and when the
+/// provider will not take an unsigned thinking block back, the continuation
+/// in [`can_continue_after_max_tokens`] cannot replay it. Ending the turn
+/// there ended the task with nothing done and nothing said, as a success.
+/// Returns the reasoning, to hand the re-asked step as text.
+fn reasoning_cut_off(message: &AssistantMessage) -> Option<String> {
+    if !matches!(message.stop_reason, Some(StopReason::MaxTokens)) {
+        return None;
+    }
+    let mut reasoning = String::new();
+    for block in &message.content {
+        match block {
+            ApiContentBlock::Thinking(thinking) => reasoning.push_str(&thinking.thinking),
+            ApiContentBlock::Text(text) if text.text.trim().is_empty() => {}
+            _ => return None,
+        }
+    }
+    (!reasoning.trim().is_empty()).then_some(reasoning)
+}
+
+/// Hand the re-asked step the reasoning its last response was cut off in,
+/// as a note on the last user message of this request (history keeps no
+/// copy). Only its last [`CARRIED_REASONING_CHARS`] characters go along.
+fn attach_cut_off_reasoning(messages: &mut Vec<ApiMessage>, reasoning: &str) {
+    let reasoning = reasoning.trim();
+    let start = reasoning.len().saturating_sub(CARRIED_REASONING_CHARS);
+    let start = (start..=reasoning.len())
+        .find(|index| reasoning.is_char_boundary(*index))
+        .unwrap_or(reasoning.len());
+    let omitted = if start > 0 {
+        "[earlier reasoning omitted]\n"
+    } else {
+        ""
+    };
+    let note = format!(
+        "<system-reminder>\nYour last response ran out of output tokens while you were still \
+         reasoning, before you answered or acted, so it was discarded. This is what you had \
+         worked out:\n\n<reasoning>\n{omitted}{}\n</reasoning>\n\nDo not start that reasoning \
+         over. Act on it now: make the next concrete move (a tool call, or your answer).\n\
+         </system-reminder>",
+        &reasoning[start..]
+    );
+    let block = ApiContentBlock::Text(TextBlock { text: note });
+    match messages.last_mut() {
+        Some(last) if last.role == Role::User => last.content.push(block),
+        _ => messages.push(ApiMessage {
+            role: Role::User,
+            content: vec![block],
+        }),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn attach_cut_off_reasoning_for_test(messages: &mut Vec<ApiMessage>, reasoning: &str) {
+    attach_cut_off_reasoning(messages, reasoning);
+}
+
+/// Re-asks spent on cut-off reasoning (see [`reasoning_cut_off`]), and the
+/// reasoning the next request carries.
+#[derive(Default)]
+struct ReasoningCutOffs {
+    in_a_row: usize,
+    pending: Option<String>,
+}
+
 /// Continue only replayable truncated text/thinking output.
 fn can_continue_after_max_tokens(
     message: &AssistantMessage,
@@ -839,6 +915,7 @@ async fn settle_stream_outcome(
     stop_reason_final: &mut Option<StopReason>,
     pending_max_token_content: &mut Option<Vec<ApiContentBlock>>,
     automatic_max_token_continuations: &mut usize,
+    reasoning_cut_offs: &mut ReasoningCutOffs,
     truncated_tool_call_rounds: &mut usize,
     transient_replay_streak: &mut u32,
     request_cache_trace_context: &Option<rebon_api::CacheTraceContext>,
@@ -935,6 +1012,27 @@ async fn settle_stream_outcome(
             model = %params.model,
             "turn_control: model hit max_tokens on the final iteration; emitting the truncated response instead of continuing"
         );
+    }
+
+    if pending_max_token_content.is_none() {
+        if let Some(reasoning) = reasoning_cut_off(&message) {
+            if reasoning_cut_offs.in_a_row < MAX_REASONING_CUT_OFF_REASKS
+                && iteration + 1 < params.max_iterations
+            {
+                reasoning_cut_offs.in_a_row += 1;
+                tracing::warn!(
+                    model = %params.model,
+                    reask = reasoning_cut_offs.in_a_row,
+                    max_reasks = MAX_REASONING_CUT_OFF_REASKS,
+                    reasoning_chars = reasoning.len(),
+                    "turn_control: max_tokens cut the response off mid-reasoning; re-asking the step without thinking, carrying the reasoning"
+                );
+                reasoning_cut_offs.pending = Some(reasoning);
+                return StreamOutcomeFlow::NextIteration;
+            }
+        } else {
+            reasoning_cut_offs.in_a_row = 0;
+        }
     }
 
     if let Some(pending) = (*pending_max_token_content).take() {
@@ -1669,6 +1767,7 @@ impl TurnControlPlugin {
         let mut pending_cache_miss_reason = CacheMissReason::None;
         let mut pending_max_token_content: Option<Vec<ApiContentBlock>> = None;
         let mut automatic_max_token_continuations = 0usize;
+        let mut reasoning_cut_offs = ReasoningCutOffs::default();
         let mut truncated_tool_call_rounds = 0usize;
         let mut terminal = TerminalState::default();
         let mut iterations_run = 0usize;
@@ -1711,7 +1810,7 @@ impl TurnControlPlugin {
             };
 
             let BuiltRequest {
-                request,
+                mut request,
                 request_cache_trace_context,
             } = build_iteration_request(
                 self,
@@ -1725,6 +1824,10 @@ impl TurnControlPlugin {
             );
             announced_tools.remove(RUN_CODE_TOOL);
             extend_announced_tools(&params, &mut announced_tools);
+            if let Some(reasoning) = reasoning_cut_offs.pending.take() {
+                request.thinking = Some(ThinkingConfig::Disabled);
+                attach_cut_off_reasoning(&mut request.messages, &reasoning);
+            }
 
             let accumulator = match open_and_drain_stream(
                 &mut manager,
@@ -1759,6 +1862,7 @@ impl TurnControlPlugin {
                 &mut stop_reason_final,
                 &mut pending_max_token_content,
                 &mut automatic_max_token_continuations,
+                &mut reasoning_cut_offs,
                 &mut truncated_tool_call_rounds,
                 &mut transient_replay_streak,
                 &request_cache_trace_context,
