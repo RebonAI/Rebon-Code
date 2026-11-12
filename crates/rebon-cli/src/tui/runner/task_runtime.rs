@@ -286,7 +286,20 @@ fn format_shell_tool_result(value: &serde_json::Value) -> String {
     if output.is_empty() {
         output.push_str("(no output)");
     }
+    // A command that outlived its timeout keeps running as a background
+    // shell; only one that was actually killed timed out.
     if value
+        .get("backgrounded")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        match value.get("shellId").and_then(|value| value.as_str()) {
+            Some(shell_id) => output.push_str(&format!(
+                "\n[still running in the background as {shell_id}]"
+            )),
+            None => output.push_str("\n[still running in the background]"),
+        }
+    } else if value
         .get("timedOut")
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
@@ -845,6 +858,45 @@ mod tests {
     fn scan_needed(inbox: &SessionInbox, revision: tokio::sync::watch::Receiver<u64>) -> bool {
         inbox.observe_task_notifications(revision, false);
         inbox.take_task_notification_look()
+    }
+
+    /// A command moved to the background at its timeout reads as still
+    /// running, with its shell id; a killed one still reads as timed out.
+    #[test]
+    fn a_backgrounded_shell_result_reads_as_still_running() {
+        let backgrounded = serde_json::json!({
+            "stdout": "1\n2",
+            "stderr": "",
+            "exitCode": null,
+            "timedOut": true,
+            "backgrounded": true,
+            "shellId": "sh_abc"
+        });
+        assert_eq!(
+            format_shell_tool_result(&backgrounded),
+            "1\n2\n[still running in the background as sh_abc]"
+        );
+
+        let without_id = serde_json::json!({
+            "stdout": "",
+            "timedOut": true,
+            "backgrounded": true
+        });
+        assert_eq!(
+            format_shell_tool_result(&without_id),
+            "(no output)\n[still running in the background]"
+        );
+
+        let killed = serde_json::json!({
+            "stdout": "partial",
+            "exitCode": null,
+            "timedOut": true,
+            "interrupted": true
+        });
+        assert_eq!(format_shell_tool_result(&killed), "partial\n[timed out]");
+
+        let failed = serde_json::json!({ "stdout": "", "stderr": "boom", "exitCode": 2 });
+        assert_eq!(format_shell_tool_result(&failed), "boom\n[exit code: 2]");
     }
 
     #[test]
