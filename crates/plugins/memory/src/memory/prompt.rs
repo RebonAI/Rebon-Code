@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use rebon_session::memory_paths::{self, MemoryScope, ENTRYPOINT_NAME};
+use rebon_types::prompt_profile::PromptProfile;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -221,18 +222,35 @@ struct ScopedEntrypoint {
 /// `memory_dir_display` is the display path shown to the model (forward-slash
 /// normalised on all platforms). Compatibility wrapper for a single repo scope.
 pub fn build_memory_prompt(memory_dir_display: &str, entrypoint_content: Option<&str>) -> String {
+    build_memory_prompt_for_profile(
+        memory_dir_display,
+        entrypoint_content,
+        PromptProfile::current(),
+    )
+}
+
+/// [`build_memory_prompt`] under an explicit prompt profile.
+pub fn build_memory_prompt_for_profile(
+    memory_dir_display: &str,
+    entrypoint_content: Option<&str>,
+    profile: PromptProfile,
+) -> String {
     let scoped = ScopedEntrypoint {
         label: "repo-scope",
         dir: PathBuf::from(memory_dir_display),
         content: entrypoint_content.map(str::to_string),
     };
-    build_scoped_memory_prompt(&[scoped], MemoryPromptOptions::default())
+    build_scoped_memory_prompt_for_profile(&[scoped], MemoryPromptOptions::default(), profile)
 }
 
-fn build_scoped_memory_prompt(
+fn build_scoped_memory_prompt_for_profile(
     entrypoints: &[ScopedEntrypoint],
     options: MemoryPromptOptions,
+    profile: PromptProfile,
 ) -> String {
+    if !profile.is_legacy() {
+        return build_lean_memory_prompt(entrypoints, options);
+    }
     let mut lines = build_memory_lines(entrypoints, options);
 
     for entrypoint in entrypoints {
@@ -254,6 +272,63 @@ fn build_scoped_memory_prompt(
         }
     }
 
+    lines.join("\n")
+}
+
+/// The lean memory section: one rule per point, and one way to save that
+/// matches the tools this turn has — SaveMemory when it is offered, files
+/// written by hand when only Write/Edit are, recall only otherwise.
+fn build_lean_memory_prompt(
+    entrypoints: &[ScopedEntrypoint],
+    options: MemoryPromptOptions,
+) -> String {
+    let save = match options.write_mode() {
+        MemoryWriteMode::SaveMemoryTool => {
+            "Save or delete memories with SaveMemory (`scope` user or repo); do not edit memory \
+             files by hand."
+                .to_string()
+        }
+        MemoryWriteMode::ManualFiles => format!(
+            "To save, write one file per memory in the scope's directory (it exists) with \
+             frontmatter `name`, `description`, and `type` (user, feedback, project, or \
+             reference), then add a one-line `- [Title](file.md) \u{2014} hook` entry to that \
+             scope's {ENTRYPOINT_NAME}, which is only an index. Update an existing memory rather \
+             than duplicating it."
+        ),
+        MemoryWriteMode::RecallOnly => {
+            "Use memory for recall only; do not edit memory files.".to_string()
+        }
+    };
+    let mut lines = vec![
+        "# Memory".to_string(),
+        format!(
+            "Memory persists across sessions: user scope applies everywhere, repo scope to this \
+             repository (directories below). {save}"
+        ),
+        "Save lasting user preferences, feedback on how to work, non-obvious project context, \
+         and pointers to external resources. Never save task progress or what the repository \
+         already records (code, git history, fixes, REBON.md), even when asked; say why instead."
+            .to_string(),
+        "Memories can be stale: check that a named file, function, or flag still exists before \
+         relying on it, and trust what you observe now. Consult memory when the user asks you \
+         to recall something; if told to ignore memory, act as if it were empty."
+            .to_string(),
+    ];
+    for entrypoint in entrypoints {
+        lines.push(String::new());
+        lines.push(format!(
+            "## {ENTRYPOINT_NAME} \u{2014} {}",
+            entrypoint.label
+        ));
+        lines.push(format!("Path: `{}`", display_dir(&entrypoint.dir)));
+        match entrypoint.content.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => {
+                let t = truncate_entrypoint(raw);
+                lines.push(render_entrypoint_content(&t.content, options.budget));
+            }
+            _ => lines.push("(empty)".to_string()),
+        }
+    }
     lines.join("\n")
 }
 
@@ -630,6 +705,15 @@ pub fn load_memory_prompt(cwd: &str) -> Option<String> {
 
 /// Load the memory prompt for a given cwd with mode/capability-aware guidance.
 pub fn load_memory_prompt_with_options(cwd: &str, options: MemoryPromptOptions) -> Option<String> {
+    load_memory_prompt_with_options_for_profile(cwd, options, PromptProfile::current())
+}
+
+/// [`load_memory_prompt_with_options`] under an explicit prompt profile.
+pub fn load_memory_prompt_with_options_for_profile(
+    cwd: &str,
+    options: MemoryPromptOptions,
+    profile: PromptProfile,
+) -> Option<String> {
     let user_dir = memory_paths::user_memory_dir()?;
     let repo_dir = memory_paths::repo_memory_dir(cwd)?;
 
@@ -653,7 +737,11 @@ pub fn load_memory_prompt_with_options(cwd: &str, options: MemoryPromptOptions) 
         },
     ];
 
-    Some(build_scoped_memory_prompt(&entrypoints, options))
+    Some(build_scoped_memory_prompt_for_profile(
+        &entrypoints,
+        options,
+        profile,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -805,6 +893,88 @@ fn same_display_path(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // These tests pin the legacy wording (`REBON_PROMPT_PROFILE=legacy`): the
+    // local items shadow the profile-reading builders from `super::*`. The
+    // lean section is pinned by `lean_memory_prompt_*` below.
+    fn build_memory_prompt(memory_dir_display: &str, entrypoint_content: Option<&str>) -> String {
+        super::build_memory_prompt_for_profile(
+            memory_dir_display,
+            entrypoint_content,
+            PromptProfile::Legacy,
+        )
+    }
+
+    fn build_scoped_memory_prompt(
+        entrypoints: &[ScopedEntrypoint],
+        options: MemoryPromptOptions,
+    ) -> String {
+        super::build_scoped_memory_prompt_for_profile(entrypoints, options, PromptProfile::Legacy)
+    }
+
+    fn load_memory_prompt_with_options(cwd: &str, options: MemoryPromptOptions) -> Option<String> {
+        super::load_memory_prompt_with_options_for_profile(cwd, options, PromptProfile::Legacy)
+    }
+
+    fn load_memory_prompt(cwd: &str) -> Option<String> {
+        load_memory_prompt_with_options(cwd, MemoryPromptOptions::default())
+    }
+
+    fn lean_entries() -> Vec<ScopedEntrypoint> {
+        vec![
+            ScopedEntrypoint {
+                label: "user-scope",
+                dir: PathBuf::from("/home/u/.rebon/memory/user"),
+                content: Some("- [a note](note.md) \u{2014} a hook".to_string()),
+            },
+            ScopedEntrypoint {
+                label: "repo-scope",
+                dir: PathBuf::from("/home/u/.rebon/projects/p/memory"),
+                content: None,
+            },
+        ]
+    }
+
+    /// One way to save, matching the tools the turn has: the lean section
+    /// never offers hand-edited files and SaveMemory together.
+    #[test]
+    fn lean_memory_prompt_names_one_save_path_per_mode() {
+        let lean = |can_save_memory, can_write_memory, is_coordinator| {
+            super::build_scoped_memory_prompt_for_profile(
+                &lean_entries(),
+                MemoryPromptOptions {
+                    is_coordinator,
+                    can_write_memory,
+                    can_save_memory,
+                    budget: Some(MemoryPromptBudget::default_runtime()),
+                },
+                PromptProfile::Lean,
+            )
+        };
+        let save = lean(true, true, false);
+        assert!(save.contains("with SaveMemory"));
+        assert!(save.contains("do not edit memory files by hand"));
+        assert!(!save.contains("frontmatter"));
+
+        let manual = lean(false, true, false);
+        assert!(manual.contains("write one file per memory"));
+        assert!(manual.contains("frontmatter `name`, `description`, and `type`"));
+        assert!(!manual.contains("SaveMemory"));
+
+        let recall = lean(false, true, true);
+        assert!(recall.contains("recall only; do not edit memory files"));
+        assert!(!recall.contains("SaveMemory"));
+
+        for text in [&save, &manual, &recall] {
+            assert!(text.starts_with("# Memory\n"));
+            assert!(text.contains("Never save task progress or what the repository"));
+            assert!(text.contains("if told to ignore memory, act as if it were empty"));
+            assert!(text
+                .contains("## MEMORY.md \u{2014} user-scope\nPath: `/home/u/.rebon/memory/user/`"));
+            assert!(text.contains("- [a note](note.md)"));
+            assert!(text.ends_with("## MEMORY.md \u{2014} repo-scope\nPath: `/home/u/.rebon/projects/p/memory/`\n(empty)"));
+        }
+    }
 
     fn test_scoped_entries() -> Vec<ScopedEntrypoint> {
         vec![

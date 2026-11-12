@@ -120,7 +120,15 @@ fn build_scoped_memory_prompt(
     // then patch the header + guidelines inline. Duplicating the
     // full body text would mean keeping two copies in sync — we avoid
     // it here by string-replacing the only two places that differ.
-    let base = crate::memory::prompt::build_memory_prompt(memory_dir_display, entrypoint_content);
+    // Per-agent memory keeps the legacy wording under either prompt profile:
+    // its header swap and scope-note anchor below are written against it, and
+    // no built-in agent declares `memory`, so the default session never sends
+    // it.
+    let base = crate::memory::prompt::build_memory_prompt_for_profile(
+        memory_dir_display,
+        entrypoint_content,
+        rebon_types::prompt_profile::PromptProfile::Legacy,
+    );
 
     // Swap the "# auto memory" header for the caller-supplied one.
     let mut rewritten = base.replacen("# auto memory", &format!("# {display_name}"), 1);
