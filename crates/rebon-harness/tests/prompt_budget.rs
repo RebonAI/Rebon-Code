@@ -24,10 +24,12 @@ use rebon_core::system_prompt::{
 use rebon_core::Engine;
 
 /// The lean surface measured 21,036 characters (about 5.3k tokens at four
-/// characters a token) when this budget was set; the margin absorbs the
-/// machine-dependent paths in the memory and scratchpad lines. A rise past it
-/// is a prompt change that has to justify itself.
-const BUDGET_CHARS: usize = 22_000;
+/// characters a token) when this budget was set, and 22,154 when it was
+/// raised for the rules on conditional test skips and on checking a bug fix
+/// against the documented contract, which A/B runs showed were needed; the
+/// margin absorbs the machine-dependent paths in the memory and scratchpad
+/// lines. A rise past it is a prompt change that has to justify itself.
+const BUDGET_CHARS: usize = 23_000;
 
 /// `<system-reminder>\n<runtime_context>\n` … `\n</runtime_context>\n</system-reminder>`.
 const RUNTIME_WRAPPER_CHARS: usize = 74;

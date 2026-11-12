@@ -288,7 +288,9 @@ fn lean_base_plane_states_each_boundary() {
         "Never discard a change because someone else made it",
         // Truthful reporting and verification.
         "never claim success, a passing check, or completion you did not observe",
-        "never weaken, skip, or delete tests or checks to get a pass",
+        "skip (conditional skips included), or delete tests or checks to make them pass",
+        "if one cannot pass or run here, leave it and say why",
+        "check the fix against the code's documented contract and the edge cases it implies",
         "If you cannot verify, say so",
         // Tools.
         "never use the shell to get around their checks",
