@@ -130,6 +130,11 @@ Images are returned as visual payloads. PDFs over 10 pages require `pages`; at m
 /// of thousands of tokens into the context window. The model should
 /// use `offset`/`limit` for targeted reads of larger files.
 const DEFAULT_READ_LINES: usize = 200;
+/// A text file up to this many lines is shown whole, whatever range was
+/// asked for.
+const WHOLE_FILE_MAX_LINES: usize = 600;
+/// Past that, a read shows a window of at least this many lines.
+const WINDOW_LINES: usize = 300;
 /// Hard cap on lines per read — applies even when an explicit `limit`
 /// is provided. Prevents a single Read call from filling the context.
 const MAX_LINES_TO_READ: usize = 2000;
@@ -354,12 +359,12 @@ impl Tool for ReadTool {
                     .saturating_add(request.limit.unwrap_or(1))
                     .saturating_sub(1)
                     .min(total);
-                if total <= 600 {
+                if total <= WHOLE_FILE_MAX_LINES {
                     request.offset = 1;
                     request.limit = Some(total.max(1));
                 } else {
-                    let requested_length = request.limit.unwrap_or(300);
-                    let length = requested_length.max(300);
+                    let requested_length = request.limit.unwrap_or(WINDOW_LINES);
+                    let length = requested_length.max(WINDOW_LINES);
                     let mut start = request
                         .offset
                         .saturating_sub((length - requested_length) / 2)
@@ -1092,6 +1097,37 @@ struct RenderResult {
     /// `(line_number, raw_byte_length)` of the longest input line we
     /// observed in the selected range. `None` when the range is empty.
     largest_line: Option<(usize, usize)>,
+}
+
+/// A file's text as a Read with no range would show it.
+pub(crate) struct CurrentView {
+    /// Line-numbered (`{:>6}\t`), within Read's line count and byte budget.
+    pub(crate) text: String,
+    pub(crate) shown_lines: usize,
+    pub(crate) total_lines: usize,
+    /// Every line shown, none clipped: the model has seen the whole file.
+    pub(crate) complete: bool,
+}
+
+/// Render `content` the way a plain `Read` of the file does: all of it up
+/// to [`WHOLE_FILE_MAX_LINES`] lines, otherwise the first [`WINDOW_LINES`],
+/// line-numbered, within the byte budget.
+pub(crate) fn current_view(content: &str) -> CurrentView {
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    let shown = if total_lines <= WHOLE_FILE_MAX_LINES {
+        total_lines
+    } else {
+        WINDOW_LINES
+    };
+    let selected = &lines[..shown];
+    let rendered = render_with_byte_budget(selected, 1);
+    CurrentView {
+        complete: rendered.emitted_lines == total_lines && rendered.clipped_lines.is_empty(),
+        text: rendered.content,
+        shown_lines: rendered.emitted_lines,
+        total_lines,
+    }
 }
 
 fn render_with_byte_budget(selected: &[&str], start_line: usize) -> RenderResult {

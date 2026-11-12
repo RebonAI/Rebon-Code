@@ -1,8 +1,8 @@
 use crate::{Tool, ToolContext};
 use async_trait::async_trait;
 use rebon_tools_core::{
-    require_valid_input, validation_outcome_from, PermissionDecision, PermissionRequest, ToolError,
-    ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
+    file_state::FileState, require_valid_input, validation_outcome_from, PermissionDecision,
+    PermissionRequest, ToolError, ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -12,9 +12,12 @@ pub const FILE_WRITE_TOOL_NAME: &str = "Write";
 const INVALID_INPUT_CODE: i64 = 400;
 const NOT_FILE_CODE: i64 = 2;
 const UNSUPPORTED_MEDIA_CODE: i64 = 3;
-/// Overwriting an existing file this session has not seen, without
+/// Overwriting an existing file this session has not seen in full, without
 /// `overwrite: true`.
 pub(crate) const UNSEEN_OVERWRITE_CODE: i64 = 6;
+/// Overwriting a file that changed since the model last saw all of it,
+/// without `overwrite: true`. The refusal carries the current content.
+pub(crate) const CHANGED_SINCE_SEEN_CODE: i64 = 7;
 
 #[derive(Debug, Clone, Default)]
 pub struct WriteTool;
@@ -50,7 +53,8 @@ impl Tool for WriteTool {
          \n\
          Usage:\n\
          - This tool will overwrite the existing file if there is one at the provided path.\n\
-         - If this is an existing file, Read it first or pass `overwrite: true`; otherwise this tool fails.\n\
+         - If this is an existing file, Read it first or pass `overwrite: true`; otherwise this tool fails. \
+         If the file changed since you saw it, Write returns its current content instead; re-issue with that in mind.\n\
          - Prefer the Edit tool for modifying existing files \u{2014} it only sends the diff. \
          Only use this tool to create new files or for complete rewrites.\n\
          - NEVER create documentation files (*.md) or README files unless explicitly requested by the User.\n\
@@ -350,12 +354,19 @@ fn enforce_write_path_scope(
 ///   session, which have nothing to consult).
 /// * The file does not exist → allowed: creating needs nothing.
 /// * `overwrite: true` → allowed.
-/// * This session has seen the file — a Read, its own Edit/Write, or a
-///   verbatim prompt injection — → allowed. Seen is a cache entry that is
-///   not an auto-injected partial view; the content is never compared, so a
-///   formatter or another writer changing the file since is not a refusal.
-/// * Otherwise refused: replacing a file the model never looked at is the
-///   one blind overwrite this guards against.
+/// * The model has seen the whole file — a Read that showed all of it, the
+///   session's own whole write, a verbatim prompt injection, each kept
+///   current by the session's own edits — and it has not changed since →
+///   allowed.
+/// * Seen whole but changed since (another agent, the user, a formatter) →
+///   refused, with the current content in the refusal. That refusal is
+///   itself a view of the file: when it shows all of it, it counts as seen,
+///   so the model can re-issue the Write at once without a Read round.
+/// * Otherwise refused: a file never seen, seen only in part (a ranged or
+///   cut-off Read), or only through a shortened auto-injected view.
+///
+/// Only the content is compared — no mtime — and only here: Edit and
+/// MultiEdit match their anchors against the current content instead.
 fn check_overwrite(input: &WriteInput, context: &ToolContext) -> ValidationOutcome {
     let Some(cache) = context.file_state_cache() else {
         return ValidationOutcome::valid();
@@ -364,25 +375,67 @@ fn check_overwrite(input: &WriteInput, context: &ToolContext) -> ValidationOutco
     if input.overwrite || !path.exists() {
         return ValidationOutcome::valid();
     }
-    match cache.get(path) {
-        Some(state) if !state.is_partial_view => ValidationOutcome::valid(),
-        Some(_) => ValidationOutcome::invalid(
+    let unseen = |why: &str| {
+        ValidationOutcome::invalid(
             format!(
-                "{} already exists and was only shown in a shortened auto-injected view \
-                 (REBON.md / MEMORY.md). Read it first, or pass `overwrite: true` to replace it.",
+                "{} already exists and {why}. Read it in full first, or pass `overwrite: true` \
+                 to replace it.",
                 path.display()
             ),
             UNSEEN_OVERWRITE_CODE,
-        ),
-        None => ValidationOutcome::invalid(
-            format!(
-                "{} already exists and has not been read in this session. Read it first, or \
-                 pass `overwrite: true` to replace it.",
-                path.display()
-            ),
-            UNSEEN_OVERWRITE_CODE,
-        ),
+        )
+    };
+    let Some(state) = cache.get(path) else {
+        return unseen("has not been read in this session");
+    };
+    if state.is_partial_view {
+        return unseen("was only shown in a shortened auto-injected view (REBON.md / MEMORY.md)");
     }
+    if state.offset.is_some() || state.limit.is_some() {
+        return unseen("you have seen only part of it");
+    }
+    let Ok(bytes) = fs::read(path) else {
+        // Unreadable here; the write itself reports what is wrong.
+        return ValidationOutcome::valid();
+    };
+    let current = String::from_utf8_lossy(&bytes).into_owned();
+    if current == state.content {
+        return ValidationOutcome::valid();
+    }
+
+    let view = crate::read::current_view(&current);
+    let (shown, next) = if view.complete {
+        cache.record_whole_write(path, current);
+        (
+            "here is its current content".to_string(),
+            "Re-issue the Write with it in mind, or pass `overwrite: true`.",
+        )
+    } else {
+        cache.set(
+            path,
+            FileState {
+                content: current,
+                offset: Some(1),
+                limit: Some(view.shown_lines as u64),
+                is_partial_view: false,
+            },
+        );
+        (
+            format!(
+                "here are the first {} of its {} lines",
+                view.shown_lines, view.total_lines
+            ),
+            "Read the rest before re-issuing the Write, or pass `overwrite: true`.",
+        )
+    };
+    ValidationOutcome::invalid(
+        format!(
+            "{} changed since you last saw it; {shown}:\n{}\n{next}",
+            path.display(),
+            view.text
+        ),
+        CHANGED_SINCE_SEEN_CODE,
+    )
 }
 
 fn count_lines(content: String) -> usize {
@@ -396,8 +449,9 @@ fn count_lines(content: String) -> usize {
 /// Provider-visible description under the lean prompt profile.
 const LEAN_DESCRIPTION: &str =
     "Create a file, or replace a file's whole content. `file_path` must be absolute. \
-Replacing an existing file needs a Read of it first, or `overwrite: true`. Use Edit to change \
-part of a file.";
+Replacing an existing file needs a Read of it first, or `overwrite: true`; if the file changed \
+since you saw it, Write returns its current content instead, so re-issue with that in mind. \
+Use Edit to change part of a file.";
 
 fn lean_schema() -> ToolInputSchema {
     json!({
@@ -498,7 +552,7 @@ mod tests {
                 error_code, reason, ..
             } => {
                 assert_eq!(error_code, Some(UNSEEN_OVERWRITE_CODE), "{reason}");
-                assert!(reason.contains("Read it first"), "{reason}");
+                assert!(reason.contains("Read it in full first"), "{reason}");
                 assert!(reason.contains("`overwrite: true`"), "{reason}");
                 reason
             }
@@ -928,36 +982,188 @@ mod tests {
             .is_empty());
     }
 
-    /// Seen is about presence, not freshness: the file changed after this
-    /// session read it, and the Write still goes through.
+    fn write_input(file: &Path, content: &str) -> Value {
+        json!({ "file_path": file.to_string_lossy(), "content": content })
+    }
+
+    async fn read_whole(file: &Path, ctx: &ToolContext) {
+        crate::ReadTool
+            .call(json!({ "targets": [{ "path": file }] }), ctx)
+            .await
+            .unwrap();
+    }
+
+    /// Read, someone else changes the file, Write: refused, with the current
+    /// content line-numbered in the refusal and nothing written. That refusal
+    /// counts as a fresh whole view, so the very next Write goes through.
     #[tokio::test]
-    async fn write_does_not_compare_content_with_the_cached_snapshot() {
+    async fn a_file_changed_since_it_was_read_is_refused_with_its_content() {
         let dir = TempDir::new();
         let file = dir.path().join("stale.txt");
-        fs::write(&file, "original").unwrap();
-        let cache = FileStateCache::new();
-        cache.set(
-            &file,
-            FileState {
-                content: "original".to_string(),
-                offset: None,
-                limit: None,
-                is_partial_view: false,
-            },
+        fs::write(&file, "original\n").unwrap();
+        let ctx = ToolContext::new().with_file_state_cache(FileStateCache::new());
+        read_whole(&file, &ctx).await;
+        fs::write(&file, "original\nadded by someone else\n").unwrap();
+
+        let verdict = tool()
+            .validate_input(&write_input(&file, "replacement\n"), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(verdict.error_code, Some(CHANGED_SINCE_SEEN_CODE));
+        let message = verdict.message.unwrap();
+        assert!(
+            message.contains("changed since you last saw it"),
+            "{message}"
         );
-        let ctx = ToolContext::new().with_file_state_cache(cache.clone());
-        fs::write(&file, "external change").unwrap();
+        assert!(
+            message.contains("     2\tadded by someone else"),
+            "{message}"
+        );
+        assert!(message.len() < 400, "short: {message}");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "original\nadded by someone else\n"
+        );
 
         tool()
+            .call(write_input(&file, "replacement\n"), &ctx)
+            .await
+            .expect("the refusal showed the whole file, so the retry goes through");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "replacement\n");
+    }
+
+    /// The decisive check runs again under the path lock in `call`.
+    #[tokio::test]
+    async fn the_change_is_caught_by_call_too() {
+        let dir = TempDir::new();
+        let file = dir.path().join("race.txt");
+        fs::write(&file, "one\n").unwrap();
+        let ctx = ToolContext::new().with_file_state_cache(FileStateCache::new());
+        read_whole(&file, &ctx).await;
+        fs::write(&file, "two\n").unwrap();
+
+        let err = tool()
+            .call(write_input(&file, "three\n"), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ToolError::InvalidInput {
+                error_code: Some(CHANGED_SINCE_SEEN_CODE),
+                ..
+            }
+        ));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "two\n");
+    }
+
+    #[tokio::test]
+    async fn a_file_unchanged_since_it_was_read_is_replaced() {
+        let dir = TempDir::new();
+        let file = dir.path().join("same.txt");
+        fs::write(&file, "original\n").unwrap();
+        let ctx = ToolContext::new().with_file_state_cache(FileStateCache::new());
+        read_whole(&file, &ctx).await;
+        tool()
+            .call(write_input(&file, "replacement\n"), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "replacement\n");
+    }
+
+    #[tokio::test]
+    async fn overwrite_replaces_a_changed_file_without_the_check() {
+        let dir = TempDir::new();
+        let file = dir.path().join("forced.txt");
+        fs::write(&file, "original\n").unwrap();
+        let ctx = ToolContext::new().with_file_state_cache(FileStateCache::new());
+        read_whole(&file, &ctx).await;
+        fs::write(&file, "changed\n").unwrap();
+        tool()
             .call(
-                json!({ "file_path": file.to_string_lossy(), "content": "replacement" }),
+                json!({ "file_path": file.to_string_lossy(), "content": "forced\n", "overwrite": true }),
                 &ctx,
             )
             .await
-            .expect("a changed file the session has seen may be overwritten");
-        assert_eq!(fs::read_to_string(&file).unwrap(), "replacement");
-        let state = cache.get(&file).unwrap();
-        assert_eq!(state.content, "replacement");
-        assert!(state.offset.is_none() && state.limit.is_none());
+            .unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "forced\n");
+    }
+
+    /// A ranged Read showed part of the file: not seen, as before.
+    #[tokio::test]
+    async fn a_ranged_read_does_not_count_as_seeing_the_file() {
+        let dir = TempDir::new();
+        let file = dir.path().join("long.txt");
+        let body: String = (1..=700).map(|n| format!("row {n}\n")).collect();
+        fs::write(&file, &body).unwrap();
+        let ctx = ToolContext::new().with_file_state_cache(FileStateCache::new());
+        crate::ReadTool
+            .call(
+                json!({ "targets": [{ "path": file, "start": 1, "end": 10 }] }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let err = tool()
+            .call(write_input(&file, "new\n"), &ctx)
+            .await
+            .unwrap_err();
+        let reason = assert_unseen_overwrite_refused(err);
+        assert!(reason.contains("only part of it"), "{reason}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), body);
+    }
+
+    /// The session's own edits keep the record current, so a Write after an
+    /// Edit chain is not mistaken for overwriting someone else's change.
+    #[tokio::test]
+    async fn a_write_after_the_sessions_own_edits_goes_through() {
+        let dir = TempDir::new();
+        let file = dir.path().join("mine.txt");
+        fs::write(&file, "alpha beta\n").unwrap();
+        let ctx = ToolContext::new().with_file_state_cache(FileStateCache::new());
+        read_whole(&file, &ctx).await;
+        for (old, new) in [("alpha", "ALPHA"), ("beta", "BETA")] {
+            crate::EditTool
+                .call(
+                    json!({ "file_path": file.to_string_lossy(), "old_string": old, "new_string": new }),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+        }
+        tool()
+            .call(write_input(&file, "rewritten\n"), &ctx)
+            .await
+            .expect("own edits are not someone else's change");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "rewritten\n");
+    }
+
+    /// A changed file too long to show in full: the refusal shows the first
+    /// lines, and the retry still needs the rest read or `overwrite`.
+    #[tokio::test]
+    async fn a_long_changed_file_is_shown_in_part_and_stays_unseen() {
+        let dir = TempDir::new();
+        let file = dir.path().join("big.txt");
+        fs::write(&file, "x\n").unwrap();
+        let ctx = ToolContext::new().with_file_state_cache(FileStateCache::new());
+        read_whole(&file, &ctx).await;
+        let long: String = (1..=700).map(|n| format!("line {n}\n")).collect();
+        fs::write(&file, &long).unwrap();
+
+        let err = tool()
+            .call(write_input(&file, "short\n"), &ctx)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("first 300 of its 700 lines"),
+            "{message:.200}"
+        );
+        assert!(message.contains("Read the rest"), "{message:.200}");
+        let err = tool()
+            .call(write_input(&file, "short\n"), &ctx)
+            .await
+            .unwrap_err();
+        assert_unseen_overwrite_refused(err);
+        assert_eq!(fs::read_to_string(&file).unwrap(), long);
     }
 }

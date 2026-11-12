@@ -698,8 +698,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&paths[9]).unwrap(), "edited");
-        rebon_tool::WriteTool
+
+        // The batch showed file 0 only up to its byte budget: part of it, so
+        // a Write needs a full Read or `overwrite`.
+        let error = rebon_tool::WriteTool
             .call(json!({"file_path":paths[0],"content":"replacement"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("only part of it"), "{error}");
+        rebon_tool::WriteTool
+            .call(
+                json!({"file_path":paths[0],"content":"replacement","overwrite":true}),
+                &ctx,
+            )
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&paths[0]).unwrap(), "replacement");

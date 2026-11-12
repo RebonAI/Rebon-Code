@@ -5,14 +5,17 @@
 //! The cache is a plain `HashMap` behind a `Mutex`: no LRU eviction and no byte
 //! cap.
 //!
-//! It is not a freshness gate. Nothing compares a cached snapshot with the
-//! file on disk before writing — files change under the session all the time
-//! (formatters, hooks, other agents), and refusing over that costs a round
-//! for nothing. `Edit` matches `old_string` against the current content
-//! instead. Two things read the cache:
+//! Edits do not consult it: files change under the session all the time
+//! (formatters, hooks, other agents), and `Edit` matches `old_string`
+//! against the current content instead. Only a whole-file `Write`, which
+//! would silently drop such a change, compares the snapshot with the disk,
+//! and a refusal hands the model the current content so it costs no extra
+//! round. Two things read the cache:
 //!
 //! * **`Write`'s "seen" rule.** Overwriting an existing file needs either
-//!   an entry here that is not a partial view, or `overwrite: true`.
+//!   `overwrite: true`, or an entry here that shows the model saw the whole
+//!   file (not a partial view, no `offset` / `limit`) whose `content` still
+//!   matches the file. A changed file is refused with its current content.
 //! * **`Read`'s range merge**, which widens a new range to an overlapping one
 //!   it already showed while the content is unchanged (`content`, `offset`,
 //!   `limit`).
@@ -114,9 +117,11 @@ impl FileStateCache {
     /// notebook cell), leaving its content `content`.
     ///
     /// An edit shows the model only the text it replaced, so it does not
-    /// make an unseen file seen: with no entry this records nothing, and a
-    /// partial view stays partial. An entry that was already seen gets the
-    /// new content, for `Read`'s range merge.
+    /// widen what the model has seen: with no entry this records nothing, a
+    /// partial view or a ranged Read (`offset` / `limit`) stays partial, and
+    /// an entry the model saw whole gets the new content, so `Write`'s
+    /// changed-since-seen check does not mistake the session's own edits
+    /// for someone else's.
     pub fn record_partial_write(&self, path: &Path, content: String) {
         let key = normalize_path_key(path);
         let mut guard = self
@@ -125,8 +130,6 @@ impl FileStateCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(entry) = guard.get_mut(&key) {
             entry.content = content;
-            entry.offset = None;
-            entry.limit = None;
         }
     }
 
@@ -235,11 +238,12 @@ mod tests {
                 is_partial_view: false,
             },
         );
+        // A ranged Read stays partial after an edit: the edit showed no more.
         cache.record_partial_write(&read, "a\nB".into());
         let state = cache.get(&read).unwrap();
         assert_eq!(
             (state.content.as_str(), state.offset, state.limit),
-            ("a\nB", None, None)
+            ("a\nB", Some(2), Some(1))
         );
 
         cache.record_whole_write(&unseen, "whole".into());

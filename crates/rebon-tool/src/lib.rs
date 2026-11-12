@@ -3037,6 +3037,7 @@ mod tests {
         second_input: Value,
         expected_after_both: &str,
         shared_cache: bool,
+        second_is_write: bool,
     ) {
         std::fs::write(&file, initial).unwrap();
         // Held for the whole window so the lock registry cannot evict the
@@ -3094,12 +3095,27 @@ mod tests {
 
         release_tx.send(()).unwrap();
         first.await.unwrap().expect("first write should succeed");
-        // The second runs against what the first wrote: no snapshot
-        // comparison, so a writer queued behind another is not stale.
-        second
-            .await
-            .unwrap()
-            .expect("second write applies to the first one's result");
+        let second = second.await.unwrap();
+        if second_is_write && !shared_cache {
+            // Another session's Write would replace a file that changed since
+            // it saw it: refused with the current content, nothing written.
+            let err = second.expect_err("a stale whole-file Write is refused");
+            assert!(
+                matches!(
+                    err,
+                    ToolError::InvalidInput {
+                        error_code: Some(write::CHANGED_SINCE_SEEN_CODE),
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+            assert_ne!(std::fs::read_to_string(file).unwrap(), expected_after_both);
+            return;
+        }
+        // An edit matches the current content, and a Write sharing the cache
+        // saw the first writer's result: either applies on top of it.
+        second.expect("second write applies to the first one's result");
         assert_eq!(std::fs::read_to_string(file).unwrap(), expected_after_both);
     }
 
@@ -3200,6 +3216,7 @@ mod tests {
                     second_kind.second_input(&file),
                     "ALPHA BETA",
                     shared_cache,
+                    matches!(second_kind, FileMutationToolKind::Write),
                 )
                 .await;
             }

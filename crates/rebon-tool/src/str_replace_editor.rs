@@ -546,12 +546,23 @@ fn retarget(message: &str, translated: &Translated) -> String {
         .get("file_path")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let change_it = "change it with `str_replace` or `insert`; `create` only makes new files.";
     message
         .replace(
-            "Read it first, or pass `overwrite: true` to replace it.",
+            "Read it in full first, or pass `overwrite: true` to replace it.",
             &format!(
                 "Run `{STR_REPLACE_EDITOR_TOOL_NAME}` with command=view and path={path} first, then \
-                 change it with `str_replace` or `insert`; `create` only makes new files."
+                 {change_it}"
+            ),
+        )
+        .replace(
+            "Re-issue the Write with it in mind, or pass `overwrite: true`.",
+            &format!("Work from this content: {change_it}"),
+        )
+        .replace(
+            "Read the rest before re-issuing the Write, or pass `overwrite: true`.",
+            &format!(
+                "View the rest with command=view and path={path}, then {change_it}"
             ),
         )
         .replace(
@@ -959,8 +970,8 @@ mod tests {
             input: json!({ "file_path": "/a/b.txt" }),
         };
         let advice = retarget(
-            "/a/b.txt already exists and has not been read in this session. Read it first, or \
-             pass `overwrite: true` to replace it.",
+            "/a/b.txt already exists and has not been read in this session. Read it in full \
+             first, or pass `overwrite: true` to replace it.",
             &translated,
         );
         assert!(
