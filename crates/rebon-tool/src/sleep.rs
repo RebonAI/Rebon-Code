@@ -40,8 +40,6 @@ impl Tool for SleepTool {
          Use this when the user tells you to sleep or rest, when you have nothing to do, \
          or when you're waiting for something.\n\
          \n\
-         You can call this concurrently with other tools \u{2014} it won't interfere with them.\n\
-         \n\
          Prefer this over `Bash(sleep ...)` \u{2014} it doesn't hold a shell process."
     }
 
@@ -60,8 +58,10 @@ impl Tool for SleepTool {
         })
     }
 
+    /// A sleep in a batch means "wait, then go on": the calls after it must
+    /// not start until it ends.
     fn is_concurrency_safe(&self, _input: &Value) -> bool {
-        true
+        false
     }
 
     fn is_read_only(&self, _input: &Value) -> bool {
