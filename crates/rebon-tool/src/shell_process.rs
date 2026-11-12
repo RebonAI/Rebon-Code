@@ -151,6 +151,13 @@ impl<R: AsyncRead + Unpin> ShellLineReader<R> {
         }
         Ok(Some(self.encoding.decode_complete(&line)))
     }
+
+    /// The stream with whatever it has buffered, the bytes of a line read
+    /// only in part, and the encoding — everything a reader that takes over
+    /// needs to continue exactly where this one stopped.
+    pub(crate) fn into_parts(self) -> (BufReader<R>, Vec<u8>, ShellOutputEncoding) {
+        (self.reader, self.pending, self.encoding)
+    }
 }
 
 /// The console code page a Windows child writes its output in.
@@ -377,12 +384,14 @@ impl ShellProcessRegistry {
 
         let stdout_task = tokio::spawn(read_stream(
             stdout,
+            Vec::new(),
             Arc::clone(&entry),
             "stdout",
             output_encoding,
         ));
         let stderr_task = tokio::spawn(read_stream(
             stderr,
+            Vec::new(),
             Arc::clone(&entry),
             "stderr",
             output_encoding,
@@ -397,6 +406,128 @@ impl ShellProcessRegistry {
         ));
 
         Ok(entry.launch_value())
+    }
+
+    /// Take over a foreground command still running when its timeout
+    /// passed, instead of killing it: it becomes a background shell like one
+    /// started with `run_in_background`, with no deadline, and its exit is
+    /// announced the same way, once.
+    ///
+    /// The output file starts with `output_so_far` — what the foreground
+    /// call already collected — so it holds the whole stream from the first
+    /// byte. The in-memory tail (`ShellOutput`'s `outputTail`, the
+    /// completion's) starts where the foreground result stopped, so the two
+    /// together repeat nothing. A line half-read at the switch goes to the
+    /// background side.
+    ///
+    /// The child must lead its own process group (`run_foreground` spawns it
+    /// so). The tree is taken over now; on Windows, a process the command
+    /// started before this moment is outside it. Unlike a `run_in_background`
+    /// shell, the group is not killed when the command exits: what a
+    /// foreground command leaves running (`nohup server &`) outlives it as it
+    /// would have without the timeout. `ShellStop` and the session's end
+    /// still end the whole tree.
+    ///
+    /// Refused — the child handed back with the reason, for the caller to
+    /// kill as before — when nothing can own a background shell here, or
+    /// the owner is at its running-shell limit, or the tree or the output
+    /// file cannot be set up.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn adopt_foreground<O, E>(
+        &self,
+        context: &ToolContext,
+        child: Child,
+        stdout: ShellLineReader<O>,
+        stderr: ShellLineReader<E>,
+        tool_name: &'static str,
+        command_text: String,
+        output_so_far: &[(bool, String)],
+        timeout_ms: u64,
+    ) -> Result<Value, (Child, String)>
+    where
+        O: AsyncRead + Unpin + Send + 'static,
+        E: AsyncRead + Unpin + Send + 'static,
+    {
+        let Ok(owner) = owner_from_context(context, tool_name) else {
+            return Err((
+                child,
+                "nothing in this context can own a background shell".to_string(),
+            ));
+        };
+        let limit_reached = format!(
+            "the background shell limit ({MAX_RUNNING_SHELLS_PER_OWNER} running) is reached"
+        );
+        if self.ensure_capacity(&owner, tool_name).is_err() {
+            return Err((child, limit_reached));
+        }
+        let process_tree = match ProcessTreeControl::for_child(&child) {
+            Ok(process_tree) => Arc::new(process_tree),
+            Err(err) => {
+                return Err((
+                    child,
+                    format!("its process tree could not be taken over: {err}"),
+                ))
+            }
+        };
+        let shell_id = match self.unique_shell_id(tool_name, false) {
+            Ok(shell_id) => shell_id,
+            Err(err) => return Err((child, err.to_string())),
+        };
+        let output_file = match create_output_file(context, &shell_id) {
+            Ok(output_file) => output_file,
+            Err(err) => return Err((child, err.to_string())),
+        };
+        let mut entry = ShellEntry::new(
+            shell_id.clone(),
+            owner.clone(),
+            tool_name,
+            command_text,
+            None,
+            process_tree,
+            context.task_runtime_controller().cloned(),
+            PromptCancel::new(),
+            ShellTaskRegistration::BackgroundShell,
+            Some(output_file),
+        );
+        entry.reap_tree_on_exit = false;
+        let entry = Arc::new(entry);
+        entry.record_earlier_output(output_so_far);
+
+        {
+            let mut entries = lock(&self.inner.entries);
+            prune_completed(&mut entries, &owner);
+            if running_count(&entries, &owner) >= MAX_RUNNING_SHELLS_PER_OWNER {
+                return Err((child, limit_reached));
+            }
+            entries.insert(shell_id, Arc::clone(&entry));
+        }
+
+        let (stdout, stdout_pending, stdout_encoding) = stdout.into_parts();
+        let (stderr, stderr_pending, stderr_encoding) = stderr.into_parts();
+        let stdout_task = tokio::spawn(read_stream(
+            stdout,
+            stdout_pending,
+            Arc::clone(&entry),
+            "stdout",
+            stdout_encoding,
+        ));
+        let stderr_task = tokio::spawn(read_stream(
+            stderr,
+            stderr_pending,
+            Arc::clone(&entry),
+            "stderr",
+            stderr_encoding,
+        ));
+        entry.register_task();
+        tokio::spawn(supervise_process(
+            child,
+            stdout_task,
+            stderr_task,
+            Arc::clone(&entry),
+            None,
+        ));
+
+        Ok(entry.handoff_value(timeout_ms))
     }
 
     pub(crate) fn list(&self, context: &ToolContext, caller: &str) -> ToolResult<Value> {
@@ -595,6 +726,10 @@ struct ShellEntry {
     observed: AtomicBool,
     /// Where the full output goes. `None` for a Monitor.
     output_path: Option<PathBuf>,
+    /// Whether the process group is killed once the command exits. False
+    /// for a foreground command taken over at its timeout, whose leftovers
+    /// outlive it as a foreground command's do.
+    reap_tree_on_exit: bool,
 }
 
 impl Drop for ShellEntry {
@@ -645,7 +780,46 @@ impl ShellEntry {
             monitor_line_buffer: Mutex::new(String::new()),
             observed: AtomicBool::new(false),
             output_path,
+            reap_tree_on_exit: true,
         }
+    }
+
+    /// Write output collected before this entry existed to the output file
+    /// (not to the tail: the caller has already reported it).
+    fn record_earlier_output(&self, lines: &[(bool, String)]) {
+        let mut state = lock(&self.state);
+        for (_, line) in lines {
+            let text = format!("{line}\n");
+            state.output_bytes = state.output_bytes.saturating_add(text.len() as u64);
+            state.write_to_file(&text);
+        }
+    }
+
+    /// What a foreground call reports when it hands its command over.
+    fn handoff_value(&self, timeout_ms: u64) -> Value {
+        let notified = self.task_runtime_controller.is_some() && self.owner.session_id.is_some();
+        let next = if notified {
+            "Its exit will be announced in a task notification, so keep working; to wait for \
+             it instead, call ShellOutput with this shellId and a timeout."
+        } else {
+            "To wait for it, call ShellOutput with this shellId and a timeout."
+        };
+        let mut value = json!({
+            "shellId": self.shell_id,
+            "status": lock(&self.state).status.as_str(),
+            "backgrounded": true,
+            "note": format!(
+                "Still running when its {timeout_ms} ms timeout passed, so it was not killed: it \
+                 continues as background shell {}. stdout and stderr above are its output up to \
+                 that point; outputPath has all of it, including what follows. {next} ShellStop \
+                 ends it.",
+                self.shell_id
+            ),
+        });
+        if let Some(path) = self.output_path_text() {
+            value["outputPath"] = Value::String(path);
+        }
+        value
     }
 
     fn output_path_text(&self) -> Option<String> {
@@ -1297,8 +1471,12 @@ impl ShellState {
     }
 }
 
+/// Read one stream into `entry` until it closes. `pending` is output read
+/// before this reader started (a foreground reader's half line), which goes
+/// first.
 async fn read_stream<R>(
     mut reader: R,
+    pending: Vec<u8>,
     entry: Arc<ShellEntry>,
     stream: &'static str,
     output_encoding: ShellOutputEncoding,
@@ -1307,6 +1485,9 @@ async fn read_stream<R>(
 {
     let mut buffer = vec![0u8; READ_CHUNK_BYTES];
     let mut decoder = ShellStreamDecoder::new(output_encoding);
+    if !pending.is_empty() {
+        entry.push_output(stream, decoder.decode_chunk(&pending));
+    }
     loop {
         match reader.read(&mut buffer).await {
             Ok(0) => break,
@@ -1519,8 +1700,10 @@ async fn supervise_process(
         }
     };
 
-    if let Err(err) = entry.process_tree.terminate() {
-        entry.record_error(format!("failed to clean up process tree: {err}"));
+    if entry.reap_tree_on_exit {
+        if let Err(err) = entry.process_tree.terminate() {
+            entry.record_error(format!("failed to clean up process tree: {err}"));
+        }
     }
     let drain_deadline = Instant::now() + READER_DRAIN_GRACE;
     drain_reader(stdout_task, drain_deadline, &entry, "stdout").await;
@@ -1704,13 +1887,13 @@ impl Drop for ProcessTreeControl {
 }
 
 #[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
+pub(crate) fn configure_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.as_std_mut().process_group(0);
 }
 
 #[cfg(windows)]
-fn configure_process_group(_command: &mut Command) {}
+pub(crate) fn configure_process_group(_command: &mut Command) {}
 
 /// Guard a spawned shell's whole process tree.
 ///
@@ -1774,6 +1957,7 @@ mod tests {
             } else {
                 read_stream(
                     FailingStream,
+                    Vec::new(),
                     entry.clone(),
                     stage,
                     ShellOutputEncoding::Utf8,
@@ -3091,5 +3275,98 @@ mod tests {
 
         drop(entry);
         assert!(!path.exists(), "the file goes with its entry");
+    }
+
+    /// A foreground command still running at its timeout is not killed: it
+    /// continues as a background shell, the output file holds the whole
+    /// stream, the foreground result plus the shell's tail repeat nothing,
+    /// and the exit is reported to the task runtime exactly once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_foreground_command_past_its_timeout_continues_in_the_background() {
+        use crate::Tool as _;
+        let _env = crate::test_env::hold_env();
+        let registry = Arc::new(ShellProcessRegistry::new());
+        let controller = Arc::new(RecordingTaskController::default());
+        let context = context("handoff")
+            .with_shell_process_registry(Arc::clone(&registry))
+            .with_task_runtime_controller(controller.clone());
+
+        let result = crate::bash::BashTool::new()
+            .call(
+                json!({
+                    "command": "for i in 1 2 3 4 5 6; do echo $i; sleep 0.2; done",
+                    "timeout": 300
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["backgrounded"], true, "{result}");
+        assert_eq!(result["timedOut"], true);
+        assert_eq!(result["interrupted"], false);
+        assert_eq!(result["exitCode"], Value::Null);
+        assert_eq!(result["status"], "running");
+        let note = result["note"].as_str().unwrap();
+        assert!(note.contains("300 ms timeout"), "{note}");
+        assert!(note.contains("task notification"), "{note}");
+        let shell_id = result["shellId"].as_str().unwrap().to_owned();
+        let output_path = result["outputPath"].as_str().unwrap().to_owned();
+        let foreground = result["stdout"].as_str().unwrap().to_owned();
+        assert!(foreground.starts_with('1'), "{foreground:?}");
+        assert!(!foreground.contains('6'), "{foreground:?}");
+
+        let done = registry
+            .wait(&context, "ShellOutput", &shell_id, true, 10_000)
+            .await
+            .unwrap();
+        assert_eq!(done["completed"], true, "{done}");
+        assert_eq!(done["exitCode"], 0);
+        assert_eq!(
+            std::fs::read_to_string(&output_path).unwrap(),
+            "1\n2\n3\n4\n5\n6\n"
+        );
+        let tail = done["outputTail"].as_str().unwrap_or_default();
+        assert_eq!(format!("{foreground}\n{tail}"), "1\n2\n3\n4\n5\n6\n");
+
+        // `wait` returns once the status is terminal; the completion is
+        // reported right after.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while lock(&controller.finished).is_empty() && Instant::now() < deadline {
+            sleep(Duration::from_millis(10)).await;
+        }
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(lock(&controller.started).len(), 1);
+        let finished = lock(&controller.finished);
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].shell_id, shell_id);
+        assert_eq!(finished[0].status, BackgroundShellCompletionStatus::Exited);
+    }
+
+    /// The command itself exited but left a process holding its output
+    /// open: nothing is still running to hand over, so the result is the
+    /// command's own exit with the cut-off said, not a timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_held_open_by_a_leftover_process_is_not_a_timeout() {
+        use crate::Tool as _;
+        let _env = crate::test_env::hold_env();
+        let registry = Arc::new(ShellProcessRegistry::new());
+        let context = context("held-open").with_shell_process_registry(Arc::clone(&registry));
+
+        let result = crate::bash::BashTool::new()
+            .call(
+                json!({ "command": "(sleep 2) & echo started", "timeout": 300 }),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["exitCode"], 0, "{result}");
+        assert_eq!(result["timedOut"], false);
+        assert_eq!(result["interrupted"], false);
+        assert_eq!(result["outputCutOff"], true);
+        assert_eq!(result["stdout"], "started");
+        assert!(result.get("shellId").is_none());
+        assert!(lock(&registry.inner.entries).is_empty());
     }
 }

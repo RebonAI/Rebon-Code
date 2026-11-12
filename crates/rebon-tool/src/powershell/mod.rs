@@ -19,17 +19,16 @@ pub mod prompt;
 use crate::command_sandbox::{self, BinShell, CommandSandbox, PreparedCommand};
 use crate::edit::optional_bool;
 use crate::output_truncation::{finish_shell_streams, tool_output_max_bytes};
-use crate::shell_process::{ShellLineReader, ShellOutputEncoding};
+use crate::shell_process::ShellOutputEncoding;
 use crate::{Tool, ToolContext};
 use async_trait::async_trait;
 use rebon_tools_core::{
     require_valid_input, validation_outcome_from, PermissionDecision, ToolError, ToolId,
-    ToolInputSchema, ToolProgressUpdate, ToolResult, ValidationOutcome,
+    ToolInputSchema, ToolResult, ValidationOutcome,
 };
 use serde_json::{json, Value};
 use std::sync::OnceLock;
 use tokio::process::Command;
-use tokio::time::{sleep, Duration};
 
 pub use detect::{is_available, PowerShellEdition, PowerShellRuntime};
 
@@ -212,7 +211,7 @@ impl Tool for PowerShellTool {
             context.cwd(),
             parsed.dangerously_disable_sandbox,
         )?;
-        let mut cmd = configured_powershell_command(&prepared);
+        let cmd = configured_powershell_command(&prepared);
 
         if parsed.run_in_background {
             let registry =
@@ -239,100 +238,39 @@ impl Tool for PowerShellTool {
             return Ok(result);
         }
 
-        let mut child = cmd.spawn().map_err(|err| ToolError::Execution {
-            tool: self.id(),
-            source: anyhow::Error::from(err)
-                .context(format!("failed to start {}", runtime.path.display())),
-        })?;
-
-        let stdout = child.stdout.take().ok_or_else(|| ToolError::Execution {
-            tool: self.id(),
-            source: anyhow::anyhow!("failed to capture child stdout"),
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| ToolError::Execution {
-            tool: self.id(),
-            source: anyhow::anyhow!("failed to capture child stderr"),
-        })?;
-
-        // Cancel-safe readers: the `select!` below drops whichever read loses
-        // the race, and PowerShell flushes a line's text and its newline
-        // separately — so a line half-read at that moment is the common case,
-        // not the rare one, and it has to survive into the next poll.
-        let mut stdout_reader = ShellLineReader::new(stdout, output_encoding);
-        let mut stderr_reader = ShellLineReader::new(stderr, output_encoding);
-        let timeout = sleep(Duration::from_millis(
+        let run = crate::shell_foreground::run_foreground(
+            context,
+            cmd,
+            POWERSHELL_TOOL_NAME,
+            &parsed.command,
             parsed.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
-        ));
-        tokio::pin!(timeout);
-
-        // Mirror the Bash tool: one arrival-ordered log rather than two
-        // per-stream buckets, so the interleaving survives into the result
-        // for renderers to replay.
-        let mut output_lines: Vec<(bool, String)> = Vec::new();
-        let mut stdout_open = true;
-        let mut stderr_open = true;
-        let mut interrupted = false;
-
-        while stdout_open || stderr_open {
-            tokio::select! {
-                _ = &mut timeout => {
-                    interrupted = true;
-                    let _ = child.kill().await;
-                    break;
-                }
-                line = stdout_reader.next_line(), if stdout_open => {
-                    match line {
-                        Ok(Some(line)) => {
-                            context.emit_progress(ToolProgressUpdate::new("stdout").with_message(line.clone()));
-                            output_lines.push((false, line));
-                        }
-                        Ok(None) => stdout_open = false,
-                        Err(err) => {
-                            return Err(ToolError::Execution {
-                                tool: self.id(),
-                                source: err.into(),
-                            });
-                        }
-                    }
-                }
-                line = stderr_reader.next_line(), if stderr_open => {
-                    match line {
-                        Ok(Some(line)) => {
-                            context.emit_progress(ToolProgressUpdate::new("stderr").with_message(line.clone()));
-                            output_lines.push((true, line));
-                        }
-                        Ok(None) => stderr_open = false,
-                        Err(err) => {
-                            return Err(ToolError::Execution {
-                                tool: self.id(),
-                                source: err.into(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        let status = child.wait().await.map_err(|err| ToolError::Execution {
-            tool: self.id(),
-            source: err.into(),
-        })?;
+            output_encoding,
+            |stage, err, _pid| ToolError::Execution {
+                tool: self.id(),
+                source: if stage == "spawn" {
+                    anyhow::Error::from(err)
+                        .context(format!("failed to start {}", runtime.path.display()))
+                } else {
+                    err.into()
+                },
+            },
+        )
+        .await?;
 
         // Mirror the Bash tool: cap each stream so a single large dump
         // doesn't flood the transcript. Live progress already streamed
         // the untruncated output to the user.
         let max_bytes = tool_output_max_bytes();
-        let (stdout, stderr, stream_order) = finish_shell_streams(&output_lines, max_bytes);
+        let (stdout, stderr, stream_order) = finish_shell_streams(&run.lines, max_bytes);
         let mut result = json!({
             "stdout": stdout,
             "stderr": stderr,
-            "interrupted": interrupted,
-            "exitCode": status.code(),
-            "timedOut": interrupted,
+            "exitCode": run.exit_code,
             "command": parsed.command,
             "dangerouslyDisableSandbox": parsed.dangerously_disable_sandbox,
             "shellEdition": runtime.edition.as_str(),
         });
+        run.annotate(&mut result);
         if let Some(description) = parsed.description {
             result["description"] = Value::String(description);
         }

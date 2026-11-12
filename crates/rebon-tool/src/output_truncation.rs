@@ -50,6 +50,11 @@ pub fn tool_output_max_bytes() -> usize {
 ///
 /// `max_bytes == 0` disables truncation. Content already within budget
 /// is returned unchanged with no header.
+///
+/// A failing step's marker line (see [`crate::shell_failure_marker`]) is
+/// kept with the few lines before it — the error that step printed — even
+/// when it falls in the dropped middle; those windows come out of the same
+/// budget.
 pub fn truncate_stream_output(content: &str, max_bytes: usize) -> String {
     if max_bytes == 0 || content.len() <= max_bytes {
         return content.to_string();
@@ -57,10 +62,120 @@ pub fn truncate_stream_output(content: &str, max_bytes: usize) -> String {
 
     let original_tokens = approx_token_count(content);
     let total_lines = content.lines().count();
-    let body = truncate_middle_bytes(content, max_bytes);
+    let windows = marker_windows(content, max_bytes / 2);
+    let body = if windows.is_empty() {
+        truncate_middle_bytes(content, max_bytes)
+    } else {
+        truncate_keeping_windows(content, max_bytes, &windows)
+    };
     format!(
         "Warning: truncated output (original token count: {original_tokens}, {total_lines} lines)\n\n{body}"
     )
+}
+
+/// Lines kept before each marker line.
+const MARKER_CONTEXT_LINES: usize = 3;
+/// Most bytes one marker window keeps, marker line included.
+const MARKER_WINDOW_MAX_BYTES: usize = 512;
+/// Markers kept from each end when there are more than twice this many.
+const MARKERS_KEPT_PER_END: usize = 4;
+
+/// Byte ranges to keep around the marker lines of `content`: up to
+/// [`MARKER_CONTEXT_LINES`] lines before each marker plus the marker line,
+/// at most [`MARKER_WINDOW_MAX_BYTES`] each, for the first and last
+/// [`MARKERS_KEPT_PER_END`] markers, merged where they overlap and thinned
+/// from the middle until they fit `budget`.
+fn marker_windows(content: &str, budget: usize) -> Vec<std::ops::Range<usize>> {
+    // (start of line, end of line without its newline) for every line.
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for line in content.split_inclusive('\n') {
+        let text = line.strip_suffix('\n').unwrap_or(line);
+        lines.push((start, start + text.len()));
+        start += line.len();
+    }
+    let markers: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, (from, to))| crate::shell_failure_marker::is_marker_line(&content[*from..*to]))
+        .map(|(index, _)| index)
+        .collect();
+    let chosen: Vec<usize> = if markers.len() > 2 * MARKERS_KEPT_PER_END {
+        markers[..MARKERS_KEPT_PER_END]
+            .iter()
+            .chain(&markers[markers.len() - MARKERS_KEPT_PER_END..])
+            .copied()
+            .collect()
+    } else {
+        markers
+    };
+
+    let mut windows: Vec<std::ops::Range<usize>> = Vec::new();
+    for index in chosen {
+        let (marker_start, marker_end) = lines[index];
+        let mut from = lines[index.saturating_sub(MARKER_CONTEXT_LINES)].0;
+        if marker_end - from > MARKER_WINDOW_MAX_BYTES {
+            from = (marker_end.saturating_sub(MARKER_WINDOW_MAX_BYTES)).max(from);
+            while !content.is_char_boundary(from) {
+                from += 1;
+            }
+            from = from.min(marker_start);
+        }
+        match windows.last_mut() {
+            Some(last) if from <= last.end => last.end = last.end.max(marker_end),
+            _ => windows.push(from..marker_end),
+        }
+    }
+    while windows.iter().map(|window| window.len()).sum::<usize>() > budget {
+        windows.remove(windows.len() / 2);
+    }
+    windows
+}
+
+/// [`truncate_middle_bytes`] that also keeps `windows`: the head and tail
+/// share what the windows leave of `max_bytes`, and every dropped stretch
+/// gets its own `…N chars truncated…` note.
+fn truncate_keeping_windows(
+    content: &str,
+    max_bytes: usize,
+    windows: &[std::ops::Range<usize>],
+) -> String {
+    let window_bytes: usize = windows.iter().map(|window| window.len()).sum();
+    let remaining = max_bytes.saturating_sub(window_bytes);
+    let head_bytes = remaining / 2;
+    let tail_bytes = remaining - head_bytes;
+
+    let mut head_end = head_bytes.min(content.len());
+    while !content.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = content.len().saturating_sub(tail_bytes);
+    while !content.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+
+    let mut kept: Vec<std::ops::Range<usize>> = Vec::with_capacity(windows.len() + 2);
+    for range in std::iter::once(0..head_end)
+        .chain(windows.iter().cloned())
+        .chain(std::iter::once(tail_start..content.len()))
+    {
+        match kept.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => kept.push(range),
+        }
+    }
+
+    let mut out = String::with_capacity(max_bytes + 64 * kept.len());
+    let mut position = 0;
+    for range in kept {
+        if range.start > position {
+            let removed = content[position..range.start].chars().count();
+            out.push_str(&format!("…{removed} chars truncated…"));
+        }
+        out.push_str(&content[range.start.max(position)..range.end]);
+        position = position.max(range.end);
+    }
+    out
 }
 
 /// Turn the arrival-ordered lines a shell tool collected into the three
@@ -220,6 +335,73 @@ mod tests {
         // Direct budget path is env-independent; just verify the
         // default constant is what we expect.
         assert_eq!(DEFAULT_TOOL_OUTPUT_MAX_BYTES, 10_000);
+    }
+
+    fn noise(range: std::ops::Range<usize>) -> String {
+        range.map(|i| format!("noise line {i:05}\n")).collect()
+    }
+
+    /// A failing step's marker in the dropped middle survives with the
+    /// lines before it, and the result stays within the budget.
+    #[test]
+    fn a_marker_in_the_middle_is_kept_with_the_lines_before_it() {
+        let content = format!(
+            "{}error[E0308]: mismatched types\n  --> src/lib.rs:3:5\nerror: could not compile\n\
+             [rebon: exit 101: cargo build]\n{}",
+            noise(0..1000),
+            noise(1000..2000)
+        );
+        let out = truncate_stream_output(&content, 2_000);
+        assert!(out.starts_with("Warning: truncated output"), "{out:.80}");
+        assert!(out.contains("noise line 00000"), "head kept");
+        assert!(out.contains("noise line 01999"), "tail kept");
+        assert!(out.contains(
+            "--> src/lib.rs:3:5\nerror: could not compile\n[rebon: exit 101: cargo build]"
+        ));
+        assert_eq!(out.matches("chars truncated").count(), 2, "{out}");
+        assert!(out.len() < 2_300, "{}", out.len());
+    }
+
+    /// Without a marker, the output is exactly what it was before markers.
+    #[test]
+    fn without_a_marker_the_output_is_unchanged() {
+        let content = noise(0..2000);
+        let out = truncate_stream_output(&content, 2_000);
+        assert!(out.ends_with(&truncate_middle_bytes(&content, 2_000)));
+        assert_eq!(out.matches("chars truncated").count(), 1);
+    }
+
+    /// Many failing steps: the first and last few are kept, never all.
+    #[test]
+    fn only_the_first_and_last_markers_are_kept() {
+        let mut content = String::new();
+        for step in 0..20 {
+            content.push_str(&noise(step * 100..step * 100 + 100));
+            content.push_str(&format!("[rebon: exit 1: step {step:02}]\n"));
+        }
+        content.push_str(&noise(5000..5100));
+        let out = truncate_stream_output(&content, 8_000);
+        for kept in [0, 1, 2, 3, 16, 17, 18, 19] {
+            assert!(
+                out.contains(&format!("step {kept:02}]")),
+                "step {kept} missing"
+            );
+        }
+        for dropped in 6..14 {
+            assert!(
+                !out.contains(&format!("step {dropped:02}]")),
+                "step {dropped} kept"
+            );
+        }
+    }
+
+    /// A budget too small for any window falls back to head and tail.
+    #[test]
+    fn a_tiny_budget_still_truncates_to_head_and_tail() {
+        let content = format!("{}[rebon: exit 1: x]\n{}", noise(0..50), noise(50..100));
+        let out = truncate_stream_output(&content, 40);
+        assert_eq!(out.matches("chars truncated").count(), 1);
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
     }
 
     fn line(is_stderr: bool, text: &str) -> (bool, String) {

@@ -1,19 +1,18 @@
 use crate::command_sandbox::{self, BinShell, PreparedCommand};
 use crate::edit::optional_bool;
 use crate::output_truncation::{finish_shell_streams, tool_output_max_bytes};
-use crate::shell_process::{ShellLineReader, ShellOutputEncoding, ShellProcessError};
+use crate::shell_process::{ShellOutputEncoding, ShellProcessError};
 use crate::{Tool, ToolContext};
 use async_trait::async_trait;
 use rebon_shell_policy::lexer::{self, simple_command_segments};
 use rebon_tools_core::{
     require_valid_input, validation_outcome_from, PermissionDecision, PermissionRequest, ToolError,
-    ToolId, ToolInputSchema, ToolProgressUpdate, ToolResult, ValidationOutcome,
+    ToolId, ToolInputSchema, ToolResult, ValidationOutcome,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
-use tokio::time::{sleep, Duration};
 
 const BASH_TOOL_NAME: &str = "Bash";
 const INVALID_INPUT_CODE: i64 = 400;
@@ -398,18 +397,26 @@ impl Tool for BashTool {
         // Asking `CommandSandbox::check` here as well would duplicate the
         // decision, and two copies of a security decision drift.
         let shell = bash_bin_shell();
+        // The shell runs the command behind a trap that marks each failing
+        // step in stderr; rules and the sandbox policy see the command as
+        // written. Not for the PowerShell fallback, which is no bash.
+        let payload = if command_shell() == CommandShell::WindowsPowerShell {
+            parsed.command.clone()
+        } else {
+            crate::shell_failure_marker::with_failure_markers(&parsed.command)
+        };
         let prepared = match context.command_sandbox() {
             Some(sandbox) => sandbox.prepare(
                 &self.id(),
                 &parsed.command,
-                &parsed.command,
+                &payload,
                 shell,
                 context.cwd(),
                 parsed.dangerously_disable_sandbox,
             )?,
-            None => PreparedCommand::passthrough(&shell, &parsed.command, context.cwd()),
+            None => PreparedCommand::passthrough(&shell, &payload, context.cwd()),
         };
-        let mut cmd = command_sandbox::to_process(&prepared);
+        let cmd = command_sandbox::to_process(&prepared);
 
         if parsed.run_in_background {
             let registry =
@@ -435,97 +442,31 @@ impl Tool for BashTool {
             return Ok(result);
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|err| bash_process_error("spawn", err, &prepared, context, None))?;
-        let child_pid = child.id();
-
-        let stdout = child.stdout.take().ok_or_else(|| ToolError::Execution {
-            tool: self.id(),
-            source: anyhow::anyhow!("failed to capture child stdout"),
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| ToolError::Execution {
-            tool: self.id(),
-            source: anyhow::anyhow!("failed to capture child stderr"),
-        })?;
-
-        // Cancel-safe readers: the `select!` below drops whichever read loses
-        // the race, and a line half-read at that moment has to survive into
-        // the next poll rather than disappear.
-        let mut stdout_reader = ShellLineReader::new(stdout, ShellOutputEncoding::Utf8);
-        let mut stderr_reader = ShellLineReader::new(stderr, ShellOutputEncoding::Utf8);
-        let timeout = sleep(Duration::from_millis(
+        let run = crate::shell_foreground::run_foreground(
+            context,
+            cmd,
+            BASH_TOOL_NAME,
+            &parsed.command,
             parsed.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
-        ));
-        tokio::pin!(timeout);
-
-        // One arrival-ordered log instead of two per-stream buckets. The
-        // result still reports `stdout` / `stderr` separately for the model,
-        // but keeping the interleaving here is what lets a renderer put
-        // cargo's stderr progress lines back ahead of its stdout results.
-        let mut output_lines: Vec<(bool, String)> = Vec::new();
-        let mut stdout_open = true;
-        let mut stderr_open = true;
-        let mut interrupted = false;
-
-        while stdout_open || stderr_open {
-            tokio::select! {
-                _ = &mut timeout => {
-                    interrupted = true;
-                    let _ = child.kill().await;
-                    break;
-                }
-                line = stdout_reader.next_line(), if stdout_open => {
-                    match line {
-                        Ok(Some(line)) => {
-                            context.emit_progress(ToolProgressUpdate::new("stdout").with_message(line.clone()));
-                            output_lines.push((false, line));
-                        }
-                        Ok(None) => stdout_open = false,
-                        Err(err) => {
-                            return Err(bash_process_error(
-                                "read_stdout", err, &prepared, context, child_pid,
-                            ));
-                        }
-                    }
-                }
-                line = stderr_reader.next_line(), if stderr_open => {
-                    match line {
-                        Ok(Some(line)) => {
-                            context.emit_progress(ToolProgressUpdate::new("stderr").with_message(line.clone()));
-                            output_lines.push((true, line));
-                        }
-                        Ok(None) => stderr_open = false,
-                        Err(err) => {
-                            return Err(bash_process_error(
-                                "read_stderr", err, &prepared, context, child_pid,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        let status = child
-            .wait()
-            .await
-            .map_err(|err| bash_process_error("wait", err, &prepared, context, child_pid))?;
+            ShellOutputEncoding::Utf8,
+            |stage, err, pid| bash_process_error(stage, err, &prepared, context, pid),
+        )
+        .await?;
 
         // Cap each stream so a single large dump doesn't flood the
         // transcript (and every later model request) with output the
-        // model rarely needs in full. The live per-line progress above
+        // model rarely needs in full. The live per-line progress
         // already streamed the untruncated output to the user.
         let max_bytes = tool_output_max_bytes();
-        let (stdout, stderr, stream_order) = finish_shell_streams(&output_lines, max_bytes);
+        let (stdout, stderr, stream_order) = finish_shell_streams(&run.lines, max_bytes);
         let mut result = json!({
             "stdout": stdout,
             "stderr": stderr,
-            "interrupted": interrupted,
-            "exitCode": status.code(),
-            "timedOut": interrupted,
+            "exitCode": run.exit_code,
             "command": parsed.command,
             "dangerouslyDisableSandbox": parsed.dangerously_disable_sandbox,
         });
+        run.annotate(&mut result);
         if let Some(description) = parsed.description {
             result["description"] = Value::String(description);
         }
@@ -1528,6 +1469,36 @@ mod tests {
 
         assert_eq!(out["interrupted"], json!(true));
         assert_eq!(out["timedOut"], json!(true));
+        // Without a registry there is nowhere to continue it, and it says so.
+        let note = out["note"].as_str().unwrap();
+        assert!(note.contains("no background shell registry"), "{note}");
+        assert!(out.get("shellId").is_none());
+    }
+
+    /// A step that fails in a `;` chain is marked on stderr; stdout and the
+    /// exit status are untouched. Only where `sh` is bash: dash has no
+    /// `ERR` trap, and there the command runs as written.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_step_of_a_chain_is_marked_in_stderr() {
+        let _env = crate::test_env::hold_env();
+        let out = tool()
+            .call(json!({ "command": "false; echo ok" }), &ToolContext::new())
+            .await
+            .unwrap();
+        assert_eq!(out["exitCode"], json!(0));
+        assert_eq!(out["stdout"], json!("ok"));
+        assert_eq!(out["command"], json!("false; echo ok"));
+
+        let sh_is_bash = std::process::Command::new("sh")
+            .args(["-c", "printf %s \"${BASH_VERSION-}\""])
+            .output()
+            .is_ok_and(|output| !output.stdout.is_empty());
+        if sh_is_bash {
+            assert_eq!(out["stderr"], json!("[rebon: exit 1: false]"));
+        } else {
+            assert_eq!(out["stderr"], json!(""));
+        }
     }
 
     // -----------------------------------------------------------------

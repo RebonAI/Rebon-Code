@@ -54,6 +54,19 @@ async fn run_batch(
     cwd: &Path,
     calls: &[(&str, &str, Value)],
 ) -> (Vec<QueryEvent>, Vec<rebon_api::CreateMessageRequest>) {
+    run_batch_in(
+        engine,
+        ToolContext::new().with_cwd(cwd.to_string_lossy().to_string()),
+        calls,
+    )
+    .await
+}
+
+async fn run_batch_in(
+    engine: Arc<Engine>,
+    context: ToolContext,
+    calls: &[(&str, &str, Value)],
+) -> (Vec<QueryEvent>, Vec<rebon_api::CreateMessageRequest>) {
     let mock = MockModelClient::new();
     mock.push_turn(n_tool_turn("msg_batch", calls));
     mock.push_turn(text_turn("msg_done", "done"));
@@ -64,7 +77,7 @@ async fn run_batch(
         engine,
         SessionHandle::new(client),
         params,
-        ToolContext::new().with_cwd(cwd.to_string_lossy().to_string()),
+        context,
         CancelToken::new(),
     );
     let events = drain(&mut rx).await;
@@ -276,6 +289,58 @@ async fn a_failed_mutation_skips_the_later_mutations_of_its_batch() {
     let order = dispatch_order(&events);
     assert!(order.contains(&"start:toolu_write".to_string()));
     assert!(order.contains(&"result:toolu_write".to_string()));
+}
+
+/// A command that outlived its timeout keeps running in the background. It
+/// has not finished, so the mutation planned after it is skipped with that
+/// reason; a read-only call still runs.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_still_running_after_its_timeout_skips_the_later_mutations() {
+    let dir = tempfile::tempdir().unwrap();
+    let after = dir.path().join("after.txt");
+    let registry = Arc::new(rebon_tool::ShellProcessRegistry::new());
+    let context = ToolContext::new()
+        .with_cwd(dir.path().to_string_lossy().to_string())
+        .with_session_id("schedule-handoff")
+        .with_shell_process_registry(Arc::clone(&registry));
+    let (_, requests) = run_batch_in(
+        file_tools_engine(),
+        context,
+        &[
+            (
+                "Bash",
+                "toolu_slow",
+                json!({"command": "sleep 3", "timeout": 200}),
+            ),
+            (
+                "Write",
+                "toolu_write",
+                json!({"file_path": after, "content": "never"}),
+            ),
+            (
+                "Bash",
+                "toolu_read_only",
+                json!({"command": "echo still-runs"}),
+            ),
+        ],
+    )
+    .await;
+
+    assert_eq!(requests.len(), 2);
+    let (slow, is_error) = result_text(&requests, "toolu_slow");
+    assert!(!is_error, "{slow}");
+    assert!(slow.contains("\"backgrounded\":true"), "{slow}");
+    let (write, is_error) = result_text(&requests, "toolu_write");
+    assert!(is_error, "{write}");
+    assert_eq!(
+        write,
+        "skipped: call #1 (Bash) is still running in the background after its timeout; \
+         re-issue once it has finished"
+    );
+    assert!(!after.exists());
+    let (read_only, is_error) = result_text(&requests, "toolu_read_only");
+    assert!(!is_error && read_only.contains("still-runs"), "{read_only}");
 }
 
 #[tokio::test]

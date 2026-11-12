@@ -175,6 +175,8 @@ pub mod queue;
 pub mod read;
 mod read_outline;
 mod search_walk;
+mod shell_failure_marker;
+mod shell_foreground;
 pub mod shell_management;
 pub mod shell_preference;
 pub mod shell_process;

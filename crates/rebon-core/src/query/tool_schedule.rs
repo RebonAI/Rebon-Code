@@ -101,32 +101,53 @@ pub(super) fn plan_stages(concurrent: &[bool]) -> Vec<std::ops::Range<usize>> {
     stages
 }
 
-/// The error a barrier gets when an earlier barrier of its batch failed.
-/// `failed_index` is the failed call's 0-based position in the response.
-pub(super) fn skipped_after_failure_message(failed_index: usize, failed_tool: &str) -> String {
-    format!(
-        "skipped: call #{} ({failed_tool}) failed earlier in this batch; re-issue after fixing it",
-        failed_index + 1
-    )
+/// Why a barrier's outcome strands the barriers after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Stranded {
+    /// The step failed.
+    Failed,
+    /// A shell command outlived its timeout and continues in the background:
+    /// the step has not finished, so what comes after it cannot rely on it.
+    StillRunning,
+}
+
+/// The error a barrier gets when an earlier barrier of its batch stranded
+/// it. `index` is that call's 0-based position in the response.
+pub(super) fn skipped_message(index: usize, tool: &str, why: Stranded) -> String {
+    let call = index + 1;
+    match why {
+        Stranded::Failed => format!(
+            "skipped: call #{call} ({tool}) failed earlier in this batch; re-issue after fixing it"
+        ),
+        Stranded::StillRunning => format!(
+            "skipped: call #{call} ({tool}) is still running in the background after its \
+             timeout; re-issue once it has finished"
+        ),
+    }
 }
 
 /// Whether a call's outcome means the step did not happen as planned.
 ///
 /// A shell tool reports a failing command as a successful call with a
 /// non-zero `exitCode` (or `timedOut`), and the step after `cargo build` is
-/// as stranded by that as by a tool error. A `null` exit code is a
-/// background shell still running, not a failure.
-pub(super) fn outcome_failed(outcome: &Result<Value, ToolErrorPresentation>) -> bool {
-    match outcome {
-        Err(_) => true,
-        Ok(value) => {
-            value
-                .get("exitCode")
-                .and_then(Value::as_i64)
-                .is_some_and(|code| code != 0)
-                || value.get("timedOut").and_then(Value::as_bool) == Some(true)
-        }
+/// as stranded by that as by a tool error. So is one whose command was moved
+/// to the background at its timeout (`backgrounded`): it has not finished.
+/// A `null` exit code alone is a `run_in_background` launch, which the model
+/// asked for, not a failure.
+pub(super) fn stranding(outcome: &Result<Value, ToolErrorPresentation>) -> Option<Stranded> {
+    let value = match outcome {
+        Err(_) => return Some(Stranded::Failed),
+        Ok(value) => value,
+    };
+    if value.get("backgrounded").and_then(Value::as_bool) == Some(true) {
+        return Some(Stranded::StillRunning);
     }
+    let failed = value
+        .get("exitCode")
+        .and_then(Value::as_i64)
+        .is_some_and(|code| code != 0)
+        || value.get("timedOut").and_then(Value::as_bool) == Some(true);
+    failed.then_some(Stranded::Failed)
 }
 
 fn interrupted() -> ToolErrorPresentation {
@@ -226,7 +247,7 @@ pub(super) async fn run_staged(
 ) -> Vec<IndexedOutcome> {
     let flags: Vec<bool> = calls.iter().map(|call| call.concurrent).collect();
     let mut results = Vec::with_capacity(calls.len());
-    let mut first_failed_barrier: Option<(usize, String)> = None;
+    let mut first_stranding_barrier: Option<(usize, String, Stranded)> = None;
     let mut calls = calls.into_iter();
 
     for stage in plan_stages(&flags) {
@@ -242,12 +263,12 @@ pub(super) async fn run_staged(
 
         let mut running = Vec::with_capacity(stage_calls.len());
         for call in stage_calls {
-            if let (false, Some((failed_index, failed_tool))) =
-                (call.concurrent, first_failed_barrier.as_ref())
+            if let (false, Some((stranding_index, stranding_tool, why))) =
+                (call.concurrent, first_stranding_barrier.as_ref())
             {
                 let outcome = Err(ToolErrorPresentation::same(
                     "skipped_after_failure",
-                    skipped_after_failure_message(*failed_index, failed_tool),
+                    skipped_message(*stranding_index, stranding_tool, *why),
                 ));
                 send_start(tx, &call);
                 send_result(tx, &call.id, &call.name, &outcome);
@@ -276,8 +297,10 @@ pub(super) async fn run_staged(
                     outcome
                 }
             };
-            if !concurrent && outcome_failed(&outcome) && first_failed_barrier.is_none() {
-                first_failed_barrier = Some((index, name.clone()));
+            if !concurrent && first_stranding_barrier.is_none() {
+                if let Some(why) = stranding(&outcome) {
+                    first_stranding_barrier = Some((index, name.clone(), why));
+                }
             }
             results.push((index, id, name, outcome));
         }
@@ -304,26 +327,52 @@ mod tests {
     }
 
     #[test]
-    fn a_non_zero_exit_or_timeout_is_a_failure_but_a_running_shell_is_not() {
-        assert!(outcome_failed(&Err(interrupted())));
-        assert!(outcome_failed(&Ok(json!({"exitCode": 2}))));
-        assert!(outcome_failed(&Ok(
-            json!({"exitCode": 0, "timedOut": true})
-        )));
-        assert!(!outcome_failed(&Ok(
-            json!({"exitCode": 0, "timedOut": false})
-        )));
-        assert!(!outcome_failed(&Ok(
-            json!({"shellId": "s1", "exitCode": null})
-        )));
-        assert!(!outcome_failed(&Ok(json!({"type": "update"}))));
+    fn a_non_zero_exit_or_timeout_is_a_failure_but_a_background_launch_is_not() {
+        assert_eq!(stranding(&Err(interrupted())), Some(Stranded::Failed));
+        assert_eq!(
+            stranding(&Ok(json!({"exitCode": 2}))),
+            Some(Stranded::Failed)
+        );
+        assert_eq!(
+            stranding(&Ok(json!({"exitCode": 0, "timedOut": true}))),
+            Some(Stranded::Failed)
+        );
+        assert_eq!(
+            stranding(&Ok(json!({"exitCode": 0, "timedOut": false}))),
+            None
+        );
+        assert_eq!(
+            stranding(&Ok(json!({"shellId": "s1", "exitCode": null}))),
+            None
+        );
+        assert_eq!(stranding(&Ok(json!({"type": "update"}))), None);
+    }
+
+    /// A foreground command moved to the background at its timeout has not
+    /// finished, which strands what comes after it.
+    #[test]
+    fn a_command_backgrounded_at_its_timeout_strands_the_rest() {
+        assert_eq!(
+            stranding(&Ok(json!({
+                "exitCode": null,
+                "timedOut": true,
+                "backgrounded": true,
+                "shellId": "sh_1"
+            }))),
+            Some(Stranded::StillRunning)
+        );
     }
 
     #[test]
-    fn skip_message_names_the_failed_call_one_based() {
+    fn skip_message_names_the_call_one_based_and_says_why() {
         assert_eq!(
-            skipped_after_failure_message(1, "Bash"),
+            skipped_message(1, "Bash", Stranded::Failed),
             "skipped: call #2 (Bash) failed earlier in this batch; re-issue after fixing it"
+        );
+        assert_eq!(
+            skipped_message(0, "Bash", Stranded::StillRunning),
+            "skipped: call #1 (Bash) is still running in the background after its timeout; \
+             re-issue once it has finished"
         );
     }
 }
