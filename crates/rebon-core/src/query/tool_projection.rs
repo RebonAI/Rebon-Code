@@ -482,7 +482,7 @@ pub fn filtered_eager_tools_from_engine_for_policy(
     execution_policy: Option<&ExecutionPolicy>,
 ) -> Vec<ApiTool> {
     engine
-        .eager_tool_snapshots_for_policy(execution_policy)
+        .eager_tool_snapshots_for_filter_and_policy(Some(filter), execution_policy)
         .into_iter()
         .filter(|snap| filter.allows(&snap.name, snap.aliases))
         .flat_map(api_tool_from_snapshot)

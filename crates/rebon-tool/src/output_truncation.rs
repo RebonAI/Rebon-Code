@@ -32,8 +32,9 @@ pub const DEFAULT_TOOL_OUTPUT_MAX_BYTES: usize = 10_000;
 const MAX_BYTES_ENV: &str = "REBON_TOOL_OUTPUT_MAX_BYTES";
 
 /// Per-stream budget for a command that only reads, under the shell-first
-/// toolset (`REBON_TOOLSET=shell`), where `cat` and `sed -n` stand in for
-/// Read: the text one Read call may return ([`crate::read::READ_BATCH_TEXT_BUDGET`]).
+/// toolset (the default, see [`crate::Toolset`]), where `cat` and `sed -n`
+/// stand in for Read: the text one Read call may return
+/// ([`crate::read::READ_BATCH_TEXT_BUDGET`]).
 /// With the default cap a mid-sized source file comes back with its middle
 /// cut out, and the model spends a request paging it back in.
 pub const SHELL_TOOLSET_READ_MAX_BYTES: usize = crate::read::READ_BATCH_TEXT_BUDGET;
@@ -371,20 +372,20 @@ mod tests {
     /// budget; an explicit override applies to every command.
     #[test]
     fn the_shell_toolset_gives_read_only_commands_reads_budget() {
-        use crate::Toolset::{Shell, Standard};
+        use crate::Toolset::{Files, Shell};
         assert_eq!(SHELL_TOOLSET_READ_MAX_BYTES, 32 * 1024);
         assert_eq!(
             shell_output_max_bytes_for(None, Shell, true),
             SHELL_TOOLSET_READ_MAX_BYTES
         );
-        for (toolset, read_only) in [(Shell, false), (Standard, true), (Standard, false)] {
+        for (toolset, read_only) in [(Shell, false), (Files, true), (Files, false)] {
             assert_eq!(
                 shell_output_max_bytes_for(None, toolset, read_only),
                 DEFAULT_TOOL_OUTPUT_MAX_BYTES,
                 "{toolset:?} read_only={read_only}"
             );
         }
-        for (toolset, read_only) in [(Shell, true), (Standard, false)] {
+        for (toolset, read_only) in [(Shell, true), (Files, false)] {
             assert_eq!(shell_output_max_bytes_for(Some(0), toolset, read_only), 0);
             assert_eq!(
                 shell_output_max_bytes_for(Some(500), toolset, read_only),

@@ -140,6 +140,13 @@ fn normal_projection_keeps_full_tools_and_standard_deferred_behavior() {
         .find(|tool| tool.name == "Bash")
         .expect("Normal mode should expose Bash's full schema");
     assert!(bash.input_schema["properties"].get("timeout").is_some());
+    // The shell-first toolset (the default) keeps Read behind ToolSearch,
+    // for images, PDFs and notebooks.
+    if rebon_tool::shell_toolset() {
+        assert!(projection.deferred_tool_names.contains(&"Read".to_string()));
+        assert!(projection.tool_search_index.contains_name("Read"));
+        return;
+    }
     let read = projection
         .provider_visible_tools
         .iter()

@@ -2729,9 +2729,15 @@ mod tests {
         assert!(!tool_names.contains("TeamDelete"));
         assert!(!tool_names.contains("SendMessage"));
         assert!(!tool_names.contains("TaskStop"));
-        assert!(tool_names.contains("Read"));
-        assert!(tool_names.contains("Glob"));
-        assert!(tool_names.contains("Grep"));
+        // The shell-first toolset (the default) keeps the dedicated file
+        // tools behind ToolSearch; Bash and Edit carry the file work.
+        for name in ["Read", "Glob", "Grep"] {
+            assert_eq!(
+                tool_names.contains(name),
+                !rebon_tool::shell_toolset(),
+                "{name}"
+            );
+        }
         assert!(tool_names.contains("Bash"));
         assert!(tool_names.contains("Edit"));
         assert!(tool_names.contains("TaskList"));

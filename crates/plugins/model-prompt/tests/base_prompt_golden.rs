@@ -292,8 +292,10 @@ fn lean_base_plane_states_each_boundary() {
         "if one cannot pass or run here, leave it and say why",
         "check the fix against the code's documented contract and the edge cases it implies",
         "If you cannot verify, say so",
-        // Tools.
-        "never use the shell to get around their checks",
+        // Tools: the shell-first rule is the default.
+        "Never use the shell to get around tool checks",
+        "Change files only with Edit",
+        "never through shell redirection, `sed -i`, `tee`, or heredocs",
         "Pass only the parameters a tool's schema defines",
         "so you can batch dependent steps",
     ] {

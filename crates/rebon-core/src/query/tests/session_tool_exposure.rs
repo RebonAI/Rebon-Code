@@ -199,6 +199,18 @@ fn stable_builtin_exposure_policy_projects_expected_eager_and_deferred_sets() {
         .map(str::to_owned)
         .collect();
 
+    // The shell-first toolset (the default) reads and searches with Bash
+    // and keeps the dedicated file tools behind ToolSearch.
+    let file_tools = ["Read", "Glob", "Grep", "Write"];
+    if rebon_tool::shell_toolset() {
+        for name in file_tools {
+            if registered.contains(name) {
+                assert!(!eager.contains(name), "{name} should not be eager");
+                assert!(deferred.contains(name), "{name} should be deferred");
+                assert!(index_names.contains(name), "{name} should be indexed");
+            }
+        }
+    }
     for name in [
         "ToolSearch",
         "InvokeDeferredTool",
@@ -223,6 +235,9 @@ fn stable_builtin_exposure_policy_projects_expected_eager_and_deferred_sets() {
     ] {
         // The lean prompt profile defers the opt-in planning entry.
         if name == "EnterPlanMode" && !rebon_tool::legacy_prompt_profile() {
+            continue;
+        }
+        if file_tools.contains(&name) && rebon_tool::shell_toolset() {
             continue;
         }
         if registered.contains(name) {
@@ -548,4 +563,42 @@ async fn tool_search_discovery_does_not_change_provider_visible_tools() {
     assert!(after_names.contains(&"AskUserQuestion"));
     assert!(!after_names.contains(&"Monitor"));
     assert!(after_names.contains(&rebon_tool::INVOKE_DEFERRED_TOOL_NAME));
+}
+
+/// The shell-first toolset defers the file tools only where Bash can run.
+/// A session whose filter refuses Bash, or that has no Bash at all, would be
+/// left unable to read, so it keeps them eager.
+#[test]
+fn the_file_tools_stay_eager_where_bash_cannot_run() {
+    if !rebon_tool::shell_toolset() {
+        return;
+    }
+    let eager_names = |engine: &Engine, filter: Option<&ToolFilter>| -> Vec<String> {
+        match filter {
+            Some(filter) => filtered_eager_tools_from_engine_for_policy(engine, filter, None),
+            None => eager_tools_from_engine(engine),
+        }
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect()
+    };
+    let read = || Arc::new(RecordingTool::new("Read", json!({}))) as Arc<dyn Tool>;
+    let bash = || Arc::new(RecordingTool::new("Bash", json!({}))) as Arc<dyn Tool>;
+
+    let with_bash = build_engine_with_tools(vec![read(), bash()]);
+    assert_eq!(eager_names(&with_bash, None), vec!["Bash"]);
+    assert_eq!(with_bash.deferred_tool_names(), vec!["Read"]);
+
+    let without_bash = build_engine_with_tools(vec![read()]);
+    assert_eq!(eager_names(&without_bash, None), vec!["Read"]);
+    assert!(without_bash.deferred_tool_names().is_empty());
+
+    let refuses_bash = ToolFilter::allow_only(["Read"]);
+    assert_eq!(eager_names(&with_bash, Some(&refuses_bash)), vec!["Read"]);
+    assert!(with_bash
+        .filtered_deferred_tool_names(&refuses_bash)
+        .is_empty());
+    assert!(!with_bash
+        .build_filtered_tool_search_index(&refuses_bash)
+        .contains_name("Read"));
 }

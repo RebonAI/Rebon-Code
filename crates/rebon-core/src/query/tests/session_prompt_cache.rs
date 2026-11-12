@@ -418,7 +418,9 @@ async fn stable_base_system_provider_requests_survive_rebon_md_mutation() {
     for system in &systems {
         assert!(!system.contains("initial project instruction"));
         assert!(!system.contains("updated project instruction"));
-        assert!(!system.contains("Read"));
+        // No tool list: the shell-first rule names Bash, Edit and Read
+        // whatever the session carries, and nothing else.
+        assert!(!system.contains("Glob"));
         assert!(!system.contains("AskUserQuestion"));
         assert!(!system.contains("Write"));
         if rebon_tool::legacy_prompt_profile() {

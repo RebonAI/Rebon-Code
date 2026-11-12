@@ -1686,7 +1686,7 @@ mod tests {
     /// reads and searches, Edit changes files.
     #[test]
     fn the_shell_toolset_description_reads_with_bash_and_writes_with_edit() {
-        let standard = lean_description(crate::Toolset::Standard);
+        let standard = lean_description(crate::Toolset::Files);
         let shell = lean_description(crate::Toolset::Shell);
         let standard_sentence =
             "Use the file tools, not the shell, to read, search, and edit files. ";

@@ -40,6 +40,19 @@ impl BuiltinToolExposurePolicy {
         }
     }
 
+    /// This table for a session that cannot run Bash: the shell-first set
+    /// would leave it no way to read at all, so it keeps the file tools.
+    pub(crate) fn without_shell(self) -> Self {
+        Self {
+            toolset: Toolset::Files,
+            ..self
+        }
+    }
+
+    pub(crate) fn is_shell_toolset(&self) -> bool {
+        !self.profile.is_legacy() && self.toolset.is_shell()
+    }
+
     pub(crate) fn exposure_for(&self, tool: &dyn Tool) -> ToolExposure {
         if !tool.is_enabled() {
             return ToolExposure::Hidden;
@@ -233,12 +246,12 @@ mod tests {
     }
 
     fn exposure(surface: ExecutionSurface, name: &'static str) -> ToolExposure {
-        BuiltinToolExposurePolicy::new(surface, PromptProfile::Legacy, Toolset::Standard)
+        BuiltinToolExposurePolicy::new(surface, PromptProfile::Legacy, Toolset::Files)
             .exposure_for(&NamedTool(name))
     }
 
     fn lean_exposure(surface: ExecutionSurface, name: &'static str) -> ToolExposure {
-        BuiltinToolExposurePolicy::new(surface, PromptProfile::Lean, Toolset::Standard)
+        BuiltinToolExposurePolicy::new(surface, PromptProfile::Lean, Toolset::Files)
             .exposure_for(&NamedTool(name))
     }
 
@@ -277,7 +290,7 @@ mod tests {
 
     /// The shell-first set defers exactly the dedicated read, search and
     /// write tools (MultiEdit is deferred on the lean profile already) and
-    /// leaves every other tool where the standard set puts it.
+    /// leaves every other tool where the file-tool set puts it.
     #[test]
     fn the_shell_toolset_defers_only_the_file_read_search_and_write_tools() {
         for surface in [ExecutionSurface::Interactive, ExecutionSurface::Unattended] {

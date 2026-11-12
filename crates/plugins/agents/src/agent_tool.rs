@@ -2516,8 +2516,8 @@ mod tests {
     /// Under the shell-first toolset the lookups the model keeps for itself
     /// are not sent to the deferred file tools; nothing else changes.
     #[test]
-    fn the_lean_description_names_the_file_tools_only_in_the_standard_set() {
-        let standard = lean_model_description("- x", rebon_tool::Toolset::Standard);
+    fn the_lean_description_names_the_file_tools_only_in_the_files_set() {
+        let standard = lean_model_description("- x", rebon_tool::Toolset::Files);
         let shell = lean_model_description("- x", rebon_tool::Toolset::Shell);
         assert!(standard.contains("Do directed lookups yourself with Read, Glob, and Grep; "));
         assert!(!shell.contains("Read, Glob"));

@@ -731,10 +731,38 @@ impl Engine {
             .collect()
     }
 
+    /// The exposure table for a session whose tools pass `filter` (every
+    /// tool when `None`).
+    ///
+    /// The shell-first toolset reads and searches with Bash and keeps the
+    /// file tools behind ToolSearch. A session that cannot run Bash, because
+    /// its filter refuses it (an /ultraplan planning turn) or it is not
+    /// enabled here (a PowerShell-only machine), would be left with no way
+    /// to read, so it keeps the file tools eager instead.
+    pub(crate) fn exposure_policy(
+        &self,
+        filter: Option<&rebon_tool::ToolFilter>,
+    ) -> BuiltinToolExposurePolicy {
+        let policy = BuiltinToolExposurePolicy::default_coding_agent();
+        if !policy.is_shell_toolset() {
+            return policy;
+        }
+        let bash_runs = self.tool_catalog().iter().any(|tool| {
+            tool.id().as_str() == "Bash"
+                && tool.is_enabled()
+                && filter.is_none_or(|filter| filter.allows(tool.id().as_str(), tool.aliases()))
+        });
+        if bash_runs {
+            policy
+        } else {
+            policy.without_shell()
+        }
+    }
+
     /// Build a [`ToolSearchIndex`] from all policy-deferred registered tools
     /// that are enabled.
     pub fn build_tool_search_index(&self) -> ToolSearchIndex {
-        let policy = BuiltinToolExposurePolicy::default_coding_agent();
+        let policy = self.exposure_policy(None);
         ToolSearchIndex::build_filtered_by(&self.tool_catalog(), None, |tool| {
             policy.is_deferred(tool)
         })
@@ -744,7 +772,7 @@ impl Engine {
         &self,
         execution_policy: Option<&ExecutionPolicy>,
     ) -> ToolSearchIndex {
-        let policy = BuiltinToolExposurePolicy::default_coding_agent();
+        let policy = self.exposure_policy(None);
         ToolSearchIndex::build_filtered_by(&self.tool_catalog(), None, |tool| {
             policy.is_deferred(tool) && !is_eager_promotion(execution_policy, tool)
         })
@@ -756,7 +784,7 @@ impl Engine {
         &self,
         filter: &rebon_tool::ToolFilter,
     ) -> ToolSearchIndex {
-        let policy = BuiltinToolExposurePolicy::default_coding_agent();
+        let policy = self.exposure_policy(Some(filter));
         ToolSearchIndex::build_filtered_by(&self.tool_catalog(), Some(filter), |tool| {
             policy.is_deferred(tool)
         })
@@ -767,7 +795,7 @@ impl Engine {
         filter: &rebon_tool::ToolFilter,
         execution_policy: Option<&ExecutionPolicy>,
     ) -> ToolSearchIndex {
-        let policy = BuiltinToolExposurePolicy::default_coding_agent();
+        let policy = self.exposure_policy(Some(filter));
         ToolSearchIndex::build_filtered_by(&self.tool_catalog(), Some(filter), |tool| {
             policy.is_deferred(tool) && !is_eager_promotion(execution_policy, tool)
         })
@@ -785,7 +813,18 @@ impl Engine {
         &self,
         execution_policy: Option<&ExecutionPolicy>,
     ) -> Vec<query::ToolSnapshot> {
-        let policy = BuiltinToolExposurePolicy::default_coding_agent();
+        self.eager_tool_snapshots_for_filter_and_policy(None, execution_policy)
+    }
+
+    /// [`Self::eager_tool_snapshots_for_policy`] for a session whose tools
+    /// pass `filter`, which decides whether it can run Bash at all (see
+    /// [`Self::exposure_policy`]). The snapshots are not filtered here.
+    pub fn eager_tool_snapshots_for_filter_and_policy(
+        &self,
+        filter: Option<&rebon_tool::ToolFilter>,
+        execution_policy: Option<&ExecutionPolicy>,
+    ) -> Vec<query::ToolSnapshot> {
+        let policy = self.exposure_policy(filter);
         self.tool_catalog()
             .iter()
             .filter(|tool| {
@@ -807,7 +846,7 @@ impl Engine {
     /// [`eager_tool_snapshots`](Self::eager_tool_snapshots) serialises
     /// every input schema, which is most of a session's startup.
     pub fn eager_tool_name_snapshots(&self) -> Vec<query::ToolNameSnapshot> {
-        let policy = BuiltinToolExposurePolicy::default_coding_agent();
+        let policy = self.exposure_policy(None);
         self.tool_catalog()
             .iter()
             .filter(|tool| tool.is_enabled() && policy.is_eager(tool.as_ref()))
@@ -820,7 +859,7 @@ impl Engine {
 
     /// Snapshot only policy-deferred tool names (for the system prompt).
     pub fn deferred_tool_names(&self) -> Vec<String> {
-        let policy = BuiltinToolExposurePolicy::default_coding_agent();
+        let policy = self.exposure_policy(None);
         self.tool_catalog()
             .iter()
             .filter(|tool| policy.is_deferred(tool.as_ref()))
@@ -832,7 +871,7 @@ impl Engine {
         &self,
         execution_policy: Option<&ExecutionPolicy>,
     ) -> Vec<String> {
-        let policy = BuiltinToolExposurePolicy::default_coding_agent();
+        let policy = self.exposure_policy(None);
         self.tool_catalog()
             .iter()
             .filter(|tool| policy.is_deferred(tool.as_ref()))
@@ -843,7 +882,7 @@ impl Engine {
 
     /// Snapshot only policy-deferred tool names that pass the given filter.
     pub fn filtered_deferred_tool_names(&self, filter: &rebon_tool::ToolFilter) -> Vec<String> {
-        let policy = BuiltinToolExposurePolicy::default_coding_agent();
+        let policy = self.exposure_policy(Some(filter));
         self.tool_catalog()
             .iter()
             .filter(|tool| policy.is_deferred(tool.as_ref()))
@@ -857,7 +896,7 @@ impl Engine {
         filter: &rebon_tool::ToolFilter,
         execution_policy: Option<&ExecutionPolicy>,
     ) -> Vec<String> {
-        let policy = BuiltinToolExposurePolicy::default_coding_agent();
+        let policy = self.exposure_policy(Some(filter));
         self.tool_catalog()
             .iter()
             .filter(|tool| policy.is_deferred(tool.as_ref()))
@@ -985,7 +1024,7 @@ impl Engine {
                 .ok_or_else(|| ToolError::UnknownTool {
                     tool: ToolId::new(&gateway_input.tool_name),
                 })?;
-            let policy = BuiltinToolExposurePolicy::default_coding_agent();
+            let policy = self.exposure_policy(context.tool_filter());
             if !(policy.is_deferred(target.as_ref())
                 || (target.id().as_str() == gateway_input.tool_name && target.should_defer()))
             {

@@ -24,12 +24,14 @@ use rebon_core::system_prompt::{
 use rebon_core::Engine;
 
 /// The lean surface measured 21,036 characters (about 5.3k tokens at four
-/// characters a token) when this budget was set, and 22,154 when it was
-/// raised for the rules on conditional test skips and on checking a bug fix
-/// against the documented contract, which A/B runs showed were needed; the
-/// margin absorbs the machine-dependent paths in the memory and scratchpad
-/// lines. A rise past it is a prompt change that has to justify itself.
-const BUDGET_CHARS: usize = 23_000;
+/// characters a token) when this budget was set, 22,154 after the rules on
+/// conditional test skips and on checking a bug fix against the documented
+/// contract, which A/B runs showed were needed, and 19,705 once the
+/// shell-first toolset became the default and took the Read, Write, Glob and
+/// Grep schemas out of every request. The margin absorbs the
+/// machine-dependent paths in the memory and scratchpad lines. A rise past it
+/// is a prompt change that has to justify itself.
+const BUDGET_CHARS: usize = 20_500;
 
 /// `<system-reminder>\n<runtime_context>\n` … `\n</runtime_context>\n</system-reminder>`.
 const RUNTIME_WRAPPER_CHARS: usize = 74;
@@ -139,21 +141,20 @@ async fn default_tui_main_agent_overhead_stays_within_budget() {
     );
 
     // The exposure decisions the budget depends on.
-    for eager in [
-        "Read",
-        "Edit",
-        "Write",
-        "Bash",
-        "Agent",
-        "ExitPlanMode",
-        "ToolSearch",
-    ] {
+    for eager in ["Edit", "Bash", "Agent", "ExitPlanMode", "ToolSearch"] {
         assert!(
             tool_names.iter().any(|name| name == eager),
             "{eager} is eager"
         );
     }
-    for name in ["EnterPlanMode", "MultiEdit"] {
+    for name in [
+        "Read",
+        "Write",
+        "Glob",
+        "Grep",
+        "EnterPlanMode",
+        "MultiEdit",
+    ] {
         assert!(!tool_names.iter().any(|n| n == name), "{name} is not eager");
         assert!(deferred.iter().any(|n| n == name), "{name} is deferred");
     }

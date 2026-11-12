@@ -106,8 +106,9 @@ something are skipped."
     };
 }
 
-/// How to use tools. Names no tool: the base plane stays byte-stable across
-/// tool sets, and the session's deferred names live in the runtime context.
+/// How to use tools, with the dedicated file tools (`REBON_TOOLSET=files`).
+/// Names no tool: the base plane stays byte-stable across tool sets, and the
+/// session's deferred names live in the runtime context.
 pub(super) const TOOLS: &str = concat!(
     "\
 # Using tools
@@ -117,11 +118,11 @@ use the shell to get around their checks.
     tools_rest!()
 );
 
-/// [`TOOLS`] for the shell-first toolset (`REBON_TOOLSET=shell`): reads and
+/// How to use tools with the shell-first toolset, the default: reads and
 /// searches go through Bash, every change through Edit, because file
 /// history, rewind and Write's overwrite check only see changes Edit makes.
-/// It names tools, but it is fixed for the process, so the base plane is
-/// still byte-stable within a session.
+/// It names tools, but the toolset is fixed for the process, so the base
+/// plane is still byte-stable within a session.
 pub(super) const TOOLS_SHELL: &str = concat!(
     "\
 # Using tools

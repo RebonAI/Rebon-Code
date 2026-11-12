@@ -2793,16 +2793,23 @@ mod lean_profile_tests {
         }
     }
 
-    /// The base plane is byte-stable: the same for every tool set, and it
-    /// names no tool, so a tool-set change never moves the cache prefix.
+    /// The base plane is byte-stable: the same for every tool list, so a
+    /// tool-list change never moves the cache prefix. With the file tools it
+    /// names no tool at all; the shell-first rule names the tools it sends
+    /// file work to, and nothing else.
     #[test]
     fn lean_base_is_independent_of_the_tool_set() {
-        let a = build_base_system_prompt_for_profile(&config(&[], &[], true), LEAN);
-        let b = build_base_system_prompt_for_profile(
-            &config(&["Read", "Edit", "Bash", "Agent"], &["WebFetch"], false),
-            LEAN,
-        );
-        assert_eq!(a, b);
+        let base = |toolset: rebon_tool::Toolset, config: &SystemPromptConfig| {
+            PromptAssembly::for_variant_profile_and_toolset(&PromptVariant::Standard, LEAN, toolset)
+                .assemble_base(config, &DynamicPromptContext::default())
+        };
+        let few = config(&[], &[], true);
+        let many = config(&["Read", "Edit", "Bash", "Agent"], &["WebFetch"], false);
+        for toolset in [rebon_tool::Toolset::Files, rebon_tool::Toolset::Shell] {
+            assert_eq!(base(toolset, &few), base(toolset, &many), "{toolset:?}");
+        }
+        let files = base(rebon_tool::Toolset::Files, &few);
+        let shell = base(rebon_tool::Toolset::Shell, &few);
         for name in [
             "Read",
             "Write",
@@ -2812,38 +2819,34 @@ mod lean_profile_tests {
             "ToolSearch",
             "AskUserQuestion",
         ] {
-            assert!(!a.contains(name), "{name}");
+            assert!(!files.contains(name), "{name}");
         }
+        for name in ["Write", "Agent", "ToolSearch", "AskUserQuestion"] {
+            assert!(!shell.contains(name), "{name}");
+        }
+        // The default is the shell-first plane.
+        assert_eq!(build_base_system_prompt_for_profile(&few, LEAN), shell);
     }
 
     /// The shell-first toolset swaps the file-tool rule for one that reads
     /// and searches with Bash and changes files only through Edit; every
-    /// other byte of the base plane is the standard one, and it still does
-    /// not follow the session's tool list.
+    /// other byte of the base plane is the file-tool one.
     #[test]
     fn the_shell_toolset_swaps_only_the_file_tool_rule() {
-        let base = |toolset: rebon_tool::Toolset, profile: PromptProfile, tools: &[&str]| {
+        let base = |toolset: rebon_tool::Toolset, profile: PromptProfile| {
             PromptAssembly::for_variant_profile_and_toolset(
                 &PromptVariant::Standard,
                 profile,
                 toolset,
             )
-            .assemble_base(&config(tools, &[], true), &DynamicPromptContext::default())
+            .assemble_base(&config(&[], &[], true), &DynamicPromptContext::default())
         };
-        let standard = base(rebon_tool::Toolset::Standard, LEAN, &[]);
-        let shell = base(rebon_tool::Toolset::Shell, LEAN, &[]);
-        assert_eq!(
-            shell,
-            base(
-                rebon_tool::Toolset::Shell,
-                LEAN,
-                &["Read", "Edit", "Bash", "Agent"]
-            )
-        );
+        let files = base(rebon_tool::Toolset::Files, LEAN);
+        let shell = base(rebon_tool::Toolset::Shell, LEAN);
 
-        let standard_rule = "- Use the dedicated file tools, not shell commands, to read, search, \
-                             and edit files, and never use the shell to get around their checks.\n";
-        assert!(standard.contains(standard_rule));
+        let files_rule = "- Use the dedicated file tools, not shell commands, to read, search, \
+                          and edit files, and never use the shell to get around their checks.\n";
+        assert!(files.contains(files_rule));
         assert!(!shell.contains("dedicated file tools"));
         for needle in [
             "Read and search files with Bash (`cat`, `sed -n`, `rg`, `fd`, `ls`)",
@@ -2861,13 +2864,13 @@ mod lean_profile_tests {
             (start, end)
         };
         let mut swapped = shell.clone();
-        swapped.replace_range(rule_start..rule_end, standard_rule);
-        assert_eq!(swapped, standard);
+        swapped.replace_range(rule_start..rule_end, files_rule);
+        assert_eq!(swapped, files);
 
         // The legacy profile restores the old surface whole.
         assert_eq!(
-            base(rebon_tool::Toolset::Shell, PromptProfile::Legacy, &[]),
-            base(rebon_tool::Toolset::Standard, PromptProfile::Legacy, &[])
+            base(rebon_tool::Toolset::Shell, PromptProfile::Legacy),
+            base(rebon_tool::Toolset::Files, PromptProfile::Legacy)
         );
     }
 
