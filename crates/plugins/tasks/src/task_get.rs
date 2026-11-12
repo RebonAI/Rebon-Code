@@ -51,6 +51,14 @@ impl Tool for TaskGetTool {
          - Use TaskList to see all tasks in summary form."
     }
 
+    fn model_description(&self) -> &str {
+        if rebon_tool::legacy_prompt_profile() {
+            self.description()
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
@@ -126,6 +134,10 @@ fn parse_input(input: &Value) -> ToolResult<TaskGetInput> {
 
     Ok(TaskGetInput { task_id })
 }
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str =
+    "Get a task's full details (description, status, blocks, blockedBy) by ID.";
 
 #[cfg(test)]
 mod tests {

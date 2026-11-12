@@ -124,7 +124,19 @@ impl Tool for AskUserQuestionTool {
     }
 
     fn model_description(&self) -> &str {
-        "Asks multiple-choice questions only for unresolved user decisions that block progress. Batch foreseeable questions, stop when answers are sufficient, and never use it for notifications or closing remarks. Waits for the user to answer or cancel before returning; answers and annotations are returned in the tool result."
+        if rebon_tool::legacy_prompt_profile() {
+            LEGACY_MODEL_DESCRIPTION
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
+    fn model_input_schema(&self) -> ToolInputSchema {
+        if rebon_tool::legacy_prompt_profile() {
+            self.input_schema()
+        } else {
+            lean_schema()
+        }
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -658,6 +670,67 @@ fn optional_string_map(
     Ok(Some(map))
 }
 
+/// Provider-visible description under `REBON_PROMPT_PROFILE=legacy`.
+const LEGACY_MODEL_DESCRIPTION: &str = "Asks multiple-choice questions only for unresolved user decisions that block progress. Batch foreseeable questions, stop when answers are sufficient, and never use it for notifications or closing remarks. Waits for the user to answer or cancel before returning; answers and annotations are returned in the tool result.";
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str =
+    "Ask the user 1-4 multiple-choice questions when a decision only they can make \
+blocks progress. Investigate first, ask everything you foresee in one call, and never use it \
+for status updates or closing remarks. An \"Other\" free-text choice is added automatically; \
+put a recommended option first. Waits for the user to answer or cancel before returning, with \
+the answers in the result.";
+
+fn lean_schema() -> ToolInputSchema {
+    json!({
+        "type": "object",
+        "properties": {
+            "questions": {
+                "type": "array",
+                "minItems": MIN_QUESTIONS,
+                "maxItems": MAX_QUESTIONS,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question": { "type": "string" },
+                        "header": {
+                            "type": "string",
+                            "maxLength": ASK_USER_QUESTION_TOOL_CHIP_WIDTH
+                        },
+                        "options": {
+                            "type": "array",
+                            "minItems": MIN_OPTIONS,
+                            "maxItems": MAX_OPTIONS,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": { "type": "string" },
+                                    "description": { "type": "string" },
+                                    "preview": {
+                                        "type": "string",
+                                        "description": "Optional preview, single-select only."
+                                    }
+                                },
+                                "required": ["label", "description"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "multiSelect": { "type": "boolean", "default": false }
+                    },
+                    "required": ["question", "header", "options"],
+                    "additionalProperties": false
+                }
+            },
+            "metadata": {
+                "type": "object",
+                "description": "Ultraplan Grill confirmation only: intent \"confirm_understanding\", plan_hash, interview_revision."
+            }
+        },
+        "required": ["questions"],
+        "additionalProperties": false
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,7 +845,7 @@ mod tests {
             );
         }
 
-        let model_description = tool.model_description();
+        let model_description = LEGACY_MODEL_DESCRIPTION;
         assert!(
             model_description.contains("only for unresolved user decisions that block progress")
         );
@@ -784,15 +857,18 @@ mod tests {
     #[test]
     fn prompt_contract_waits_for_an_answer_or_cancellation() {
         let tool = tool();
-        for description in [tool.description(), tool.model_description()] {
+        for description in [
+            tool.description(),
+            LEGACY_MODEL_DESCRIPTION,
+            LEAN_DESCRIPTION,
+        ] {
             assert!(description.contains("Waits for the user to answer or cancel before returning"));
             assert!(!description.contains("may come later"));
             assert!(!description.contains("may arrive later"));
             assert!(!description.contains("pending"));
         }
         assert!(tool.description().contains("not in a later user message"));
-        assert!(tool
-            .model_description()
+        assert!(LEGACY_MODEL_DESCRIPTION
             .contains("answers and annotations are returned in the tool result"));
     }
 
@@ -806,6 +882,8 @@ mod tests {
         for (label, text) in [
             ("description", tool.description()),
             ("model_description", tool.model_description()),
+            ("legacy model_description", LEGACY_MODEL_DESCRIPTION),
+            ("lean model_description", LEAN_DESCRIPTION),
         ] {
             for needle in [
                 "Plan mode",

@@ -56,6 +56,14 @@ impl Tool for TaskListTool {
          Use TaskGet with a specific task ID to view full details."
     }
 
+    fn model_description(&self) -> &str {
+        if rebon_tool::legacy_prompt_profile() {
+            self.description()
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
@@ -131,6 +139,9 @@ impl Tool for TaskListTool {
         Ok(json!({ "tasks": entries }))
     }
 }
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str = "List all tasks with their status, owner, and blockers.";
 
 #[cfg(test)]
 mod tests {

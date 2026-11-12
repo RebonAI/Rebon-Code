@@ -489,6 +489,22 @@ impl Tool for SkillTool {
          - Do not invoke a skill that is already running"
     }
 
+    fn model_description(&self) -> &str {
+        if rebon_tool::legacy_prompt_profile() {
+            self.description()
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
+    fn model_input_schema(&self) -> ToolInputSchema {
+        if rebon_tool::legacy_prompt_profile() {
+            self.input_schema()
+        } else {
+            lean_schema()
+        }
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
@@ -630,6 +646,25 @@ fn parse_input(input: &Value) -> Result<(String, Map<String, Value>, Option<Stri
         None => None,
     };
     Ok((skill, variables, args))
+}
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str =
+    "Run a skill from the skills listed in your context. A user's `/<name>` command is \
+a skill: invoke it before saying anything else about the task. Use only listed names, never \
+guess one, and do not invoke a skill that is already running. `args` passes the command's \
+arguments.";
+
+fn lean_schema() -> ToolInputSchema {
+    json!({
+        "type": "object",
+        "properties": {
+            "skill": { "type": "string" },
+            "args": { "type": "string" }
+        },
+        "required": ["skill"],
+        "additionalProperties": false
+    })
 }
 
 #[cfg(test)]

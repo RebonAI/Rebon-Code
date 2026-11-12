@@ -34,6 +34,22 @@ impl Tool for SaveMemoryTool {
          Storage `scope` is only `user` or `repo`; content `type` is taxonomy (`user`, `feedback`, `project`, `reference`)."
     }
 
+    fn model_description(&self) -> &str {
+        if rebon_tool::legacy_prompt_profile() {
+            self.description()
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
+    fn model_input_schema(&self) -> ToolInputSchema {
+        if rebon_tool::legacy_prompt_profile() {
+            self.input_schema()
+        } else {
+            lean_schema()
+        }
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
@@ -290,6 +306,38 @@ fn scope_as_str(scope: rebon_session::memory_paths::MemoryScope) -> &'static str
         rebon_session::memory_paths::MemoryScope::User => "user",
         rebon_session::memory_paths::MemoryScope::Repo => "repo",
     }
+}
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str =
+    "Save (`upsert`) or `delete` a durable memory. Use it for lasting user preferences, \
+feedback, non-obvious project context, or external references; never for task progress or \
+what the repository already records, even when asked. Upsert needs `type`, `title`, \
+`description` (the one-line MEMORY.md hook), and `content`; delete needs `target_file` or \
+`title`.";
+
+fn lean_schema() -> ToolInputSchema {
+    json!({
+        "type": "object",
+        "properties": {
+            "action": { "type": "string", "enum": ["upsert", "delete"] },
+            "scope": { "type": "string", "enum": ["user", "repo"] },
+            "type": { "type": "string", "enum": ["user", "feedback", "project", "reference"] },
+            "title": { "type": "string" },
+            "description": { "type": "string" },
+            "content": { "type": "string" },
+            "target_file": {
+                "type": "string",
+                "description": "Basename of an existing .md memory file to update or delete."
+            },
+            "project": {
+                "type": ["string", "null"],
+                "description": "Scope repo only: absolute path of another project this memory belongs to."
+            }
+        },
+        "required": ["action", "scope"],
+        "additionalProperties": false
+    })
 }
 
 #[cfg(test)]
