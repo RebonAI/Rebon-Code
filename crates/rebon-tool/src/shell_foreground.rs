@@ -11,9 +11,19 @@
 //!
 //! The command is killed as before only when it cannot be handed over (no
 //! registry, no owner, the running-shell limit), and the result says why.
+//! A command stopped at its timeout because it tried to use the terminal (a
+//! password prompt) cannot run in the background either: it is killed, and
+//! the result says it needed interactive input.
+//!
+//! On unix the command runs as its own process group, so the tree can be
+//! taken over whole. [`crate::foreground_group`] keeps what being in rebon's
+//! group used to give it: Ctrl-C and a hangup reach it, and a cancelled call
+//! kills the whole tree, not just the shell.
 //!
 //! [`ShellProcessRegistry::adopt_foreground`]: crate::shell_process::ShellProcessRegistry::adopt_foreground
 
+#[cfg(unix)]
+use crate::foreground_group::ForegroundGroup;
 use crate::shell_process::{ShellLineReader, ShellOutputEncoding};
 use crate::ToolContext;
 use rebon_tools_core::{ToolError, ToolId, ToolProgressUpdate, ToolResult};
@@ -21,6 +31,22 @@ use serde_json::Value;
 use std::io;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
+
+/// No process groups off unix: the child is killed alone, as it always was.
+#[cfg(not(unix))]
+struct ForegroundGroup;
+
+#[cfg(not(unix))]
+impl ForegroundGroup {
+    fn enter(_pid: u32) -> Option<Self> {
+        None
+    }
+    fn kill(&self) {}
+    fn release(self) {}
+    async fn is_stopped(&self) -> bool {
+        false
+    }
+}
 
 /// How a foreground run ended.
 pub(crate) enum Ending {
@@ -33,6 +59,9 @@ pub(crate) enum Ending {
     /// Timed out and killed, for the reason given: it could not be handed to
     /// the background.
     Killed { reason: String },
+    /// Found stopped at the timeout — waiting to read or write a terminal it
+    /// does not have — and killed.
+    NeedsTerminal { timeout_ms: u64 },
     /// Timed out and now running as a background shell. The registry's
     /// handoff fields: `shellId`, `outputPath`, `status`, `backgrounded`,
     /// `note`.
@@ -45,6 +74,8 @@ pub(crate) struct ForegroundRun {
     /// `None` while the command still runs in the background, or when the
     /// platform reports no code (a signal).
     pub(crate) exit_code: Option<i32>,
+    /// The signal that ended the command, when one did (unix).
+    pub(crate) signal: Option<i32>,
     pub(crate) ending: Ending,
 }
 
@@ -55,15 +86,37 @@ impl ForegroundRun {
     pub(crate) fn annotate(self, result: &mut Value) {
         let (interrupted, timed_out) = match &self.ending {
             Ending::Exited | Ending::OutputHeldOpen => (false, false),
-            Ending::Killed { .. } => (true, true),
+            Ending::Killed { .. } | Ending::NeedsTerminal { .. } => (true, true),
             // Still running: the step is not done, which is what a later
             // step of the same response needs to know.
             Ending::Backgrounded(_) => (false, true),
         };
         result["interrupted"] = Value::Bool(interrupted);
         result["timedOut"] = Value::Bool(timed_out);
+        // A command that ended on a signal of its own (a segfault, an
+        // out-of-memory kill) has no exit code; say which signal it was. The
+        // kills this runner sends itself are explained by the ending.
+        if let (Ending::Exited | Ending::OutputHeldOpen, Some(signal)) = (&self.ending, self.signal)
+        {
+            result["signal"] = Value::from(signal);
+            result["note"] = Value::String(match signal_name(signal) {
+                Some(name) => format!("The command was killed by signal {signal} ({name})."),
+                None => format!("The command was killed by signal {signal}."),
+            });
+        }
         match self.ending {
             Ending::Exited => {}
+            Ending::NeedsTerminal { timeout_ms } => {
+                result["needsTerminal"] = Value::Bool(true);
+                result["note"] = Value::String(format!(
+                    "The command stopped to read from or write to a terminal (a password or \
+                     passphrase prompt, an interactive confirmation), and commands here run \
+                     without one, so it was killed at its {timeout_ms} ms timeout. Use a \
+                     non-interactive form (for example `sudo -n`, `ssh -o BatchMode=yes`, a \
+                     credential helper), or ask the user to run it themselves with \
+                     `! <command>`."
+                ));
+            }
             Ending::OutputHeldOpen => {
                 result["outputCutOff"] = Value::Bool(true);
                 result["note"] = Value::String(
@@ -111,6 +164,10 @@ where
         .spawn()
         .map_err(|err| process_error("spawn", err, None))?;
     let child_pid = child.id();
+    // Until released, dropping this kills the whole group: a cancelled call
+    // (this future dropped) takes the command's tree down with it. While it
+    // is held, Ctrl-C and a hangup are forwarded to the group.
+    let group = child_pid.and_then(ForegroundGroup::enter);
     let missing = |stream: &str| ToolError::Execution {
         tool: ToolId::new(tool_name),
         source: anyhow::anyhow!("failed to capture child {stream}"),
@@ -165,10 +222,24 @@ where
         }
     }
 
+    let stopped = timed_out
+        && matches!(child.try_wait(), Ok(None))
+        && match &group {
+            Some(group) => group.is_stopped().await,
+            None => false,
+        };
     let ending = if !timed_out {
         Ending::Exited
     } else if let Ok(Some(_)) = child.try_wait() {
         Ending::OutputHeldOpen
+    } else if stopped {
+        // Stopped waiting for a terminal: in the background it would sit
+        // stopped forever, so kill it and say why.
+        if let Some(group) = &group {
+            group.kill();
+        }
+        let _ = child.kill().await;
+        Ending::NeedsTerminal { timeout_ms }
     } else {
         let refused = match context.shell_process_registry() {
             None => Err((
@@ -192,14 +263,22 @@ where
         };
         match refused {
             Ok(handoff) => {
+                // The registry owns the tree now.
+                if let Some(group) = group {
+                    group.release();
+                }
                 return Ok(ForegroundRun {
                     lines,
                     exit_code: None,
+                    signal: None,
                     ending: Ending::Backgrounded(handoff),
                 });
             }
             Err((returned, reason)) => {
                 child = *returned;
+                if let Some(group) = &group {
+                    group.kill();
+                }
                 let _ = child.kill().await;
                 Ending::Killed { reason }
             }
@@ -210,9 +289,53 @@ where
         .wait()
         .await
         .map_err(|err| process_error("wait", err, child_pid))?;
+    // Ended one way or another: whatever is left in the group (`server &`)
+    // outlives the command, as it did before the group existed.
+    if let Some(group) = group {
+        group.release();
+    }
     Ok(ForegroundRun {
         lines,
         exit_code: status.code(),
+        signal: exit_signal(&status),
         ending,
     })
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+#[cfg(unix)]
+fn signal_name(signal: i32) -> Option<&'static str> {
+    Some(match signal {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGUSR2 => "SIGUSR2",
+        _ => return None,
+    })
+}
+
+#[cfg(not(unix))]
+fn signal_name(_signal: i32) -> Option<&'static str> {
+    None
 }

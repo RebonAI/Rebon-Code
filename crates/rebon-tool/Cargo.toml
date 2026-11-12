@@ -85,6 +85,7 @@ test-support = ["dep:tempfile"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+signal-hook = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [

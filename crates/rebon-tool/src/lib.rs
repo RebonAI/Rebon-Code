@@ -157,6 +157,8 @@ pub mod escalation;
 pub mod execution_surface;
 pub mod external_agent;
 pub mod filter;
+#[cfg(unix)]
+mod foreground_group;
 pub mod glob;
 pub mod grep;
 pub mod invoke_deferred_tool;

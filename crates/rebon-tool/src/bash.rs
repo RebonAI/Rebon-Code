@@ -1517,6 +1517,109 @@ mod tests {
         assert!(out.get("shellId").is_none());
     }
 
+    #[cfg(unix)]
+    fn process_is_gone(pid: i32) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// The kill at a timeout that cannot be handed over reaches the whole
+    /// command tree, not only the shell.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_command_is_killed_with_its_whole_tree() {
+        let _env = crate::test_env::hold_env();
+        let out = tool()
+            .call(
+                json!({ "command": "sleep 30 & echo $!; wait", "timeout": 300 }),
+                &ToolContext::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["timedOut"], json!(true), "{out}");
+        let grandchild: i32 = out["stdout"].as_str().unwrap().trim().parse().unwrap();
+        assert!(process_is_gone(grandchild), "the shell's child survived");
+    }
+
+    /// Cancelling the call — dropping its future, as a user's interrupt
+    /// does — kills the whole command tree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_foreground_call_kills_its_whole_tree() {
+        let _env = crate::test_env::hold_env();
+        let (context, mut rx) = ToolContext::new().with_progress("bash-cancel");
+        let bash = tool();
+        let mut call =
+            Box::pin(bash.call(json!({ "command": "sleep 30 & echo $!; wait" }), &context));
+        let grandchild: i32 = tokio::select! {
+            _ = &mut call => panic!("the command should still be running"),
+            update = rx.recv() => update
+                .and_then(|update| update.message)
+                .expect("the pid line")
+                .trim()
+                .parse()
+                .unwrap(),
+        };
+        drop(call);
+        assert!(
+            process_is_gone(grandchild),
+            "the shell's child survived the cancel"
+        );
+    }
+
+    /// A command stopped by job control at its timeout (what reading the
+    /// terminal does to it here) is killed, not handed to the background,
+    /// and the result says it needed a terminal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_stopped_for_the_terminal_is_killed_with_a_note() {
+        let _env = crate::test_env::hold_env();
+        let registry = Arc::new(crate::ShellProcessRegistry::new());
+        let context = ToolContext::new()
+            .with_session_id("bash-needs-terminal")
+            .with_shell_process_registry(registry);
+        let out = tool()
+            .call(
+                json!({ "command": "echo asking; kill -STOP $$; echo never", "timeout": 500 }),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["needsTerminal"], json!(true), "{out}");
+        assert_eq!(out["timedOut"], json!(true));
+        assert_eq!(out["interrupted"], json!(true));
+        assert!(out.get("shellId").is_none(), "nothing was handed over");
+        assert!(out.get("backgrounded").is_none());
+        assert_eq!(out["stdout"], json!("asking"));
+        let note = out["note"].as_str().unwrap();
+        assert!(
+            note.contains("terminal") && note.contains("! <command>"),
+            "{note}"
+        );
+    }
+
+    /// A shell killed by a signal of its own has no exit code; the result
+    /// names the signal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_killed_by_a_signal_reports_it() {
+        let _env = crate::test_env::hold_env();
+        let out = tool()
+            .call(json!({ "command": "kill -SEGV $$" }), &ToolContext::new())
+            .await
+            .unwrap();
+        assert_eq!(out["exitCode"], Value::Null, "{out}");
+        assert_eq!(out["timedOut"], json!(false));
+        assert_eq!(out["signal"], json!(libc::SIGSEGV));
+        assert!(out["note"].as_str().unwrap().contains("SIGSEGV"), "{out}");
+    }
+
     /// A step that fails in a `;` chain is marked on stderr; stdout and the
     /// exit status are untouched. Only where `sh` is bash: dash has no
     /// `ERR` trap, and there the command runs as written.
