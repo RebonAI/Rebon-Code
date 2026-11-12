@@ -724,3 +724,174 @@ async fn query_local_terminal_hook_skips_tool_use_responses() {
         other => panic!("expected Done, got {other:?}"),
     }
 }
+
+// ── Bookkeeping tail ───────────────────────────────────────────
+
+/// A final answer that also calls TaskUpdate: its text, then the call.
+fn answer_and_task_update(id: &str, text: &str, task_id: &str) -> Vec<StreamEvent> {
+    let mut events = vec![
+        message_start(id),
+        StreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: ContentBlockStart::Text {
+                text: String::new(),
+            },
+        },
+        StreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: ContentBlockDelta::TextDelta { text: text.into() },
+        },
+        StreamEvent::ContentBlockStop { index: 0 },
+    ];
+    let call = tool_turn(
+        id,
+        "TaskUpdate",
+        &format!("toolu_update_{task_id}"),
+        &format!(r#"{{"taskId":"{task_id}","status":"completed"}}"#),
+    );
+    // The tool turn's blocks, moved to index 1.
+    events.extend(call.into_iter().skip(1).map(|event| match event {
+        StreamEvent::ContentBlockStart { content_block, .. } => StreamEvent::ContentBlockStart {
+            index: 1,
+            content_block,
+        },
+        StreamEvent::ContentBlockDelta { delta, .. } => {
+            StreamEvent::ContentBlockDelta { index: 1, delta }
+        }
+        StreamEvent::ContentBlockStop { .. } => StreamEvent::ContentBlockStop { index: 1 },
+        other => other,
+    }));
+    events
+}
+
+/// Run one turn on the task tools; returns the requests and the final text.
+async fn bookkeeping_turn(
+    task_list_id: &str,
+    turns: Vec<Vec<StreamEvent>>,
+) -> (Vec<rebon_api::CreateMessageRequest>, String) {
+    let engine = build_engine_with_tools(vec![
+        Arc::new(rebon_plugin_tasks::TaskCreateTool) as Arc<dyn Tool>,
+        Arc::new(rebon_plugin_tasks::TaskUpdateTool) as Arc<dyn Tool>,
+    ]);
+    let client = MockModelClient::new();
+    for turn in turns {
+        client.push_turn(turn);
+    }
+    let captured = client.clone();
+    let mut rx = run_query(
+        engine.clone(),
+        SessionHandle::new(Arc::new(client)),
+        QueryParams::new("mock", vec![ApiMessage::user_text("fix it")])
+            .with_tools(tools_from_engine(&engine)),
+        ToolContext::new().with_task_list_id(task_list_id),
+        CancelToken::new(),
+    );
+    let events = drain(&mut rx).await;
+    let final_text = match events.last() {
+        Some(QueryEvent::Done { final_message, .. }) => final_message.text(),
+        other => panic!("expected Done, got {other:?}"),
+    };
+    (captured.captured_requests(), final_text)
+}
+
+fn create_task(id: &str, subject: &str) -> Vec<StreamEvent> {
+    tool_turn(
+        id,
+        "TaskCreate",
+        &format!("toolu_{id}"),
+        &format!(r#"{{"subject":"{subject}","description":"{subject}"}}"#),
+    )
+}
+
+/// A final answer that closes its task ends the turn once the update
+/// succeeds: two requests, where the model used to be asked a third time
+/// only to say it was done.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_final_answer_that_closes_its_task_ends_the_turn() {
+    let _env = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _config_dir = EnvVarGuard::set("REBON_CONFIG_DIR", temp.path().to_str().unwrap());
+    let _tasks_enabled = EnvVarGuard::set("REBON_ENABLE_TASKS", "1");
+    let list = "bookkeeping-tail-ends";
+
+    let (requests, final_text) = bookkeeping_turn(
+        list,
+        vec![
+            create_task("create", "Fix the bug"),
+            answer_and_task_update("answer", "Fixed the bug.", "1"),
+            text_turn("done", "Done."),
+        ],
+    )
+    .await;
+
+    assert_eq!(requests.len(), 2);
+    assert_eq!(final_text, "Fixed the bug.");
+    assert_eq!(
+        rebon_tool::tasks::get_task(list, "1")
+            .unwrap()
+            .unwrap()
+            .status,
+        rebon_tool::tasks::TaskListStatus::Completed
+    );
+}
+
+/// A bookkeeping call that fails leaves the model something to answer, so
+/// the turn goes on.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_bookkeeping_call_keeps_the_turn_going() {
+    let _env = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _config_dir = EnvVarGuard::set("REBON_CONFIG_DIR", temp.path().to_str().unwrap());
+    let _tasks_enabled = EnvVarGuard::set("REBON_ENABLE_TASKS", "1");
+
+    let (requests, final_text) = bookkeeping_turn(
+        "bookkeeping-tail-failed",
+        vec![
+            create_task("create", "Fix the bug"),
+            answer_and_task_update("answer", "Fixed the bug.", "99"),
+            answer_and_task_update("retry", "Fixed the bug; closed task 1.", "1"),
+        ],
+    )
+    .await;
+
+    // The failed update is answered; the corrected one ends the turn.
+    assert_eq!(requests.len(), 3);
+    assert_eq!(final_text, "Fixed the bug; closed task 1.");
+}
+
+/// The tail still passes through the turn-end gate: a touched task left
+/// open gets its reminder, after a well-formed history.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "current_thread")]
+async fn a_bookkeeping_tail_that_leaves_a_task_open_still_gets_the_reminder() {
+    let _env = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _config_dir = EnvVarGuard::set("REBON_CONFIG_DIR", temp.path().to_str().unwrap());
+    let _tasks_enabled = EnvVarGuard::set("REBON_ENABLE_TASKS", "1");
+
+    let (requests, final_text) = bookkeeping_turn(
+        "bookkeeping-tail-open",
+        vec![
+            create_task("create_1", "Fix the bug"),
+            create_task("create_2", "Write the docs"),
+            answer_and_task_update("answer", "Fixed the bug.", "1"),
+            text_turn("blocked", "The docs wait on a review."),
+        ],
+    )
+    .await;
+
+    assert_eq!(requests.len(), 4);
+    assert_eq!(final_text, "The docs wait on a review.");
+    let last = &requests[3].messages;
+    let roles: Vec<_> = last.iter().rev().take(4).map(|m| m.role).collect();
+    assert_eq!(
+        roles,
+        vec![Role::User, Role::Assistant, Role::User, Role::Assistant],
+        "reminder, answer, tool results, the call"
+    );
+    let reminder = text_message_texts(std::slice::from_ref(last.last().unwrap())).join("\n");
+    assert!(reminder.contains("- #2: pending"), "{reminder}");
+    assert!(!reminder.contains("- #1"), "{reminder}");
+}

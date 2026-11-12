@@ -397,7 +397,12 @@ async fn compact_after_tool_round(
 }
 
 enum ToolRoundFlow {
-    Ran { anchored_promoted: bool },
+    Ran {
+        anchored_promoted: bool,
+        /// Every call ran and reported success: no error, and no
+        /// `"success": false` in its output.
+        all_succeeded: bool,
+    },
     Cancelled,
 }
 
@@ -499,6 +504,12 @@ async fn run_tool_round(
     }
 
     // Notify synchronously while folding results back into provider order.
+    let all_succeeded = indexed_results.len() == tool_use_list.len()
+        && indexed_results.iter().all(|(_, _, _, outcome)| {
+            outcome
+                .as_ref()
+                .is_ok_and(|value| value.get("success").and_then(Value::as_bool) != Some(false))
+        });
     let mut tool_results: Vec<ApiContentBlock> = Vec::new();
     for (i, tool_use_id, tool_name, outcome) in &indexed_results {
         let tool_input = tool_use_list.get(*i).map(|tool_use| &tool_use.input);
@@ -565,7 +576,45 @@ async fn run_tool_round(
     }
 
     manager.push_tool_results(tool_results);
-    ToolRoundFlow::Ran { anchored_promoted }
+    ToolRoundFlow::Ran {
+        anchored_promoted,
+        all_succeeded,
+    }
+}
+
+/// The task-list tools a final response may call without needing another
+/// request: what they return is a confirmation, not something to act on.
+const BOOKKEEPING_TOOLS: &[&str] = &["TaskUpdate", "TodoWrite"];
+
+/// Whether `message` is a final answer that only keeps the books: text for
+/// the user, and no call but task-list updates. Asking the model again after
+/// those calls buys nothing but a "done".
+fn is_bookkeeping_tail(message: &AssistantMessage, truncated_tool_uses: &[String]) -> bool {
+    let mut tool_uses = message.tool_uses().peekable();
+    truncated_tool_uses.is_empty()
+        && matches!(
+            message.stop_reason,
+            None | Some(StopReason::ToolUse) | Some(StopReason::EndTurn)
+        )
+        && tool_uses.peek().is_some()
+        && tool_uses.all(|tool_use| BOOKKEEPING_TOOLS.contains(&tool_use.name.as_str()))
+        && message.content.iter().any(
+            |block| matches!(block, ApiContentBlock::Text(text) if !text.text.trim().is_empty()),
+        )
+}
+
+/// A bookkeeping tail's answer as the turn's final message: its text, ended.
+fn bookkeeping_tail_answer(message: &AssistantMessage) -> AssistantMessage {
+    AssistantMessage {
+        content: message
+            .content
+            .iter()
+            .filter(|block| matches!(block, ApiContentBlock::Text(_)))
+            .cloned()
+            .collect(),
+        stop_reason: Some(StopReason::EndTurn),
+        ..message.clone()
+    }
 }
 
 enum StopReasonFlow {
@@ -660,77 +709,107 @@ async fn settle_stop_reason(
     }
 
     if !wants_tools {
-        // The ordered terminal waterfall stops at its first continuation.
-        tx.dispatch_turn_end(
+        return end_turn_or_continue(
+            manager,
+            params,
+            context,
+            client,
+            tx,
             message,
             iteration,
-            manager.messages(),
-            &context.task_list_id(),
-            params,
+            total_usage,
+            stop_reason_final,
+            terminal,
+        )
+        .await;
+    }
+    StopReasonFlow::Ran
+}
+
+/// The terminal waterfall for a response that would end the turn: the turn
+/// hooks, then the Stop hooks, then `Done`. Never [`StopReasonFlow::Ran`].
+#[allow(clippy::too_many_arguments)]
+async fn end_turn_or_continue(
+    manager: &mut ContextManager,
+    params: &mut QueryParams,
+    context: &mut ToolContext,
+    client: &Arc<dyn ModelClient>,
+    tx: &QueryEventSender,
+    message: &AssistantMessage,
+    iteration: usize,
+    total_usage: &mut Usage,
+    stop_reason_final: &mut Option<StopReason>,
+    terminal: &mut TerminalState,
+) -> StopReasonFlow {
+    // The ordered terminal waterfall stops at its first continuation.
+    tx.dispatch_turn_end(
+        message,
+        iteration,
+        manager.messages(),
+        &context.task_list_id(),
+        params,
+    );
+    let applied = tx.take_writeback().apply_to_params(params);
+    if let Some(followups) = applied.continue_followups {
+        tracing::info!("turn hook requested another iteration");
+        if params.next_tool_choice.is_some() && !client.supports_forced_tool_choice() {
+            params.next_tool_choice = None;
+            tracing::debug!(
+                provider = client.provider_name(),
+                "turn hook requested forced tool_choice but provider does not advertise support"
+            );
+        }
+        reserve_terminal_continuations(
+            iteration,
+            params.max_iterations,
+            followups,
+            &mut terminal.continuations_remaining,
         );
-        let applied = tx.take_writeback().apply_to_params(params);
-        if let Some(followups) = applied.continue_followups {
-            tracing::info!("turn hook requested another iteration");
-            if params.next_tool_choice.is_some() && !client.supports_forced_tool_choice() {
-                params.next_tool_choice = None;
-                tracing::debug!(
-                    provider = client.provider_name(),
-                    "turn hook requested forced tool_choice but provider does not advertise support"
-                );
-            }
+        // Usage precedes the terminal phase's writebacks.
+        manager.set_usage_baseline(message.usage.context_input_tokens());
+        commit_turn_hook_writeback(manager, context, tx, iteration + 1, applied);
+        return StopReasonFlow::NextIteration;
+    }
+    commit_turn_hook_writeback(manager, context, tx, iteration + 1, applied);
+    // The turn's own Stop event: a hook may keep it going, its reason the
+    // model's next user message, as Claude Code's Stop hooks do.
+    if let Some(reason) = stop_gate(
+        params,
+        message,
+        stop_reason_final.as_ref(),
+        terminal.stop_hook_continuations > 0,
+    )
+    .await
+    {
+        if terminal.stop_hook_continuations < MAX_STOP_HOOK_CONTINUATIONS {
+            terminal.stop_hook_continuations += 1;
+            tracing::info!(%reason, "a Stop hook kept the turn going");
             reserve_terminal_continuations(
                 iteration,
                 params.max_iterations,
-                followups,
+                1,
                 &mut terminal.continuations_remaining,
             );
-            // Usage precedes the terminal phase's writebacks.
             manager.set_usage_baseline(message.usage.context_input_tokens());
-            commit_turn_hook_writeback(manager, context, tx, iteration + 1, applied);
+            manager.push_message(ApiMessage {
+                role: Role::Assistant,
+                content: message.content.clone(),
+            });
+            manager.push_message(ApiMessage::user_text(reason));
             return StopReasonFlow::NextIteration;
         }
-        commit_turn_hook_writeback(manager, context, tx, iteration + 1, applied);
-        // The turn's own Stop event: a hook may keep it going, its reason the
-        // model's next user message, as Claude Code's Stop hooks do.
-        if let Some(reason) = stop_gate(
-            params,
-            message,
-            stop_reason_final.as_ref(),
-            terminal.stop_hook_continuations > 0,
-        )
-        .await
-        {
-            if terminal.stop_hook_continuations < MAX_STOP_HOOK_CONTINUATIONS {
-                terminal.stop_hook_continuations += 1;
-                tracing::info!(%reason, "a Stop hook kept the turn going");
-                reserve_terminal_continuations(
-                    iteration,
-                    params.max_iterations,
-                    1,
-                    &mut terminal.continuations_remaining,
-                );
-                manager.set_usage_baseline(message.usage.context_input_tokens());
-                manager.push_message(ApiMessage {
-                    role: Role::Assistant,
-                    content: message.content.clone(),
-                });
-                manager.push_message(ApiMessage::user_text(reason));
-                return StopReasonFlow::NextIteration;
-            }
-            tracing::warn!(
-                %reason,
-                times = terminal.stop_hook_continuations,
-                "Stop hooks kept refusing to let the turn end; ending it"
-            );
-        }
-        let _ = tx.send(QueryEvent::Done {
-            final_message: message.clone(),
-            stop_reason: stop_reason_final.clone().unwrap_or(StopReason::EndTurn),
-            total_usage: *total_usage,
-        });
-        return StopReasonFlow::Stop;
+        tracing::warn!(
+            %reason,
+            times = terminal.stop_hook_continuations,
+            "Stop hooks kept refusing to let the turn end; ending it"
+        );
     }
-    StopReasonFlow::Ran
+    let _ = tx.send(QueryEvent::Done {
+        final_message: message.clone(),
+        stop_reason: stop_reason_final.clone().unwrap_or(StopReason::EndTurn),
+        total_usage: *total_usage,
+    });
+    StopReasonFlow::Stop
 }
 
 enum StreamOutcomeFlow {
@@ -1740,7 +1819,8 @@ impl TurnControlPlugin {
                 content: message.content.clone(),
             });
 
-            let anchored_promoted = match run_tool_round(
+            let bookkeeping_tail = is_bookkeeping_tail(&message, &truncated_tool_uses);
+            let (anchored_promoted, round_succeeded) = match run_tool_round(
                 &engine,
                 &mut manager,
                 &mut params,
@@ -1754,9 +1834,13 @@ impl TurnControlPlugin {
             )
             .await
             {
-                ToolRoundFlow::Ran { anchored_promoted } => anchored_promoted,
+                ToolRoundFlow::Ran {
+                    anchored_promoted,
+                    all_succeeded,
+                } => (anchored_promoted, all_succeeded),
                 ToolRoundFlow::Cancelled => return None,
             };
+            let history_after_round = manager.messages().len();
 
             match finish_tool_round(
                 &mut manager,
@@ -1778,6 +1862,36 @@ impl TurnControlPlugin {
                 PostRoundFlow::Ran => {}
                 PostRoundFlow::NextIteration => continue 'iteration,
                 PostRoundFlow::Reset(reset_messages) => return Some(reset_messages),
+            }
+
+            // A final answer that also closed its tasks has nothing left for
+            // the model to answer once those calls succeeded, unless the
+            // round brought something new (an attachment, a hook's message).
+            // It ends here, through the same waterfall as any final answer,
+            // which can still keep the turn going.
+            if bookkeeping_tail
+                && round_succeeded
+                && manager.messages().len() == history_after_round
+            {
+                let answer = bookkeeping_tail_answer(&message);
+                stop_reason_final = answer.stop_reason.clone();
+                match end_turn_or_continue(
+                    &mut manager,
+                    &mut params,
+                    &mut context,
+                    &client,
+                    &tx,
+                    &answer,
+                    iteration,
+                    &mut total_usage,
+                    &mut stop_reason_final,
+                    &mut terminal,
+                )
+                .await
+                {
+                    StopReasonFlow::Stop => return None,
+                    StopReasonFlow::Ran | StopReasonFlow::NextIteration => continue 'iteration,
+                }
             }
 
             let budget_writeback = tx.dispatch_turn_budget(iteration, params.max_iterations);
