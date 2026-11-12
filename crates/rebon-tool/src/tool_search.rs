@@ -117,7 +117,7 @@ impl ToolSearchIndex {
                     // discovered via ToolSearch get the same text the eager
                     // tool-snapshot path serves. Falls back to description().
                     t.model_description().to_string(),
-                    t.input_schema(),
+                    t.model_input_schema(),
                     t.search_hint().map(str::to_string),
                 )
             })
@@ -385,6 +385,22 @@ impl Tool for ToolSearchTool {
          - \"+slack send\" \u{2014} require \"slack\" in the name, rank by remaining terms"
     }
 
+    fn model_description(&self) -> &str {
+        if crate::legacy_prompt_profile() {
+            self.description()
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
+    fn model_input_schema(&self) -> ToolInputSchema {
+        if crate::legacy_prompt_profile() {
+            self.input_schema()
+        } else {
+            lean_schema()
+        }
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
@@ -510,6 +526,23 @@ fn format_results(found: &[&ToolSearchEntry], missing: &[String], total_deferred
 }
 
 // ── Tests ────────────────────────────────────────────────────────
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str =
+    "Load the schemas of deferred tools (listed by name in your context). Query \
+\"select:A,B\" for exact names, or keywords; \"+term\" requires term in the name. Matches come \
+back as <function> definitions; then call the tool by name.";
+
+fn lean_schema() -> ToolInputSchema {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": { "type": "string" },
+            "max_results": { "type": "number", "default": 5 }
+        },
+        "required": ["query"]
+    })
+}
 
 #[cfg(test)]
 mod tests {

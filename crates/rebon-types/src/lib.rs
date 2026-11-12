@@ -16,6 +16,7 @@ mod file_mention;
 mod kernel_plugin;
 mod paste_content;
 mod person_channel;
+pub mod prompt_profile;
 mod reasoning_effort;
 mod secure_token;
 mod session_id;

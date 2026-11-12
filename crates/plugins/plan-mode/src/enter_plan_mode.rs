@@ -82,6 +82,14 @@ impl Tool for EnterPlanModeTool {
          exploration and planning phase."
     }
 
+    fn model_description(&self) -> &str {
+        if rebon_tool::legacy_prompt_profile() {
+            self.description()
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         // No parameters, and no extra properties accepted.
         json!({
@@ -166,6 +174,12 @@ impl Tool for EnterPlanModeTool {
         }))
     }
 }
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str =
+    "Ask the user to enter plan mode: the session turns read-only until they approve \
+a plan you submit with ExitPlanMode. Use it only when the user must choose the approach \
+before any code is written; otherwise just do the task.";
 
 #[cfg(test)]
 mod tests {

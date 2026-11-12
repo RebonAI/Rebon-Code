@@ -594,6 +594,14 @@ ShellOutput calls or Sleep."
 /// deliberately tight; the recurring per-turn cost inside every
 /// sub-agent is ~60 tokens.
 pub fn sub_agent_notes_section() -> &'static str {
+    sub_agent_notes_section_for_profile(rebon_tool::PromptProfile::current())
+}
+
+/// [`sub_agent_notes_section`] under an explicit prompt profile.
+pub fn sub_agent_notes_section_for_profile(profile: rebon_tool::PromptProfile) -> &'static str {
+    if !profile.is_legacy() {
+        return super::lean::SUB_AGENT_NOTES;
+    }
     "Notes:\n\
 - Use absolute file paths exclusively: an Agent thread's cwd is reset between \
 bash calls.\n\

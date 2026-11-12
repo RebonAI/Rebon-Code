@@ -56,19 +56,34 @@ pub const WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT: &str = r#"SHARED WORKTREE SAFET
 - If a file you must edit already contains other changes, reread its latest contents and make the smallest compatible edit. If you cannot preserve the existing work safely, report the conflict instead of cleaning the worktree.
 - Never use git reset, checkout or switch, restore, clean, stash, revert, force push, or branch deletion to remove observed differences or recover from a suspected bad edit. Only perform such an operation when the user explicitly requested it and the current command receives explicit permission approval."#;
 
+/// The shared-worktree rules under the lean prompt profile: the same
+/// contract, without file-tool mechanics the tools describe themselves.
+pub const LEAN_WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT: &str = r#"SHARED WORKTREE SAFETY:
+- This may be a shared working tree with uncommitted changes from the user or other agents. Treat pre-existing and concurrent changes as owned work, not as errors to clean up.
+- Stay focused on the assigned task. Do not investigate, fix, format, stage, or commit unrelated changes. Scope Git status and diff inspection to task-relevant paths whenever possible.
+- Change files with the file tools; do not get around their checks with shell commands or scripts.
+- If a file you must edit already contains other changes, reread its latest contents and make the smallest compatible edit. If you cannot preserve the existing work safely, report the conflict instead of cleaning the worktree.
+- Never use git reset, checkout or switch, restore, clean, stash, revert, force push, or branch deletion to remove observed differences or recover from a suspected bad edit. Only perform such an operation when the user explicitly requested it and the current command receives explicit permission approval."#;
+
+/// The shared-worktree rules for the active prompt profile.
+pub fn workflow_agent_shared_worktree_prompt() -> &'static str {
+    if crate::legacy_prompt_profile() {
+        WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT
+    } else {
+        LEAN_WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT
+    }
+}
+
 pub fn append_workflow_agent_shared_worktree_prompt(system: Option<String>) -> String {
+    let prompt = workflow_agent_shared_worktree_prompt();
     let system = system.unwrap_or_default();
-    if system.contains(WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT) {
+    if system.contains(prompt) {
         return system;
     }
     if system.trim().is_empty() {
-        WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT.to_string()
+        prompt.to_string()
     } else {
-        format!(
-            "{}\n\n{}",
-            system.trim_end(),
-            WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT
-        )
+        format!("{}\n\n{}", system.trim_end(), prompt)
     }
 }
 
@@ -1045,6 +1060,21 @@ mod tests {
         assert!(!WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT.contains("Named teammates"));
     }
 
+    /// The lean rules keep the ownership and no-reset contract but leave
+    /// file-tool mechanics (read tracking, conflict reports) to the tools.
+    #[test]
+    fn lean_shared_worktree_prompt_keeps_the_contract_only() {
+        let lean = LEAN_WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT;
+        assert!(lean.starts_with("SHARED WORKTREE SAFETY:"));
+        assert!(lean.contains("owned work"));
+        assert!(lean.contains("do not get around their checks with shell commands"));
+        assert!(lean.contains("report the conflict"));
+        assert!(lean.contains("Never use git reset"));
+        assert!(!lean.contains("modified-since-read"));
+        assert!(!lean.contains("MultiEdit"));
+        assert!(!lean.contains("Parallel implementation agents"));
+    }
+
     #[test]
     fn appending_the_shared_worktree_prompt_is_idempotent() {
         let once = append_workflow_agent_shared_worktree_prompt(Some("BASE".into()));
@@ -1056,7 +1086,7 @@ mod tests {
         );
         assert_eq!(
             append_workflow_agent_shared_worktree_prompt(None),
-            WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT
+            workflow_agent_shared_worktree_prompt()
         );
     }
 

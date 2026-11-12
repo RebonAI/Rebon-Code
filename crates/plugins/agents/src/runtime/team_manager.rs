@@ -2710,10 +2710,20 @@ mod tests {
             .map(|tool| tool.name.as_str())
             .collect();
 
-        assert_eq!(
-            request.system.as_deref(),
-            Some("workflow shared worktree safety")
-        );
+        // The caller's system prompt, followed under the lean prompt profile
+        // by the deferred-tool line: a deny-only filter is not an allow-list,
+        // so the worker gets the session's exposure policy.
+        let system = request.system.as_deref().unwrap_or_default();
+        assert!(system.starts_with("workflow shared worktree safety"));
+        if rebon_tool::legacy_prompt_profile() {
+            assert_eq!(system, "workflow shared worktree safety");
+        } else {
+            assert!(system.contains("Deferred tools, usable once loaded"));
+            assert!(
+                !system.contains("SendMessage"),
+                "denied tools stay out: {system}"
+            );
+        }
         assert!(!tool_names.contains("Agent"));
         assert!(!tool_names.contains("TeamCreate"));
         assert!(!tool_names.contains("TeamDelete"));

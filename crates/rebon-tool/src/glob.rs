@@ -63,6 +63,22 @@ impl Tool for GlobTool {
         DESCRIPTION
     }
 
+    fn model_description(&self) -> &str {
+        if crate::legacy_prompt_profile() {
+            self.description()
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
+    fn model_input_schema(&self) -> ToolInputSchema {
+        if crate::legacy_prompt_profile() {
+            self.input_schema()
+        } else {
+            lean_schema()
+        }
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
@@ -339,6 +355,25 @@ fn display_path(path: &Path, cwd: &Path, root: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str =
+    "Find files by glob pattern (such as \"src/**/*.ts\"); returns up to 100 paths, \
+newest first. `path` (default: the working directory) should be the narrowest directory you \
+need: build output (target/, node_modules/) is skipped, and the walk stops after 100k entries \
+or 10s.";
+
+fn lean_schema() -> ToolInputSchema {
+    json!({
+        "type": "object",
+        "properties": {
+            "pattern": { "type": "string" },
+            "path": { "type": "string" }
+        },
+        "required": ["pattern"],
+        "additionalProperties": false
+    })
 }
 
 #[cfg(test)]

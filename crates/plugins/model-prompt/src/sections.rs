@@ -34,6 +34,25 @@ Prioritize these in your text:
 Use one sentence instead of three whenever one suffices. Favor brief, direct sentences \
 over lengthy explanations. Code and tool calls are exempt from this guidance.";
 
+/// The lean profile's one model-preference section (`Rung::Style`): how to
+/// talk, stated once. The legacy profile sends [`TONE_AND_STYLE`] and
+/// [`OUTPUT_EFFICIENCY`] instead.
+pub const LEAN_STYLE: &str = "# Style
+- Be concise: lead with the answer or result, skip preamble and recaps, and keep progress \
+updates to milestones, decisions you need from the user, and blockers.
+- Reference code as file_path:line_number.
+- No emojis unless the user asks for them.";
+
+/// The lean Astra addendum: what GPT-6 Astra needs beyond the shared
+/// sections, without the legacy task-decision vocabulary it no longer has.
+pub const LEAN_ASTRA_WORKING: &str = "# Working in this session
+- Explain actions at the start, at meaningful milestones, on a change of plan, or at a real \
+blocker; do not narrate routine tool calls.
+- Waiting on running work may end a turn, not the task: give a brief progress update and keep \
+responsibility for the result. Do the clear, authorized follow-up before replying.
+- If a conflict between the user's request and a skill file or REBON.md instruction causes you \
+to stop, identify that file and quote the sentence responsible.";
+
 /// Astra 的独立工作习惯；Code Mode 优先指令由公共 query 路径负责。
 pub fn astra_working() -> String {
     let mut lines = vec!["# Working in this session".to_string()];

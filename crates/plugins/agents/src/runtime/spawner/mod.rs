@@ -4540,7 +4540,10 @@ mod tests {
         assert!(system.contains("Notes:"));
         // ...and the scratchpad pointer now rides along, aimed at a
         // path ending in `scratchpad` outside the project tree.
-        assert!(system.contains("# Scratchpad Directory"));
+        assert!(
+            system.contains("# Scratchpad Directory")
+                || system.contains("Temporary files go in this session's scratchpad")
+        );
         assert!(system.replace('\\', "/").contains("/scratchpad"));
     }
 

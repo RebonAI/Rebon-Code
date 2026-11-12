@@ -124,6 +124,22 @@ impl Tool for GrepTool {
          For cross-line patterns like `struct \\\\{[\\\\s\\\\S]*?field`, use `multiline: true`"
     }
 
+    fn model_description(&self) -> &str {
+        if crate::legacy_prompt_profile() {
+            self.description()
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
+    fn model_input_schema(&self) -> ToolInputSchema {
+        if crate::legacy_prompt_profile() {
+            self.input_schema()
+        } else {
+            lean_schema()
+        }
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
@@ -690,6 +706,40 @@ fn apply_window<T>(items: Vec<T>, limit: Option<usize>, offset: usize) -> (Vec<T
         .collect::<Vec<_>>();
     let truncated = total_after_offset > effective_limit;
     (sliced, truncated.then_some(effective_limit))
+}
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str =
+    "Search file contents with a ripgrep regex (escape literal braces; set \
+`multiline` for patterns that span lines). `output_mode`: files_with_matches (default), \
+content, or count. In content mode, -A/-B/-C add context lines and -n line numbers. `glob` \
+(such as \"*.rs\") or `type` (such as \"rust\") filters files; `head_limit` and `offset` page \
+results. Keep `path` narrow: the walk stops after 100k entries or 10s.";
+
+fn lean_schema() -> ToolInputSchema {
+    json!({
+        "type": "object",
+        "properties": {
+            "pattern": { "type": "string" },
+            "path": { "type": "string" },
+            "glob": { "type": "string" },
+            "type": { "type": "string" },
+            "output_mode": {
+                "type": "string",
+                "enum": ["content", "files_with_matches", "count"]
+            },
+            "-i": { "type": "boolean" },
+            "-n": { "type": "boolean" },
+            "-A": { "type": "integer", "minimum": 0 },
+            "-B": { "type": "integer", "minimum": 0 },
+            "-C": { "type": "integer", "minimum": 0 },
+            "multiline": { "type": "boolean" },
+            "head_limit": { "type": "integer", "minimum": 0 },
+            "offset": { "type": "integer", "minimum": 0 }
+        },
+        "required": ["pattern"],
+        "additionalProperties": false
+    })
 }
 
 #[cfg(test)]

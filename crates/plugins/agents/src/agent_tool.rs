@@ -59,7 +59,10 @@ fn external_model_target(context: &ToolContext, model: Option<&str>) -> Option<S
 #[derive(Debug, Clone)]
 pub struct AgentTool {
     description: String,
+    /// The provider-visible description under `REBON_PROMPT_PROFILE=legacy`.
     model_description: String,
+    /// The provider-visible description under the lean prompt profile.
+    lean_model_description: String,
     registry: Arc<AgentRegistry>,
     use_worktree: bool,
     /// The [`rebon_tool::AgentRegistrySelection`] generation this tool was
@@ -252,9 +255,12 @@ impl AgentTool {
         let model_description = format!(
             "Launch specialized sub-agents for complex tasks. Prefer direct investigation with Read, Glob, and Grep, including multi-round and cross-module searches; use Explore for extensive separable research with clear independent parallel or context-saving benefits, not merely unclear scope. Use subagent_type for a matching role; omit for general-purpose. `provider`, `model`, and `modelProfile` are optional routing overrides. Normally omit them to inherit the selected agent definition and current session/provider defaults; set them only when intentionally targeting exact configured identifiers. Do not specify both `model` and `modelProfile`. A named local agent is a reusable session teammate: the first call creates it, and later calls with the same name dispatch follow-up work while preserving its context. Set `name` only when that accumulated context is likely to be reused; do not name one-off searches, reviews, verifications, or implementations merely to label them. Named teammates use the execution boundary fixed by their teammate/session: never combine `name` with per-call `cwd`, `allowed_roots`, `isolation`, or `allowed_tools`. Concurrent/background write agents are auto-isolated in runtime-created worktrees and merged back serially; named teammates cannot be concurrent writers. Named teammates default to background; completion delivery and automatic continuation follow session-specific guidance; omit `run_in_background` unless the Agent call itself must block for the handoff. Omit name for a one-shot sub-agent. Choose a feasible execution mode before teammate reuse. Among feasible options, prefer relevant context from the current roster. Without automatic continuation, use foreground one-shot work or execute directly for necessary dependencies. Use SendMessage only to supplement or correct work already in progress. One-shot local agents default to foreground; named teammates and external ACP agents default to background. Before invoking an external ACP agent, first send the user a short visible status message describing the delegation. Keep one-shot Explore agents in the foreground when their findings determine your next step; do not force named Explore teammates foreground merely to wait for them. Yielding is not final delivery: retain responsibility for results and verification, following the user's latest pause, cancellation, or scope change.\n\nAvailable agent types:\n{agent_lines}"
         );
+        let lean_model_description =
+            lean_model_description(&registry.format_lean_lines(use_worktree));
         Self {
             description,
             model_description,
+            lean_model_description,
             registry,
             use_worktree,
             selection_generation: None,
@@ -515,7 +521,11 @@ impl Tool for AgentTool {
     }
 
     fn model_description(&self) -> &str {
-        &self.model_description
+        if rebon_tool::legacy_prompt_profile() {
+            &self.model_description
+        } else {
+            &self.lean_model_description
+        }
     }
 
     fn is_enabled(&self) -> bool {
@@ -528,6 +538,14 @@ impl Tool for AgentTool {
 
     fn search_hint(&self) -> Option<&str> {
         Some("sub-agent delegate specialized agents parallel exploration planning review")
+    }
+
+    fn model_input_schema(&self) -> ToolInputSchema {
+        if rebon_tool::legacy_prompt_profile() {
+            self.input_schema()
+        } else {
+            lean_input_schema()
+        }
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -2399,11 +2417,82 @@ impl AgentTool {
     }
 }
 
+/// The `Agent` tool's provider-visible description under the lean prompt
+/// profile: the delegation policy's one home, then the roster.
+fn lean_model_description(agent_lines: &str) -> String {
+    format!(
+        "Run a sub-agent on a self-contained task. It sees only `prompt`, so state the goal, \
+         what you already know, and what to return; its result comes back to you, not the user. \
+         Do directed lookups yourself with Read, Glob, and Grep; delegate broad, separable \
+         research (Explore) or independent work that gains from running in parallel, and do \
+         not repeat work you delegated.\n\
+         - `subagent_type` picks a role below; omit it for general-purpose. `description` is a \
+         3-5 word label.\n\
+         - One-shot agents run in the foreground unless `run_in_background` is true. Concurrent \
+         or background agents that write files get their own worktree, merged back when they \
+         finish.\n\
+         - `name` makes a reusable teammate in this session: a later call with the same name \
+         sends it follow-up work, and it runs in the background. Name an agent only when you \
+         will reuse its context, and never combine `name` with `cwd`, `allowed_roots`, \
+         `isolation`, or `allowed_tools`.\n\
+         - Set `model`, `provider`, `modelProfile`, or `reasoningEffort` only when the user asks; \
+         use exact configured IDs, and not both `model` and `modelProfile`.\n\
+         - Before delegating to an external ACP agent, tell the user what you are handing off.\n\
+         \n\
+         Agent types:\n\
+         {agent_lines}"
+    )
+}
+
+/// The fields a model sets. Dispatch still accepts the harness-only ones in
+/// [`AgentTool::input_schema`] (`context`, `cacheStrategy`, `system`, `mode`,
+/// `metadata`, `coordinator_task_kind`), which internal callers pass.
+fn lean_input_schema() -> ToolInputSchema {
+    json!({
+        "type": "object",
+        "properties": {
+            "description": { "type": "string" },
+            "prompt": { "type": "string" },
+            "subagent_type": { "type": "string" },
+            "run_in_background": { "type": "boolean" },
+            "name": { "type": "string" },
+            "team_name": { "type": "string" },
+            "task_kind": {
+                "type": "string",
+                "enum": ["research", "implementation", "verification", "other"]
+            },
+            "isolation": { "type": "string", "description": "\"worktree\" for an isolated git worktree." },
+            "cwd": { "type": "string" },
+            "allowed_roots": { "type": "array", "items": { "type": "string" } },
+            "allowed_tools": { "type": "array", "items": { "type": "string" } },
+            "model": { "type": "string" },
+            "provider": { "type": "string" },
+            "modelProfile": { "type": "string" },
+            "reasoningEffort": {
+                "type": "string",
+                "enum": ["max", "xhigh", "high", "medium", "low"]
+            }
+        },
+        "required": ["prompt"],
+        "additionalProperties": false
+    })
+}
+
+#[cfg(test)]
+impl AgentTool {
+    /// The legacy provider-visible description, whatever the process's
+    /// prompt profile: the tests below pin its wording.
+    fn legacy_model_description(&self) -> &str {
+        &self.model_description
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rebon_tool::agent_registry::{AgentGroups, AgentRuntime, AgentSource, ResolvedAgentDef};
     use rebon_tool::tasks::test_support::TestConfigHome;
+    use rebon_tool::workflow_agent_shared_worktree_prompt;
     use rebon_tool::{
         set_sub_agents_enabled, SubAgentResult, SubAgentSpawner, TeammateHandoff,
         TeammateSpawnResult, UltraplanRunRepository, WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT,
@@ -2435,7 +2524,7 @@ mod tests {
             .description()
             .contains("Named teammates cannot be concurrent writers"));
         assert!(tool
-            .model_description()
+            .legacy_model_description()
             .contains("named teammates cannot be concurrent writers"));
     }
 
@@ -2572,7 +2661,7 @@ mod tests {
     #[test]
     fn agent_descriptions_follow_session_completion_capabilities() {
         let tool = AgentTool::new();
-        for description in [tool.description(), tool.model_description()] {
+        for description in [tool.description(), tool.legacy_model_description()] {
             assert!(description.contains("session-specific guidance"));
             assert!(!description.contains("report completion automatically"));
             assert!(!description.contains("you will be automatically notified"));
@@ -2583,15 +2672,15 @@ mod tests {
     #[test]
     fn agent_descriptions_choose_mode_before_reuse_and_retain_delivery() {
         let tool = AgentTool::new();
-        for description in [tool.description(), tool.model_description()] {
+        for description in [tool.description(), tool.legacy_model_description()] {
             assert!(description.contains("Choose a feasible execution mode before teammate reuse"));
             assert!(description.contains("retain responsibility for results and verification"));
         }
         assert!(tool
-            .model_description()
+            .legacy_model_description()
             .contains("Yielding is not final delivery"));
         assert!(tool
-            .model_description()
+            .legacy_model_description()
             .contains("latest pause, cancellation, or scope change"));
     }
 
@@ -2641,7 +2730,7 @@ mod tests {
     #[test]
     fn agent_descriptions_explain_model_routing_overrides() {
         let tool = AgentTool::new();
-        for description in [tool.description(), tool.model_description()] {
+        for description in [tool.description(), tool.legacy_model_description()] {
             assert!(description.contains("optional routing overrides"));
             assert!(description.contains("Normally omit them"));
             assert!(description.contains("exact configured identifiers"));
@@ -2897,14 +2986,14 @@ mod tests {
         // that half of the claim.
         assert!(!desc.contains("- Plan:"));
         assert!(!desc.contains("Do not invoke this from Plan Mode"));
-        assert!(!tool.model_description().contains("- Plan:"));
+        assert!(!tool.legacy_model_description().contains("- Plan:"));
         assert!(
             desc.contains("If the agent description mentions that it should be used proactively")
         );
         assert!(desc.contains("Never delegate understanding"));
         assert!(desc.contains("Prefer direct investigation"));
         assert!(tool
-            .model_description()
+            .legacy_model_description()
             .contains("Prefer direct investigation"));
         assert!(!desc.contains("One probe was enough"));
         assert!(desc.contains("never combine `name` with per-call `cwd`"));
@@ -2916,26 +3005,26 @@ mod tests {
         // applies in every mode) is always documented.
         assert!(desc.contains("automatically isolated in runtime-created worktrees"));
         assert!(tool
-            .model_description()
+            .legacy_model_description()
             .contains("Launch specialized sub-agents"));
         assert!(tool
-            .model_description()
+            .legacy_model_description()
             .contains("never combine `name` with per-call `cwd`"));
         assert!(tool
-            .model_description()
+            .legacy_model_description()
             .contains("do not name one-off searches"));
-        assert!(tool.model_description().contains("- Explore:"));
+        assert!(tool.legacy_model_description().contains("- Explore:"));
         assert!(tool
-            .model_description()
+            .legacy_model_description()
             .contains("Keep one-shot Explore agents in the foreground"));
         assert!(tool
-            .model_description()
+            .legacy_model_description()
             .contains("named teammates and external ACP agents default to background"));
         assert!(tool
-            .model_description()
+            .legacy_model_description()
             .contains("first send the user a short visible status message"));
         assert!(desc.contains("Before invoking an external ACP agent"));
-        assert!(!tool.model_description().contains("Example usage"));
+        assert!(!tool.legacy_model_description().contains("Example usage"));
     }
 
     #[test]
@@ -2944,8 +3033,8 @@ mod tests {
         let desc = tool.description();
         assert!(desc.contains("batch-worker"));
         assert!(desc.contains("worktree"));
-        assert!(tool.model_description().contains("batch-worker"));
-        assert!(tool.model_description().contains("worktree"));
+        assert!(tool.legacy_model_description().contains("batch-worker"));
+        assert!(tool.legacy_model_description().contains("worktree"));
     }
 
     #[test]
@@ -3006,7 +3095,11 @@ mod tests {
         // Read-only allowed_tools → no shared-worktree block, even inside
         // a workflow: the agent cannot write the tree.
         let system = recorded[0].system.as_deref().unwrap_or_default();
-        assert!(system.starts_with("You are an agent for Rebon"));
+        // The general-purpose persona, in either prompt profile's words.
+        assert!(
+            system.starts_with("You are an agent for Rebon")
+                || system.starts_with("You are a sub-agent of Rebon")
+        );
         assert!(!system.contains("SHARED WORKTREE SAFETY:"));
     }
 
@@ -3032,7 +3125,7 @@ mod tests {
             .system
             .as_deref()
             .unwrap_or_default()
-            .contains(WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT));
+            .contains(workflow_agent_shared_worktree_prompt()));
     }
 
     #[tokio::test]
@@ -3049,7 +3142,11 @@ mod tests {
         let recorded = spawner.calls.lock().unwrap();
         assert_eq!(recorded[0].workflow_nesting_depth, 0);
         let system = recorded[0].system.as_deref().unwrap_or_default();
-        assert!(system.starts_with("You are an agent for Rebon"));
+        // The general-purpose persona, in either prompt profile's words.
+        assert!(
+            system.starts_with("You are an agent for Rebon")
+                || system.starts_with("You are a sub-agent of Rebon")
+        );
         assert!(!system.contains("SHARED WORKTREE SAFETY:"));
     }
 
@@ -3769,11 +3866,11 @@ mod tests {
         assert_eq!(out["agentType"], "Explore");
         let recorded = spawner.calls.lock().unwrap();
         assert_eq!(recorded[0].metadata["agent_type"], "Explore");
-        assert!(recorded[0]
-            .system
-            .as_deref()
-            .unwrap_or_default()
-            .contains("file search specialist"));
+        let system = recorded[0].system.as_deref().unwrap_or_default();
+        // The Explore persona, in either prompt profile's words.
+        assert!(
+            system.contains("file search specialist") || system.contains("read-only search agent")
+        );
     }
 
     #[tokio::test]
@@ -4780,7 +4877,7 @@ mod tests {
             .system
             .as_deref()
             .unwrap_or_default()
-            .contains(WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT));
+            .contains(workflow_agent_shared_worktree_prompt()));
         assert_eq!(background[0].metadata["display_name"], "explore-engine");
         assert_eq!(background[0].cwd.as_deref(), Some("C:/projects/example"));
     }
@@ -5500,7 +5597,7 @@ mod tests {
         assert!(calls[0]
             .system
             .as_deref()
-            .is_some_and(|system| system.contains(WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT)));
+            .is_some_and(|system| system.contains(workflow_agent_shared_worktree_prompt())));
     }
 
     #[tokio::test]

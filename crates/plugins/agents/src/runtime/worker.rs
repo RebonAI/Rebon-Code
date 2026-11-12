@@ -9,9 +9,7 @@
 use std::sync::Arc;
 
 use rebon_api::{PruneLevelHandle, ReasoningEffort, SessionHandle, StopReason, Usage};
-use rebon_core::query::{
-    filtered_tools_from_engine, run_query, tools_from_engine, QueryEvent, QueryParams,
-};
+use rebon_core::query::{run_query, QueryEvent, QueryParams};
 use rebon_core::turn_hook::TurnHook;
 use rebon_core::Engine;
 use rebon_tool::{ExecutionPolicy, ToolContext, ToolFilter};
@@ -1207,18 +1205,27 @@ pub fn spawn_worker(
 ) -> Result<WorkerHandle, WorkerSpawnError> {
     let effective_tool_filter =
         effective_worker_tool_filter(spec.tool_filter.as_ref(), spec.execution_policy.as_ref());
-    let tools = match effective_tool_filter.as_ref() {
-        Some(filter) => {
-            let filtered = filtered_tools_from_engine(&engine, filter);
-            if filtered.is_empty() && !filter.is_unrestricted() {
-                return Err(WorkerSpawnError::NoMatchingTools(
-                    filter.allow_list().unwrap_or_default(),
-                ));
-            }
-            filtered
+    let worker_tools = engine.worker_tools(
+        effective_tool_filter.as_ref(),
+        spec.execution_policy.as_ref(),
+        spec.capability_context.is_some(),
+    );
+    let tools = worker_tools.tools;
+    if let Some(filter) = effective_tool_filter.as_ref() {
+        if tools.is_empty() && !filter.is_unrestricted() {
+            return Err(WorkerSpawnError::NoMatchingTools(
+                filter.allow_list().unwrap_or_default(),
+            ));
         }
-        None => tools_from_engine(&engine),
-    };
+    }
+    let system =
+        match rebon_core::system_prompt::deferred_tools_line(&worker_tools.deferred_tool_names) {
+            Some(line) => spec
+                .system
+                .clone()
+                .map(|system| format!("{system}\n\n{line}")),
+            None => spec.system.clone(),
+        };
     preflight_worker_capabilities(
         spec.capability_context.as_ref(),
         spec.execution_policy.as_ref(),
@@ -1270,7 +1277,7 @@ pub fn spawn_worker(
 
     let params = QueryParams {
         model: spec.model.clone(),
-        system: spec.system.clone(),
+        system: system.clone(),
         capability_mode: rebon_types::AgentCapabilityMode::Normal,
         anchored_minimal_promotion: None,
         runtime_context_message: None,
@@ -1309,7 +1316,7 @@ pub fn spawn_worker(
         invariant_execution_policy: spec.execution_policy.clone(),
         base_tool_filter: spec.tool_filter.clone(),
         effective_tool_filter,
-        post_context_reset_system: spec.system.clone(),
+        post_context_reset_system: system,
         post_context_reset_runtime_context_message: None,
         post_context_reset_transient_context_message: None,
         policy: spec.policy.clone(),
@@ -1318,6 +1325,9 @@ pub fn spawn_worker(
     };
 
     let mut tool_context = spec.tool_context.clone();
+    if let Some(index) = worker_tools.tool_search_index {
+        tool_context = tool_context.with_tool_search_index(index);
+    }
     if let Some(policy) = spec.execution_policy.clone() {
         tool_context = tool_context.with_execution_policy(policy);
     }
@@ -1347,6 +1357,7 @@ mod tests {
         events::{ContentBlockDelta, ContentBlockStart, MessageDeltaFields},
         MockModelClient, ModelClient, StreamEvent,
     };
+    use rebon_core::query::{filtered_tools_from_engine, tools_from_engine};
     use rebon_tool::Tool;
     use rebon_tools_core::{
         PermissionDecision, ToolError, ToolId, ToolInputSchema, ValidationOutcome,

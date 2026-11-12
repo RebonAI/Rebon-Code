@@ -82,6 +82,17 @@ use rebon_types::{
     ExecutionPolicy, PolicyMode, ShellPolicy, ToolCallReference, UltraplanContext, UltraplanProfile,
 };
 
+/// What [`Engine::worker_tools`] hands a spawned worker.
+#[derive(Clone)]
+pub struct WorkerTools {
+    /// The tools the worker's requests carry.
+    pub tools: Vec<rebon_api::Tool>,
+    /// The index ToolSearch answers from, when some tools are deferred.
+    pub tool_search_index: Option<Arc<ToolSearchIndex>>,
+    /// The deferred tools' names, for the worker's prompt.
+    pub deferred_tool_names: Vec<String>,
+}
+
 /// Re-export of the [`rebon_tool::PermissionBroker`] trait so
 /// downstream callers can keep importing `rebon_core::PermissionBroker`
 /// after the trait moved to `rebon-tool`. Both names refer to the
@@ -102,6 +113,10 @@ fn is_eager_promotion(execution_policy: Option<&ExecutionPolicy>, tool: &dyn Too
             .eager_promotions
             .iter()
             .any(|entry| tool_matches_name(tool.id().as_str(), tool.aliases(), entry))
+            // The ultraplan ledger is hidden outside a run (lean exposure);
+            // a run's policy is what brings it back.
+            || (policy.ultraplan.is_some()
+                && tool.id().as_str() == rebon_tool::PLAN_LEDGER_TOOL_NAME)
     })
 }
 
@@ -694,7 +709,7 @@ impl Engine {
             .map(|tool| query::ToolSnapshot {
                 name: tool.id().as_str().to_owned(),
                 description: tool.model_description().to_owned(),
-                input_schema: tool.input_schema(),
+                input_schema: tool.model_input_schema(),
                 aliases: tool.aliases(),
             })
             .collect()
@@ -781,7 +796,7 @@ impl Engine {
             .map(|tool| query::ToolSnapshot {
                 name: tool.id().as_str().to_owned(),
                 description: tool.model_description().to_owned(),
-                input_schema: tool.input_schema(),
+                input_schema: tool.model_input_schema(),
                 aliases: tool.aliases(),
             })
             .collect()
@@ -850,6 +865,56 @@ impl Engine {
             .filter(|tool| filter.allows(tool.id().as_str(), tool.aliases()))
             .map(|tool| tool.id().as_str().to_owned())
             .collect()
+    }
+
+    /// The tool list a spawned worker's requests carry, and how it reaches
+    /// the rest.
+    ///
+    /// A worker with an explicit allow-list (an agent definition's `tools`,
+    /// a caller's `allowed_tools`, an ultraplan phase), a capability-bound
+    /// worker, and every worker under `REBON_PROMPT_PROFILE=legacy` sees
+    /// every tool its filter admits, eagerly, as before. Any other worker
+    /// gets the session's exposure policy: the eager tools in its request,
+    /// the deferred ones behind ToolSearch through the returned index, named
+    /// in `deferred_tool_names`.
+    pub fn worker_tools(
+        &self,
+        filter: Option<&rebon_tool::ToolFilter>,
+        execution_policy: Option<&ExecutionPolicy>,
+        capability_bound: bool,
+    ) -> WorkerTools {
+        let explicit_allow_list = filter.is_some_and(|filter| filter.allow_list().is_some());
+        let ultraplan = execution_policy.is_some_and(|policy| policy.ultraplan.is_some());
+        if rebon_tool::legacy_prompt_profile()
+            || explicit_allow_list
+            || ultraplan
+            || capability_bound
+        {
+            return WorkerTools {
+                tools: match filter {
+                    Some(filter) => query::filtered_tools_from_engine(self, filter),
+                    None => query::tools_from_engine(self),
+                },
+                tool_search_index: None,
+                deferred_tool_names: Vec::new(),
+            };
+        }
+        let (tools, index) = match filter {
+            Some(filter) => (
+                query::filtered_eager_tools_from_engine_for_policy(self, filter, execution_policy),
+                self.build_filtered_tool_search_index_for_policy(filter, execution_policy),
+            ),
+            None => (
+                query::eager_tools_from_engine_for_policy(self, execution_policy),
+                self.build_tool_search_index_for_policy(execution_policy),
+            ),
+        };
+        let deferred_tool_names = index.names().into_iter().map(str::to_owned).collect();
+        WorkerTools {
+            tools,
+            tool_search_index: Some(Arc::new(index)),
+            deferred_tool_names,
+        }
     }
 
     pub fn find_tool(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -1878,7 +1943,12 @@ mod tests {
             .find(|tool| tool.name == "Agent")
             .expect("Agent tool should be registered");
         assert!(!agent.description.contains("batch-worker"));
-        assert!(agent.description.contains("runtime-created worktrees"));
+        // Write agents are still told about automatic worktree isolation,
+        // in either prompt profile's words.
+        assert!(
+            agent.description.contains("runtime-created worktrees")
+                || agent.description.contains("get their own worktree")
+        );
         assert!(engine
             .eager_tool_snapshots()
             .into_iter()

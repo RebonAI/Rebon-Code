@@ -295,7 +295,7 @@ pub(super) fn plugin_api_tools(
         .map(|tool| ApiTool {
             name: tool.id().as_str().to_string(),
             description: tool.model_description().to_string(),
-            input_schema: tool.input_schema(),
+            input_schema: tool.model_input_schema(),
         })
         .collect()
 }
@@ -423,8 +423,13 @@ fn api_tool_from_snapshot(snap: ToolSnapshot) -> Vec<ApiTool> {
         description: snap.description.clone(),
         input_schema: snap.input_schema.clone(),
     }];
+    // The legacy profile also advertises the `RunWorkflow` alias as a second
+    // tool with the same schema. The lean profile sends the tool once: a call
+    // under the alias still dispatches, because `Engine::find_tool` and the
+    // announced-tool set both resolve it.
     if snap.name == rebon_tool::WORKFLOW_TOOL_NAME
         && snap.aliases.contains(&rebon_tool::RUN_WORKFLOW_ALIAS)
+        && rebon_tool::legacy_prompt_profile()
     {
         let alias_description = snap.description.clone();
         let alias_schema = snap.input_schema.clone();

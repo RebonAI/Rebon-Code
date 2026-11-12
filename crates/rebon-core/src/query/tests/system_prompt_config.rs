@@ -76,7 +76,11 @@ async fn execute_with_system_prompt_config_resolves_lazily() {
         .system
         .as_deref()
         .expect("configured system prompt");
-    assert!(system.contains("# Language\nEvery reply must be in Japanese."));
+    assert!(
+        system.contains("# Language\nEvery reply must be in Japanese.")
+            || system
+                .contains("# Language\nWrite every reply, explanation, and comment in Japanese")
+    );
 }
 
 #[tokio::test]
@@ -424,7 +428,8 @@ async fn session_system_prompt_names_the_session_scratchpad_directory() {
     };
     let first = prompt_text(&captured[0]);
     assert!(
-        first.contains("# Scratchpad Directory"),
+        first.contains("# Scratchpad Directory")
+            || first.contains("Temporary files go in this session's scratchpad"),
         "main session prompt must carry the scratchpad section: {first}"
     );
     assert!(

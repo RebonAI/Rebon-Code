@@ -32,6 +32,7 @@
 //! snapshot changes nothing: the assembly stays byte-identical to the
 //! pre-seat output.
 
+use super::lean;
 use super::sections::{
     actions_section, doing_tasks_section, env_info_section, intro_section, language_section,
     runtime_tools_section, scratchpad_section, session_specific_guidance_section,
@@ -39,6 +40,7 @@ use super::sections::{
 };
 use super::{DynamicPromptContext, SystemPromptConfig, TOOL_RESULT_RETENTION_REMINDER};
 use crate::prompt_seat::{sort_sections, PluginPromptSection};
+use rebon_tool::PromptProfile;
 
 type SectionBuild = fn(&SystemPromptConfig, &DynamicPromptContext) -> Option<String>;
 
@@ -110,14 +112,35 @@ pub struct PromptAssembly {
 }
 
 impl PromptAssembly {
-    /// The section table for `variant`. Tables are validated (unique ids,
-    /// strictly ascending ranks) so ordering bugs fail loudly in tests
-    /// rather than silently reordering the prompt.
+    /// The section table for `variant` under this process's prompt profile
+    /// (`REBON_PROMPT_PROFILE`), read here, once, rather than inside a build.
     pub fn for_variant(variant: &PromptVariant) -> Self {
+        Self::for_variant_and_profile(variant, PromptProfile::current())
+    }
+
+    /// The section table for `variant` under `profile`. Tables are validated
+    /// (unique ids, strictly ascending ranks) so ordering bugs fail loudly in
+    /// tests rather than silently reordering the prompt.
+    ///
+    /// The profile picks the standard base plane and the stable plane; the
+    /// coordinator, router and watchdog contracts are their own texts under
+    /// either profile.
+    pub fn for_variant_and_profile(variant: &PromptVariant, profile: PromptProfile) -> Self {
+        let stable = || {
+            if profile.is_legacy() {
+                stable_context_sections()
+            } else {
+                lean_stable_context_sections()
+            }
+        };
         let assembly = match variant {
             PromptVariant::Standard => Self {
-                base: standard_base_sections(),
-                stable: stable_context_sections(),
+                base: if profile.is_legacy() {
+                    standard_base_sections()
+                } else {
+                    lean_base_sections()
+                },
+                stable: stable(),
                 transient: transient_context_sections(),
                 base_accepts_plugin_sections: true,
             },
@@ -126,7 +149,7 @@ impl PromptAssembly {
                 use_worktree,
             } => Self {
                 base: coordinator_base_sections(*simple, *use_worktree),
-                stable: stable_context_sections(),
+                stable: stable(),
                 transient: transient_context_sections(),
                 base_accepts_plugin_sections: false,
             },
@@ -134,7 +157,7 @@ impl PromptAssembly {
                 base: vec![section("watchdog-contract", 10, |_, _| {
                     Some(crate::watchdog_mode::watchdog_system_prompt())
                 })],
-                stable: stable_context_sections(),
+                stable: stable(),
                 transient: transient_context_sections(),
                 base_accepts_plugin_sections: false,
             },
@@ -142,7 +165,7 @@ impl PromptAssembly {
                 base: vec![section("router-contract", 10, |_, _| {
                     Some(crate::router_mode::router_system_prompt())
                 })],
-                stable: stable_context_sections(),
+                stable: stable(),
                 transient: transient_context_sections(),
                 base_accepts_plugin_sections: false,
             },
@@ -284,6 +307,63 @@ fn standard_base_sections() -> Vec<PromptSectionDef> {
     ]
 }
 
+/// The lean base plane: the same ids and ranks as the legacy table, so the
+/// model-prompt plugin's style section still lands at rank 60.
+fn lean_base_sections() -> Vec<PromptSectionDef> {
+    vec![
+        section("intro", 10, |_, _| Some(lean::INTRO.to_string())),
+        section("system", 20, |_, _| Some(lean::SYSTEM.to_string())),
+        section("doing-tasks", 30, |_, _| {
+            Some(lean::DOING_TASKS.to_string())
+        }),
+        section("actions", 40, |_, _| Some(lean::ACTIONS.to_string())),
+        section("tool-discovery", 50, |_, _| Some(lean::TOOLS.to_string())),
+    ]
+}
+
+/// The lean stable plane: the legacy ids and ranks, lean texts. The tool
+/// section carries only the deferred names (the provider's `tools` array
+/// already lists the eager ones), and is absent when nothing is deferred.
+fn lean_stable_context_sections() -> Vec<PromptSectionDef> {
+    vec![
+        section("env-info", 10, |config, ctx| {
+            Some(lean::env_info_section(config, ctx))
+        }),
+        section("language", 20, |_, ctx| {
+            ctx.language
+                .as_ref()
+                .map(|lang| lean::language_section(lang))
+        }),
+        section("rebon-md", 30, |_, ctx| {
+            optional_non_empty(&ctx.rebon_md_content)
+        }),
+        // Rank 40 is `Rung::Memory`.
+        section("mcp-instructions", 50, |_, ctx| {
+            optional_non_empty(&ctx.mcp_instructions)
+        }),
+        section("runtime-tools", 60, |config, _| {
+            lean::runtime_tools_section(&config.deferred_tool_names)
+        }),
+        section("session-guidance", 70, |config, _| {
+            Some(lean::session_guidance_section(
+                &config.tool_names,
+                &config.deferred_tool_names,
+                config.auto_continue_background_agents,
+            ))
+        }),
+        // Rank 75 is `Rung::Context`.
+        section("scratchpad", 80, |_, ctx| {
+            ctx.scratchpad_dir
+                .as_ref()
+                .filter(|dir| !dir.is_empty())
+                .map(|dir| lean::scratchpad_section(dir))
+        }),
+        section("retention-reminder", 90, |_, _| {
+            Some(lean::RETENTION_REMINDER.to_string())
+        }),
+    ]
+}
+
 fn coordinator_base_sections(simple: bool, use_worktree: bool) -> Vec<PromptSectionDef> {
     // The contract is one opaque section; `simple`/`use_worktree` are baked
     // into the closure-free build via a rank-stable pair of const-like
@@ -370,6 +450,17 @@ fn transient_context_sections() -> Vec<PromptSectionDef> {
 mod tests {
     use super::*;
     use crate::prompt_seat::Rung;
+
+    /// These tests pin the legacy tables against the legacy reference
+    /// builders; the lean tables have their own tests in
+    /// `lean_profile_tests` below.
+    struct PromptAssembly;
+
+    impl PromptAssembly {
+        fn for_variant(variant: &PromptVariant) -> super::PromptAssembly {
+            super::PromptAssembly::for_variant_and_profile(variant, PromptProfile::Legacy)
+        }
+    }
 
     /// The reference builders the registry is compared against: the section
     /// order and join rules written out plainly, without the registry, so the
@@ -807,6 +898,27 @@ mod tests {
                 rebon_plugin_model_prompt::sections::TONE_AND_STYLE,
                 rebon_plugin_model_prompt::sections::OUTPUT_EFFICIENCY
             )
+        );
+    }
+
+    /// The lean fixture, vouched for the same way: the engine's lean base
+    /// plane, then exactly the plugin's one lean style section.
+    #[test]
+    fn the_lean_model_prompt_fixture_is_the_lean_base_plus_the_style_section() {
+        const LEAN: &str =
+            include_str!("../../../plugins/model-prompt/tests/fixtures/base-prompt-lean.txt");
+        let head = super::PromptAssembly::for_variant_and_profile(
+            &PromptVariant::Standard,
+            PromptProfile::Lean,
+        )
+        .assemble_base(&full_config(), &empty_ctx());
+        assert!(
+            LEAN.starts_with(&head),
+            "the fixture opens with the lean base"
+        );
+        assert_eq!(
+            &LEAN[head.len()..],
+            format!("\n\n{}", rebon_plugin_model_prompt::sections::LEAN_STYLE)
         );
     }
 

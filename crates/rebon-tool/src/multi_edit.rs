@@ -113,6 +113,22 @@ impl Tool for MultiEditTool {
          - Only use emojis if the user explicitly requests it."
     }
 
+    fn model_description(&self) -> &str {
+        if crate::legacy_prompt_profile() {
+            self.description()
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
+    fn model_input_schema(&self) -> ToolInputSchema {
+        if crate::legacy_prompt_profile() {
+            self.input_schema()
+        } else {
+            lean_schema()
+        }
+    }
+
     fn search_hint(&self) -> Option<&str> {
         Some("batch atomic multiple replacements one file")
     }
@@ -661,6 +677,37 @@ fn validate_parsed_input(input: &MultiEditInput) -> ToolResult<ValidationOutcome
             source: err.into(),
         }),
     }
+}
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str =
+    "Apply several Edit-style replacements to one file as one write. Edits apply in \
+order, each to the result of the previous one; if any fails, nothing is written and the \
+error names its index. To create a file, pass one edit with an empty `old_string`.";
+
+fn lean_schema() -> ToolInputSchema {
+    json!({
+        "type": "object",
+        "properties": {
+            "file_path": { "type": "string" },
+            "edits": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "old_string": { "type": "string" },
+                        "new_string": { "type": "string" },
+                        "replace_all": { "type": "boolean" }
+                    },
+                    "required": ["old_string", "new_string"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["file_path", "edits"],
+        "additionalProperties": false
+    })
 }
 
 #[cfg(test)]

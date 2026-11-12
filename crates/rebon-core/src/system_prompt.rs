@@ -15,19 +15,21 @@
 //! dynamic info is resolved at prompt time.
 
 mod assembly;
+mod lean;
 mod sections;
 
 pub use self::assembly::{
     coordinator_simple_mode_enabled, PromptAssembly, PromptPlane, PromptVariant,
 };
-pub use self::sections::sub_agent_notes_section;
 #[cfg(test)]
 use self::sections::{doing_tasks_section, using_tools_section};
 use self::sections::{
     env_info_section, language_section, runtime_tools_section, scratchpad_section,
     session_specific_guidance_section,
 };
+pub use self::sections::{sub_agent_notes_section, sub_agent_notes_section_for_profile};
 pub use crate::prompt_seat::PluginPromptSection;
+pub use rebon_tool::PromptProfile;
 
 use std::path::PathBuf;
 
@@ -197,7 +199,16 @@ pub fn build_minimal_system_prompt(prompt_override: Option<&str>) -> String {
 /// The parts of [`build_split_system_prompt`] are joined by double
 /// newlines.
 pub fn build_system_prompt(config: &SystemPromptConfig, ctx: &DynamicPromptContext) -> String {
-    let parts = build_split_system_prompt(config, ctx);
+    build_system_prompt_for_profile(config, ctx, PromptProfile::current())
+}
+
+/// [`build_system_prompt`] under an explicit prompt profile.
+pub fn build_system_prompt_for_profile(
+    config: &SystemPromptConfig,
+    ctx: &DynamicPromptContext,
+    profile: PromptProfile,
+) -> String {
+    let parts = build_split_system_prompt_for_profile(config, ctx, profile);
     join_prompt_parts(
         parts.base_system,
         parts.runtime_context,
@@ -211,7 +222,16 @@ pub fn build_system_prompt_report(
     config: &SystemPromptConfig,
     ctx: &DynamicPromptContext,
 ) -> PromptCostReport {
-    let parts = build_split_system_prompt(config, ctx);
+    build_system_prompt_report_for_profile(config, ctx, PromptProfile::current())
+}
+
+/// [`build_system_prompt_report`] under an explicit prompt profile.
+pub fn build_system_prompt_report_for_profile(
+    config: &SystemPromptConfig,
+    ctx: &DynamicPromptContext,
+    profile: PromptProfile,
+) -> PromptCostReport {
+    let parts = build_split_system_prompt_for_profile(config, ctx, profile);
     let mut sections = vec![prompt_text_section_report(
         "base system prompt",
         "system_prompt_base",
@@ -219,7 +239,12 @@ pub fn build_system_prompt_report(
     )];
 
     if let Some(runtime_context) = parts.runtime_context.as_deref().filter(|s| !s.is_empty()) {
-        sections.push(stable_runtime_context_report(config, ctx, runtime_context));
+        sections.push(stable_runtime_context_report(
+            config,
+            ctx,
+            runtime_context,
+            profile,
+        ));
     }
     if let Some(transient_context) = parts.transient_context.as_deref().filter(|s| !s.is_empty()) {
         sections.push(transient_runtime_context_report(
@@ -236,18 +261,28 @@ fn stable_runtime_context_report(
     config: &SystemPromptConfig,
     ctx: &DynamicPromptContext,
     runtime_context: &str,
+    profile: PromptProfile,
 ) -> PromptSectionReport {
+    let legacy = profile.is_legacy();
     let mut details = Vec::new();
     details.push(prompt_text_section_report(
         "environment context",
         "runtime_context",
-        &env_info_section(config, ctx),
+        &if legacy {
+            env_info_section(config, ctx)
+        } else {
+            lean::env_info_section(config, ctx)
+        },
     ));
     if let Some(ref lang) = ctx.language {
         details.push(prompt_text_section_report(
             "language preference",
             "runtime_context",
-            &language_section(lang),
+            &if legacy {
+                language_section(lang)
+            } else {
+                lean::language_section(lang)
+            },
         ));
     }
     if let Some(content) = optional_non_empty_section(&ctx.rebon_md_content) {
@@ -268,8 +303,13 @@ fn stable_runtime_context_report(
             &mcp,
         ));
     }
-    if !config.tool_names.is_empty() || !config.deferred_tool_names.is_empty() {
-        let runtime_tools = runtime_tools_section(&config.tool_names, &config.deferred_tool_names);
+    let runtime_tools = if legacy {
+        (!config.tool_names.is_empty() || !config.deferred_tool_names.is_empty())
+            .then(|| runtime_tools_section(&config.tool_names, &config.deferred_tool_names))
+    } else {
+        lean::runtime_tools_section(&config.deferred_tool_names)
+    };
+    if let Some(runtime_tools) = runtime_tools {
         let tool_details =
             config
                 .tool_names
@@ -286,11 +326,20 @@ fn stable_runtime_context_report(
                 .with_details(tool_details),
         );
     }
-    if let Some(section) = session_specific_guidance_section(
-        &config.tool_names,
-        &config.deferred_tool_names,
-        config.auto_continue_background_agents,
-    ) {
+    let session_guidance = if legacy {
+        session_specific_guidance_section(
+            &config.tool_names,
+            &config.deferred_tool_names,
+            config.auto_continue_background_agents,
+        )
+    } else {
+        Some(lean::session_guidance_section(
+            &config.tool_names,
+            &config.deferred_tool_names,
+            config.auto_continue_background_agents,
+        ))
+    };
+    if let Some(section) = session_guidance {
         details.push(prompt_text_section_report(
             "skill guidance",
             "runtime_skill_guidance",
@@ -306,14 +355,22 @@ fn stable_runtime_context_report(
             details.push(prompt_text_section_report(
                 "scratchpad directory",
                 "runtime_context",
-                &scratchpad_section(dir),
+                &if legacy {
+                    scratchpad_section(dir)
+                } else {
+                    lean::scratchpad_section(dir)
+                },
             ));
         }
     }
     details.push(prompt_text_section_report(
         "tool result retention reminder",
         "runtime_context",
-        TOOL_RESULT_RETENTION_REMINDER,
+        if legacy {
+            TOOL_RESULT_RETENTION_REMINDER
+        } else {
+            lean::RETENTION_REMINDER
+        },
     ));
 
     prompt_text_section_report("runtime context", "runtime_context", runtime_context)
@@ -377,13 +434,21 @@ fn transient_runtime_context_report(
 /// Build only the stable base prompt for top-level provider `system` /
 /// `instructions` fields.
 pub fn build_base_system_prompt(config: &SystemPromptConfig) -> String {
+    build_base_system_prompt_for_profile(config, PromptProfile::current())
+}
+
+/// [`build_base_system_prompt`] under an explicit prompt profile.
+pub fn build_base_system_prompt_for_profile(
+    config: &SystemPromptConfig,
+    profile: PromptProfile,
+) -> String {
     if let Some(prompt_override) =
         non_empty_prompt_override(config.normal_system_prompt_override.as_deref())
     {
         return prompt_override.to_string();
     }
 
-    PromptAssembly::for_variant(&PromptVariant::Standard)
+    PromptAssembly::for_variant_and_profile(&PromptVariant::Standard, profile)
         .assemble_base(config, &DynamicPromptContext::default())
 }
 
@@ -413,7 +478,17 @@ pub fn build_stable_runtime_context_block(
     config: &SystemPromptConfig,
     ctx: &DynamicPromptContext,
 ) -> Option<String> {
-    PromptAssembly::for_variant(&PromptVariant::Standard).assemble_stable(config, ctx)
+    build_stable_runtime_context_block_for_profile(config, ctx, PromptProfile::current())
+}
+
+/// [`build_stable_runtime_context_block`] under an explicit prompt profile.
+pub fn build_stable_runtime_context_block_for_profile(
+    config: &SystemPromptConfig,
+    ctx: &DynamicPromptContext,
+    profile: PromptProfile,
+) -> Option<String> {
+    PromptAssembly::for_variant_and_profile(&PromptVariant::Standard, profile)
+        .assemble_stable(config, ctx)
 }
 
 /// Build high-churn per-request runtime context.
@@ -434,9 +509,18 @@ pub fn build_runtime_context_block(
     config: &SystemPromptConfig,
     ctx: &DynamicPromptContext,
 ) -> Option<String> {
+    build_runtime_context_block_for_profile(config, ctx, PromptProfile::current())
+}
+
+/// [`build_runtime_context_block`] under an explicit prompt profile.
+pub fn build_runtime_context_block_for_profile(
+    config: &SystemPromptConfig,
+    ctx: &DynamicPromptContext,
+    profile: PromptProfile,
+) -> Option<String> {
     finish_sections(
         [
-            build_stable_runtime_context_block(config, ctx),
+            build_stable_runtime_context_block_for_profile(config, ctx, profile),
             build_transient_runtime_context_block(config, ctx),
         ]
         .into_iter()
@@ -452,8 +536,17 @@ pub fn build_split_system_prompt(
     config: &SystemPromptConfig,
     ctx: &DynamicPromptContext,
 ) -> PromptParts {
+    build_split_system_prompt_for_profile(config, ctx, PromptProfile::current())
+}
+
+/// [`build_split_system_prompt`] under an explicit prompt profile.
+pub fn build_split_system_prompt_for_profile(
+    config: &SystemPromptConfig,
+    ctx: &DynamicPromptContext,
+    profile: PromptProfile,
+) -> PromptParts {
     let variant = PromptVariant::from_context(ctx);
-    let assembly = PromptAssembly::for_variant(&variant);
+    let assembly = PromptAssembly::for_variant_and_profile(&variant, profile);
     // The user's Normal base override replaces the standard persona and
     // nothing else. The coordinator variant's base plane is its worker-routing
     // contract rather than a persona — before the assembly registry existed
@@ -537,6 +630,12 @@ const GIT_STATUS_MAX_CHARS: usize = 2000;
 /// abc1234 last commit
 /// ```
 pub fn collect_git_status(cwd: &str) -> Option<String> {
+    collect_git_status_for_profile(cwd, PromptProfile::current())
+}
+
+/// [`collect_git_status`] under an explicit prompt profile (the header line
+/// is the only part that differs).
+pub fn collect_git_status_for_profile(cwd: &str, profile: PromptProfile) -> Option<String> {
     if !check_is_git(cwd) {
         return None;
     }
@@ -581,12 +680,18 @@ pub fn collect_git_status(cwd: &str) -> Option<String> {
     // fresh copy is appended to history (or attached transiently), so the
     // header must not claim conversation-lifetime validity: with several
     // snapshots in one transcript, the newest one wins.
-    lines.push(
-        "The git status below was captured at the beginning of this turn. \
-         It stays fixed throughout the turn. A newer gitStatus snapshot later \
-         in the conversation replaces this one as the current snapshot."
-            .to_string(),
-    );
+    if profile.is_legacy() {
+        lines.push(
+            "The git status below was captured at the beginning of this turn. \
+             It stays fixed throughout the turn. A newer gitStatus snapshot later \
+             in the conversation replaces this one as the current snapshot."
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "Snapshot from the start of this turn; a later gitStatus replaces it.".to_string(),
+        );
+    }
     lines.push(format!("Current branch: {branch}"));
     lines.push(format!(
         "Main branch (normally the branch to use for PRs): {main_branch}"
@@ -672,15 +777,30 @@ fn scratchpad_dir_for_session(cwd: &str, session_id: Option<&str>) -> Option<Str
 /// sessions and cannot depend on this crate, resolves the same one.
 pub use rebon_session::{remove_scratchpad_for, scratchpad_dir_for};
 
+/// The deferred-tool line a prompt carries when some tools are reachable
+/// only through ToolSearch, or `None` when none are.
+pub fn deferred_tools_line(deferred_names: &[String]) -> Option<String> {
+    lean::runtime_tools_section(deferred_names)
+}
+
 /// Suffix appended to every sub-agent system prompt: the shared
 /// sub-agent notes plus a scratchpad pointer, so workers put temp
 /// artifacts (test scripts, packaging output, export bundles) outside
 /// the user's project tree instead of scattering them into the cwd.
 pub fn sub_agent_prompt_suffix(scratchpad_dir: &str) -> String {
+    sub_agent_prompt_suffix_for_profile(scratchpad_dir, PromptProfile::current())
+}
+
+/// [`sub_agent_prompt_suffix`] under an explicit prompt profile.
+pub fn sub_agent_prompt_suffix_for_profile(scratchpad_dir: &str, profile: PromptProfile) -> String {
+    let scratchpad = if profile.is_legacy() {
+        sections::scratchpad_section(scratchpad_dir)
+    } else {
+        lean::scratchpad_section(scratchpad_dir)
+    };
     format!(
         "{notes}\n\n{scratchpad}",
-        notes = sub_agent_notes_section(),
-        scratchpad = sections::scratchpad_section(scratchpad_dir),
+        notes = sub_agent_notes_section_for_profile(profile),
     )
 }
 
@@ -828,6 +948,54 @@ pub fn prime_injected_prompt_files(
 mod tests {
     use super::*;
     use crate::tests::SubAgentsEnabledGuard;
+
+    // These tests pin the legacy wording (`REBON_PROMPT_PROFILE=legacy`).
+    // The local items below shadow the profile-reading builders from
+    // `super::*` with their legacy-profile variants, so every test here
+    // reads the legacy surface whatever the process environment says. The
+    // lean surface is pinned by `lean_profile_tests` below.
+    const PROFILE: PromptProfile = PromptProfile::Legacy;
+
+    fn build_system_prompt(config: &SystemPromptConfig, ctx: &DynamicPromptContext) -> String {
+        super::build_system_prompt_for_profile(config, ctx, PROFILE)
+    }
+
+    fn build_split_system_prompt(
+        config: &SystemPromptConfig,
+        ctx: &DynamicPromptContext,
+    ) -> PromptParts {
+        super::build_split_system_prompt_for_profile(config, ctx, PROFILE)
+    }
+
+    fn build_system_prompt_report(
+        config: &SystemPromptConfig,
+        ctx: &DynamicPromptContext,
+    ) -> PromptCostReport {
+        super::build_system_prompt_report_for_profile(config, ctx, PROFILE)
+    }
+
+    fn build_base_system_prompt(config: &SystemPromptConfig) -> String {
+        super::build_base_system_prompt_for_profile(config, PROFILE)
+    }
+
+    fn build_runtime_context_block(
+        config: &SystemPromptConfig,
+        ctx: &DynamicPromptContext,
+    ) -> Option<String> {
+        super::build_runtime_context_block_for_profile(config, ctx, PROFILE)
+    }
+
+    fn collect_git_status(cwd: &str) -> Option<String> {
+        super::collect_git_status_for_profile(cwd, PROFILE)
+    }
+
+    fn sub_agent_prompt_suffix(scratchpad_dir: &str) -> String {
+        super::sub_agent_prompt_suffix_for_profile(scratchpad_dir, PROFILE)
+    }
+
+    fn sub_agent_notes_section() -> &'static str {
+        super::sub_agent_notes_section_for_profile(PROFILE)
+    }
 
     fn sample_config() -> SystemPromptConfig {
         SystemPromptConfig {
@@ -2550,5 +2718,221 @@ mod tests {
             state.is_partial_view,
             "stripped injected view must be partial"
         );
+    }
+}
+
+/// The lean prompt profile, the default. The legacy wording is pinned by
+/// `tests` above and by `rebon-plugin-model-prompt`'s golden fixtures.
+#[cfg(test)]
+mod lean_profile_tests {
+    use super::*;
+    use crate::tests::SubAgentsEnabledGuard;
+
+    const LEAN: PromptProfile = PromptProfile::Lean;
+
+    fn config(tools: &[&str], deferred: &[&str], auto_continue: bool) -> SystemPromptConfig {
+        SystemPromptConfig {
+            model: "claude-opus-4-6".into(),
+            model_marketing_name: Some("Claude Opus 4.6".into()),
+            knowledge_cutoff: Some("May 2025".into()),
+            tool_names: tools.iter().map(|t| t.to_string()).collect(),
+            deferred_tool_names: deferred.iter().map(|t| t.to_string()).collect(),
+            platform: "linux".into(),
+            shell: "zsh".into(),
+            os_version: "Ubuntu 24.04".into(),
+            language: None,
+            normal_system_prompt_override: None,
+            minimal_system_prompt_override: None,
+            chat_system_prompt_override: None,
+            auto_continue_background_agents: auto_continue,
+        }
+    }
+
+    fn ctx() -> DynamicPromptContext {
+        DynamicPromptContext {
+            cwd: "/home/user/project".into(),
+            is_git: true,
+            session_date: Some("2026-04-10".into()),
+            scratchpad_dir: Some("/tmp/rebon/p/s/scratchpad".into()),
+            ..DynamicPromptContext::default()
+        }
+    }
+
+    fn stable(config: &SystemPromptConfig, ctx: &DynamicPromptContext) -> String {
+        build_stable_runtime_context_block_for_profile(config, ctx, LEAN).unwrap()
+    }
+
+    /// Same ids, same ranks: plugin sections land where they always did.
+    #[test]
+    fn lean_tables_keep_the_legacy_section_ids() {
+        for variant in [
+            PromptVariant::Standard,
+            PromptVariant::Coordinator {
+                simple: false,
+                use_worktree: false,
+            },
+        ] {
+            let lean = PromptAssembly::for_variant_and_profile(&variant, LEAN);
+            let legacy = PromptAssembly::for_variant_and_profile(&variant, PromptProfile::Legacy);
+            for plane in [
+                PromptPlane::Base,
+                PromptPlane::Stable,
+                PromptPlane::Transient,
+            ] {
+                assert_eq!(lean.plane_ids(plane), legacy.plane_ids(plane), "{plane:?}");
+            }
+        }
+    }
+
+    /// The base plane is byte-stable: the same for every tool set, and it
+    /// names no tool, so a tool-set change never moves the cache prefix.
+    #[test]
+    fn lean_base_is_independent_of_the_tool_set() {
+        let a = build_base_system_prompt_for_profile(&config(&[], &[], true), LEAN);
+        let b = build_base_system_prompt_for_profile(
+            &config(&["Read", "Edit", "Bash", "Agent"], &["WebFetch"], false),
+            LEAN,
+        );
+        assert_eq!(a, b);
+        for name in [
+            "Read",
+            "Write",
+            "Edit",
+            "Bash",
+            "Agent",
+            "ToolSearch",
+            "AskUserQuestion",
+        ] {
+            assert!(!a.contains(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn lean_runtime_context_drops_the_eager_tool_list() {
+        let config = config(&["Read", "Bash", "Skill"], &["WebSearch", "Monitor"], true);
+        let text = stable(&config, &ctx());
+        assert!(!text.contains("Provider-visible"));
+        assert!(!text.contains("# Using your tools"));
+        assert!(text.contains(
+            "Deferred tools, usable once loaded: call ToolSearch with \"select:<name>[,<name>...]\" \
+             to get a schema, then call the tool by name: Monitor, WebSearch"
+        ));
+        // Nothing deferred, no line.
+        let none = stable(
+            &super::lean_profile_tests::config(&["Read"], &[], true),
+            &ctx(),
+        );
+        assert!(!none.contains("Deferred tools"));
+    }
+
+    #[test]
+    fn lean_runtime_context_carries_environment_language_scratchpad_and_retention() {
+        let mut config = config(&["Read", "Bash"], &[], true);
+        config.language = Some("Chinese".into());
+        let mut ctx = ctx();
+        ctx.language = Some("Chinese".into());
+        let text = stable(&config, &ctx);
+        assert!(text.starts_with(
+            "# Environment\n- Working directory: /home/user/project (git repository: yes)\n\
+             - Platform: linux; OS: Ubuntu 24.04\n- Shell: zsh\n\
+             - Model: Claude Opus 4.6 (claude-opus-4-6); knowledge cutoff May 2025\n\
+             - Date: 2026-04-10"
+        ));
+        assert!(text.contains("# Language\nWrite every reply, explanation, and comment in Chinese"));
+        assert!(text.contains("`/tmp/rebon/p/s/scratchpad`"));
+        assert!(text.contains("<git-root>/.rebon/worktrees/"));
+        assert!(text.ends_with(lean::RETENTION_REMINDER));
+    }
+
+    /// One waiting rule, worded for what the frontend can do.
+    #[test]
+    fn lean_session_guidance_follows_the_frontend() {
+        let _guard = SubAgentsEnabledGuard::set(true);
+        let auto = stable(&config(&["Bash", "Agent"], &[], true), &ctx());
+        assert!(auto.contains("`! <command>`"));
+        assert!(auto.contains("Background agents and shells send a notification"));
+        assert!(auto.contains("Never poll or Sleep"));
+
+        let manual = stable(&config(&["Bash", "Agent"], &[], false), &ctx());
+        assert!(manual.contains("Nothing wakes you after your turn ends"));
+        assert!(manual.contains("one ShellOutput call"));
+        assert!(manual.contains("arrives only with the user's next message"));
+        assert!(!manual.contains("starts a new turn"));
+
+        let bare = stable(&config(&["Read"], &[], true), &ctx());
+        assert!(!bare.contains("Background"));
+        assert!(bare.contains("`! <command>`"));
+    }
+
+    /// The Windows shell line names the shell the session actually has.
+    #[test]
+    fn lean_windows_shell_line_follows_the_advertised_tools() {
+        let mut config = config(&["PowerShell"], &[], true);
+        config.platform = "win32".into();
+        assert!(stable(&config, &ctx()).contains("- Shell: PowerShell, not POSIX"));
+        config.tool_names = vec!["Bash".into()];
+        assert!(stable(&config, &ctx()).contains("- Shell: zsh (Unix syntax"));
+        config.tool_names = vec!["Bash".into(), "PowerShell".into()];
+        assert!(stable(&config, &ctx()).contains("- Shells: Bash takes Unix syntax"));
+    }
+
+    #[test]
+    fn lean_git_status_header_is_one_line() {
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        if !check_is_git(cwd) {
+            return;
+        }
+        let status = collect_git_status_for_profile(cwd, LEAN).unwrap();
+        assert!(status.starts_with(
+            "Snapshot from the start of this turn; a later gitStatus replaces it.\n\nCurrent branch: "
+        ));
+    }
+
+    #[test]
+    fn lean_sub_agent_suffix_keeps_paths_waiting_and_scratchpad() {
+        let suffix = sub_agent_prompt_suffix_for_profile("/tmp/rebon/p/s/scratchpad", LEAN);
+        assert!(suffix.starts_with("Notes:\n- Use absolute paths"));
+        assert!(suffix.contains("one ShellOutput call"));
+        assert!(suffix.contains("# Scratchpad Directory\nTemporary files go in"));
+        assert!(suffix.contains("`/tmp/rebon/p/s/scratchpad`"));
+    }
+
+    /// The `/context` report accounts for the lean sections it renders.
+    #[test]
+    fn lean_report_matches_the_rendered_prompt() {
+        let config = config(&["Read", "Bash"], &["WebSearch"], true);
+        let ctx = ctx();
+        let report = build_system_prompt_report_for_profile(&config, &ctx, LEAN);
+        let parts = build_split_system_prompt_for_profile(&config, &ctx, LEAN);
+        let runtime = report
+            .sections
+            .iter()
+            .find(|section| section.name == "runtime context")
+            .expect("runtime section");
+        let detail = |name: &str| {
+            runtime
+                .details
+                .iter()
+                .find(|detail| detail.name == name)
+                .and_then(|detail| detail.byte_count)
+                .unwrap_or_else(|| panic!("{name} detail"))
+        };
+        assert_eq!(
+            detail("environment context"),
+            lean::env_info_section(&config, &ctx).len()
+        );
+        assert_eq!(
+            detail("tool guidance"),
+            lean::runtime_tools_section(&config.deferred_tool_names)
+                .unwrap()
+                .len()
+        );
+        assert_eq!(
+            detail("tool result retention reminder"),
+            lean::RETENTION_REMINDER.len()
+        );
+        let runtime_text = parts.runtime_context.unwrap();
+        assert!(runtime_text.contains(&lean::env_info_section(&config, &ctx)));
+        assert!(runtime_text.contains(lean::RETENTION_REMINDER));
     }
 }

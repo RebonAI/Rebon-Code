@@ -421,8 +421,12 @@ async fn stable_base_system_provider_requests_survive_rebon_md_mutation() {
         assert!(!system.contains("Read"));
         assert!(!system.contains("AskUserQuestion"));
         assert!(!system.contains("Write"));
-        assert!(system.contains("ToolSearch may expose additional capabilities"));
-        assert!(system.contains("InvokeDeferredTool gateway"));
+        if rebon_tool::legacy_prompt_profile() {
+            assert!(system.contains("ToolSearch may expose additional capabilities"));
+            assert!(system.contains("InvokeDeferredTool gateway"));
+        } else {
+            assert!(system.contains("Pass only the parameters a tool's schema defines"));
+        }
     }
     assert_eq!(snapshot.read().unwrap().as_deref(), Some(systems[2]));
     assert_eq!(
@@ -444,6 +448,12 @@ async fn stable_base_system_provider_requests_survive_rebon_md_mutation() {
         assert!(runtime_context.contains("<runtime_context>"));
         assert!(runtime_context.contains("</runtime_context>"));
         assert!(runtime_context.contains("</system-reminder>"));
+        if !rebon_tool::legacy_prompt_profile() {
+            // The lean runtime context does not repeat the provider's tools
+            // array; it names only the deferred tools, when there are any.
+            assert!(!runtime_context.contains("Provider-visible tools"));
+            continue;
+        }
         assert!(runtime_context.contains("Provider-visible tools loaded in advance for this turn"));
         assert!(runtime_context.contains("Read"));
         assert!(runtime_context.contains("AskUserQuestion"));

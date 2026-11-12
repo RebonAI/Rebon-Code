@@ -11,3 +11,4 @@ description = "The `model-prompt` feature plugin: the model-preference sections 
 rebon-api.workspace = true
 rebon-core.workspace = true
 rebon-kernel.workspace = true
+rebon-types.workspace = true

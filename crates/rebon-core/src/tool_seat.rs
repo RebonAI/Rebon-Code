@@ -302,6 +302,10 @@ impl Tool for ProviderGuardedTool {
         self.tool.input_schema()
     }
 
+    fn model_input_schema(&self) -> ToolInputSchema {
+        self.tool.model_input_schema()
+    }
+
     fn is_enabled(&self) -> bool {
         self.active.load(Ordering::Acquire) && self.tool.is_enabled()
     }

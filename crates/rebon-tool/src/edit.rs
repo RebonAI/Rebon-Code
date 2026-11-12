@@ -62,6 +62,14 @@ impl Tool for EditTool {
          if you want to rename a variable for instance."
     }
 
+    fn model_description(&self) -> &str {
+        if crate::legacy_prompt_profile() {
+            self.description()
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
@@ -466,6 +474,13 @@ pub(crate) fn normalize_line_endings(s: &str, to_crlf: bool) -> std::borrow::Cow
         }
     }
 }
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str =
+    "Replace `old_string` with `new_string` in a file (absolute `file_path`). \
+`old_string` is matched against the file's current content: exactly, without Read's \
+line-number prefix, and uniquely unless `replace_all` is true. A miss returns the nearby \
+current lines. Several edits to one file in one response apply in order.";
 
 #[cfg(test)]
 mod tests {

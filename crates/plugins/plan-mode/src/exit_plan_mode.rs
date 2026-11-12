@@ -41,6 +41,22 @@ impl Tool for ExitPlanModeTool {
          - When approval is required, the tool sends a plan_approval_request to the team leader and pauses work until a response arrives."
     }
 
+    fn model_description(&self) -> &str {
+        if rebon_tool::legacy_prompt_profile() {
+            self.description()
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
+    fn model_input_schema(&self) -> ToolInputSchema {
+        if rebon_tool::legacy_prompt_profile() {
+            self.input_schema()
+        } else {
+            lean_schema()
+        }
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
@@ -451,6 +467,37 @@ fn validate_ultraplan_plan(
             INVALID_INPUT_CODE,
         )),
     }
+}
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str =
+    "In plan mode, submit your finished plan (Markdown in `plan`) for approval once \
+research and needed clarification are done; implement only after it is approved. Do not ask \
+for plan approval with AskUserQuestion. During /ultraplan, also pass `ledger_revision` and \
+`step_coverage` (no hand-written COVERS markers).";
+
+fn lean_schema() -> ToolInputSchema {
+    json!({
+        "type": "object",
+        "properties": {
+            "plan": { "type": "string" },
+            "ledger_revision": { "type": "integer", "minimum": 1 },
+            "step_coverage": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "step_id": { "type": "string" },
+                        "requirement_ids": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["step_id", "requirement_ids"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["plan"],
+        "additionalProperties": false
+    })
 }
 
 #[cfg(test)]

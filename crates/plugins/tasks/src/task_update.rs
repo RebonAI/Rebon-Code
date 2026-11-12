@@ -77,7 +77,19 @@ impl Tool for TaskUpdateTool {
     }
 
     fn model_description(&self) -> &str {
-        "Update an existing task's status or fields. Mark tasks completed only after fully accomplishing them."
+        if rebon_tool::legacy_prompt_profile() {
+            "Update an existing task's status or fields. Mark tasks completed only after fully accomplishing them."
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
+    fn model_input_schema(&self) -> ToolInputSchema {
+        if rebon_tool::legacy_prompt_profile() {
+            self.input_schema()
+        } else {
+            lean_schema()
+        }
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -415,6 +427,36 @@ fn optional_status(value: Option<&Value>, tool: &ToolId) -> ToolResult<Option<Ta
             error_code: Some(INVALID_INPUT_CODE),
         }),
     }
+}
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str =
+    "Update a task's status, fields, owner, or dependencies. Mark a task in_progress \
+when you start it and completed as soon as it is fully done, never before; keep it open, \
+with the blocker in its description, while it is not.";
+
+fn lean_schema() -> ToolInputSchema {
+    json!({
+        "type": "object",
+        "properties": {
+            "taskId": { "type": "string" },
+            "status": {
+                "type": "string",
+                "enum": ["pending", "in_progress", "completed", "deleted"]
+            },
+            "subject": { "type": "string" },
+            "description": { "type": "string" },
+            "activeForm": { "type": "string" },
+            "owner": {
+                "type": "string",
+                "description": "Agent name; kept only while the task is in_progress."
+            },
+            "addBlocks": { "type": "array", "items": { "type": "string" } },
+            "addBlockedBy": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["taskId"],
+        "additionalProperties": false
+    })
 }
 
 #[cfg(test)]

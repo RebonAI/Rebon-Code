@@ -63,7 +63,19 @@ impl Tool for TaskCreateTool {
     }
 
     fn model_description(&self) -> &str {
-        "Create a structured task for tracking current-session coding work. Use for complex or multi-step tasks; created tasks start pending."
+        if rebon_tool::legacy_prompt_profile() {
+            "Create a structured task for tracking current-session coding work. Use for complex or multi-step tasks; created tasks start pending."
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
+    fn model_input_schema(&self) -> ToolInputSchema {
+        if rebon_tool::legacy_prompt_profile() {
+            self.input_schema()
+        } else {
+            lean_schema()
+        }
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -201,6 +213,28 @@ fn optional_object(
             error_code: Some(INVALID_INPUT_CODE),
         }),
     }
+}
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str =
+    "Add a task (status pending) to this session's task list. Track work with several \
+steps or that spans turns, by requested outcome rather than micro-step; skip it for simple, \
+single-step requests.";
+
+fn lean_schema() -> ToolInputSchema {
+    json!({
+        "type": "object",
+        "properties": {
+            "subject": { "type": "string" },
+            "description": { "type": "string" },
+            "activeForm": {
+                "type": "string",
+                "description": "Spinner text while in progress, e.g. \"Running tests\"."
+            }
+        },
+        "required": ["subject", "description"],
+        "additionalProperties": false
+    })
 }
 
 #[cfg(test)]

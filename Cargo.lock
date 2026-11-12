@@ -5222,6 +5222,7 @@ dependencies = [
  "rebon-api",
  "rebon-core",
  "rebon-kernel",
+ "rebon-types",
 ]
 
 [[package]]

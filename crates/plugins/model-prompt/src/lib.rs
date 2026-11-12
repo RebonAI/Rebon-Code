@@ -37,6 +37,7 @@ use rebon_core::prompt_seat::{
     PROMPT_SEAT_SERVICE,
 };
 use rebon_kernel::{Context, KernelError, Plugin, PluginDef, PluginHost, PluginKind, PluginMeta};
+use rebon_types::prompt_profile::PromptProfile;
 
 pub mod sections;
 pub mod tier;
@@ -82,7 +83,32 @@ pub fn model_family(model: &str) -> ModelFamily {
 
 /// The sections this plugin contributes for one turn's subject, in render
 /// order: the two shared sections, then the Astra addendum for that family.
+/// Under the lean profile (the default) the shared sections are one style
+/// section; `REBON_PROMPT_PROFILE=legacy` restores the two.
 pub fn sections_for_subject(subject: &PromptSubject) -> Vec<PluginPromptSection> {
+    sections_for_subject_and_profile(subject, PromptProfile::current())
+}
+
+/// [`sections_for_subject`] under an explicit profile.
+pub fn sections_for_subject_and_profile(
+    subject: &PromptSubject,
+    profile: PromptProfile,
+) -> Vec<PluginPromptSection> {
+    if !profile.is_legacy() {
+        let mut sections = vec![PluginPromptSection::new(
+            TONE_AND_STYLE_SECTION,
+            Rung::Style,
+            sections::LEAN_STYLE,
+        )];
+        if model_family(&subject.model) == ModelFamily::Astra {
+            sections.push(PluginPromptSection::new(
+                ASTRA_WORKING_SECTION,
+                Rung::Efficiency,
+                sections::LEAN_ASTRA_WORKING,
+            ));
+        }
+        return sections;
+    }
     // Both sections go to every model unchanged.
     let mut sections = vec![
         PluginPromptSection::new(
@@ -199,8 +225,9 @@ mod tests {
         PromptSubject::new("claude-opus-5").with_tools(vec!["Read".into()], vec![])
     }
 
-    /// The two sections are on the seat at the rungs the engine's rows held,
-    /// and the switch takes them off and puts them back.
+    /// Under the lean profile (the default) the seat carries one style
+    /// section; the legacy profile's two sections stand at the rungs the
+    /// engine's rows held. The switch takes them off and puts them back.
     #[test]
     fn the_switch_takes_the_sections_off_the_seat_and_puts_them_back() {
         let (kernel, registry) = boot();
@@ -210,6 +237,15 @@ mod tests {
         assert_eq!(
             sections
                 .iter()
+                .map(|s| (s.name.as_str(), s.rung, s.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(TONE_AND_STYLE_SECTION, Rung::Style, sections::LEAN_STYLE)]
+        );
+
+        let legacy = sections_for_subject_and_profile(&subject(), PromptProfile::Legacy);
+        assert_eq!(
+            legacy
+                .iter()
                 .map(|s| (s.name.as_str(), s.rung))
                 .collect::<Vec<_>>(),
             vec![
@@ -217,13 +253,14 @@ mod tests {
                 (OUTPUT_EFFICIENCY_SECTION, Rung::Efficiency),
             ]
         );
-        assert_eq!(sections[0].text, sections::TONE_AND_STYLE);
-        assert_eq!(sections[1].text, sections::OUTPUT_EFFICIENCY);
+        assert_eq!(legacy[0].text, sections::TONE_AND_STYLE);
+        assert_eq!(legacy[1].text, sections::OUTPUT_EFFICIENCY);
         // Capability does not change the text. The two models sit at
         // opposite ends of the tier table and get the same bytes.
         let small = PromptSubject::new("gpt-5.6-luna").with_tools(vec!["Read".into()], vec![]);
+        assert_eq!(sections_for(&session, &small), sections);
         assert_eq!(
-            sections_for(&session, &small)[1].text,
+            sections_for_subject_and_profile(&small, PromptProfile::Legacy)[1].text,
             sections::OUTPUT_EFFICIENCY
         );
 
@@ -233,7 +270,7 @@ mod tests {
         assert!(sections_for(&session, &subject()).is_empty());
 
         registry.set_enabled(PLUGIN_ID, true).expect("and back");
-        assert_eq!(sections_for(&session, &subject()).len(), 2);
+        assert_eq!(sections_for(&session, &subject()).len(), 1);
     }
 
     /// The family table has two rows, and the catalogue decides which one
@@ -263,33 +300,51 @@ mod tests {
         let session = kernel.context().fork_scoped("session/abc");
 
         let bare = PromptSubject::new("gpt-6-astra").with_tools(vec!["Read".into()], vec![]);
-        let sections = sections_for(&session, &bare);
-        assert_eq!(sections.len(), 3);
-        let addendum = &sections[2];
-        assert_eq!(addendum.name, ASTRA_WORKING_SECTION);
-        assert_eq!(addendum.rung, Rung::Efficiency);
-        assert!(
-            addendum.order > sections[1].order,
-            "after the shared section"
-        );
-        assert_eq!(addendum.text, sections::astra_working());
-        assert!(!addendum.text.contains("run_code"));
-        assert!(addendum.text.contains("quote the sentence responsible"));
-
         let eager = PromptSubject::new("gpt-6-astra")
             .with_tools(vec!["Read".into(), RUN_CODE_TOOL.into()], vec![]);
         let deferred =
             PromptSubject::new("gpt-6-astra").with_tools(vec![], vec![RUN_CODE_TOOL.into()]);
-        for subject in [eager, deferred] {
-            let text = &sections_for(&session, &subject)[2].text;
+
+        // The lean profile, through the seat: the style section, then the
+        // lean addendum on the efficiency rung.
+        let sections = sections_for(&session, &bare);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[1].name, ASTRA_WORKING_SECTION);
+        assert_eq!(sections[1].rung, Rung::Efficiency);
+        assert_eq!(sections[1].text, sections::LEAN_ASTRA_WORKING);
+        assert!(sections[1].text.contains("quote the sentence responsible"));
+        for subject in [&eager, &deferred] {
+            assert_eq!(sections_for(&session, subject), sections);
+        }
+
+        // The legacy profile: after the two shared sections.
+        let legacy = sections_for_subject_and_profile(&bare, PromptProfile::Legacy);
+        assert_eq!(legacy.len(), 3);
+        let addendum = &legacy[2];
+        assert_eq!(addendum.name, ASTRA_WORKING_SECTION);
+        assert_eq!(addendum.rung, Rung::Efficiency);
+        assert!(addendum.order > legacy[1].order, "after the shared section");
+        assert_eq!(addendum.text, sections::astra_working());
+        assert!(addendum.text.contains("quote the sentence responsible"));
+        for subject in [&eager, &deferred] {
+            let text = &sections_for_subject_and_profile(subject, PromptProfile::Legacy)[2].text;
             assert_eq!(text, &sections::astra_working());
+        }
+        for text in [
+            sections::LEAN_ASTRA_WORKING.to_string(),
+            sections::astra_working(),
+        ] {
             assert!(!text.contains("run_code"));
         }
 
         // Nobody else gets it, run_code or not.
         let other =
             PromptSubject::new("gpt-5.6-sol").with_tools(vec![RUN_CODE_TOOL.into()], vec![]);
-        assert_eq!(sections_for(&session, &other).len(), 2);
+        assert_eq!(sections_for(&session, &other).len(), 1);
+        assert_eq!(
+            sections_for_subject_and_profile(&other, PromptProfile::Legacy).len(),
+            2
+        );
     }
 
     /// Loading without the seat is a failed load, reported, not a silent
