@@ -1642,6 +1642,46 @@ fn turn_end_summary_prefers_model_backed_agent_view_summary_event() {
     );
 }
 
+/// A turn whose own model-written summary is still being generated ends on
+/// what it last said, not on an earlier turn's model-written summary.
+#[test]
+fn turn_reply_summary_ignores_every_model_summary_event() {
+    let (_dir, store) = store();
+    let mut state = store
+        .create_job("prompt".into(), PathBuf::from("."), runtime())
+        .unwrap();
+    state.process.status = BackgroundJobStatus::Running;
+    store.write_state(&state).unwrap();
+    store
+        .append_event(
+            &state.identity.job_id,
+            "agent_view_summary_updated",
+            serde_json::json!({ "summary": "the previous turn", "phase": "completion" }),
+        )
+        .unwrap();
+    let update = rebon_types::SessionUpdateParams {
+        session_id: "sess-one".into(),
+        update: rebon_types::SessionUpdate::AgentMessageChunk {
+            content: rebon_types::ContentBlock::Text(rebon_types::TextContent {
+                text: "this turn's last words".into(),
+                annotations: None,
+            }),
+        },
+    };
+    store
+        .append_session_update(&state.identity.job_id, &update)
+        .unwrap();
+
+    assert_eq!(
+        background_job_success_summary_from_store(&store, &state.identity.job_id).as_deref(),
+        Some("the previous turn")
+    );
+    assert_eq!(
+        background_job_turn_reply_summary_from_store(&store, &state.identity.job_id).as_deref(),
+        Some("responding: this turn's last words")
+    );
+}
+
 #[test]
 fn turn_end_summary_ignores_running_model_summary_events() {
     let (_dir, store) = store();

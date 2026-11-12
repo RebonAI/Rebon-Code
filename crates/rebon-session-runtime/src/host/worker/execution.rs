@@ -251,6 +251,12 @@ pub async fn run_background_worker(job_id: String) -> anyhow::Result<()> {
     // the next.
     let mut handed_back = crate::session_handoff::HandedBack::default();
     let result = run_worker_turns(&store, &job_id, &ipc, &mut handed_back).await;
+    // A finished turn's summary is generated after the turn let go of the
+    // session; a worker that leaves now still delivers it. Each is bounded
+    // by the summary timeout.
+    for delivery in std::mem::take(&mut handed_back.summary_deliveries) {
+        let _ = delivery.await;
+    }
     // The one line that says a worker chose to leave, as opposed to being
     // killed: a worker that vanishes with nothing here was taken down from
     // outside.
@@ -408,6 +414,7 @@ async fn run_worker_turns(
         )?;
 
         let result = execute_background_job(store, &mut state, ipc, turn_cancel, handed_back).await;
+        let completion_summary = handed_back.completion_summary.take();
         match result {
             Ok(BackgroundExecutionOutcome::IdleWarmEnded) => return Ok(()),
             Ok(BackgroundExecutionOutcome::PromptCancelled) => {
@@ -464,8 +471,14 @@ async fn run_worker_turns(
                 BackgroundExecutionOutcome::PromptCompleted
                 | BackgroundExecutionOutcome::PromptAlreadyPersisted,
             ) => {
-                let summary = background_job_success_summary_from_store(&store, &job_id)
-                    .unwrap_or_else(|| background_job_success_summary(&state));
+                // With this turn's own model-written summary still to come,
+                // the newest one in the log is an earlier turn's.
+                let summary = if completion_summary.is_some() {
+                    background_job_turn_reply_summary_from_store(store, job_id)
+                } else {
+                    background_job_success_summary_from_store(store, job_id)
+                }
+                .unwrap_or_else(|| background_job_success_summary(&state));
                 let completed_at = now_ms();
                 let finalization = finalize_completed_background_turn(
                     &store,
@@ -486,6 +499,18 @@ async fn run_worker_turns(
                     BackgroundTurnFinalization::Applied => {}
                 }
                 store.append_event(&job_id, "completed", serde_json::json!({}))?;
+                if let Some(completion_summary) = completion_summary {
+                    handed_back
+                        .summary_deliveries
+                        .retain(|delivery| !delivery.is_finished());
+                    handed_back
+                        .summary_deliveries
+                        .push(completion_summary.deliver(
+                            store.clone(),
+                            job_id.to_string(),
+                            ipc.status_publisher(),
+                        ));
+                }
                 if wait_for_terminal_worker_reuse(store, job_id, ipc, handed_back).await? {
                     continue;
                 }
@@ -820,16 +845,17 @@ async fn finish_background_turn(
     // detaches the task in Tokio; it does not abort.
     let _ = task_bridge_stop.send(());
     let _ = task_bridge;
-    if execution.is_ok() && !turn_cancel.is_cancelled() {
-        let _ = refresh_agent_view_completion_summary(
-            store,
-            &state.identity.job_id,
-            &summary_prompt,
-            summary_client.as_ref(),
-            &session.model.title_name,
-        )
-        .await;
-    }
+    // The completion summary is a model call of up to the summary timeout.
+    // Awaited here, it held the session, and with it the next turn or the
+    // terminal taking the session back, until it answered. The worker
+    // generates it once the turn is finalized (`CompletionSummary::deliver`).
+    handed_back.completion_summary =
+        (execution.is_ok() && !turn_cancel.is_cancelled()).then(|| CompletionSummary {
+            turn_generation: state.process.turn_generation,
+            prompt: summary_prompt,
+            client: summary_client,
+            model: session.model.title_name.clone(),
+        });
     // A load that landed during the turn, or a server the turn's `/mcp
     // disconnect` took down: say so before the session goes.
     if let Some(mcp) = session.engine_half.mcp.as_mut() {
@@ -2228,31 +2254,89 @@ async fn release_session_keeping_lock(
         HeldIdleCompaction::of(session, handed_back.idle_compaction.take());
 }
 
+/// A finished turn's model-written summary, still to be generated: what
+/// the turn hands the worker instead of waiting on the summary model.
+pub(crate) struct CompletionSummary {
+    turn_generation: u64,
+    prompt: String,
+    client: Arc<dyn rebon_api::ModelClient>,
+    model: String,
+}
+
+impl CompletionSummary {
+    /// Generate the summary in the background, record it on the job, and
+    /// tell the clients.
+    fn deliver(
+        self,
+        store: BackgroundStore,
+        job_id: String,
+        status: crate::host::ipc::server::StatusPublisher,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            match refresh_agent_view_completion_summary(&store, &job_id, &self).await {
+                Ok(true) => status.publish_now(&store, &job_id),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::debug!(%job_id, %error, "could not record the completion summary")
+                }
+            }
+        })
+    }
+}
+
+/// Whether a turn's completion summary may still be written: the record
+/// is on that turn and finished, or has a follow-up queued behind it. A
+/// later turn, a stop, or a follow-up already queued when the turn was
+/// finalized (whose own summary says so) own the record instead.
+fn completion_summary_applies(state: &BackgroundJobState, turn_generation: u64) -> bool {
+    state.process.turn_generation == turn_generation
+        && matches!(
+            state.process.status,
+            BackgroundJobStatus::Succeeded | BackgroundJobStatus::Queued
+        )
+}
+
+/// Generate and record `summary`'s turn summary; `true` when it was written.
+/// Checked before the model call, so a turn already moved on costs no
+/// request, and again when writing, since the call takes seconds.
 pub(crate) async fn refresh_agent_view_completion_summary(
     store: &BackgroundStore,
     job_id: &str,
-    prompt: &str,
-    client: &dyn rebon_api::ModelClient,
-    model: &str,
-) -> anyhow::Result<()> {
-    let summary = generate_agent_view_summary_for_job(store, job_id, prompt, client, model).await;
-    let Some(summary) = summary else {
-        return Ok(());
+    summary: &CompletionSummary,
+) -> anyhow::Result<bool> {
+    if !completion_summary_applies(&store.read_state(job_id)?, summary.turn_generation) {
+        return Ok(false);
+    }
+    let generated = generate_agent_view_summary_for_job(
+        store,
+        job_id,
+        &summary.prompt,
+        summary.client.as_ref(),
+        &summary.model,
+    )
+    .await;
+    let Some(generated) = generated else {
+        return Ok(false);
     };
 
     let updated_at = now_ms();
-    store.update_state(job_id, |state| {
-        state.outcome.summary = Some(summary.clone());
+    let updated = store.update_state(job_id, |state| {
+        if !completion_summary_applies(state, summary.turn_generation) {
+            return Ok(false);
+        }
+        state.outcome.summary = Some(generated.clone());
         state.outcome.summary_updated_at_ms = None;
         state.process.updated_at_ms = updated_at;
-        Ok(())
+        Ok(true)
     })?;
-    store.append_event(
-        job_id,
-        "agent_view_summary_updated",
-        serde_json::json!({ "summary": summary, "phase": "completion" }),
-    )?;
-    Ok(())
+    if updated {
+        store.append_event(
+            job_id,
+            "agent_view_summary_updated",
+            serde_json::json!({ "summary": generated, "phase": "completion" }),
+        )?;
+    }
+    Ok(updated)
 }
 
 pub(crate) async fn refresh_agent_view_running_summary(
@@ -2991,6 +3075,221 @@ fn strip_command<'a>(prompt: &'a str, command: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
     use crate::host::BackgroundRuntimeFields;
+
+    fn summary_reply(text: &str) -> Vec<rebon_api::StreamEvent> {
+        use rebon_api::{ContentBlockDelta, ContentBlockStart, MessageDeltaFields, StreamEvent};
+        vec![
+            StreamEvent::MessageStart {
+                message_id: "summary".into(),
+                model: "mock".into(),
+                usage: Default::default(),
+            },
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlockStart::Text {
+                    text: String::new(),
+                },
+            },
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentBlockDelta::TextDelta { text: text.into() },
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::MessageDelta {
+                delta: MessageDeltaFields {
+                    stop_reason: Some(rebon_api::StopReason::EndTurn),
+                    usage: Default::default(),
+                },
+            },
+            StreamEvent::MessageStop,
+        ]
+    }
+
+    /// A job that just finished turn 3, with something in its log to sum up.
+    fn finished_turn_job(
+        status: BackgroundJobStatus,
+        turn_generation: u64,
+    ) -> (tempfile::TempDir, BackgroundStore, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BackgroundStore::new(dir.path().join(".rebon").join("background"));
+        let mut state = store
+            .create_job(
+                "fix the flaky test".into(),
+                std::path::PathBuf::from("."),
+                summary_runtime(),
+            )
+            .unwrap();
+        state.process.status = status;
+        state.process.turn_generation = turn_generation;
+        state.outcome.summary = Some("responding: done".into());
+        store.write_state(&state).unwrap();
+        let update = rebon_types::SessionUpdateParams {
+            session_id: "sess-one".into(),
+            update: rebon_types::SessionUpdate::AgentMessageChunk {
+                content: rebon_types::ContentBlock::Text(rebon_types::TextContent {
+                    text: "the test is fixed".into(),
+                    annotations: None,
+                }),
+            },
+        };
+        store
+            .append_session_update(&state.identity.job_id, &update)
+            .unwrap();
+        let job_id = state.identity.job_id.clone();
+        (dir, store, job_id)
+    }
+
+    fn summary_runtime() -> BackgroundRuntimeFields {
+        BackgroundRuntimeFields {
+            provider: None,
+            model: None,
+            fast_mode: None,
+            channels: Vec::new(),
+            development_channels: Vec::new(),
+            provider_format: None,
+            ui_mode: None,
+            effort_level: None,
+            permission_mode: None,
+            capability_mode: rebon_types::AgentCapabilityMode::Normal,
+            settings: Vec::new(),
+            add_dirs: Vec::new(),
+            plugin_dirs: Vec::new(),
+            mcp_configs: Vec::new(),
+            strict_mcp_config: false,
+        }
+    }
+
+    fn turn_three_summary(client: &rebon_api::MockModelClient) -> CompletionSummary {
+        client.push_turn(summary_reply(r#"{"summary":"fixed the flaky test"}"#));
+        CompletionSummary {
+            turn_generation: 3,
+            prompt: "fix the flaky test".into(),
+            client: Arc::new(client.clone()),
+            model: "small-model".into(),
+        }
+    }
+
+    fn completion_events(store: &BackgroundStore, job_id: &str) -> usize {
+        store
+            .read_events_tail(job_id, 50)
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event.kind == "agent_view_summary_updated"
+                    && event.data["phase"] == serde_json::json!("completion")
+            })
+            .count()
+    }
+
+    /// The summary generated after the turn let go of the session still lands
+    /// on the finished turn, or on its queued follow-up, with its event.
+    #[tokio::test]
+    async fn a_completion_summary_lands_on_the_turn_it_describes() {
+        for status in [BackgroundJobStatus::Succeeded, BackgroundJobStatus::Queued] {
+            let (_dir, store, job_id) = finished_turn_job(status, 3);
+            let client = rebon_api::MockModelClient::new();
+            let summary = turn_three_summary(&client);
+            assert!(
+                refresh_agent_view_completion_summary(&store, &job_id, &summary)
+                    .await
+                    .unwrap(),
+                "{status:?}"
+            );
+            assert_eq!(client.call_count(), 1);
+            assert_eq!(
+                store
+                    .read_state(&job_id)
+                    .unwrap()
+                    .outcome
+                    .summary
+                    .as_deref(),
+                Some("fixed the flaky test")
+            );
+            assert_eq!(completion_events(&store, &job_id), 1);
+        }
+    }
+
+    /// A job that moved on (a later turn, a stop) before the summary started
+    /// costs no request and keeps its record.
+    #[tokio::test]
+    async fn a_completion_summary_for_a_turn_the_job_left_is_not_requested() {
+        for (status, generation) in [
+            (BackgroundJobStatus::Running, 4),
+            (BackgroundJobStatus::Succeeded, 4),
+            (BackgroundJobStatus::Stopped, 3),
+        ] {
+            let (_dir, store, job_id) = finished_turn_job(status, generation);
+            let client = rebon_api::MockModelClient::new();
+            let summary = turn_three_summary(&client);
+            let before = store.read_state(&job_id).unwrap().outcome.summary;
+            assert!(
+                !refresh_agent_view_completion_summary(&store, &job_id, &summary)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(client.call_count(), 0, "{status:?} {generation}");
+            assert_eq!(store.read_state(&job_id).unwrap().outcome.summary, before);
+            assert_eq!(completion_events(&store, &job_id), 0);
+        }
+    }
+
+    /// A model client that starts the job's next turn while it answers.
+    struct NextTurnStartsDuringTheCall {
+        inner: rebon_api::MockModelClient,
+        store: BackgroundStore,
+        job_id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl rebon_api::ModelClient for NextTurnStartsDuringTheCall {
+        fn provider_name(&self) -> &'static str {
+            "mock"
+        }
+
+        async fn create_message_stream(
+            &self,
+            request: rebon_api::CreateMessageRequest,
+        ) -> rebon_api::ModelResult<rebon_api::StreamEventStream> {
+            self.store
+                .update_state(&self.job_id, |state| {
+                    state.process.turn_generation += 1;
+                    state.process.status = BackgroundJobStatus::Running;
+                    Ok(())
+                })
+                .unwrap();
+            self.inner.create_message_stream(request).await
+        }
+    }
+
+    /// A summary that answers after the next turn started is not written over
+    /// that turn's record.
+    #[tokio::test]
+    async fn a_completion_summary_that_answers_late_leaves_the_next_turn_alone() {
+        let (_dir, store, job_id) = finished_turn_job(BackgroundJobStatus::Succeeded, 3);
+        let inner = rebon_api::MockModelClient::new();
+        let mut summary = turn_three_summary(&inner);
+        summary.client = Arc::new(NextTurnStartsDuringTheCall {
+            inner: inner.clone(),
+            store: store.clone(),
+            job_id: job_id.clone(),
+        });
+        assert!(
+            !refresh_agent_view_completion_summary(&store, &job_id, &summary)
+                .await
+                .unwrap()
+        );
+        assert_eq!(inner.call_count(), 1);
+        assert_eq!(
+            store
+                .read_state(&job_id)
+                .unwrap()
+                .outcome
+                .summary
+                .as_deref(),
+            Some("responding: done")
+        );
+        assert_eq!(completion_events(&store, &job_id), 0);
+    }
 
     #[test]
     fn only_a_leading_router_command_is_one() {

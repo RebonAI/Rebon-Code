@@ -46,14 +46,27 @@ pub fn background_job_success_summary_from_store(
                 .and_then(|value| value.as_str())
                 .and_then(non_empty_trimmed)
         })
-        .or_else(|| {
-            events
-                .into_iter()
-                .rev()
-                .filter(|event| event.kind == "session_update")
-                .filter_map(|event| serde_json::from_value::<SessionUpdateParams>(event.data).ok())
-                .find_map(|update| summarize_session_update(&update.update))
-        })
+        .or_else(|| last_session_update_summary(events))
+}
+
+/// What the job's last session update says, ignoring every model-written
+/// summary: the summary a turn ends on while its own model-written one is
+/// still being generated, when the newest one in the log is an earlier
+/// turn's.
+pub fn background_job_turn_reply_summary_from_store(
+    store: &BackgroundStore,
+    job_id: &str,
+) -> Option<String> {
+    last_session_update_summary(store.read_events_tail(job_id, 200).ok()?)
+}
+
+fn last_session_update_summary(events: Vec<crate::BackgroundJobEvent>) -> Option<String> {
+    events
+        .into_iter()
+        .rev()
+        .filter(|event| event.kind == "session_update")
+        .filter_map(|event| serde_json::from_value::<SessionUpdateParams>(event.data).ok())
+        .find_map(|update| summarize_session_update(&update.update))
 }
 
 pub fn background_job_failure_summary(message: &str) -> String {

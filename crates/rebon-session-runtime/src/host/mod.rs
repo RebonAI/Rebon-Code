@@ -75,7 +75,7 @@ use rebon_session_host::TERMINAL_WORKER_IDLE_TTL_MS;
 use rebon_session_host::{
     background_job_failure_summary, background_job_success_summary,
     background_job_success_summary_from_store, background_job_transcript_cwd,
-    background_worktree_slug, build_ask_user_question_updated_input, generate_ipc_token,
+    background_job_turn_reply_summary_from_store, background_worktree_slug, build_ask_user_question_updated_input, generate_ipc_token,
     generate_pending_prompt_id, now_ms, preserved_background_worktree_path, process_is_running,
     process_owns_detached_group, should_skip_background_worktree, validate_job_id,
 };

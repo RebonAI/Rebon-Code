@@ -184,7 +184,8 @@ pub use stop_job::{
 use subagent_frontmatter::apply_subagent_frontmatter_to_runtime;
 pub use summary::{
     background_job_failure_summary, background_job_success_summary,
-    background_job_success_summary_from_store, summarize_session_update,
+    background_job_success_summary_from_store, background_job_turn_reply_summary_from_store,
+    summarize_session_update,
 };
 pub use supervisor::binary::{executable_modified_ms, supervisor_binary_changed};
 pub use supervisor::process::spawn_worker_process;

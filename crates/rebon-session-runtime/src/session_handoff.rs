@@ -20,6 +20,12 @@ pub struct HandedBack {
     pub session_loop: Option<HeldSessionLoop>,
     /// What the worker needs to compact the released session while parked.
     pub idle_compaction: Option<crate::host::worker::idle_compaction::HeldIdleCompaction>,
+    /// The summary the turn just finished still owes, generated once the
+    /// worker has finalized it.
+    pub(crate) completion_summary: Option<crate::host::worker::execution::CompletionSummary>,
+    /// Summaries being generated in the background, awaited before the
+    /// worker exits so a leaving worker still records them.
+    pub(crate) summary_deliveries: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// The session loop a worker's turns run through, kept across the sessions it
