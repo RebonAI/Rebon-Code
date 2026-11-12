@@ -97,6 +97,8 @@ pub(super) const TOOLS: &str = "\
 - Use the dedicated file tools, not shell commands, to read, search, and edit files, and never \
 use the shell to get around their checks.
 - Pass only the parameters a tool's schema defines.
+- Make every independent call — reads, searches, edits to different places, independent \
+commands — in the same response, not one per response.
 - The calls in one response run in order (consecutive read-only calls overlap), so you can \
 batch dependent steps; if a call that changes something fails, the later ones that change \
 something are skipped.";

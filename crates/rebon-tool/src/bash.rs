@@ -899,9 +899,11 @@ const LEAN_DESCRIPTION: &str =
     "Run a shell command and return its output. Use the file tools, not the shell, to \
 read, search, and edit files. Join dependent steps with `&&`; a failure inside a `;` chain is \
 marked in stderr. `timeout` is in ms (default 60000, max 600000); a command that reaches it \
-keeps running in the background under a shellId, and its completion is announced. \
-`run_in_background` returns a shellId and an outputPath that receives the output; wait for it \
-with ShellOutput and stop it with ShellStop.";
+keeps running in the background under a shellId, and its completion is announced. When you \
+need a command's result before going on (a test suite, a build), run it in the foreground with \
+a `timeout` long enough for it. Use `run_in_background` only for work you will not wait on right \
+away: it returns a shellId and an outputPath that receives the output; wait for it with \
+ShellOutput and stop it with ShellStop.";
 
 fn lean_schema() -> ToolInputSchema {
     json!({
