@@ -255,8 +255,10 @@ impl AgentTool {
         let model_description = format!(
             "Launch specialized sub-agents for complex tasks. Prefer direct investigation with Read, Glob, and Grep, including multi-round and cross-module searches; use Explore for extensive separable research with clear independent parallel or context-saving benefits, not merely unclear scope. Use subagent_type for a matching role; omit for general-purpose. `provider`, `model`, and `modelProfile` are optional routing overrides. Normally omit them to inherit the selected agent definition and current session/provider defaults; set them only when intentionally targeting exact configured identifiers. Do not specify both `model` and `modelProfile`. A named local agent is a reusable session teammate: the first call creates it, and later calls with the same name dispatch follow-up work while preserving its context. Set `name` only when that accumulated context is likely to be reused; do not name one-off searches, reviews, verifications, or implementations merely to label them. Named teammates use the execution boundary fixed by their teammate/session: never combine `name` with per-call `cwd`, `allowed_roots`, `isolation`, or `allowed_tools`. Concurrent/background write agents are auto-isolated in runtime-created worktrees and merged back serially; named teammates cannot be concurrent writers. Named teammates default to background; completion delivery and automatic continuation follow session-specific guidance; omit `run_in_background` unless the Agent call itself must block for the handoff. Omit name for a one-shot sub-agent. Choose a feasible execution mode before teammate reuse. Among feasible options, prefer relevant context from the current roster. Without automatic continuation, use foreground one-shot work or execute directly for necessary dependencies. Use SendMessage only to supplement or correct work already in progress. One-shot local agents default to foreground; named teammates and external ACP agents default to background. Before invoking an external ACP agent, first send the user a short visible status message describing the delegation. Keep one-shot Explore agents in the foreground when their findings determine your next step; do not force named Explore teammates foreground merely to wait for them. Yielding is not final delivery: retain responsibility for results and verification, following the user's latest pause, cancellation, or scope change.\n\nAvailable agent types:\n{agent_lines}"
         );
-        let lean_model_description =
-            lean_model_description(&registry.format_lean_lines(use_worktree));
+        let lean_model_description = lean_model_description(
+            &registry.format_lean_lines(use_worktree),
+            rebon_tool::Toolset::current(),
+        );
         Self {
             description,
             model_description,
@@ -2419,11 +2421,19 @@ impl AgentTool {
 
 /// The `Agent` tool's provider-visible description under the lean prompt
 /// profile: the delegation policy's one home, then the roster.
-fn lean_model_description(agent_lines: &str) -> String {
+///
+/// The shell-first toolset reads and searches with Bash, so the lookups the
+/// model keeps for itself are not pinned to the file tools there.
+fn lean_model_description(agent_lines: &str, toolset: rebon_tool::Toolset) -> String {
+    let lookups = if toolset.is_shell() {
+        "Do directed lookups yourself"
+    } else {
+        "Do directed lookups yourself with Read, Glob, and Grep"
+    };
     format!(
         "Run a sub-agent on a self-contained task. It sees only `prompt`, so state the goal, \
          what you already know, and what to return; its result comes back to you, not the user. \
-         Do directed lookups yourself with Read, Glob, and Grep; delegate broad, separable \
+         {lookups}; delegate broad, separable \
          research (Explore) or independent work that gains from running in parallel, and do \
          not repeat work you delegated.\n\
          - `subagent_type` picks a role below; omit it for general-purpose. `description` is a \
@@ -2502,6 +2512,24 @@ mod tests {
     };
     use std::sync::Arc;
     use std::sync::Mutex;
+
+    /// Under the shell-first toolset the lookups the model keeps for itself
+    /// are not sent to the deferred file tools; nothing else changes.
+    #[test]
+    fn the_lean_description_names_the_file_tools_only_in_the_standard_set() {
+        let standard = lean_model_description("- x", rebon_tool::Toolset::Standard);
+        let shell = lean_model_description("- x", rebon_tool::Toolset::Shell);
+        assert!(standard.contains("Do directed lookups yourself with Read, Glob, and Grep; "));
+        assert!(!shell.contains("Read, Glob"));
+        assert_eq!(
+            shell.replacen(
+                "Do directed lookups yourself; ",
+                "Do directed lookups yourself with Read, Glob, and Grep; ",
+                1
+            ),
+            standard
+        );
+    }
 
     #[test]
     fn shared_worktree_prompt_targets_the_agent_not_the_caller() {

@@ -18,6 +18,8 @@
 use serde_json::Value;
 
 use crate::lexer::{simple_command_segments, READ_ONLY_ARGV};
+
+mod sed;
 use crate::powershell_shape::{canonical_cmdlet, powershell_segments};
 
 /// Whether `input`'s command only reads.
@@ -62,7 +64,9 @@ fn argv_only_reads(argv: &[String]) -> bool {
         | "stat" | "du" | "df" | "which" | "whoami" | "uname" | "basename" | "dirname"
         | "realpath" | "readlink" | "diff" | "cmp" | "cut" | "tr" | "nl" | "true" | "false" => true,
         "find" => find_args_only_read(args),
+        "fd" | "fdfind" => fd_args_only_read(args),
         "rg" => rg_args_only_read(args),
+        "sed" => sed::sed_args_only_read(args),
         "sort" => sort_args_only_read(args),
         // `uniq IN OUT` writes OUT; with no file operand it is a filter.
         "uniq" => args.iter().all(|arg| arg.starts_with('-')),
@@ -87,6 +91,20 @@ fn find_args_only_read(args: &[String]) -> bool {
                 | "-fprintf"
                 | "-fls"
         )
+    })
+}
+
+/// `fd -x` / `--exec` and `-X` / `--exec-batch` run a command per match. A
+/// short-flag cluster with an `x` in it, and any abbreviation of the long
+/// names, is refused rather than parsed.
+fn fd_args_only_read(args: &[String]) -> bool {
+    !args.iter().any(|arg| {
+        let name = arg.split('=').next().unwrap_or(arg);
+        if let Some(long) = name.strip_prefix("--") {
+            !long.is_empty() && ("exec-batch".starts_with(long) || long.starts_with("exec"))
+        } else {
+            name.starts_with('-') && name.contains(['x', 'X'])
+        }
     })
 }
 
@@ -308,6 +326,21 @@ mod tests {
             "rg --files",
             "rg -n 'fn main' crates",
             "find . -name Cargo.toml -type f",
+            "find crates -name '*.rs' -newer Cargo.toml",
+            "fd",
+            "fd -e rs lexer crates",
+            "fd -t f -H --exclude target",
+            "fdfind Cargo.toml",
+            "sed -n '10,40p' src/lib.rs",
+            "sed -n '/^fn main/,/^}/p' src/main.rs",
+            "sed 's/foo/bar/g' f",
+            "head -c 200 f",
+            "tail -n +20 f | head -40",
+            "cat -n src/lib.rs | sed -n '1,80p'",
+            "rg -n 'fn main' crates | head -20",
+            "rg -l TODO 2>/dev/null | wc -l",
+            "grep -rn --include=lib.rs TODO crates",
+            "ls -la crates/rebon-core/src && wc -l crates/rebon-core/src/lib.rs",
             "git status",
             "git status --short",
             "git log --oneline -5",
@@ -348,6 +381,17 @@ mod tests {
             "touch x",
             "mkdir out",
             "sed -i s/a/b/ f",
+            "sed -i.bak 's/a/b/' f",
+            "sed -n 'w out' f",
+            "sed 's/a/b/w out' f",
+            "sed 's/a/b/e' f",
+            "sed -f script.sed f",
+            "sed -n '1p' f > out",
+            "fd -x rm",
+            "fd --exec rm {}",
+            "fd --exec-batch=rm",
+            "fd -HX rm",
+            "fd --exe rm",
             "awk '{print}' f",
             "xargs cat",
             "env ls",

@@ -818,6 +818,41 @@ mod tests {
             .is_empty());
     }
 
+    /// The shell-first toolset creates files with Edit alone: an empty
+    /// `old_string` makes the file and any missing directories, file history
+    /// sees it before it exists (so rewind can remove it), and the same call
+    /// against a file that has content is refused rather than overwriting it.
+    #[tokio::test]
+    async fn an_empty_old_string_creates_a_file_in_new_directories_under_history() {
+        let dir = TempDir::new();
+        let file = dir.path().join("fresh").join("dir").join("new.rs");
+        let tracker = Arc::new(RecordingHistoryTracker::default());
+        let ctx = ToolContext::new()
+            .with_cwd(dir.path().to_string_lossy())
+            .with_file_history_tracker(tracker.clone());
+
+        let out = tool()
+            .call(edit_input(&file, "", "fn main() {}\n"), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out["type"], json!("create"));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "fn main() {}\n");
+        assert_eq!(
+            *tracker
+                .calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            vec![file.clone()]
+        );
+
+        let err = tool()
+            .call(edit_input(&file, "", "other"), &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists and is not empty"));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "fn main() {}\n");
+    }
+
     #[tokio::test]
     async fn call_matches_lf_old_string_against_crlf_file() {
         let dir = TempDir::new();

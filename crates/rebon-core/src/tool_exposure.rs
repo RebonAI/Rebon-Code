@@ -1,4 +1,4 @@
-use rebon_tool::{ExecutionSurface, PromptProfile, Tool, INVOKE_DEFERRED_TOOL_NAME};
+use rebon_tool::{ExecutionSurface, PromptProfile, Tool, Toolset, INVOKE_DEFERRED_TOOL_NAME};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolExposure {
@@ -18,6 +18,9 @@ pub(crate) struct BuiltinToolExposurePolicy {
     /// rarely used planning tools out of every request; the legacy profile
     /// is the table as it stood before.
     profile: PromptProfile,
+    /// Which file tools the session leads with. The shell-first set keeps
+    /// the dedicated read, search and write tools behind ToolSearch.
+    toolset: Toolset,
 }
 
 impl BuiltinToolExposurePolicy {
@@ -26,14 +29,15 @@ impl BuiltinToolExposurePolicy {
     }
 
     pub(crate) fn for_surface(surface: ExecutionSurface) -> Self {
-        Self::for_surface_and_profile(surface, PromptProfile::current())
+        Self::new(surface, PromptProfile::current(), Toolset::current())
     }
 
-    pub(crate) fn for_surface_and_profile(
-        surface: ExecutionSurface,
-        profile: PromptProfile,
-    ) -> Self {
-        Self { surface, profile }
+    pub(crate) fn new(surface: ExecutionSurface, profile: PromptProfile, toolset: Toolset) -> Self {
+        Self {
+            surface,
+            profile,
+            toolset,
+        }
     }
 
     pub(crate) fn exposure_for(&self, tool: &dyn Tool) -> ToolExposure {
@@ -58,6 +62,12 @@ impl BuiltinToolExposurePolicy {
                 // run's execution policy promotes it back
                 // (`is_eager_promotion`).
                 "PlanLedger" => return ToolExposure::Hidden,
+                // The shell-first set reads and searches with Bash and
+                // changes files with Edit; Read stays one ToolSearch away
+                // for images, PDFs and notebooks.
+                "Read" | "Write" | "Glob" | "Grep" if self.toolset.is_shell() => {
+                    return ToolExposure::Deferred
+                }
                 _ => {}
             }
         }
@@ -223,13 +233,95 @@ mod tests {
     }
 
     fn exposure(surface: ExecutionSurface, name: &'static str) -> ToolExposure {
-        BuiltinToolExposurePolicy::for_surface_and_profile(surface, PromptProfile::Legacy)
+        BuiltinToolExposurePolicy::new(surface, PromptProfile::Legacy, Toolset::Standard)
             .exposure_for(&NamedTool(name))
     }
 
     fn lean_exposure(surface: ExecutionSurface, name: &'static str) -> ToolExposure {
-        BuiltinToolExposurePolicy::for_surface_and_profile(surface, PromptProfile::Lean)
+        BuiltinToolExposurePolicy::new(surface, PromptProfile::Lean, Toolset::Standard)
             .exposure_for(&NamedTool(name))
+    }
+
+    fn shell_exposure(
+        surface: ExecutionSurface,
+        profile: PromptProfile,
+        name: &'static str,
+    ) -> ToolExposure {
+        BuiltinToolExposurePolicy::new(surface, profile, Toolset::Shell)
+            .exposure_for(&NamedTool(name))
+    }
+
+    /// Every tool that is not a file reader, searcher or writer.
+    const NON_FILE_TOOLS: &[&str] = &[
+        "Bash",
+        "Edit",
+        "ToolSearch",
+        "ShellOutput",
+        "ShellStop",
+        "Skill",
+        "Agent",
+        "TaskCreate",
+        "TaskGet",
+        "TaskList",
+        "TaskUpdate",
+        "AskUserQuestion",
+        "ExitPlanMode",
+        "EnterPlanMode",
+        "SaveMemory",
+        "ReadMemory",
+        "WebFetch",
+        "Workflow",
+        "NotebookEdit",
+        "SomeFuturePluginTool",
+    ];
+
+    /// The shell-first set defers exactly the dedicated read, search and
+    /// write tools (MultiEdit is deferred on the lean profile already) and
+    /// leaves every other tool where the standard set puts it.
+    #[test]
+    fn the_shell_toolset_defers_only_the_file_read_search_and_write_tools() {
+        for surface in [ExecutionSurface::Interactive, ExecutionSurface::Unattended] {
+            for name in ["Read", "Write", "Glob", "Grep", "MultiEdit"] {
+                assert_eq!(
+                    lean_exposure(surface, name) == ToolExposure::Deferred,
+                    name == "MultiEdit",
+                    "{name} standard"
+                );
+                assert_eq!(
+                    shell_exposure(surface, PromptProfile::Lean, name),
+                    ToolExposure::Deferred,
+                    "{name} shell"
+                );
+            }
+            for name in NON_FILE_TOOLS {
+                assert_eq!(
+                    shell_exposure(surface, PromptProfile::Lean, name),
+                    lean_exposure(surface, name),
+                    "{name}"
+                );
+            }
+            assert_eq!(
+                shell_exposure(surface, PromptProfile::Lean, "Bash"),
+                ToolExposure::Eager
+            );
+            assert_eq!(
+                shell_exposure(surface, PromptProfile::Lean, "Edit"),
+                ToolExposure::Eager
+            );
+        }
+    }
+
+    /// The legacy profile restores the old surface whole, so the shell-first
+    /// set changes nothing under it.
+    #[test]
+    fn the_legacy_profile_ignores_the_shell_toolset() {
+        for name in ["Read", "Write", "Glob", "Grep", "MultiEdit", "Bash", "Edit"] {
+            assert_eq!(
+                shell_exposure(ExecutionSurface::Interactive, PromptProfile::Legacy, name),
+                exposure(ExecutionSurface::Interactive, name),
+                "{name}"
+            );
+        }
     }
 
     /// The lean profile defers the opt-in planning entry and MultiEdit and

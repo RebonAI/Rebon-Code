@@ -31,14 +31,44 @@ pub const DEFAULT_TOOL_OUTPUT_MAX_BYTES: usize = 10_000;
 /// `usize`; `0` disables truncation entirely.
 const MAX_BYTES_ENV: &str = "REBON_TOOL_OUTPUT_MAX_BYTES";
 
+/// Per-stream budget for a command that only reads, under the shell-first
+/// toolset (`REBON_TOOLSET=shell`), where `cat` and `sed -n` stand in for
+/// Read: the text one Read call may return ([`crate::read::READ_BATCH_TEXT_BUDGET`]).
+/// With the default cap a mid-sized source file comes back with its middle
+/// cut out, and the model spends a request paging it back in.
+pub const SHELL_TOOLSET_READ_MAX_BYTES: usize = crate::read::READ_BATCH_TEXT_BUDGET;
+
 /// Resolve the active per-stream byte budget:
 /// `REBON_TOOL_OUTPUT_MAX_BYTES` when set to a valid integer, otherwise
 /// [`DEFAULT_TOOL_OUTPUT_MAX_BYTES`].
 pub fn tool_output_max_bytes() -> usize {
+    env_max_bytes().unwrap_or(DEFAULT_TOOL_OUTPUT_MAX_BYTES)
+}
+
+/// The per-stream budget for a Bash command: [`tool_output_max_bytes`],
+/// except that a command the shell policy proves read-only gets
+/// [`SHELL_TOOLSET_READ_MAX_BYTES`] under the shell-first toolset. An
+/// explicit `REBON_TOOL_OUTPUT_MAX_BYTES` still wins.
+pub fn shell_output_max_bytes(read_only: bool) -> usize {
+    shell_output_max_bytes_for(env_max_bytes(), crate::Toolset::current(), read_only)
+}
+
+fn shell_output_max_bytes_for(
+    env: Option<usize>,
+    toolset: crate::Toolset,
+    read_only: bool,
+) -> usize {
+    match env {
+        Some(max_bytes) => max_bytes,
+        None if read_only && toolset.is_shell() => SHELL_TOOLSET_READ_MAX_BYTES,
+        None => DEFAULT_TOOL_OUTPUT_MAX_BYTES,
+    }
+}
+
+fn env_max_bytes() -> Option<usize> {
     std::env::var(MAX_BYTES_ENV)
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_TOOL_OUTPUT_MAX_BYTES)
 }
 
 /// Truncate a single shell stream (stdout or stderr) to `max_bytes`,
@@ -335,6 +365,32 @@ mod tests {
         // Direct budget path is env-independent; just verify the
         // default constant is what we expect.
         assert_eq!(DEFAULT_TOOL_OUTPUT_MAX_BYTES, 10_000);
+    }
+
+    /// Only a read-only command under the shell-first toolset gets Read's
+    /// budget; an explicit override applies to every command.
+    #[test]
+    fn the_shell_toolset_gives_read_only_commands_reads_budget() {
+        use crate::Toolset::{Shell, Standard};
+        assert_eq!(SHELL_TOOLSET_READ_MAX_BYTES, 32 * 1024);
+        assert_eq!(
+            shell_output_max_bytes_for(None, Shell, true),
+            SHELL_TOOLSET_READ_MAX_BYTES
+        );
+        for (toolset, read_only) in [(Shell, false), (Standard, true), (Standard, false)] {
+            assert_eq!(
+                shell_output_max_bytes_for(None, toolset, read_only),
+                DEFAULT_TOOL_OUTPUT_MAX_BYTES,
+                "{toolset:?} read_only={read_only}"
+            );
+        }
+        for (toolset, read_only) in [(Shell, true), (Standard, false)] {
+            assert_eq!(shell_output_max_bytes_for(Some(0), toolset, read_only), 0);
+            assert_eq!(
+                shell_output_max_bytes_for(Some(500), toolset, read_only),
+                500
+            );
+        }
     }
 
     fn noise(range: std::ops::Range<usize>) -> String {

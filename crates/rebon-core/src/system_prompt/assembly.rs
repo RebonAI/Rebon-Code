@@ -40,7 +40,7 @@ use super::sections::{
 };
 use super::{DynamicPromptContext, SystemPromptConfig, TOOL_RESULT_RETENTION_REMINDER};
 use crate::prompt_seat::{sort_sections, PluginPromptSection};
-use rebon_tool::PromptProfile;
+use rebon_tool::{PromptProfile, Toolset};
 
 type SectionBuild = fn(&SystemPromptConfig, &DynamicPromptContext) -> Option<String>;
 
@@ -126,6 +126,16 @@ impl PromptAssembly {
     /// coordinator, router and watchdog contracts are their own texts under
     /// either profile.
     pub fn for_variant_and_profile(variant: &PromptVariant, profile: PromptProfile) -> Self {
+        Self::for_variant_profile_and_toolset(variant, profile, Toolset::current())
+    }
+
+    /// [`Self::for_variant_and_profile`] under an explicit toolset, which
+    /// picks the lean tool-use section; the legacy profile ignores it.
+    pub fn for_variant_profile_and_toolset(
+        variant: &PromptVariant,
+        profile: PromptProfile,
+        toolset: Toolset,
+    ) -> Self {
         let stable = || {
             if profile.is_legacy() {
                 stable_context_sections()
@@ -138,7 +148,7 @@ impl PromptAssembly {
                 base: if profile.is_legacy() {
                     standard_base_sections()
                 } else {
-                    lean_base_sections()
+                    lean_base_sections(toolset)
                 },
                 stable: stable(),
                 transient: transient_context_sections(),
@@ -308,8 +318,14 @@ fn standard_base_sections() -> Vec<PromptSectionDef> {
 }
 
 /// The lean base plane: the same ids and ranks as the legacy table, so the
-/// model-prompt plugin's style section still lands at rank 60.
-fn lean_base_sections() -> Vec<PromptSectionDef> {
+/// model-prompt plugin's style section still lands at rank 60. The toolset
+/// picks which file tools the tool-use section sends file work to.
+fn lean_base_sections(toolset: Toolset) -> Vec<PromptSectionDef> {
+    let tools: SectionBuild = if toolset.is_shell() {
+        |_, _| Some(lean::TOOLS_SHELL.to_string())
+    } else {
+        |_, _| Some(lean::TOOLS.to_string())
+    };
     vec![
         section("intro", 10, |_, _| Some(lean::INTRO.to_string())),
         section("system", 20, |_, _| Some(lean::SYSTEM.to_string())),
@@ -317,7 +333,7 @@ fn lean_base_sections() -> Vec<PromptSectionDef> {
             Some(lean::DOING_TASKS.to_string())
         }),
         section("actions", 40, |_, _| Some(lean::ACTIONS.to_string())),
-        section("tool-discovery", 50, |_, _| Some(lean::TOOLS.to_string())),
+        section("tool-discovery", 50, tools),
     ]
 }
 

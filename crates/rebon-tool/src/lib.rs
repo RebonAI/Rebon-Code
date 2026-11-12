@@ -195,6 +195,7 @@ pub mod team_manager;
 mod test_env;
 pub mod todo_write;
 pub mod tool_search;
+pub mod toolset;
 pub mod ultraplan;
 pub mod validation;
 pub mod web;
@@ -296,6 +297,7 @@ pub use plan_mode::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, PLAN_LE
 pub use powershell::{PowerShellEdition, PowerShellTool, POWERSHELL_TOOL_NAME};
 pub use read::ReadTool;
 pub use rebon_types::prompt_profile::{legacy_prompt_profile, PromptProfile, PROMPT_PROFILE_ENV};
+pub use toolset::{shell_toolset, Toolset, TOOLSET_ENV};
 pub use rebon_types::{
     CapabilityContext, ExecutionPolicy, PolicyMode, ShellPolicy, UltraplanContext,
 };

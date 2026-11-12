@@ -93,18 +93,45 @@ re-read, keep what can coexist, and report a real conflict. Fix the cause of a f
 or hook instead of bypassing it (no --no-verify), and resolve merge conflicts instead of \
 dropping a side.";
 
-/// How to use tools. Names no tool: the base plane stays byte-stable across
-/// tool sets, and the session's deferred names live in the runtime context.
-pub(super) const TOOLS: &str = "\
-# Using tools
-- Use the dedicated file tools, not shell commands, to read, search, and edit files, and never \
-use the shell to get around their checks.
+/// The rules [`TOOLS`] and [`TOOLS_SHELL`] share, written once.
+macro_rules! tools_rest {
+    () => {
+        "\
 - Pass only the parameters a tool's schema defines.
 - Make every independent call — reads, searches, edits to different places, independent \
 commands — in the same response, not one per response.
 - The calls in one response run in order (consecutive read-only calls overlap), so you can \
 batch dependent steps; if a call that changes something fails, the later ones that change \
-something are skipped.";
+something are skipped."
+    };
+}
+
+/// How to use tools. Names no tool: the base plane stays byte-stable across
+/// tool sets, and the session's deferred names live in the runtime context.
+pub(super) const TOOLS: &str = concat!(
+    "\
+# Using tools
+- Use the dedicated file tools, not shell commands, to read, search, and edit files, and never \
+use the shell to get around their checks.
+",
+    tools_rest!()
+);
+
+/// [`TOOLS`] for the shell-first toolset (`REBON_TOOLSET=shell`): reads and
+/// searches go through Bash, every change through Edit, because file
+/// history, rewind and Write's overwrite check only see changes Edit makes.
+/// It names tools, but it is fixed for the process, so the base plane is
+/// still byte-stable within a session.
+pub(super) const TOOLS_SHELL: &str = concat!(
+    "\
+# Using tools
+- Read and search files with Bash (`cat`, `sed -n`, `rg`, `fd`, `ls`); load the Read tool \
+only for images, PDFs, and notebooks. Change files only with Edit (an empty `old_string` creates a \
+file), never through shell redirection, `sed -i`, `tee`, or heredocs: file history and rewind \
+see only Edit's changes. Never use the shell to get around tool checks.
+",
+    tools_rest!()
+);
 
 /// `# Environment`: cwd, repository, platform, shell, model, date.
 pub(super) fn env_info_section(config: &SystemPromptConfig, ctx: &DynamicPromptContext) -> String {

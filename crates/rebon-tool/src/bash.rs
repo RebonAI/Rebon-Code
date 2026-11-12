@@ -1,6 +1,6 @@
 use crate::command_sandbox::{self, BinShell, PreparedCommand};
 use crate::edit::optional_bool;
-use crate::output_truncation::{finish_shell_streams, tool_output_max_bytes};
+use crate::output_truncation::{finish_shell_streams, shell_output_max_bytes};
 use crate::shell_process::{ShellOutputEncoding, ShellProcessError};
 use crate::{Tool, ToolContext};
 use async_trait::async_trait;
@@ -312,7 +312,7 @@ impl Tool for BashTool {
         if crate::legacy_prompt_profile() {
             BASH_MODEL_DESCRIPTION
         } else {
-            LEAN_DESCRIPTION
+            lean_description(crate::Toolset::current())
         }
     }
 
@@ -469,7 +469,9 @@ impl Tool for BashTool {
         // transcript (and every later model request) with output the
         // model rarely needs in full. The live per-line progress
         // already streamed the untruncated output to the user.
-        let max_bytes = tool_output_max_bytes();
+        let max_bytes = shell_output_max_bytes(
+            rebon_shell_policy::read_only::is_read_only_shell_command(BASH_TOOL_NAME, &input),
+        );
         let (stdout, stderr, stream_order) = finish_shell_streams(&run.lines, max_bytes);
         let mut result = json!({
             "stdout": stdout,
@@ -895,15 +897,43 @@ pub(crate) fn bash_bin_shell() -> BinShell {
 }
 
 /// Provider-visible description under the lean prompt profile.
-const LEAN_DESCRIPTION: &str =
-    "Run a shell command and return its output. Use the file tools, not the shell, to \
-read, search, and edit files. Join dependent steps with `&&`; a failure inside a `;` chain is \
+/// What the lean description says after its file-tool sentence, shared by
+/// both toolsets.
+macro_rules! lean_description_rest {
+    () => {
+        "Join dependent steps with `&&`; a failure inside a `;` chain is \
 marked in stderr. `timeout` is in ms (default 60000, max 600000); a command that reaches it \
 keeps running in the background under a shellId, and its completion is announced. When you \
 need a command's result before going on (a test suite, a build), run it in the foreground with \
 a `timeout` long enough for it. Use `run_in_background` only for work you will not wait on right \
 away: it returns a shellId and an outputPath that receives the output; wait for it with \
-ShellOutput and stop it with ShellStop.";
+ShellOutput and stop it with ShellStop."
+    };
+}
+
+const LEAN_DESCRIPTION: &str = concat!(
+    "Run a shell command and return its output. Use the file tools, not the shell, to \
+read, search, and edit files. ",
+    lean_description_rest!()
+);
+
+/// [`LEAN_DESCRIPTION`] for the shell-first toolset, where this tool is how
+/// files are read and searched and Edit is how they change.
+const LEAN_SHELL_DESCRIPTION: &str = concat!(
+    "Run a shell command and return its output. Read and search files with it (`cat`, \
+`sed -n`, `rg`, `fd`, `ls`), but change files only with Edit, never through redirection, \
+`sed -i`, `tee`, or heredocs. ",
+    lean_description_rest!()
+);
+
+/// The lean description for `toolset`.
+fn lean_description(toolset: crate::Toolset) -> &'static str {
+    if toolset.is_shell() {
+        LEAN_SHELL_DESCRIPTION
+    } else {
+        LEAN_DESCRIPTION
+    }
+}
 
 fn lean_schema() -> ToolInputSchema {
     json!({
@@ -1651,6 +1681,25 @@ mod tests {
     // -----------------------------------------------------------------
     // Description content (commit/PR + background) coverage
     // -----------------------------------------------------------------
+
+    /// The shell-first toolset swaps only the file-tool sentence: Bash
+    /// reads and searches, Edit changes files.
+    #[test]
+    fn the_shell_toolset_description_reads_with_bash_and_writes_with_edit() {
+        let standard = lean_description(crate::Toolset::Standard);
+        let shell = lean_description(crate::Toolset::Shell);
+        let standard_sentence =
+            "Use the file tools, not the shell, to read, search, and edit files. ";
+        assert!(standard.contains(standard_sentence));
+        assert!(!shell.contains("Use the file tools"));
+        let shell_sentence = "Read and search files with it (`cat`, `sed -n`, `rg`, `fd`, \
+                              `ls`), but change files only with Edit, never through redirection, \
+                              `sed -i`, `tee`, or heredocs. ";
+        assert_eq!(
+            shell.replacen(shell_sentence, standard_sentence, 1),
+            standard
+        );
+    }
 
     #[test]
     fn description_contains_base_guidance() {

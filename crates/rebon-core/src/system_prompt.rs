@@ -2816,6 +2816,61 @@ mod lean_profile_tests {
         }
     }
 
+    /// The shell-first toolset swaps the file-tool rule for one that reads
+    /// and searches with Bash and changes files only through Edit; every
+    /// other byte of the base plane is the standard one, and it still does
+    /// not follow the session's tool list.
+    #[test]
+    fn the_shell_toolset_swaps_only_the_file_tool_rule() {
+        let base = |toolset: rebon_tool::Toolset, profile: PromptProfile, tools: &[&str]| {
+            PromptAssembly::for_variant_profile_and_toolset(
+                &PromptVariant::Standard,
+                profile,
+                toolset,
+            )
+            .assemble_base(&config(tools, &[], true), &DynamicPromptContext::default())
+        };
+        let standard = base(rebon_tool::Toolset::Standard, LEAN, &[]);
+        let shell = base(rebon_tool::Toolset::Shell, LEAN, &[]);
+        assert_eq!(
+            shell,
+            base(
+                rebon_tool::Toolset::Shell,
+                LEAN,
+                &["Read", "Edit", "Bash", "Agent"]
+            )
+        );
+
+        let standard_rule = "- Use the dedicated file tools, not shell commands, to read, search, \
+                             and edit files, and never use the shell to get around their checks.\n";
+        assert!(standard.contains(standard_rule));
+        assert!(!shell.contains("dedicated file tools"));
+        for needle in [
+            "Read and search files with Bash (`cat`, `sed -n`, `rg`, `fd`, `ls`)",
+            "load the Read tool only for images, PDFs, and notebooks",
+            "Change files only with Edit (an empty `old_string` creates a file)",
+            "never through shell redirection, `sed -i`, `tee`, or heredocs",
+            "file history and rewind see only Edit's changes",
+            "Never use the shell to get around tool checks.",
+        ] {
+            assert!(shell.contains(needle), "{needle}");
+        }
+        let (rule_start, rule_end) = {
+            let start = shell.find("- Read and search files with Bash").unwrap();
+            let end = start + shell[start..].find("\n- Pass only").unwrap() + 1;
+            (start, end)
+        };
+        let mut swapped = shell.clone();
+        swapped.replace_range(rule_start..rule_end, standard_rule);
+        assert_eq!(swapped, standard);
+
+        // The legacy profile restores the old surface whole.
+        assert_eq!(
+            base(rebon_tool::Toolset::Shell, PromptProfile::Legacy, &[]),
+            base(rebon_tool::Toolset::Standard, PromptProfile::Legacy, &[])
+        );
+    }
+
     #[test]
     fn lean_runtime_context_drops_the_eager_tool_list() {
         let config = config(&["Read", "Bash", "Skill"], &["WebSearch", "Monitor"], true);
