@@ -8,6 +8,13 @@ Each section is a `## <version>` heading followed by one to four `- ` items.
 Keep every item within 36 columns: that is the narrowest the banner's notes
 column gets, and a longer line is cut off.
 
+## 1.28.0
+
+- Leaner prompt, fewer requests
+- Shell-first file tools by default
+- Read deny rules cover shell reads
+- Slow commands move to background
+
 ## 1.27.7
 
 - Router talks to you via TellPerson
