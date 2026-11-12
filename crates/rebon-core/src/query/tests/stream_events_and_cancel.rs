@@ -594,7 +594,12 @@ fn workflow_controller_policy_exposes_workflow_and_scouting_tools() {
     let tool_names = projection.provider_visible_tool_names();
 
     assert!(tool_names.contains(&rebon_tool::WORKFLOW_TOOL_NAME.to_string()));
-    assert!(tool_names.contains(&rebon_tool::RUN_WORKFLOW_ALIAS.to_string()));
+    // Only the legacy prompt profile sends the alias as a second tool; it
+    // dispatches under either.
+    assert_eq!(
+        tool_names.contains(&rebon_tool::RUN_WORKFLOW_ALIAS.to_string()),
+        rebon_tool::legacy_prompt_profile()
+    );
     assert!(tool_names.contains(&"Read".to_string()));
     assert!(!tool_names.contains(&"Write".to_string()));
     assert!(!tool_names.contains(&"Bash".to_string()));
@@ -627,5 +632,8 @@ fn eager_tools_from_engine_exposes_run_workflow_alias_when_promoted() {
         .collect();
 
     assert!(tool_names.contains(&rebon_tool::WORKFLOW_TOOL_NAME.to_string()));
-    assert!(tool_names.contains(&rebon_tool::RUN_WORKFLOW_ALIAS.to_string()));
+    assert_eq!(
+        tool_names.contains(&rebon_tool::RUN_WORKFLOW_ALIAS.to_string()),
+        rebon_tool::legacy_prompt_profile()
+    );
 }

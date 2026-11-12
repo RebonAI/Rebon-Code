@@ -524,8 +524,14 @@ async fn anchored_minimal_text_answer_promotes_after_executor_reload() {
         .iter()
         .any(|tool| tool.name == "SaveMemory"));
     let runtime = captured_runtime_context_text(&requests[1]);
-    assert!(runtime.contains("Provider-visible tools loaded in advance for this turn"));
-    assert!(runtime.contains("The deferred tools below"));
+    if rebon_tool::legacy_prompt_profile() {
+        assert!(runtime.contains("Provider-visible tools loaded in advance for this turn"));
+        assert!(runtime.contains("The deferred tools below"));
+    } else {
+        // The provider's tools array lists the eager tools; the runtime
+        // context names only the deferred ones.
+        assert!(runtime.contains("Deferred tools, usable once loaded"));
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -1,4 +1,4 @@
-use rebon_tool::{ExecutionSurface, Tool, INVOKE_DEFERRED_TOOL_NAME};
+use rebon_tool::{ExecutionSurface, PromptProfile, Tool, INVOKE_DEFERRED_TOOL_NAME};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolExposure {
@@ -14,6 +14,10 @@ pub(crate) struct BuiltinToolExposurePolicy {
     /// function of (tool, surface) — testable, and ready for the day a
     /// process hosts one of each.
     surface: ExecutionSurface,
+    /// Which prompt surface the process sends. The lean profile keeps the
+    /// rarely used planning tools out of every request; the legacy profile
+    /// is the table as it stood before.
+    profile: PromptProfile,
 }
 
 impl BuiltinToolExposurePolicy {
@@ -22,7 +26,14 @@ impl BuiltinToolExposurePolicy {
     }
 
     pub(crate) fn for_surface(surface: ExecutionSurface) -> Self {
-        Self { surface }
+        Self::for_surface_and_profile(surface, PromptProfile::current())
+    }
+
+    pub(crate) fn for_surface_and_profile(
+        surface: ExecutionSurface,
+        profile: PromptProfile,
+    ) -> Self {
+        Self { surface, profile }
     }
 
     pub(crate) fn exposure_for(&self, tool: &dyn Tool) -> ToolExposure {
@@ -34,6 +45,21 @@ impl BuiltinToolExposurePolicy {
         let name = id.as_str();
         if self.surface.is_unattended() && unattended_dead_end(name) {
             return ToolExposure::Hidden;
+        }
+
+        if !self.profile.is_legacy() {
+            match name {
+                // A plan the user must approve before any code is written is
+                // the exception; the tool stays one ToolSearch away.
+                // Multi-replacement edits are an Edit convenience and are
+                // found the same way.
+                "EnterPlanMode" | "MultiEdit" => return ToolExposure::Deferred,
+                // The ledger answers only inside an /ultraplan run, and that
+                // run's execution policy promotes it back
+                // (`is_eager_promotion`).
+                "PlanLedger" => return ToolExposure::Hidden,
+                _ => {}
+            }
         }
 
         match name {
@@ -197,7 +223,51 @@ mod tests {
     }
 
     fn exposure(surface: ExecutionSurface, name: &'static str) -> ToolExposure {
-        BuiltinToolExposurePolicy::for_surface(surface).exposure_for(&NamedTool(name))
+        BuiltinToolExposurePolicy::for_surface_and_profile(surface, PromptProfile::Legacy)
+            .exposure_for(&NamedTool(name))
+    }
+
+    fn lean_exposure(surface: ExecutionSurface, name: &'static str) -> ToolExposure {
+        BuiltinToolExposurePolicy::for_surface_and_profile(surface, PromptProfile::Lean)
+            .exposure_for(&NamedTool(name))
+    }
+
+    /// The lean profile defers the opt-in planning entry and MultiEdit and
+    /// hides the ultraplan ledger outside a run; everything else matches the
+    /// legacy table, and the unattended dead ends stay hidden.
+    #[test]
+    fn the_lean_profile_moves_only_the_rarely_used_planning_tools() {
+        let surface = ExecutionSurface::Interactive;
+        assert_eq!(
+            lean_exposure(surface, "EnterPlanMode"),
+            ToolExposure::Deferred
+        );
+        assert_eq!(lean_exposure(surface, "MultiEdit"), ToolExposure::Deferred);
+        assert_eq!(lean_exposure(surface, "PlanLedger"), ToolExposure::Hidden);
+        assert_eq!(lean_exposure(surface, "ExitPlanMode"), ToolExposure::Eager);
+        for name in [
+            "Read",
+            "Edit",
+            "Write",
+            "Bash",
+            "Agent",
+            "SaveMemory",
+            "WebFetch",
+            "Workflow",
+        ] {
+            assert_eq!(
+                lean_exposure(surface, name),
+                exposure(surface, name),
+                "{name}"
+            );
+        }
+        for name in ["EnterPlanMode", "PlanLedger"] {
+            assert_eq!(
+                lean_exposure(ExecutionSurface::Unattended, name),
+                ToolExposure::Hidden,
+                "{name}"
+            );
+        }
     }
 
     /// The 13 calls that could not have succeeded, plus

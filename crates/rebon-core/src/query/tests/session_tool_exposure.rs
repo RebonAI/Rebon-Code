@@ -221,6 +221,10 @@ fn stable_builtin_exposure_policy_projects_expected_eager_and_deferred_sets() {
         "ExitPlanMode",
         "SaveMemory",
     ] {
+        // The lean prompt profile defers the opt-in planning entry.
+        if name == "EnterPlanMode" && !rebon_tool::legacy_prompt_profile() {
+            continue;
+        }
         if registered.contains(name) {
             assert!(eager.contains(name), "{name} should be eager");
             assert!(!deferred.contains(name), "{name} should not be deferred");
@@ -515,7 +519,7 @@ fn eager_tools_include_gateway_but_not_deferred_tool() {
             .find(|tool| tool.name == rebon_tool::INVOKE_DEFERRED_TOOL_NAME)
             .unwrap()
             .input_schema,
-        rebon_tool::InvokeDeferredTool.input_schema()
+        rebon_tool::InvokeDeferredTool.model_input_schema()
     );
 }
 
