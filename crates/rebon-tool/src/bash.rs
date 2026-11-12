@@ -316,6 +316,15 @@ impl Tool for BashTool {
         }
     }
 
+    /// The output as plain text rather than the result object (see
+    /// [`crate::shell_result_text`]). The legacy profile keeps the object.
+    fn project_result_for_model(&self, value: &Value) -> Option<rebon_api::ToolResultContent> {
+        if crate::legacy_prompt_profile() {
+            return None;
+        }
+        crate::shell_result_text::shell_result_text(value).map(rebon_api::ToolResultContent::text)
+    }
+
     fn model_input_schema(&self) -> ToolInputSchema {
         if crate::legacy_prompt_profile() {
             self.input_schema()

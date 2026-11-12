@@ -181,6 +181,7 @@ pub use response_changes::{changed_earlier_in_response, record_file_change};
 mod search_walk;
 mod shell_failure_marker;
 mod shell_foreground;
+mod shell_result_text;
 pub mod shell_management;
 pub mod shell_preference;
 pub mod shell_process;
