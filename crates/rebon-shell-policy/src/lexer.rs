@@ -73,6 +73,18 @@ pub struct Grammar {
     /// next and a list runs the next whatever the last did, so a verdict on
     /// the first link says nothing about the second. `|&` still stops it.
     pub list_operators_separate: bool,
+    /// Whether an unquoted, unescaped newline starts a new segment, the way
+    /// a shell runs each line as its own command, instead of stopping the
+    /// scan. Blank lines are skipped. A newline inside quotes or after a
+    /// backslash still stops it, whatever this says, when
+    /// `newline_always_ends_the_scan` is set: a line continuation can join
+    /// `find .` to a `-delete` on the next line.
+    pub newline_separates: bool,
+    /// Whether the redirections that cannot write a file pass: `>/dev/null`,
+    /// `>>/dev/null` and `>&1` / `>&2`, each with an optional unquoted `1` or
+    /// `2` fd in front (`2>/dev/null`, `2>&1`). They are dropped from the
+    /// argv. Every other redirection still stops the scan.
+    pub null_redirections: bool,
     pub double_quote_escape: DoubleQuoteEscape,
     /// Whether `""` produces an empty word. It is a real argument, but the
     /// rule matchers have always dropped it.
@@ -91,6 +103,8 @@ pub const RULE_ARGV: Grammar = Grammar {
     newline_always_ends_the_scan: false,
     and_chain_separates: true,
     list_operators_separate: false,
+    newline_separates: false,
+    null_redirections: false,
     double_quote_escape: DoubleQuoteEscape::Literal,
     keep_empty_tokens: false,
     word_separator: |ch| ch.is_ascii_whitespace(),
@@ -114,21 +128,28 @@ pub const STATIC_ARGV: Grammar = Grammar {
     newline_always_ends_the_scan: true,
     and_chain_separates: false,
     list_operators_separate: false,
+    newline_separates: false,
+    null_redirections: false,
     double_quote_escape: DoubleQuoteEscape::Posix,
     keep_empty_tokens: true,
     word_separator: char::is_whitespace,
 };
 
-/// Deciding that a command only reads: every link of a pipeline or a list is
-/// its own argv, judged on its own, and everything [`STATIC_ARGV`] refuses —
-/// expansion, globbing, substitution, redirection — still stops the scan,
-/// because a word that can become another word can become `-delete`. Words
-/// split on ASCII whitespace only, as in [`RULE_ARGV`]: a program name with a
-/// non-breaking space in it is one unknown program, not an allowed one.
+/// Deciding that a command only reads: every link of a pipeline or a list —
+/// and every line of a multi-line command — is its own argv, judged on its
+/// own, and everything [`STATIC_ARGV`] refuses — expansion, globbing,
+/// substitution, redirection to a file — still stops the scan, because a word
+/// that can become another word can become `-delete`. Only the redirections
+/// that cannot write anything (`2>/dev/null`, `2>&1`) pass. Words split on a
+/// space or a tab only, the shell's own blanks: a program name with a form
+/// feed or a non-breaking space in it is one unknown program, not an allowed
+/// one.
 pub const READ_ONLY_ARGV: Grammar = Grammar {
     and_chain_separates: true,
     list_operators_separate: true,
-    word_separator: |ch| ch.is_ascii_whitespace(),
+    newline_separates: true,
+    null_redirections: true,
+    word_separator: |ch| ch == ' ' || ch == '\t',
     ..STATIC_ARGV
 };
 
@@ -199,13 +220,28 @@ pub fn simple_command_segments(command: &str, grammar: &Grammar) -> Result<Vec<V
     let mut current: Vec<String> = Vec::new();
     let mut token = String::new();
     let mut token_started = false;
+    // Whether any of the word so far was quoted or escaped: `2>` names a
+    // file descriptor, `'2'>` an argument.
+    let mut token_quoted = false;
     let mut quote = Quote::None;
     let mut escaped = false;
     let mut chars = command.chars().peekable();
 
     while let Some(ch) = chars.next() {
-        if grammar.newline_always_ends_the_scan && matches!(ch, '\n' | '\r') {
+        let separating_newline =
+            grammar.newline_separates && ch == '\n' && quote == Quote::None && !escaped;
+        if grammar.newline_always_ends_the_scan && matches!(ch, '\n' | '\r') && !separating_newline
+        {
             return Err(Bail::Metacharacter);
+        }
+        if separating_newline {
+            push_word(&mut current, &mut token, &mut token_started, grammar);
+            token_quoted = false;
+            // A blank line, or the line after `&&` / `|`, adds no segment.
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+            continue;
         }
         match quote {
             Quote::Single => {
@@ -257,14 +293,34 @@ pub fn simple_command_segments(command: &str, grammar: &Grammar) -> Result<Vec<V
                     return Err(Bail::Metacharacter);
                 }
                 match ch {
-                    '\\' => escaped = true,
+                    '\\' => {
+                        escaped = true;
+                        token_quoted = true;
+                    }
                     '\'' => {
                         quote = Quote::Single;
                         token_started = true;
+                        token_quoted = true;
                     }
                     '"' => {
                         quote = Quote::Double;
                         token_started = true;
+                        token_quoted = true;
+                    }
+                    '>' if grammar.null_redirections => {
+                        // The word so far is the fd, or the redirection
+                        // follows a word directly; only a bare `1` / `2`
+                        // is accepted as the former, and nothing as the
+                        // latter.
+                        if token_started {
+                            if token_quoted || !matches!(token.as_str(), "1" | "2") {
+                                return Err(Bail::Metacharacter);
+                            }
+                            token.clear();
+                            token_started = false;
+                        }
+                        skip_null_redirection(&mut chars)?;
+                        token_quoted = false;
                     }
                     ';' | '|' if grammar.list_operators_separate => {
                         if ch == '|' {
@@ -277,6 +333,7 @@ pub fn simple_command_segments(command: &str, grammar: &Grammar) -> Result<Vec<V
                             }
                         }
                         push_word(&mut current, &mut token, &mut token_started, grammar);
+                        token_quoted = false;
                         if current.is_empty() {
                             return Err(Bail::EmptySegment);
                         }
@@ -293,6 +350,7 @@ pub fn simple_command_segments(command: &str, grammar: &Grammar) -> Result<Vec<V
                         }
                         chars.next();
                         push_word(&mut current, &mut token, &mut token_started, grammar);
+                        token_quoted = false;
                         if current.is_empty() {
                             return Err(Bail::EmptySegment);
                         }
@@ -300,6 +358,7 @@ pub fn simple_command_segments(command: &str, grammar: &Grammar) -> Result<Vec<V
                     }
                     ch if (grammar.word_separator)(ch) => {
                         push_word(&mut current, &mut token, &mut token_started, grammar);
+                        token_quoted = false;
                     }
                     _ => {
                         token.push(ch);
@@ -319,6 +378,47 @@ pub fn simple_command_segments(command: &str, grammar: &Grammar) -> Result<Vec<V
     }
     segments.push(current);
     Ok(segments)
+}
+
+/// Consume one null redirection, the `>` already read: `>` or `>>` then
+/// `/dev/null`, or `>&1` / `>&2`. Blanks may separate the operator from a
+/// `/dev/null` target, as a shell allows. Anything else — a file, `>|`,
+/// `>&-`, a quoted or expanded target — is a [`Bail::Metacharacter`].
+fn skip_null_redirection<I>(chars: &mut std::iter::Peekable<I>) -> Result<(), Bail>
+where
+    I: Iterator<Item = char>,
+{
+    let ends_word = |ch: Option<&char>| {
+        matches!(
+            ch,
+            None | Some(' ' | '\t' | '\n' | ';' | '|' | '&' | '<' | '>')
+        )
+    };
+    match chars.peek() {
+        Some('&') => {
+            chars.next();
+            if !matches!(chars.next(), Some('1' | '2')) || !ends_word(chars.peek()) {
+                return Err(Bail::Metacharacter);
+            }
+            return Ok(());
+        }
+        Some('>') => {
+            chars.next();
+        }
+        _ => {}
+    }
+    while matches!(chars.peek(), Some(' ' | '\t')) {
+        chars.next();
+    }
+    let mut target = String::new();
+    while !ends_word(chars.peek()) {
+        target.push(chars.next().expect("peeked a target character"));
+    }
+    if target == "/dev/null" {
+        Ok(())
+    } else {
+        Err(Bail::Metacharacter)
+    }
 }
 
 fn push_word(current: &mut Vec<String>, token: &mut String, started: &mut bool, grammar: &Grammar) {
@@ -749,17 +849,62 @@ mod tests {
                 argv(&["cat", "x;y"]),
             ]
         );
+        // Each line is its own segment; blank lines and the line after a
+        // trailing `&&` or `|` add none.
+        assert_eq!(
+            split("ls\n\npwd\ngit status &&\ngit log |\nhead").unwrap(),
+            vec![
+                argv(&["ls"]),
+                argv(&["pwd"]),
+                argv(&["git", "status"]),
+                argv(&["git", "log"]),
+                argv(&["head"]),
+            ]
+        );
+        // The redirections that cannot write a file are dropped from the argv.
+        assert_eq!(
+            split("git log 2>/dev/null | head >/dev/null 2>&1; ls 2> /dev/null >>/dev/null 1>&2")
+                .unwrap(),
+            vec![argv(&["git", "log"]), argv(&["head"]), argv(&["ls"]),]
+        );
+        // `2` after a blank is an argument, and `>` then redirects stdout.
+        assert_eq!(
+            split("echo 2 >/dev/null").unwrap(),
+            vec![argv(&["echo", "2"])]
+        );
         for (command, why) in [
             ("ls |& cat", Bail::Metacharacter),
             ("ls & pwd", Bail::Metacharacter),
             ("ls > out", Bail::Metacharacter),
+            ("ls 2>err.txt", Bail::Metacharacter),
+            ("ls >>log", Bail::Metacharacter),
+            ("ls >|/dev/null", Bail::Metacharacter),
+            ("ls &>/dev/null", Bail::Metacharacter),
+            ("ls 3>/dev/null", Bail::Metacharacter),
+            ("ls '2'>/dev/null", Bail::Metacharacter),
+            ("ls x2>/dev/null", Bail::Metacharacter),
+            ("ls 2>&-", Bail::Metacharacter),
+            ("ls >&3", Bail::Metacharacter),
+            ("ls >&12", Bail::Metacharacter),
+            ("ls >>&1", Bail::Metacharacter),
+            ("ls >\"/dev/null\"", Bail::Metacharacter),
+            ("ls >/dev/null2", Bail::Metacharacter),
+            ("ls >$OUT", Bail::Metacharacter),
+            ("ls >", Bail::Metacharacter),
             ("cat < in", Bail::Metacharacter),
+            ("cat </dev/null", Bail::Metacharacter),
             ("echo $(id)", Bail::Metacharacter),
             ("echo `id`", Bail::Metacharacter),
             ("cat $HOME/x", Bail::Metacharacter),
             ("ls *.rs", Bail::Metacharacter),
             ("ls ~/x", Bail::Metacharacter),
-            ("ls\npwd", Bail::Metacharacter),
+            // A line continuation, a newline inside quotes, and a CR still
+            // stop the scan: `find .` must not be joined to a `-delete`.
+            ("find . \\\n-delete", Bail::Metacharacter),
+            ("echo 'a\nb'", Bail::Metacharacter),
+            ("echo \"a\nb\"", Bail::Metacharacter),
+            ("ls\r\npwd", Bail::Metacharacter),
+            ("ls\n&& pwd", Bail::EmptySegment),
             ("(ls)", Bail::Metacharacter),
             ("ls ;", Bail::EmptySegment),
             ("| ls", Bail::EmptySegment),
@@ -768,6 +913,11 @@ mod tests {
         ] {
             assert_eq!(split(command), Err(why), "{command:?}");
         }
+        // Words split on a space or a tab only: with a form feed or a vertical
+        // tab in it, `ls` is a different, unknown program.
+        assert_eq!(split("ls\u{c}-la").unwrap(), vec![argv(&["ls\u{c}-la"])]);
+        assert_eq!(split("ls\u{b}-la").unwrap(), vec![argv(&["ls\u{b}-la"])]);
+        assert_eq!(split("ls\t-la").unwrap(), vec![argv(&["ls", "-la"])]);
         // The rule matchers keep refusing a pipe: a rule vouches for one
         // program, and the knob is off for them.
         assert_eq!(

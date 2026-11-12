@@ -8,8 +8,9 @@
 //!
 //! The judgment is an allowlist and it fails closed. A command is read-only
 //! only when it is a list of plain argvs — [`crate::lexer::READ_ONLY_ARGV`]
-//! refuses redirection, substitution, expansion and globbing before anything
-//! here looks at it — and every link names a program on the list below with
+//! refuses redirection to a file, substitution, expansion and globbing before
+//! anything here looks at it, and splits a multi-line command into its lines —
+//! and every link names a program on the list below with
 //! arguments that program cannot be talked into writing, deleting, running
 //! something else or reaching the network with. Anything unlisted, and
 //! anything this cannot read, asks as before.
@@ -328,6 +329,12 @@ mod tests {
             "rg -c foo | sort | uniq -c",
             "ls && git status; pwd",
             "stat Cargo.toml || true",
+            // One command per line, each judged on its own.
+            "git status\ngit log --oneline -3",
+            // Redirections that cannot write a file.
+            "echo x 2>/dev/null",
+            "git log --oneline 2>&1 | head -5",
+            "rg -n foo crates >/dev/null 2>&1",
         ] {
             assert!(bash(command), "expected {command:?} to be read-only");
         }
@@ -359,7 +366,8 @@ mod tests {
             // Redirection, substitution, expansion, globbing, backgrounding.
             "ls > files.txt",
             "cat a >> b",
-            "echo x 2>/dev/null",
+            "echo x 2>err.txt",
+            "ls 2>&1 >out.txt",
             "cat < in",
             "echo $(rm -rf /)",
             "echo `id`",
@@ -368,6 +376,8 @@ mod tests {
             "ls ~",
             "ls &",
             "ls\nrm x",
+            "git status\ngit commit -m x",
+            "find . \\\n-delete",
             // A read piped or chained into something that is not one.
             "git log | sh",
             "ls && rm x",
@@ -428,6 +438,9 @@ mod tests {
     fn a_session_credential_read_still_asks() {
         assert!(!bash("cat /home/u/.rebon/jobs/abc/state.json"));
         assert!(!bash("cat sess.owner.json"));
+        // On a later line, or behind a null redirection.
+        assert!(!bash("ls\ncat /home/u/.rebon/jobs/abc/state.json"));
+        assert!(!bash("cat /home/u/.rebon/jobs/abc/state.json 2>/dev/null"));
         assert!(!powershell(
             "Get-Content C:\\Users\\u\\.rebon\\jobs\\a\\state.json"
         ));
