@@ -137,6 +137,31 @@ impl ProcessTreeGuard {
             Ok(())
         }
     }
+
+    /// Let the tree go: clear `KILL_ON_JOB_CLOSE`, so the drop closes the
+    /// job without terminating what is still in it. An explicit
+    /// [`terminate`](Self::terminate) still works until then.
+    pub fn release(&mut self) -> io::Result<()> {
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        };
+
+        let limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        let configured = unsafe {
+            SetInformationJobObject(
+                self.job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::addr_of!(limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -176,6 +201,16 @@ impl ProcessTreeGuard {
     /// False once the group has been signalled once.
     pub fn is_armed(&self) -> bool {
         self.process_group_id.is_some()
+    }
+
+    /// Let the tree go without signalling it: the guard disarms, so neither
+    /// a later [`terminate`](Self::terminate) nor the drop reaches the group.
+    /// For a group whose leader has exited and whose leftovers are meant to
+    /// outlive it — once the leader is gone its id can be reused, and a
+    /// signal sent later could land on a stranger.
+    pub fn release(&mut self) -> io::Result<()> {
+        self.process_group_id = None;
+        Ok(())
     }
 
     /// Kill the whole group now, rather than waiting for the drop.
@@ -274,6 +309,27 @@ mod unix_tests {
         assert!(!guard.is_armed());
         drop(guard);
 
+        let _ = child.wait();
+    }
+
+    /// A released guard signals nothing, on terminate or on drop: the group
+    /// keeps running.
+    #[test]
+    fn a_released_guard_never_signals_the_group() {
+        let mut child = spawn_group_leader();
+        let process_group_id = i32::try_from(child.id()).unwrap();
+        let mut guard = ProcessTreeGuard::for_process_group(child.id()).unwrap();
+
+        guard.release().expect("release");
+        assert!(!guard.is_armed());
+        guard
+            .terminate()
+            .expect("a released guard's terminate is a no-op");
+        drop(guard);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(group_exists(process_group_id), "the group must survive");
+
+        let _ = child.kill();
         let _ = child.wait();
     }
 

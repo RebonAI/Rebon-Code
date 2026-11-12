@@ -425,8 +425,12 @@ impl ShellProcessRegistry {
     /// started before this moment is outside it. Unlike a `run_in_background`
     /// shell, the group is not killed when the command exits: what a
     /// foreground command leaves running (`nohup server &`) outlives it as it
-    /// would have without the timeout. `ShellStop` and the session's end
-    /// still end the whole tree.
+    /// would have without the timeout. Once the command has exited the tree
+    /// is released for good — the unix guard forgets the group id, the
+    /// Windows job loses its kill-on-close — so neither the entry's later
+    /// drop (a prune, the registry's shutdown) nor anything else can signal
+    /// it, or a group id that has since been reused. While the command runs,
+    /// `ShellStop` and the session's end still end the whole tree.
     ///
     /// Refused — the child handed back with the reason, for the caller to
     /// kill as before — when nothing can own a background shell here, or
@@ -1049,7 +1053,15 @@ impl ShellEntry {
         };
         state.status = status;
         state.completed_at_ms = Some(completed_at_ms);
-        self.process_tree.mark_finished();
+        if self.reap_tree_on_exit {
+            self.process_tree.mark_finished();
+        } else if let Err(err) = self.process_tree.release() {
+            tracing::warn!(
+                shell_id = %self.shell_id,
+                error = %err,
+                "could not release an adopted shell's process tree"
+            );
+        }
         drop(state);
 
         if let Some(controller) = self.task_runtime_controller.as_ref() {
@@ -1880,6 +1892,18 @@ impl ProcessTreeControl {
 
     fn mark_finished(&self) {
         self.active.store(false, Ordering::Release);
+    }
+
+    /// Finish without reaping: disarm the platform guard too, so nothing
+    /// signals the tree later — not the prune that drops this entry, not
+    /// the registry's drop. Once the leader has exited its group id can be
+    /// reused, and the leftovers are meant to outlive it.
+    fn release(&self) -> io::Result<()> {
+        self.active.store(false, Ordering::Release);
+        match &self.platform {
+            Some(platform) => lock(platform).release(),
+            None => Ok(()),
+        }
     }
 }
 
@@ -3371,5 +3395,46 @@ mod tests {
         assert_eq!(result["stdout"], "started");
         assert!(result.get("shellId").is_none());
         assert!(lock(&registry.inner.entries).is_empty());
+    }
+
+    /// Once an adopted foreground shell exits, its tree is let go for good:
+    /// a process it left running survives the shell's exit and the entry's
+    /// later drop (a prune, the registry's shutdown). Nothing signals the
+    /// group id after the shell is done, so a reused id is never hit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_adopted_shells_leftovers_outlive_it_and_its_entry() {
+        use crate::Tool as _;
+        let _env = crate::test_env::hold_env();
+        let registry = Arc::new(ShellProcessRegistry::new());
+        let context = context("leftovers").with_shell_process_registry(Arc::clone(&registry));
+
+        let result = crate::bash::BashTool::new()
+            .call(
+                json!({
+                    "command": "sleep 30 >/dev/null 2>&1 & echo $!; sleep 0.6",
+                    "timeout": 200
+                }),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["backgrounded"], true, "{result}");
+        let leftover: i32 = result["stdout"].as_str().unwrap().trim().parse().unwrap();
+        let shell_id = result["shellId"].as_str().unwrap().to_owned();
+        let done = registry
+            .wait(&context, "ShellOutput", &shell_id, true, 10_000)
+            .await
+            .unwrap();
+        assert_eq!(done["completed"], true, "{done}");
+
+        drop(context);
+        drop(registry);
+        sleep(Duration::from_millis(300)).await;
+        let alive = unsafe { libc::kill(leftover, 0) } == 0;
+        unsafe {
+            libc::kill(leftover, libc::SIGKILL);
+        }
+        assert!(alive, "the leftover was killed when the entry went away");
     }
 }
