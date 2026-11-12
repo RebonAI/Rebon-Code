@@ -172,7 +172,7 @@ where
     } else {
         let refused = match context.shell_process_registry() {
             None => Err((
-                child,
+                Box::new(child),
                 "there is no background shell registry here".to_string(),
             )),
             Some(registry) => {
@@ -199,7 +199,7 @@ where
                 });
             }
             Err((returned, reason)) => {
-                child = returned;
+                child = *returned;
                 let _ = child.kill().await;
                 Ending::Killed { reason }
             }

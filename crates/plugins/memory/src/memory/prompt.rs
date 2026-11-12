@@ -759,8 +759,9 @@ pub fn load_memory_prompt_with_options_for_profile(
 /// * `path` — absolute path of the MEMORY.md file on disk.
 /// * `raw_content` — unmodified bytes as read from disk.
 /// * `content_differs_from_disk` — true iff the injected prompt content
-/// would differ from `raw_content` (i.e. existing truncation or prompt-budget
-/// omission fired) — what keeps the entry from counting as seen for Write.
+///   would differ from `raw_content` (i.e. existing truncation or
+///   prompt-budget omission fired) — what keeps the entry from counting as
+///   seen for Write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryEntrypointSnapshot {
     /// Absolute path of the MEMORY.md file on disk.

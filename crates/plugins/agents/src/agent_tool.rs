@@ -2506,7 +2506,8 @@ mod tests {
     #[test]
     fn shared_worktree_prompt_targets_the_agent_not_the_caller() {
         assert!(WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT.contains("do not bypass"));
-        assert!(WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT.contains("modified-since-read"));
+        assert!(WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT.contains("current content"));
+        assert!(!WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT.contains("modified-since-read"));
         // Caller-side orchestration rules (parallel writer isolation, named
         // teammate limits) live in the tool description, not in the prompt
         // injected into the agent that is being spawned.

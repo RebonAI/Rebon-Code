@@ -1310,11 +1310,18 @@ mod tests {
             "Create files with Write, not cat with heredoc or echo redirection",
             "Locate files with Glob, not find or ls",
             "Search within files with Grep, not grep or rg",
-            "read-before-write, stale-content, or same-path serialization",
+            "get around the file tools' checks",
             "Edit, Write, MultiEdit, and NotebookEdit",
-            "modified-since-read",
+            "run in the order you list them",
         ] {
             assert!(full.contains(required), "{required}");
+        }
+        for gone in [
+            "modified-since-read",
+            "read-before-write",
+            "do not batch a read",
+        ] {
+            assert!(!full.contains(gone), "{gone}");
         }
     }
 
@@ -1731,7 +1738,7 @@ mod tests {
     }
 
     #[test]
-    fn using_tools_marks_same_path_file_calls_as_dependent() {
+    fn using_tools_says_same_path_file_calls_apply_in_order() {
         let tools = vec![
             "Bash".into(),
             "Read".into(),
@@ -1742,11 +1749,13 @@ mod tests {
         ];
         let section = using_tools_section(&tools);
 
-        assert!(section.contains("operating on one path are dependent"));
+        assert!(section.contains("on one path may share a response and apply in that order"));
         assert!(section.contains("NotebookEdit"));
-        assert!(section.contains("do not batch a read and mutation of the same path"));
-        assert!(section.contains("modified-since-read"));
-        assert!(section.contains("Shell commands and scripts must never circumvent"));
+        assert!(
+            section.contains("the later calls of that response that change something are skipped")
+        );
+        assert!(!section.contains("modified-since-read"));
+        assert!(section.contains("Shell commands and scripts must never be used to get around"));
     }
 
     #[test]

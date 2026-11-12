@@ -443,39 +443,36 @@ impl ShellProcessRegistry {
         command_text: String,
         output_so_far: &[(bool, String)],
         timeout_ms: u64,
-    ) -> Result<Value, (Child, String)>
+    ) -> Result<Value, (Box<Child>, String)>
     where
         O: AsyncRead + Unpin + Send + 'static,
         E: AsyncRead + Unpin + Send + 'static,
     {
         let Ok(owner) = owner_from_context(context, tool_name) else {
-            return Err((
-                child,
-                "nothing in this context can own a background shell".to_string(),
-            ));
+            return refused(child, "nothing in this context can own a background shell");
         };
         let limit_reached = format!(
             "the background shell limit ({MAX_RUNNING_SHELLS_PER_OWNER} running) is reached"
         );
         if self.ensure_capacity(&owner, tool_name).is_err() {
-            return Err((child, limit_reached));
+            return refused(child, limit_reached);
         }
         let process_tree = match ProcessTreeControl::for_child(&child) {
             Ok(process_tree) => Arc::new(process_tree),
             Err(err) => {
-                return Err((
+                return refused(
                     child,
                     format!("its process tree could not be taken over: {err}"),
-                ))
+                )
             }
         };
         let shell_id = match self.unique_shell_id(tool_name, false) {
             Ok(shell_id) => shell_id,
-            Err(err) => return Err((child, err.to_string())),
+            Err(err) => return refused(child, err.to_string()),
         };
         let output_file = match create_output_file(context, &shell_id) {
             Ok(output_file) => output_file,
-            Err(err) => return Err((child, err.to_string())),
+            Err(err) => return refused(child, err.to_string()),
         };
         let mut entry = ShellEntry::new(
             shell_id.clone(),
@@ -497,7 +494,7 @@ impl ShellProcessRegistry {
             let mut entries = lock(&self.inner.entries);
             prune_completed(&mut entries, &owner);
             if running_count(&entries, &owner) >= MAX_RUNNING_SHELLS_PER_OWNER {
-                return Err((child, limit_reached));
+                return refused(child, limit_reached);
             }
             entries.insert(shell_id, Arc::clone(&entry));
         }
@@ -645,6 +642,12 @@ impl ShellProcessRegistry {
             .cloned()
             .ok_or_else(|| unknown_shell_error(caller, shell_id))
     }
+}
+
+/// [`ShellProcessRegistry::adopt_foreground`]'s refusal: the child handed
+/// back, boxed to keep the `Result` small, and why.
+fn refused(child: Child, reason: impl Into<String>) -> Result<Value, (Box<Child>, String)> {
+    Err((Box::new(child), reason.into()))
 }
 
 #[derive(Default)]

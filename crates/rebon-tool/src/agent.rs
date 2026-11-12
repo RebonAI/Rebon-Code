@@ -52,7 +52,7 @@ pub const DEFAULT_SUB_AGENT_TYPE: &str = "general-purpose";
 pub const WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT: &str = r#"SHARED WORKTREE SAFETY:
 - This may be a shared working tree with uncommitted changes from the user or other agents. Treat pre-existing and concurrent changes as owned work, not as errors to clean up.
 - Stay focused on the assigned task. Do not investigate, fix, format, stage, or commit unrelated changes. Scope Git status and diff inspection to task-relevant paths whenever possible.
-- Use Read/Edit/Write/MultiEdit for file changes; do not bypass their conflict protection with shell commands or scripts. If a file reports modified-since-read, reread it and preserve the latest contents before retrying.
+- Use Read/Edit/Write/MultiEdit for file changes; do not bypass their checks with shell commands or scripts. Edit matches `old_string` against the file's current content, so a change someone else made is not an error: build the edit from the current text.
 - If a file you must edit already contains other changes, reread its latest contents and make the smallest compatible edit. If you cannot preserve the existing work safely, report the conflict instead of cleaning the worktree.
 - Never use git reset, checkout or switch, restore, clean, stash, revert, force push, or branch deletion to remove observed differences or recover from a suspected bad edit. Only perform such an operation when the user explicitly requested it and the current command receives explicit permission approval."#;
 
@@ -1055,7 +1055,8 @@ mod tests {
     #[test]
     fn shared_worktree_prompt_targets_the_agent_not_the_caller() {
         assert!(WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT.contains("do not bypass"));
-        assert!(WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT.contains("modified-since-read"));
+        assert!(WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT.contains("current content"));
+        assert!(!WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT.contains("modified-since-read"));
         assert!(!WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT.contains("Parallel implementation agents"));
         assert!(!WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT.contains("Named teammates"));
     }

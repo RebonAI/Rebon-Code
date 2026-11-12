@@ -234,10 +234,12 @@ whenever you intend to make more than one, maximizing safe parallelism for effic
 If a call needs values supplied by an earlier call, do NOT run them in parallel; execute \
 them in order. For example, an operation that requires another to finish first must wait \
 for that operation to complete.\n\
- - Operations on a single file path depend on one another. Never run a read alongside \
-a mutation of that path, or several mutations of it, in parallel. If a mutation says \
-the file has changed since your read, read it anew and retain the current contents \
-before trying again."
+ - The calls in one response run in the order you list them: consecutive read-only calls \
+run together, every other call runs alone. A read and a mutation of one path, or several \
+mutations of it, may therefore share a response and apply in that order. If a call that \
+changes something fails, the later calls of that response that change something are \
+skipped. An edit is matched against the file's current content, so it needs no earlier \
+read."
         .to_string()
 }
 
@@ -338,8 +340,8 @@ understand and review; this is CRITICAL to helping them:"
          fall back to {bash_name} for these operations only when absolutely necessary."
     ));
     sub_items.push(
-        "  - Shell commands and scripts must never circumvent file-tool safeguards for \
-         read-before-write, stale-content, or same-path serialization."
+        "  - Shell commands and scripts must never be used to get around the file tools' \
+         checks, such as Write's refusal to replace a file you have not read."
             .to_string(),
     );
 
@@ -361,11 +363,12 @@ dependencies active; delegation and starting a check do not mean completion."
 dependencies, execute every independent call in parallel. Make the fullest possible \
 use of parallel calls for efficiency. Calls needing values from earlier calls must \
 NOT be parallelized; run them in sequence. For example, when one operation cannot \
-start until another completes, finish the first before starting the second. Read \
-and file-mutating tools (Edit, Write, MultiEdit, and NotebookEdit) operating on one \
-path are dependent: do not batch a read and mutation of the same path, or several \
-mutations of that path, in parallel. Upon a modified-since-read report from a \
-mutation, use Read again and keep the latest file contents intact when retrying."
+start until another completes, finish the first before starting the second. The \
+calls of one response run in the order you list them (consecutive read-only calls \
+overlap), so a Read and the file-mutating tools (Edit, Write, MultiEdit, and \
+NotebookEdit) on one path may share a response and apply in that order. If a call \
+that changes something fails, the later calls of that response that change something \
+are skipped."
             .to_string(),
     );
 
