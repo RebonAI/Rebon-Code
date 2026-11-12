@@ -310,7 +310,19 @@ impl Tool for BashTool {
     }
 
     fn model_description(&self) -> &str {
-        BASH_MODEL_DESCRIPTION
+        if crate::legacy_prompt_profile() {
+            BASH_MODEL_DESCRIPTION
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
+    fn model_input_schema(&self) -> ToolInputSchema {
+        if crate::legacy_prompt_profile() {
+            self.input_schema()
+        } else {
+            lean_schema()
+        }
     }
 
     /// `Bash` and `PowerShell` are peers, and the user picks which
@@ -937,6 +949,36 @@ pub(crate) fn bash_bin_shell() -> BinShell {
     // a `BinShell` is only the prefix that precedes it.
     args.pop();
     BinShell::new(program, args)
+}
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str =
+    "Run a shell command and return its output. Use the file tools, not the shell, to \
+read, search, and edit files. Join dependent steps with `&&`; a failure inside a `;` chain is \
+marked in stderr. `timeout` is in ms (default 60000, max 600000); a command that reaches it \
+keeps running in the background under a shellId, and its completion is announced. \
+`run_in_background` returns a shellId and an outputPath that receives the output; wait for it \
+with ShellOutput and stop it with ShellStop.";
+
+fn lean_schema() -> ToolInputSchema {
+    json!({
+        "type": "object",
+        "properties": {
+            "command": { "type": "string" },
+            "description": {
+                "type": "string",
+                "description": "What the command does, 5-10 words, shown to the user."
+            },
+            "timeout": { "type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_MS },
+            "run_in_background": { "type": "boolean" },
+            "dangerouslyDisableSandbox": {
+                "type": "boolean",
+                "description": "Only when the sandbox blocked a command the task needs."
+            }
+        },
+        "required": ["command"],
+        "additionalProperties": false
+    })
 }
 
 #[cfg(test)]

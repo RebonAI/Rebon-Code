@@ -221,6 +221,14 @@ impl Tool for ReadTool {
         DESCRIPTION
     }
 
+    fn model_description(&self) -> &str {
+        if crate::legacy_prompt_profile() {
+            self.description()
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
@@ -1578,6 +1586,15 @@ fn pdf_output_dir() -> PathBuf {
         std::process::id()
     ))
 }
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str =
+    "Read files (not directories), including images and PDFs. `targets` holds 1-16 \
+files, each an absolute `path` with optional 1-indexed inclusive `start`/`end`, a `symbol` to \
+read, or PDF `pages` (\"1-5\"; required above 10 pages, at most 20). Files up to 600 lines \
+come back whole, longer ones in windows of at least 300 lines. Output is capped at 16 KiB per \
+file and 32 KiB per call; omitted targets are named for retry. Each line is prefixed with its \
+number and a tab.";
 
 #[cfg(test)]
 mod tests {

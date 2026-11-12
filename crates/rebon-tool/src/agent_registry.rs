@@ -486,6 +486,38 @@ impl AgentRegistry {
             .join("\n")
     }
 
+    /// The agent list for the `Agent` tool's lean description: a compiled-in
+    /// agent gets its one-line [`crate::builtin_agents::lean_when_to_use`];
+    /// an agent a user, project or plugin defined keeps its own text.
+    pub fn format_lean_lines(&self, include_worktree_agents: bool) -> String {
+        self.spawnable()
+            .filter(|def| def.is_offered_to_model())
+            .filter(|def| {
+                include_worktree_agents
+                    || !def
+                        .isolation
+                        .as_deref()
+                        .is_some_and(|mode| mode.eq_ignore_ascii_case("worktree"))
+            })
+            .map(|def| {
+                let lean = matches!(def.source, AgentSource::BuiltIn)
+                    .then(|| crate::builtin_agents::lean_when_to_use(&def.agent_type))
+                    .flatten();
+                let tools = if def.tool_filter.is_unrestricted() {
+                    String::new()
+                } else {
+                    format!(" (Tools: {})", def.tool_filter.describe_allowed())
+                };
+                format!(
+                    "- {}: {}{tools}",
+                    def.agent_type,
+                    lean.unwrap_or(def.when_to_use.as_str())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     pub fn format_lines_without_worktree_agents(&self) -> String {
         self.spawnable()
             .filter(|def| def.is_offered_to_model())

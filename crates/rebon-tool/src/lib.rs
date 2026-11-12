@@ -281,6 +281,7 @@ pub use worker_control::{
 };
 pub use workflow::WorkflowContext;
 
+pub use agent::workflow_agent_shared_worktree_prompt;
 pub use agent::{
     agent_input_may_write, agent_registry_selection, append_workflow_agent_shared_worktree_prompt,
     ensure_agent_id, set_agent_registry_selection, set_sub_agents_enabled, sub_agents_enabled,
@@ -341,6 +342,7 @@ pub const NOTEBOOK_EDIT_TOOL_NAME: &str = "NotebookEdit";
 pub use plan_mode::{ENTER_PLAN_MODE_TOOL_NAME, EXIT_PLAN_MODE_TOOL_NAME, PLAN_LEDGER_TOOL_NAME};
 pub use powershell::{PowerShellEdition, PowerShellTool, POWERSHELL_TOOL_NAME};
 pub use read::ReadTool;
+pub use rebon_types::prompt_profile::{legacy_prompt_profile, PromptProfile, PROMPT_PROFILE_ENV};
 pub use rebon_types::{
     CapabilityContext, ExecutionPolicy, PolicyMode, ShellPolicy, UltraplanContext,
 };
@@ -2376,8 +2378,17 @@ pub trait Tool: Send + Sync {
         self.description()
     }
 
-    /// JSON schema for the tool's input object.
+    /// JSON schema for the tool's input object. Dispatch validates calls
+    /// against this one, so it lists every field the tool accepts.
     fn input_schema(&self) -> ToolInputSchema;
+
+    /// Schema sent in provider-visible tool metadata. Defaults to
+    /// [`Self::input_schema`]; a tool that accepts fields only the harness
+    /// sets (internal routing, broker-filled answers) advertises a narrower
+    /// schema here while dispatch keeps accepting the full one.
+    fn model_input_schema(&self) -> ToolInputSchema {
+        self.input_schema()
+    }
 
     /// Whether the tool is currently enabled.
     fn is_enabled(&self) -> bool {

@@ -32,6 +32,22 @@ impl Tool for InvokeDeferredTool {
         "Invoke a deferred tool discovered through ToolSearch."
     }
 
+    fn model_description(&self) -> &str {
+        if crate::legacy_prompt_profile() {
+            self.description()
+        } else {
+            LEAN_DESCRIPTION
+        }
+    }
+
+    fn model_input_schema(&self) -> ToolInputSchema {
+        if crate::legacy_prompt_profile() {
+            self.input_schema()
+        } else {
+            lean_schema()
+        }
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
@@ -59,6 +75,22 @@ impl Tool for InvokeDeferredTool {
             source: anyhow::anyhow!("InvokeDeferredTool must be dispatched by the engine gateway"),
         })
     }
+}
+
+/// Provider-visible description under the lean prompt profile.
+const LEAN_DESCRIPTION: &str =
+    "Call a deferred tool whose schema ToolSearch returned, when calling it by name \
+is not possible. `arguments` must satisfy that schema.";
+
+fn lean_schema() -> ToolInputSchema {
+    json!({
+        "type": "object",
+        "properties": {
+            "tool_name": { "type": "string" },
+            "arguments": { "type": "object" }
+        },
+        "required": ["tool_name", "arguments"]
+    })
 }
 
 #[cfg(test)]

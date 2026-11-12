@@ -47,6 +47,22 @@ impl Tool for ShellOutputTool {
          handled here: their events arrive as task notifications."
     }
 
+    fn model_description(&self) -> &str {
+        if crate::legacy_prompt_profile() {
+            self.description()
+        } else {
+            LEAN_OUTPUT_DESCRIPTION
+        }
+    }
+
+    fn model_input_schema(&self) -> ToolInputSchema {
+        if crate::legacy_prompt_profile() {
+            self.input_schema()
+        } else {
+            lean_output_schema()
+        }
+    }
+
     fn input_schema(&self) -> ToolInputSchema {
         json!({
             "type": "object",
@@ -113,6 +129,14 @@ impl Tool for ShellStopTool {
     fn description(&self) -> &str {
         "Stops a background Bash or PowerShell process tree by shellId. Repeated calls are \
          idempotent, and stopping an already completed shell is a successful no-op."
+    }
+
+    fn model_description(&self) -> &str {
+        if crate::legacy_prompt_profile() {
+            self.description()
+        } else {
+            LEAN_STOP_DESCRIPTION
+        }
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -252,6 +276,28 @@ fn invalid_input(tool_name: &str, reason: impl Into<String>) -> ToolError {
         error_code: Some(INVALID_INPUT_CODE),
     }
 }
+
+/// ShellOutput's provider-visible description under the lean prompt profile.
+const LEAN_OUTPUT_DESCRIPTION: &str =
+    "Without `shellId`, list background shells. With it, block until that shell exits \
+or `timeout` ms pass (5000-300000, default 30000), then return its status, exit code, output \
+tail, and outputPath (Read or Grep it for the full output). `wait: false` returns the status \
+at once. Use one long wait rather than repeated short ones.";
+
+fn lean_output_schema() -> ToolInputSchema {
+    json!({
+        "type": "object",
+        "properties": {
+            "shellId": { "type": "string" },
+            "timeout": { "type": "integer" },
+            "wait": { "type": "boolean" }
+        },
+        "additionalProperties": false
+    })
+}
+
+/// ShellStop's provider-visible description under the lean prompt profile.
+const LEAN_STOP_DESCRIPTION: &str = "Stop a background shell's process tree by shellId.";
 
 #[cfg(test)]
 mod tests {

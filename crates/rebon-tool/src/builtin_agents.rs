@@ -282,6 +282,14 @@ the preferred read-only codebase-search fallback; for unknown-scope codebase \
 discovery or evidence gathering, choose Explore instead.";
 
 fn general_purpose_system_prompt() -> String {
+    if crate::legacy_prompt_profile() {
+        legacy_general_purpose_system_prompt()
+    } else {
+        LEAN_GENERAL_PURPOSE_SYSTEM_PROMPT.to_string()
+    }
+}
+
+fn legacy_general_purpose_system_prompt() -> String {
     "\
 You are an agent for Rebon, an independent agentic coding CLI. Given the user's \
 message, you should use the tools available to complete the task. Complete the task \
@@ -505,6 +513,14 @@ When calling, specify search breadth: \"quick\" for a single targeted lookup, \
 multiple locations and naming conventions.";
 
 fn explore_system_prompt() -> String {
+    if crate::legacy_prompt_profile() {
+        legacy_explore_system_prompt()
+    } else {
+        LEAN_EXPLORE_SYSTEM_PROMPT.to_string()
+    }
+}
+
+fn legacy_explore_system_prompt() -> String {
     "\
 You are a file search specialist for Rebon, an independent agentic coding CLI. You excel at thoroughly navigating and exploring codebases.
 
@@ -610,9 +626,87 @@ REMEMBER: You can ONLY explore and plan. You CANNOT and MUST NOT write, edit, or
         .to_string()
 }
 
+// ── Lean prompt profile ────────────────────────────────────────────
+
+/// The general-purpose sub-agent's persona under the lean prompt profile.
+const LEAN_GENERAL_PURPOSE_SYSTEM_PROMPT: &str = "\
+You are a sub-agent of Rebon, a coding CLI. Complete the task in the caller's message with the \
+tools available: all of it, and nothing beyond it. Create files only when the task needs them. \
+Do not delete others' work, push, publish, or send messages unless the task explicitly asks. \
+Report truthfully, including what you did not finish or could not verify. End with a concise \
+report of what you did and found; the caller relays it to the user.";
+
+/// The Explore sub-agent's persona under the lean prompt profile.
+const LEAN_EXPLORE_SYSTEM_PROMPT: &str = "\
+You are a read-only search agent for Rebon, a coding CLI. Find what the caller asked for with \
+Glob, Grep, and Read, at the breadth they asked for (quick, medium, or very thorough). Do not \
+create, modify, move, or delete files or change any system state, including temporary files. \
+Run independent searches in parallel. Finish the search before reporting: an untried lookup is \
+not a blocker. Report findings concisely with absolute file paths; do not ask follow-up \
+questions or offer next steps.";
+
+/// One line per built-in agent for the `Agent` tool's lean description, or
+/// `None` for a type without one (the full `when_to_use` is used then).
+pub fn lean_when_to_use(agent_type: &str) -> Option<&'static str> {
+    Some(match agent_type {
+        "Explore" => {
+            "Read-only codebase search for broad, separable questions; give the breadth: quick, \
+             medium, or very thorough."
+        }
+        "general-purpose" => "Multi-step research or implementation; the default.",
+        "verification" => {
+            "Independent PASS/FAIL check of finished work, only when the user asks for one; \
+             pass the original task, the changed files, and the approach. Verify your own work \
+             yourself."
+        }
+        "statusline-setup" => "Configure the user's Rebon status line.",
+        "rebon-code-guide" => {
+            "Questions about Rebon itself, its agents, or model provider APIs; continue a \
+             running one with SendMessage instead of starting another."
+        }
+        "batch-worker" => "Worker in an isolated git worktree for one /batch unit (one PR).",
+        PLAN_AGENT_TYPE => "Independent implementation plan, outside plan mode.",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lean personas keep the boundaries the legacy ones carried: Explore
+    /// stays read-only and finishes its search, general-purpose stays inside
+    /// its task and does not reach outside the machine unasked.
+    #[test]
+    fn lean_personas_keep_their_boundaries() {
+        for needle in [
+            "read-only",
+            "Do not create, modify, move, or delete files or change any system state",
+            "an untried lookup is not a blocker",
+            "do not ask follow-up questions or offer next steps",
+        ] {
+            assert!(LEAN_EXPLORE_SYSTEM_PROMPT.contains(needle), "{needle}");
+        }
+        for needle in [
+            "nothing beyond it",
+            "Do not delete others' work, push, publish, or send messages",
+            "Report truthfully",
+        ] {
+            assert!(
+                LEAN_GENERAL_PURPOSE_SYSTEM_PROMPT.contains(needle),
+                "{needle}"
+            );
+        }
+        for agent in all_builtin_agents() {
+            if builtin_agent_is_offered_to_model(agent.agent_type) {
+                assert!(
+                    lean_when_to_use(agent.agent_type).is_some(),
+                    "{}",
+                    agent.agent_type
+                );
+            }
+        }
+    }
 
     // ── Explore ───────────────────────────────────────────────
 
@@ -634,7 +728,11 @@ mod tests {
 
     #[test]
     fn explore_system_prompt_mentions_read_only() {
-        let def = explore_agent_def();
+        // The legacy wording; the lean persona has its own test below.
+        let def = BuiltInAgentDef {
+            system_prompt: legacy_explore_system_prompt(),
+            ..explore_agent_def()
+        };
         assert!(def.system_prompt.contains("READ-ONLY"));
         assert!(def.system_prompt.contains("Rebon"));
         assert!(def.system_prompt.contains("file search specialist"));
@@ -672,7 +770,10 @@ mod tests {
 
     #[test]
     fn explore_finishes_available_research_before_reporting_a_limit() {
-        let def = explore_agent_def();
+        let def = BuiltInAgentDef {
+            system_prompt: legacy_explore_system_prompt(),
+            ..explore_agent_def()
+        };
         assert!(def
             .system_prompt
             .contains("Complete the assigned search with the available read-only tools"));
