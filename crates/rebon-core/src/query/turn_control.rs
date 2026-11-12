@@ -410,7 +410,8 @@ enum ToolRoundFlow {
     Cancelled,
 }
 
-/// Dispatch tool calls concurrently and restore provider order.
+/// Dispatch tool calls in ordered stages (see [`super::tool_schedule`]) and
+/// restore provider order.
 #[allow(clippy::too_many_arguments)]
 async fn run_tool_round(
     engine: &Arc<Engine>,
@@ -429,8 +430,8 @@ async fn run_tool_round(
     let tool_batch_context = context
         .clone()
         .with_auto_mode_classifier_transcript(auto_mode_classifier_transcript)
-        .with_fresh_file_mutation_batch()
         .with_parallel_agent_write_batch(parallel_agent_write_batch);
+    let tools = engine.tool_resolver_for_context(&tool_batch_context);
     let mut cancelled_during_dispatch = false;
 
     if cancel.is_cancelled() {
@@ -445,37 +446,25 @@ async fn run_tool_round(
         cancelled_during_dispatch = true;
     }
 
-    // Keep each result's original index for the model-visible order.
-    let mut handles = Vec::with_capacity(tool_use_list.len());
+    let mut indexed_results = Vec::new();
     if !cancelled_during_dispatch {
+        let mut prepared = Vec::with_capacity(tool_use_list.len());
         for (i, tool_use) in tool_use_list.iter().enumerate() {
-            let _ = tx.send(QueryEvent::ToolDispatchStart {
-                tool_use_id: tool_use.id.clone(),
-                name: tool_use.name.clone(),
-                input: tool_use.input.clone(),
-            });
-
-            let engine = Arc::clone(&engine);
-            let context = tool_batch_context.clone();
-            let tx = tx.clone();
-            let cancel = cancel.clone();
-            let tool_id = tool_use.id.clone();
-            let tool_name = tool_use.name.clone();
-            let tool_input = tool_use.input.clone();
-            let deferred_indexed = context
+            let deferred_indexed = tool_batch_context
                 .tool_search_index()
                 .is_some_and(|index| index.contains_name(&tool_use.name));
             let deferred_available = deferred_indexed
                 && (!params.capability_mode.is_minimal()
-                    || context.is_deferred_tool_discovered(&tool_use.name));
+                    || tool_batch_context.is_deferred_tool_discovered(&tool_use.name));
             let filter_reject = !announced_tools.is_empty()
                 && !announced_tools.contains(&tool_use.name)
                 && !deferred_available;
             let truncated_input = truncated_tool_uses
                 .contains(&tool_use.id)
                 .then(|| truncated_tool_call_result(&tool_use.name, params.max_tokens));
-            let context = if tool_name == rebon_tool::AGENT_TOOL_NAME {
-                tool_input
+            let call_context = if tool_use.name == rebon_tool::AGENT_TOOL_NAME {
+                tool_use
+                    .input
                     .get("context")
                     .and_then(|value| {
                         serde_json::from_value::<rebon_tool::ContextRequest>(value.clone()).ok()
@@ -486,74 +475,38 @@ async fn run_tool_round(
                             manager.messages(),
                         )
                     })
-                    .map(|capsule| context.clone().with_frozen_parent_context(capsule))
-                    .unwrap_or(context)
+                    .map(|capsule| {
+                        tool_batch_context
+                            .clone()
+                            .with_frozen_parent_context(capsule)
+                    })
+                    .unwrap_or_else(|| tool_batch_context.clone())
             } else {
-                context
+                tool_batch_context.clone()
             };
-            let policy = params.policy.clone();
-
-            handles.push(tokio::spawn(async move {
-                let result_tx = tx.clone();
-                let result_tool_id = tool_id.clone();
-                let result_tool_name = tool_name.clone();
-                let dispatch = async move {
-                    if let Some(reason) = truncated_input {
-                        Err(ToolErrorPresentation::same("output_truncated", reason))
-                    } else if filter_reject {
-                        Err(ToolErrorPresentation::same(
-                            "tool_unavailable",
-                            format!("tool `{}` is not available in this session", tool_name),
-                        ))
-                    } else {
-                        let tu = ToolUseBlock {
-                            id: tool_id.clone(),
-                            name: tool_name.clone(),
-                            input: tool_input,
-                        };
-                        dispatch_tool_use(&engine, &tu, &context, &tx, policy).await
-                    }
-                };
-                tokio::pin!(dispatch);
-                let outcome = tokio::select! {
-                    biased;
-                    _ = cancel.notified() => Err(ToolErrorPresentation::same(
-                        "cancelled",
-                        "Interrupted by user",
-                    )),
-                    outcome = &mut dispatch => outcome,
-                };
-                let error_presentation = outcome
-                    .as_ref()
-                    .err()
-                    .filter(|error| error.has_distinct_display_message())
-                    .cloned();
-                let event_outcome = outcome.clone().map_err(|error| error.model_message.clone());
-                let _ = result_tx.send(QueryEvent::ToolDispatchResult {
-                    tool_use_id: result_tool_id.clone(),
-                    name: result_tool_name.clone(),
-                    outcome: event_outcome,
-                    error_presentation,
-                });
-                (i, result_tool_id, result_tool_name, outcome)
-            }));
+            let concurrent = super::tool_schedule::call_is_concurrency_safe(
+                tools.as_ref(),
+                &tool_batch_context,
+                &tool_use.name,
+                &tool_use.input,
+                parallel_agent_write_batch,
+            );
+            prepared.push(super::tool_schedule::PreparedToolCall {
+                index: i,
+                id: tool_use.id.clone(),
+                name: tool_use.name.clone(),
+                input: tool_use.input.clone(),
+                context: call_context,
+                truncated_input,
+                filter_reject,
+                concurrent,
+            });
         }
+        indexed_results =
+            super::tool_schedule::run_staged(engine, prepared, tx, cancel, &params.policy).await;
     }
-
-    let mut indexed_results: Vec<(usize, String, String, Result<Value, ToolErrorPresentation>)> =
-        Vec::with_capacity(handles.len());
-    for handle in handles {
-        match handle.await {
-            Ok(result) => indexed_results.push(result),
-            Err(join_err) => {
-                tracing::error!(error = %join_err, "tool dispatch task panicked");
-            }
-        }
-    }
-    indexed_results.sort_by_key(|(i, _, _, _)| *i);
 
     // Notify synchronously while folding results back into provider order.
-    let tools = engine.tool_resolver_for_context(&tool_batch_context);
     let mut tool_results: Vec<ApiContentBlock> = Vec::new();
     for (i, tool_use_id, tool_name, outcome) in &indexed_results {
         let tool_input = tool_use_list.get(*i).map(|tool_use| &tool_use.input);

@@ -282,15 +282,16 @@ pub use worker_control::{
 pub use workflow::WorkflowContext;
 
 pub use agent::{
-    agent_input_may_write, agent_registry_selection, append_workflow_agent_shared_worktree_prompt,
-    ensure_agent_id, set_agent_registry_selection, set_sub_agents_enabled, sub_agents_enabled,
-    AgentRegistrySelection, CacheStrategy, ContextRequest, ContextShareMode, FileContextMode,
-    FrozenParentContextCapsule, SubAgentGitMetadata, SubAgentProgressSender, SubAgentResult,
-    SubAgentRuntimeHandle, SubAgentSpawner, SubAgentSpawnerRequest, SubAgentSpawnerService,
-    SubAgentSpawnerSource, SubAgentSpec, SubAgentTaskKind, ToolResultMode,
-    UnavailableSubAgentSpawner, AGENT_EXTERNAL_PATH_AUTHORIZATION_KIND, AGENT_TOOL_NAME,
-    DEFAULT_SUB_AGENT_MAX_ITERATIONS, DEFAULT_SUB_AGENT_TYPE, SUB_AGENTS_UNAVAILABLE,
-    SUB_AGENT_SPAWNER_SERVICE, WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT,
+    agent_call_is_concurrency_safe, agent_input_may_write, agent_registry_selection,
+    append_workflow_agent_shared_worktree_prompt, ensure_agent_id, set_agent_registry_selection,
+    set_sub_agents_enabled, sub_agents_enabled, AgentRegistrySelection, CacheStrategy,
+    ContextRequest, ContextShareMode, FileContextMode, FrozenParentContextCapsule,
+    SubAgentGitMetadata, SubAgentProgressSender, SubAgentResult, SubAgentRuntimeHandle,
+    SubAgentSpawner, SubAgentSpawnerRequest, SubAgentSpawnerService, SubAgentSpawnerSource,
+    SubAgentSpec, SubAgentTaskKind, ToolResultMode, UnavailableSubAgentSpawner,
+    AGENT_EXTERNAL_PATH_AUTHORIZATION_KIND, AGENT_TOOL_NAME, DEFAULT_SUB_AGENT_MAX_ITERATIONS,
+    DEFAULT_SUB_AGENT_TYPE, SUB_AGENTS_UNAVAILABLE, SUB_AGENT_SPAWNER_SERVICE,
+    WORKFLOW_AGENT_SHARED_WORKTREE_PROMPT,
 };
 pub use external_agent::{
     compose_external_first_prompt, external_route_for_spec, parse_external_model_spec,

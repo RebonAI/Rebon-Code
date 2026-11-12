@@ -345,8 +345,10 @@ impl Tool for BashTool {
         })
     }
 
-    fn is_concurrency_safe(&self, _input: &Value) -> bool {
-        true
+    /// Only a command the shell policy proves read-only may share a stage
+    /// with its neighbours; anything else runs alone, in provider order.
+    fn is_concurrency_safe(&self, input: &Value) -> bool {
+        rebon_shell_policy::read_only::is_read_only_shell_command(BASH_TOOL_NAME, input)
     }
 
     fn is_destructive(&self, _input: &Value) -> bool {

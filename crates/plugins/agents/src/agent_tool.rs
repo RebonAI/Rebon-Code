@@ -8,14 +8,14 @@
 
 use async_trait::async_trait;
 use rebon_tool::{
-    agent_input_may_write, agent_registry_selection, append_workflow_agent_shared_worktree_prompt,
-    ensure_session_default_team, is_session_default_team_name, set_current_team_name,
-    sub_agents_enabled, AgentRegistry, CacheStrategy, ContextRequest, ContextShareMode,
-    ExecutionPolicy, FileContextMode, FrozenParentContextCapsule, PolicyMode, SubAgentGitMetadata,
-    SubAgentProgressSender, SubAgentSpec, SubAgentTaskKind, TeammateSpawnSpec, Tool, ToolContext,
-    ToolFilter, ToolResultMode, UltraplanContext, WorkflowNesting,
-    AGENT_EXTERNAL_PATH_AUTHORIZATION_KIND, AGENT_TOOL_NAME, DEFAULT_SUB_AGENT_MAX_ITERATIONS,
-    DEFAULT_SUB_AGENT_TYPE,
+    agent_call_is_concurrency_safe, agent_input_may_write, agent_registry_selection,
+    append_workflow_agent_shared_worktree_prompt, ensure_session_default_team,
+    is_session_default_team_name, set_current_team_name, sub_agents_enabled, AgentRegistry,
+    CacheStrategy, ContextRequest, ContextShareMode, ExecutionPolicy, FileContextMode,
+    FrozenParentContextCapsule, PolicyMode, SubAgentGitMetadata, SubAgentProgressSender,
+    SubAgentSpec, SubAgentTaskKind, TeammateSpawnSpec, Tool, ToolContext, ToolFilter,
+    ToolResultMode, UltraplanContext, WorkflowNesting, AGENT_EXTERNAL_PATH_AUTHORIZATION_KIND,
+    AGENT_TOOL_NAME, DEFAULT_SUB_AGENT_MAX_ITERATIONS, DEFAULT_SUB_AGENT_TYPE,
 };
 use rebon_tools_core::{
     PermissionDecision, PermissionRequest, ToolError, ToolId, ToolInputSchema, ToolResult,
@@ -634,6 +634,12 @@ impl Tool for AgentTool {
             "required": ["prompt"],
             "additionalProperties": false
         })
+    }
+
+    /// Alone, the call cannot see the rest of its batch; the run loop asks
+    /// [`agent_call_is_concurrency_safe`] with the batch's writer count.
+    fn is_concurrency_safe(&self, input: &Value) -> bool {
+        agent_call_is_concurrency_safe(input, false)
     }
 
     fn needs_permission(&self, input: &Value) -> bool {

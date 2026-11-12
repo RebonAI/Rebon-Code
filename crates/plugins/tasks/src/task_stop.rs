@@ -57,8 +57,9 @@ impl Tool for TaskStopTool {
         })
     }
 
+    /// Stopping a task changes what the calls after it see.
     fn is_concurrency_safe(&self, _input: &Value) -> bool {
-        true
+        false
     }
 
     async fn validate_input(

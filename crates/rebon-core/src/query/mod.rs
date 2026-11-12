@@ -90,6 +90,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 mod tool_projection;
+mod tool_schedule;
 mod traits;
 mod transcript;
 mod turn_control;

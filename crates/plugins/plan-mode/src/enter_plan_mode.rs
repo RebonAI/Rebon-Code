@@ -91,8 +91,9 @@ impl Tool for EnterPlanModeTool {
         })
     }
 
+    /// The mode it switches to governs how the calls after it are checked.
     fn is_concurrency_safe(&self, _input: &Value) -> bool {
-        true
+        false
     }
 
     fn is_read_only(&self, _input: &Value) -> bool {
@@ -252,9 +253,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_is_read_only_concurrency_safe_and_needs_permission() {
+    fn tool_is_read_only_runs_alone_and_needs_permission() {
         assert!(tool().is_read_only(&json!({})));
-        assert!(tool().is_concurrency_safe(&json!({})));
+        assert!(!tool().is_concurrency_safe(&json!({})));
         assert!(tool().needs_permission(&json!({})));
         assert_eq!(tool().id().as_str(), "EnterPlanMode");
     }

@@ -121,8 +121,9 @@ impl Tool for TaskUpdateTool {
         })
     }
 
+    /// Updates to one task must land in the order the model sent them.
     fn is_concurrency_safe(&self, _input: &Value) -> bool {
-        true
+        false
     }
 
     async fn validate_input(

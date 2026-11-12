@@ -1538,6 +1538,7 @@ mod stream_events_and_cancel;
 mod system_prompt_config;
 mod task_reconciliation;
 mod tool_projection;
+mod tool_schedule;
 mod transcript_persistence;
 mod transient_context;
 mod ultraplan_and_tool_results;

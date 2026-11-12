@@ -126,8 +126,9 @@ impl Tool for ShellStopTool {
         })
     }
 
+    /// Stopping a shell changes what a later ShellOutput sees.
     fn is_concurrency_safe(&self, _input: &Value) -> bool {
-        true
+        false
     }
 
     fn is_destructive(&self, _input: &Value) -> bool {

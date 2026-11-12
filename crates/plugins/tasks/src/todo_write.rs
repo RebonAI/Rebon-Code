@@ -110,8 +110,10 @@ impl Tool for TodoWriteTool {
         })
     }
 
+    /// Each call replaces the whole list, so two in one response must land in
+    /// order or the earlier one can win.
     fn is_concurrency_safe(&self, _input: &Value) -> bool {
-        true
+        false
     }
 
     async fn validate_input(
@@ -430,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn todo_write_tool_is_concurrency_safe() {
-        assert!(tool().is_concurrency_safe(&json!({})));
+    fn todo_write_tool_runs_alone() {
+        assert!(!tool().is_concurrency_safe(&json!({})));
     }
 }

@@ -93,8 +93,10 @@ impl Tool for TaskCreateTool {
         })
     }
 
+    /// Task ids are handed out in call order, and a later call in the same
+    /// response may name one.
     fn is_concurrency_safe(&self, _input: &Value) -> bool {
-        true
+        false
     }
 
     async fn validate_input(

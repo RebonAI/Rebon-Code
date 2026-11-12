@@ -959,6 +959,27 @@ fn rand_id() -> u64 {
         .as_nanos() as u64
 }
 
+/// Whether an `Agent` call may run in the same stage as its neighbours in
+/// one model response, rather than alone and in provider order.
+///
+/// Parallel agents are the point of sending several in one response, so
+/// every call that cannot touch the shared tree under the others qualifies:
+/// a read-only child, a background child (it returns at once, and a writer
+/// there is isolated in its own worktree), an explicit worktree, and every
+/// writer of a batch with more than one (`parallel_agent_write_batch`: each
+/// is moved into its own worktree, or refused when it is a named teammate).
+/// What is left — the one foreground writer in the shared tree — runs alone,
+/// so the edits and commands around it see the tree before or after it.
+pub fn agent_call_is_concurrency_safe(input: &Value, parallel_agent_write_batch: bool) -> bool {
+    !agent_input_may_write(input)
+        || parallel_agent_write_batch
+        || input.get("run_in_background").and_then(Value::as_bool) == Some(true)
+        || input
+            .get("isolation")
+            .and_then(Value::as_str)
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("worktree"))
+}
+
 /// Whether an `Agent` tool input is asking for work that may mutate files.
 ///
 /// Read by the run loop (to spot a parallel write batch) as well as by

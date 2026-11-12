@@ -616,7 +616,7 @@ async fn engine_query_executor_publishes_multiple_tool_calls_in_sequence() {
 }
 
 #[tokio::test]
-async fn same_response_same_file_writes_do_not_both_succeed() {
+async fn same_response_same_file_writes_apply_in_order() {
     let target_dir = tempfile::tempdir().unwrap();
     let file = target_dir.path().join("shared.txt");
     std::fs::write(&file, "original").unwrap();
@@ -643,7 +643,7 @@ async fn same_response_same_file_writes_do_not_both_succeed() {
         ("Write", "toolu_first_write", &first_write),
         ("Write", "toolu_second_write", &second_write),
     ));
-    client.push_turn(text_turn("msg_done", "write conflict handled"));
+    client.push_turn(text_turn("msg_done", "both writes applied"));
     let client: Arc<dyn ModelClient> = Arc::new(client);
 
     let projects_root_dir = temp_projects_root("same_response_file_writes");
@@ -679,8 +679,9 @@ async fn same_response_same_file_writes_do_not_both_succeed() {
 
     let outcome = executor.execute(request).await.unwrap();
     assert_eq!(outcome.stop_reason, AcpStopReason::EndTurn);
-    let final_content = std::fs::read_to_string(&file).unwrap();
-    assert!(final_content == "first" || final_content == "second");
+    // Writes are barriers: they run one at a time in provider order, so the
+    // second lands on top of the first and neither is refused.
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "second");
 
     let updates = publisher.snapshot();
     let terminal_status = |tool_call_id: &str| {
@@ -702,18 +703,8 @@ async fn same_response_same_file_writes_do_not_both_succeed() {
         terminal_status("toolu_second_write").expect("second write terminal status"),
     ];
     assert_eq!(
-        statuses
-            .iter()
-            .filter(|status| **status == ToolCallStatus::Completed)
-            .count(),
-        1
-    );
-    assert_eq!(
-        statuses
-            .iter()
-            .filter(|status| **status == ToolCallStatus::Failed)
-            .count(),
-        1
+        statuses,
+        [ToolCallStatus::Completed, ToolCallStatus::Completed]
     );
 }
 
