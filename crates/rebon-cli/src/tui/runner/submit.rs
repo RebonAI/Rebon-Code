@@ -430,9 +430,10 @@ fn submit_after_command_dispatch(
         return false;
     }
 
-    // A goal check is the tail of the turn that just ended: what is typed
-    // meanwhile waits behind it, like a prompt typed during the turn.
-    if active_prompt.is_some() || app.goal_check.is_pending() {
+    // A prompt the person sends does not wait for a goal check: it runs now
+    // and supersedes the check, and its own turn ends with a fresh one.
+    app.goal_check.abandon();
+    if active_prompt.is_some() {
         save_to_history_for_session_if_needed(app, session, text.trim_end());
         let Some(submit) = take_submit_payload_with_images(app, &text, injected_images.clone())
         else {
@@ -1447,7 +1448,9 @@ pub(super) fn submit_model_text(
     cursor_offset_before_submit: usize,
     transcript_len_before_submit: usize,
 ) {
-    if active_prompt.is_some() || app.goal_check.is_pending() {
+    // A command the person ran supersedes a goal check, as a typed prompt does.
+    app.goal_check.abandon();
+    if active_prompt.is_some() {
         let Some(mut submit) = take_submit_payload(app, prompt) else {
             return;
         };

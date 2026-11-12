@@ -57,6 +57,8 @@ impl std::fmt::Debug for GoalCheck {
 struct PendingGoalCheck {
     result: tokio::sync::oneshot::Receiver<Result<GoalContinuationAction, String>>,
     previous_session_context: Option<String>,
+    /// The request in flight, stopped when the check is abandoned.
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl GoalCheck {
@@ -75,8 +77,19 @@ impl GoalCheck {
         self.start(PendingGoalCheck {
             result,
             previous_session_context: None,
+            task: None,
         });
         tx
+    }
+
+    /// Drop a running check without applying it: the person sent a prompt,
+    /// which runs now and supersedes it. The turn that prompt runs ends with
+    /// a check of its own.
+    pub(crate) fn abandon(&self) {
+        let pending = self.0.lock().expect("goal check poisoned").take();
+        if let Some(task) = pending.and_then(|pending| pending.task) {
+            task.abort();
+        }
     }
 
     fn start(&self, pending: PendingGoalCheck) {
@@ -118,13 +131,9 @@ pub(super) fn start_goal_check(
     let transcript_summary = transcript_summary(app);
     let previous_session_context =
         (!transcript_summary.trim().is_empty()).then(|| transcript_summary.clone());
-    let hook = GoalHookInputs {
-        model: session.model.name.clone(),
-        client: session.engine_half.client.clone(),
-        context: session.engine_half.runtime.policy.context().clone(),
-    };
+    let hook = goal_hook_inputs(session);
     let (tx, result) = tokio::sync::oneshot::channel();
-    handle.spawn(async move {
+    let task = handle.spawn(async move {
         let action =
             run_goal_session_end_hook(goal_snapshot, hook, stop_reason, transcript_summary).await;
         let _ = tx.send(action);
@@ -132,8 +141,27 @@ pub(super) fn start_goal_check(
     app.goal_check.start(PendingGoalCheck {
         result,
         previous_session_context,
+        task: Some(task),
     });
     true
+}
+
+/// The goal check is a side request, so it runs like the session's other
+/// side requests: on the small/fast model when one is configured, and on a
+/// session forked from the conversation's, so it cannot disturb the
+/// conversation's provider state (a continuation chain, a live transport).
+fn goal_hook_inputs(session: &TuiEngineSession) -> GoalHookInputs {
+    let (runtime, parent) = session.model.runtime_model.snapshot();
+    let model = if runtime.title_model.trim().is_empty() {
+        runtime.model
+    } else {
+        runtime.title_model
+    };
+    GoalHookInputs {
+        model,
+        client: parent.fork_for_sub_agent(None).client_arc(),
+        context: session.engine_half.runtime.policy.context().clone(),
+    }
 }
 
 /// Apply a finished goal check: continue in a fresh session, complete, or
@@ -633,6 +661,65 @@ mod tests {
             })),
         );
     }
+    /// The conversation's client, which hands out `side` when forked.
+    struct ForksToSide {
+        main: rebon_api::MockModelClient,
+        side: rebon_api::MockModelClient,
+    }
+
+    #[async_trait]
+    impl ModelClient for ForksToSide {
+        fn provider_name(&self) -> &'static str {
+            "mock"
+        }
+
+        fn fork_for_sub_agent(&self) -> Option<Arc<dyn ModelClient>> {
+            Some(Arc::new(self.side.clone()))
+        }
+
+        async fn create_message_stream(
+            &self,
+            request: CreateMessageRequest,
+        ) -> rebon_api::ModelResult<rebon_api::StreamEventStream> {
+            self.main.create_message_stream(request).await
+        }
+    }
+
+    /// The goal check is a side request: it goes to the small model, on a
+    /// session forked from the conversation's, never on the conversation's
+    /// own client.
+    #[test]
+    fn the_goal_check_runs_on_the_small_model_on_a_forked_session() {
+        let main = rebon_api::MockModelClient::new();
+        let side = rebon_api::MockModelClient::new();
+        side.push_turn(goal_reply(r#"{"completed":true,"reason":"tests pass"}"#));
+        let handle = tokio::runtime::Runtime::new().expect("runtime");
+        let mut app = AppState::new();
+        app.goal = Some(crate::goal::GoalState::new_now("ship it").with_max_sessions(3));
+        let (_projects_root, mut session) = make_goal_session_with_mock(main.clone());
+        let client: Arc<dyn ModelClient> = Arc::new(ForksToSide {
+            main: main.clone(),
+            side: side.clone(),
+        });
+        let mut config = session.model.runtime_model.get();
+        config.client = client.clone();
+        session.model.runtime_model = rebon_core::query::SharedRuntimeModel::new(config);
+        session.engine_half.client = client;
+
+        let action = maybe_prepare_goal_continuation(
+            &mut app,
+            &mut session,
+            handle.handle(),
+            Some("end_turn".into()),
+        );
+
+        assert!(matches!(action, GoalContinuationAction::Completed { .. }));
+        assert_eq!(main.call_count(), 0);
+        let requests = side.captured_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].model, "test-small-model");
+    }
+
     #[test]
     fn goal_session_end_snapshot_contains_only_session_hook() {
         let hook = rebon_hooks::IndividualHookConfig {

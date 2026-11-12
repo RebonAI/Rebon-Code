@@ -231,13 +231,18 @@ pub(super) fn maybe_update_loading_state(
     if restore_foreground_agent_after_main_finalize {
         sync_foreground_agent_view(app, session.engine_half.tasks.as_ref());
     }
+    // A prompt the person queued during the turn runs next, without a goal
+    // check first: its turn ends with one of its own.
+    let user_prompt_queued =
+        !app.queued_auto_drain_paused_after_withdrawal && !app.queued_commands.is_empty();
     let goal_check_started = !failed
         && !restore_foreground_agent_after_main_finalize
+        && !user_prompt_queued
         && completed_stop_reason.is_some_and(|reason| {
             start_goal_check(app, session, handle, Some(format!("{reason:?}")))
         });
-    // Whatever runs next waits for the goal check, which may move the goal on
-    // to a fresh session; `finish_pending_goal_check` picks it up from there.
+    // Automatic work waits for the goal check, which may move the goal on to
+    // a fresh session; `finish_pending_goal_check` picks it up from there.
     if goal_check_started {
         return;
     }
@@ -3123,8 +3128,11 @@ mod tests {
         runtime.shutdown_background();
     }
 
+    /// Automatic work waits for a running goal check, which may move the
+    /// goal on to a fresh session. A prompt the person sends does not: it
+    /// runs at once and the check is dropped, unapplied.
     #[test]
-    fn work_sent_during_a_goal_check_waits_for_it() {
+    fn a_prompt_sent_during_a_goal_check_supersedes_it() {
         let (runtime, handle) = make_immediate_handle();
         let mut app = AppState::new();
         let mut session = make_test_tui_session();
@@ -3137,11 +3145,15 @@ mod tests {
             .enqueue("check the build".into());
         let mut active_prompt = None;
 
-        // Neither a cron fire nor a typed prompt starts while it runs.
+        // A cron fire does not start while the check runs.
         maybe_spawn_ready_idle_turn(&mut app, &session, &handle, &mut active_prompt);
         assert!(active_prompt.is_none());
         assert_eq!(system_error_rows(&app), 0);
-        assert!(!super::super::submit::submit_or_queue(
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active_prompt);
+        assert!(active_prompt.is_none(), "still checking");
+
+        // A typed prompt does, and the check is gone.
+        super::super::submit::submit_or_queue(
             &mut app,
             "typed meanwhile".into(),
             &mut session,
@@ -3149,28 +3161,61 @@ mod tests {
             &mut active_prompt,
             &mut None,
             crate::ui_config::UiMode::Screen,
-        ));
-        assert!(active_prompt.is_none());
-        assert_eq!(app.queued_commands.len(), 1);
-        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active_prompt);
-        assert!(active_prompt.is_none(), "still checking");
-
-        finish
+        );
+        assert!(!app.goal_check.is_pending());
+        assert!(active_prompt.is_some(), "the typed prompt runs now");
+        assert!(app.queued_commands.is_empty());
+        runtime.block_on(tokio::task::yield_now());
+        let requests = recorder.take_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(prompt_text(&requests[0]), "typed meanwhile");
+        // The abandoned check's result has nowhere to land.
+        assert!(finish
             .send(Ok(
                 super::super::goal_continuation::GoalContinuationAction::None,
             ))
-            .unwrap();
-        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active_prompt);
+            .is_err());
+        drop(active_prompt.take());
+        runtime.shutdown_background();
+    }
+
+    /// A prompt the person queued during a turn runs when the turn ends,
+    /// without a goal check in front of it: that prompt's own turn ends with
+    /// one.
+    #[test]
+    fn a_queued_prompt_runs_before_the_goal_check() {
+        let (runtime, handle) = make_immediate_handle();
+        let mut app = AppState::new();
+        app.goal = Some(crate::goal::GoalState::new_now("ship it"));
+        enqueue_submit_payload(
+            &mut app,
+            SubmitPayload {
+                text: "queued during the turn".into(),
+                model_text: None,
+                user_message_uuid: None,
+                image_pastes: Vec::new(),
+                directory_attachments: Vec::new(),
+                execution_policy: None,
+                skill_invocations: Vec::new(),
+            },
+        );
+        let mut session = make_test_tui_session();
+        session.engine_half.update_rx = rebon_agent_core::ChannelSessionUpdatePublisher::new().1;
+        let recorder = Arc::new(RecordingPromptExecutor::default());
+        session.set_test_executor(recorder.clone());
+        let (tx, rx) = oneshot::channel();
+        tx.send(Ok(PromptOutcome::end_turn())).unwrap();
+        let mut active = Some(ActivePrompt::new(rx, PromptCancel::new()));
+
+        maybe_update_loading_state(&mut app, &mut session, &handle, &mut active);
         runtime.block_on(tokio::task::yield_now());
 
-        assert!(!app.goal_check.is_pending());
-        let active = active_prompt
-            .as_ref()
-            .expect("the queued prompt runs once it is done");
-        assert_eq!(active.source, LocalTurnSource::QueuedFollowUp);
-        assert!(app.queued_commands.is_empty());
-        assert_eq!(recorder.take_requests().len(), 1);
-        drop(active_prompt.take());
+        assert!(!app.goal_check.is_pending(), "no goal check in front of it");
+        assert!(active.is_some(), "the queued prompt runs");
+        let requests = recorder.take_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(prompt_text(&requests[0]), "queued during the turn");
+        drop(active.take());
         runtime.shutdown_background();
     }
 
