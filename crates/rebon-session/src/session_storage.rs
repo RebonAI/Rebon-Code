@@ -1206,8 +1206,8 @@ pub fn load_session_hidden_from_chats(projects_root: &Path, cwd: &str, session_i
 /// missing.
 ///
 /// Errors are returned to the caller so they can decide whether to log
-/// or retry; the title-generation background task treats any failure as
-/// "no-op, try again next turn".
+/// or retry; the title-generation background task logs a failure and keeps
+/// the title in memory only.
 pub fn save_session_title(
     projects_root: &Path,
     cwd: &str,

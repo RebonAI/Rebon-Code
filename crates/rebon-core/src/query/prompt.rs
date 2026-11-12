@@ -16,7 +16,29 @@ pub(super) struct SessionTitleGenerationRequest {
     pub(super) user_text: String,
 }
 
-pub(super) fn maybe_spawn_session_title_generation(request: SessionTitleGenerationRequest) {
+/// The sessions an executor has already asked for a title.
+///
+/// One request per session. A title that came back is in the session's
+/// sidecar, and one that did not (a refusal, an unparseable reply, a title
+/// model the provider does not serve) would fail the same way on every later
+/// turn, each time as one more side request.
+#[derive(Default)]
+pub(super) struct SessionTitleAttempts(Mutex<std::collections::HashSet<String>>);
+
+impl SessionTitleAttempts {
+    /// Record an attempt for `session_id`; `true` only the first time.
+    fn begin(&self, session_id: &str) -> bool {
+        self.0
+            .lock()
+            .expect("session title attempts poisoned")
+            .insert(session_id.to_owned())
+    }
+}
+
+pub(super) fn maybe_spawn_session_title_generation(
+    request: SessionTitleGenerationRequest,
+    attempts: &SessionTitleAttempts,
+) {
     if request
         .existing_title
         .as_deref()
@@ -40,6 +62,18 @@ pub(super) fn maybe_spawn_session_title_generation(request: SessionTitleGenerati
             session_id = %request.session_id,
             "session-title: skipping generation because no title model is configured"
         );
+        return;
+    }
+
+    if !attempts.begin(&request.session_id) {
+        return;
+    }
+    // In-memory state is not the only home of a title: a session this
+    // executor did not create (a resume, a background worker's rebuilt
+    // engine, a host without server state) has it only in its sidecar.
+    if rebon_session::load_session_title(&request.projects_root, &request.cwd, &request.session_id)
+        .is_some()
+    {
         return;
     }
 

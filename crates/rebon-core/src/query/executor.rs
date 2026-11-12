@@ -543,6 +543,10 @@ pub struct EngineQueryExecutor {
     system_prompt_snapshot: Option<SystemPromptSnapshot>,
     /// Concrete model used for background session-title generation.
     title_model: String,
+    /// Sessions already asked for a title, so a failed request is not
+    /// repeated on every turn. Keyed by session id and shared with every
+    /// executor forked from this one, which may serve the same session.
+    title_attempts: Arc<super::prompt::SessionTitleAttempts>,
     /// Optional observer that receives every raw [`QueryEvent`] before it is
     /// consumed. Used by `rebon exec --json` to emit a JSONL event stream.
     query_event_observer: Option<QueryEventObserver>,
@@ -875,6 +879,7 @@ impl EngineQueryExecutor {
             session_prompt_state: SessionPromptState::default(),
             system_prompt_snapshot: self.system_prompt_snapshot.clone(),
             title_model: self.title_model.clone(),
+            title_attempts: self.title_attempts.clone(),
             query_event_observer: self.query_event_observer.clone(),
         }
     }
@@ -934,6 +939,7 @@ impl EngineQueryExecutor {
             session_prompt_state: SessionPromptState::default(),
             system_prompt_snapshot: self.system_prompt_snapshot.clone(),
             title_model: self.title_model.clone(),
+            title_attempts: self.title_attempts.clone(),
             query_event_observer: self.query_event_observer.clone(),
         }
     }
@@ -1003,6 +1009,7 @@ impl EngineQueryExecutor {
             session_prompt_state: SessionPromptState::default(),
             system_prompt_snapshot: None,
             title_model: String::new(),
+            title_attempts: Default::default(),
             query_event_observer: None,
         }
     }
@@ -4577,21 +4584,24 @@ impl EngineQueryExecutor {
             FileHistoryTurnGuard::begin(file_history_tracker.clone(), &user_uuid);
 
         if !replay_only && !resume_without_new_prompt {
-            maybe_spawn_session_title_generation(SessionTitleGenerationRequest {
-                session: session.clone(),
-                title_model: title_model.clone(),
-                projects_root: self.projects_root.clone(),
-                cwd: cwd.clone(),
-                session_id: session_id.clone(),
-                update_publisher: update_publisher.clone(),
-                server_state: self.server_state.clone(),
-                existing_title: self
-                    .server_state
-                    .as_ref()
-                    .and_then(|state| state.session_title(&session_id)),
-                prior_conversation_text: title_conversation_text,
-                user_text: user_text.clone(),
-            });
+            maybe_spawn_session_title_generation(
+                SessionTitleGenerationRequest {
+                    session: session.clone(),
+                    title_model: title_model.clone(),
+                    projects_root: self.projects_root.clone(),
+                    cwd: cwd.clone(),
+                    session_id: session_id.clone(),
+                    update_publisher: update_publisher.clone(),
+                    server_state: self.server_state.clone(),
+                    existing_title: self
+                        .server_state
+                        .as_ref()
+                        .and_then(|state| state.session_title(&session_id)),
+                    prior_conversation_text: title_conversation_text,
+                    user_text: user_text.clone(),
+                },
+                &self.title_attempts,
+            );
         }
         TurnOpening {
             attachment_poller_turn_id,

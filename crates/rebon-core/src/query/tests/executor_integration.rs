@@ -134,6 +134,87 @@ async fn engine_query_executor_generates_session_title_without_client_fork() {
     assert_eq!(captured[1].model, "main-model");
 }
 
+/// Two turns of one session on an executor with no in-memory title store,
+/// as a background worker or `rebon exec` runs it, and how many requests
+/// the title model saw.
+async fn title_requests_over_two_turns(
+    tag: &str,
+    title_reply: &str,
+    title_on_disk: Option<&str>,
+) -> usize {
+    let engine = build_engine_with(Arc::new(RecordingTool::new("Bash", json!({"ok": true}))));
+    let main_client = MockModelClient::new();
+    main_client.push_turn(text_turn("main_1", "done"));
+    main_client.push_turn(text_turn("main_2", "done again"));
+    let title_client = MockModelClient::new();
+    title_client.push_turn(text_turn("title_1", title_reply));
+    title_client.push_turn(text_turn("title_2", title_reply));
+    let title_client_for_assert = title_client.clone();
+    let client: Arc<dyn ModelClient> = Arc::new(ForkingModelClient {
+        main: main_client,
+        title: title_client,
+    });
+    let projects_root_dir = temp_projects_root(tag);
+    let projects_root = projects_root_dir.path();
+    let cwd = projects_root.to_string_lossy().to_string();
+    if let Some(title) = title_on_disk {
+        rebon_session::save_session_title(projects_root, &cwd, "sess-title", title).unwrap();
+    }
+    let executor = EngineQueryExecutor::new(engine, client, projects_root, "main-model")
+        .with_title_model("small-title-model");
+
+    for turn in 0..2 {
+        let publisher = Arc::new(MemorySessionUpdatePublisher::new());
+        let mut request = basic_prompt_request("sess-title", &cwd);
+        request.prompt = vec![AcpContentBlock::Text(TextContent {
+            text: format!("fix the flaky title test, step {turn}"),
+            annotations: None,
+        })];
+        request.update_publisher = Some(publisher.clone() as Arc<dyn SessionUpdatePublisher>);
+        executor.execute(request).await.unwrap();
+        // Let a spawned title request land before the next turn opens.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+    title_client_for_assert.call_count()
+}
+
+/// A title that was generated and saved is not asked for again on the next
+/// turn, even when no in-memory server state carries it.
+#[tokio::test]
+async fn a_generated_title_is_not_requested_again_on_the_next_turn() {
+    assert_eq!(
+        title_requests_over_two_turns("title_once", r#"{"title":"Fix flaky title test"}"#, None)
+            .await,
+        1
+    );
+}
+
+/// A title request that yields nothing is not repeated every turn.
+#[tokio::test]
+async fn a_failed_title_request_is_not_repeated_every_turn() {
+    assert_eq!(
+        title_requests_over_two_turns("title_failed", "no json here", None).await,
+        1
+    );
+}
+
+/// A session whose sidecar already has a title (a resume) asks for none.
+#[tokio::test]
+async fn a_persisted_title_is_not_requested_at_all() {
+    assert_eq!(
+        title_requests_over_two_turns(
+            "title_persisted",
+            r#"{"title":"Other"}"#,
+            Some("Resumed title")
+        )
+        .await,
+        0
+    );
+}
+
 #[tokio::test]
 async fn engine_query_executor_runs_full_turn_with_mock_model() {
     // Engine + one recording tool.
