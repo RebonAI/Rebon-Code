@@ -34,6 +34,10 @@ pub struct ModelCapabilities {
     pub accepts_unsigned_thinking_replay: bool,
     pub prefix_cache_is_byte_exact: bool,
     pub remote_compaction_v2: bool,
+    /// A retry layer in this client already retries a transient failure to
+    /// open a stream, with backoff, before returning it. A caller that gets
+    /// one back should not retry it again (see `RetryMiddleware`).
+    pub retries_transient_errors: bool,
 }
 
 impl ModelCapabilities {

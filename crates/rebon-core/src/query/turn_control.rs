@@ -1132,7 +1132,12 @@ async fn open_and_drain_stream(
             (*context_overflow_retried) = true;
             return StreamDrainFlow::NextIteration;
         }
-        Err(err) if err.is_transient() => {
+        // A retry layer in the client has already retried this one with
+        // backoff; replaying it here would multiply its attempts, not
+        // add a different one. Replays stay for clients without one, and
+        // for failures after the stream opened, which no layer below can
+        // retry.
+        Err(err) if err.is_transient() && !client.capabilities().retries_transient_errors => {
             (*last_request_failure) = Some(format!("model stream start failed: {err}"));
             (*transient_replay_streak) += 1;
             if (*transient_replay_streak) > MAX_TRANSIENT_REPLAYS {
@@ -2330,5 +2335,157 @@ mod cancellation_tests {
             1,
             "backoff cancellation must not replay the request"
         );
+    }
+}
+
+#[cfg(test)]
+mod retry_layer_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use rebon_api::{
+        ContentBlockDelta, ContentBlockStart, MessageDeltaFields, ModelError, ModelResult,
+        RetryConfig, RetryMiddleware, StreamEventStream,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn text_reply(text: &str) -> Vec<ModelResult<StreamEvent>> {
+        vec![
+            StreamEvent::MessageStart {
+                message_id: "reply".into(),
+                model: "mock".into(),
+                usage: Default::default(),
+            },
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ContentBlockStart::Text {
+                    text: String::new(),
+                },
+            },
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentBlockDelta::TextDelta { text: text.into() },
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::MessageDelta {
+                delta: MessageDeltaFields {
+                    stop_reason: Some(StopReason::EndTurn),
+                    usage: Default::default(),
+                },
+            },
+            StreamEvent::MessageStop,
+        ]
+        .into_iter()
+        .map(Ok)
+        .collect()
+    }
+
+    /// How each request fails, by its number; past the list it answers.
+    #[derive(Clone, Copy)]
+    enum Failure {
+        /// The stream does not open.
+        AtStart,
+        /// The stream opens and fails before any visible output.
+        MidStream,
+        /// Every request fails to open.
+        Always,
+    }
+
+    struct FlakyProvider {
+        requests: Arc<AtomicUsize>,
+        failures: Vec<Failure>,
+    }
+
+    #[async_trait]
+    impl ModelClient for FlakyProvider {
+        fn provider_name(&self) -> &'static str {
+            "flaky-provider-test"
+        }
+
+        async fn create_message_stream(
+            &self,
+            _request: CreateMessageRequest,
+        ) -> ModelResult<StreamEventStream> {
+            let request = self.requests.fetch_add(1, Ordering::AcqRel);
+            let failure = match self.failures.as_slice() {
+                [Failure::Always] => Some(Failure::Always),
+                failures => failures.get(request).copied(),
+            };
+            let events = match failure {
+                Some(Failure::AtStart | Failure::Always) => {
+                    return Err(ModelError::transient("connection reset"))
+                }
+                Some(Failure::MidStream) => vec![
+                    Ok(StreamEvent::MessageStart {
+                        message_id: "cut".into(),
+                        model: "mock".into(),
+                        usage: Default::default(),
+                    }),
+                    Err(ModelError::transient("stream reset")),
+                ],
+                None => text_reply("done"),
+            };
+            Ok(Box::pin(futures_util::stream::iter(events)))
+        }
+    }
+
+    /// Run one query against `failures`, behind the retry middleware when
+    /// `retried`, with no replay backoff. Returns the provider's request
+    /// count and whether the turn ended with a reply.
+    async fn run(failures: Vec<Failure>, retried: bool) -> (usize, bool) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn ModelClient> = Arc::new(FlakyProvider {
+            requests: requests.clone(),
+            failures,
+        });
+        let client: Arc<dyn ModelClient> = if retried {
+            Arc::new(RetryMiddleware::wrap(provider, RetryConfig::for_tests()))
+        } else {
+            provider
+        };
+        let params = QueryParams::new("mock", vec![ApiMessage::user_text("start")]);
+        let (raw_tx, mut rx) = mpsc::unbounded_channel();
+        let tx = QueryEventSender::new(raw_tx, &params.turn_hooks);
+        let plugin = TurnControlPlugin {
+            engine: Arc::new(Engine::new()),
+            session: SessionHandle::new(client),
+            params,
+            context: ToolContext::new(),
+            cancel: CancelToken::new(),
+            tx,
+        };
+        let probe = TransientReplayBackoffProbe {
+            entered: Arc::new(Notify::new()),
+            delay: std::time::Duration::ZERO,
+        };
+        TRANSIENT_REPLAY_BACKOFF_PROBE
+            .scope(probe, async move { plugin.run().await })
+            .await;
+        let mut replied = false;
+        while let Ok(event) = rx.try_recv() {
+            replied |= matches!(event, QueryEvent::Done { .. });
+        }
+        (requests.load(Ordering::Acquire), replied)
+    }
+
+    /// A stream that never opens is retried by the middleware alone: the
+    /// turn gives up after its attempts instead of replaying each of them
+    /// another `MAX_TRANSIENT_REPLAYS` times.
+    #[tokio::test]
+    async fn a_stream_start_the_middleware_retried_is_not_replayed_again() {
+        let attempts = RetryConfig::for_tests().max_retries as usize;
+        assert_eq!(run(vec![Failure::Always], true).await, (attempts, false));
+    }
+
+    /// Without a retry layer the turn still replays a failed stream start.
+    #[tokio::test]
+    async fn a_stream_start_nobody_retried_is_still_replayed() {
+        assert_eq!(run(vec![Failure::AtStart], false).await, (2, true));
+    }
+
+    /// A stream that fails after it opened is past every layer that could
+    /// retry it, so the turn replays it with the middleware in place.
+    #[tokio::test]
+    async fn a_failure_after_the_stream_opened_is_still_replayed() {
+        assert_eq!(run(vec![Failure::MidStream], true).await, (2, true));
     }
 }

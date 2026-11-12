@@ -389,7 +389,10 @@ impl ModelClient for RetryMiddleware {
     }
 
     fn capabilities(&self) -> ModelCapabilities {
-        ModelCapabilities::forwarded(self.inner.as_ref())
+        ModelCapabilities {
+            retries_transient_errors: true,
+            ..ModelCapabilities::forwarded(self.inner.as_ref())
+        }
     }
 
     fn reset_session_state(&self) {
@@ -713,6 +716,26 @@ mod tests {
         ]
     }
 
+    /// The retry layer says it retries, and the layers above it pass that on,
+    /// so a caller does not stack its own retries on top.
+    #[test]
+    fn the_retry_layer_is_visible_through_the_layers_above_it() {
+        let mock: Arc<dyn ModelClient> = Arc::new(MockModelClient::new());
+        assert!(!mock.capabilities().retries_transient_errors);
+        let retried: Arc<dyn ModelClient> = Arc::new(RetryMiddleware::wrap(
+            mock.clone(),
+            RetryConfig::for_tests(),
+        ));
+        assert!(retried.capabilities().retries_transient_errors);
+        let logged = LoggingMiddleware::wrap(retried);
+        assert!(logged.capabilities().retries_transient_errors);
+        assert!(
+            !LoggingMiddleware::wrap(mock)
+                .capabilities()
+                .retries_transient_errors
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn retry_middleware_recovers_from_transient_error() {
         let mock = Arc::new(MockModelClient::new());
@@ -1008,7 +1031,11 @@ mod tests {
         mock.set_supports_anchored_minimal(true);
         mock.set_supports_request_scoped_transient_context(false);
         mock.set_thinking_replay_requires_signature(false);
-        let expected = mock.capabilities();
+        // Everything the backend reports, plus the retry layer's own mark.
+        let expected = ModelCapabilities {
+            retries_transient_errors: true,
+            ..mock.capabilities()
+        };
 
         let base: Arc<dyn ModelClient> = mock;
         let retry = Arc::new(RetryMiddleware::wrap(base, RetryConfig::for_tests()));
