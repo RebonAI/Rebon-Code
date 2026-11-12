@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use rebon_api::{
@@ -302,6 +302,35 @@ pub trait AutoModeClassifier: Send + Sync + std::fmt::Debug {
 #[derive(Clone)]
 pub struct ModelAutoModeClassifier {
     runtime_model: SharedRuntimeModel,
+    budgets: Arc<ReasoningBudgetModels>,
+}
+
+/// The models seen spending the verdict-sized output ceiling before they
+/// answered.
+///
+/// Such a model reasons on its output budget whatever its client reports
+/// (DeepSeek over Chat Completions), so every verdict-sized call it gets
+/// fails and is asked again with the reasoning-sized ceiling. Once one has
+/// failed that way, its later calls, in either stage, start with the
+/// reasoning-sized ceiling. The ceiling is only a cap: a model that stops on
+/// its stop sequence spends no more for it.
+#[derive(Debug, Default)]
+struct ReasoningBudgetModels(Mutex<HashSet<String>>);
+
+impl ReasoningBudgetModels {
+    fn reasons_on_output_budget(&self, model: &str) -> bool {
+        self.0
+            .lock()
+            .expect("reasoning budget models poisoned")
+            .contains(model)
+    }
+
+    fn record(&self, model: &str) {
+        self.0
+            .lock()
+            .expect("reasoning budget models poisoned")
+            .insert(model.to_owned());
+    }
 }
 
 impl std::fmt::Debug for ModelAutoModeClassifier {
@@ -312,7 +341,10 @@ impl std::fmt::Debug for ModelAutoModeClassifier {
 
 impl ModelAutoModeClassifier {
     pub fn new(runtime_model: SharedRuntimeModel) -> Self {
-        Self { runtime_model }
+        Self {
+            runtime_model,
+            budgets: Arc::default(),
+        }
     }
 }
 
@@ -325,7 +357,14 @@ impl AutoModeClassifier for ModelAutoModeClassifier {
         let (runtime, session) = self.runtime_model.snapshot();
         let (primary, fallback) = classifier_models(&runtime);
         let primary_session = session.fork_for_sub_agent(None);
-        match classify_with_client(primary_session.client().as_ref(), &primary, &request).await {
+        match classify_with_client(
+            primary_session.client().as_ref(),
+            &primary,
+            &request,
+            &self.budgets,
+        )
+        .await
+        {
             Ok(outcome) => Ok(outcome),
             Err(primary_error) if primary_error.can_fallback() => {
                 let Some(fallback) = fallback else {
@@ -343,18 +382,23 @@ impl AutoModeClassifier for ModelAutoModeClassifier {
                     "auto-mode classifier primary model failed; trying fallback"
                 );
                 let fallback_session = session.fork_for_sub_agent(None);
-                classify_with_client(fallback_session.client().as_ref(), &fallback, &request)
-                    .await
-                    .map_err(|fallback_error| {
-                        tracing::warn!(
-                            primary_model = %primary,
-                            fallback_model = %fallback,
-                            primary_error = %primary_error,
-                            error = %fallback_error,
-                            "auto-mode classifier fallback model failed too; blocking for safety"
-                        );
-                        anyhow::Error::new(fallback_error)
-                    })
+                classify_with_client(
+                    fallback_session.client().as_ref(),
+                    &fallback,
+                    &request,
+                    &self.budgets,
+                )
+                .await
+                .map_err(|fallback_error| {
+                    tracing::warn!(
+                        primary_model = %primary,
+                        fallback_model = %fallback,
+                        primary_error = %primary_error,
+                        error = %fallback_error,
+                        "auto-mode classifier fallback model failed too; blocking for safety"
+                    );
+                    anyhow::Error::new(fallback_error)
+                })
             }
             Err(error) => Err(anyhow::Error::new(error)),
         }
@@ -377,6 +421,7 @@ async fn classify_with_client(
     client: &dyn ModelClient,
     model: &str,
     classifier_request: &AutoModeClassifierRequest,
+    budgets: &ReasoningBudgetModels,
 ) -> Result<AutoModeClassifierOutcome, AutoModeClassifierError> {
     let system = classifier_system_prompt();
     let stage_one = classifier_user_prompt(classifier_request, stage_one_suffix());
@@ -386,6 +431,7 @@ async fn classify_with_client(
         system,
         stage_one,
         AutoModeClassifierStage::Fast,
+        budgets,
     )
     .await?;
     let should_review = parse_stage_one_response(&stage_one_response).map_err(|error| {
@@ -410,6 +456,7 @@ async fn classify_with_client(
         system,
         stage_two,
         AutoModeClassifierStage::Thinking,
+        budgets,
     )
     .await?;
     let verdict = parse_stage_two_response(&stage_two_response).map_err(|error| {
@@ -441,6 +488,7 @@ async fn send_classifier_request(
     system: &str,
     user_prompt: String,
     stage: AutoModeClassifierStage,
+    budgets: &ReasoningBudgetModels,
 ) -> Result<String, AutoModeClassifierError> {
     let mut request =
         CreateMessageRequest::simple(model, user_prompt).with_system(system.to_owned());
@@ -474,7 +522,7 @@ async fn send_classifier_request(
             )
         }
     };
-    if client.output_budget_includes_reasoning() {
+    if client.output_budget_includes_reasoning() || budgets.reasons_on_output_budget(model) {
         request.max_tokens = reasoning_ceiling;
         return send_sized_classifier_request(client, model, request, stage).await;
     }
@@ -487,7 +535,8 @@ async fn send_classifier_request(
     // before `<block>` and every call fails closed — the primary and
     // the fallback alike, since both are asked with the same ceiling.
     // A spent verdict ceiling is therefore evidence enough to ask once
-    // more with the room a reasoning provider gets.
+    // more with the room a reasoning provider gets, and to give this model
+    // that room from the start from now on.
     let mut retry = request.clone();
     request.max_tokens = verdict_ceiling;
     match send_sized_classifier_request(client, model, request, stage).await {
@@ -499,6 +548,7 @@ async fn send_classifier_request(
                 reasoning_ceiling,
                 "auto-mode classifier spent the verdict-sized output ceiling; retrying with a reasoning-sized one"
             );
+            budgets.record(model);
             retry.max_tokens = reasoning_ceiling;
             send_sized_classifier_request(client, model, retry, stage).await
         }
@@ -1458,9 +1508,14 @@ mod tests {
         let client = MockModelClient::new();
         client.push_turn(response_turn("<block>no", StopReason::StopSequence));
 
-        let outcome = classify_with_client(&client, "classifier-model", &classifier_request())
-            .await
-            .unwrap();
+        let outcome = classify_with_client(
+            &client,
+            "classifier-model",
+            &classifier_request(),
+            &ReasoningBudgetModels::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             outcome,
             AutoModeClassifierOutcome::Allow {
@@ -1500,9 +1555,14 @@ mod tests {
             StopReason::StopSequence,
         ));
 
-        classify_with_client(&client, "classifier-model", &classifier_request())
-            .await
-            .unwrap();
+        classify_with_client(
+            &client,
+            "classifier-model",
+            &classifier_request(),
+            &ReasoningBudgetModels::default(),
+        )
+        .await
+        .unwrap();
 
         let requests = client.captured_requests();
         assert_eq!(requests.len(), 2);
@@ -1533,9 +1593,14 @@ mod tests {
             StopReason::StopSequence,
         ));
 
-        classify_with_client(&client, "reasoning-model", &classifier_request())
-            .await
-            .unwrap();
+        classify_with_client(
+            &client,
+            "reasoning-model",
+            &classifier_request(),
+            &ReasoningBudgetModels::default(),
+        )
+        .await
+        .unwrap();
 
         let requests = client.captured_requests();
         assert_eq!(
@@ -1559,9 +1624,14 @@ mod tests {
         client.push_turn(response_turn("", StopReason::MaxTokens));
         client.push_turn(response_turn("", StopReason::MaxTokens));
 
-        let error = classify_with_client(&client, "reasoning-model", &classifier_request())
-            .await
-            .unwrap_err();
+        let error = classify_with_client(
+            &client,
+            "reasoning-model",
+            &classifier_request(),
+            &ReasoningBudgetModels::default(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(
             error.kind(),
@@ -1576,45 +1646,99 @@ mod tests {
         );
     }
 
+    /// A model that thinks on its output budget, behind a client that says
+    /// it does not: any ceiling below what its reasoning needs is spent before
+    /// the verdict. Every request is counted.
+    #[derive(Default)]
+    struct ReasonsOnItsBudget {
+        ceilings: Mutex<Vec<u32>>,
+    }
+
+    impl ReasonsOnItsBudget {
+        fn ceilings(&self) -> Vec<u32> {
+            self.ceilings.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelClient for ReasonsOnItsBudget {
+        fn provider_name(&self) -> &'static str {
+            "mock"
+        }
+
+        async fn create_message_stream(
+            &self,
+            request: CreateMessageRequest,
+        ) -> rebon_api::ModelResult<rebon_api::StreamEventStream> {
+            self.ceilings.lock().unwrap().push(request.max_tokens);
+            let reply =
+                if request.max_tokens < effort_to_openai_max_tokens(STAGE_ONE_EFFORT_ORDINAL) {
+                    response_turn("", StopReason::MaxTokens)
+                } else if request
+                    .stop_sequences
+                    .iter()
+                    .any(|stop| stop == STAGE_TWO_END_MARKER)
+                {
+                    response_turn("<block>no</block><end/>", StopReason::StopSequence)
+                } else {
+                    response_turn("<block>yes", StopReason::StopSequence)
+                };
+            Ok(Box::pin(futures_util::stream::iter(
+                reply.into_iter().map(Ok),
+            )))
+        }
+    }
+
     /// A client that reports its budget as verdict-only can still sit
     /// in front of a model that reasons on it (DeepSeek over Chat
     /// Completions). The spent verdict ceiling is retried once with the
-    /// reasoning-sized one instead of failing closed on every call.
+    /// reasoning-sized one instead of failing closed on every call, and the
+    /// model gets that ceiling from the start afterwards: in the second
+    /// stage of the same review, and in every later review.
     #[tokio::test]
-    async fn a_spent_verdict_ceiling_is_retried_with_room_to_reason() {
-        let client = MockModelClient::new();
-        client.push_turn(response_turn("", StopReason::MaxTokens));
-        client.push_turn(response_turn("<block>yes", StopReason::StopSequence));
-        client.push_turn(response_turn("", StopReason::MaxTokens));
-        client.push_turn(response_turn(
-            "<block>no</block><end/>",
-            StopReason::StopSequence,
-        ));
+    async fn a_spent_verdict_ceiling_is_retried_once_and_then_skipped() {
+        let budgets = ReasoningBudgetModels::default();
+        let client = ReasonsOnItsBudget::default();
+        let allowed = AutoModeClassifierOutcome::Allow {
+            reason: "Allowed by thinking classifier".to_owned(),
+            stage: AutoModeClassifierStage::Thinking,
+        };
+        let stage_one = effort_to_openai_max_tokens(STAGE_ONE_EFFORT_ORDINAL);
+        let stage_two = effort_to_openai_max_tokens(STAGE_TWO_EFFORT_ORDINAL);
 
-        let outcome = classify_with_client(&client, "deepseek-v4.1-flash", &classifier_request())
+        for _ in 0..2 {
+            let outcome = classify_with_client(
+                &client,
+                "deepseek-v4.1-flash",
+                &classifier_request(),
+                &budgets,
+            )
             .await
             .unwrap();
-
+            assert_eq!(outcome, allowed);
+        }
+        // Five requests for two reviews, where asking each stage at its
+        // verdict ceiling first took eight.
         assert_eq!(
-            outcome,
-            AutoModeClassifierOutcome::Allow {
-                reason: "Allowed by thinking classifier".to_owned(),
-                stage: AutoModeClassifierStage::Thinking,
-            }
-        );
-        let ceilings: Vec<u32> = client
-            .captured_requests()
-            .iter()
-            .map(|request| request.max_tokens)
-            .collect();
-        assert_eq!(
-            ceilings,
+            client.ceilings(),
             vec![
                 STAGE_ONE_MAX_TOKENS,
-                effort_to_openai_max_tokens(STAGE_ONE_EFFORT_ORDINAL),
-                STAGE_TWO_MAX_TOKENS,
-                effort_to_openai_max_tokens(STAGE_TWO_EFFORT_ORDINAL),
+                stage_one,
+                stage_two,
+                stage_one,
+                stage_two
             ]
+        );
+
+        // Another model behind the same classifier is not assumed to reason.
+        let other = MockModelClient::new();
+        other.push_turn(response_turn("<block>no</block>", StopReason::StopSequence));
+        classify_with_client(&other, "chatty-model", &classifier_request(), &budgets)
+            .await
+            .unwrap();
+        assert_eq!(
+            other.captured_requests()[0].max_tokens,
+            STAGE_ONE_MAX_TOKENS
         );
     }
 
@@ -1629,9 +1753,14 @@ mod tests {
             StopReason::MaxTokens,
         ));
 
-        let outcome = classify_with_client(&client, "chatty-model", &classifier_request())
-            .await
-            .unwrap();
+        let outcome = classify_with_client(
+            &client,
+            "chatty-model",
+            &classifier_request(),
+            &ReasoningBudgetModels::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             outcome,
@@ -1651,9 +1780,14 @@ mod tests {
             StopReason::EndTurn,
         ));
 
-        let outcome = classify_with_client(&client, "classifier-model", &classifier_request())
-            .await
-            .unwrap();
+        let outcome = classify_with_client(
+            &client,
+            "classifier-model",
+            &classifier_request(),
+            &ReasoningBudgetModels::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             outcome,
             AutoModeClassifierOutcome::Block {
@@ -1680,16 +1814,26 @@ mod tests {
     async fn parse_failure_and_refusal_are_typed_failures() {
         let malformed = MockModelClient::new();
         malformed.push_turn(response_turn("not xml", StopReason::EndTurn));
-        let error = classify_with_client(&malformed, "model", &classifier_request())
-            .await
-            .unwrap_err();
+        let error = classify_with_client(
+            &malformed,
+            "model",
+            &classifier_request(),
+            &ReasoningBudgetModels::default(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.kind(), AutoModeClassifierFailureKind::Parsing);
 
         let refused = MockModelClient::new();
         refused.push_turn(response_turn("", StopReason::Refusal));
-        let error = classify_with_client(&refused, "model", &classifier_request())
-            .await
-            .unwrap_err();
+        let error = classify_with_client(
+            &refused,
+            "model",
+            &classifier_request(),
+            &ReasoningBudgetModels::default(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.kind(), AutoModeClassifierFailureKind::Refusal);
     }
 
@@ -1706,9 +1850,14 @@ mod tests {
             StopReason::EndTurn,
         ));
 
-        let outcome = classify_with_client(&client, "chatty-model", &classifier_request())
-            .await
-            .unwrap();
+        let outcome = classify_with_client(
+            &client,
+            "chatty-model",
+            &classifier_request(),
+            &ReasoningBudgetModels::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             outcome,
@@ -1733,9 +1882,14 @@ mod tests {
             StopReason::EndTurn,
         ));
 
-        let outcome = classify_with_client(&client, "chatty-model", &classifier_request())
-            .await
-            .unwrap();
+        let outcome = classify_with_client(
+            &client,
+            "chatty-model",
+            &classifier_request(),
+            &ReasoningBudgetModels::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             outcome,
@@ -1761,9 +1915,14 @@ mod tests {
             StopReason::EndTurn,
         ));
 
-        let outcome = classify_with_client(&client, "chatty-model", &classifier_request())
-            .await
-            .unwrap();
+        let outcome = classify_with_client(
+            &client,
+            "chatty-model",
+            &classifier_request(),
+            &ReasoningBudgetModels::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             outcome,
@@ -1786,9 +1945,14 @@ mod tests {
             StopReason::EndTurn,
         ));
 
-        let error = classify_with_client(&client, "chatty-model", &classifier_request())
-            .await
-            .unwrap_err();
+        let error = classify_with_client(
+            &client,
+            "chatty-model",
+            &classifier_request(),
+            &ReasoningBudgetModels::default(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error.kind(), AutoModeClassifierFailureKind::Parsing);
         assert!(
@@ -1812,9 +1976,14 @@ mod tests {
             StopReason::EndTurn,
         ));
 
-        let error = classify_with_client(&client, "gpt-classifier", &classifier_request())
-            .await
-            .unwrap_err();
+        let error = classify_with_client(
+            &client,
+            "gpt-classifier",
+            &classifier_request(),
+            &ReasoningBudgetModels::default(),
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error.kind(), AutoModeClassifierFailureKind::Parsing);
         let detail = error.detail().expect("parse failures carry a detail");

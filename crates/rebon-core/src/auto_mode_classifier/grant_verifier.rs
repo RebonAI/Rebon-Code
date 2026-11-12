@@ -12,7 +12,9 @@
 
 use async_trait::async_trait;
 
-use super::{classifier_models, send_classifier_request, AutoModeClassifierStage};
+use super::{
+    classifier_models, send_classifier_request, AutoModeClassifierStage, ReasoningBudgetModels,
+};
 use crate::query::SharedRuntimeModel;
 
 const GRANT_VERIFIER_PROMPT: &str = include_str!("grant_verifier_prompt.md");
@@ -48,11 +50,15 @@ pub trait GrantVerifier: Send + Sync {
 /// The verifier on the session's classifier model.
 pub struct ModelGrantVerifier {
     runtime_model: SharedRuntimeModel,
+    budgets: ReasoningBudgetModels,
 }
 
 impl ModelGrantVerifier {
     pub fn new(runtime_model: SharedRuntimeModel) -> Self {
-        Self { runtime_model }
+        Self {
+            runtime_model,
+            budgets: ReasoningBudgetModels::default(),
+        }
     }
 }
 
@@ -73,6 +79,7 @@ impl GrantVerifier for ModelGrantVerifier {
             GRANT_VERIFIER_PROMPT,
             verifier_user_prompt(request),
             AutoModeClassifierStage::Thinking,
+            &self.budgets,
         )
         .await;
         match response {
