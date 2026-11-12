@@ -250,10 +250,16 @@ async fn anchored_minimal_tool_search_promotes_normal_projection_and_restores_bu
     assert!(requests[0].transient_context.is_none());
     assert_eq!(requests[1].max_tokens, 4096);
     assert_eq!(requests[1].system.as_deref(), Some("minimal persona"));
-    assert_eq!(
-        requests[1].transient_context.as_deref(),
-        Some("promoted transient\n\npromoted dynamic attachment")
-    );
+    // The promoted transient context waits for the next turn's start: the
+    // only place left in this one is after the tool results.
+    assert!(requests[1].transient_context.is_none());
+    assert!(requests[1]
+        .messages_with_transient_context()
+        .iter()
+        .all(|message| message.content.iter().all(|block| block
+            .as_text()
+            .is_none_or(|text| !text.contains("promoted transient")
+                && !text.contains("promoted dynamic attachment")))));
     assert!(captured_runtime_context_text(&requests[1]).contains("promoted runtime"));
     assert!(requests[1].tools.iter().any(|tool| tool.name == "Edit"));
     assert!(requests[1]
@@ -439,14 +445,24 @@ async fn anchored_promotion_keeps_tool_results_adjacent_to_their_tool_use() {
             "message {index} calls {tool_use_ids:?} but the next message carries {result_ids:?}"
         );
     }
+    // Nothing follows the tool results: the promoted context waits for the
+    // next turn's start rather than reading as a new user message here.
     assert!(
-        messages
+        requests[1]
+            .messages_with_transient_context()
             .iter()
-            .any(|message| message.content.iter().any(|block| block
+            .all(|message| message.content.iter().all(|block| block
                 .as_text()
-                .is_some_and(|text| text.contains("promoted transient")))),
-        "the promoted context must still reach the model, just after the tool results"
+                .is_none_or(|text| !text.contains("promoted transient")))),
+        "the promoted context must not be appended after the tool results"
     );
+    let last = requests[1].messages_with_transient_context();
+    assert!(last
+        .last()
+        .unwrap()
+        .content
+        .iter()
+        .all(|block| matches!(block, ApiContentBlock::ToolResult(_))));
 }
 
 #[tokio::test(flavor = "current_thread")]

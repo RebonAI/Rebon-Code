@@ -3677,17 +3677,16 @@ impl EngineQueryExecutor {
             cancel,
         } = *inputs;
         // The current user prompt, or the saved user tail for a resume-only
-        // background continuation, is the plain tail. Durable transient context
-        // can be inserted immediately before it for providers that need
-        // append-only history.
-        let durable_runtime_message = if !client.supports_request_scoped_transient_context() {
-            materialize_durable_transient_context(
-                &mut params.messages,
-                &mut params.transient_context_message,
-            )
-        } else {
-            None
-        };
+        // background continuation, is the plain tail. Transient context (the
+        // git status) goes into history immediately before it, for every
+        // provider, and only when it differs from the last copy history holds:
+        // re-attached to each request it would land after tool results, where
+        // the model reads it as a new user turn. Persisted below, so the next
+        // turn can tell whether it changed.
+        let durable_runtime_message = materialize_durable_transient_context(
+            &mut params.messages,
+            &mut params.transient_context_message,
+        );
         if truncate_initial_query_history_for_request_budget(&session_id, &mut params) {
             client.invalidate_previous_response_id();
         }

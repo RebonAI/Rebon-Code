@@ -310,3 +310,159 @@ fn context_reset_restores_runtime_context_message() {
         Some("execution transient")
     );
 }
+
+/// A real git-status block, as each prompt profile renders it.
+fn git_status_block(profile: rebon_types::prompt_profile::PromptProfile) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let initialised = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .is_ok_and(|status| status.success());
+    let body = initialised
+        .then(|| {
+            crate::system_prompt::collect_git_status_for_profile(
+                &dir.path().to_string_lossy(),
+                profile,
+            )
+        })
+        .flatten()
+        .unwrap_or_else(|| "Current branch: main\n\nStatus:\n(clean)".to_string());
+    format!("gitStatus: {body}")
+}
+
+fn mentions_git_status(message: &ApiMessage) -> bool {
+    message.content.iter().any(|block| {
+        block
+            .as_text()
+            .is_some_and(|text| text.contains("gitStatus:"))
+    })
+}
+
+/// After a tool round, the request a provider receives ends with the
+/// tool_result message: the git status is not appended after it, where it
+/// reads to the model as the user speaking again. It went in once, before
+/// the turn's prompt. Under both prompt profiles, and whether or not the
+/// client supports request-scoped context.
+#[tokio::test]
+async fn a_tool_round_is_never_followed_by_a_git_status_block() {
+    use rebon_types::prompt_profile::PromptProfile;
+    for profile in [PromptProfile::Legacy, PromptProfile::Lean] {
+        for request_scoped in [true, false] {
+            let label = format!("{profile:?}, request-scoped {request_scoped}");
+            let tool = Arc::new(RecordingTool::new("Read", json!({"contents": "file body"})));
+            let engine = build_engine_with(tool as Arc<dyn Tool>);
+            let mock = MockModelClient::new();
+            mock.set_supports_request_scoped_transient_context(request_scoped);
+            mock.push_turn(tool_turn(
+                "msg_tool",
+                "Read",
+                "toolu_read",
+                "{\"path\":\"a.rs\"}",
+            ));
+            mock.push_turn(text_turn("msg_done", "done"));
+            let captured = mock.clone();
+            let mut params = QueryParams::new("mock", vec![ApiMessage::user_text("do work")])
+                .with_tools(tools_from_engine(&engine));
+            params.transient_context_message = Some(git_status_block(profile));
+
+            let mut rx = run_query(
+                engine,
+                SessionHandle::new(Arc::new(mock)),
+                params,
+                ToolContext::new().with_cwd("/tmp/repo"),
+                CancelToken::new(),
+            );
+            let events = drain(&mut rx).await;
+            assert!(
+                matches!(events.last(), Some(QueryEvent::Done { .. })),
+                "{label}"
+            );
+
+            let requests = captured.captured_requests();
+            assert_eq!(requests.len(), 2, "{label}");
+            // What the provider sends: any request-scoped context folded in.
+            let first = requests[0].messages_with_transient_context();
+            let after_tools = requests[1].messages_with_transient_context();
+
+            let last = after_tools.last().unwrap();
+            assert_eq!(last.role, rebon_api::Role::User, "{label}");
+            assert!(
+                last.content
+                    .iter()
+                    .all(|block| matches!(block, rebon_api::ContentBlock::ToolResult(_))),
+                "{label}: something follows the tool results: {last:?}"
+            );
+            for messages in [&first, &after_tools] {
+                let blocks: Vec<usize> = messages
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, message)| mentions_git_status(message))
+                    .map(|(index, _)| index)
+                    .collect();
+                let prompt = messages
+                    .iter()
+                    .position(|message| {
+                        message.content.first().and_then(|block| block.as_text()) == Some("do work")
+                    })
+                    .unwrap();
+                assert_eq!(
+                    blocks,
+                    vec![prompt - 1],
+                    "{label}: one block, right before the prompt"
+                );
+            }
+        }
+    }
+}
+
+/// Across turns the git status is sent again only when it changed, at the
+/// start of the turn that sees the change, before its prompt. Once history
+/// no longer holds the last copy (compaction, a reset) it counts as unsent.
+#[test]
+fn git_status_is_sent_again_only_when_it_changed() {
+    let clean = "gitStatus: Current branch: main\n\nStatus:\n(clean)".to_string();
+    let dirty = "gitStatus: Current branch: main\n\nStatus:\n M src/lib.rs".to_string();
+    let count = |messages: &[ApiMessage]| {
+        messages
+            .iter()
+            .filter(|message| rebon_api::is_runtime_context_message(message))
+            .count()
+    };
+
+    let mut messages = vec![ApiMessage::user_text("turn one")];
+    assert!(
+        materialize_durable_transient_context(&mut messages, &mut Some(clean.clone())).is_some()
+    );
+    messages.push(ApiMessage::assistant_text("reply one"));
+    messages.push(ApiMessage::user_text("turn two"));
+
+    // Unchanged: no second block.
+    assert!(
+        materialize_durable_transient_context(&mut messages, &mut Some(clean.clone())).is_none()
+    );
+    assert_eq!(count(&messages), 1);
+
+    // Changed: exactly one new block, right before this turn's prompt.
+    messages.push(ApiMessage::assistant_text("reply two"));
+    messages.push(ApiMessage::user_text("turn three"));
+    assert!(
+        materialize_durable_transient_context(&mut messages, &mut Some(dirty.clone())).is_some()
+    );
+    assert_eq!(count(&messages), 2);
+    let tail = messages.len();
+    assert_eq!(
+        rebon_api::runtime_context_body_from_message(&messages[tail - 2]),
+        Some(dirty.as_str())
+    );
+    assert_eq!(messages[tail - 1].content[0].as_text(), Some("turn three"));
+
+    // Compacted history no longer holds it: sent again.
+    let mut compacted = vec![
+        ApiMessage::user_text("summary of earlier turns"),
+        ApiMessage::assistant_text("ok"),
+        ApiMessage::user_text("turn four"),
+    ];
+    assert!(materialize_durable_transient_context(&mut compacted, &mut Some(dirty)).is_some());
+    assert_eq!(count(&compacted), 1);
+}

@@ -339,8 +339,12 @@ async fn run_query_repeated_context_overflow_keeps_shrinking_instead_of_failing(
     );
 }
 
+/// The poller's dynamic context (the teammate roster) joins the base
+/// transient context once, before the turn's prompt. It is not re-attached
+/// to the request after the tool round, where it would follow the tool
+/// results as if the user had spoken again.
 #[tokio::test]
-async fn run_query_replaces_dynamic_transient_context_each_iteration() {
+async fn run_query_sends_dynamic_transient_context_once_before_the_prompt() {
     struct SequencedTransientPoller(AtomicUsize);
 
     impl AttachmentPoller for SequencedTransientPoller {
@@ -387,24 +391,26 @@ async fn run_query_replaces_dynamic_transient_context_each_iteration() {
     assert!(matches!(events.last(), Some(QueryEvent::Done { .. })));
     let requests = captured_client.captured_requests();
     assert_eq!(requests.len(), 2);
-    assert_eq!(
-        requests[0].transient_context.as_deref(),
-        Some("base-transient\n\nroster-0")
-    );
-    assert_eq!(
-        requests[1].transient_context.as_deref(),
-        Some("base-transient\n\nroster-1")
-    );
-    assert!(!requests[1]
-        .transient_context
-        .as_deref()
-        .unwrap()
-        .contains("roster-0"));
-    assert!(requests.iter().all(|request| {
-        text_message_texts(&request.messages)
+    for request in &requests {
+        assert!(request.transient_context.is_none());
+        let bodies: Vec<&str> = request
+            .messages
+            .iter()
+            .filter_map(rebon_api::runtime_context_body_from_message)
+            .filter(|body| body.contains("base-transient"))
+            .collect();
+        assert_eq!(bodies, vec!["base-transient\n\nroster-0"]);
+        assert!(!text_message_texts(&request.messages)
             .into_iter()
-            .all(|text| !text.contains("roster-"))
-    }));
+            .any(|text| text.contains("roster-1")));
+    }
+    let after_tools = requests[1].messages_with_transient_context();
+    assert!(after_tools
+        .last()
+        .unwrap()
+        .content
+        .iter()
+        .all(|block| matches!(block, rebon_api::ContentBlock::ToolResult(_))));
 }
 
 #[tokio::test]

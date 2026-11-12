@@ -303,11 +303,13 @@ async fn cache_trace_subscriber_observes_first_and_tool_followup_requests_with_u
             .lock()
             .expect("cache trace observations poisoned"),
         [
+            // The transient context went into history before the prompt,
+            // once; no request carries it as request-scoped context.
             CacheTraceObservation::Request {
                 model: "mock".into(),
-                message_count: 2,
+                message_count: 3,
                 runtime_context_message: Some("runtime".into()),
-                transient_context_message: Some("transient".into()),
+                transient_context_message: None,
                 cache_miss_reason: CacheMissReason::None,
                 cache_trace_context: Some(trace.clone()),
             },
@@ -319,9 +321,9 @@ async fn cache_trace_subscriber_observes_first_and_tool_followup_requests_with_u
             },
             CacheTraceObservation::Request {
                 model: "mock".into(),
-                message_count: 4,
+                message_count: 5,
                 runtime_context_message: Some("runtime".into()),
-                transient_context_message: Some("transient".into()),
+                transient_context_message: None,
                 cache_miss_reason: CacheMissReason::None,
                 cache_trace_context: Some(trace.clone()),
             },

@@ -215,22 +215,13 @@ fn truncated_tool_call_result(name: &str, max_tokens: u32) -> String {
     )
 }
 
-/// Materialize promoted transient context for providers without request scope.
-fn absorb_promoted_transient_context(
-    params: &mut QueryParams,
-    manager: &mut ContextManager,
-    request_scoped_transient_context: bool,
-) {
-    if request_scoped_transient_context {
-        return;
-    }
-    let Some(context) = params.transient_context_message.take() else {
-        return;
-    };
-    if context.is_empty() {
-        return;
-    }
-    manager.push_message(virtual_runtime_context_message(&context));
+/// An Anchored Minimal promotion mid-turn brings the full transient context
+/// (git status and the rest). It is not sent now: the only place left in this
+/// turn is after the tool results, where it reads as the user speaking again.
+/// The next turn sends it before its prompt, since nothing equal to it is in
+/// history yet.
+fn defer_promoted_transient_context(params: &mut QueryParams) {
+    params.transient_context_message = None;
 }
 
 fn merge_transient_context(base: Option<String>, dynamic: Option<String>) -> Option<String> {
@@ -771,8 +762,6 @@ async fn settle_stream_outcome(
     automatic_max_token_continuations: &mut usize,
     truncated_tool_call_rounds: &mut usize,
     transient_replay_streak: &mut u32,
-    request_scoped_transient_context: bool,
-    base_transient_context_message: &mut Option<String>,
     request_cache_trace_context: &Option<rebon_api::CacheTraceContext>,
     last_message: &mut Option<AssistantMessage>,
 ) -> StreamOutcomeFlow {
@@ -893,8 +882,7 @@ async fn settle_stream_outcome(
         && anchored_minimal_content_has_anchor(&Role::Assistant, &message.content)
         && apply_anchored_minimal_promotion(params, context)
     {
-        absorb_promoted_transient_context(params, manager, request_scoped_transient_context);
-        (*base_transient_context_message) = params.transient_context_message.clone();
+        defer_promoted_transient_context(params);
         extend_announced_tools(&params, announced_tools);
     }
     StreamOutcomeFlow::Ran {
@@ -1330,15 +1318,11 @@ async fn finish_tool_round(
     wants_tools: bool,
     anchored_promoted: bool,
     estimated_input_tokens: u32,
-    request_scoped_transient_context: bool,
-    base_transient_context_message: &mut Option<String>,
     skip_auto_compact: &mut bool,
     pending_cache_miss_reason: &mut CacheMissReason,
 ) -> PostRoundFlow {
-    // Promotion must follow tool results to preserve tool_use/result adjacency.
     if anchored_promoted {
-        absorb_promoted_transient_context(params, manager, request_scoped_transient_context);
-        (*base_transient_context_message) = params.transient_context_message.clone();
+        defer_promoted_transient_context(params);
     }
 
     let hook_writeback = tx.dispatch_tool_round(message, iteration, params).await;
@@ -1470,30 +1454,31 @@ fn initial_announced_tools(params: &QueryParams) -> std::collections::HashSet<St
         .collect()
 }
 
-/// Materialize transient context unless the provider supports request scope.
-fn prime_transient_context(
-    params: &mut QueryParams,
-    client: &Arc<dyn ModelClient>,
-) -> (bool, Option<String>) {
-    let request_scoped_transient_context = client.supports_request_scoped_transient_context();
-    let base_transient_context_message = params.transient_context_message.clone();
-    if !request_scoped_transient_context {
-        let dynamic = params.attachment_poller.as_ref().and_then(|binding| {
-            binding
-                .poller
-                .transient_context_for_query(&binding.session_id, &binding.turn_id)
-        });
-        params.transient_context_message =
-            merge_transient_context(base_transient_context_message.clone(), dynamic);
-        materialize_durable_transient_context(
-            &mut params.messages,
-            &mut params.transient_context_message,
-        );
-    }
-    (
-        request_scoped_transient_context,
-        base_transient_context_message,
-    )
+/// Put this turn's transient context — the git status, worker-tool notes,
+/// plugin sections, the teammate roster — into history once, right before
+/// the turn's prompt, and only when it differs from the last copy history
+/// holds (so an unchanged git status is not sent again, and one compacted
+/// away counts as unsent).
+///
+/// Nothing is request-scoped, for any provider: context re-attached to every
+/// request lands after the tool results mid-turn, and a model reads a user
+/// message there as the user speaking again — it re-verifies and
+/// re-summarises in answer. What changes inside a turn is mostly the model's
+/// own work, which it already knows. When there is no prompt to put it
+/// before (a continuation), it waits for the next turn.
+fn prime_transient_context(params: &mut QueryParams) {
+    let dynamic = params.attachment_poller.as_ref().and_then(|binding| {
+        binding
+            .poller
+            .transient_context_for_query(&binding.session_id, &binding.turn_id)
+    });
+    params.transient_context_message =
+        merge_transient_context(params.transient_context_message.take(), dynamic);
+    materialize_durable_transient_context(
+        &mut params.messages,
+        &mut params.transient_context_message,
+    );
+    params.transient_context_message = None;
 }
 
 /// Commit hook history, attachment events, and context paths in order.
@@ -1594,8 +1579,7 @@ impl TurnControlPlugin {
         // Break a compact loop when history cannot shrink further.
         let mut skip_auto_compact = false;
         // ContextManager is the sole live owner of query history.
-        let (request_scoped_transient_context, mut base_transient_context_message) =
-            prime_transient_context(&mut params, &client);
+        prime_transient_context(&mut params);
         let mut manager =
             ContextManager::new(params.system.clone(), std::mem::take(&mut params.messages));
         let mut pending_cache_miss_reason = CacheMissReason::None;
@@ -1622,16 +1606,6 @@ impl TurnControlPlugin {
             if cancel.is_cancelled() {
                 let _ = tx.send(QueryEvent::Cancelled);
                 return None;
-            }
-
-            if request_scoped_transient_context {
-                let dynamic = params.attachment_poller.as_ref().and_then(|binding| {
-                    binding
-                        .poller
-                        .transient_context_for_query(&binding.session_id, &binding.turn_id)
-                });
-                params.transient_context_message =
-                    merge_transient_context(base_transient_context_message.clone(), dynamic);
             }
 
             let (estimated_input_tokens, cache_miss_reason) = match compact_before_request(
@@ -1703,8 +1677,6 @@ impl TurnControlPlugin {
                 &mut automatic_max_token_continuations,
                 &mut truncated_tool_call_rounds,
                 &mut transient_replay_streak,
-                request_scoped_transient_context,
-                &mut base_transient_context_message,
                 &request_cache_trace_context,
                 &mut last_message,
             )
@@ -1793,8 +1765,6 @@ impl TurnControlPlugin {
                 wants_tools,
                 anchored_promoted,
                 estimated_input_tokens,
-                request_scoped_transient_context,
-                &mut base_transient_context_message,
                 &mut skip_auto_compact,
                 &mut pending_cache_miss_reason,
             )
