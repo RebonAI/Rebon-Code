@@ -12,12 +12,20 @@
 //! Where it stops is kept beside the transcript (`<session>.memory-capture.json`)
 //! rather than in this process, because a background job builds a fresh
 //! engine for every turn it runs.
+//!
+//! A session in an agent group is also asked, at the end of each turn, what
+//! the turn found out that the group should keep
+//! ([`rebon_instructions::memory_capture::GroupCapture`]). That one reads the
+//! agent's work as well as the person's words — a worker the router sends
+//! is handed a task and talks to no one — and runs when the turn is done, so
+//! a worker with one long turn is asked about it rather than never. Its
+//! place is kept in `<session>.group-capture.json`.
 
 use super::*;
 
 use std::collections::HashSet;
 
-use rebon_instructions::memory_capture::MemoryCapture;
+use rebon_instructions::memory_capture::{GroupCapture, MemoryCapture};
 
 /// What one message may bring into the question, and the whole of it. The
 /// newest part is kept: an old stretch was asked about already, or is the
@@ -133,6 +141,143 @@ async fn run(job: &MemoryCaptureJob, client: &dyn rebon_api::ModelClient) {
     if let Some(uuid) = last_uuid {
         write_cursor(&cursor_path, &uuid);
     }
+}
+
+/// Less said by the agent than this in a turn is not worth asking the
+/// group's question about.
+const MIN_AGENT_CHARS: usize = 200;
+/// How much of the task that opened the work stays when the newest part
+/// fills the budget.
+const MAX_TASK_CHARS: usize = 1_500;
+
+pub(super) struct GroupCaptureJob {
+    pub(super) capture: Arc<dyn GroupCapture>,
+    pub(super) session: Arc<SessionHandle>,
+    /// The small model the title uses.
+    pub(super) model: String,
+    pub(super) projects_root: PathBuf,
+    pub(super) cwd: String,
+    pub(super) session_id: String,
+}
+
+/// After a turn: ask what it found out that the session's group should
+/// keep, in the background. Shares the memory capture's one-in-flight rule,
+/// under a key of its own.
+pub(super) fn maybe_spawn_group_capture(job: GroupCaptureJob, runs: &Arc<MemoryCaptureRuns>) {
+    if !memory_capture_enabled() || job.model.trim().is_empty() {
+        return;
+    }
+    let run_key = format!("group:{}", job.session_id);
+    if !runs.begin(&run_key) {
+        return;
+    }
+    let runs = runs.clone();
+    let forked = job.session.fork_for_sub_agent(None);
+    tokio::spawn(async move {
+        run_group(&job, forked.client().as_ref()).await;
+        runs.end(&run_key);
+    });
+}
+
+async fn run_group(job: &GroupCaptureJob, client: &dyn rebon_api::ModelClient) {
+    if !job.capture.in_group(&job.session_id) {
+        return;
+    }
+    let transcript =
+        rebon_session::transcript_file_path(&job.projects_root, &job.cwd, &job.session_id);
+    let cursor_path = transcript.with_extension("group-capture.json");
+    let through = read_cursor(&cursor_path);
+    let entries = match rebon_session::load_transcript_from_file(&transcript) {
+        Ok(Some(loaded)) => loaded.messages,
+        _ => Vec::new(),
+    };
+    let (slice, last_uuid) = since(&entries, through.as_deref());
+    let messages = transcript_to_api_messages(slice);
+    let (work, agent_chars) = render_work(&messages);
+    let ask = (agent_chars >= MIN_AGENT_CHARS)
+        .then(|| job.capture.ask(&job.session_id, &work))
+        .flatten();
+    if let Some(ask) = ask {
+        let mut request =
+            rebon_api::CreateMessageRequest::simple(&job.model, ask.prompt).with_system(ask.system);
+        request.stream = false;
+        request.max_tokens = ask.max_tokens;
+        request.thinking = Some(rebon_api::ThinkingConfig::Disabled);
+        let answer = match client.create_message(request).await {
+            Ok(message) => message.text(),
+            Err(error) => {
+                tracing::debug!(%error, session_id = %job.session_id, "group capture: model call failed");
+                return;
+            }
+        };
+        let kept = job.capture.keep(&job.session_id, &answer);
+        if !kept.is_empty() {
+            tracing::info!(
+                session_id = %job.session_id,
+                facts = ?kept,
+                "group capture kept what the turn found out"
+            );
+        }
+    }
+    if let Some(uuid) = last_uuid {
+        write_cursor(&cursor_path, &uuid);
+    }
+}
+
+/// `Task:`, `Person:` and `Assistant:` lines, newest part kept, and how
+/// much the agent said in it. A prompt the scheduler or the router
+/// delivered is the task the work is on, so it is shown as one; when the
+/// newest part fills the budget, the last task before it still opens it.
+fn render_work(messages: &[ApiMessage]) -> (String, usize) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut agent_chars = 0;
+    for message in messages {
+        match message.role {
+            Role::User => {
+                for text in message.content.iter().filter_map(|block| block.as_text()) {
+                    let trimmed = text.trim_start();
+                    if trimmed.starts_with(rebon_tool::cron::SCHEDULED_PROMPT_MARKER) {
+                        let task = rebon_tool::cron::strip_scheduled_marker(trimmed).trim();
+                        if !task.is_empty() {
+                            lines.push(format!("Task: {}", clip(task, MAX_TASK_CHARS)));
+                        }
+                    } else if !is_machine_text(text) && !text.trim().is_empty() {
+                        lines.push(format!("Person: {}", clip(text.trim(), MAX_MESSAGE_CHARS)));
+                    }
+                }
+            }
+            Role::Assistant => {
+                let text = assistant_text(message);
+                let text = text.trim();
+                if !text.is_empty() {
+                    agent_chars += text.chars().count();
+                    lines.push(format!("Assistant: {}", clip(text, MAX_MESSAGE_CHARS)));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut kept: Vec<String> = Vec::new();
+    let mut total = 0;
+    let mut first_kept = lines.len();
+    for (index, line) in lines.iter().enumerate().rev() {
+        let size = line.chars().count() + 1;
+        if total + size > MAX_CONVERSATION_CHARS && !kept.is_empty() {
+            break;
+        }
+        total += size;
+        kept.push(line.clone());
+        first_kept = index;
+    }
+    kept.reverse();
+    if let Some(task) = lines[..first_kept]
+        .iter()
+        .rev()
+        .find(|line| line.starts_with("Task: ") || line.starts_with("Person: "))
+    {
+        kept.insert(0, task.clone());
+    }
+    (kept.join("\n"), agent_chars)
 }
 
 /// The entries after `through` (all of them when it is unknown: the
@@ -332,6 +477,46 @@ mod tests {
         assert!(text.ends_with(&"x".repeat(10)));
         assert!(text.contains("39: "));
         assert!(!text.contains("Person: 0: "));
+    }
+
+    #[test]
+    fn a_workers_turn_reads_as_its_task_and_what_it_said() {
+        let brief = rebon_tool::cron::mark_scheduled_prompt("Fix the flaky login test");
+        let messages = vec![
+            ApiMessage::user_text(&brief),
+            ApiMessage::assistant_text("The test raced the session store; it needs a lock."),
+            ApiMessage::user_text("<system-reminder>\nGroup news\n</system-reminder>"),
+            ApiMessage::user_text("also check the logout one"),
+        ];
+        let (work, agent_chars) = render_work(&messages);
+        assert_eq!(
+            work,
+            "Task: Fix the flaky login test\n\
+             Assistant: The test raced the session store; it needs a lock.\n\
+             Person: also check the logout one"
+        );
+        assert_eq!(agent_chars, 50);
+    }
+
+    #[test]
+    fn a_long_turn_keeps_its_task_and_its_end() {
+        let brief = rebon_tool::cron::mark_scheduled_prompt("Port the parser");
+        let mut messages = vec![ApiMessage::user_text(&brief)];
+        for index in 0..40 {
+            messages.push(ApiMessage::assistant_text(format!(
+                "{index} {}",
+                "x".repeat(900)
+            )));
+        }
+        let (work, _) = render_work(&messages);
+        assert!(
+            work.starts_with("Task: Port the parser\nAssistant: "),
+            "{}",
+            &work[..80]
+        );
+        assert!(work.ends_with(&"x".repeat(900)));
+        assert!(!work.contains("\nAssistant: 0 "));
+        assert!(work.chars().count() <= MAX_CONVERSATION_CHARS + 100);
     }
 
     #[test]

@@ -7,7 +7,9 @@
 //!   `group_join`, …), `rebon-group`'s own, run as this session;
 //! - the **attachment seat** gets `group_inbox` ([`inbox`]) at
 //!   [`Order::Mailbox`]: what the group wrote to the session, delivered
-//!   between rounds.
+//!   between rounds;
+//! - and the **group-capture** seat gets [`capture`]: what a member's turn
+//!   found out that the group should keep, asked at the end of the turn.
 //!
 //! The same tools reach other agents through `rebon mcp serve`, which a
 //! project's `.mcp.json` starts for Rebon sessions too. That server leaves
@@ -22,6 +24,7 @@ use rebon_core::tool_seat::{Priority, ToolSeatService, TOOL_SEAT_SERVICE};
 use rebon_group::GroupStore;
 use rebon_kernel::{Context, KernelError, Plugin, PluginDef, PluginHost, PluginKind, PluginMeta};
 
+pub mod capture;
 pub mod inbox;
 pub mod tools;
 
@@ -60,7 +63,11 @@ impl Plugin for GroupsPlugin {
             INBOX_PROVIDER_ID,
             Order::Mailbox,
             Arc::new(inbox::GroupInboxProducer::new(self.store.clone())),
-        )
+        )?;
+
+        ctx.provide::<rebon_instructions::memory_capture::GroupCaptureService>(Arc::new(
+            capture::GroupCaptureProvider::new(self.store.clone()),
+        ))
     }
 }
 

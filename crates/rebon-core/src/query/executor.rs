@@ -4990,6 +4990,32 @@ impl PromptExecutor for EngineQueryExecutor {
                 );
             }
         }
+        // What the turn found out that the session's group should keep,
+        // asked once the turn is done. Only where the session may call
+        // group_remember itself.
+        let group_capture = (!replay_only
+            && !resume_without_new_prompt
+            && effective_tool_filter
+                .as_ref()
+                .is_none_or(|filter| filter.allows("group_remember", &[])))
+        .then(|| {
+            kernel_turn_lease_for_attachments
+                .as_ref()
+                .and_then(|lease| {
+                    lease
+                        .context()
+                        .get::<rebon_instructions::memory_capture::GroupCaptureService>()
+                })
+        })
+        .flatten()
+        .map(|capture| super::memory_capture::GroupCaptureJob {
+            capture,
+            session: session.clone(),
+            model: title_model.clone(),
+            projects_root: self.projects_root.clone(),
+            cwd: cwd.clone(),
+            session_id: session_id.clone(),
+        });
 
         let stable_base_system = stable_base_system_enabled();
         let mut base_prompt_cache_hits = Vec::new();
@@ -5158,6 +5184,9 @@ impl PromptExecutor for EngineQueryExecutor {
             final_usage,
         )?;
         attachment_poller_turn.mark_succeeded();
+        if let Some(job) = group_capture {
+            super::memory_capture::maybe_spawn_group_capture(job, &self.memory_capture_runs);
+        }
         Ok(outcome)
     }
 }

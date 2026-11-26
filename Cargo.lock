@@ -5132,6 +5132,7 @@ dependencies = [
  "rebon-api",
  "rebon-core",
  "rebon-group",
+ "rebon-instructions",
  "rebon-kernel",
  "rebon-tool",
  "rebon-tools-core",

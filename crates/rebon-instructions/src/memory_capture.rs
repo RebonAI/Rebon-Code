@@ -16,6 +16,13 @@
 //!
 //! With no provider nothing is captured, which is what a session with the
 //! memory plugin turned off should get.
+//!
+//! An agent group's memory is kept the same way, on a seat of its own
+//! ([`GroupCaptureService`]), which the `groups` plugin fills: at the end of
+//! a turn of a session in a group, what the turn found out that the other
+//! members should know. The person may have said nothing — a worker the
+//! router sent is given a task and reports back — so it reads the agent's
+//! work, not only the person's words.
 
 use std::path::Path;
 
@@ -54,6 +61,89 @@ pub struct MemoryCaptureService;
 impl Service for MemoryCaptureService {
     type Interface = dyn MemoryCapture;
     const NAME: &'static str = MEMORY_CAPTURE_SERVICE;
+}
+
+/// JSON/typed name of the group-capture seam.
+pub const GROUP_CAPTURE_SERVICE: &str = "group-capture";
+
+/// The provider behind the group seam.
+pub trait GroupCapture: Send + Sync {
+    /// Whether the session `session_id` is in a group at all: asked first,
+    /// so a session in none costs no transcript read.
+    fn in_group(&self, session_id: &str) -> bool;
+
+    /// The question for `conversation` — `Task:`, `Person:` and `Assistant:`
+    /// lines — of the session `session_id`, or `None` when the session is in
+    /// no group.
+    fn ask(&self, session_id: &str, conversation: &str) -> Option<CaptureAsk>;
+
+    /// Keep what the model answered to [`Self::ask`] in the session's group.
+    /// Returns each fact kept, for the log.
+    fn keep(&self, session_id: &str, answer: &str) -> Vec<String>;
+}
+
+/// Typed definition for the kernel's `group-capture` seat.
+pub struct GroupCaptureService;
+
+impl Service for GroupCaptureService {
+    type Interface = dyn GroupCapture;
+    const NAME: &'static str = GROUP_CAPTURE_SERVICE;
+}
+
+/// The shapes a key or a private key takes. The instructions already say not
+/// to keep secrets; this is for the answer that keeps one anyway.
+pub fn looks_like_a_secret(text: &str) -> bool {
+    const MARKERS: [&str; 6] = [
+        "-----BEGIN",
+        "sk-ant-",
+        "ghp_",
+        "github_pat_",
+        "AKIA",
+        "xoxb-",
+    ];
+    if MARKERS.iter().any(|marker| text.contains(marker)) {
+        return true;
+    }
+    // `sk-` followed by a long run of key characters (OpenAI-style keys).
+    text.match_indices("sk-").any(|(at, _)| {
+        text[at + 3..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .count()
+            >= 20
+    })
+}
+
+/// The first balanced `{…}` in `text`: models wrap JSON in fences or prose
+/// now and then.
+pub fn first_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in text[start..].char_indices() {
+        if in_string {
+            match ch {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=start + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]

@@ -10,7 +10,9 @@
 
 use std::path::Path;
 
-use rebon_instructions::memory_capture::{CaptureAsk, MemoryCapture};
+use rebon_instructions::memory_capture::{
+    first_json_object, looks_like_a_secret, CaptureAsk, MemoryCapture,
+};
 use rebon_session::memory_paths::{self, MemoryScope, ENTRYPOINT_NAME};
 use serde_json::Value;
 
@@ -203,62 +205,6 @@ fn clip(text: &str, max: usize) -> String {
     } else {
         text.chars().take(max).collect()
     }
-}
-
-/// The shapes a key or a private key takes. The instructions already say not
-/// to keep secrets; this is for the answer that keeps one anyway.
-fn looks_like_a_secret(text: &str) -> bool {
-    const MARKERS: [&str; 6] = [
-        "-----BEGIN",
-        "sk-ant-",
-        "ghp_",
-        "github_pat_",
-        "AKIA",
-        "xoxb-",
-    ];
-    if MARKERS.iter().any(|marker| text.contains(marker)) {
-        return true;
-    }
-    // `sk-` followed by a long run of key characters (OpenAI-style keys).
-    text.match_indices("sk-").any(|(at, _)| {
-        text[at + 3..]
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .count()
-            >= 20
-    })
-}
-
-/// The first balanced `{…}` in `text`: models wrap JSON in fences or prose
-/// now and then.
-fn first_json_object(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (offset, ch) in text[start..].char_indices() {
-        if in_string {
-            match ch {
-                _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[start..=start + offset]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 #[cfg(test)]
