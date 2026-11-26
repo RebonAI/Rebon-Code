@@ -1,7 +1,7 @@
 //! The public ACP agent registry
 //! (<https://agentclientprotocol.com/get-started/registry>): the agent CLIs
 //! it lists, how each one starts on this machine, and installing one as an
-//! `acpAgents` entry in `config.json`, where `/agent` and the desktop app
+//! `acpAgents` entry in `config.json`, where `/backend` and the desktop app
 //! find it.
 //!
 //! - [`Registry`] — the file, as `FORMAT.md` in agentclientprotocol/registry
@@ -281,7 +281,7 @@ pub fn choose(
 
 /// The id an agent gets in `acpAgents` unless told otherwise: the
 /// registry's, lowercased, without the `-acp` most adapters carry
-/// (`pi-acp` → `pi`), so `/agent pi` reads the way the user says it.
+/// (`pi-acp` → `pi`), so `/backend pi` reads the way the user says it.
 pub fn default_id(registry_id: &str) -> String {
     let id = registry_id.trim().to_ascii_lowercase();
     match id.strip_suffix("-acp") {

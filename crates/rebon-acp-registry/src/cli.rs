@@ -12,7 +12,7 @@ use crate::{install, Registry, RegistryAgent};
 
 #[derive(Debug, clap::Subcommand, PartialEq, Eq)]
 pub enum AgentCommand {
-    /// The ACP agents config.json declares: what `/agent` can switch to.
+    /// The ACP agents config.json declares: what `/backend` can switch to.
     List(ListArgs),
     /// The agents the public ACP registry lists: whether each can be
     /// installed here and how, and which are installed.
@@ -144,7 +144,7 @@ pub async fn run(command: AgentCommand) -> anyhow::Result<()> {
                     "installed"
                 };
                 println!(
-                    "{verb} {} as `{}` ({}); switch a session to it with /agent {}",
+                    "{verb} {} as `{}` ({}); switch a session to it with /backend {}",
                     installed.agent.label(),
                     installed.agent.id,
                     installed.method,
