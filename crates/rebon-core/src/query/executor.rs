@@ -552,6 +552,8 @@ pub struct EngineQueryExecutor {
     /// repeated on every turn. Keyed by session id and shared with every
     /// executor forked from this one, which may serve the same session.
     title_attempts: Arc<super::prompt::SessionTitleAttempts>,
+    /// The memory captures in flight, one per session, shared the same way.
+    memory_capture_runs: Arc<super::memory_capture::MemoryCaptureRuns>,
     /// Optional observer that receives every raw [`QueryEvent`] before it is
     /// consumed. Used by `rebon exec --json` to emit a JSONL event stream.
     query_event_observer: Option<QueryEventObserver>,
@@ -885,6 +887,7 @@ impl EngineQueryExecutor {
             system_prompt_snapshot: self.system_prompt_snapshot.clone(),
             title_model: self.title_model.clone(),
             title_attempts: self.title_attempts.clone(),
+            memory_capture_runs: self.memory_capture_runs.clone(),
             query_event_observer: self.query_event_observer.clone(),
         }
     }
@@ -945,6 +948,7 @@ impl EngineQueryExecutor {
             system_prompt_snapshot: self.system_prompt_snapshot.clone(),
             title_model: self.title_model.clone(),
             title_attempts: self.title_attempts.clone(),
+            memory_capture_runs: self.memory_capture_runs.clone(),
             query_event_observer: self.query_event_observer.clone(),
         }
     }
@@ -1015,6 +1019,7 @@ impl EngineQueryExecutor {
             system_prompt_snapshot: None,
             title_model: String::new(),
             title_attempts: Default::default(),
+            memory_capture_runs: Default::default(),
             query_event_observer: None,
         }
     }
@@ -4952,6 +4957,39 @@ impl PromptExecutor for EngineQueryExecutor {
                 anchored_minimal_bootstrap,
             )
             .await?;
+
+        // What the conversation said that should outlive it, asked in the
+        // background on the small model. Only where the session may write
+        // memory itself: a worker that may not call SaveMemory does not get
+        // it written for it either.
+        if !replay_only
+            && !resume_without_new_prompt
+            && effective_tool_filter
+                .as_ref()
+                .is_none_or(|filter| filter.allows("SaveMemory", &["SaveMemoryTool"]))
+        {
+            if let Some(capture) = kernel_turn_lease_for_attachments
+                .as_ref()
+                .and_then(|lease| {
+                    lease
+                        .context()
+                        .get::<rebon_instructions::memory_capture::MemoryCaptureService>()
+                })
+            {
+                super::memory_capture::maybe_spawn_memory_capture(
+                    super::memory_capture::MemoryCaptureJob {
+                        capture,
+                        session: session.clone(),
+                        model: title_model.clone(),
+                        projects_root: self.projects_root.clone(),
+                        cwd: cwd.clone(),
+                        session_id: session_id.clone(),
+                        prompt_text: user_text.clone(),
+                    },
+                    &self.memory_capture_runs,
+                );
+            }
+        }
 
         let stable_base_system = stable_base_system_enabled();
         let mut base_prompt_cache_hits = Vec::new();

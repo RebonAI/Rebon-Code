@@ -72,6 +72,8 @@ pub enum MemorySource {
     CoordinatorSynthesis,
     AssistantInferred,
     ForgetRequest,
+    /// Kept by the background capture pass, not by a tool call.
+    AutoCapture,
 }
 
 impl MemorySource {
@@ -82,6 +84,7 @@ impl MemorySource {
             "coordinator_synthesis" => Ok(Self::CoordinatorSynthesis),
             "assistant_inferred" => Ok(Self::AssistantInferred),
             "forget_request" => Ok(Self::ForgetRequest),
+            "auto_capture" => Ok(Self::AutoCapture),
             other => Err(SaveMemoryError::Validation(format!(
                 "unsupported source `{other}`; expected one of explicit_user_request, durable_feedback, coordinator_synthesis, assistant_inferred, forget_request"
             ))),
@@ -95,6 +98,7 @@ impl MemorySource {
             Self::CoordinatorSynthesis => "coordinator_synthesis",
             Self::AssistantInferred => "assistant_inferred",
             Self::ForgetRequest => "forget_request",
+            Self::AutoCapture => "auto_capture",
         }
     }
 }

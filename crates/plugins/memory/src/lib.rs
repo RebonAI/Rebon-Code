@@ -160,6 +160,11 @@ impl Plugin for MemoryPlugin {
         ctx.provide::<rebon_instructions::agent_documents::AgentMemoryPromptService>(Arc::new(
             MemoryAgentPrompts,
         ))?;
+        // What the engine asks, in the background each turn, about the
+        // conversation since it last asked, and how the answer is kept.
+        ctx.provide::<rebon_instructions::memory_capture::MemoryCaptureService>(Arc::new(
+            crate::memory::capture::MemoryCaptureProvider,
+        ))?;
 
         // `/memory` is this plugin's command, so it comes and goes with the
         // same switch. The handler is `Native`: printing the list needs the

@@ -44,6 +44,7 @@ pub mod agent_documents;
 pub mod frontmatter;
 pub mod instruction_files;
 pub mod loaded_documents;
+pub mod memory_capture;
 pub mod memory_file;
 pub mod memory_type;
 

@@ -34,6 +34,7 @@ pub(crate) mod test_env;
 
 pub mod age;
 pub mod agent_memory;
+pub mod capture;
 pub mod description;
 pub mod dream_status;
 pub mod focus_state;

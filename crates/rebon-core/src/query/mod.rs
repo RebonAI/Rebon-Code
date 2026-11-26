@@ -80,6 +80,7 @@ mod compact;
 mod executor;
 mod file_history;
 mod formatting;
+mod memory_capture;
 mod model_routing;
 mod parent_context;
 mod prompt;
