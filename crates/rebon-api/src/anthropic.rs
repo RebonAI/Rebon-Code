@@ -647,16 +647,32 @@ pub fn parse_anthropic_event(data: &str) -> ModelResult<Option<StreamEvent>> {
     }
 }
 
+/// Where the request marks `cache_control` breakpoints.
+///
+/// Claude caches a prompt prefix only up to a marked block, so a request
+/// with no marker pays full price for the whole history on every turn.
+/// [`Self::Conversation`] is the default for Claude models: it marks the
+/// end of the system prompt (tools and system together), the end of the
+/// frozen runtime-context message at index 0, and the end of the history —
+/// the last mark moves with each request and every earlier one stays a read
+/// point, so a turn pays full price only for what it appended.
+///
+/// Other models on this wire (DeepSeek, Kimi, MiniMax, GLM's Anthropic
+/// endpoints) cache prefixes on their own and are sent no markers.
+/// `REBON_ANTHROPIC_PROMPT_CACHE` overrides the choice: `0` sends none,
+/// `1`/`conversation` the full set, `system`/`tools`/`system_and_tools`
+/// only those.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnthropicPromptCacheMode {
     Disabled,
     System,
     Tools,
     SystemAndTools,
+    Conversation,
 }
 
 impl AnthropicPromptCacheMode {
-    fn from_env() -> Self {
+    fn for_model(model: &str) -> Self {
         #[cfg(test)]
         if !PROMPT_CACHE_ENV_READ_ENABLED.with(|enabled| enabled.get()) {
             return Self::Disabled;
@@ -664,14 +680,16 @@ impl AnthropicPromptCacheMode {
 
         match std::env::var("REBON_ANTHROPIC_PROMPT_CACHE") {
             Ok(value) => Self::parse(&value),
+            Err(_) if is_claude_model(model) => Self::Conversation,
             Err(_) => Self::Disabled,
         }
     }
 
     fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
-            "" | "0" | "false" => Self::Disabled,
-            "1" | "true" | "system_and_tools" | "system-tools" => Self::SystemAndTools,
+            "" | "0" | "false" | "off" => Self::Disabled,
+            "1" | "true" | "on" | "conversation" | "auto" => Self::Conversation,
+            "system_and_tools" | "system-tools" => Self::SystemAndTools,
             "system" => Self::System,
             "tools" => Self::Tools,
             _ => Self::Disabled,
@@ -679,12 +697,107 @@ impl AnthropicPromptCacheMode {
     }
 
     fn caches_system(self) -> bool {
-        matches!(self, Self::System | Self::SystemAndTools)
+        matches!(
+            self,
+            Self::System | Self::SystemAndTools | Self::Conversation
+        )
     }
 
     fn caches_tools(self) -> bool {
+        // In conversation mode the system marker covers the tools, which
+        // render before it; a tools marker of its own would spend a slot.
         matches!(self, Self::Tools | Self::SystemAndTools)
     }
+
+    fn caches_messages(self) -> bool {
+        matches!(self, Self::Conversation)
+    }
+}
+
+/// Whether `model` names a Claude model, as Anthropic, Bedrock, Vertex and
+/// the gateways in front of them spell it (`claude-opus-5-5`,
+/// `anthropic.claude-sonnet-5-5`, `anthropic/claude-haiku-5-5`).
+fn is_claude_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("claude")
+}
+
+/// Mark the last block of the frozen runtime-context message and the last
+/// block of the history. `transient_last` says the request's last block is
+/// the per-request transient context, which the next request will not
+/// carry: the history's mark goes on the block before it, so the next
+/// request can read what this one wrote.
+fn mark_conversation(messages: &mut [Value], transient_last: bool) {
+    let runtime_context = messages.first().is_some_and(is_runtime_context_wire);
+    let mut skip = usize::from(transient_last);
+    let mut tail_marked_at = None;
+    for (index, message) in messages.iter_mut().enumerate().rev() {
+        if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+            if mark_last_cacheable(blocks, &mut skip) {
+                tail_marked_at = Some(index);
+                break;
+            }
+        }
+    }
+    if runtime_context && tail_marked_at != Some(0) {
+        if let Some(blocks) = messages[0].get_mut("content").and_then(Value::as_array_mut) {
+            mark_last_cacheable(blocks, &mut 0);
+        }
+    }
+}
+
+/// Put an ephemeral marker on the last block of `blocks` that can carry
+/// one, after passing over `skip` blocks from the end. Thinking blocks and
+/// empty text cannot.
+fn mark_last_cacheable(blocks: &mut [Value], skip: &mut usize) -> bool {
+    for block in blocks.iter_mut().rev() {
+        if *skip > 0 {
+            *skip -= 1;
+            continue;
+        }
+        let cacheable = match block.get("type").and_then(Value::as_str) {
+            Some("text") => block
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty()),
+            Some("image" | "document" | "tool_use" | "tool_result") => true,
+            _ => false,
+        };
+        if cacheable {
+            block["cache_control"] = ephemeral_cache_control();
+            return true;
+        }
+    }
+    false
+}
+
+fn is_runtime_context_wire(message: &Value) -> bool {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|blocks| blocks.first())
+        .and_then(|block| block.get("text"))
+        .and_then(Value::as_str)
+        .is_some_and(|text| text.starts_with("<system-reminder>\n<runtime_context>\n"))
+}
+
+/// What a cached conversation should ask of server-side context editing.
+///
+/// Clearing earlier turns' thinking rewrites the history just before the
+/// newest turn every time the person speaks, which costs the cache from
+/// there on; with the history cached, keeping the thinking is the cheaper
+/// side. Tool-result clearing stays: it clears at least `clear_at_least`
+/// at a time, so its cache cost comes in rare large steps.
+fn cache_friendly_context_management(
+    config: &crate::request::ContextManagementConfig,
+) -> crate::request::ContextManagementConfig {
+    use crate::request::{ContextEditStrategy, ThinkingKeep};
+    let mut config = config.clone();
+    for edit in &mut config.edits {
+        if let ContextEditStrategy::ClearThinking { keep } = edit {
+            *keep = ThinkingKeep::All("all".to_string());
+        }
+    }
+    config
 }
 
 /// Build the JSON body for `POST /v1/messages`.
@@ -728,13 +841,27 @@ pub fn build_request_body(request: &CreateMessageRequest) -> Value {
         context_management: Option<&'a crate::request::ContextManagementConfig>,
     }
 
-    let prompt_cache_mode = AnthropicPromptCacheMode::from_env();
-    let messages = request
+    let prompt_cache_mode = AnthropicPromptCacheMode::for_model(&request.model);
+    let mut messages = request
         .messages_with_transient_context()
         .into_iter()
         .filter(|msg| msg.role != Role::System)
         .filter_map(|message| message_to_wire(&message))
         .collect::<Vec<_>>();
+    if prompt_cache_mode.caches_messages() {
+        let transient_last = request
+            .transient_context
+            .as_deref()
+            .is_some_and(|context| !context.is_empty());
+        mark_conversation(&mut messages, transient_last);
+    }
+    let context_management = request.context_management.as_ref().map(|config| {
+        if prompt_cache_mode.caches_messages() {
+            std::borrow::Cow::Owned(cache_friendly_context_management(config))
+        } else {
+            std::borrow::Cow::Borrowed(config)
+        }
+    });
     let mut tools = request
         .tools
         .iter()
@@ -746,7 +873,10 @@ pub fn build_request_body(request: &CreateMessageRequest) -> Value {
             })
         })
         .collect::<Vec<_>>();
-    if prompt_cache_mode.caches_tools() {
+    // With no system prompt to mark, the tools carry the first mark.
+    if prompt_cache_mode.caches_tools()
+        || (prompt_cache_mode.caches_messages() && request.system.is_none())
+    {
         if let Some(last_tool) = tools.last_mut() {
             last_tool["cache_control"] = ephemeral_cache_control();
         }
@@ -817,7 +947,7 @@ pub fn build_request_body(request: &CreateMessageRequest) -> Value {
         stream: true,
         metadata: request.metadata.as_ref(),
         thinking: thinking_param,
-        context_management: request.context_management.as_ref(),
+        context_management: context_management.as_deref(),
     };
 
     serde_json::to_value(&wire).expect("wire request serializes")
@@ -1130,7 +1260,7 @@ mod tests {
 
     #[test]
     fn build_request_body_prompt_cache_system_and_tools_aliases_mark_both() {
-        for value in ["1", "true", " TRUE ", "system_and_tools", "system-tools"] {
+        for value in ["system_and_tools", "system-tools", " System_And_Tools "] {
             with_prompt_cache_env(Some(value), || {
                 let req = cache_test_request();
                 let body = build_request_body(&req);
@@ -1140,6 +1270,152 @@ mod tests {
                 assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
             });
         }
+    }
+
+    /// A Claude request as a session sends it: the runtime context at
+    /// index 0, a finished exchange, and the current prompt.
+    fn claude_conversation() -> CreateMessageRequest {
+        let mut req = cache_test_request();
+        req.model = "claude-opus-5-5".into();
+        req.messages = vec![
+            crate::request::runtime_context_message("cwd: /work"),
+            Message::user_text("first question"),
+            Message::assistant_text("first answer"),
+            Message::user_text("second question"),
+        ];
+        req
+    }
+
+    fn marked(body: &Value) -> Vec<String> {
+        let mut marks = Vec::new();
+        if body["system"][0].get("cache_control").is_some() {
+            marks.push("system".to_string());
+        }
+        for (index, tool) in body["tools"].as_array().into_iter().flatten().enumerate() {
+            if tool.get("cache_control").is_some() {
+                marks.push(format!("tool{index}"));
+            }
+        }
+        for (m, message) in body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            for (b, block) in message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if block.get("cache_control").is_some() {
+                    marks.push(format!("m{m}b{b}"));
+                }
+            }
+        }
+        marks
+    }
+
+    #[test]
+    fn claude_models_cache_the_conversation_by_default() {
+        with_prompt_cache_env(None, || {
+            let body = build_request_body(&claude_conversation());
+            // Tools + system, the frozen runtime context, the history's end.
+            assert_eq!(marked(&body), ["system", "m0b0", "m3b0"]);
+            assert_eq!(body["system"][0]["text"], "Be terse.");
+        });
+        for value in ["1", "true", " TRUE ", "conversation", "auto"] {
+            with_prompt_cache_env(Some(value), || {
+                let body = build_request_body(&claude_conversation());
+                assert_eq!(marked(&body), ["system", "m0b0", "m3b0"], "{value:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn other_models_on_the_anthropic_wire_get_no_marks_unless_asked() {
+        with_prompt_cache_env(None, || {
+            let mut req = claude_conversation();
+            req.model = "deepseek-v4-pro".into();
+            assert_no_cache_control(&build_request_body(&req));
+        });
+        with_prompt_cache_env(Some("1"), || {
+            let mut req = claude_conversation();
+            req.model = "kimi-k3".into();
+            assert_eq!(
+                marked(&build_request_body(&req)),
+                ["system", "m0b0", "m3b0"]
+            );
+        });
+        with_prompt_cache_env(Some("0"), || {
+            assert_no_cache_control(&build_request_body(&claude_conversation()));
+        });
+    }
+
+    #[test]
+    fn the_history_mark_skips_the_transient_context_and_thinking() {
+        with_prompt_cache_env(None, || {
+            // Transient context rides on this request only; the next
+            // request reads from the block before it.
+            let req = claude_conversation().with_transient_context("git: clean");
+            let body = build_request_body(&req);
+            assert_eq!(marked(&body), ["system", "m0b0", "m3b0"]);
+            assert_eq!(body["messages"][3]["content"].as_array().unwrap().len(), 2);
+
+            // A tool round: the tool result is the last cacheable block.
+            let mut req = claude_conversation();
+            req.messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse(crate::types::ToolUseBlock {
+                    id: "t1".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({"path": "a"}),
+                })],
+            });
+            req.messages.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult(crate::types::ToolResultBlock {
+                    tool_use_id: "t1".into(),
+                    content: crate::types::ToolResultContent::text("contents"),
+                    is_error: false,
+                })],
+            });
+            let body = build_request_body(&req);
+            assert_eq!(marked(&body), ["system", "m0b0", "m5b0"]);
+        });
+    }
+
+    #[test]
+    fn a_first_request_marks_its_one_message_once_and_no_system_marks_the_tools() {
+        with_prompt_cache_env(None, || {
+            let mut req = claude_conversation();
+            req.messages.truncate(1);
+            assert_eq!(marked(&build_request_body(&req)), ["system", "m0b0"]);
+
+            let mut req = claude_conversation();
+            req.system = None;
+            assert_eq!(marked(&build_request_body(&req)), ["tool1", "m0b0", "m3b0"]);
+        });
+    }
+
+    #[test]
+    fn a_cached_conversation_keeps_earlier_thinking() {
+        with_prompt_cache_env(None, || {
+            let req = claude_conversation().with_context_management(
+                crate::request::ContextManagementConfig::anthropic_full_history_replay(),
+            );
+            let body = build_request_body(&req);
+            let edits = body["context_management"]["edits"].as_array().unwrap();
+            assert_eq!(edits[0]["type"], "clear_thinking_20251015");
+            assert_eq!(edits[0]["keep"], "all");
+            assert_eq!(edits[1]["type"], "clear_tool_uses_20250919");
+
+            // Without caching the configured clearing goes out as it is.
+            let mut req = req;
+            req.model = "deepseek-v4-pro".into();
+            let body = build_request_body(&req);
+            assert_eq!(body["context_management"]["edits"][0]["keep"]["value"], 1);
+        });
     }
 
     #[test]
