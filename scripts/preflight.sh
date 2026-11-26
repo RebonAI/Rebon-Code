@@ -158,7 +158,7 @@ retry "rebon-cli" cargo test -q -p rebon-cli --locked
 
 say "the crates the plugin-first refactor touches"
 retry "the plugin-first crates" cargo test -q --locked -p rebon-core -p rebon-harness -p rebon-tool -p rebon-acp \
-    -p rebon-agent-core -p rebon-slash-commands -p rebon-acp-client -p rebon-config \
+    -p rebon-agent-core -p rebon-slash-commands -p rebon-acp-client -p rebon-acp-registry -p rebon-config \
     -p rebon-proto -p rebon-schema-gen -p rebon-i18n-gen -p rebon-session-state \
     -p rebon-kernel -p rebon-kernel-seats -p rebon-provider -p rebon-plugin-host \
     -p rebon-instructions -p rebon-session -p rebon-session-host \

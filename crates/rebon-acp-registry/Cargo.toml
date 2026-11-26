@@ -1,0 +1,29 @@
+[package]
+name = "rebon-acp-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "The public ACP agent registry: the agent CLIs it lists, how each one starts on this machine, and installing one as an `acpAgents` entry in config.json (`rebon agent`)."
+
+[dependencies]
+# The `acpAgents` entry an install writes, and the config home it goes in.
+rebon-config.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The registry's per-archive digest.
+sha2.workspace = true
+# Unpacking a binary distribution: `.tar.gz`, `.tar.bz2` and `.zip` are what
+# the registry's binary agents ship as. bzip2 0.6 decodes in Rust
+# (libbz2-rs-sys), so nothing here links a C library.
+flate2 = "1"
+tar = "0.4"
+bzip2 = "0.6"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"

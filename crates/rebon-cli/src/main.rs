@@ -385,6 +385,13 @@ enum Command {
         #[command(subcommand)]
         command: rebon_mcp_channel::cli::GroupCommand,
     },
+    /// ACP agents: the agent CLIs `/agent` can run a session on. `list`
+    /// shows the ones config.json declares; `registry`, `add` and `remove`
+    /// install them from the public ACP registry and take them out again.
+    Agent {
+        #[command(subcommand)]
+        command: rebon_acp_registry::cli::AgentCommand,
+    },
     /// Permission requests from Claude Code or Codex running in the Rebon
     /// app: `rebon permission hook` is their PermissionRequest hook, and asks
     /// the user in the app.
@@ -1202,6 +1209,7 @@ async fn run_headless_command(command: Command) -> anyhow::Result<()> {
             .await
         }
         Command::Group { command } => rebon_mcp_channel::cli::run_group(command),
+        Command::Agent { command } => rebon_acp_registry::cli::run(command).await,
         Command::Permission { command } => rebon_mcp_channel::cli::run_permission(command),
         Command::BrowserMcp { args } => {
             sibling_command::forward_to_sibling("browser-mcp", BROWSER_MCP_SIBLING, args)

@@ -272,7 +272,7 @@ jobs:
         run: >-
           cargo test --locked --no-fail-fast
           -p rebon-core -p rebon-harness -p rebon-tool -p rebon-acp
-          -p rebon-agent-core -p rebon-slash-commands -p rebon-acp-client -p rebon-config
+          -p rebon-agent-core -p rebon-slash-commands -p rebon-acp-client -p rebon-acp-registry -p rebon-config
           -p rebon-proto
           -p rebon-schema-gen -p rebon-i18n-gen
           -p rebon-session-state -p rebon-kernel
