@@ -45,6 +45,7 @@ pub mod project_settings;
 pub mod queue_controller;
 pub mod rebon_config;
 pub mod ripgrep;
+pub mod router_group;
 pub mod session_handoff;
 pub mod task_notification_poller;
 #[cfg(any(test, feature = "test-support"))]

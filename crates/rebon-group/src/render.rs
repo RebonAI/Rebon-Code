@@ -125,16 +125,34 @@ fn briefing(group: &Group, alias: &str) -> String {
     } else {
         others.join(", ")
     };
+    let router_worker = group
+        .member_by_alias(alias)
+        .is_some_and(crate::router::is_worker);
+    let questions = if router_worker {
+        ROUTER_WORKER_GUIDE
+    } else {
+        QUESTION_GUIDE
+    };
     format!(
         "{}, with {}. The group talks and remembers \
          through the group_* tools (load them by name with your tool search if they are not \
          listed): group_send tells or asks a member, all, or user (the person you work for); \
          group_inbox reads what came in; group_remember keeps a fact; group_recall searches the \
-         memory.\n\n{MEMORY_GUIDE}\n\n{QUESTION_GUIDE}",
+         memory.\n\n{MEMORY_GUIDE}\n\n{questions}",
         briefing_marker(group, alias),
         escape_text(&with)
     )
 }
+
+/// What a router worker is told in place of [`QUESTION_GUIDE`]: the group is
+/// the project's memory across the router's tasks, and its questions go to
+/// the router, as its task says, not to the person.
+pub const ROUTER_WORKER_GUIDE: &str = "This is the group every worker the Rebon router sends \
+    into this project joins: the memory above is what earlier workers here kept, and the next \
+    worker reads what you keep. Before you finish, keep with group_remember what the next task \
+    in this project should not have to find out again: a convention, a gotcha about the code, \
+    build or environment, a decision and its reason. Questions go to the router as your task \
+    says, not to user.";
 
 /// The memory facts, whole (`whole`: the memory as it stands) or as the
 /// ones new since the member last heard.
@@ -723,6 +741,18 @@ mod tests {
         // Nothing remembered is said too, so the model knows it looked.
         let empty = context(&pending(true, Vec::new(), Vec::new())).unwrap();
         assert!(empty.contains("memory is empty so far"), "{empty}");
+        assert!(empty.contains(QUESTION_GUIDE) && !empty.contains(ROUTER_WORKER_GUIDE));
+    }
+
+    #[test]
+    fn a_router_worker_keeps_for_the_next_worker_and_asks_the_router() {
+        let mut worker = pending(true, Vec::new(), Vec::new());
+        worker.group.members[0].agent = crate::identity::AgentKind::REBON.into();
+        worker.group.members[0].role = Some(format!("{}: Fix it", crate::router::WORKER_ROLE));
+        let text = context(&worker).unwrap();
+        assert!(text.contains(ROUTER_WORKER_GUIDE), "{text}");
+        assert!(!text.contains(QUESTION_GUIDE), "{text}");
+        assert!(text.contains(MEMORY_GUIDE));
     }
 
     #[test]

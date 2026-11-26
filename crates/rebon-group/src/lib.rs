@@ -28,6 +28,7 @@
 //!   channel end to end.
 //! - [`render`] — how pending entries read in an attachment, a hook's
 //!   context or a terminal.
+//! - [`router`] — the group the Rebon router's workers share in a project.
 //! - [`warmth`] — whether a member can be woken cheaply, from its agent's
 //!   own session files.
 //!
@@ -40,6 +41,7 @@ pub mod deliver;
 pub mod identity;
 pub mod model;
 pub mod render;
+pub mod router;
 pub mod skill;
 pub mod store;
 pub mod tools;

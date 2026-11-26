@@ -13,8 +13,12 @@
 //! The same tick publishes `<store>/router-roster.json`: the router's session
 //! and its workers' sessions, for the desktop app, which pins the router and
 //! folds its workers under it. It is removed while no router runs.
+//!
+//! And once a minute it takes the workers whose job is over out of their
+//! project's router group (`rebon_session_runtime::router_group`), so a
+//! group's members are the workers still at it.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -25,6 +29,9 @@ const STATE_FILE_NAME: &str = "router-digest.json";
 /// How long the first line waits for others before the digest goes out.
 const BATCH_MS: u64 = 15_000;
 const MAX_LINE_CHARS: usize = 300;
+/// How often the router groups are looked over for finished workers; it
+/// reads every group.
+const GROUPS_CHECK_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -122,6 +129,8 @@ pub(crate) struct RouterDigest {
     state: RefCell<Option<DigestState>>,
     /// The roster as last written; `None` before the first tick.
     published: RefCell<Option<Option<Roster>>>,
+    /// When finished workers were last taken out of their groups.
+    groups_checked_at_ms: Cell<Option<u64>>,
 }
 
 impl RouterDigest {
@@ -131,6 +140,7 @@ impl RouterDigest {
             roster_path: store.root().join(crate::router::ROSTER_FILE_NAME),
             state: RefCell::new(None),
             published: RefCell::new(None),
+            groups_checked_at_ms: Cell::new(None),
         }
     }
 
@@ -173,6 +183,15 @@ impl RouterDigest {
         task_of: &TaskOf<'_>,
         responsibility_of: &ResponsibilityOf<'_>,
     ) -> bool {
+        // Also while no router runs: its workers' jobs end without it.
+        if self
+            .groups_checked_at_ms
+            .get()
+            .is_none_or(|at| now_ms.saturating_sub(at) >= GROUPS_CHECK_MS)
+        {
+            self.groups_checked_at_ms.set(Some(now_ms));
+            crate::session::router_group::leave_finished(store, jobs, now_ms);
+        }
         let Some(router) = crate::router::current_router(store) else {
             self.publish(None);
             return false;

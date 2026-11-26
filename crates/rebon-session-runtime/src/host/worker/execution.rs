@@ -1718,6 +1718,9 @@ async fn build_background_session(
             BackgroundExecutionOutcome::PromptCancelled,
         ));
     }
+    // Before the first turn reads the group inbox, so a router worker
+    // starts with what earlier workers in its project kept.
+    crate::router_group::join(store, state, &session_id);
     if crate::host::should_hide_agent_session_from_chats(state.identity.agent_type.as_deref()) {
         if let Err(error) = rebon_session::save_session_hidden_from_chats(
             &rebon_session::default_projects_root(),
