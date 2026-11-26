@@ -1873,6 +1873,20 @@ pub struct AcpAgentConfig {
     /// `write_file`/`edit_file` actually get used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_meta: Option<BTreeMap<String, serde_json::Value>>,
+    /// The ACP registry entry `rebon agent add` installed this agent from,
+    /// so adding it again updates it and removing it also removes what was
+    /// downloaded for it. Absent for an agent declared by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<AcpRegistrySource>,
+}
+
+/// Which ACP registry entry an [`AcpAgentConfig`] was installed from.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AcpRegistrySource {
+    /// The registry's id (`pi-acp`), which need not be the entry's (`pi`).
+    pub id: String,
+    /// The registry version installed.
+    pub version: String,
 }
 
 impl AcpAgentConfig {
@@ -1958,6 +1972,81 @@ pub fn load_acp_agents_in(config_dir: &Path) -> anyhow::Result<Vec<AcpAgentConfi
         });
     }
     Ok(agents)
+}
+
+/// Adds `agent` to `acpAgents`, or replaces the entry with its id (ids
+/// compare case-insensitively, as [`load_acp_agents_in`] does). Answers the
+/// entry it replaced. The other entries — fields this crate does not model
+/// included — and every other key in `config.json` stay as they were.
+pub fn upsert_acp_agent_in(
+    config_dir: &Path,
+    agent: &AcpAgentConfig,
+) -> anyhow::Result<Option<AcpAgentConfig>> {
+    let id = agent.id.trim();
+    if id.is_empty() || id.eq_ignore_ascii_case(LOCAL_AGENT_ID) {
+        anyhow::bail!("`{id}` cannot be an ACP agent's id");
+    }
+    if agent.command.trim().is_empty() {
+        anyhow::bail!("ACP agent `{id}` needs a command");
+    }
+    let mut config = read_config_roundtrip(config_dir)?;
+    let entries = acp_agent_entries(&mut config)?;
+    let value = serde_json::to_value(agent)?;
+    let replaced = match entries.iter().position(|entry| entry_has_id(entry, id)) {
+        Some(index) => {
+            let old = std::mem::replace(&mut entries[index], value);
+            serde_json::from_value(old).ok()
+        }
+        None => {
+            entries.push(value);
+            None
+        }
+    };
+    write_config_roundtrip(config_dir, &config)?;
+    Ok(replaced)
+}
+
+/// Takes the entry `id` out of `acpAgents`, and `activeAcpAgent` too when it
+/// named that agent, so new sessions start on Rebon's own engine rather
+/// than on an agent that is gone. Answers the entry removed, `None` when
+/// there was none (and then nothing is written).
+pub fn remove_acp_agent_in(config_dir: &Path, id: &str) -> anyhow::Result<Option<AcpAgentConfig>> {
+    let id = id.trim();
+    let mut config = read_config_roundtrip(config_dir)?;
+    let entries = acp_agent_entries(&mut config)?;
+    let Some(index) = entries.iter().position(|entry| entry_has_id(entry, id)) else {
+        return Ok(None);
+    };
+    let removed = serde_json::from_value(entries.remove(index)).ok();
+    if config
+        .extra
+        .get(ACTIVE_ACP_AGENT_CONFIG_KEY)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|active| active.trim().eq_ignore_ascii_case(id))
+    {
+        config.extra.remove(ACTIVE_ACP_AGENT_CONFIG_KEY);
+    }
+    write_config_roundtrip(config_dir, &config)?;
+    Ok(removed)
+}
+
+/// `acpAgents` as raw entries, created empty when absent.
+fn acp_agent_entries(
+    config: &mut RebonConfigRoundTrip,
+) -> anyhow::Result<&mut Vec<serde_json::Value>> {
+    config
+        .extra
+        .entry(ACP_AGENTS_CONFIG_KEY.to_string())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("`{ACP_AGENTS_CONFIG_KEY}` in config.json is not a list"))
+}
+
+fn entry_has_id(entry: &serde_json::Value, id: &str) -> bool {
+    entry
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|entry_id| entry_id.trim().eq_ignore_ascii_case(id))
 }
 
 /// Top-level `config.json` key for Remote Control (`rebon rc`) settings.
@@ -8031,6 +8120,76 @@ mod tests {
             write_config(tmp.path(), bad);
             assert!(load_rc_projects_in(tmp.path()).is_err(), "{bad}");
         }
+    }
+
+    fn acp_agent(id: &str, command: &str) -> AcpAgentConfig {
+        AcpAgentConfig {
+            id: id.to_string(),
+            display_name: None,
+            command: command.to_string(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: None,
+            inject_fs_tools: None,
+            session_meta: None,
+            registry: None,
+        }
+    }
+
+    #[test]
+    fn upserting_an_acp_agent_adds_it_then_replaces_it_and_keeps_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        write_config(
+            tmp.path(),
+            r#"{"theme":"dark","acpAgents":[{"id":"Mine","command":"mine","futureField":1}]}"#,
+        );
+        let mut pi = acp_agent("pi", "npx");
+        pi.registry = Some(AcpRegistrySource {
+            id: "pi-acp".into(),
+            version: "0.0.35".into(),
+        });
+        assert_eq!(upsert_acp_agent_in(tmp.path(), &pi).unwrap(), None);
+
+        let mut newer = pi.clone();
+        newer.registry.as_mut().unwrap().version = "0.0.36".into();
+        newer.id = "PI".into();
+        assert_eq!(upsert_acp_agent_in(tmp.path(), &newer).unwrap(), Some(pi));
+
+        let agents = load_acp_agents_in(tmp.path()).unwrap();
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[1].registry.as_ref().unwrap().version, "0.0.36");
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(config_json_path(tmp.path())).unwrap()).unwrap();
+        assert_eq!(raw["theme"], "dark");
+        assert_eq!(raw["acpAgents"][0]["futureField"], 1);
+    }
+
+    #[test]
+    fn an_acp_agent_needs_a_real_id_and_a_command() {
+        let tmp = TempDir::new().unwrap();
+        assert!(upsert_acp_agent_in(tmp.path(), &acp_agent("local", "x")).is_err());
+        assert!(upsert_acp_agent_in(tmp.path(), &acp_agent(" ", "x")).is_err());
+        assert!(upsert_acp_agent_in(tmp.path(), &acp_agent("pi", " ")).is_err());
+        write_config(tmp.path(), r#"{"acpAgents":{"pi":{}}}"#);
+        assert!(upsert_acp_agent_in(tmp.path(), &acp_agent("pi", "npx")).is_err());
+    }
+
+    #[test]
+    fn removing_the_default_acp_agent_sends_new_sessions_back_to_the_local_engine() {
+        let tmp = TempDir::new().unwrap();
+        upsert_acp_agent_in(tmp.path(), &acp_agent("pi", "npx")).unwrap();
+        upsert_acp_agent_in(tmp.path(), &acp_agent("goose", "goose")).unwrap();
+        save_active_acp_agent_in(tmp.path(), Some("pi")).unwrap();
+
+        assert_eq!(
+            remove_acp_agent_in(tmp.path(), "goose").unwrap(),
+            Some(acp_agent("goose", "goose"))
+        );
+        assert_eq!(active_acp_agent_in(tmp.path()).as_deref(), Some("pi"));
+        assert!(remove_acp_agent_in(tmp.path(), "Pi").unwrap().is_some());
+        assert!(active_acp_agent_in(tmp.path()).is_none());
+        assert!(load_acp_agents_in(tmp.path()).unwrap().is_empty());
+        assert_eq!(remove_acp_agent_in(tmp.path(), "pi").unwrap(), None);
     }
 
     #[test]

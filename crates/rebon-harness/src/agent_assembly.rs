@@ -920,6 +920,7 @@ pub mod test_support {
             cwd: None,
             inject_fs_tools: None,
             session_meta: None,
+            registry: None,
         }
     }
 
@@ -1475,6 +1476,7 @@ mod tests {
                 cwd: None,
                 inject_fs_tools: None,
                 session_meta: None,
+                registry: None,
             }),
         ];
         // The remote opts out; the local agent opts in. The two must
@@ -1518,6 +1520,7 @@ mod tests {
             cwd: None,
             inject_fs_tools: None,
             session_meta: None,
+            registry: None,
         });
         // config.json is not validated against the prefix, so the
         // guarantee is on the other side: a remote *host* name may not
@@ -1543,6 +1546,7 @@ mod tests {
             cwd: Some("/elsewhere".into()),
             inject_fs_tools: None,
             session_meta: None,
+            registry: None,
         });
         assert_eq!(from_config.origin, AgentOrigin::Config);
         assert_eq!(from_config.label, "Claude Code");
