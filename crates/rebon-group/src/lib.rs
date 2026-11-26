@@ -40,6 +40,7 @@ pub mod deliver;
 pub mod identity;
 pub mod model;
 pub mod render;
+pub mod skill;
 pub mod store;
 pub mod tools;
 pub mod warmth;

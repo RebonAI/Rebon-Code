@@ -377,8 +377,10 @@ enum Command {
         command: rebon_mcp_channel::cli::McpCommand,
     },
     /// Agent groups: several agents in one project sharing notes, requests
-    /// and a memory. `rebon group hook` is what Claude Code and Codex run to
-    /// hear from their group.
+    /// and a memory. `info`, `join`, `send`, `inbox` and the rest are the
+    /// group tools as commands, for an agent with a shell and no MCP
+    /// connection (`rebon group skill` teaches them); `rebon group hook` is
+    /// what Claude Code and Codex run to hear from their group.
     Group {
         #[command(subcommand)]
         command: rebon_mcp_channel::cli::GroupCommand,
