@@ -60,8 +60,15 @@ pub(crate) fn resolve_background_agent_runtime(
     let Some(agent_type) = state.identity.agent_type.as_deref() else {
         return BackgroundAgentRuntime::local(prompt);
     };
+    let config_home = crate::rebon_config::config_home_dir();
+    if let Some(agent_id) = declared_acp_agent(&config_home, agent_type) {
+        return BackgroundAgentRuntime {
+            external_agent: Some(agent_id),
+            ..BackgroundAgentRuntime::local(prompt)
+        };
+    }
     let cwd = PathBuf::from(&state.identity.cwd);
-    let registry = rebon_tool::AgentRegistry::load(&cwd, &crate::rebon_config::config_home_dir());
+    let registry = rebon_tool::AgentRegistry::load(&cwd, &config_home);
     // Keyed by the job's session when it already has one so restarts
     // keep pointing the agent at the same scratchpad.
     let scratchpad_key = state
@@ -77,6 +84,24 @@ pub(crate) fn resolve_background_agent_runtime(
         &cwd,
         Some(&scratchpad_dir),
     )
+}
+
+/// The `acpAgents` entry in `config_dir` a job's agent names, by the entry's
+/// own spelling.
+///
+/// Agent definitions are not the only agents: `rebon agent add` and the
+/// desktop app's agent list write `config.json` entries and nothing else,
+/// and a job naming one of them used to resolve no definition and run
+/// Rebon's own loop under that agent's name. The entry comes first, as it
+/// does wherever a name is declared twice (`config.json > plugin >
+/// definition`): it is the one the user wrote or chose to install.
+pub(crate) fn declared_acp_agent(config_dir: &Path, agent_type: &str) -> Option<String> {
+    let wanted = agent_type.trim();
+    crate::rebon_config::load_acp_agents_in(config_dir)
+        .ok()?
+        .into_iter()
+        .find(|agent| agent.id.eq_ignore_ascii_case(wanted))
+        .map(|agent| agent.id)
 }
 
 /// The decision itself, once the definition has been resolved.

@@ -70,6 +70,26 @@ fn a_job_on_an_external_agent_supplies_no_prompt_or_tools_of_its_own() {
 }
 
 #[test]
+fn a_job_naming_a_config_json_agent_runs_on_it() {
+    // `rebon agent add pi-acp` writes an acpAgents entry and no definition;
+    // a job asking for it used to run Rebon's own loop instead.
+    let config = tempfile::tempdir().unwrap();
+    std::fs::write(
+        config.path().join("config.json"),
+        r#"{"acpAgents": [{"id": "Pi", "command": "npx", "args": ["-y", "pi-acp@0.0.35"]}]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        declared_acp_agent(config.path(), " pi ").as_deref(),
+        Some("Pi")
+    );
+    assert_eq!(declared_acp_agent(config.path(), "reviewer"), None);
+
+    std::fs::write(config.path().join("config.json"), "{not json").unwrap();
+    assert_eq!(declared_acp_agent(config.path(), "pi"), None);
+}
+
+#[test]
 fn a_job_with_no_agent_runs_on_the_sessions_own_backend() {
     let resolved = background_agent_runtime_for("just do it".into(), None, Path::new("."), None);
     assert!(resolved.system.is_none());
