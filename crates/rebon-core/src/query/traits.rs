@@ -10,12 +10,19 @@ pub enum AttachmentPollPhase {
 }
 
 /// Complete identity and timing for one attachment poll.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AttachmentPollRequest<'a> {
     pub session_id: &'a str,
     pub turn_id: &'a str,
     pub next_iteration: u64,
     pub phase: AttachmentPollPhase,
+    /// The history the next request will carry, as the loop holds it when
+    /// it polls: the replayed conversation, a compaction's summary in place
+    /// of what it replaced, and what earlier polls of this turn injected.
+    /// A producer that hands over something once per context — a briefing —
+    /// reads it to tell whether that is still there. Empty when the caller
+    /// has none to give.
+    pub history: &'a [ApiMessage],
 }
 
 impl<'a> AttachmentPollRequest<'a> {
@@ -30,7 +37,24 @@ impl<'a> AttachmentPollRequest<'a> {
             turn_id,
             next_iteration,
             phase,
+            history: &[],
         }
+    }
+
+    /// The same request, carrying the history it is polled against.
+    pub const fn with_history(mut self, history: &'a [ApiMessage]) -> Self {
+        self.history = history;
+        self
+    }
+
+    /// Whether any text block of [`Self::history`] contains `needle`.
+    pub fn history_contains(&self, needle: &str) -> bool {
+        self.history.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| block.as_text().is_some_and(|text| text.contains(needle)))
+        })
     }
 }
 

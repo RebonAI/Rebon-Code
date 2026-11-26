@@ -19,8 +19,12 @@
 //! them in full and moves `read`. A long request the model wants to act on
 //! is one tool call away.
 //!
-//! 每个新回合补齐当前有效记忆，避免恢复或压缩后只剩已投递游标；
-//! 回合内仅追加增量，不改变已有的缓存前缀。
+//! **Briefed once per context.** The briefing and the whole memory go in
+//! when the history the session will send holds no briefing for this
+//! group: a new session, or one whose briefing a compaction summarised
+//! away. Otherwise only what is new goes in. Re-sending the whole memory
+//! every turn would cost its tokens on every turn for nothing; the history
+//! is the record of what the model still has.
 
 use std::sync::{Arc, Mutex};
 
@@ -64,7 +68,9 @@ impl SeatAttachmentProducer for GroupInboxProducer {
 pub struct GroupInboxPoller {
     store: GroupStore,
     member: MemberKey,
-    briefed_turn: Mutex<Option<String>>,
+    /// Polls of one session do not overlap; this keeps two that might from
+    /// both briefing.
+    polling: Mutex<()>,
 }
 
 impl GroupInboxPoller {
@@ -72,8 +78,21 @@ impl GroupInboxPoller {
         Self {
             store,
             member,
-            briefed_turn: Mutex::new(None),
+            polling: Mutex::new(()),
         }
+    }
+
+    /// Whether the history this poll is for still holds the member's
+    /// briefing. Not knowing the group yet is "no": there is nothing to
+    /// deliver then anyway.
+    fn context_holds_briefing(&self, request: &AttachmentPollRequest<'_>) -> bool {
+        let Ok(Some(group)) = self.store.group_of(&self.member) else {
+            return false;
+        };
+        let Some(me) = group.member(&self.member) else {
+            return false;
+        };
+        request.history_contains(&rebon_group::render::briefing_marker(&group, &me.alias))
     }
 }
 
@@ -85,11 +104,8 @@ impl AttachmentPoller for GroupInboxPoller {
         if request.session_id != self.member.session_id {
             return Vec::new();
         }
-        let mut briefed = self
-            .briefed_turn
-            .lock()
-            .expect("group briefed turn poisoned");
-        let fresh = briefed.as_deref() != Some(request.turn_id);
+        let _polling = self.polling.lock().expect("group inbox poll poisoned");
+        let fresh = !self.context_holds_briefing(&request);
         let Some(pending) = deliver::pending_with(&self.store, &self.member, fresh) else {
             return Vec::new();
         };
@@ -97,7 +113,6 @@ impl AttachmentPoller for GroupInboxPoller {
         if !deliver::delivered(&self.store, &self.member, &pending, Via::Attachment) {
             return Vec::new();
         }
-        *briefed = Some(request.turn_id.to_string());
         messages
     }
 }
@@ -179,13 +194,40 @@ mod tests {
             .join("\n")
     }
 
-    fn poll(poller: &GroupInboxPoller, session_id: &str) -> Vec<ApiMessage> {
-        poller.poll(AttachmentPollRequest::new(
-            session_id,
-            "turn",
-            1,
-            AttachmentPollPhase::Regular,
-        ))
+    /// A session as the engine runs it: what a poll injects stays in the
+    /// history the next poll sees.
+    struct Session {
+        poller: GroupInboxPoller,
+        history: std::cell::RefCell<Vec<ApiMessage>>,
+    }
+
+    impl Session {
+        fn new(poller: GroupInboxPoller) -> Self {
+            Self {
+                poller,
+                history: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn poll_as(&self, session_id: &str, turn: &str) -> Vec<ApiMessage> {
+            let history = self.history.borrow().clone();
+            let messages = self.poller.poll(
+                AttachmentPollRequest::new(session_id, turn, 1, AttachmentPollPhase::Regular)
+                    .with_history(&history),
+            );
+            self.history.borrow_mut().extend(messages.iter().cloned());
+            messages
+        }
+
+        /// A compaction: the history becomes a summary that names nothing
+        /// of the group's.
+        fn compact(&self) {
+            *self.history.borrow_mut() = vec![ApiMessage::user_text("summary of the work so far")];
+        }
+    }
+
+    fn poll(session: &Session, session_id: &str) -> Vec<ApiMessage> {
+        session.poll_as(session_id, "turn")
     }
 
     #[test]
@@ -199,7 +241,7 @@ mod tests {
         store
             .join(&group.id, member("claude-code", "c1", "coder"))
             .unwrap();
-        let planner = GroupInboxPoller::new(store.clone(), key("rebon", "s1"));
+        let planner = Session::new(GroupInboxPoller::new(store.clone(), key("rebon", "s1")));
         // Only the coder's joining so far.
         let first = model_text(&poll(&planner, "s1"));
         assert!(first.contains("kind=\"join\""), "{first}");
@@ -243,13 +285,13 @@ mod tests {
     fn nothing_for_a_session_outside_a_group_or_for_another_session() {
         let dir = tempfile::tempdir().unwrap();
         let store = GroupStore::new(dir.path());
-        let loner = GroupInboxPoller::new(store.clone(), key("rebon", "s9"));
+        let loner = Session::new(GroupInboxPoller::new(store.clone(), key("rebon", "s9")));
         assert!(poll(&loner, "s9").is_empty());
 
         let group = store.create("g", "/w").unwrap();
         store.join(&group.id, member("rebon", "s1", "a")).unwrap();
         store.join(&group.id, member("rebon", "s2", "b")).unwrap();
-        let a = GroupInboxPoller::new(store.clone(), key("rebon", "s1"));
+        let a = Session::new(GroupInboxPoller::new(store.clone(), key("rebon", "s1")));
         assert!(poll(&a, "some-other-session").is_empty());
         // What a sent to b is not a's to hear.
         send(
@@ -282,18 +324,48 @@ mod tests {
         let me = key("rebon", "s1");
         let pending = deliver::pending(&store, &me).unwrap();
         assert!(deliver::delivered(&store, &me, &pending, Via::Terminal));
-        let poller = GroupInboxPoller::new(store.clone(), me);
+        let poller = Session::new(GroupInboxPoller::new(store.clone(), me));
         assert!(model_text(&poll(&poller, "s1")).contains("shared-api-v2"));
         assert!(poll(&poller, "s1").is_empty());
-        let next = poller.poll(AttachmentPollRequest::new(
-            "s1",
-            "next-turn",
-            0,
-            AttachmentPollPhase::Eager,
-        ));
-        assert!(model_text(&next).contains("shared-api-v2"));
-        let rebuilt = GroupInboxPoller::new(store, key("rebon", "s1"));
+        // A new turn over the same history: the briefing is still there, so
+        // the memory is not sent again.
+        assert!(poller.poll_as("s1", "next-turn").is_empty());
+        // A resumed session replays the history that holds the briefing.
+        let resumed = Session::new(GroupInboxPoller::new(store.clone(), key("rebon", "s1")));
+        *resumed.history.borrow_mut() = poller.history.borrow().clone();
+        assert!(poll(&resumed, "s1").is_empty());
+        // A compaction summarised the briefing away: brief again, whole.
+        poller.compact();
+        let again = model_text(&poller.poll_as("s1", "after-compaction"));
+        assert!(again.contains("shared-api-v2"), "{again}");
+        assert!(again.contains("in the agent group"), "{again}");
+        assert!(poller.poll_as("s1", "after-compaction").is_empty());
+        // A fresh context for the same member (cleared) gets it too.
+        let rebuilt = Session::new(GroupInboxPoller::new(store, key("rebon", "s1")));
         assert!(model_text(&poll(&rebuilt, "s1")).contains("shared-api-v2"));
+    }
+
+    #[test]
+    fn memory_learned_mid_session_arrives_once_as_news() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GroupStore::new(dir.path());
+        let group = store.create("g", "/w").unwrap();
+        store.join(&group.id, member("rebon", "s1", "a")).unwrap();
+        store.join(&group.id, member("rebon", "s2", "b")).unwrap();
+        let a = Session::new(GroupInboxPoller::new(store.clone(), key("rebon", "s1")));
+        let _ = poll(&a, "s1");
+        send(
+            &store,
+            &group.id,
+            &key("rebon", "s2"),
+            "all",
+            EntryKind::Memory,
+            "deploys-freeze-friday",
+        );
+        let news = model_text(&a.poll_as("s1", "turn-2"));
+        assert!(news.contains("deploys-freeze-friday"), "{news}");
+        assert!(!news.contains("in the agent group"), "{news}");
+        assert!(a.poll_as("s1", "turn-3").is_empty());
     }
 
     #[test]
@@ -311,12 +383,12 @@ mod tests {
             "before-join",
         );
         store.join(&group.id, member("rebon", "s1", "a")).unwrap();
-        let poller = GroupInboxPoller::new(store.clone(), key("rebon", "s1"));
+        let poller = Session::new(GroupInboxPoller::new(store.clone(), key("rebon", "s1")));
         assert!(model_text(&poll(&poller, "s1")).contains("before-join"));
         let mut pull = member("rebon", "s3", "c");
         pull.delivery = Delivery::PullOnly;
         store.join(&group.id, pull).unwrap();
-        let poller = GroupInboxPoller::new(store, key("rebon", "s3"));
+        let poller = Session::new(GroupInboxPoller::new(store, key("rebon", "s3")));
         assert!(poll(&poller, "s3").is_empty());
     }
 
@@ -327,7 +399,7 @@ mod tests {
         let group = store.create("g", "/w").unwrap();
         store.join(&group.id, member("rebon", "s1", "a")).unwrap();
         store.join(&group.id, member("rebon", "s2", "b")).unwrap();
-        let a = GroupInboxPoller::new(store.clone(), key("rebon", "s1"));
+        let a = Session::new(GroupInboxPoller::new(store.clone(), key("rebon", "s1")));
         let _ = poll(&a, "s1");
         for n in 0..20 {
             send(

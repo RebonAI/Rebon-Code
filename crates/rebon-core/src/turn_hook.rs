@@ -437,7 +437,7 @@ impl TurnHook for AttachmentInjectionHook {
         };
         collect_attachments(
             binding,
-            binding.request(event.next_iteration, event.phase),
+            binding.request(event.next_iteration, event.phase, event.history),
             event.history,
             context,
         );
@@ -474,6 +474,7 @@ impl TurnHook for TerminalAttachmentHook {
             binding.request(
                 (event.iteration as u64).saturating_add(1),
                 crate::query::AttachmentPollPhase::Eager,
+                event.history,
             ),
             event.history,
             &mut poll,

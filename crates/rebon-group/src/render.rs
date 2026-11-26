@@ -95,6 +95,20 @@ fn wrap(body: &str) -> String {
     format!("<system-reminder>\n{body}\n\nDo not mention this reminder.\n</system-reminder>")
 }
 
+/// The words a briefing opens with, which name the member and the group.
+///
+/// A context that still holds them holds the briefing, and with it the
+/// memory as it stood then: the inbox reads the history for them to tell a
+/// context that needs briefing again (new, compacted) from one that only
+/// needs what is new.
+pub fn briefing_marker(group: &Group, alias: &str) -> String {
+    format!(
+        "You are \"{}\" in the agent group \"{}\"",
+        escape_text(alias),
+        escape_text(&group.name)
+    )
+}
+
 /// Who the member is in the group, the tools, and [`MEMORY_GUIDE`].
 fn briefing(group: &Group, alias: &str) -> String {
     let others: Vec<String> = group
@@ -112,13 +126,12 @@ fn briefing(group: &Group, alias: &str) -> String {
         others.join(", ")
     };
     format!(
-        "You are \"{}\" in the agent group \"{}\", with {}. The group talks and remembers \
+        "{}, with {}. The group talks and remembers \
          through the group_* tools (load them by name with your tool search if they are not \
          listed): group_send tells or asks a member, all, or user (the person you work for); \
          group_inbox reads what came in; group_remember keeps a fact; group_recall searches the \
          memory.\n\n{MEMORY_GUIDE}\n\n{QUESTION_GUIDE}",
-        escape_text(alias),
-        escape_text(&group.name),
+        briefing_marker(group, alias),
         escape_text(&with)
     )
 }

@@ -156,16 +156,18 @@ impl AttachmentPollerBinding {
         }
     }
 
-    pub(crate) fn request(
-        &self,
+    pub(crate) fn request<'a>(
+        &'a self,
         next_iteration: u64,
         phase: AttachmentPollPhase,
-    ) -> AttachmentPollRequest<'_> {
+        history: &'a [ApiMessage],
+    ) -> AttachmentPollRequest<'a> {
         AttachmentPollRequest {
             session_id: &self.session_id,
             turn_id: &self.turn_id,
             next_iteration,
             phase,
+            history,
         }
     }
 }
