@@ -8,6 +8,13 @@ Each section is a `## <version>` heading followed by one to four `- ` items.
 Keep every item within 36 columns: that is the narrowest the banner's notes
 column gets, and a longer line is cut off.
 
+## 1.30.0
+
+- Claude chats are cached by default
+- Memory kept without being asked
+- Preferences stay in the index
+- Groups brief a member once
+
 ## 1.29.0
 
 - rebon agent installs ACP agents
