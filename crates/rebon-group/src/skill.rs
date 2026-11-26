@@ -7,25 +7,175 @@
 //! group sees one session. The text lives here, beside the tools it
 //! describes, so `rebon group skill` and the desktop app's group setup write
 //! the same copy.
+//!
+//! # Whose copy a file is
+//!
+//! A skill sits in a directory every session of its agent reads, and its
+//! description rides in each of those sessions' prompts. So the copy Rebon
+//! wrote has to go when the group tools are turned off ([`uninstall`]), and
+//! a copy somebody edited must never be replaced or removed behind their
+//! back. Every copy written here ends with a marker carrying the SHA-256 of
+//! the text above it:
+//!
+//! - text that still matches its checksum is Rebon's: [`install`] replaces
+//!   it with a newer copy and [`uninstall`] removes it;
+//! - text that does not was edited, and is left alone, as is a copy without
+//!   the marker;
+//! - a `SKILL.md` whose frontmatter names another skill is not this one, and
+//!   is left alone too.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 
 /// The skill's name, which is also the directory it goes in.
 pub const NAME: &str = "rebon-groups";
+
+const FILE: &str = "SKILL.md";
+
+/// Starts the last line of every copy written here; the checksum follows.
+const MARKER: &str = "<!-- Written by Rebon (`rebon group skill`). While the text above is unchanged, Rebon replaces it with newer copies and removes it when the group tools are turned off; to keep your own, edit a copy under another name. sha256:";
+const MARKER_END: &str = " -->";
 
 /// The skill's `SKILL.md`, telling the agent to run `command`: `rebon`, or
 /// the path of the desktop app's own copy when that is not on PATH.
 pub fn skill_md(command: &str) -> String {
     // A Windows checkout may have given the template CRLF line endings; the
     // file is the same skill either way, so it is written with LF always.
-    TEMPLATE
-        .replace("\r\n", "\n")
-        .replace("{rebon}", &shell_word(command))
+    let head = format!(
+        "{}\n",
+        TEMPLATE
+            .replace("\r\n", "\n")
+            .replace("{rebon}", &shell_word(command))
+    );
+    format!("{head}{MARKER}{}{MARKER_END}\n", sha256_hex(&head))
 }
 
-/// Whether `text` is a `SKILL.md` this module wrote, by its frontmatter
-/// name: such a file may be replaced with a newer copy, anything else is the
-/// user's.
-pub fn is_ours(text: &str) -> bool {
-    let Some(rest) = text.trim_start_matches('\u{feff}').strip_prefix("---") else {
+/// Where the skill goes in `skills_dir` (`.agents/skills`, `.claude/skills`).
+pub fn path(skills_dir: &Path) -> PathBuf {
+    skills_dir.join(NAME).join(FILE)
+}
+
+/// Whose a `SKILL.md` at [`path`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    /// Written here and unchanged since: Rebon may replace or remove it.
+    Unchanged,
+    /// This skill, but edited since it was written (or written without the
+    /// marker): somebody's own now.
+    Edited,
+    /// Another skill altogether.
+    Foreign,
+}
+
+/// Reads a `SKILL.md`'s text the way [`Status`] describes. Line endings do not
+/// count: a copy a checkout turned into CRLF is still unchanged.
+pub fn classify(text: &str) -> Status {
+    let text = text.trim_start_matches('\u{feff}').replace("\r\n", "\n");
+    if !names_this_skill(&text) {
+        return Status::Foreign;
+    }
+    let Some(at) = text.rfind(MARKER) else {
+        return Status::Edited;
+    };
+    let (head, marker) = text.split_at(at);
+    let Some(rest) = marker[MARKER.len()..].strip_suffix('\n') else {
+        return Status::Edited;
+    };
+    match rest.strip_suffix(MARKER_END) {
+        Some(sum) if sum == sha256_hex(head) => Status::Unchanged,
+        _ => Status::Edited,
+    }
+}
+
+/// What [`install`] or [`uninstall`] did to `skills_dir`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// The skill was written (new, or replacing an older unchanged copy).
+    Wrote,
+    /// The copy there already was this one.
+    AlreadyCurrent,
+    /// The unchanged copy was removed, with the directories it leaves empty.
+    Removed,
+    /// There was nothing to remove.
+    NotThere,
+    /// Left alone: it was edited since Rebon wrote it.
+    KeptEdited,
+    /// Left alone: it is another skill.
+    KeptForeign,
+}
+
+/// Writes the skill for `command` into `skills_dir`, unless a copy there is
+/// edited or is another skill.
+pub fn install(skills_dir: &Path, command: &str) -> Result<Outcome> {
+    let path = path(skills_dir);
+    let wanted = skill_md(command);
+    if let Some(existing) = read(&path)? {
+        match classify(&existing) {
+            Status::Foreign => return Ok(Outcome::KeptForeign),
+            Status::Edited => return Ok(Outcome::KeptEdited),
+            Status::Unchanged if existing.replace("\r\n", "\n") == wanted => {
+                return Ok(Outcome::AlreadyCurrent)
+            }
+            Status::Unchanged => {}
+        }
+    }
+    let dir = path.parent().expect("the skill path has a directory");
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    // Through a temporary file, so an agent starting meanwhile reads either
+    // copy whole and never half of one.
+    let temporary = dir.join(format!(".{FILE}.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, &wanted)
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("failed to write {}", path.display()));
+    }
+    Ok(Outcome::Wrote)
+}
+
+/// Removes the skill from `skills_dir` if it is Rebon's unchanged copy, then
+/// the directories that leaves empty: the skill's own, and — when
+/// `skills_dir` is the usual `<agent dir>/skills` — that and the agent
+/// directory above it. A directory with anything else in it stays.
+pub fn uninstall(skills_dir: &Path) -> Result<Outcome> {
+    let path = path(skills_dir);
+    let Some(existing) = read(&path)? else {
+        return Ok(Outcome::NotThere);
+    };
+    match classify(&existing) {
+        Status::Foreign => return Ok(Outcome::KeptForeign),
+        Status::Edited => return Ok(Outcome::KeptEdited),
+        Status::Unchanged => {}
+    }
+    std::fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    // `remove_dir` takes only an empty directory, so each step stops the
+    // walk at the first one somebody else uses.
+    let mut prune = vec![skills_dir.join(NAME)];
+    if skills_dir.file_name().is_some_and(|name| name == "skills") {
+        prune.push(skills_dir.to_path_buf());
+        prune.extend(skills_dir.parent().map(Path::to_path_buf));
+    }
+    for dir in prune {
+        if std::fs::remove_dir(&dir).is_err() {
+            break;
+        }
+    }
+    Ok(Outcome::Removed)
+}
+
+fn read(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+/// Whether the frontmatter says `name: rebon-groups`.
+fn names_this_skill(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix("---") else {
         return false;
     };
     let Some(end) = rest.find("\n---") else {
@@ -34,6 +184,10 @@ pub fn is_ours(text: &str) -> bool {
     rest[..end]
         .lines()
         .any(|line| line.trim() == format!("name: {NAME}"))
+}
+
+fn sha256_hex(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
 /// `command` as one word in bash and PowerShell alike: forward slashes,
@@ -110,6 +264,10 @@ Error messages name the MCP tools: `group_join` there is `group join` here.
 mod tests {
     use super::*;
 
+    fn skills(root: &Path) -> PathBuf {
+        root.join(".agents").join("skills")
+    }
+
     #[test]
     fn the_skill_names_the_command_it_was_given_and_nothing_else() {
         let text = skill_md("rebon");
@@ -138,11 +296,104 @@ mod tests {
     }
 
     #[test]
-    fn only_a_copy_this_module_wrote_counts_as_ours() {
-        assert!(is_ours(&skill_md("rebon")));
-        assert!(is_ours(&skill_md("rebon").replace('\n', "\r\n")));
-        assert!(!is_ours("---\nname: my-groups\n---\n"));
-        assert!(!is_ours("name: rebon-groups\n"));
-        assert!(!is_ours(""));
+    fn a_copy_is_unchanged_until_its_text_is_and_line_endings_do_not_count() {
+        let text = skill_md("rebon");
+        assert_eq!(classify(&text), Status::Unchanged);
+        assert_eq!(classify(&text.replace('\n', "\r\n")), Status::Unchanged);
+        assert_eq!(classify(&format!("\u{feff}{text}")), Status::Unchanged);
+
+        let edited = text.replace("Keep messages short", "Keep messages very short");
+        assert_eq!(classify(&edited), Status::Edited);
+        let appended = format!("{text}\nMy own note.\n");
+        assert_eq!(classify(&appended), Status::Edited);
+        let without_marker = &text[..text.rfind(MARKER).unwrap()];
+        assert_eq!(classify(without_marker), Status::Edited);
+
+        assert_eq!(classify("---\nname: my-groups\n---\n"), Status::Foreign);
+        assert_eq!(classify("name: rebon-groups\n"), Status::Foreign);
+        assert_eq!(classify(""), Status::Foreign);
+    }
+
+    #[test]
+    fn install_writes_once_replaces_its_own_older_copy_and_nothing_else() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = skills(root.path());
+        let file = path(&dir);
+
+        assert_eq!(install(&dir, "rebon").unwrap(), Outcome::Wrote);
+        assert_eq!(install(&dir, "rebon").unwrap(), Outcome::AlreadyCurrent);
+        assert_eq!(install(&dir, "/opt/rebon").unwrap(), Outcome::Wrote);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            skill_md("/opt/rebon")
+        );
+
+        let edited = skill_md("/opt/rebon").replace("Keep messages short", "Be brief");
+        std::fs::write(&file, &edited).unwrap();
+        assert_eq!(install(&dir, "rebon").unwrap(), Outcome::KeptEdited);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), edited);
+
+        std::fs::write(&file, "---\nname: mine\n---\n").unwrap();
+        assert_eq!(install(&dir, "rebon").unwrap(), Outcome::KeptForeign);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "---\nname: mine\n---\n"
+        );
+    }
+
+    #[test]
+    fn uninstall_removes_the_copy_and_the_directories_it_alone_was_in() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = skills(root.path());
+        install(&dir, "rebon").unwrap();
+
+        assert_eq!(uninstall(&dir).unwrap(), Outcome::Removed);
+        assert!(!dir.exists());
+        assert!(!root.path().join(".agents").exists());
+        assert!(root.path().exists());
+        assert_eq!(uninstall(&dir).unwrap(), Outcome::NotThere);
+    }
+
+    #[test]
+    fn uninstall_keeps_every_directory_something_else_is_in() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".claude").join("skills");
+        install(&dir, "rebon").unwrap();
+        std::fs::write(root.path().join(".claude/settings.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.join("other-skill")).unwrap();
+        std::fs::write(dir.join(NAME).join("notes.md"), "mine").unwrap();
+
+        assert_eq!(uninstall(&dir).unwrap(), Outcome::Removed);
+        assert!(!path(&dir).exists());
+        assert!(dir.join(NAME).join("notes.md").exists());
+        assert!(dir.join("other-skill").exists());
+        assert!(root.path().join(".claude/settings.json").exists());
+    }
+
+    #[test]
+    fn uninstall_leaves_an_edited_copy_and_another_skill_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = skills(root.path());
+        install(&dir, "rebon").unwrap();
+        let file = path(&dir);
+
+        let edited = format!("{}\nMy own note.\n", skill_md("rebon"));
+        std::fs::write(&file, &edited).unwrap();
+        assert_eq!(uninstall(&dir).unwrap(), Outcome::KeptEdited);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), edited);
+
+        std::fs::write(&file, "---\nname: mine\n---\n").unwrap();
+        assert_eq!(uninstall(&dir).unwrap(), Outcome::KeptForeign);
+        assert!(file.exists());
+    }
+
+    #[test]
+    fn a_directory_not_called_skills_loses_only_the_skill_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("shared").join("agent-skills");
+        install(&dir, "rebon").unwrap();
+        assert_eq!(uninstall(&dir).unwrap(), Outcome::Removed);
+        assert!(!dir.join(NAME).exists());
+        assert!(dir.exists());
     }
 }

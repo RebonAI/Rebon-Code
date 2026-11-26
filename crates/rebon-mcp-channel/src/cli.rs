@@ -122,7 +122,13 @@ pub enum GroupCommand {
     /// Read the group's shared memory.
     Recall(RecallArgs),
     /// Print the rebon-groups skill, which teaches an agent these commands,
-    /// or write it into skill directories.
+    /// or write it into skill directories, or remove it from them.
+    ///
+    /// A copy written here carries a checksum of its own text. While that
+    /// still matches, the copy is Rebon's: --write replaces it with a newer
+    /// one and --remove deletes it, with the directories that leaves empty.
+    /// An edited copy, and a SKILL.md that is another skill, are left alone
+    /// either way, and the command fails naming them.
     Skill(SkillArgs),
 }
 
@@ -224,14 +230,19 @@ pub struct RecallArgs {
     pub who: WhoArgs,
 }
 
+/// Without --write or --remove, the skill is printed.
 #[derive(Debug, clap::Args, PartialEq, Eq)]
 pub struct SkillArgs {
-    /// Write the skill to `<SKILLS_DIR>/rebon-groups/SKILL.md` instead of
-    /// printing it. Repeatable: `.agents/skills` is read by pi, Codex and
-    /// OpenCode, `.claude/skills` by Claude Code. A SKILL.md there that this
-    /// command did not write is left alone.
-    #[arg(long = "write", value_name = "SKILLS_DIR")]
+    /// Write the skill to `<SKILLS_DIR>/rebon-groups/SKILL.md`. Repeatable:
+    /// `.agents/skills` is read by pi, Codex and OpenCode, `.claude/skills`
+    /// by Claude Code.
+    #[arg(long = "write", value_name = "SKILLS_DIR", conflicts_with = "remove")]
     pub write: Vec<PathBuf>,
+    /// Remove the copy --write put in `<SKILLS_DIR>`, for when the group
+    /// tools are turned off: the skill's description is in every session of
+    /// the agents that read that directory. Repeatable.
+    #[arg(long = "remove", value_name = "SKILLS_DIR")]
+    pub remove: Vec<PathBuf>,
     /// The program the skill tells the agent to run.
     #[arg(long, default_value = "rebon")]
     pub command: String,
@@ -413,39 +424,45 @@ fn run_hook(args: &HookArgs) -> anyhow::Result<()> {
 }
 
 fn run_skill(args: &SkillArgs) -> anyhow::Result<()> {
-    let text = rebon_group::skill::skill_md(&args.command);
-    if args.write.is_empty() {
-        print!("{text}");
+    use rebon_group::skill;
+
+    if args.write.is_empty() && args.remove.is_empty() {
+        print!("{}", skill::skill_md(&args.command));
         return Ok(());
     }
-    for dir in &args.write {
-        let path = write_skill(dir, &text)?;
-        println!("{}", path.display());
+    let mut kept = Vec::new();
+    let installs = args
+        .write
+        .iter()
+        .map(|dir| (dir, skill::install(dir, &args.command)));
+    let removals = args.remove.iter().map(|dir| (dir, skill::uninstall(dir)));
+    // Every directory is tried before failing, so one edited copy does not
+    // leave the rest half done.
+    for (dir, outcome) in installs.chain(removals) {
+        let path = skill::path(dir);
+        let what = match outcome? {
+            skill::Outcome::Wrote => "wrote",
+            skill::Outcome::AlreadyCurrent => "already current",
+            skill::Outcome::Removed => "removed",
+            skill::Outcome::NotThere => "not there",
+            skill::Outcome::KeptEdited => {
+                kept.push(format!(
+                    "{} was edited since Rebon wrote it",
+                    path.display()
+                ));
+                continue;
+            }
+            skill::Outcome::KeptForeign => {
+                kept.push(format!("{} is another skill", path.display()));
+                continue;
+            }
+        };
+        println!("{what}: {}", path.display());
+    }
+    if !kept.is_empty() {
+        anyhow::bail!("left alone: {}", kept.join("; "));
     }
     Ok(())
-}
-
-/// Writes `text` as `<dir>/rebon-groups/SKILL.md`, replacing only a copy
-/// this command wrote before.
-fn write_skill(dir: &std::path::Path, text: &str) -> anyhow::Result<PathBuf> {
-    let path = dir.join(rebon_group::skill::NAME).join("SKILL.md");
-    match std::fs::read_to_string(&path) {
-        Ok(existing) if !rebon_group::skill::is_ours(&existing) => anyhow::bail!(
-            "{} is someone else's skill; it was left alone",
-            path.display()
-        ),
-        Ok(existing) if existing == text => return Ok(path),
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", path.display()))
-        }
-    }
-    let parent = path.parent().expect("the skill path has a directory");
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create {}", parent.display()))?;
-    std::fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(path)
 }
 
 #[cfg(test)]
@@ -643,22 +660,33 @@ mod group_cli_tests {
     }
 
     #[test]
-    fn the_skill_is_written_once_updated_in_place_and_never_over_a_users_own() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills = dir.path().join(".agents/skills");
-        let path = write_skill(&skills, &rebon_group::skill::skill_md("rebon")).unwrap();
-        assert_eq!(path, skills.join("rebon-groups/SKILL.md"));
+    fn the_skill_is_written_or_removed_but_not_both_at_once() {
+        assert!(parse(&["skill", "--write", "a", "--write", "b"]).is_ok());
+        assert!(parse(&["skill", "--remove", "a", "--remove", "b"]).is_ok());
+        assert!(parse(&["skill", "--write", "a", "--remove", "b"]).is_err());
+    }
 
-        let newer = rebon_group::skill::skill_md("/opt/rebon/bin/rebon");
-        write_skill(&skills, &newer).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+    #[test]
+    fn removing_tries_every_directory_and_then_names_the_copies_it_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let ours = root.path().join("a/.agents/skills");
+        let edited = root.path().join("b/.claude/skills");
+        rebon_group::skill::install(&ours, "rebon").unwrap();
+        rebon_group::skill::install(&edited, "rebon").unwrap();
+        let edited_file = rebon_group::skill::path(&edited);
+        let text = std::fs::read_to_string(&edited_file).unwrap() + "\nmine\n";
+        std::fs::write(&edited_file, &text).unwrap();
 
-        std::fs::write(&path, "---\nname: my-own\n---\nmine\n").unwrap();
-        assert!(write_skill(&skills, &newer).is_err());
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "---\nname: my-own\n---\nmine\n"
-        );
+        let error = run_skill(&SkillArgs {
+            write: Vec::new(),
+            remove: vec![edited.clone(), ours.clone()],
+            command: "rebon".into(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("was edited"), "{error}");
+        assert!(!rebon_group::skill::path(&ours).exists());
+        assert_eq!(std::fs::read_to_string(&edited_file).unwrap(), text);
     }
 
     /// Splits a line the way a shell would, for the few quoting forms the

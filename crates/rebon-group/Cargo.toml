@@ -13,6 +13,9 @@ anyhow.workspace = true
 fs2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The checksum a written skill carries, which tells an unchanged copy (ours
+# to replace or remove) from one somebody edited.
+sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # The parent process's image name, to tell whose MCP server this is when a
