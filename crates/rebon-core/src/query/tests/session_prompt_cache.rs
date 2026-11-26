@@ -222,6 +222,60 @@ fn stable_prompt_helper_uses_cached_base_but_rebuilds_runtime_context() {
 }
 
 #[test]
+fn a_new_day_does_not_re_render_the_runtime_context() {
+    let state = SessionPromptState::default();
+    let config = test_system_prompt_config();
+    let monday = DynamicPromptContext {
+        cwd: "/tmp/one".to_string(),
+        session_date: Some("2026-11-27".to_string()),
+        ..Default::default()
+    };
+    let tuesday = DynamicPromptContext {
+        session_date: Some("2026-11-28".to_string()),
+        ..monday.clone()
+    };
+
+    let (_, before, _, _) = build_prompt_parts_with_session_cache(&config, &monday, &state);
+    let (_, after, _, _) = build_prompt_parts_with_session_cache(&config, &tuesday, &state);
+
+    // Byte-identical: the day turning is announced by `date_change`,
+    // appended, not by rewriting message index 0.
+    assert_eq!(before, after);
+    assert!(after.unwrap().contains("2026-11-27"));
+}
+
+#[test]
+fn a_compaction_lets_the_runtime_context_pick_up_current_memory() {
+    let state = SessionPromptState::default();
+    let config = test_system_prompt_config();
+    let before = DynamicPromptContext {
+        cwd: "/tmp/one".to_string(),
+        rebon_md_content: Some("old instructions".to_string()),
+        ..Default::default()
+    };
+    let after = DynamicPromptContext {
+        rebon_md_content: Some("new instructions".to_string()),
+        ..before.clone()
+    };
+
+    let (_, first, _, _) = build_prompt_parts_with_session_cache(&config, &before, &state);
+    assert!(state
+        .doc_update_triggers(AnnouncedDocSnapshot::from_ctx(&before))
+        .is_empty());
+    // Mid-session the block stays frozen; the edit is announced instead.
+    let (_, frozen, _, _) = build_prompt_parts_with_session_cache(&config, &after, &state);
+    assert_eq!(first, frozen);
+
+    state.forget_frozen_context();
+    let (_, fresh, _, _) = build_prompt_parts_with_session_cache(&config, &after, &state);
+    assert!(fresh.unwrap().contains("new instructions"));
+    // The fresh block is the new baseline: nothing to announce.
+    assert!(state
+        .doc_update_triggers(AnnouncedDocSnapshot::from_ctx(&after))
+        .is_empty());
+}
+
+#[test]
 fn doc_update_triggers_fire_once_per_change() {
     let state = SessionPromptState::default();
     let baseline = AnnouncedDocSnapshot {

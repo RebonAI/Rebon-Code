@@ -131,6 +131,9 @@ pub struct ResumeReplayHandle {
     compact_fallback_provider: Option<Arc<dyn CompactProvider>>,
     compact_custom_instructions: Option<String>,
     compact_summary_options: rebon_api::CompactSummaryOptions,
+    /// The session's frozen prompt parts, so installing a compacted
+    /// baseline lets the next turn render them afresh.
+    session_prompt_state: Arc<SessionPromptState>,
 }
 
 impl ResumeReplayHandle {
@@ -278,6 +281,7 @@ impl ResumeReplayHandle {
     pub fn install_summary(&self, session_id: String, prepared: PreparedResumeSummary) {
         self.replay_windows
             .install_resume_summary(session_id, prepared);
+        self.session_prompt_state.forget_frozen_context();
     }
 
     /// Install a compacted baseline that outlives this process.
@@ -300,6 +304,7 @@ impl ResumeReplayHandle {
             session_id,
             prepared,
         );
+        self.session_prompt_state.forget_frozen_context();
     }
 
     pub fn clear_summary(&self, session_id: &str) {
@@ -538,7 +543,7 @@ pub struct EngineQueryExecutor {
     context_management: Option<rebon_api::ContextManagementConfig>,
     /// Session-local stable base-system prompt cache. This is scoped to the
     /// executor/session lifecycle and is never shared globally.
-    pub(super) session_prompt_state: SessionPromptState,
+    pub(super) session_prompt_state: Arc<SessionPromptState>,
     /// Optional shared cell where `execute()` publishes the resolved system prompt.
     system_prompt_snapshot: Option<SystemPromptSnapshot>,
     /// Concrete model used for background session-title generation.
@@ -876,7 +881,7 @@ impl EngineQueryExecutor {
             policy: PolicySources::default(),
             policy_resolver: self.policy_resolver.clone(),
             context_management: self.context_management.clone(),
-            session_prompt_state: SessionPromptState::default(),
+            session_prompt_state: Arc::default(),
             system_prompt_snapshot: self.system_prompt_snapshot.clone(),
             title_model: self.title_model.clone(),
             title_attempts: self.title_attempts.clone(),
@@ -936,7 +941,7 @@ impl EngineQueryExecutor {
             policy: runtime.policy,
             policy_resolver: self.policy_resolver.clone(),
             context_management: self.context_management.clone(),
-            session_prompt_state: SessionPromptState::default(),
+            session_prompt_state: Arc::default(),
             system_prompt_snapshot: self.system_prompt_snapshot.clone(),
             title_model: self.title_model.clone(),
             title_attempts: self.title_attempts.clone(),
@@ -1006,7 +1011,7 @@ impl EngineQueryExecutor {
             policy: PolicySources::default(),
             policy_resolver: None,
             context_management: None,
-            session_prompt_state: SessionPromptState::default(),
+            session_prompt_state: Arc::default(),
             system_prompt_snapshot: None,
             title_model: String::new(),
             title_attempts: Default::default(),
@@ -1022,6 +1027,7 @@ impl EngineQueryExecutor {
             compact_fallback_provider: self.compact_fallback_provider.clone(),
             compact_custom_instructions: self.compact_custom_instructions.clone(),
             compact_summary_options: self.compact_summary_options.clone(),
+            session_prompt_state: self.session_prompt_state.clone(),
         }
     }
 
@@ -4218,6 +4224,7 @@ impl EngineQueryExecutor {
                     frame.session_id.clone(),
                     prepared,
                 );
+                self.session_prompt_state.forget_frozen_context();
                 handle.budget.record_compact_success();
                 (projection, report.used_model)
             }
@@ -5171,6 +5178,7 @@ mod compact_now_tests {
             compact_fallback_provider: None,
             compact_custom_instructions: None,
             compact_summary_options: rebon_api::CompactSummaryOptions::default(),
+            session_prompt_state: Arc::default(),
         }
     }
 
@@ -5683,6 +5691,7 @@ mod attachment_poller_turn_tests {
             compact_fallback_provider: fallback,
             compact_custom_instructions: None,
             compact_summary_options: rebon_api::CompactSummaryOptions::default(),
+            session_prompt_state: Arc::default(),
         }
     }
 

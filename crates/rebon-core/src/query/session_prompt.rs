@@ -51,10 +51,15 @@ impl SessionPromptCacheKey {
 /// Cache key for the frozen stable runtime-context block.
 ///
 /// Extends the base-system key with every *identity* input of the block
-/// (cwd, git-ness, language, session date, scratchpad) plus the
-/// announced tool shape — a tool-filter change already invalidates the
-/// provider's prefix cache through the request `tools` array, so
-/// regenerating the block then is free.
+/// (cwd, git-ness, language, scratchpad) plus the announced tool shape —
+/// a tool-filter change already invalidates the provider's prefix cache
+/// through the request `tools` array, so regenerating the block then is
+/// free.
+///
+/// The date is not identity. The block keeps the date it was rendered on;
+/// when the day turns, the `date_change` attachment says so, appended. A
+/// block keyed on the date would re-render at local midnight and
+/// re-prefill the whole conversation behind it for one changed line.
 ///
 /// Deliberately excluded are the block's *content* inputs
 /// (`rebon_md_content`, the [`Rung::Memory`] sections, `mcp_instructions`):
@@ -68,7 +73,6 @@ pub(super) struct RuntimeContextCacheKey {
     cwd: String,
     is_git: bool,
     language: Option<String>,
-    session_date: Option<String>,
     scratchpad_dir: Option<String>,
     tool_names: Vec<String>,
     deferred_tool_names: Vec<String>,
@@ -99,7 +103,6 @@ impl RuntimeContextCacheKey {
             cwd: ctx.cwd.clone(),
             is_git: ctx.is_git,
             language: ctx.language.clone(),
-            session_date: ctx.session_date.clone(),
             scratchpad_dir: ctx.scratchpad_dir.clone(),
             tool_names: config.tool_names.clone(),
             deferred_tool_names: config.deferred_tool_names.clone(),
@@ -246,6 +249,26 @@ impl SessionPromptState {
         }
         *guard = Some(current);
         triggers
+    }
+
+    /// Let the next turn render the runtime-context block afresh, with the
+    /// instruction files and memory as they are now.
+    ///
+    /// A compaction is the moment: it replaces the history, so everything
+    /// after message index 0 is new to the provider's cache anyway and the
+    /// block costs only its own bytes to re-send — while the mid-session
+    /// update announcements it relied on may be among what the summary
+    /// dropped. The announced-docs record goes with it; the fresh block is
+    /// the new baseline.
+    pub(super) fn forget_frozen_context(&self) {
+        self.runtime_context_by_key
+            .lock()
+            .expect("session runtime context cache lock poisoned")
+            .clear();
+        *self
+            .announced_docs
+            .lock()
+            .expect("announced docs lock poisoned") = None;
     }
 
     /// Freeze the stable runtime-context block per (base key, tool
