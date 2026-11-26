@@ -162,7 +162,7 @@ retry "the plugin-first crates" cargo test -q --locked -p rebon-core -p rebon-ha
     -p rebon-proto -p rebon-schema-gen -p rebon-i18n-gen -p rebon-session-state \
     -p rebon-kernel -p rebon-kernel-seats -p rebon-provider -p rebon-plugin-host \
     -p rebon-instructions -p rebon-session -p rebon-session-host \
-    -p rebon-session-runtime -p rebon-mcp-channel -p rebon-rc-runner -p rebon-command-seat -p rebon-dialog -p rebon-tui \
+    -p rebon-session-runtime -p rebon-mcp-channel -p rebon-group -p rebon-rc-runner -p rebon-command-seat -p rebon-dialog -p rebon-tui \
     -p rebon-render -p rebon-message-tui -p rebon-plugin-cron -p rebon-plugin-web \
     -p rebon-plugin-monitor -p rebon-plugin-memory -p rebon-plugin-notebook \
     -p rebon-plugin-structured-output -p rebon-plugin-profile \
