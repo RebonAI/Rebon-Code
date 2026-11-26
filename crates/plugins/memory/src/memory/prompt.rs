@@ -359,23 +359,37 @@ fn budget_entrypoint_content(content: &str, budget: MemoryPromptBudget) -> Strin
     }
 
     let hard_byte_cap = budget.max_entrypoint_index_tokens.saturating_mul(4);
-    let mut kept = Vec::new();
+    let lines: Vec<&str> = trimmed.lines().map(str::trim_end).collect();
+    // What the person said about how they work, and who they are, is the
+    // memory that costs them most to repeat: it is picked first, the rest
+    // in index order after it. What is kept still reads in index order.
+    let mut order: Vec<usize> = (0..lines.len()).collect();
+    order.sort_by_key(|&index| !is_preference_entry(lines[index]));
+    let mut keep = vec![false; lines.len()];
     let mut omitted = 0usize;
     let mut used_bytes = 0usize;
+    let mut any_kept = false;
 
-    for line in trimmed.lines().map(str::trim_end) {
-        let projected_bytes = if kept.is_empty() {
-            line.len()
-        } else {
+    for index in order {
+        let line = lines[index];
+        let projected_bytes = if any_kept {
             used_bytes.saturating_add(1).saturating_add(line.len())
+        } else {
+            line.len()
         };
         if projected_bytes <= hard_byte_cap {
-            kept.push(line.to_string());
+            keep[index] = true;
+            any_kept = true;
             used_bytes = projected_bytes;
         } else if !line.trim().is_empty() {
             omitted += 1;
         }
     }
+    let kept: Vec<&str> = lines
+        .iter()
+        .zip(&keep)
+        .filter_map(|(line, keep)| keep.then_some(*line))
+        .collect();
 
     let mut rendered = kept.join("\n").trim().to_string();
     if !rendered.is_empty() {
@@ -389,6 +403,12 @@ fn budget_entrypoint_content(content: &str, budget: MemoryPromptBudget) -> Strin
 
 fn estimated_tokens(s: &str) -> usize {
     (s.len() + 3) / 4
+}
+
+/// An index line pointing at a `feedback` or `user` memory, which the
+/// writer names `feedback-…md` / `user-…md`.
+fn is_preference_entry(line: &str) -> bool {
+    line.contains("](feedback-") || line.contains("](user-")
 }
 
 /// Build the behavioral instruction lines (without MEMORY.md content).
@@ -1256,6 +1276,43 @@ mod tests {
         assert!(prompt.contains("- [entry 0](entry-0.md)"));
         assert!(!prompt.contains("- [entry 19](entry-19.md)"));
         assert!(prompt.contains("omitted by prompt budget"));
+    }
+
+    #[test]
+    fn budget_keeps_preferences_before_other_entries_in_index_order() {
+        let mut lines: Vec<String> = (0..12)
+            .map(|i| {
+                format!(
+                    "- [project {i}](project-{i}.md) \u{2014} {}",
+                    "p".repeat(40)
+                )
+            })
+            .collect();
+        lines.push(format!(
+            "- [Answer in Chinese](feedback-chinese.md) \u{2014} {}",
+            "f".repeat(40)
+        ));
+        lines.push(format!(
+            "- [Kernel engineer](user-role.md) \u{2014} {}",
+            "u".repeat(40)
+        ));
+        let content = lines.join("\n");
+        let budget = MemoryPromptBudget {
+            max_entrypoint_index_tokens: 60,
+        };
+
+        let kept = budget_entrypoint_content(&content, budget);
+
+        // The two at the end of the index survive the cut; projects fill
+        // what is left from the top, and the order on the page is the
+        // index's.
+        assert!(kept.contains("](feedback-chinese.md)"), "{kept}");
+        assert!(kept.contains("](user-role.md)"), "{kept}");
+        assert!(kept.contains("](project-0.md)"), "{kept}");
+        assert!(!kept.contains("](project-11.md)"), "{kept}");
+        let first_project = kept.find("](project-0.md)").unwrap();
+        let feedback = kept.find("](feedback-chinese.md)").unwrap();
+        assert!(first_project < feedback, "{kept}");
     }
 
     #[test]

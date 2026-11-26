@@ -43,6 +43,11 @@ pub fn memory_file_candidates(cwd: &str) -> Vec<PathBuf> {
             .collect();
 
     if crate::memory::settings::is_auto_memory_enabled(Path::new(cwd)) {
+        // Both indexes the prompt carries: the person's own, then the
+        // project's.
+        if let Some(user_dir) = rebon_session::memory_paths::user_memory_dir() {
+            paths.push(user_dir.join(rebon_session::memory_paths::ENTRYPOINT_NAME));
+        }
         if let Some(memory_dir) = get_auto_mem_path(cwd) {
             paths.push(memory_dir.join(rebon_session::memory_paths::ENTRYPOINT_NAME));
         }
