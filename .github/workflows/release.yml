@@ -258,9 +258,16 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-registry-
       - run: cargo test -p rebon-cli --locked
       - name: Build the runner the plane's tests start
-        # Contained hosts, Code Mode and the process tests run on rebon-verve;
-        # the tests find it in this target directory.
-        run: cargo build -p rebon-verve-host --bin rebon-verve --locked
+        # Contained hosts, Code Mode and the process tests run on rebon-verve.
+        # The batch below unifies features across more crates than this
+        # build does, so it rebuilds rebon-verve-host and the runner left in
+        # target/debug does not survive it; a copy outside the target
+        # directory, named by REBON_VERVE, does.
+        run: |
+          set -eu
+          cargo build -p rebon-verve-host --bin rebon-verve --locked
+          cp target/debug/rebon-verve "$RUNNER_TEMP/rebon-verve"
+          echo "REBON_VERVE=$RUNNER_TEMP/rebon-verve" >> "$GITHUB_ENV"
       - name: Test the crates the plugin-first refactor touches
         # rebon-core's unit tests (and the ACP end-to-end tests that moved
         # to rebon-harness) cannot run on the main development machine: its

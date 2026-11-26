@@ -61,10 +61,20 @@ fn a_project_has_one_group_of_a_name() {
     assert!(store.create("refactor", "C:/work/app/").is_err());
     // Another project may use the name.
     store.create("refactor", "C:/work/other").unwrap();
+    // Either separator, a trailing slash, and any case of the name find it.
+    assert_eq!(
+        store.find("C:/work/app/", "REFACTOR").unwrap().unwrap().id,
+        group.id
+    );
+    // Only Windows folds the case of a path: elsewhere `c:` is another
+    // directory.
+    #[cfg(windows)]
     assert_eq!(
         store.find("c:/work/app", "REFACTOR").unwrap().unwrap().id,
         group.id
     );
+    #[cfg(not(windows))]
+    assert!(store.find("c:/work/app", "REFACTOR").unwrap().is_none());
     assert_eq!(store.list().unwrap().len(), 2);
 }
 
