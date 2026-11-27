@@ -19,6 +19,8 @@
 //! log is the agent's own tool call.
 //!
 //! - [`store`] — the files and the lock.
+//! - [`assign`] — work a member hands another and waits for, and the new
+//!   members it asks the app to start for it.
 //! - [`agents`] — which agent programs may join at all.
 //! - [`identity`] — which session a server belongs to, from the environment
 //!   the agent started it with.
@@ -37,6 +39,7 @@
 //! session is meant to get the same tools from a feature plugin.
 
 pub mod agents;
+pub mod assign;
 pub mod deliver;
 pub mod identity;
 pub mod model;

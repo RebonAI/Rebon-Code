@@ -416,6 +416,69 @@ pub fn handover_prompt(group: &Group, previous: &Member, open: &[Entry]) -> Stri
     text
 }
 
+/// The task in [`task_prompt`] is cut to this many characters: the prompt is
+/// a command-line argument when the app starts a CLI with it, and Windows
+/// caps a command line at 32,767. The whole text stays in `group_inbox`.
+pub const TASK_CHARS: usize = 20_000;
+
+/// The first message of a member the app started on `request`
+/// ([`crate::assign`]): who asks, the task itself, and that the asker waits
+/// for the answer — a reply naming the request — so the work is not done
+/// until one is sent.
+pub fn task_prompt(
+    group: &Group,
+    alias: &str,
+    request: &Entry,
+    access: Option<crate::assign::Access>,
+) -> String {
+    let id = request.id.as_deref().unwrap_or_default();
+    let from = &request.from;
+    let mut text = format!(
+        "[Agent group \"{}\"] You are {alias} in this group. {from} asks you ({id}):\n\n",
+        group.name
+    );
+    let task = request.text.trim();
+    if task.chars().count() > TASK_CHARS {
+        // Cut, not flattened: a task's lines and lists are part of it.
+        text.extend(task.chars().take(TASK_CHARS));
+        text.push_str("…\n\n(The task goes on: read it whole with group_inbox.)");
+    } else {
+        text.push_str(task);
+    }
+    if let Some(access) = access {
+        text.push_str(&format!(
+            "\n\nYour access for this task: {}.",
+            access.describe()
+        ));
+    }
+    text.push_str(&format!(
+        "\n\n{from} is waiting. Answer with group_send (kind reply, re {id}, to {from}). Its \
+         first line says what came of it in a few words — `Done: slugify.py written, self-check \
+         prints ok`, `Blocked: needs network access`. Add at most 4 short lines after it, only \
+         what {from} needs; never paste file contents or diffs, {from} reads the files. If the \
+         task needs something you are not allowed, do not work around it: answer `Blocked:` \
+         with what you needed."
+    ));
+    text
+}
+
+/// What an entry comes to, for a line in a list: its first line that has
+/// words, cut to `limit` characters. A task's title, a reply's outcome
+/// ([`task_prompt`] asks for one there).
+pub fn headline(text: &str, limit: usize) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let line = line.trim_start_matches('#').trim();
+    if line.chars().count() <= limit {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(limit).collect();
+    format!("{}…", cut.trim_end())
+}
+
 fn entry_tag(entry: &Entry) -> String {
     let mut attrs = format!(
         " seq=\"{}\" from=\"{}\" kind=\"{}\"",

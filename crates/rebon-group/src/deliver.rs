@@ -57,6 +57,21 @@ impl Pending {
     }
 }
 
+/// Whether `entry` is the reply to a request `alias` posted awaited: one it
+/// takes through its own wait.
+fn answers_a_wait_of(
+    entry: &Entry,
+    awaited: &std::collections::BTreeMap<String, String>,
+    alias: &str,
+) -> bool {
+    entry.kind == EntryKind::Reply
+        && entry
+            .re
+            .as_deref()
+            .and_then(|request| awaited.get(request))
+            .is_some_and(|asker| asker.eq_ignore_ascii_case(alias))
+}
+
 /// The member's undelivered entries and memory, or `None` when it is in no
 /// group, is pull-only, or has nothing new.
 pub fn pending(store: &GroupStore, member: &MemberKey) -> Option<Pending> {
@@ -75,9 +90,14 @@ pub fn pending_with(store: &GroupStore, member: &MemberKey, fresh: bool) -> Opti
     let cursor = store.cursor(&group.id, member).ok()?;
     let after = store.entries_after(&group.id, cursor.delivered).ok()?;
     let through = after.last().map_or(cursor.delivered, |entry| entry.seq);
+    // The reply to a request the member waits on in-turn reaches it through
+    // that wait (`GroupStore::append_awaited`); handed over again it would
+    // cost a second turn's worth of the same text.
+    let awaited = store.awaited(&group.id).ok()?;
     let entries: Vec<Entry> = after
         .into_iter()
         .filter(|entry| entry.kind != EntryKind::Memory && entry.is_for(&alias))
+        .filter(|entry| !answers_a_wait_of(entry, &awaited, &alias))
         .collect();
     let brief = fresh || !cursor.briefed;
     let facts = store.memory(&group.id).ok()?;

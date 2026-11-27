@@ -26,6 +26,9 @@ const CURSORS_FILE: &str = "cursors.json";
 const DELIVERIES_FILE: &str = "deliveries.jsonl";
 const MEMORY_FILE: &str = "MEMORY.md";
 const LOCK_FILE: &str = "lock";
+/// The requests whose askers wait for the reply in the turn they are in
+/// ([`GroupStore::append_awaited`]): request id → the asker's alias.
+const AWAITS_FILE: &str = "awaits.json";
 
 /// The groups under one root (`<config home>/groups`).
 #[derive(Clone, Debug)]
@@ -562,6 +565,86 @@ impl GroupStore {
         })
     }
 
+    /// Writes a request from `from` to the member `to` whose reply `from`
+    /// waits for in the turn it is in — a workflow step handed to `@Ada`,
+    /// say ([`crate::assign`]). The reply reaches it through that wait, so
+    /// [`crate::deliver::pending`] leaves it out of what any channel hands
+    /// `from` again.
+    pub fn append_awaited(
+        &self,
+        id: &str,
+        from: &MemberKey,
+        to: &str,
+        text: &str,
+    ) -> Result<Entry> {
+        check_id(id)?;
+        let to = to.trim();
+        if text.trim().is_empty() {
+            bail!("nothing to ask");
+        }
+        self.with_lock(id, || {
+            let dir = self.dir(id);
+            let path = dir.join(GROUP_FILE);
+            let mut file = read_group_file(&path)?;
+            let Some(sender) = file.group.member(from).cloned() else {
+                bail!(
+                    "this session is not a member of group `{}`",
+                    file.group.name
+                );
+            };
+            if to.eq_ignore_ascii_case(&sender.alias) {
+                bail!("a member does not ask itself");
+            }
+            if file.group.member_by_alias(to).is_none() {
+                bail!(
+                    "no member called `{to}`; members are {}",
+                    aliases(&file.group)
+                );
+            }
+            let entry = self.append_locked(
+                id,
+                &mut file,
+                &sender.alias,
+                Draft {
+                    kind: EntryKind::Request,
+                    to: Some(to.to_string()),
+                    re: None,
+                    supersedes: None,
+                    text: text.to_string(),
+                },
+            )?;
+            write_json(&path, &file)?;
+            let mut awaits = read_awaits(&dir)?;
+            let request = entry.id.clone().expect("a request is given an id");
+            awaits.insert(request, sender.alias);
+            write_json(&dir.join(AWAITS_FILE), &awaits)?;
+            Ok(entry)
+        })
+    }
+
+    /// The requests whose askers wait for the reply in-turn: request id →
+    /// the asker's alias.
+    pub fn awaited(&self, id: &str) -> Result<BTreeMap<String, String>> {
+        check_id(id)?;
+        self.with_lock(id, || read_awaits(&self.dir(id)))
+    }
+
+    /// The asker of `request` has stopped waiting with no reply — it was
+    /// cancelled, or gave up — so a reply that comes after is handed over as
+    /// any other is. Not for a request whose reply it took: until its cursor
+    /// passes that reply, it would be handed over again.
+    pub fn stop_awaiting(&self, id: &str, request: &str) -> Result<()> {
+        check_id(id)?;
+        self.with_lock(id, || {
+            let dir = self.dir(id);
+            let mut awaits = read_awaits(&dir)?;
+            if awaits.remove(request).is_some() {
+                write_json(&dir.join(AWAITS_FILE), &awaits)?;
+            }
+            Ok(())
+        })
+    }
+
     /// Writes `draft` to the log as the user ([`USER`]): a note, a request
     /// a member's reply will name, or the answer to a member's question.
     /// Posted from the desktop app, so no member key stands behind it.
@@ -1003,6 +1086,16 @@ fn read_group_file(path: &Path) -> Result<GroupFile> {
     let bytes =
         std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn read_awaits(dir: &Path) -> Result<BTreeMap<String, String>> {
+    let path = dir.join(AWAITS_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
 }
 
 fn read_cursors(dir: &Path) -> Result<BTreeMap<String, Cursor>> {
