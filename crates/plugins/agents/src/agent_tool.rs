@@ -32,11 +32,7 @@ const PLAN_MODE_PLAN_AGENT_REJECTION: &str = "The Plan agent cannot be invoked w
 
 /// The declared external agent a model spec would route to, if any.
 fn external_model_target(context: &ToolContext, model: Option<&str>) -> Option<String> {
-    let (prefix, _) = model?.trim().split_once(':')?;
-    let prefix = prefix.trim();
-    if prefix.is_empty() || prefix.contains('/') {
-        return None;
-    }
+    let (prefix, _) = rebon_tool::parse_external_model_spec(model?)?;
     context.sub_agent_spawner()?.resolve_external_agent(prefix)
 }
 

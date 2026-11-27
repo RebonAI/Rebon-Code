@@ -37,6 +37,7 @@ pub const LSP_MCP_SIBLING: &str = "rebon-lsp-mcp";
 pub const RUST_LSP_SERVER_NAME: &str = "rust_lsp";
 
 pub mod acp_subagent_pool;
+pub mod group_member_runner;
 pub mod host;
 pub mod mcp_config;
 pub mod mcp_status;

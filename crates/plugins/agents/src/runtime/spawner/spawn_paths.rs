@@ -168,19 +168,44 @@ impl EngineSubAgentSpawner {
             &saw_streamed_answer,
         );
 
+        // A member of the session's agent group (`@name`) is told by the
+        // group how to answer; a sub-agent brief would only contradict it.
+        let group_member = route.agent_id.starts_with('@');
+        // The runner may need to know whose task this is — a group member's
+        // runner finds the asker's group by it — wherever the spawn kept it.
+        let mut metadata = spec.metadata.clone();
+        if metadata
+            .get("parent_session_id")
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            if let (Some(session), Some(object)) = (
+                spec.capability_context
+                    .as_ref()
+                    .map(|context| context.session_id.clone())
+                    .filter(|session| !session.trim().is_empty()),
+                metadata.as_object_mut(),
+            ) {
+                object.insert("parent_session_id".into(), Value::String(session));
+            }
+        }
         let request = ExternalTaskRequest {
             agent_id: route.agent_id.clone(),
             model_hint: route.model_hint.clone(),
             task_session_id: format!("subagent-{agent_id}"),
-            prompt: compose_external_first_prompt(
-                spec.system.as_deref(),
-                &spec.prompt,
-                agent_type.as_deref(),
-            ),
+            prompt: if group_member {
+                spec.prompt.clone()
+            } else {
+                compose_external_first_prompt(
+                    spec.system.as_deref(),
+                    &spec.prompt,
+                    agent_type.as_deref(),
+                )
+            },
             cwd: spec.cwd.clone(),
             cancel: cancel.clone(),
             progress: progress_sink,
-            metadata: spec.metadata.clone(),
+            metadata,
         };
         let outcome = runner.run_task(request).await;
 

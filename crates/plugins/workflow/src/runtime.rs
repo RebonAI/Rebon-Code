@@ -2486,6 +2486,9 @@ fn run_agent_request_sync(
         "workflow_run_id": run_id,
         "workflow_phase": phase_title,
         "workflow_phase_instance_id": phase_id,
+        // What the step is, for whoever shows it: a group member's handoff
+        // is titled by it.
+        "workflow_label": label,
     });
     if let Some(schema) = schema.as_ref() {
         agent_metadata[WORKFLOW_STRUCTURED_OUTPUT_SCHEMA_KEY] = schema.clone();
@@ -3244,6 +3247,9 @@ fn spawn_agent_task(
         "workflow_run_id": run_id,
         "workflow_phase": phase_title,
         "workflow_phase_instance_id": phase_id,
+        // What the step is, for whoever shows it: a group member's handoff
+        // is titled by it.
+        "workflow_label": label,
     });
     if let Some(schema) = schema.as_ref() {
         agent_metadata[WORKFLOW_STRUCTURED_OUTPUT_SCHEMA_KEY] = schema.clone();

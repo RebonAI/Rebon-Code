@@ -43,8 +43,8 @@ use rebon_plugin_skill::{
 use rebon_plugin_tasks::{runtime::TaskRegistry, TaskRegistryResolver};
 use rebon_provider::provider_runtime_cache::ProviderRuntimeCache;
 use rebon_tool::{
-    AgentRegistry, Extensions, ExternalSubAgentRunner, McpClient, SubAgentRuntimeHandle,
-    SubAgentSpawner, SubAgentSpawnerRequest, TaskRuntimeController, TeamManager, ToolFilter,
+    AgentRegistry, Extensions, McpClient, SubAgentRuntimeHandle, SubAgentSpawner,
+    SubAgentSpawnerRequest, TaskRuntimeController, TeamManager, ToolFilter,
     UnavailableSubAgentSpawner, WorkflowLauncher, WorkflowLauncherRequest, WorkflowLauncherService,
     WorkflowTaskRuntimeHandle,
 };
@@ -251,9 +251,12 @@ impl SessionRuntimeFactory {
             coordinator_mode: Some(self.coordinator_mode_handle.clone()),
             coordinator_use_worktree: self.coordinator_use_worktree,
             file_history_tracker: Some(tracker_dyn.clone()),
-            external_runner: acp_subagent_pool
-                .clone()
-                .map(|pool| pool as Arc<dyn ExternalSubAgentRunner>),
+            // `@name` specs go to the session's agent group, the rest to
+            // the ACP pool.
+            external_runner: Some(crate::group_member_runner::external_runner(
+                acp_subagent_pool.clone(),
+                session_id,
+            )),
         })
         .unwrap_or_else(|| Arc::new(UnavailableSubAgentSpawner));
 

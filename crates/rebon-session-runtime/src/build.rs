@@ -50,9 +50,9 @@ use rebon_plugin_tasks::runtime::{TaskRegistry, TaskRegistryRuntimeController};
 use rebon_provider::provider_runtime_cache::ProviderRuntimeCache;
 use rebon_session::{HeldSessionLock, SessionActiveLock, TranscriptEntry};
 use rebon_tool::{
-    AgentRegistry, ExternalSubAgentRunner, McpClient, SessionCronStore, SharedCoordinatorMode,
-    SharedToolFilter, SubAgentRuntimeHandle, SubAgentSpawner, SubAgentSpawnerRequest,
-    TaskRuntimeController, TeamManager, TeamManagerRequest, ToolFilter, UnavailableSubAgentSpawner,
+    AgentRegistry, McpClient, SessionCronStore, SharedCoordinatorMode, SharedToolFilter,
+    SubAgentRuntimeHandle, SubAgentSpawner, SubAgentSpawnerRequest, TaskRuntimeController,
+    TeamManager, TeamManagerRequest, ToolFilter, UnavailableSubAgentSpawner,
 };
 use rebon_types::{AgentCapabilityMode, ModelProfileMap, SubAgentModelConfig};
 use std::path::{Path, PathBuf};
@@ -751,7 +751,8 @@ fn bind_session_record(
     // where a session made before handles existed gets one. A mirror holds no
     // lock and writes nothing: the name belongs to whoever does.
     if session_active_lock.is_some() {
-        if let Err(error) = rebon_session::ensure_session_handle(&projects_root(), &cwd, &session_id)
+        if let Err(error) =
+            rebon_session::ensure_session_handle(&projects_root(), &cwd, &session_id)
         {
             tracing::warn!(
                 session_id = %session_id,
@@ -1333,9 +1334,12 @@ async fn bind_session_kernel(req: SessionKernelRequest<'_>) -> SessionKernelBind
         coordinator_use_worktree: req.coordinator_use_worktree,
         file_history_tracker: Some(Arc::new(req.worker_file_history_tracker.clone())
             as Arc<dyn rebon_agent_core::file_history::FileHistoryTracker>),
-        external_runner: req
-            .acp_subagent_pool
-            .map(|pool| pool as Arc<dyn ExternalSubAgentRunner>),
+        // `@name` specs go to the session's agent group, the rest to the
+        // ACP pool.
+        external_runner: Some(crate::group_member_runner::external_runner(
+            req.acp_subagent_pool,
+            req.session_id,
+        )),
     })
     .unwrap_or_else(|| Arc::new(UnavailableSubAgentSpawner));
     let task_notification_poller =

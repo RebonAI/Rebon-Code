@@ -36,8 +36,15 @@ use rebon_types::SubAgentModelConfig;
 /// provider-hint spelling, a different axis), and must not be an
 /// inherit sentinel. An empty or sentinel model part means "the agent's
 /// default model".
+///
+/// `@name` needs no colon: it names a member of the session's agent group
+/// (`@Ada`) or a new member of an agent (`@codex`), which bring their own
+/// model — `@codex:gpt-5` still names one.
 pub fn parse_external_model_spec(raw: &str) -> Option<(&str, Option<&str>)> {
     let trimmed = raw.trim();
+    if trimmed.starts_with('@') && !trimmed.contains(':') {
+        return (trimmed.len() > 1 && !trimmed.contains('/')).then_some((trimmed, None));
+    }
     let (prefix, model) = trimmed.split_once(':')?;
     let prefix = prefix.trim();
     if prefix.is_empty() || prefix.contains('/') || is_sentinel(prefix) {
@@ -285,6 +292,16 @@ mod tests {
         );
         assert_eq!(parse_external_model_spec("inherit"), None);
         assert_eq!(parse_external_model_spec(":model"), None);
+        assert_eq!(
+            parse_external_model_spec(" @codex "),
+            Some(("@codex", None)),
+            "a group address needs no colon"
+        );
+        assert_eq!(
+            parse_external_model_spec("@codex:gpt-5"),
+            Some(("@codex", Some("gpt-5")))
+        );
+        assert_eq!(parse_external_model_spec("@"), None);
         // Model ids containing colons after a slashless prefix parse
         // structurally; whether they route depends on the resolver.
         assert_eq!(
