@@ -11,7 +11,7 @@ column gets, and a longer line is cut off.
 ## 1.31.0
 
 - Memory saved unasked, right folder
-- Router workers share project memory
+- Workers share project memory
 - Router remembers across restarts
 - Memory work folds to one line
 
