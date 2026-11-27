@@ -223,7 +223,23 @@ fn upsert_memory(
 
     let generated_name = format!("{}-{}.md", memory_type.as_str(), slugify(&title));
     let target_name = match input.target_file.as_deref() {
-        Some(raw) => validate_target_file(raw)?,
+        // An update of a memory this scope has. A name it does not have is a
+        // memory from somewhere else — the router read its own memory and
+        // wrote the update into a project's — and writing it here would
+        // leave the real one stale beside a copy.
+        Some(raw) => {
+            let name = validate_target_file(raw)?;
+            if !memory_dir.join(&name).is_file() {
+                return Err(SaveMemoryError::Validation(format!(
+                    "`target_file` `{name}` names no memory in {}: it updates a memory this \
+                     scope already has. Read this scope's index for the name, check `scope` and \
+                     `project` are the ones you read it from, or leave `target_file` out to add \
+                     a new memory.",
+                    memory_dir.display()
+                )));
+            }
+            name
+        }
         None => match find_dedupe_match(
             &memory_dir,
             input.dedupe_key.as_deref(),
@@ -712,6 +728,33 @@ mod tests {
         assert!(content.contains("source: explicit_user_request"));
         let index = fs::read_to_string(outcome.index_path).unwrap();
         assert_eq!(index, "- [User Pref](user-user-pref.md) — one-line hook\n");
+    }
+
+    /// `target_file` updates a memory the scope has; a name it does not have
+    /// is refused rather than written as a new file beside the real one.
+    #[test]
+    fn target_file_must_name_a_memory_the_scope_has() {
+        let _env = EnvGuard::new();
+        let created = save_memory(Some("/repo"), upsert(MemoryScope::User, "User Pref")).unwrap();
+        let name = created
+            .memory_path
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let mut update = upsert(MemoryScope::User, "User Pref");
+        update.target_file = Some(name.clone());
+        update.content = Some("Updated body".to_string());
+        assert_eq!(
+            save_memory(Some("/repo"), update).unwrap().status,
+            "updated"
+        );
+
+        let mut elsewhere = upsert(MemoryScope::Repo, "User Pref");
+        elsewhere.target_file = Some(name);
+        let error = save_memory(Some("/some/project"), elsewhere).unwrap_err();
+        assert!(error.to_string().contains("names no memory"), "{error}");
     }
 
     /// Titles in Chinese no longer share a file: each names its own, the same
