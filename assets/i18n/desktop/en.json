@@ -1579,6 +1579,8 @@
   "SidebarProjectTags": "Tags",
   "SidebarProjectTagsPlaceholder": "New tag, Enter to add",
   "SidebarMoveToFolder": "Move to folder",
+  "SidebarOpenIn": "Open in",
+  "SidebarMore": "More",
   "SidebarFolderNone": "Not in a folder",
   "SidebarFolderNewPlaceholder": "New folder name, Enter to create",
   "SidebarFolderSubtitle": "Folder · {count} projects",

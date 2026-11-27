@@ -1579,6 +1579,8 @@
   "SidebarProjectTags": "タグ",
   "SidebarProjectTagsPlaceholder": "新しいタグ（Enter で追加）",
   "SidebarMoveToFolder": "フォルダーに移動",
+  "SidebarOpenIn": "アプリで開く",
+  "SidebarMore": "その他",
   "SidebarFolderNone": "フォルダーに入れない",
   "SidebarFolderNewPlaceholder": "新しいフォルダー名（Enter で作成）",
   "SidebarFolderSubtitle": "フォルダー · プロジェクト {count} 件",

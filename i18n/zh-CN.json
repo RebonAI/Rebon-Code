@@ -1579,6 +1579,8 @@
   "app.SidebarProjectTags": "标签",
   "app.SidebarProjectTagsPlaceholder": "新标签，回车添加",
   "app.SidebarMoveToFolder": "移到文件夹",
+  "app.SidebarOpenIn": "打开方式",
+  "app.SidebarMore": "更多",
   "app.SidebarFolderNone": "不放在文件夹里",
   "app.SidebarFolderNewPlaceholder": "新文件夹名称，回车创建",
   "app.SidebarFolderSubtitle": "文件夹 · {count} 个项目",
