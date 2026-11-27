@@ -5253,6 +5253,7 @@ dependencies = [
  "rebon-config",
  "rebon-core",
  "rebon-dialog",
+ "rebon-group",
  "rebon-instructions",
  "rebon-kernel",
  "rebon-session",

@@ -5,7 +5,9 @@
 //! and to update a memory instead of adding a near-duplicate beside it, or
 //! to brief a worker with what a project already knows, it has to see what
 //! is there. This is that window, and nothing more: the `MEMORY.md` index,
-//! or one memory it lists, of user memory or of one project's repo memory.
+//! or one memory it lists, of user memory or of one project's repo memory —
+//! or what the router's workers in a project kept in that project's router
+//! group (`rebon_group::router`), which the router is not a member of.
 
 use crate::memory::save::{parse_scope, validate_memory_file_name};
 use crate::save_memory::{memory_cwd, project_problem};
@@ -33,6 +35,8 @@ struct ReadRequest {
     project: Option<String>,
     /// `None` is the index itself.
     file: Option<String>,
+    /// Scope `group`: the project whose router group's memory to read.
+    group_of: Option<String>,
 }
 
 #[async_trait]
@@ -46,9 +50,11 @@ impl Tool for ReadMemoryTool {
          index of user memory (scope `user`) or of a project's repo memory (scope `repo`); with \
          `file`, one memory the index lists. Naming `MEMORY.md` also means the index. `project` \
          is the absolute path of the project whose repo memory to read, and takes no part in \
-         scope `user`, which is the person's memory and the same for every project. Read a \
-         project's memory before saving to it, so you update a memory instead of adding one \
-         beside it, and before briefing a worker there."
+         scope `user`, which is the person's memory and the same for every project. Scope \
+         `group`, with `project`, returns what the router's workers in that project kept in its \
+         router group: one list of facts, no `file`. Read a project's memory before saving to \
+         it, so you update a memory instead of adding one beside it, and before briefing a \
+         worker there."
     }
 
     fn input_schema(&self) -> ToolInputSchema {
@@ -57,12 +63,12 @@ impl Tool for ReadMemoryTool {
             "properties": {
                 "scope": {
                     "type": "string",
-                    "enum": ["user", "repo"],
-                    "description": "Whose memory: the person's (`user`) or a project's (`repo`)."
+                    "enum": ["user", "repo", "group"],
+                    "description": "Whose memory: the person's (`user`), a project's (`repo`), or what the workers in a project kept in its router group (`group`)."
                 },
                 "project": {
                     "type": ["string", "null"],
-                    "description": "Only with scope `repo`: the absolute path of the project whose memory to read. Omit it or pass null for the project this session runs in. Never pass it with scope `user`."
+                    "description": "With scope `repo`: the absolute path of the project whose memory to read; omit it or pass null for the project this session runs in. With scope `group`: the project, required. Never pass it with scope `user`."
                 },
                 "file": {
                     "type": ["string", "null"],
@@ -104,6 +110,9 @@ impl Tool for ReadMemoryTool {
 
     async fn call(&self, input: Value, context: &ToolContext) -> ToolResult<Value> {
         let request = parse_input(&input)?;
+        if let Some(project) = request.group_of.as_deref() {
+            return Ok(read_group_memory(project));
+        }
         let dir = memory_dir(&request, context)?;
         let path = dir.join(request.file.as_deref().unwrap_or(ENTRYPOINT_NAME));
         let content = match std::fs::read_to_string(&path) {
@@ -144,6 +153,30 @@ fn clip(text: String) -> String {
     clipped
 }
 
+/// The project's router group memory, as its MEMORY.md has it.
+fn read_group_memory(project: &str) -> Value {
+    let store = rebon_group::GroupStore::new(rebon_group::default_root(
+        &rebon_session::config_home::default_config_home_dir(),
+    ));
+    let group = store
+        .find(project, rebon_group::router::GROUP_NAME)
+        .ok()
+        .flatten();
+    let Some(group) = group else {
+        return json!({
+            "content": "This project has no router group yet: no worker the router sent there has kept anything.",
+        });
+    };
+    let path = store.memory_path(&group.id);
+    let content = std::fs::read_to_string(&path)
+        .map(clip)
+        .unwrap_or_else(|_| "Nothing is kept in this group's memory yet.".to_string());
+    json!({
+        "path": path.to_string_lossy(),
+        "content": content,
+    })
+}
+
 fn parse_input(input: &Value) -> ToolResult<ReadRequest> {
     let object = input
         .as_object()
@@ -156,6 +189,35 @@ fn parse_input(input: &Value) -> ToolResult<ReadRequest> {
         }
     };
     let scope = string("scope")?.ok_or_else(|| invalid("ReadMemory requires `scope`".into()))?;
+    if scope.trim().eq_ignore_ascii_case("group") {
+        let project = string("project")?
+            .map(|project| project.trim().to_string())
+            .filter(|project| !project.is_empty())
+            .ok_or_else(|| {
+                invalid(
+                    "scope `group` needs `project`: the project whose router group to read".into(),
+                )
+            })?;
+        if let Some(why) = project_problem(MemoryScope::Repo, &project) {
+            return Err(invalid(why));
+        }
+        if string("file")?
+            .as_deref()
+            .and_then(|file| read_file_name(file).ok())
+            .flatten()
+            .is_some()
+        {
+            return Err(invalid(
+                "scope `group` is one list of facts; leave `file` out".into(),
+            ));
+        }
+        return Ok(ReadRequest {
+            scope: MemoryScope::Repo,
+            project: None,
+            file: None,
+            group_of: Some(project),
+        });
+    }
     let scope = parse_scope(&scope).map_err(|error| invalid(error.to_string()))?;
     let project = string("project")?;
     if let Some(why) = project
@@ -172,6 +234,7 @@ fn parse_input(input: &Value) -> ToolResult<ReadRequest> {
         scope,
         project,
         file,
+        group_of: None,
     })
 }
 
@@ -497,6 +560,69 @@ mod tests {
                     }
                 ),
                 "{call}: {error:?}"
+            );
+        }
+    }
+
+    /// Scope `group` shows what the workers in a project kept in its router
+    /// group, which the router reads without being a member.
+    #[tokio::test]
+    async fn the_router_reads_what_a_projects_workers_kept() {
+        let _home = Home::new();
+        let workspace = tempfile::tempdir().unwrap();
+        let context = router(&workspace);
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path().to_string_lossy().into_owned();
+        let call = json!({"scope": "group", "project": project_path, "file": null});
+
+        let empty = ReadMemoryTool.call(call.clone(), &context).await.unwrap();
+        assert!(empty["content"]
+            .as_str()
+            .unwrap()
+            .contains("no router group yet"));
+
+        let groups = rebon_group::GroupStore::new(rebon_group::default_root(
+            &rebon_session::config_home::default_config_home_dir(),
+        ));
+        let group = rebon_group::router::join_worker(&groups, &project_path, "s1", "Fix CI")
+            .unwrap()
+            .unwrap();
+        groups
+            .append(
+                &group.id,
+                &rebon_group::model::MemberKey {
+                    agent: rebon_group::AgentKind::REBON.into(),
+                    session_id: "s1".into(),
+                },
+                rebon_group::store::Draft {
+                    kind: rebon_group::EntryKind::Memory,
+                    to: None,
+                    re: None,
+                    supersedes: None,
+                    text: "CI needs the macOS runner for the DSH job".into(),
+                },
+            )
+            .unwrap();
+        let read = ReadMemoryTool.call(call.clone(), &context).await.unwrap();
+        assert!(
+            read["content"]
+                .as_str()
+                .unwrap()
+                .contains("CI needs the macOS runner for the DSH job"),
+            "{read}"
+        );
+
+        for refused in [
+            json!({"scope": "group"}),
+            json!({"scope": "group", "project": "relative"}),
+            json!({"scope": "group", "project": project_path, "file": "notes.md"}),
+        ] {
+            assert!(
+                ReadMemoryTool
+                    .call(refused.clone(), &context)
+                    .await
+                    .is_err(),
+                "{refused}"
             );
         }
     }

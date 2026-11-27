@@ -17,6 +17,8 @@ rebon-tool.workspace = true
 rebon-tools-core.workspace = true
 rebon-types.workspace = true
 rebon-instructions.workspace = true
+# What the workers in a project kept in its router group, for ReadMemory.
+rebon-group.workspace = true
 rebon-session.workspace = true
 # The `settings.json` chain the `autoMemoryEnabled` switch is read through:
 # which files, in which order, and which one is the user layer in cowork mode.
