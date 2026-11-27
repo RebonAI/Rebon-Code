@@ -3023,6 +3023,8 @@ fn apply_background_ceo_command(session: &mut crate::EngineSession, prompt: &mut
         // app matches its echo of the sent message against it.
         let reminder = if rest.is_empty() {
             "You are now online as the router. Say so in one short line and wait for the person; do nothing else this turn."
+        } else if rest.contains(crate::router_handoff::HANDOFF_MARKER) {
+            "You are now online as the router, in place of one that stopped. Read the handoff below: it is how your conversation with the person ended. Tell the person in one short line that you are back and what you are picking up, then carry on with what was in flight."
         } else {
             "You are now online as the router. Handle the request after /router."
         };

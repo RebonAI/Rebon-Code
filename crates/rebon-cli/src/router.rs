@@ -179,10 +179,22 @@ fn ensure(
     let workspace = workspace(store, resident);
     std::fs::create_dir_all(&workspace)?;
     let (provider, model) = resident_identity();
-    let job = crate::background::launch_background_prompt(
-        store,
-        launch_options(resident, &workspace, provider, model),
-    )?;
+    let mut options = launch_options(resident, &workspace, provider, model);
+    // A new router hears how the last one's conversation with the person
+    // ended; its memory and ledger carry the rest.
+    if resident == ROUTER {
+        if let Some(handoff) =
+            crate::session::router_handoff::handoff(store, &rebon_harness::projects_root())
+        {
+            options.prompt = format!(
+                "{}
+
+{handoff}",
+                options.prompt
+            );
+        }
+    }
+    let job = crate::background::launch_background_prompt(store, options)?;
     let record = Record {
         job_id: job.identity.job_id.clone(),
     };
