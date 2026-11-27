@@ -302,16 +302,22 @@ fn build_lean_memory_prompt(
     let mut lines = vec![
         "# Memory".to_string(),
         format!(
-            "Memory persists across sessions: user scope applies everywhere, repo scope to this \
-             repository (directories below). {save}"
+            "Memory persists across sessions in two folders (below): user scope for what holds \
+             in every project, repo scope for this project only. {save}"
         ),
-        "Save lasting user preferences, feedback on how to work, non-obvious project context, \
-         and pointers to external resources. Never save task progress or what the repository \
-         already records (code, git history, fixes, REBON.md), even when asked; say why instead."
+        "Save unasked, the moment the user or the work shows you something lasting:\n\
+         - user: who they are (role, expertise, languages, tools); how they want you to work \
+         (preferences, corrections, \"always\", \"never\", \"from now on\"); language and style.\n\
+         - repo: rules they state for this project, even before the code shows them; how it \
+         builds, tests, releases; decisions and why; where things live; a gotcha you hit and \
+         fixed (a missing file, an env var, a flag a step needed).\n\
+         Would it hold in another project too? Then user. \"Just reply OK\" limits the reply, \
+         not the save. Update the memory on the same topic rather than add one. \
+         Never save task progress or what the repository already records (code, git history, \
+         REBON.md), nor one-off requests."
             .to_string(),
-        "Memories can be stale: check that a named file, function, or flag still exists before \
-         relying on it, and trust what you observe now. Consult memory when the user asks you \
-         to recall something; if told to ignore memory, act as if it were empty."
+        "Memories can be stale: check a named file, function, or flag still exists before \
+         relying on it; if told to ignore memory, act as if it were empty."
             .to_string(),
     ];
     for entrypoint in entrypoints {

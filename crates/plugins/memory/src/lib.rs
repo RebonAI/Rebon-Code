@@ -46,6 +46,7 @@ use rebon_ui_seat::{DialogDef, UiSeatService};
 pub mod attachments;
 pub mod dialog;
 pub mod memory;
+pub mod memory_nudge;
 pub mod prompt_section;
 pub mod read_memory;
 pub mod save_memory;
@@ -64,6 +65,8 @@ pub use update_hook::{MemoryUpdateNotification, MEMORY_NOTIFICATION_FIELD};
 pub const PLUGIN_ID: &str = "memory";
 
 const PROVIDER_ID: &str = "memory";
+/// The save reminder's seat entry, beside the nested-memory one.
+const MEMORY_NUDGE_PROVIDER_ID: &str = "memory-nudge";
 
 /// The two tools: `SaveMemory`, and `ReadMemory` for the router, which has
 /// no file tools (other sessions' filters deny it; see
@@ -128,6 +131,14 @@ impl Plugin for MemoryPlugin {
             PROVIDER_ID,
             Order::Context,
             Arc::new(NestedMemoryProducer),
+        )?;
+        // A reminder to save, right after a message that looks like it says
+        // something lasting: [`Order::Reminder`], once the rest is said.
+        attachment_seat.register(
+            ctx,
+            MEMORY_NUDGE_PROVIDER_ID,
+            Order::Reminder,
+            Arc::new(memory_nudge::MemoryNudgeProducer),
         )?;
 
         // The auto-`MEMORY.md` prompt section: `Rung::Memory`, rank 40 of the
@@ -362,7 +373,10 @@ mod tests {
             .expect("the attachment seat is on the root");
         assert_eq!(
             attachment_seat.provider_ids(),
-            vec![PROVIDER_ID.to_string()]
+            vec![
+                PROVIDER_ID.to_string(),
+                MEMORY_NUDGE_PROVIDER_ID.to_string()
+            ]
         );
 
         registry
@@ -373,7 +387,10 @@ mod tests {
         registry.set_enabled(PLUGIN_ID, true).expect("and back");
         assert_eq!(
             attachment_seat.provider_ids(),
-            vec![PROVIDER_ID.to_string()]
+            vec![
+                PROVIDER_ID.to_string(),
+                MEMORY_NUDGE_PROVIDER_ID.to_string()
+            ]
         );
     }
 }

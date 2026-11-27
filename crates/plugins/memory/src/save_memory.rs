@@ -310,9 +310,10 @@ fn scope_as_str(scope: rebon_session::memory_paths::MemoryScope) -> &'static str
 
 /// Provider-visible description under the lean prompt profile.
 const LEAN_DESCRIPTION: &str =
-    "Save (`upsert`) or `delete` a durable memory. Use it for lasting user preferences, \
-feedback, non-obvious project context, or external references; never for task progress or \
-what the repository already records, even when asked. Upsert needs `type`, `title`, \
+    "Save (`upsert`) or `delete` a durable memory. Call it on your own the moment you learn \
+something lasting, before you go on: scope `user` for what holds in every project (who the user is, how they want \
+you to work), scope `repo` for this project's rules, conventions, decisions and gotchas. Never \
+for task progress or what the repository already records. Upsert needs `type`, `title`, \
 `description` (the one-line MEMORY.md hook), and `content`; delete needs `target_file` or \
 `title`.";
 
