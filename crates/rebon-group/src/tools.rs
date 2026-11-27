@@ -413,10 +413,10 @@ fn inbox(ctx: &mut ToolContext<'_>, args: InboxArgs) -> Result<Value> {
 }
 
 fn entry_json(entry: &Entry, full: bool) -> Value {
-    let text = if full {
-        entry.text.clone()
-    } else {
-        summarize(&entry.text)
+    let text = match entry.supersedes.filter(|_| entry.is_retirement()) {
+        Some(retired) => format!("Fact #{retired} no longer holds: retired from the memory."),
+        None if full => entry.text.clone(),
+        None => summarize(&entry.text),
     };
     json!({
         "seq": entry.seq,

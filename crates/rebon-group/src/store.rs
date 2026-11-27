@@ -601,6 +601,69 @@ impl GroupStore {
         })
     }
 
+    /// Records `text` in the group's memory as the user's ([`USER`]), from
+    /// the desktop app: a new fact, or with `replaces` the new version of a
+    /// fact the memory holds.
+    pub fn remember_as_user(&self, id: &str, text: &str, replaces: Option<u64>) -> Result<Entry> {
+        let text = text.trim();
+        if text.is_empty() {
+            bail!("nothing to remember");
+        }
+        self.user_memory_entry(id, text.to_string(), replaces)
+    }
+
+    /// Takes the fact `seq` out of the group's memory, as the user: the log
+    /// keeps it and its retirement, and members are told it no longer holds
+    /// ([`Entry::is_retirement`]).
+    pub fn retire_as_user(&self, id: &str, seq: u64) -> Result<Entry> {
+        self.user_memory_entry(id, String::new(), Some(seq))
+    }
+
+    fn user_memory_entry(&self, id: &str, text: String, replaces: Option<u64>) -> Result<Entry> {
+        check_id(id)?;
+        self.with_lock(id, || {
+            let dir = self.dir(id);
+            let path = dir.join(GROUP_FILE);
+            let mut file = read_group_file(&path)?;
+            if let Some(seq) = replaces {
+                if !effective_memory(read_log(&dir)?)
+                    .iter()
+                    .any(|fact| fact.seq == seq)
+                {
+                    bail!("#{seq} is not a fact in this group's memory");
+                }
+            }
+            let entry = self.append_locked(
+                id,
+                &mut file,
+                USER,
+                Draft {
+                    kind: EntryKind::Memory,
+                    to: None,
+                    re: None,
+                    supersedes: replaces,
+                    text,
+                },
+            )?;
+            write_json(&path, &file)?;
+            let memory = effective_memory(read_log(&dir)?);
+            write_text(&dir.join(MEMORY_FILE), &render_memory(&file.group, &memory))?;
+            Ok(entry)
+        })
+    }
+
+    /// The retirements after `seq`, oldest first: facts taken out of the
+    /// memory since, which a member that had them should hear about.
+    pub fn retirements_after(&self, id: &str, seq: u64) -> Result<Vec<Entry>> {
+        check_id(id)?;
+        self.with_lock(id, || {
+            Ok(read_log(&self.dir(id))?
+                .into_iter()
+                .filter(|entry| entry.seq > seq && entry.is_retirement())
+                .collect())
+        })
+    }
+
     /// Appends under a lock the caller holds, and bumps `last_seq` in the
     /// caller's copy of the group file, which the caller writes back.
     fn append_locked(
@@ -823,7 +886,8 @@ impl GroupStore {
     }
 }
 
-/// Memory entries that nothing later replaced.
+/// Memory entries that nothing later replaced or retired, without the
+/// retirements themselves.
 fn effective_memory(entries: Vec<Entry>) -> Vec<Entry> {
     let memory: Vec<Entry> = entries
         .into_iter()
@@ -832,7 +896,7 @@ fn effective_memory(entries: Vec<Entry>) -> Vec<Entry> {
     let superseded: Vec<u64> = memory.iter().filter_map(|entry| entry.supersedes).collect();
     memory
         .into_iter()
-        .filter(|entry| !superseded.contains(&entry.seq))
+        .filter(|entry| !superseded.contains(&entry.seq) && !entry.is_retirement())
         .collect()
 }
 

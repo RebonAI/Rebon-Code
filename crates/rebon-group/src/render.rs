@@ -178,6 +178,11 @@ fn memory_block(memory: &[Entry], whole: bool) -> Option<String> {
 
 fn fact_tag(fact: &Entry) -> String {
     let mut attrs = format!(" n=\"{}\" from=\"{}\"", fact.seq, escape_attr(&fact.from));
+    if let Some(retired) = fact.supersedes.filter(|_| fact.is_retirement()) {
+        return format!(
+            "<group-fact{attrs} retires=\"{retired}\">Fact {retired} no longer holds; leave it out.</group-fact>"
+        );
+    }
     if let Some(replaces) = fact.supersedes {
         attrs.push_str(&format!(" replaces=\"{replaces}\""));
     }

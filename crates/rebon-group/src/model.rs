@@ -185,6 +185,14 @@ impl Entry {
     pub fn is_from_user(&self) -> bool {
         self.from.eq_ignore_ascii_case(USER)
     }
+
+    /// A memory entry that takes the fact it supersedes out of the memory
+    /// without putting a new version in its place: no text, only the fact
+    /// it retires. It is in the log, so members hear the fact no longer
+    /// holds, but never in the memory itself.
+    pub fn is_retirement(&self) -> bool {
+        self.kind == EntryKind::Memory && self.supersedes.is_some() && self.text.trim().is_empty()
+    }
 }
 
 /// Entries reaching a member, and by which way. One line of

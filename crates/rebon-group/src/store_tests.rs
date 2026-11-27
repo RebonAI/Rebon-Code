@@ -252,6 +252,56 @@ fn memory_drops_what_was_superseded_and_is_written_out() {
 }
 
 #[test]
+fn the_user_adds_corrects_and_retires_facts() {
+    let (_dir, store, group) = pair();
+    let agents = store
+        .append(
+            &group.id,
+            &key("rebon", "s1"),
+            memory("deploys on friday", None),
+        )
+        .unwrap();
+    let added = store
+        .remember_as_user(&group.id, "  ask before force-pushing  ", None)
+        .unwrap();
+    assert!(added.is_from_user() && !added.is_retirement());
+    assert_eq!(added.text, "ask before force-pushing");
+    let corrected = store
+        .remember_as_user(&group.id, "never force-push main", Some(added.seq))
+        .unwrap();
+    let retired = store.retire_as_user(&group.id, agents.seq).unwrap();
+    assert!(retired.is_retirement() && retired.is_from_user());
+
+    let facts: Vec<(u64, String)> = store
+        .memory(&group.id)
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.seq, e.text))
+        .collect();
+    assert_eq!(
+        facts,
+        vec![(corrected.seq, "never force-push main".to_string())]
+    );
+    let retirements = store.retirements_after(&group.id, 0).unwrap();
+    assert_eq!(retirements.len(), 1);
+    assert_eq!(retirements[0].supersedes, Some(agents.seq));
+    let document = std::fs::read_to_string(store.memory_path(&group.id)).unwrap();
+    assert!(document.contains("never force-push main"), "{document}");
+    assert!(!document.contains("deploys on friday"), "{document}");
+
+    // Only a fact the memory holds can be corrected or retired, and a fact
+    // needs words.
+    for seq in [agents.seq, added.seq, retired.seq, 999] {
+        assert!(store.retire_as_user(&group.id, seq).is_err(), "#{seq}");
+        assert!(
+            store.remember_as_user(&group.id, "x", Some(seq)).is_err(),
+            "#{seq}"
+        );
+    }
+    assert!(store.remember_as_user(&group.id, "   ", None).is_err());
+}
+
+#[test]
 fn a_torn_last_line_does_not_stop_readers() {
     let (_dir, store, group) = pair();
     store

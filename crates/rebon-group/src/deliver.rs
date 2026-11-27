@@ -81,18 +81,28 @@ pub fn pending_with(store: &GroupStore, member: &MemberKey, fresh: bool) -> Opti
         .collect();
     let brief = fresh || !cursor.briefed;
     let facts = store.memory(&group.id).ok()?;
-    // The newest fact is never superseded, so the newest effective fact is
-    // the newest one recorded.
+    // Facts taken out since: news to a member that had them, nothing to one
+    // briefed on the memory as it stands.
+    let retired = store.retirements_after(&group.id, cursor.memory).ok()?;
+    // The newest fact is never superseded, so the newest memory entry is the
+    // newest effective fact or the newest retirement.
     let memory_through = facts
-        .last()
-        .map_or(cursor.memory, |fact| fact.seq.max(cursor.memory));
+        .iter()
+        .chain(&retired)
+        .map(|entry| entry.seq)
+        .max()
+        .map_or(cursor.memory, |seq| seq.max(cursor.memory));
     let memory: Vec<Entry> = if brief {
         facts
     } else {
-        facts
+        let mut news: Vec<Entry> = facts
             .into_iter()
-            .filter(|fact| fact.seq > cursor.memory && !fact.from.eq_ignore_ascii_case(&alias))
-            .collect()
+            .filter(|fact| fact.seq > cursor.memory)
+            .chain(retired)
+            .filter(|entry| !entry.from.eq_ignore_ascii_case(&alias))
+            .collect();
+        news.sort_by_key(|entry| entry.seq);
+        news
     };
     let pending = Pending {
         group,
@@ -406,6 +416,31 @@ mod tests {
             .expect("终端派活不能吞掉尚未注入的共享记忆");
         assert!(output.to_string().contains("shared-api-v2"));
         assert!(hook_output(&store, "claude-code", &input("PostToolUse")).is_none());
+    }
+
+    #[test]
+    fn a_fact_the_user_retires_is_news_to_a_briefed_member_and_gone_for_a_new_one() {
+        let (_dir, store, group) = setup(Delivery::Auto);
+        let old = remember(&store, &group, "deploy-on-friday", None);
+        let key = member("claude-code", "aa38", "coder", Delivery::Auto).key();
+        let briefing = pending(&store, &key).unwrap();
+        assert!(delivered(&store, &key, &briefing, Via::Attachment));
+
+        store.retire_as_user(&group, old.seq).unwrap();
+        let news = pending(&store, &key).unwrap();
+        assert!(!news.brief);
+        assert_eq!(news.memory.len(), 1);
+        assert!(news.memory[0].is_retirement());
+        let text = crate::render::context(&news).unwrap();
+        assert!(text.contains(&format!("retires=\"{}\"", old.seq)), "{text}");
+        assert!(delivered(&store, &key, &news, Via::Attachment));
+        assert!(pending(&store, &key).is_none());
+
+        let fresh = pending_with(&store, &key, true).unwrap();
+        assert!(fresh.memory.is_empty());
+        assert!(!crate::render::context(&fresh)
+            .unwrap()
+            .contains("deploy-on-friday"));
     }
 
     #[test]
