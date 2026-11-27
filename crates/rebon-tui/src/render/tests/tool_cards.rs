@@ -3314,6 +3314,94 @@ fn memory_tools_fold_into_one_counted_line() {
     );
 }
 
+/// One memory kept is still one line, not a card with its content.
+#[test]
+fn a_lone_memory_write_folds_too() {
+    let mut overlay = StreamingOverlay::new();
+    overlay.upsert_streaming_tool_use(streaming_tool(
+        "w1",
+        "SaveMemory",
+        ToolKind::Edit,
+        ToolCallStatus::Completed,
+        vec![
+            ("action", json!("upsert")),
+            ("scope", json!("user")),
+            ("title", json!("Answer in Chinese")),
+            ("content", json!("Reply in Chinese, comments in English")),
+        ],
+    ));
+    let mut buf = new_buf(120, 8);
+    render_streaming_overlay(
+        &overlay,
+        Rect::new(0, 0, 120, 8),
+        &mut buf,
+        &RenderTheme::plain(),
+        ToolOutputVerbosity::Compact,
+    );
+    let snap = (0..8).map(|y| row_text(&buf, y)).collect::<Vec<_>>().join(
+        "
+",
+    );
+    assert!(snap.contains("Wrote 1 memory"), "{snap:?}");
+    assert!(snap.contains("Ctrl+O to expand"), "{snap:?}");
+    assert!(
+        !snap.contains("Reply in Chinese, comments in English"),
+        "{snap:?}"
+    );
+}
+
+/// In scrollback too: a turn that kept one memory shows one line.
+#[test]
+fn a_committed_lone_memory_write_folds() {
+    use crate::state::{reducer, Action};
+    let mut s = AppState::new();
+    reducer(
+        &mut s,
+        Action::Commit(user("u0", "from now on answer in Chinese")),
+    );
+    reducer(
+        &mut s,
+        Action::Commit(assistant_tool_uses(
+            "a1",
+            vec![(
+                "toolu_1",
+                "SaveMemory",
+                json!({
+                    "action": "upsert",
+                    "scope": "user",
+                    "type": "feedback",
+                    "title": "Answer in Chinese",
+                    "content": "Reply in Chinese, comments in English"
+                }),
+            )],
+        )),
+    );
+    reducer(
+        &mut s,
+        Action::Commit(user_tool_results(
+            "u1",
+            vec![("toolu_1", "Saved feedback-answer-in-chinese.md", None)],
+        )),
+    );
+    let mut buf = new_buf(120, 12);
+    render_transcript(
+        &s,
+        Rect::new(0, 0, 120, 12),
+        &mut buf,
+        &RenderTheme::plain(),
+        0,
+        ToolOutputVerbosity::Compact,
+        0,
+        None,
+    );
+    let snap = all_text(&buf);
+    assert!(snap.contains("Wrote 1 memory"), "{snap:?}");
+    assert!(
+        !snap.contains("Reply in Chinese, comments in English"),
+        "{snap:?}"
+    );
+}
+
 #[test]
 fn collapsed_inline_hint_suppresses_trailing_single_tool_hint() {
     let mut overlay = StreamingOverlay::new();

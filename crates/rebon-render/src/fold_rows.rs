@@ -409,6 +409,8 @@ fn build_base_transcript_segments(
             indices.push(head);
         }
         let mut tool_count: usize = head_tools.len();
+        let mut all_memory = classify_message_tool_uses(&head_tools)
+            .is_some_and(|classes| classes.iter().all(ToolClass::is_memory));
         let mut j = head + 1;
         while j < rows.len() {
             if is_meta_user(&rows[j]) {
@@ -426,7 +428,8 @@ fn build_base_transcript_segments(
                 continue;
             }
             if let Some(tools) = tool_only_assistant(&rows[j]) {
-                if classify_message_tool_uses(&tools).is_some() {
+                if let Some(classes) = classify_message_tool_uses(&tools) {
+                    all_memory &= classes.iter().all(ToolClass::is_memory);
                     tool_count += tools.len();
                     indices.push(j);
                     j += 1;
@@ -436,7 +439,8 @@ fn build_base_transcript_segments(
             break;
         }
 
-        if tool_count >= 2 {
+        // A lone memory call folds too: see [`crate::run_folds`].
+        if tool_count >= 2 || (tool_count == 1 && all_memory) {
             segments.push(TranscriptSegment::Collapsed { indices });
         } else {
             for idx in indices {

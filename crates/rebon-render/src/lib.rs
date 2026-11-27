@@ -278,7 +278,8 @@ pub use auto_mode_note::{
 };
 pub use brief::{drop_text_in_brief_turns, filter_for_brief_tool};
 pub use collapse_grouping::{
-    classify_tool_use, command_as_hint, is_collapsible_tool_result, Aggregator, FinalizeParams,
+    classify_tool_use, command_as_hint, is_collapsible_tool_result, run_folds, Aggregator,
+    FinalizeParams,
     MemoryPathPolicy, ResultStatus, RowDecision, ToolClass, MAX_HINT_CHARS,
 };
 pub use collapsed_read_search::{

@@ -219,6 +219,24 @@ impl ToolClass {
     pub fn is_collapsible(&self) -> bool {
         !matches!(self, ToolClass::NotCollapsible)
     }
+
+    /// Memory work: a memory read, search or write.
+    pub fn is_memory(&self) -> bool {
+        matches!(
+            self,
+            ToolClass::MemoryWrite
+                | ToolClass::Read { memory: true, .. }
+                | ToolClass::Search { memory: true, .. }
+        )
+    }
+}
+
+/// Whether a run of collapsible calls folds into one summary line. Two or
+/// more always do; a lone call keeps its own card, except memory work, which
+/// says only how much was done ("Wrote 1 memory") with what was kept behind
+/// the expand hint.
+pub fn run_folds(classes: &[ToolClass]) -> bool {
+    classes.len() >= 2 || (!classes.is_empty() && classes.iter().all(ToolClass::is_memory))
 }
 
 /// Classify a single tool invocation.

@@ -110,7 +110,11 @@ fn build_base_stream_segments<'a>(overlay: &'a StreamingOverlay) -> Vec<StreamSe
                             StreamingContentBlock::Text(_) => break,
                         }
                     }
-                    if run_tools.len() >= 2 {
+                    let classes: Vec<_> = run_tools
+                        .iter()
+                        .map(|tool| classify_streaming_tool(tool))
+                        .collect();
+                    if rebon_render::run_folds(&classes) {
                         segments.push(StreamSegment::Collapsed(CollapsedStreamRun {
                             tools: run_tools,
                             items: run_items,
