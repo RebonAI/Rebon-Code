@@ -37,9 +37,9 @@ Do not keep:
 - what the repository already records: the code itself, commit messages, the project's docs;
 - guesses, or anything the member was not sure of;
 - secrets, credentials, tokens, or contact details;
-- anything the memory already says. When a fact in the memory is no longer true, give the correction with "replaces" set to that fact's number.
+- anything the memory already says, even in other words, and a fact that mostly restates one there. The member often records what it found itself as it works: what it recorded is in the memory above, so do not add it again. When a fact in the memory is no longer true, or a new finding makes one more precise, give the corrected fact with "replaces" set to that fact's number instead of adding one beside it.
 
-Each fact stands on its own, in one or two sentences. Most turns hold nothing new: then answer {"facts": []}. Keep at most 3.
+Each fact stands on its own, in one or two sentences, under 300 characters. Most turns hold nothing new: then answer {"facts": []}. Adding nothing is better than restating. Keep at most 3.
 
 Answer with JSON only, no prose:
 {"facts": [{"text": "the fact", "replaces": null or the number of the fact it corrects}]}"#;

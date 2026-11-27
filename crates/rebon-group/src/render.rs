@@ -151,8 +151,10 @@ pub const ROUTER_WORKER_GUIDE: &str = "This is the group every worker the Rebon 
     into this project joins: the memory above is what earlier workers here kept, and the next \
     worker reads what you keep. Before you finish, keep with group_remember what the next task \
     in this project should not have to find out again: a convention, a gotcha about the code, \
-    build or environment, a decision and its reason. Questions go to the router as your task \
-    says, not to user.";
+    build or environment, a decision and its reason. Keep facts, not reports: never what this \
+    task did, whether it passed, or what only this task needed; the router hears your report \
+    anyway. One short fact per call, and correct a fact (supersedes) rather than add a near \
+    copy. Questions go to the router as your task says, not to user.";
 
 /// The memory facts, whole (`whole`: the memory as it stands) or as the
 /// ones new since the member last heard.
