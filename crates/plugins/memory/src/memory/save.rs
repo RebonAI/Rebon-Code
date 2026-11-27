@@ -535,24 +535,44 @@ fn scope_as_str(scope: MemoryScope) -> &'static str {
     }
 }
 
+/// The file-name part a title gives. A title with letters a file name does
+/// not keep — Chinese, accented — also gets a short hash of itself: without
+/// it every all-Chinese title came out `memory`, and `proj-a 发布规则` and
+/// `proj-a 测试命令` both `proj-a`, so the second upsert overwrote the first.
+/// ASCII titles keep the names they always had, and a memory saved under an
+/// older name is still found by its title.
 fn slugify(title: &str) -> String {
     let mut slug = String::new();
     let mut last_dash = false;
+    let mut dropped_letters = false;
     for ch in title.chars().flat_map(char::to_lowercase) {
         if ch.is_ascii_alphanumeric() {
             slug.push(ch);
             last_dash = false;
-        } else if !last_dash {
-            slug.push('-');
-            last_dash = true;
+        } else {
+            dropped_letters |= ch.is_alphanumeric();
+            if !last_dash {
+                slug.push('-');
+                last_dash = true;
+            }
         }
     }
     let slug = slug.trim_matches('-');
-    if slug.is_empty() {
-        "memory".to_string()
+    let base = if slug.is_empty() { "memory" } else { slug };
+    if dropped_letters {
+        format!("{base}-{:08x}", title_hash(title.trim()) as u32)
     } else {
-        slug.to_string()
+        base.to_string()
     }
+}
+
+/// FNV-1a over the title's bytes: stable across builds and platforms, which
+/// the standard hasher does not promise, so a title names the same file
+/// every time.
+fn title_hash(title: &str) -> u64 {
+    title.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 fn upsert_index_entry(
@@ -692,6 +712,65 @@ mod tests {
         assert!(content.contains("source: explicit_user_request"));
         let index = fs::read_to_string(outcome.index_path).unwrap();
         assert_eq!(index, "- [User Pref](user-user-pref.md) — one-line hook\n");
+    }
+
+    /// Titles in Chinese no longer share a file: each names its own, the same
+    /// title names the same one again, and a memory saved under the old
+    /// name is still found by its title.
+    #[test]
+    fn chinese_titles_each_keep_their_own_file() {
+        let env = EnvGuard::new();
+        let save = |title: &str, content: &str| {
+            let mut req = upsert(MemoryScope::User, title);
+            req.memory_type = Some(MemoryContentType::Feedback);
+            req.dedupe_key = None;
+            req.content = Some(content.to_string());
+            save_memory(Some("/repo"), req).unwrap()
+        };
+        let rules = save("proj-a 发布规则", "发布走 PR");
+        let tests = save("proj-a 测试命令", "cargo nextest run");
+        let prefs = save("用户偏好", "中文回答");
+        let rules_path = rules.memory_path.unwrap();
+        let tests_path = tests.memory_path.unwrap();
+        let prefs_path = prefs.memory_path.unwrap();
+        assert_ne!(rules_path, tests_path);
+        assert!(rules_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("feedback-proj-a-"));
+        assert!(prefs_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("feedback-memory-"));
+        assert!(fs::read_to_string(&rules_path)
+            .unwrap()
+            .contains("发布走 PR"));
+        assert!(fs::read_to_string(&tests_path)
+            .unwrap()
+            .contains("cargo nextest run"));
+
+        let again = save("proj-a 测试命令", "cargo nextest run --workspace");
+        assert_eq!(again.memory_path.unwrap(), tests_path);
+        assert_eq!(again.status, "updated");
+
+        // Saved before the hash, under the bare name: found by its title.
+        let dir = env.config_home_path.join("memory/user");
+        fs::write(
+            dir.join("feedback-memory.md"),
+            "---\nname: '旧偏好'\ndescription: 'old'\ntype: feedback\nscope: user\n---\n\n旧内容\n",
+        )
+        .unwrap();
+        let old = save("旧偏好", "新内容");
+        assert_eq!(old.memory_path.unwrap(), dir.join("feedback-memory.md"));
+        let index = fs::read_to_string(dir.join(ENTRYPOINT_NAME)).unwrap();
+        assert_eq!(index.lines().count(), 4, "{index}");
+        assert_eq!(slugify("Launch Plan"), "launch-plan");
+        assert_eq!(
+            slugify("Café rules"),
+            format!("caf-rules-{:08x}", title_hash("Café rules") as u32)
+        );
     }
 
     #[test]
