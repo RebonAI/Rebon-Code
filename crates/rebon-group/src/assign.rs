@@ -397,11 +397,7 @@ pub struct Assignment<'a> {
 pub fn task_text(title: Option<&str>, task: &str) -> String {
     let task = task.trim();
     match title.map(str::trim).filter(|title| !title.is_empty()) {
-        Some(title) if !task.starts_with(title) => format!(
-            "{title}
-
-{task}"
-        ),
+        Some(title) if !task.starts_with(title) => format!("{title}\n\n{task}"),
         _ => task.to_string(),
     }
 }
@@ -435,7 +431,8 @@ pub fn hand_on(
             .map(|member| member.alias.as_str())
             .collect();
         bail!(
-            "no member called `{target}` in group `{}` (members: {}); a new member is `@rebon`,              `@claudecode` or `@codex`",
+            "no member called `{target}` in group `{}` (members: {}); a new member is \
+             `@rebon`, `@claudecode` or `@codex`",
             group.name,
             if others.is_empty() {
                 "none besides you".to_string()
@@ -474,9 +471,8 @@ pub fn answer_for_asker(reply: &crate::model::Entry) -> String {
     }
     let cut: String = text.chars().take(ANSWER_CHARS).collect();
     format!(
-        "{}…
-
-(Cut here: the whole answer is the reply to {} in the group log —          group_inbox has it.)",
+        "{}…\n\n(Cut here: the whole answer is the reply to {} in the group log — \
+         group_inbox has it.)",
         cut.trim_end(),
         reply.re.as_deref().unwrap_or("the request")
     )
@@ -917,10 +913,7 @@ mod tests {
         assert_eq!(alias, "Ada");
         let posted = store.entries_after(&group.id, seq - 1).unwrap();
         assert_eq!(
-            posted[0].text,
-            "Count the lines
-
-count the lines of auth.rs",
+            posted[0].text, "Count the lines\n\ncount the lines of auth.rs",
             "the title is the request's first line"
         );
         assert_eq!(
@@ -1007,6 +1000,10 @@ count the lines of auth.rs",
         )
         .unwrap_err();
         assert!(format!("{error}").contains("members: Ada, Bo"), "{error}");
+        assert!(
+            format!("{error}").ends_with("a new member is `@rebon`, `@claudecode` or `@codex`"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1029,6 +1026,10 @@ count the lines of auth.rs",
         let long = answer_for_asker(&reply("x".repeat(ANSWER_CHARS + 50)));
         assert!(long.chars().count() < ANSWER_CHARS + 200);
         assert!(long.contains("reply to r8"), "{long}");
+        assert!(
+            long.contains("in the group log — group_inbox has it.)"),
+            "the note reads as one sentence: {long}"
+        );
     }
 
     #[test]
