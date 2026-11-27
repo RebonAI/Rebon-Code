@@ -8,6 +8,13 @@ Each section is a `## <version>` heading followed by one to four `- ` items.
 Keep every item within 36 columns: that is the narrowest the banner's notes
 column gets, and a longer line is cut off.
 
+## 1.31.0
+
+- Memory saved unasked, right folder
+- Router workers share project memory
+- Router remembers across restarts
+- Memory work folds to one line
+
 ## 1.30.0
 
 - Claude chats are cached by default
