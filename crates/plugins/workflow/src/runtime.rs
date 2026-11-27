@@ -3330,6 +3330,19 @@ fn prepare_workflow_subagent_spec(
     spec.system = Some(workflow_subagent_system_prompt(schema));
     spec.execution_policy = workflow_agent_execution_policy(context, schema.is_some());
     apply_agent_options(&mut spec, opts);
+    // Whose step this is, as the Agent tool says it: the spawner binds a
+    // sub-agent to its session's task registry by it, and in a hosted
+    // session has nothing to bind it to without it.
+    if let Some(session_id) = context
+        .session_id()
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())
+    {
+        merge_agent_metadata(
+            &mut spec.metadata,
+            json!({ "parent_session_id": session_id }),
+        );
+    }
     ensure_workflow_task_kind(&mut spec);
     enforce_workflow_child_path_scope(context, &mut spec)?;
     Ok(spec)
@@ -8072,6 +8085,20 @@ return await agent('schema fallback', {
         assert!(structured.contains("FINAL DELIVERY CONTRACT:"));
         assert!(structured.contains("JSON schema:"));
         assert!(structured.find("SHARED WORKTREE SAFETY:") < structured.find("JSON schema:"));
+    }
+
+    #[test]
+    fn workflow_subagent_spec_names_its_session() {
+        let context = ToolContext::new().with_session_id("sess-lead");
+        let spec = prepare_workflow_subagent_spec(&context, "work".into(), 1, false, None, None)
+            .expect("workflow subagent spec");
+        assert_eq!(
+            spec.metadata
+                .get("parent_session_id")
+                .and_then(Value::as_str),
+            Some("sess-lead"),
+            "a hosted session's spawner binds the step to it"
+        );
     }
 
     #[test]
