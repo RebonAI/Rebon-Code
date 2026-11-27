@@ -121,7 +121,7 @@ impl GroupStore {
             bail!("this project already has a group named `{name}`");
         }
         let now = now_ms();
-        let id = format!("g{now:x}{:04x}", std::process::id() & 0xffff);
+        let id = self.claim_dir(&format!("g{now:x}{:04x}", std::process::id() & 0xffff))?;
         let group = Group {
             id: id.clone(),
             name: name.to_string(),
@@ -130,8 +130,6 @@ impl GroupStore {
             members: Vec::new(),
             warmth: Warmth::default(),
         };
-        std::fs::create_dir_all(self.dir(&id))
-            .with_context(|| format!("failed to create {}", self.dir(&id).display()))?;
         self.with_lock(&id, || {
             write_json(
                 &self.dir(&id).join(GROUP_FILE),
@@ -142,6 +140,30 @@ impl GroupStore {
             )
         })?;
         Ok(group)
+    }
+
+    /// Makes the directory of a new group and returns its id: `base`, or
+    /// `base` with a count after it when that is taken. The id is the clock's
+    /// millisecond and the process, so two groups made in the same
+    /// millisecond by one process had the same one, and the second wrote over
+    /// the first. Making the directory is the claim, so two cannot win it.
+    fn claim_dir(&self, base: &str) -> Result<String> {
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("failed to create {}", self.root.display()))?;
+        let mut id = base.to_string();
+        for n in 1u32.. {
+            match std::fs::create_dir(self.dir(&id)) {
+                Ok(()) => return Ok(id),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && n < 4096 => {
+                    id = format!("{base}-{n:x}");
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to create {}", self.dir(&id).display()));
+                }
+            }
+        }
+        unreachable!("the loop returns")
     }
 
     /// Every group, oldest first. A directory without a readable

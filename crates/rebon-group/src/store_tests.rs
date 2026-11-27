@@ -53,6 +53,28 @@ fn pair() -> (tempfile::TempDir, GroupStore, Group) {
     (dir, store, group)
 }
 
+/// Groups made in the same millisecond by one process each keep their own
+/// directory: the id's clock part alone no longer decides it.
+#[test]
+fn groups_made_together_do_not_share_an_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = GroupStore::new(dir.path());
+    let groups: Vec<Group> = (0..40)
+        .map(|n| store.create("g", &format!("/w/p{n}")).unwrap())
+        .collect();
+    let ids: std::collections::HashSet<&str> = groups.iter().map(|g| g.id.as_str()).collect();
+    assert_eq!(ids.len(), groups.len());
+    assert_eq!(store.list().unwrap().len(), groups.len());
+    for group in &groups {
+        assert_eq!(store.find(&group.cwd, "g").unwrap().unwrap().id, group.id);
+    }
+    // The clock cannot be made to repeat here, so the claim itself: an id
+    // whose directory exists moves to the next one.
+    assert_eq!(store.claim_dir("gtaken").unwrap(), "gtaken");
+    assert_eq!(store.claim_dir("gtaken").unwrap(), "gtaken-1");
+    assert_eq!(store.claim_dir("gtaken").unwrap(), "gtaken-2");
+}
+
 #[test]
 fn a_project_has_one_group_of_a_name() {
     let dir = tempfile::tempdir().unwrap();
