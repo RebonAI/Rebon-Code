@@ -53,6 +53,23 @@ pub trait MemoryCapture: Send + Sync {
     /// each memory written or updated, for the log; an answer that is not
     /// in the asked-for shape keeps nothing.
     fn keep(&self, cwd: &Path, answer: &str) -> Vec<String>;
+
+    /// The question for one turn of the router: the resident session the
+    /// person talks to, whose own workspace is `cwd` and which dispatches
+    /// workers into `projects` (the ones the turn named). Its memory spans
+    /// the person, itself and those projects, and most of its turns are
+    /// deliveries — digests, events, progress checks — rather than the
+    /// person's words, so it is asked about all of the turn. `None` when
+    /// this session keeps no memory.
+    fn ask_router(&self, _cwd: &Path, _work: &str, _projects: &[String]) -> Option<CaptureAsk> {
+        None
+    }
+
+    /// Keep what the model answered to [`Self::ask_router`]; a project
+    /// memory goes only to one of `projects`.
+    fn keep_router(&self, _cwd: &Path, _answer: &str, _projects: &[String]) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Typed definition for the kernel's `memory-capture` seat.

@@ -53,6 +53,29 @@ Most stretches hold nothing worth keeping: then answer {"memories": []}. Keep at
 Answer with JSON only, no prose:
 {"memories": [{"scope": "user" or "repo", "type": "feedback" or "user" or "project" or "reference", "title": "short title", "description": "one line saying when this matters", "content": "the fact or rule; for feedback and project add **Why:** and **How to apply:** lines when known", "target_file": "existing-file.md, only when updating one"}]}"#;
 
+pub const ROUTER_CAPTURE_SYSTEM_PROMPT: &str = r#"You keep the long-term memory of Rebon's router: the one assistant the person talks to about everything they have going, which dispatches background workers into the person's projects and follows their work. The router's conversation is compacted as it grows and starts over when the router restarts; this memory is what carries over. You are shown the memory indexes as they stand and the router's latest turn: what the person said, what was delivered to the router (worker digests, events, progress checks), the router's own notes, and what it did and told the person.
+
+Keep, most important first:
+1. scope "user" — the person, in every session they have: preferences, standing instructions, corrections, how they want to be kept posted, decisions and rulings they made. Types feedback or user.
+2. scope "router" — how the router should work for this person, across projects: which projects there are and what each is for, standing arrangements (how a project releases, what needs the person's approval), goals the person keeps pursuing, lessons about running workers (a kind of task that needs a stronger model or a fresh worker, a check that keeps failing for the same reason). Types project, feedback or reference.
+3. scope "project", with "project" set to one of the project directories listed under "Projects in this turn" — what work there taught about that project: how a change is verified, a pitfall a failed check or a rework exposed, a decision, where things live. The project's workers read it.
+
+Do not keep:
+- task status, task or worker ids, progress, or what a single task needed: the router's ledger holds those;
+- worker chatter, or a report's details that matter only to that task;
+- what the router assumed or proposed that the person did not confirm;
+- anything an index already covers: update that memory instead (give its file name as "target_file" and write the merged content);
+- secrets, credentials, tokens, or contact details.
+
+Most turns hold nothing worth keeping: then answer {"memories": []}. Keep at most 3.
+
+Answer with JSON only, no prose:
+{"memories": [{"scope": "user" or "router" or "project", "project": "the project directory, only for scope project", "type": "feedback" or "user" or "project" or "reference", "title": "short title", "description": "one line saying when this matters", "content": "the fact or rule; for feedback and project add **Why:** and **How to apply:** lines when known", "target_file": "existing-file.md, only when updating one"}]}"#;
+
+/// How many projects' indexes a router question carries.
+const MAX_ROUTER_PROJECTS: usize = 3;
+const MAX_PROJECT_INDEX_CHARS: usize = 4_000;
+
 /// The provider the plugin puts on the seat.
 pub struct MemoryCaptureProvider;
 
@@ -67,6 +90,96 @@ impl MemoryCapture for MemoryCaptureProvider {
     fn keep(&self, cwd: &Path, answer: &str) -> Vec<String> {
         keep_answer(cwd, answer)
     }
+
+    fn ask_router(&self, cwd: &Path, work: &str, projects: &[String]) -> Option<CaptureAsk> {
+        if work.trim().is_empty() || !is_auto_memory_enabled(cwd) {
+            return None;
+        }
+        Some(ask_router_for(cwd, work, projects))
+    }
+
+    fn keep_router(&self, cwd: &Path, answer: &str, projects: &[String]) -> Vec<String> {
+        keep_router_answer(cwd, answer, projects)
+    }
+}
+
+fn ask_router_for(cwd: &Path, work: &str, projects: &[String]) -> CaptureAsk {
+    let cwd_text = cwd.to_string_lossy();
+    let user_index = memory_paths::user_memory_dir()
+        .map(|dir| read_index(&dir))
+        .unwrap_or_default();
+    let router_index = memory_paths::repo_memory_dir(&cwd_text)
+        .map(|dir| read_index(&dir))
+        .unwrap_or_default();
+    let mut prompt = format!(
+        "## Memory index, user scope\n{}\n\n## Memory index, router scope\n{}",
+        or_empty(&user_index),
+        or_empty(&router_index),
+    );
+    let projects: Vec<&String> = projects.iter().take(MAX_ROUTER_PROJECTS).collect();
+    if projects.is_empty() {
+        prompt.push_str("\n\n## Projects in this turn\n(none: keep no project memory)");
+    } else {
+        prompt.push_str("\n\n## Projects in this turn");
+        for project in projects {
+            let index = memory_paths::repo_memory_dir(project)
+                .map(|dir| clip(read_index(&dir).trim(), MAX_PROJECT_INDEX_CHARS))
+                .unwrap_or_default();
+            prompt.push_str(&format!(
+                "\n\n### {project}\nMemory index:\n{}",
+                or_empty(&index)
+            ));
+        }
+    }
+    prompt.push_str(&format!("\n\n## The router's latest turn\n{}", work.trim()));
+    CaptureAsk {
+        system: ROUTER_CAPTURE_SYSTEM_PROMPT.to_string(),
+        prompt,
+        max_tokens: 1_500,
+    }
+}
+
+/// [`keep_answer`] for the router: `router` is its own workspace's repo
+/// memory, and `project` a project the turn named.
+pub fn keep_router_answer(cwd: &Path, answer: &str, projects: &[String]) -> Vec<String> {
+    let cwd_text = cwd.to_string_lossy().into_owned();
+    let mut kept = Vec::new();
+    for proposal in proposals(answer) {
+        let (scope, place) = match proposal.scope.trim().to_ascii_lowercase().as_str() {
+            "user" => (MemoryScope::User, cwd_text.clone()),
+            "router" => (MemoryScope::Repo, cwd_text.clone()),
+            "project" => {
+                let Some(project) = proposal
+                    .project
+                    .as_deref()
+                    .and_then(|named| projects.iter().find(|project| same_dir(project, named)))
+                else {
+                    continue;
+                };
+                (MemoryScope::Repo, project.clone())
+            }
+            _ => continue,
+        };
+        let Some(request) = build_request(&place, scope, proposal) else {
+            continue;
+        };
+        let title = request.title.clone().unwrap_or_default();
+        if save_memory(Some(&place), request).is_ok() {
+            kept.push(title);
+        }
+    }
+    kept
+}
+
+/// The same directory, however its separators and case were written.
+fn same_dir(a: &str, b: &str) -> bool {
+    let normal = |path: &str| {
+        path.trim()
+            .trim_end_matches(['/', '\\'])
+            .replace('\\', "/")
+            .to_lowercase()
+    };
+    !a.trim().is_empty() && normal(a) == normal(b)
 }
 
 fn ask_for(cwd: &Path, conversation: &str) -> CaptureAsk {
@@ -106,6 +219,8 @@ fn or_empty(index: &str) -> &str {
 /// One entry of the answer's `memories`.
 struct Proposal {
     scope: String,
+    /// The router's answers name the project a memory is about.
+    project: Option<String>,
     kind: String,
     title: String,
     description: String,
@@ -118,6 +233,7 @@ impl Proposal {
         let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
         Some(Self {
             scope: text("scope")?,
+            project: text("project"),
             kind: text("type")?,
             title: text("title")?,
             description: text("description")?,
@@ -130,20 +246,10 @@ impl Proposal {
 /// Write what the answer proposes; a proposal that does not hold up is
 /// dropped on its own, the rest still kept.
 pub fn keep_answer(cwd: &Path, answer: &str) -> Vec<String> {
-    let Some(json) = first_json_object(answer) else {
-        return Vec::new();
-    };
-    let Ok(answer) = serde_json::from_str::<Value>(json) else {
-        return Vec::new();
-    };
-    let Some(memories) = answer.get("memories").and_then(Value::as_array) else {
-        return Vec::new();
-    };
     let cwd_text = cwd.to_string_lossy().into_owned();
     let mut kept = Vec::new();
-    for proposal in memories.iter().take(MAX_KEPT) {
-        let Some(request) = Proposal::from_value(proposal).and_then(|p| request_for(&cwd_text, p))
-        else {
+    for proposal in proposals(answer) {
+        let Some(request) = request_for(&cwd_text, proposal) else {
             continue;
         };
         let title = request.title.clone().unwrap_or_default();
@@ -154,12 +260,35 @@ pub fn keep_answer(cwd: &Path, answer: &str) -> Vec<String> {
     kept
 }
 
+/// The answer's first [`MAX_KEPT`] proposals in the asked-for shape.
+fn proposals(answer: &str) -> Vec<Proposal> {
+    let Some(json) = first_json_object(answer) else {
+        return Vec::new();
+    };
+    let Ok(answer) = serde_json::from_str::<Value>(json) else {
+        return Vec::new();
+    };
+    let Some(memories) = answer.get("memories").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    memories
+        .iter()
+        .take(MAX_KEPT)
+        .filter_map(Proposal::from_value)
+        .collect()
+}
+
 fn request_for(cwd: &str, proposal: Proposal) -> Option<SaveMemoryRequest> {
     let scope = match proposal.scope.trim().to_ascii_lowercase().as_str() {
         "user" => MemoryScope::User,
         "repo" => MemoryScope::Repo,
         _ => return None,
     };
+    build_request(cwd, scope, proposal)
+}
+
+/// The write a proposal asks for, in `scope` (repo scope: of `cwd`).
+fn build_request(cwd: &str, scope: MemoryScope, proposal: Proposal) -> Option<SaveMemoryRequest> {
     let memory_type = MemoryContentType::parse(&proposal.kind).ok()?;
     let title = bounded(&proposal.title, MAX_TITLE_CHARS)?;
     let description = bounded(&proposal.description, MAX_DESCRIPTION_CHARS)?;
@@ -287,6 +416,77 @@ mod tests {
         let ask = MemoryCaptureProvider.ask(cwd.path(), "Person: hi").unwrap();
         assert!(ask.prompt.contains("Answer in Chinese"), "{}", ask.prompt);
         assert!(ask.prompt.ends_with("## Conversation\nPerson: hi"));
+    }
+
+    #[test]
+    fn the_router_keeps_for_the_person_itself_and_the_projects_it_named() {
+        let _home = TestConfigHome::new("capture-router");
+        let router = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let project_text = project.path().to_string_lossy().to_string();
+        let projects = vec![project_text.clone()];
+        let named = project_text.replace('\\', "/").to_uppercase() + "/";
+        let kept = keep_router_answer(
+            router.path(),
+            &answer(&format!(
+                r#"{{"scope": "user", "type": "feedback", "title": "Report in one line",
+                    "description": "How the person wants updates", "content": "One line per task."}},
+                   {{"scope": "router", "type": "project", "title": "Projects",
+                    "description": "What each project is", "content": "app is the desktop client."}},
+                   {{"scope": "project", "project": {named:?}, "type": "project",
+                    "title": "Verify with the app suite", "description": "How a change is checked",
+                    "content": "cargo test --bin Rebon, hosted_sessions alone."}}"#
+            )),
+            &projects,
+        );
+        assert_eq!(
+            kept,
+            [
+                "Report in one line",
+                "Projects",
+                "Verify with the app suite"
+            ]
+        );
+        let index = |dir: std::path::PathBuf| {
+            std::fs::read_to_string(dir.join(ENTRYPOINT_NAME)).unwrap_or_default()
+        };
+        assert!(index(memory_paths::user_memory_dir().unwrap()).contains("Report in one line"));
+        let router_dir = memory_paths::repo_memory_dir(&router.path().to_string_lossy()).unwrap();
+        assert!(index(router_dir).contains("Projects"));
+        let project_dir = memory_paths::repo_memory_dir(&project_text).unwrap();
+        assert!(index(project_dir).contains("Verify with the app suite"));
+
+        // A project the turn did not name, or none, keeps nothing.
+        let elsewhere_text = elsewhere.path().to_string_lossy().to_string();
+        let stray = keep_router_answer(
+            router.path(),
+            &answer(&format!(
+                r#"{{"scope": "project", "project": {elsewhere_text:?}, "type": "project",
+                    "title": "Stray", "description": "d", "content": "c"}},
+                   {{"scope": "project", "type": "project", "title": "Nowhere",
+                    "description": "d", "content": "c"}},
+                   {{"scope": "repo", "type": "project", "title": "Old scope",
+                    "description": "d", "content": "c"}}"#
+            )),
+            &projects,
+        );
+        assert!(stray.is_empty(), "{stray:?}");
+
+        let ask = MemoryCaptureProvider
+            .ask_router(router.path(), "Delivered: digest", &projects)
+            .unwrap();
+        assert!(ask.system.contains("scope \"router\""));
+        assert!(ask.prompt.contains("Report in one line"), "{}", ask.prompt);
+        assert!(ask.prompt.contains(&format!("### {project_text}")));
+        assert!(ask.prompt.contains("Verify with the app suite"));
+        assert!(ask
+            .prompt
+            .ends_with("## The router's latest turn\nDelivered: digest"));
+        let alone = MemoryCaptureProvider
+            .ask_router(router.path(), "Person: hi", &[])
+            .unwrap();
+        assert!(alone.prompt.contains("(none: keep no project memory)"));
     }
 
     #[test]

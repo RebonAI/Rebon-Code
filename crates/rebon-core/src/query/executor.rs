@@ -4959,37 +4959,37 @@ impl PromptExecutor for EngineQueryExecutor {
             .await?;
 
         // What the conversation said that should outlive it, asked in the
-        // background on the small model. Only where the session may write
-        // memory itself: a worker that may not call SaveMemory does not get
-        // it written for it either.
-        if !replay_only
+        // background on the small model once the turn is done, when the
+        // memory the turn saved itself is in the index the question shows.
+        // Only where the session may write memory itself: a worker that may
+        // not call SaveMemory does not get it written for it either. The
+        // router is asked its own question instead (below).
+        let router_session = self.is_router_session();
+        let may_save_memory = !replay_only
             && !resume_without_new_prompt
             && effective_tool_filter
                 .as_ref()
-                .is_none_or(|filter| filter.allows("SaveMemory", &["SaveMemoryTool"]))
-        {
-            if let Some(capture) = kernel_turn_lease_for_attachments
-                .as_ref()
-                .and_then(|lease| {
-                    lease
-                        .context()
-                        .get::<rebon_instructions::memory_capture::MemoryCaptureService>()
-                })
-            {
-                super::memory_capture::maybe_spawn_memory_capture(
-                    super::memory_capture::MemoryCaptureJob {
-                        capture,
-                        session: session.clone(),
-                        model: title_model.clone(),
-                        projects_root: self.projects_root.clone(),
-                        cwd: cwd.clone(),
-                        session_id: session_id.clone(),
-                        prompt_text: user_text.clone(),
-                    },
-                    &self.memory_capture_runs,
-                );
-            }
-        }
+                .is_none_or(|filter| filter.allows("SaveMemory", &["SaveMemoryTool"]));
+        let memory_capture = (may_save_memory && !router_session)
+            .then(|| {
+                kernel_turn_lease_for_attachments
+                    .as_ref()
+                    .and_then(|lease| {
+                        lease
+                            .context()
+                            .get::<rebon_instructions::memory_capture::MemoryCaptureService>()
+                    })
+            })
+            .flatten()
+            .map(|capture| super::memory_capture::MemoryCaptureJob {
+                capture,
+                session: session.clone(),
+                model: title_model.clone(),
+                projects_root: self.projects_root.clone(),
+                cwd: cwd.clone(),
+                session_id: session_id.clone(),
+                prompt_text: user_text.clone(),
+            });
         // What the turn found out that the session's group should keep,
         // asked once the turn is done. Only where the session may call
         // group_remember itself.
@@ -5016,6 +5016,29 @@ impl PromptExecutor for EngineQueryExecutor {
             cwd: cwd.clone(),
             session_id: session_id.clone(),
         });
+        // What the router's turn taught that should outlive its
+        // conversation — about the person, itself, or a project — asked once
+        // the turn is done: its turns are mostly deliveries, and what it did
+        // about them is in the turn.
+        let router_capture = (may_save_memory && router_session)
+            .then(|| {
+                kernel_turn_lease_for_attachments
+                    .as_ref()
+                    .and_then(|lease| {
+                        lease
+                            .context()
+                            .get::<rebon_instructions::memory_capture::MemoryCaptureService>()
+                    })
+            })
+            .flatten()
+            .map(|capture| super::memory_capture::RouterCaptureJob {
+                capture,
+                session: session.clone(),
+                model: title_model.clone(),
+                projects_root: self.projects_root.clone(),
+                cwd: cwd.clone(),
+                session_id: session_id.clone(),
+            });
 
         let stable_base_system = stable_base_system_enabled();
         let mut base_prompt_cache_hits = Vec::new();
@@ -5184,8 +5207,14 @@ impl PromptExecutor for EngineQueryExecutor {
             final_usage,
         )?;
         attachment_poller_turn.mark_succeeded();
+        if let Some(job) = memory_capture {
+            super::memory_capture::maybe_spawn_memory_capture(job, &self.memory_capture_runs);
+        }
         if let Some(job) = group_capture {
             super::memory_capture::maybe_spawn_group_capture(job, &self.memory_capture_runs);
+        }
+        if let Some(job) = router_capture {
+            super::memory_capture::maybe_spawn_router_capture(job, &self.memory_capture_runs);
         }
         Ok(outcome)
     }

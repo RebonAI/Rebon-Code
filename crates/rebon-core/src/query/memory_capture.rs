@@ -1,10 +1,13 @@
 //! The engine's half of memory capture
 //! ([`rebon_instructions::memory_capture`]).
 //!
-//! At the start of a turn, in the background and on the small model, the
-//! conversation since the last capture — the finished turns on disk plus the
-//! prompt just sent — is put to the memory store's question, and what comes
-//! back is kept. It runs beside the turn on a forked session, as the title
+//! When a turn ends, in the background and on the small model, the
+//! conversation since the last capture — the turns on disk, this one
+//! included — is put to the memory store's question, and what comes back is
+//! kept. At the end rather than the start, so the index the question shows
+//! already holds what the turn saved itself: asked beside the turn, the pass
+//! saw the index from before it and wrote near-copies of the memories the
+//! model was saving at the same moment. It runs beside the turn on a forked session, as the title
 //! does, so it neither waits on the turn nor joins its history; the store's
 //! index changing underneath is announced to the next turn by the ordinary
 //! mid-session memory update.
@@ -20,6 +23,15 @@
 //! is handed a task and talks to no one — and runs when the turn is done, so
 //! a worker with one long turn is asked about it rather than never. Its
 //! place is kept in `<session>.group-capture.json`.
+//!
+//! The router is asked its own question instead, at the end of its turns
+//! ([`rebon_instructions::memory_capture::MemoryCapture::ask_router`]): most
+//! of what reaches it is delivered — worker digests, events, progress checks
+//! — not said by the person, and what it learns from them belongs to the
+//! person's memory, its own workspace's, or a project's it dispatched into.
+//! Its place is kept in `<session>.router-capture.json`, with when it last
+//! asked, so a run of quiet deliveries is read together every few minutes
+//! rather than once each.
 
 use super::*;
 
@@ -42,17 +54,47 @@ pub(super) struct MemoryCaptureRuns(Mutex<HashSet<String>>);
 
 impl MemoryCaptureRuns {
     fn begin(&self, session_id: &str) -> bool {
-        self.0
+        let began = self
+            .0
             .lock()
             .expect("memory capture runs poisoned")
-            .insert(session_id.to_owned())
+            .insert(session_id.to_owned());
+        if began {
+            IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        began
     }
 
     fn end(&self, session_id: &str) {
-        self.0
+        let ended = self
+            .0
             .lock()
             .expect("memory capture runs poisoned")
             .remove(session_id);
+        if ended {
+            IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            SETTLED.notify_waiters();
+        }
+    }
+}
+
+/// Captures in flight in this process, whichever executor started them.
+static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SETTLED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Wait, at most `timeout`, for the captures in flight to finish. A process
+/// that ends right after its turn — `rebon exec` — calls this first, since a
+/// capture runs once the turn is done and would otherwise die with it.
+pub async fn settle_memory_capture(timeout: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let settled = SETTLED.notified();
+        if IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return;
+        }
+        if tokio::time::timeout_at(deadline, settled).await.is_err() {
+            return;
+        }
     }
 }
 
@@ -131,13 +173,13 @@ async fn run(job: &MemoryCaptureJob, client: &dyn rebon_api::ModelClient) {
         }
     };
     let kept = job.capture.keep(cwd, &answer);
-    if !kept.is_empty() {
-        tracing::info!(
-            session_id = %job.session_id,
-            memories = ?kept,
-            "memory capture kept what the conversation said"
-        );
-    }
+    // One line per question asked, kept or not: how often this runs and how
+    // often it finds something is what tells whether it pays.
+    tracing::info!(
+        session_id = %job.session_id,
+        memories = ?kept,
+        "memory capture asked about the conversation"
+    );
     if let Some(uuid) = last_uuid {
         write_cursor(&cursor_path, &uuid);
     }
@@ -211,13 +253,11 @@ async fn run_group(job: &GroupCaptureJob, client: &dyn rebon_api::ModelClient) {
             }
         };
         let kept = job.capture.keep(&job.session_id, &answer);
-        if !kept.is_empty() {
-            tracing::info!(
-                session_id = %job.session_id,
-                facts = ?kept,
-                "group capture kept what the turn found out"
-            );
-        }
+        tracing::info!(
+            session_id = %job.session_id,
+            facts = ?kept,
+            "group capture asked about the turn"
+        );
     }
     if let Some(uuid) = last_uuid {
         write_cursor(&cursor_path, &uuid);
@@ -278,6 +318,275 @@ fn render_work(messages: &[ApiMessage]) -> (String, usize) {
         kept.insert(0, task.clone());
     }
     (kept.join("\n"), agent_chars)
+}
+
+/// How often the router's turns are put to the question when the person
+/// said nothing in them. Deliveries alone — digests, events, progress
+/// checks — come every few seconds on a busy day; what they teach keeps
+/// until a later pass reads them together.
+const ROUTER_QUIET_INTERVAL_MS: u64 = 5 * 60 * 1000;
+/// Less than this in a stretch of the router's turns is not worth asking.
+const MIN_ROUTER_CHARS: usize = 200;
+/// The router's calls that say nothing worth remembering about the turn.
+const ROUTER_QUIET_CALLS: &[&str] = &[
+    "Recall",
+    "ReadMemory",
+    "ToolSearch",
+    "InvokeDeferredTool",
+    "ListAuthorizations",
+    "ScheduleWakeup",
+    "SyntheticOutput",
+];
+
+pub(super) struct RouterCaptureJob {
+    pub(super) capture: Arc<dyn MemoryCapture>,
+    pub(super) session: Arc<SessionHandle>,
+    /// The small model the title uses.
+    pub(super) model: String,
+    pub(super) projects_root: PathBuf,
+    /// The router's own workspace.
+    pub(super) cwd: String,
+    pub(super) session_id: String,
+}
+
+/// After a router turn: ask what it taught that should outlive the
+/// router's conversation, in the background.
+pub(super) fn maybe_spawn_router_capture(job: RouterCaptureJob, runs: &Arc<MemoryCaptureRuns>) {
+    if !memory_capture_enabled() || job.model.trim().is_empty() {
+        return;
+    }
+    let run_key = format!("router:{}", job.session_id);
+    if !runs.begin(&run_key) {
+        return;
+    }
+    let runs = runs.clone();
+    let forked = job.session.fork_for_sub_agent(None);
+    tokio::spawn(async move {
+        run_router(&job, forked.client().as_ref()).await;
+        runs.end(&run_key);
+    });
+}
+
+async fn run_router(job: &RouterCaptureJob, client: &dyn rebon_api::ModelClient) {
+    let transcript =
+        rebon_session::transcript_file_path(&job.projects_root, &job.cwd, &job.session_id);
+    let cursor_path = transcript.with_extension("router-capture.json");
+    let (through, asked_at_ms) = read_router_cursor(&cursor_path);
+    let entries = match rebon_session::load_transcript_from_file(&transcript) {
+        Ok(Some(loaded)) => loaded.messages,
+        _ => Vec::new(),
+    };
+    let (slice, last_uuid) = since(&entries, through.as_deref());
+    let Some(last_uuid) = last_uuid else {
+        return;
+    };
+    let turn = render_router_turn(&transcript_to_api_messages(slice));
+    let now = now_ms();
+    if turn.person_chars == 0
+        && asked_at_ms.is_some_and(|at| now.saturating_sub(at) < ROUTER_QUIET_INTERVAL_MS)
+    {
+        // Left for a later pass, which reads it with what comes next.
+        return;
+    }
+    if turn.text.chars().count() < MIN_ROUTER_CHARS {
+        write_router_cursor(&cursor_path, &last_uuid, asked_at_ms);
+        return;
+    }
+    let cwd = std::path::Path::new(&job.cwd);
+    let Some(ask) = job.capture.ask_router(cwd, &turn.text, &turn.projects) else {
+        write_router_cursor(&cursor_path, &last_uuid, asked_at_ms);
+        return;
+    };
+    let mut request =
+        rebon_api::CreateMessageRequest::simple(&job.model, ask.prompt).with_system(ask.system);
+    request.stream = false;
+    request.max_tokens = ask.max_tokens;
+    request.thinking = Some(rebon_api::ThinkingConfig::Disabled);
+    let answer = match client.create_message(request).await {
+        Ok(message) => message.text(),
+        Err(error) => {
+            tracing::debug!(%error, session_id = %job.session_id, "router capture: model call failed");
+            return;
+        }
+    };
+    let kept = job.capture.keep_router(cwd, &answer, &turn.projects);
+    tracing::info!(
+        session_id = %job.session_id,
+        memories = ?kept,
+        projects = ?turn.projects,
+        "router capture asked about its turns"
+    );
+    write_router_cursor(&cursor_path, &last_uuid, Some(now));
+}
+
+/// One stretch of the router's turns, as the question reads it.
+struct RouterTurn {
+    /// `Delivered:`, `Person:` and `Router …` lines, newest part kept.
+    text: String,
+    /// How much of it the person wrote.
+    person_chars: usize,
+    /// The project directories its calls named, in order.
+    projects: Vec<String>,
+}
+
+fn render_router_turn(messages: &[ApiMessage]) -> RouterTurn {
+    let mut lines: Vec<String> = Vec::new();
+    let mut person_chars = 0;
+    let mut projects: Vec<String> = Vec::new();
+    for message in messages {
+        match message.role {
+            Role::User => {
+                for text in message.content.iter().filter_map(|block| block.as_text()) {
+                    let trimmed = text.trim_start();
+                    if trimmed.starts_with(rebon_tool::cron::SCHEDULED_PROMPT_MARKER) {
+                        let delivered = rebon_tool::cron::strip_scheduled_marker(trimmed).trim();
+                        if !delivered.is_empty() {
+                            lines
+                                .push(format!("Delivered: {}", clip(delivered, MAX_MESSAGE_CHARS)));
+                        }
+                    } else if !is_machine_text(text) && !text.trim().is_empty() {
+                        person_chars += text.trim().chars().count();
+                        lines.push(format!("Person: {}", clip(text.trim(), MAX_MESSAGE_CHARS)));
+                    }
+                }
+            }
+            Role::Assistant => {
+                for block in &message.content {
+                    if let Some(text) = block.as_text().map(str::trim).filter(|t| !t.is_empty()) {
+                        lines.push(format!(
+                            "Router (its own notes): {}",
+                            clip(text, MAX_MESSAGE_CHARS)
+                        ));
+                    } else if let Some(call) = block.as_tool_use() {
+                        collect_projects(&call.input, &mut projects);
+                        if let Some(line) = describe_router_call(&call.name, &call.input) {
+                            lines.push(line);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut kept: Vec<String> = Vec::new();
+    let mut total = 0;
+    for line in lines.into_iter().rev() {
+        let size = line.chars().count() + 1;
+        if total + size > MAX_CONVERSATION_CHARS && !kept.is_empty() {
+            break;
+        }
+        total += size;
+        kept.push(line);
+    }
+    kept.reverse();
+    RouterTurn {
+        text: kept.join("\n"),
+        person_chars,
+        projects,
+    }
+}
+
+/// A line for one of the router's calls, or `None` for one that only
+/// looks things up.
+fn describe_router_call(name: &str, input: &serde_json::Value) -> Option<String> {
+    if ROUTER_QUIET_CALLS.contains(&name) {
+        return None;
+    }
+    let field = |key: &str| {
+        input
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or_default()
+    };
+    if let Some(message) = rebon_types::tell_person_message(name, input) {
+        return Some(format!(
+            "Router to the person: {}",
+            clip(message, MAX_MESSAGE_CHARS)
+        ));
+    }
+    let line = match name {
+        "SaveMemory" => format!(
+            "Router saved memory ({}): {}",
+            field("scope"),
+            field("title")
+        ),
+        "DispatchWorker" => format!(
+            "Router dispatched a worker into {}: {}. Brief: {}",
+            field("project"),
+            field("title"),
+            clip(field("brief"), 400)
+        ),
+        "PlanTasks" => {
+            let tasks: Vec<String> = input
+                .get("tasks")
+                .and_then(|tasks| tasks.as_array())
+                .into_iter()
+                .flatten()
+                .map(|task| {
+                    let text = |key: &str| task.get(key).and_then(|v| v.as_str()).unwrap_or("");
+                    format!("{} in {}", text("title"), text("project"))
+                })
+                .collect();
+            format!("Router planned tasks: {}", tasks.join("; "))
+        }
+        _ => format!("Router called {name}: {}", clip(&input.to_string(), 300)),
+    };
+    Some(line)
+}
+
+/// Every `project` string anywhere in a call's input, once each.
+fn collect_projects(input: &serde_json::Value, projects: &mut Vec<String>) {
+    match input {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                match value.as_str().map(str::trim) {
+                    Some(project) if key == "project" && !project.is_empty() => {
+                        if !projects.iter().any(|known| known == project) {
+                            projects.push(project.to_string());
+                        }
+                    }
+                    _ => collect_projects(value, projects),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_projects(item, projects);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// Where the router's pass stopped, and when it last asked.
+fn read_router_cursor(path: &std::path::Path) -> (Option<String>, Option<u64>) {
+    let Some(value) = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
+        return (None, None);
+    };
+    (
+        value
+            .get("through")
+            .and_then(|through| through.as_str())
+            .map(str::to_string),
+        value.get("atMs").and_then(|at| at.as_u64()),
+    )
+}
+
+fn write_router_cursor(path: &std::path::Path, uuid: &str, at_ms: Option<u64>) {
+    let body = serde_json::json!({ "through": uuid, "atMs": at_ms }).to_string();
+    if let Err(error) = std::fs::write(path, body) {
+        tracing::debug!(%error, path = %path.display(), "router capture: could not record where it stopped");
+    }
 }
 
 /// The entries after `through` (all of them when it is unknown: the
@@ -517,6 +826,64 @@ mod tests {
         assert!(work.ends_with(&"x".repeat(900)));
         assert!(!work.contains("\nAssistant: 0 "));
         assert!(work.chars().count() <= MAX_CONVERSATION_CHARS + 100);
+    }
+
+    #[test]
+    fn a_router_turn_reads_as_what_was_delivered_said_and_done() {
+        let digest = rebon_tool::cron::mark_scheduled_prompt("- worker w-1 done: tests pass");
+        let mut acted = ApiMessage::assistant_text("Next: ship it.");
+        for (name, input) in [
+            (
+                "DispatchWorker",
+                serde_json::json!({"project": "/w/app", "title": "Release", "brief": "Cut 1.2"}),
+            ),
+            ("Recall", serde_json::json!({"id": "w-1"})),
+            (
+                "PlanTasks",
+                serde_json::json!({"tasks": [{"title": "Docs", "project": "/w/site"},
+                                              {"title": "Again", "project": "/w/app"}]}),
+            ),
+            (
+                rebon_types::TELL_PERSON_TOOL_NAME,
+                serde_json::json!({"message": "w-1 is done; releasing."}),
+            ),
+        ] {
+            acted
+                .content
+                .push(rebon_api::ContentBlock::ToolUse(rebon_api::ToolUseBlock {
+                    id: format!("toolu_{name}"),
+                    name: name.to_string(),
+                    input,
+                }));
+        }
+        let messages = vec![
+            ApiMessage::user_text(&digest),
+            ApiMessage::user_text("always release on Mondays"),
+            acted,
+        ];
+        let turn = render_router_turn(&messages);
+        assert_eq!(
+            turn.text,
+            "Delivered: - worker w-1 done: tests pass\n\
+             Person: always release on Mondays\n\
+             Router (its own notes): Next: ship it.\n\
+             Router dispatched a worker into /w/app: Release. Brief: Cut 1.2\n\
+             Router planned tasks: Docs in /w/site; Again in /w/app\n\
+             Router to the person: w-1 is done; releasing."
+        );
+        assert_eq!(turn.person_chars, "always release on Mondays".len());
+        assert_eq!(turn.projects, ["/w/app", "/w/site"]);
+    }
+
+    #[test]
+    fn the_router_cursor_keeps_when_it_last_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.router-capture.json");
+        assert_eq!(read_router_cursor(&path), (None, None));
+        write_router_cursor(&path, "u7", None);
+        assert_eq!(read_router_cursor(&path), (Some("u7".into()), None));
+        write_router_cursor(&path, "u9", Some(42));
+        assert_eq!(read_router_cursor(&path), (Some("u9".into()), Some(42)));
     }
 
     #[test]

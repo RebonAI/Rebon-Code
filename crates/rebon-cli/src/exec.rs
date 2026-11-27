@@ -170,6 +170,9 @@ pub async fn run(args: ExecArgs) -> anyhow::Result<()> {
     let json = args.json;
     let error_emitted = Arc::new(AtomicBool::new(false));
     let outcome = run_inner(args, &error_emitted).await;
+    // What the turn taught is asked about once it is done, in the
+    // background; give that a moment before the process ends with it.
+    rebon_core::query::settle_memory_capture(std::time::Duration::from_secs(30)).await;
     if json {
         if let Err(error) = &outcome {
             emit_error_once(&error_emitted, &error.to_string());
