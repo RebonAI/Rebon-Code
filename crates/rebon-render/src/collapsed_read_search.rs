@@ -864,10 +864,10 @@ fn append_memory_parts(
             pick_verb(
                 is_active_group,
                 local_count == 0,
-                "Recalling",
-                "recalling",
-                "Recalled",
-                "recalled"
+                "Reading",
+                "reading",
+                "Read",
+                "read"
             ),
             read_count,
             if team { " team" } else { "" },
@@ -1036,7 +1036,7 @@ mod tests {
         };
         assert_eq!(
             display.summary_text,
-            "Searched for 3 patterns, read 1 file, recalled 1 memory, searched memories, wrote 2 team memories"
+            "Searched for 3 patterns, read 1 file, read 1 memory, searched memories, wrote 2 team memories"
         );
         assert!(display.dim_summary);
     }

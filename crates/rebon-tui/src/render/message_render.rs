@@ -608,7 +608,7 @@ pub(super) fn streaming_tool_input_json(tool: &crate::streaming::StreamingToolUs
 
 /// Classify a streaming tool use for collapse grouping.
 pub(super) fn classify_streaming_tool(tool: &crate::streaming::StreamingToolUse) -> ToolClass {
-    let policy = MemoryPathPolicy::default();
+    let policy = MemoryPathPolicy::rebon();
     let input = streaming_tool_input_json(tool);
     classify_tool_use(&tool.tool_name, &input, &policy)
 }
@@ -773,7 +773,7 @@ pub(super) fn render_collapsed_streaming_group(
         return 0;
     }
 
-    let policy = MemoryPathPolicy::default();
+    let policy = MemoryPathPolicy::rebon();
     let mut agg = Aggregator::new();
     let mut any_in_progress = false;
     let mut any_failed = false;

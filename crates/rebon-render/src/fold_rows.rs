@@ -160,7 +160,7 @@ pub fn is_thinking_only_assistant(msg: &Message) -> bool {
 pub fn classify_message_tool_uses(
     tools: &[&crate::transcript_row::AssistantToolUseBlock],
 ) -> Option<Vec<ToolClass>> {
-    let policy = MemoryPathPolicy::default();
+    let policy = MemoryPathPolicy::rebon();
     let mut out = Vec::with_capacity(tools.len());
     for t in tools {
         let class = classify_tool_use(&t.name, &t.input, &policy);

@@ -3263,6 +3263,57 @@ fn collapsed_run_renders_aggregated_summary_with_ctrl_o_hint() {
     );
 }
 
+/// Memory work reads as one line: how many memories were read and written,
+/// not what they say — the content is behind the expand hint.
+#[test]
+fn memory_tools_fold_into_one_counted_line() {
+    let mut overlay = StreamingOverlay::new();
+    for (id, file) in [("r1", "feedback-a.md"), ("r2", "project-b.md")] {
+        overlay.upsert_streaming_tool_use(streaming_tool(
+            id,
+            "ReadMemory",
+            ToolKind::Read,
+            ToolCallStatus::Completed,
+            vec![("scope", json!("user")), ("file", json!(file))],
+        ));
+    }
+    overlay.upsert_streaming_tool_use(streaming_tool(
+        "w1",
+        "SaveMemory",
+        ToolKind::Edit,
+        ToolCallStatus::Completed,
+        vec![
+            ("action", json!("upsert")),
+            ("scope", json!("repo")),
+            ("title", json!("Build needs config/local.toml")),
+            ("content", json!("copy config/local.example.toml first")),
+        ],
+    ));
+
+    let mut buf = new_buf(120, 12);
+    render_streaming_overlay(
+        &overlay,
+        Rect::new(0, 0, 120, 12),
+        &mut buf,
+        &RenderTheme::plain(),
+        ToolOutputVerbosity::Compact,
+    );
+    let snap = (0..12)
+        .map(|y| row_text(&buf, y))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        snap.contains("Read 2 memories, wrote 1 memory"),
+        "memory summary missing: {snap:?}"
+    );
+    assert!(snap.contains("Ctrl+O to expand"), "{snap:?}");
+    assert!(
+        !snap.contains("copy config/local.example.toml first"),
+        "what was saved is behind the expand hint: {snap:?}"
+    );
+}
+
 #[test]
 fn collapsed_inline_hint_suppresses_trailing_single_tool_hint() {
     let mut overlay = StreamingOverlay::new();

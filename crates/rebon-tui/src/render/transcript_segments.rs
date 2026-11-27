@@ -713,7 +713,7 @@ fn committed_collapsed_group_display(
     // and record its lifecycle result. Any tool_use without a matching
     // tool_result is treated as resolved — this is the committed path,
     // so every call we see has already left the wire.
-    let policy = MemoryPathPolicy::default();
+    let policy = MemoryPathPolicy::rebon();
     let mut agg = Aggregator::new();
     let mut any_failed = false;
     for &i in indices {

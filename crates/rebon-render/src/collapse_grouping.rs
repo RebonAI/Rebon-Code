@@ -62,6 +62,89 @@ impl std::fmt::Debug for MemoryPathPolicy {
     }
 }
 
+impl MemoryPathPolicy {
+    /// Rebon's own memory folders under `config_home`: user memory at
+    /// `<home>/memory/…` and each project's at `<home>/projects/<slug>/memory/…`.
+    /// Path matching only; nothing is read.
+    pub fn for_config_home(config_home: &std::path::Path) -> Self {
+        let root = normal(&config_home.to_string_lossy());
+        let is_dir = {
+            let root = root.clone();
+            move |path: &str| memory_dir_of(&root, &normal(path)).is_some()
+        };
+        let is_file = {
+            let root = root.clone();
+            move |path: &str| {
+                let path = normal(path);
+                path.ends_with(".md") && memory_dir_of(&root, &path).is_some()
+            }
+        };
+        let is_pattern = {
+            let root = root.clone();
+            move |glob: &str| memory_dir_of(&root, &normal(glob)).is_some()
+        };
+        let is_command = {
+            let root = root.clone();
+            move |command: &str| {
+                let command = normal(command);
+                command
+                    .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                    .any(|word| memory_dir_of(&root, word).is_some())
+                    || command.contains("~/.rebon/memory")
+            }
+        };
+        Self {
+            is_memory_file: Box::new(is_file),
+            is_memory_dir: Box::new(is_dir),
+            is_memory_pattern: Box::new(is_pattern),
+            is_shell_cmd_targeting_memory: Box::new(is_command),
+        }
+    }
+
+    /// [`Self::for_config_home`] for this process's config home —
+    /// `$REBON_CONFIG_DIR`, else `$REBON_CONFIG_HOME`, else `~/.rebon`, as
+    /// the session resolves it — found once.
+    pub fn rebon() -> &'static Self {
+        static POLICY: std::sync::OnceLock<MemoryPathPolicy> = std::sync::OnceLock::new();
+        POLICY.get_or_init(|| {
+            let home = ["REBON_CONFIG_DIR", "REBON_CONFIG_HOME"]
+                .iter()
+                .find_map(|key| std::env::var_os(key).filter(|value| !value.is_empty()))
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("USERPROFILE")
+                        .or_else(|| std::env::var_os("HOME"))
+                        .map(|home| std::path::PathBuf::from(home).join(".rebon"))
+                });
+            match home {
+                Some(home) => Self::for_config_home(&home),
+                None => Self::default(),
+            }
+        })
+    }
+}
+
+/// A path with `/` separators, compared without case: Windows paths come
+/// both ways, and the config home is the same folder either way.
+fn normal(path: &str) -> String {
+    path.trim().replace('\\', "/").to_lowercase()
+}
+
+/// The memory folder `path` is in or is, under `root`: `<root>/memory` and
+/// what is below it, or `<root>/projects/<slug>/memory` and below.
+fn memory_dir_of(root: &str, path: &str) -> Option<()> {
+    let rest = path.strip_prefix(root)?.strip_prefix('/')?;
+    let mut parts = rest.split('/');
+    match parts.next()? {
+        "memory" => Some(()),
+        "projects" => {
+            parts.next().filter(|slug| !slug.is_empty())?;
+            (parts.next()? == "memory").then_some(())
+        }
+        _ => None,
+    }
+}
+
 impl Default for MemoryPathPolicy {
     fn default() -> Self {
         Self {
@@ -217,6 +300,32 @@ pub fn classify_tool_use(
                 ToolClass::MemoryWrite
             } else {
                 ToolClass::NotCollapsible
+            }
+        }
+        // The memory tools themselves: what was kept is the tool card's,
+        // and the transcript says only how many ("Wrote 1 memory").
+        "SaveMemory" => ToolClass::MemoryWrite,
+        "ReadMemory" => {
+            let field = |key: &str| {
+                input
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            };
+            let file = field("file");
+            // Memory reads are counted by what they read; the tool names no
+            // path, so its scope, project and file stand for one.
+            let key = format!(
+                "memory:{}:{}:{}",
+                field("scope").unwrap_or("repo"),
+                field("project").unwrap_or(""),
+                file.unwrap_or("MEMORY.md")
+            );
+            ToolClass::Read {
+                file_path: Some(key),
+                memory: true,
+                hint: file.map(ToString::to_string),
             }
         }
         "ToolSearch" | "Snip" => ToolClass::AbsorbedSilently,
@@ -945,6 +1054,89 @@ mod tests {
             &policy(),
         );
         assert!(matches!(class, ToolClass::Read { memory: true, .. }));
+    }
+
+    /// The memory tools fold like memory reads and writes: the transcript
+    /// says how many, not what.
+    #[test]
+    fn the_memory_tools_fold_as_memory_reads_and_writes() {
+        let none = MemoryPathPolicy::default();
+        assert_eq!(
+            classify_tool_use(
+                "SaveMemory",
+                &json!({"action": "upsert", "scope": "user", "title": "t"}),
+                &none
+            ),
+            ToolClass::MemoryWrite
+        );
+        match classify_tool_use(
+            "ReadMemory",
+            &json!({"scope": "repo", "file": "a.md"}),
+            &none,
+        ) {
+            ToolClass::Read {
+                memory: true,
+                file_path,
+                hint,
+            } => {
+                assert_eq!(hint.as_deref(), Some("a.md"));
+                assert_eq!(file_path.as_deref(), Some("memory:repo::a.md"));
+            }
+            other => panic!("expected a memory read, got {other:?}"),
+        }
+        assert!(matches!(
+            classify_tool_use("ReadMemory", &json!({"scope": "user"}), &none),
+            ToolClass::Read {
+                memory: true,
+                hint: None,
+                ..
+            }
+        ));
+    }
+
+    /// Rebon's memory folders, under whichever config home: user memory and
+    /// each project's, in either separator and any case.
+    #[test]
+    fn the_config_home_policy_knows_both_memory_folders() {
+        let policy = MemoryPathPolicy::for_config_home(std::path::Path::new(r"C:\Users\u\.rebon"));
+        for file in [
+            r"C:\Users\u\.rebon\memory\user\feedback-x.md",
+            "c:/users/u/.rebon/memory/user/MEMORY.md",
+            "C:/Users/u/.rebon/projects/c--w-app/memory/project-y.md",
+        ] {
+            assert!((policy.is_memory_file)(file), "{file}");
+        }
+        for not in [
+            "C:/Users/u/.rebon/projects/c--w-app/session.jsonl",
+            "C:/Users/u/.rebon/projects/c--w-app/memory/notes.txt",
+            "C:/Users/u/.rebon/config.json",
+            "C:/w/app/memory/x.md",
+        ] {
+            assert!(!(policy.is_memory_file)(not), "{not}");
+        }
+        assert!((policy.is_memory_dir)(
+            "C:/Users/u/.rebon/projects/c--w-app/memory"
+        ));
+        assert!(!(policy.is_memory_dir)(
+            "C:/Users/u/.rebon/projects/c--w-app"
+        ));
+        assert!((policy.is_memory_pattern)(
+            "C:/Users/u/.rebon/memory/**/*.md"
+        ));
+        assert!((policy.is_shell_cmd_targeting_memory)(
+            r#"grep -r "nextest" "C:/Users/u/.rebon/projects/c--w-app/memory""#
+        ));
+        assert!((policy.is_shell_cmd_targeting_memory)(
+            "cat ~/.rebon/memory/user/MEMORY.md"
+        ));
+        assert!(!(policy.is_shell_cmd_targeting_memory)("cargo test"));
+
+        let read = classify_tool_use(
+            "Read",
+            &json!({"file_path": "C:/Users/u/.rebon/memory/user/feedback-x.md"}),
+            &policy,
+        );
+        assert!(matches!(read, ToolClass::Read { memory: true, .. }));
     }
 
     #[test]
