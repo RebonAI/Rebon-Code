@@ -283,7 +283,15 @@ async fn successful_turn_and_resume_keep_the_json_contract() {
     assert_eq!(resumed[0], first[0]);
     assert_eq!(resumed[3]["sessionId"], session_id);
     let requests = provider.seen.lock().expect("requests poisoned");
-    let replay = requests.last().expect("resume request")["messages"].to_string();
+    // The turn's own request, not the memory capture `exec` waits for once
+    // the turn is done: that one asks the memory question (its instructions
+    // lead its messages on this wire) about the stretch since the last one.
+    let replay = requests
+        .iter()
+        .rev()
+        .map(|request| request["messages"].to_string())
+        .find(|messages| !messages.contains("long-term memory"))
+        .expect("resume request");
     assert!(replay.contains("first prompt"));
     assert!(replay.contains("done"));
     assert!(replay.contains("second prompt"));
