@@ -752,6 +752,20 @@ async fn finish_background_turn(
     if let Ok(outcome) = execution.as_ref() {
         publish_turn_usage(session, store, &state.identity.job_id, &outcome.usage);
         note_turn_reply(session, store, state);
+        // A group member an ACP agent runs answers with its turn; one on
+        // Rebon's engine has `group_send` for that.
+        if !turn_cancel.is_cancelled() && super::acp_turns::acp_agent_of(session).is_some() {
+            let last_message = rebon_session_host::background_job_transcript_path_in(
+                &session.projects_root,
+                state,
+            )
+            .and_then(|path| {
+                rebon_session::last_turn_assistant_text(&path)
+                    .ok()
+                    .flatten()
+            });
+            super::acp_turns::answer_group_with_turn(&session.session_id, last_message);
+        }
     }
     ipc.events.publish_turn(
         rebon_session_host::TurnStreamState::Idle,
@@ -1270,7 +1284,13 @@ fn build_background_prompt_request(
         prompt: prompt_blocks,
         mcp_servers: Vec::new(),
         update_publisher: Some(session.engine_half.update_publisher.clone()),
-        permission_publisher: None,
+        // Rebon's engine asks its own broker; an ACP agent asks over ACP,
+        // answered by the session's mode (`acp_turns`).
+        permission_publisher: super::acp_turns::acp_agent_of(session).map(|_| {
+            super::acp_turns::permission_publisher(Arc::clone(
+                &session.engine_half.permission_mode_cell,
+            ))
+        }),
         cancel: turn_cancel.clone(),
         thinking_budget: thinking_overrides.thinking_budget,
         max_tokens: thinking_overrides.max_tokens,
