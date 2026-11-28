@@ -223,6 +223,20 @@ fn describe(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
 
+/// The ACP agents the config declares, which `@gemini` and the like can
+/// name for a new member: read at each handoff, so one added since the
+/// session started counts. A config that does not read is logged, and
+/// names none.
+fn declared_acp_agents() -> Vec<String> {
+    match rebon_config::load_acp_agents() {
+        Ok(agents) => agents.into_iter().map(|agent| agent.id).collect(),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "the config's ACP agents did not read");
+            Vec::new()
+        }
+    }
+}
+
 #[async_trait]
 impl ExternalSubAgentRunner for GroupMemberRunner {
     /// `@name`, as given: whether it names a member or an agent is the
@@ -276,6 +290,7 @@ impl ExternalSubAgentRunner for GroupMemberRunner {
                 .ok()
                 .map(|dir| dir.to_string_lossy().into_owned())
         });
+        let acp_agents = declared_acp_agents();
         let handed = assign::hand_on(
             &self.store,
             &group.id,
@@ -287,12 +302,13 @@ impl ExternalSubAgentRunner for GroupMemberRunner {
                 model: request.model_hint.as_deref(),
                 access: None,
                 cwd: cwd.as_deref(),
+                acp_agents: &acp_agents,
             },
         )
         .map_err(describe)?;
         let posted = match handed {
             Handed::Spawning { spawn_id, agent } => {
-                self.started(&group.id, &asker, &spawn_id, agent, &request.cancel)
+                self.started(&group.id, &asker, &spawn_id, &agent, &request.cancel)
                     .await?
             }
             posted => posted,

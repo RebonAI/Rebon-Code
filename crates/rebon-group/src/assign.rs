@@ -103,6 +103,122 @@ pub fn spawnable_agent(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Short names for ACP agents whose registry ids say more than people do.
+/// A name that is the id itself, or the id without an `-acp`, `-cli`,
+/// `-code` or `-agent` ending (`@qwen` for `qwen-code`, `@pi` for
+/// `pi-acp`), needs no entry here.
+const ACP_ALIASES: &[(&str, &str)] = &[
+    ("copilot", "github-copilot-cli"),
+    ("droid", "factory-droid"),
+    ("vibe", "mistral-vibe"),
+    ("grok", "grok-build"),
+];
+
+/// The endings an ACP agent's id may be named without.
+const ACP_ID_ENDINGS: &[&str] = &["acp", "cli", "code", "agent"];
+
+/// `name` as names are compared: lower case, without `-`, `_`, `.` or
+/// spaces.
+fn fold(name: &str) -> String {
+    name.trim()
+        .trim_start_matches('@')
+        .chars()
+        .filter(|c| !matches!(c, '-' | '_' | '.' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// A folded id without the endings it may be named without.
+fn stem(folded: &str) -> &str {
+    let mut stem = folded;
+    while let Some(shorter) = ACP_ID_ENDINGS
+        .iter()
+        .find_map(|ending| stem.strip_suffix(ending).filter(|rest| !rest.is_empty()))
+    {
+        stem = shorter;
+    }
+    stem
+}
+
+/// Google Antigravity's provider allows no client in front of its own CLI,
+/// so Rebon never starts it as a member, by any name.
+fn is_antigravity(folded: &str) -> bool {
+    folded.contains("antigravity") || folded == "agy"
+}
+
+/// The ACP agent among `declared` (the `acpAgents` ids in Rebon's config)
+/// that `name` names: its id, an alias of it ([`ACP_ALIASES`]), or its id
+/// without an ending ([`ACP_ID_ENDINGS`]). `None` when it names none of
+/// them; an error for Google Antigravity, or a name two of them answer to.
+pub fn acp_agent_named<'a>(name: &str, declared: &'a [String]) -> Result<Option<&'a str>> {
+    let folded = fold(name);
+    let antigravity = || {
+        anyhow::anyhow!(
+            "Rebon does not start Google Antigravity as a member: its provider allows only \
+             its own CLI"
+        )
+    };
+    if folded.is_empty() {
+        return Ok(None);
+    }
+    if is_antigravity(&folded) {
+        return Err(antigravity());
+    }
+    let by_id = |id: &str| declared.iter().find(|declared| fold(declared) == fold(id));
+    let found = by_id(&folded).or_else(|| {
+        ACP_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == folded)
+            .and_then(|(_, id)| by_id(id))
+    });
+    let found = match found {
+        Some(id) => Some(id),
+        None => {
+            let stemmed: Vec<&String> = declared
+                .iter()
+                .filter(|id| stem(&fold(id)) == stem(&folded))
+                .collect();
+            match stemmed.as_slice() {
+                [] => None,
+                [id] => Some(*id),
+                many => bail!(
+                    "`@{}` could be any of {}; name one by its id",
+                    name.trim().trim_start_matches('@'),
+                    many.iter()
+                        .map(|id| format!("`@{id}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
+        }
+    };
+    match found {
+        Some(id) if is_antigravity(&fold(id)) => Err(antigravity()),
+        found => Ok(found.map(String::as_str)),
+    }
+}
+
+/// What a new member can be, as an asker names it: `@rebon`,
+/// `@claudecode`, `@codex`, and each ACP agent in `declared` but Google
+/// Antigravity.
+pub fn new_member_names(declared: &[String]) -> Vec<String> {
+    ["@rebon", "@claudecode", "@codex"]
+        .into_iter()
+        .map(str::to_string)
+        .chain(acp_member_names(declared))
+        .collect()
+}
+
+/// The ACP agents among `declared` a new member can run on, as an asker
+/// names them (`@gemini`): all but Google Antigravity.
+pub fn acp_member_names(declared: &[String]) -> Vec<String> {
+    declared
+        .iter()
+        .filter(|id| !is_antigravity(&fold(id)))
+        .map(|id| format!("@{id}"))
+        .collect()
+}
+
 /// A member's request that the app start a new member on `task`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -126,6 +242,11 @@ pub struct SpawnRequest {
     /// so the new member works on the same files. The project when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// The ACP agent (an `acpAgents` id) a new Rebon member runs its turns
+    /// on in place of Rebon's own engine — `@gemini`. Only with `agent`
+    /// `rebon`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_agent: Option<String>,
     pub at_ms: u64,
 }
 
@@ -135,6 +256,8 @@ pub struct SpawnOptions<'a> {
     pub model: Option<&'a str>,
     pub access: Option<Access>,
     pub cwd: Option<&'a str>,
+    /// For a Rebon member: the ACP agent it runs on.
+    pub acp_agent: Option<&'a str>,
 }
 
 /// What the app did about a [`SpawnRequest`].
@@ -190,6 +313,10 @@ impl GroupStore {
         if task.trim().is_empty() {
             bail!("nothing to ask");
         }
+        let acp_agent = options.acp_agent.map(str::trim).filter(|id| !id.is_empty());
+        if acp_agent.is_some() && agent != AgentKind::REBON {
+            bail!("only a Rebon member runs on an ACP agent");
+        }
         let group = self.load(group_id)?;
         if group.member(requested_by).is_none() {
             bail!("this session is not a member of group `{}`", group.name);
@@ -218,6 +345,7 @@ impl GroupStore {
                 .map(str::trim)
                 .filter(|cwd| !cwd.is_empty())
                 .map(str::to_string),
+            acp_agent: acp_agent.map(str::to_string),
             at_ms,
         };
         write_json(&dir.join(format!("{}.json", request.id)), &request)?;
@@ -365,11 +493,9 @@ pub enum Handed {
         seq: u64,
     },
     /// The app was asked to start a new `agent` member on it
-    /// ([`SpawnRequest`]); see [`spawn_state`].
-    Spawning {
-        spawn_id: String,
-        agent: &'static str,
-    },
+    /// ([`SpawnRequest`]); see [`spawn_state`]. `agent` is what it runs:
+    /// `codex`, or the ACP agent a Rebon member runs on (`gemini`).
+    Spawning { spawn_id: String, agent: String },
 }
 
 /// One task to hand on ([`hand_on`]).
@@ -389,6 +515,9 @@ pub struct Assignment<'a> {
     pub access: Option<Access>,
     /// For a new member: where the asker works, so it works there too.
     pub cwd: Option<&'a str>,
+    /// The ACP agents Rebon's config declares (`acpAgents` ids), which `to`
+    /// can name for a new Rebon member that runs on one: `@gemini`.
+    pub acp_agents: &'a [String],
 }
 
 /// The text a task is posted as: its title on the first line, so a list
@@ -423,23 +552,32 @@ pub fn hand_on(
             seq: entry.seq,
         });
     }
-    let Some(agent) = spawnable_agent(target) else {
-        let others: Vec<&str> = group
-            .members
-            .iter()
-            .filter(|member| member.key() != *asker)
-            .map(|member| member.alias.as_str())
-            .collect();
-        bail!(
-            "no member called `{target}` in group `{}` (members: {}); a new member is \
-             `@rebon`, `@claudecode` or `@codex`",
-            group.name,
-            if others.is_empty() {
-                "none besides you".to_string()
-            } else {
-                others.join(", ")
+    // A member's alias, then the agents Rebon starts itself, then an ACP
+    // agent the config declares, which a Rebon member runs on.
+    let (agent, acp_agent) = match spawnable_agent(target) {
+        Some(agent) => (agent, None),
+        None => match acp_agent_named(target, assignment.acp_agents)? {
+            Some(id) => (AgentKind::REBON, Some(id)),
+            None => {
+                let others: Vec<&str> = group
+                    .members
+                    .iter()
+                    .filter(|member| member.key() != *asker)
+                    .map(|member| member.alias.as_str())
+                    .collect();
+                bail!(
+                    "no member called `{target}` in group `{}` (members: {}); a new member is \
+                     one of {}",
+                    group.name,
+                    if others.is_empty() {
+                        "none besides you".to_string()
+                    } else {
+                        others.join(", ")
+                    },
+                    new_member_names(assignment.acp_agents).join(", ")
+                );
             }
-        );
+        },
     };
     let spawn = store.request_spawn(
         group_id,
@@ -450,11 +588,12 @@ pub fn hand_on(
             model: assignment.model,
             access: assignment.access,
             cwd: assignment.cwd,
+            acp_agent,
         },
     )?;
     Ok(Handed::Spawning {
         spawn_id: spawn.id,
-        agent,
+        agent: acp_agent.unwrap_or(agent).to_string(),
     })
 }
 
@@ -548,6 +687,66 @@ pub fn handed_over(store: &GroupStore, group_id: &str, alias: &str, seq: u64) ->
         .is_ok_and(|cursor| cursor.delivered >= seq || cursor.read >= seq)
 }
 
+/// A member's turn as its answer, for a member that has no `group_send` —
+/// a Rebon session whose turns an ACP agent runs: `text`, the turn's last
+/// message, is posted as its reply to each request put to it alone that it
+/// had been handed ([`handed_over`]) and had not answered. A request it was
+/// never shown is left for a turn that shows it. Returns the replies; none
+/// when it is in no group, `text` is empty, or nothing is open.
+pub fn answer_with_turn(
+    store: &GroupStore,
+    member: &MemberKey,
+    text: &str,
+) -> Result<Vec<crate::model::Entry>> {
+    use crate::model::EntryKind;
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(group) = store.group_of(member)? else {
+        return Ok(Vec::new());
+    };
+    let Some(alias) = group.member(member).map(|me| me.alias.clone()) else {
+        return Ok(Vec::new());
+    };
+    let cursor = store.cursor(&group.id, member)?;
+    let shown = cursor.delivered.max(cursor.read);
+    let log = store.entries_after(&group.id, 0)?;
+    let answered: std::collections::HashSet<&str> = log
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::Reply && entry.from.eq_ignore_ascii_case(&alias))
+        .filter_map(|entry| entry.re.as_deref())
+        .collect();
+    let open: Vec<(String, String)> = log
+        .iter()
+        .filter(|entry| {
+            entry.kind == EntryKind::Request
+                && entry.seq <= shown
+                && entry
+                    .to
+                    .as_deref()
+                    .is_some_and(|to| to.eq_ignore_ascii_case(&alias))
+        })
+        .filter_map(|entry| Some((entry.id.clone()?, entry.from.clone())))
+        .filter(|(id, _)| !answered.contains(id.as_str()))
+        .collect();
+    let mut replies = Vec::with_capacity(open.len());
+    for (request, asker) in open {
+        replies.push(store.append(
+            &group.id,
+            member,
+            crate::store::Draft {
+                kind: EntryKind::Reply,
+                to: Some(asker),
+                re: Some(request),
+                supersedes: None,
+                text: text.to_string(),
+            },
+        )?);
+    }
+    Ok(replies)
+}
+
 /// No one waits on `request` any more: `alias` is told, and a late reply
 /// reaches the asker as any other does.
 pub fn withdraw(store: &GroupStore, group_id: &str, asker: &MemberKey, alias: &str, request: &str) {
@@ -601,7 +800,8 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Delivery, Member};
+    use crate::model::{Delivery, EntryKind, Member};
+    use crate::render::AnswerBy;
 
     fn member(
         store: &GroupStore,
@@ -660,6 +860,7 @@ mod tests {
                     model: Some(" opus "),
                     access: Some(Access::Read),
                     cwd: Some("C:/p/.rebon/worktrees/bg-1"),
+                    acp_agent: None,
                 },
             )
             .unwrap();
@@ -825,7 +1026,7 @@ mod tests {
             .unwrap();
         let id = request.id.clone().unwrap();
         let group = store.load(&group.id).unwrap();
-        let text = crate::render::task_prompt(&group, "Ada", &request, None);
+        let text = crate::render::task_prompt(&group, "Ada", &request, None, AnswerBy::GroupSend);
         assert!(text.contains("You are Ada"), "{text}");
         assert!(text.contains(&format!("Lead asks you ({id})")), "{text}");
         assert!(
@@ -834,16 +1035,34 @@ mod tests {
         );
         assert!(text.contains(&format!("re {id}, to Lead")), "{text}");
 
+        let by_message =
+            crate::render::task_prompt(&group, "Ada", &request, None, AnswerBy::LastMessage);
+        assert!(
+            by_message.contains("Your last message is your answer"),
+            "{by_message}"
+        );
+        assert!(
+            !by_message.contains("group_send") && !by_message.contains("group_inbox"),
+            "a member with no group tools is not sent to them: {by_message}"
+        );
+        assert!(by_message.contains("`Blocked:`"), "the same answer form");
+
         let long = "x".repeat(crate::render::TASK_CHARS + 10);
         let request = store
             .append_awaited(&group.id, &lead, "Ada", &long)
             .unwrap();
-        let text = crate::render::task_prompt(&group, "Ada", &request, None);
+        let text = crate::render::task_prompt(&group, "Ada", &request, None, AnswerBy::GroupSend);
         assert!(
             text.contains("read it whole with group_inbox"),
             "a long task is cut"
         );
         assert!(text.chars().count() < crate::render::TASK_CHARS + 1000);
+        let whole =
+            crate::render::task_prompt(&group, "Ada", &request, None, AnswerBy::LastMessage);
+        assert!(
+            whole.contains(&long),
+            "handed whole where it cannot be read again"
+        );
     }
 
     #[test]
@@ -1001,8 +1220,327 @@ mod tests {
         .unwrap_err();
         assert!(format!("{error}").contains("members: Ada, Bo"), "{error}");
         assert!(
-            format!("{error}").ends_with("a new member is `@rebon`, `@claudecode` or `@codex`"),
+            format!("{error}").ends_with("a new member is one of @rebon, @claudecode, @codex"),
             "{error}"
+        );
+    }
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn a_turn_answers_the_requests_its_member_was_shown_once_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GroupStore::new(dir.path());
+        let group = store.create("crew", "C:/p").unwrap();
+        let lead = member(&store, &group.id, "claude-code", "c-lead", "Lead");
+        let ada = member(&store, &group.id, "rebon", "s-ada", "Ada");
+        let asked = store
+            .append_awaited(&group.id, &lead, "Ada", "count the lines")
+            .unwrap();
+        let id = asked.id.clone().unwrap();
+
+        assert!(
+            answer_with_turn(&store, &ada, "Done: 42")
+                .unwrap()
+                .is_empty(),
+            "a request it was never shown waits for a turn that shows it"
+        );
+        store.mark_delivered(&group.id, &ada, asked.seq).unwrap();
+        let later = store
+            .append_awaited(&group.id, &lead, "Ada", "and the words")
+            .unwrap();
+        assert!(
+            answer_with_turn(&store, &ada, "  ").unwrap().is_empty(),
+            "a turn with nothing to say answers nothing"
+        );
+
+        let replies = answer_with_turn(&store, &ada, " Done: 42 lines ").unwrap();
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert_eq!(replies[0].kind, EntryKind::Reply);
+        assert_eq!(replies[0].from, "Ada");
+        assert_eq!(replies[0].to.as_deref(), Some("Lead"));
+        assert_eq!(replies[0].re.as_deref(), Some(id.as_str()));
+        assert_eq!(replies[0].text, "Done: 42 lines");
+        let (reply, _) = reply_to(&store, &group.id, &id, asked.seq).unwrap();
+        assert_eq!(
+            reply.map(|reply| reply.text).as_deref(),
+            Some("Done: 42 lines")
+        );
+        assert!(
+            answer_with_turn(&store, &ada, "again").unwrap().is_empty(),
+            "answered once"
+        );
+
+        store.mark_delivered(&group.id, &ada, later.seq).unwrap();
+        let replies = answer_with_turn(&store, &ada, "Done: 7 words").unwrap();
+        assert_eq!(
+            replies
+                .iter()
+                .map(|reply| reply.re.clone().unwrap())
+                .collect::<Vec<_>>(),
+            [later.id.clone().unwrap()]
+        );
+
+        // The user's request is answered the same way; one to everyone, or
+        // to another member, is not Ada's alone to answer.
+        let from_user = store
+            .post_as_user(
+                &group.id,
+                crate::store::Draft {
+                    kind: EntryKind::Request,
+                    to: Some("Ada".into()),
+                    re: None,
+                    supersedes: None,
+                    text: "and you?".into(),
+                },
+            )
+            .unwrap();
+        let to_all = store
+            .append(
+                &group.id,
+                &lead,
+                crate::store::Draft {
+                    kind: EntryKind::Request,
+                    to: None,
+                    re: None,
+                    supersedes: None,
+                    text: "anyone?".into(),
+                },
+            )
+            .unwrap();
+        store.mark_delivered(&group.id, &ada, to_all.seq).unwrap();
+        let replies = answer_with_turn(&store, &ada, "Done: fine").unwrap();
+        assert_eq!(replies.len(), 1, "{replies:?}");
+        assert_eq!(replies[0].re, from_user.id);
+        assert_eq!(replies[0].to.as_deref(), Some(crate::model::USER));
+
+        let stranger = MemberKey {
+            agent: "rebon".into(),
+            session_id: "s-nobody".into(),
+        };
+        assert!(answer_with_turn(&store, &stranger, "Done")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_member_with_no_group_tools_is_woken_with_everything_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GroupStore::new(dir.path());
+        let group = store.create("crew", "C:/p").unwrap();
+        let lead = member(&store, &group.id, "claude-code", "c-lead", "Lead");
+        member(&store, &group.id, "rebon", "s-ada", "Ada");
+        let long = format!("Review auth.rs\n\n{}", "detail ".repeat(100));
+        let request = store
+            .append_awaited(&group.id, &lead, "Ada", &long)
+            .unwrap();
+        let group = store.load(&group.id).unwrap();
+
+        let text =
+            crate::render::last_message_prompt(&group, "Ada", std::slice::from_ref(&request))
+                .unwrap();
+        assert!(text.contains("You are Ada"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "Lead asks you ({}):\n\n{}",
+                request.id.as_deref().unwrap(),
+                long.trim()
+            )),
+            "whole, not a summary line: {text}"
+        );
+        assert!(text.contains("Your last message is your answer"), "{text}");
+        assert!(!text.contains("group_inbox") && !text.contains("group_send"));
+
+        let note = crate::model::Entry {
+            kind: EntryKind::Memory,
+            ..request.clone()
+        };
+        assert_eq!(
+            crate::render::last_message_prompt(&group, "Ada", &[note]),
+            None,
+            "nothing that wakes a member"
+        );
+    }
+
+    #[test]
+    fn an_acp_agent_answers_to_its_id_an_alias_or_its_short_name() {
+        let declared = ids(&[
+            "gemini",
+            "qwen-code",
+            "pi-acp",
+            "github-copilot-cli",
+            "glm-acp-agent",
+        ]);
+        let named = |name: &str| acp_agent_named(name, &declared).unwrap();
+        assert_eq!(named("@gemini"), Some("gemini"));
+        assert_eq!(named("Gemini"), Some("gemini"), "case is not the name");
+        assert_eq!(named("gemini-cli"), Some("gemini"), "an ending more");
+        assert_eq!(named("qwen"), Some("qwen-code"), "an ending fewer");
+        assert_eq!(named("Qwen Code"), Some("qwen-code"));
+        assert_eq!(named("pi"), Some("pi-acp"));
+        assert_eq!(named("copilot"), Some("github-copilot-cli"), "an alias");
+        assert_eq!(
+            named("glm"),
+            Some("glm-acp-agent"),
+            "endings one after another"
+        );
+        assert_eq!(named("cursor"), None, "not declared");
+        assert_eq!(named("@"), None);
+        assert_eq!(
+            acp_agent_named("copilot", &ids(&["gemini"])).unwrap(),
+            None,
+            "an alias of an agent that is not declared"
+        );
+    }
+
+    #[test]
+    fn google_antigravity_is_never_a_member() {
+        let declared = ids(&["antigravity-acp", "gemini"]);
+        for name in [
+            "antigravity",
+            "@antigravity-acp",
+            "agy",
+            "Google Antigravity",
+        ] {
+            let error = acp_agent_named(name, &declared).unwrap_err();
+            assert!(
+                format!("{error}").contains("Antigravity"),
+                "{name}: {error}"
+            );
+        }
+        assert!(
+            acp_agent_named("agy", &[]).is_err(),
+            "refused whether or not it is declared"
+        );
+        assert_eq!(
+            new_member_names(&declared),
+            ["@rebon", "@claudecode", "@codex", "@gemini"],
+            "never offered"
+        );
+    }
+
+    #[test]
+    fn a_short_name_two_agents_answer_to_is_refused() {
+        let declared = ids(&["kimi", "kimi-code"]);
+        assert_eq!(
+            acp_agent_named("kimi", &declared).unwrap(),
+            Some("kimi"),
+            "the id itself comes first"
+        );
+        let error = acp_agent_named("kimi-cli", &declared).unwrap_err();
+        assert!(
+            format!("{error}").contains("`@kimi`, `@kimi-code`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_task_for_an_acp_agent_asks_for_a_rebon_member_on_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GroupStore::new(dir.path());
+        let group = store.create("crew", "C:/p").unwrap();
+        let lead = member(&store, &group.id, "rebon", "s-lead", "Lead");
+        let declared = ids(&["qwen-code"]);
+
+        let handed = hand_on(
+            &store,
+            &group.id,
+            &lead,
+            &Assignment {
+                to: "@qwen",
+                task: "review auth.rs",
+                access: Some(Access::Read),
+                acp_agents: &declared,
+                ..Assignment::default()
+            },
+        )
+        .unwrap();
+        let Handed::Spawning { spawn_id, agent } = handed else {
+            panic!("a new member: {handed:?}");
+        };
+        assert_eq!(agent, "qwen-code", "named for what it runs");
+        let requests = store.spawn_requests(&group.id).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, spawn_id);
+        assert_eq!(requests[0].agent, AgentKind::REBON);
+        assert_eq!(requests[0].acp_agent.as_deref(), Some("qwen-code"));
+        assert_eq!(requests[0].access, Some(Access::Read));
+
+        // The agents Rebon starts itself come before an ACP agent of the
+        // same name, and a member before either.
+        let codex = hand_on(
+            &store,
+            &group.id,
+            &lead,
+            &Assignment {
+                to: "@codex",
+                task: "x",
+                acp_agents: &ids(&["codex"]),
+                ..Assignment::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(codex, Handed::Spawning { ref agent, .. } if agent == AgentKind::CODEX));
+        let error = hand_on(
+            &store,
+            &group.id,
+            &lead,
+            &Assignment {
+                to: "@agy",
+                task: "x",
+                acp_agents: &declared,
+                ..Assignment::default()
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error}").contains("Antigravity"), "{error}");
+        let error = hand_on(
+            &store,
+            &group.id,
+            &lead,
+            &Assignment {
+                to: "@cursor",
+                task: "x",
+                acp_agents: &declared,
+                ..Assignment::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error}").ends_with("one of @rebon, @claudecode, @codex, @qwen-code"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn only_a_rebon_member_runs_on_an_acp_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GroupStore::new(dir.path());
+        let group = store.create("crew", "C:/p").unwrap();
+        let lead = member(&store, &group.id, "rebon", "s-lead", "Lead");
+        let options = SpawnOptions {
+            acp_agent: Some("gemini"),
+            ..SpawnOptions::default()
+        };
+        assert!(store
+            .request_spawn(&group.id, "codex", &lead, "x", options)
+            .is_err());
+        let request = store
+            .request_spawn(&group.id, "rebon", &lead, "x", options)
+            .unwrap();
+        assert_eq!(request.acp_agent.as_deref(), Some("gemini"));
+        let blank = SpawnOptions {
+            acp_agent: Some(" "),
+            ..SpawnOptions::default()
+        };
+        assert_eq!(
+            store
+                .request_spawn(&group.id, "rebon", &lead, "x", blank)
+                .unwrap()
+                .acp_agent,
+            None
         );
     }
 

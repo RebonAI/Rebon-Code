@@ -421,15 +421,48 @@ pub fn handover_prompt(group: &Group, previous: &Member, open: &[Entry]) -> Stri
 /// caps a command line at 32,767. The whole text stays in `group_inbox`.
 pub const TASK_CHARS: usize = 20_000;
 
+/// How a member answers what it is asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnswerBy {
+    /// A `group_send` reply: a member that has the group tools.
+    GroupSend,
+    /// Its turn's last message, which Rebon posts as its reply
+    /// ([`crate::assign::answer_with_turn`]): a Rebon member whose turns an
+    /// ACP agent runs, which has no group tools.
+    LastMessage,
+}
+
+/// How to answer `id` from `from`, and what the answer says.
+fn answer_rule(from: &str, id: &str, answer: AnswerBy) -> String {
+    let how = match answer {
+        AnswerBy::GroupSend => format!("Answer with group_send (kind reply, re {id}, to {from})."),
+        AnswerBy::LastMessage => {
+            format!("Your last message is your answer: Rebon hands it to {from} as the reply.")
+        }
+    };
+    format!(
+        "{how} Its first line says what came of it in a few words — `Done: slugify.py written, \
+         self-check prints ok`, `Blocked: needs network access`. Add at most 4 short lines after \
+         it, only what {from} needs; never paste file contents or diffs, {from} reads the files. \
+         If the task needs something you are not allowed, do not work around it: answer \
+         `Blocked:` with what you needed."
+    )
+}
+
 /// The first message of a member the app started on `request`
 /// ([`crate::assign`]): who asks, the task itself, and that the asker waits
 /// for the answer — a reply naming the request — so the work is not done
 /// until one is sent.
+///
+/// A member that answers with its last message is handed the task whole:
+/// it reaches it over the agent's own connection, not a command line, and
+/// it has no `group_inbox` to read a cut task in.
 pub fn task_prompt(
     group: &Group,
     alias: &str,
     request: &Entry,
     access: Option<crate::assign::Access>,
+    answer: AnswerBy,
 ) -> String {
     let id = request.id.as_deref().unwrap_or_default();
     let from = &request.from;
@@ -438,7 +471,7 @@ pub fn task_prompt(
         group.name
     );
     let task = request.text.trim();
-    if task.chars().count() > TASK_CHARS {
+    if answer == AnswerBy::GroupSend && task.chars().count() > TASK_CHARS {
         // Cut, not flattened: a task's lines and lists are part of it.
         text.extend(task.chars().take(TASK_CHARS));
         text.push_str("…\n\n(The task goes on: read it whole with group_inbox.)");
@@ -452,14 +485,63 @@ pub fn task_prompt(
         ));
     }
     text.push_str(&format!(
-        "\n\n{from} is waiting. Answer with group_send (kind reply, re {id}, to {from}). Its \
-         first line says what came of it in a few words — `Done: slugify.py written, self-check \
-         prints ok`, `Blocked: needs network access`. Add at most 4 short lines after it, only \
-         what {from} needs; never paste file contents or diffs, {from} reads the files. If the \
-         task needs something you are not allowed, do not work around it: answer `Blocked:` \
-         with what you needed."
+        "\n\n{from} is waiting. {}",
+        answer_rule(from, id, answer)
     ));
     text
+}
+
+/// What wakes a member that answers with its last message
+/// ([`AnswerBy::LastMessage`]): every entry for it that wakes one, whole —
+/// it has no `group_inbox` to read the rest in — and, when one asks
+/// something, how the answer gets back. `None` when nothing in `entries`
+/// wakes a member.
+pub fn last_message_prompt(group: &Group, alias: &str, entries: &[Entry]) -> Option<String> {
+    let shown: Vec<&Entry> = entries.iter().filter(|entry| wakes(entry)).collect();
+    if shown.is_empty() {
+        return None;
+    }
+    let mut text = format!(
+        "[Agent group \"{}\"] You are {alias} in this group.",
+        group.name
+    );
+    for entry in &shown {
+        let who = if entry.is_from_user() {
+            "The user"
+        } else {
+            entry.from.as_str()
+        };
+        let said = match entry.kind {
+            EntryKind::Request => "asks you",
+            EntryKind::Reply => "answers",
+            _ => "says",
+        };
+        text.push_str(&format!(
+            "\n\n{who} {said}{}:\n\n{}",
+            id_tag(entry),
+            entry.text.trim()
+        ));
+    }
+    let asking: Vec<&&Entry> = shown
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::Request)
+        .collect();
+    if let Some(last) = asking.last() {
+        let from = if asking.iter().all(|entry| entry.from == last.from) {
+            last.from.as_str()
+        } else {
+            "whoever asked"
+        };
+        text.push_str(&format!(
+            "\n\n{}",
+            answer_rule(
+                from,
+                last.id.as_deref().unwrap_or_default(),
+                AnswerBy::LastMessage
+            )
+        ));
+    }
+    Some(text)
 }
 
 /// What an entry comes to, for a line in a list: its first line that has
