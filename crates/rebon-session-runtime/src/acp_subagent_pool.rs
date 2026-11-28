@@ -162,6 +162,10 @@ impl AcpSubAgentPool {
                     file_history,
                     &self.write_roots,
                     POOL_FS_SESSION_LABEL,
+                    // A sub-agent task has no session mode of its own; its
+                    // agent's permission mode bounds it (see the pool's
+                    // permission responder).
+                    rebon_acp_client::always_write(),
                 )
             })
             .as_ref()?;

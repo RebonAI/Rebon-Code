@@ -126,6 +126,19 @@ struct ServiceState {
     token: String,
     session_id: String,
     fs: SnapshotHostFs,
+    may_write: WriteGate,
+}
+
+/// Whether the session may write right now, asked before every
+/// `write_file` and `edit_file`: `Err` with the reason to give the agent
+/// when it may not — a session in plan mode reads only. The service is
+/// started below the layer that knows the session's mode, so the session
+/// hands it this.
+pub type WriteGate = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+/// A gate that lets every write through, for a host with no mode to keep.
+pub fn always_write() -> WriteGate {
+    Arc::new(|| Ok(()))
 }
 
 /// The host half of the injected fs tools, alive as long as the
@@ -196,6 +209,7 @@ impl HostFsService {
         file_history: Arc<dyn HostFileHistory>,
         write_roots: Vec<PathBuf>,
         session_id: impl Into<String>,
+        may_write: WriteGate,
     ) -> anyhow::Result<HostFsServiceHandle> {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
         listener.set_nonblocking(true)?;
@@ -206,6 +220,7 @@ impl HostFsService {
             token: token.clone(),
             session_id: session_id.into(),
             fs: SnapshotHostFs::new(file_history, write_roots),
+            may_write,
         });
         let join = tokio::spawn(accept_loop(listener, state));
         Ok(HostFsServiceHandle { port, token, join })
@@ -294,6 +309,9 @@ async fn handle_request(state: &ServiceState, request: WireRequest) -> WireRespo
     let path = PathBuf::from(&request.path);
     if !path.is_absolute() {
         return WireResponse::err(format!("`path` must be absolute, got `{}`", request.path));
+    }
+    if let Err(reason) = (state.may_write)() {
+        return WireResponse::err(reason);
     }
     let result = match request.op.as_str() {
         "write_file" => {
@@ -940,9 +958,21 @@ mod tests {
     const SESSION: &str = "sess-1";
 
     fn start_service(root: &Path) -> (Arc<RecordingHistory>, HostFsServiceHandle) {
+        start_gated_service(root, always_write())
+    }
+
+    fn start_gated_service(
+        root: &Path,
+        may_write: WriteGate,
+    ) -> (Arc<RecordingHistory>, HostFsServiceHandle) {
         let history = Arc::new(RecordingHistory::default());
-        let handle = HostFsService::start(history.clone(), vec![root.to_path_buf()], SESSION)
-            .expect("service starts");
+        let handle = HostFsService::start(
+            history.clone(),
+            vec![root.to_path_buf()],
+            SESSION,
+            may_write,
+        )
+        .expect("service starts");
         (history, handle)
     }
 
@@ -1010,6 +1040,56 @@ mod tests {
             vec![format!("snapshot {SESSION} {}", path.display())],
             "the snapshot must precede the write"
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_that_may_not_write_is_refused_before_a_snapshot() {
+        let root = scratch_dir("gate");
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate: WriteGate = {
+            let open = Arc::clone(&open);
+            Arc::new(move || {
+                if open.load(std::sync::atomic::Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err("plan mode reads only".to_string())
+                }
+            })
+        };
+        let (history, handle) = start_gated_service(root.path(), gate);
+        let path = root.path().join("note.txt");
+        std::fs::write(&path, "before").unwrap();
+
+        let mut client = TestClient::authed(handle.port(), handle.token()).await;
+        for op in [
+            serde_json::json!({ "op": "write_file", "path": path.to_string_lossy(), "content": "x" }),
+            serde_json::json!({
+                "op": "edit_file",
+                "path": path.to_string_lossy(),
+                "old_string": "before",
+                "new_string": "after",
+            }),
+        ] {
+            client.send(&op).await;
+            let response = client.recv().await.unwrap();
+            assert!(response.ok.is_none(), "{op}: {response:?}");
+            assert_eq!(response.err.as_deref(), Some("plan mode reads only"));
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
+        assert!(history.calls().is_empty(), "refused before any snapshot");
+
+        // Asked at each write: a session out of plan mode writes again.
+        open.store(true, std::sync::atomic::Ordering::SeqCst);
+        client
+            .send(&serde_json::json!({
+                "op": "write_file",
+                "path": path.to_string_lossy(),
+                "content": "now",
+            }))
+            .await;
+        let response = client.recv().await.unwrap();
+        assert!(response.ok.is_some(), "{response:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "now");
     }
 
     #[tokio::test]

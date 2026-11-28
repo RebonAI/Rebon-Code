@@ -346,6 +346,7 @@ impl SessionRuntimeFactory {
             tracker_dyn,
             write_roots,
             Some(self.transcript_sink.clone()),
+            crate::build::fs_write_gate(Arc::clone(&self.server_state), session_id),
         )
         .with_config_error(self.acp_config_error.clone());
         let config_dir = rebon_config::config_home_dir();

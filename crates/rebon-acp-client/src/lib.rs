@@ -64,7 +64,10 @@ pub use client::{
 };
 pub use connection::{permission_tool_kind, ClientDelegate, Connection, ConnectionError};
 pub use connector::{AgentConnector, ProcessConnector};
-pub use fs_mcp::{HostFsService, HostFsServiceHandle, FS_BRIDGE_SUBCOMMAND, FS_MCP_SERVER_NAME};
+pub use fs_mcp::{
+    always_write, HostFsService, HostFsServiceHandle, WriteGate, FS_BRIDGE_SUBCOMMAND,
+    FS_MCP_SERVER_NAME,
+};
 pub use host_fs::{DirectHostFs, HostFileHistory, HostFs, SnapshotHostFs};
 pub use journal::{NoopTurnJournal, TranscriptJournal, TranscriptSink, TurnJournal};
 pub use pending::{PendingError, PendingRequests};

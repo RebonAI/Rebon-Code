@@ -267,6 +267,7 @@ impl SessionAgentRouter {
                 as Arc<dyn rebon_agent_core::file_history::FileHistoryTracker>,
             vec![PathBuf::from(cwd)],
             self.config.transcript_sink.clone(),
+            rebon_acp_client::always_write(),
         )
         .with_config_error(self.config.config_error.clone());
         for (backend_id, label, loop_config) in &self.kernel_vendors {

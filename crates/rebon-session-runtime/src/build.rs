@@ -463,6 +463,30 @@ pub(crate) async fn build_tui_session_with_extra_attachment_poller(
     .await
 }
 
+/// The gate on Rebon's injected `write_file` and `edit_file` for
+/// `session_id` ([`rebon_acp_client::WriteGate`]): shut while the session is
+/// in plan mode, which reads only. An ACP agent's own edits are refused
+/// there by the session's mode (`host::worker::acp_turns`), and these tools
+/// must not be the way round that. Shut too while the session has no record
+/// to read a mode from.
+pub(crate) fn fs_write_gate(
+    state: Arc<ServerState>,
+    session_id: &str,
+) -> rebon_acp_client::WriteGate {
+    let session_id = session_id.to_string();
+    Arc::new(move || match state.session_permission_mode(&session_id) {
+        Some(mode) if PermissionMode::from_wire(&mode) == PermissionMode::Plan => Err(
+            "This session is in plan mode, which reads only: write_file and edit_file change \
+             nothing here."
+                .to_string(),
+        ),
+        Some(_) => Ok(()),
+        None => Err(format!(
+            "Session `{session_id}` has no permission mode to check, so nothing is written."
+        )),
+    })
+}
+
 /// The third-party agent CLIs this session can run on, from both
 /// surfaces that declare them: `acpAgents` in config.json and agent
 /// definitions whose frontmatter says `runtime: acp`. Their writes go
@@ -510,6 +534,7 @@ fn build_tui_session_agents(
         // local engine can replay a cached history that is
         // missing the ACP turns.
         Some(transcript_sink.clone()),
+        fs_write_gate(Arc::clone(server_state), session_id),
     )
     .with_config_error(acp_config_error);
     // The embedded kernel loop vendors (`/kernel dsh|pi|opencode`),
@@ -2459,6 +2484,28 @@ mod tests {
                 "startup mode {startup:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_injected_fs_tools_write_only_outside_plan_mode_and_for_a_known_session() {
+        let _home = rebon_tool::tasks::test_support::TestConfigHome::new("fs-write-gate");
+        let state = Arc::new(ServerState::new());
+        let record =
+            state.create_session_with_permission_mode("/repo/gate".to_string(), Vec::new(), "plan");
+        let gate = fs_write_gate(Arc::clone(&state), &record.id);
+        assert!(
+            gate().unwrap_err().contains("plan mode"),
+            "a session in plan mode reads only"
+        );
+        // Asked at each write, so a mode the session moves to counts.
+        assert!(state.set_permission_mode(&record.id, "acceptEdits"));
+        assert_eq!(gate(), Ok(()));
+        assert!(state.set_permission_mode(&record.id, "default"));
+        assert_eq!(gate(), Ok(()), "the mode's own prompts are not this gate's");
+        assert!(
+            fs_write_gate(state, "sess-nobody")().is_err(),
+            "no record to read a mode from: nothing is written"
+        );
     }
 
     /// Resuming straight into plan mode is entering it: the snapshot the

@@ -278,6 +278,7 @@ pub fn build_session_agents(
     tracker: Arc<dyn rebon_agent_core::file_history::FileHistoryTracker>,
     write_roots: Vec<PathBuf>,
     transcript_sink: Option<rebon_acp_client::TranscriptSink>,
+    may_write: rebon_acp_client::WriteGate,
 ) -> SessionAgents<AcpAgentBackend> {
     let projects_root = projects_root.into();
     let cwd = cwd.into();
@@ -294,6 +295,7 @@ pub fn build_session_agents(
         tracker,
         write_roots,
         transcript_sink,
+        may_write,
     );
     let mut agents = SessionAgents::new(
         registry,
@@ -329,6 +331,7 @@ pub fn build_registry(
     tracker: Arc<dyn rebon_agent_core::file_history::FileHistoryTracker>,
     write_roots: Vec<PathBuf>,
     transcript_sink: Option<rebon_acp_client::TranscriptSink>,
+    may_write: rebon_acp_client::WriteGate,
 ) -> (
     BackendRegistry<AcpAgentBackend>,
     Option<rebon_acp_client::HostFsServiceHandle>,
@@ -341,7 +344,7 @@ pub fn build_registry(
     let fs_service = agents
         .iter()
         .any(|agent| agent.inject_fs_tools)
-        .then(|| start_fs_service(file_history.clone(), &write_roots, session_id))
+        .then(|| start_fs_service(file_history.clone(), &write_roots, session_id, may_write))
         .flatten();
     let injected = fs_service
         .as_ref()
@@ -410,6 +413,7 @@ pub fn start_fs_service(
     file_history: Arc<dyn HostFileHistory>,
     write_roots: &[PathBuf],
     session_id: &str,
+    may_write: rebon_acp_client::WriteGate,
 ) -> Option<rebon_acp_client::HostFsServiceHandle> {
     // The service task needs a runtime. Production wiring always has
     // one (`build_tui_session` is async); a sync test context does
@@ -419,7 +423,12 @@ pub fn start_fs_service(
         tracing::debug!("acp-fs: no tokio runtime; skipping fs tool injection");
         return None;
     }
-    match rebon_acp_client::HostFsService::start(file_history, write_roots.to_vec(), session_id) {
+    match rebon_acp_client::HostFsService::start(
+        file_history,
+        write_roots.to_vec(),
+        session_id,
+        may_write,
+    ) {
         Ok(handle) => Some(handle),
         Err(err) => {
             tracing::warn!(
@@ -553,6 +562,7 @@ mod real_agent_tests {
                 as Arc<dyn rebon_agent_core::file_history::FileHistoryTracker>,
             vec![cwd.clone()],
             None,
+            rebon_acp_client::always_write(),
         ));
         agents.switch_to("codex").expect("declared agent");
 
@@ -949,6 +959,7 @@ pub mod test_support {
             Arc::new(NoopTracker),
             vec![PathBuf::from("/tmp/repo")],
             None,
+            rebon_acp_client::always_write(),
         )
     }
 }
@@ -1502,6 +1513,7 @@ mod tests {
             Arc::new(tracker) as Arc<dyn rebon_agent_core::file_history::FileHistoryTracker>,
             vec![PathBuf::from("/tmp/repo")],
             None,
+            rebon_acp_client::always_write(),
         );
         // Both are offered to `/agent`; only their wiring differs.
         assert_eq!(registry.ids(), vec!["remote:prod", "claude-code"]);
@@ -1738,6 +1750,7 @@ mod tests {
             Arc::new(NoopTracker),
             vec![PathBuf::from("/tmp/repo")],
             None,
+            rebon_acp_client::always_write(),
         );
         assert!(
             fs_service.is_none(),
@@ -1775,6 +1788,7 @@ mod tests {
             Arc::new(NoopTracker),
             vec![PathBuf::from("/tmp/repo")],
             None,
+            rebon_acp_client::always_write(),
         );
         let service = fs_service.expect("one agent wants injection, so the host half starts");
         assert!(
@@ -1845,6 +1859,7 @@ mod tests {
             Arc::new(NoopTracker),
             vec![PathBuf::from("/old")],
             None,
+            rebon_acp_client::always_write(),
         );
         let (new_registry, new_service) = build_registry(
             &declared,
@@ -1854,6 +1869,7 @@ mod tests {
             Arc::new(NoopTracker),
             vec![PathBuf::from("/new")],
             None,
+            rebon_acp_client::always_write(),
         );
         let old_service = old_service.expect("old host-fs service");
         let new_service = new_service.expect("new host-fs service");
