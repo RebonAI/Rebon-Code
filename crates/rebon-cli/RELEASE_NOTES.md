@@ -8,6 +8,13 @@ Each section is a `## <version>` heading followed by one to four `- ` items.
 Keep every item within 36 columns: that is the narrowest the banner's notes
 column gets, and a longer line is cut off.
 
+## 1.33.0
+
+- @gemini: group members on ACP
+- ACP permissions follow your mode
+- Members on ACP answer with a turn
+- Plan mode stops fs tool writes
+
 ## 1.32.0
 
 - Steps go to group members: @Ada
