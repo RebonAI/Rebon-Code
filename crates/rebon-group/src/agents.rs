@@ -11,12 +11,19 @@
 //! Switching a program out does not take its sessions out of the groups
 //! they are already in. The app does that, after asking whether their
 //! sessions go too, because only it can ask.
+//!
+//! The same file says how an agent other than Rebon, Claude Code and Codex
+//! comes in: by default as a member Rebon runs over ACP, which writes
+//! nothing into the project; with `{"projectFiles": ["gemini-cli"]}`, also
+//! through the project files that let one the user starts in its own
+//! terminal join (`.gemini/settings.json` and the like).
 
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::identity::AgentKind;
 use crate::store::{write_json, GroupStore};
 
 const AGENTS_FILE: &str = "agents.json";
@@ -28,11 +35,27 @@ pub struct AgentPolicy {
     /// Agent programs (`AgentKind` names) that may not join a group.
     #[serde(default)]
     pub excluded: BTreeSet<String>,
+    /// Agent programs past Rebon, Claude Code and Codex whose project files
+    /// the app writes ([`Self::writes_project_files`]). None by default.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub project_files: BTreeSet<String>,
 }
 
 impl AgentPolicy {
     pub fn allows(&self, agent: &str) -> bool {
         !self.excluded.contains(agent)
+    }
+
+    /// Whether the app puts `agent`'s group tools in a project's files, for
+    /// a session the user starts in its own terminal: always for Rebon,
+    /// Claude Code and Codex, whose members it starts that way; for any
+    /// other agent only once the user asked for it, since that agent joins
+    /// as a member Rebon runs over ACP without them.
+    pub fn writes_project_files(&self, agent: &str) -> bool {
+        matches!(
+            agent,
+            AgentKind::REBON | AgentKind::CLAUDE_CODE | AgentKind::CODEX
+        ) || self.project_files.contains(agent)
     }
 }
 
@@ -60,17 +83,34 @@ impl GroupStore {
         } else {
             policy.excluded.insert(agent.to_string());
         }
+        self.write_agent_policy(&policy)?;
+        Ok(policy)
+    }
+
+    /// Lets the app write `agent`'s project files
+    /// ([`AgentPolicy::writes_project_files`]), or stops it writing more.
+    /// Files already written stay where they are.
+    pub fn set_project_files(&self, agent: &str, on: bool) -> Result<AgentPolicy> {
+        let mut policy = self.agent_policy()?;
+        if on {
+            policy.project_files.insert(agent.to_string());
+        } else {
+            policy.project_files.remove(agent);
+        }
+        self.write_agent_policy(&policy)?;
+        Ok(policy)
+    }
+
+    fn write_agent_policy(&self, policy: &AgentPolicy) -> Result<()> {
         std::fs::create_dir_all(self.root())
             .with_context(|| format!("failed to create {}", self.root().display()))?;
-        write_json(&self.root().join(AGENTS_FILE), &policy)?;
-        Ok(policy)
+        write_json(&self.root().join(AGENTS_FILE), policy)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::AgentKind;
     use crate::model::{Delivery, Member};
 
     fn member(agent: &str, session_id: &str) -> Member {
@@ -196,5 +236,59 @@ mod tests {
             .join(&group.id, member(AgentKind::REBON, "r1"))
             .is_err());
         assert!(store.set_agent_allowed(AgentKind::REBON, false).is_err());
+        assert!(store.set_project_files(AgentKind::PI, true).is_err());
+    }
+
+    #[test]
+    fn only_the_agents_the_app_starts_in_terminals_get_project_files_unasked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GroupStore::new(dir.path().join("groups"));
+        let policy = store.agent_policy().unwrap();
+        for agent in [AgentKind::REBON, AgentKind::CLAUDE_CODE, AgentKind::CODEX] {
+            assert!(policy.writes_project_files(agent), "{agent}");
+        }
+        for agent in [
+            AgentKind::PI,
+            AgentKind::GEMINI_CLI,
+            AgentKind::QWEN_CODE,
+            AgentKind::CURSOR_AGENT,
+            AgentKind::AMP,
+            AgentKind::OPENCODE,
+        ] {
+            assert!(
+                !policy.writes_project_files(agent),
+                "{agent} joins over ACP"
+            );
+        }
+
+        let on = store
+            .set_project_files(AgentKind::GEMINI_CLI, true)
+            .unwrap();
+        assert!(on.writes_project_files(AgentKind::GEMINI_CLI));
+        assert!(!on.writes_project_files(AgentKind::PI));
+        assert!(on.allows(AgentKind::GEMINI_CLI), "a separate switch");
+        assert_eq!(store.agent_policy().unwrap(), on);
+        let text = std::fs::read_to_string(store.root().join(AGENTS_FILE)).unwrap();
+        assert!(text.contains("\"projectFiles\""), "{text}");
+
+        let off = store
+            .set_project_files(AgentKind::GEMINI_CLI, false)
+            .unwrap();
+        assert_eq!(off, AgentPolicy::default());
+        let text = std::fs::read_to_string(store.root().join(AGENTS_FILE)).unwrap();
+        assert!(
+            !text.contains("projectFiles"),
+            "an empty list is not written: {text}"
+        );
+    }
+
+    #[test]
+    fn a_file_from_before_project_files_reads_as_none_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GroupStore::new(dir.path());
+        std::fs::write(dir.path().join(AGENTS_FILE), r#"{"excluded":["codex"]}"#).unwrap();
+        let policy = store.agent_policy().unwrap();
+        assert!(!policy.allows(AgentKind::CODEX));
+        assert!(policy.project_files.is_empty());
     }
 }
