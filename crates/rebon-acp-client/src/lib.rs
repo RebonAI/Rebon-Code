@@ -62,7 +62,7 @@ pub use backend::{AcpAgentBackend, AcpBackendConfig, HandoffProvider, SessionRou
 pub use client::{
     default_client_capabilities, AcpClient, ClientError, ACP_CLIENT_PROTOCOL_VERSION,
 };
-pub use connection::{ClientDelegate, Connection, ConnectionError};
+pub use connection::{permission_tool_kind, ClientDelegate, Connection, ConnectionError};
 pub use connector::{AgentConnector, ProcessConnector};
 pub use fs_mcp::{HostFsService, HostFsServiceHandle, FS_BRIDGE_SUBCOMMAND, FS_MCP_SERVER_NAME};
 pub use host_fs::{DirectHostFs, HostFileHistory, HostFs, SnapshotHostFs};

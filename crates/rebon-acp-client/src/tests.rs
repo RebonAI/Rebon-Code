@@ -243,7 +243,7 @@ async fn serve(mut stream: DuplexStream, script: AgentScript, log: Arc<AgentLog>
                         "method": "session/request_permission",
                         "params": {
                             "sessionId": session_id,
-                            "toolCall": {"toolCallId": "call-1", "title": "Write file"},
+                            "toolCall": {"toolCallId": "call-1", "title": "Write file", "kind": "edit"},
                             "options": [
                                 {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
                                 {"optionId": "deny", "name": "Deny", "kind": "reject_once"}
@@ -556,6 +556,11 @@ async fn a_permission_request_reaches_the_host_and_the_answer_goes_back() {
     let answered = tokio::spawn(async move {
         let outbound = permission_rx.recv().await.expect("permission must arrive");
         let host_session = outbound.params.session_id.clone();
+        assert_eq!(
+            crate::permission_tool_kind(&outbound.params),
+            Some("edit"),
+            "the tool call's kind reaches whoever answers"
+        );
         let response = rebon_agent_core::publisher::make_permission_result_response(
             outbound.request_id,
             RequestPermissionResult {

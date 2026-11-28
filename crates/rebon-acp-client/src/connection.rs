@@ -30,6 +30,29 @@ use tokio::sync::Mutex;
 
 use crate::pending::{PendingError, PendingRequests};
 
+/// Where a permission request keeps the kind of tool call it is for: the
+/// agent's `toolCall.kind` (`read`, `edit`, `execute`, …), which
+/// [`RequestPermissionParams`] has no field for, goes in its `metadata`
+/// under this key. Read it with [`permission_tool_kind`].
+const TOOL_KIND_KEY: &str = "toolKind";
+
+fn keep_tool_kind(params: &mut RequestPermissionParams, kind: &str) {
+    let metadata = params
+        .metadata
+        .get_or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if let serde_json::Value::Object(map) = metadata {
+        map.entry(TOOL_KIND_KEY)
+            .or_insert_with(|| serde_json::Value::String(kind.to_string()));
+    }
+}
+
+/// The kind of tool call an agent asks permission for, as it said it:
+/// `read`, `edit`, `delete`, `move`, `search`, `execute`, `think`, `fetch`,
+/// `other`. `None` when it did not say.
+pub fn permission_tool_kind(params: &RequestPermissionParams) -> Option<&str> {
+    params.metadata.as_ref()?.get(TOOL_KIND_KEY)?.as_str()
+}
+
 /// Method names this client speaks. Kept in one place so a typo is a
 /// compile error rather than a silent method-not-found.
 pub mod method {
@@ -352,11 +375,20 @@ async fn serve_request(
     let params = request.params.unwrap_or(serde_json::Value::Null);
     let outcome = match request.method.as_str() {
         method::SESSION_REQUEST_PERMISSION => {
+            let kind = params
+                .pointer("/toolCall/kind")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
             match serde_json::from_value::<RequestPermissionParams>(params) {
-                Ok(params) => delegate
-                    .request_permission(params)
-                    .await
-                    .and_then(|result| Ok(serde_json::to_value(result)?)),
+                Ok(mut params) => {
+                    if let Some(kind) = kind {
+                        keep_tool_kind(&mut params, &kind);
+                    }
+                    delegate
+                        .request_permission(params)
+                        .await
+                        .and_then(|result| Ok(serde_json::to_value(result)?))
+                }
                 Err(err) => Err(anyhow::anyhow!("invalid params: {err}")),
             }
         }
